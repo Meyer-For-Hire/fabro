@@ -1,18 +1,14 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use fabro_auth::configured_providers_from_process_env;
-use fabro_config::project as project_config;
 use fabro_interview::{AutoApproveInterviewer, Interviewer};
 use fabro_mcp::config::{McpServerSettings, McpTransport};
 use fabro_model::{Catalog, FallbackTarget, Provider};
-use fabro_retro::retro::Retro;
 use fabro_sandbox::config::{
-    self as sandbox_config, DaytonaNetwork, DaytonaSnapshotSettings,
-    DockerfileSource as SandboxDockerfileSource, WorktreeMode, bridge_worktree_mode,
+    DaytonaNetwork, DaytonaSnapshotSettings, DockerfileSource as SandboxDockerfileSource,
 };
 use fabro_sandbox::daytona::DaytonaConfig;
 use fabro_sandbox::{DockerSandboxOptions, SandboxProvider, SandboxSpec};
@@ -30,6 +26,7 @@ use fabro_types::settings::run::{
 use fabro_vault::Vault;
 use tokio::runtime::Handle;
 use tokio::sync::RwLock as AsyncRwLock;
+use tokio_util::sync::CancellationToken;
 
 use crate::ManifestPath;
 use crate::artifact_upload::ArtifactSink;
@@ -42,8 +39,7 @@ use crate::handler::HandlerRegistry;
 use crate::outcome::Outcome;
 use crate::pipeline::{
     self, DevcontainerSpec, FinalizeOptions, Finalized, InitOptions, LlmSpec, Persisted,
-    PullRequestOptions, RetroOptions, SandboxEnvSpec, build_conclusion_from_store,
-    classify_engine_result,
+    PullRequestOptions, SandboxEnvSpec, build_conclusion_from_store, classify_engine_result,
 };
 use crate::records::Checkpoint;
 use crate::run_control::RunControlState;
@@ -51,14 +47,16 @@ use crate::run_metadata::metadata_branch_name;
 use crate::run_options::{GitCheckpointOptions, LifecycleOptions, RunOptions};
 use crate::run_status::{FailureReason, RunStatus};
 use crate::runtime_store::RunStoreHandle;
+use crate::steering_hub::SteeringHub;
 use crate::workflow_bundle::{RunDefinition, WorkflowBundle};
 
 struct RunSession {
-    cancel_token:      Option<Arc<AtomicBool>>,
+    cancel_token:      CancellationToken,
     emitter:           Arc<Emitter>,
     sandbox:           SandboxSpec,
     llm:               LlmSpec,
     interviewer:       Arc<dyn Interviewer>,
+    steering_hub:      Arc<SteeringHub>,
     on_node:           crate::OnNodeCallback,
     lifecycle:         LifecycleOptions,
     hooks:             fabro_hooks::HookSettings,
@@ -70,10 +68,9 @@ struct RunSession {
     artifact_sink:     Option<ArtifactSink>,
     git:               Option<GitCheckpointOptions>,
     github_app:        Option<fabro_github::GitHubCredentials>,
-    worktree_mode:     Option<WorktreeMode>,
     registry_override: Option<Arc<HandlerRegistry>>,
-    retro_enabled:     bool,
     preserve_sandbox:  bool,
+    stop_on_terminal:  bool,
     pr_config:         Option<PullRequestSettings>,
     pr_github_app:     Option<fabro_github::GitHubCredentials>,
     pr_origin_url:     Option<String>,
@@ -86,9 +83,10 @@ struct RunSession {
 
 pub struct StartServices {
     pub run_id:             RunId,
-    pub cancel_token:       Option<Arc<AtomicBool>>,
+    pub cancel_token:       CancellationToken,
     pub emitter:            Arc<Emitter>,
     pub interviewer:        Arc<dyn Interviewer>,
+    pub steering_hub:       Arc<SteeringHub>,
     pub run_store:          RunStoreHandle,
     pub event_sink:         RunEventSink,
     pub artifact_sink:      Option<ArtifactSink>,
@@ -103,10 +101,8 @@ pub struct StartServices {
 }
 
 pub struct Started {
-    pub finalized:      Finalized,
-    pub final_context:  Option<Context>,
-    pub retro:          Option<Retro>,
-    pub retro_duration: Duration,
+    pub finalized:     Finalized,
+    pub final_context: Option<Context>,
 }
 
 /// Start a fresh workflow run. Errors if a checkpoint already exists (use
@@ -123,21 +119,20 @@ pub async fn start(run_dir: &Path, services: StartServices) -> Result<Started, E
         .state()
         .await
         .map_err(|err| Error::engine(err.to_string()))?;
-    if state.checkpoint.is_some() {
+    if state.current_checkpoint().is_some() {
         return Err(Error::Precondition(
             "checkpoint already exists in the run store — did you mean to resume?".to_string(),
         ));
     }
 
-    if let Some(status) = state.status {
-        if !matches!(
-            status,
-            RunStatus::Submitted | RunStatus::Queued | RunStatus::Starting
-        ) {
-            return Err(Error::Precondition(format!(
-                "cannot start run: status is {status}, expected submitted"
-            )));
-        }
+    let status = state.status;
+    if !matches!(
+        status,
+        RunStatus::Submitted | RunStatus::Queued | RunStatus::Starting
+    ) {
+        return Err(Error::Precondition(format!(
+            "cannot start run: status is {status}, expected submitted"
+        )));
     }
 
     Box::pin(execute_persisted_run(run_dir, None, services)).await
@@ -271,6 +266,7 @@ async fn persist_terminal_engine_failure(
         reason,
         git_commit_sha: None,
         final_patch: None,
+        diff_summary: None,
     })
     .await
     {
@@ -298,7 +294,7 @@ impl RunSession {
                 meta_branch: Some(metadata_branch_name(&record.run_id.to_string())),
             })
         });
-        let definition_blob = state.spec.as_ref().and_then(|run| run.definition_blob);
+        let definition_blob = state.spec.definition_blob;
         let accepted_definition = match definition_blob {
             Some(blob_id) => {
                 Some(load_accepted_run_definition(&services.run_store, blob_id).await?)
@@ -426,6 +422,7 @@ impl RunSession {
                 dry_run: resolved.execution.mode == RunMode::DryRun,
             },
             interviewer,
+            steering_hub: services.steering_hub,
             on_node: services.on_node,
             lifecycle: LifecycleOptions {
                 setup_commands:           resolved.prepare.commands.clone(),
@@ -442,10 +439,9 @@ impl RunSession {
             artifact_sink: services.artifact_sink,
             git,
             github_app: services.github_app.clone(),
-            worktree_mode: Some(resolve_worktree_mode(resolved)),
             registry_override: services.registry_override,
-            retro_enabled: resolved.execution.retros && project_config::is_retro_enabled(),
             preserve_sandbox: resolved.sandbox.preserve,
+            stop_on_terminal: resolved.sandbox.stop_on_terminal,
             pr_config,
             pr_github_app: services.github_app,
             pr_origin_url: record.repo_origin_url().map(str::to_string),
@@ -494,10 +490,6 @@ fn resolve_sandbox_provider(settings: &ResolvedRunSettings) -> Result<SandboxPro
     .transpose()
     .map_err(|err| Error::Precondition(format!("Invalid sandbox provider: {err}")))?
     .map_or_else(|| Ok(SandboxProvider::default()), Ok)
-}
-
-fn resolve_worktree_mode(settings: &ResolvedRunSettings) -> sandbox_config::WorktreeMode {
-    bridge_worktree_mode(settings.sandbox.local.worktree_mode)
 }
 
 fn resolve_daytona_config(settings: &ResolvedRunSettings) -> Option<DaytonaConfig> {
@@ -681,13 +673,12 @@ fn runtime_hook_type(hook_type: &ResolvedHookType) -> fabro_hooks::HookType {
 }
 
 impl RunSession {
-    /// Shared engine: initialize, execute, retro, finalize, pull_request.
+    /// Shared engine: initialize, execute, finalize, pull_request.
     async fn run(
         self,
         persisted: Persisted,
         checkpoint: Option<Checkpoint>,
     ) -> Result<Started, Error> {
-        let preserve_sandbox = self.preserve_sandbox;
         let on_node = self.on_node.clone();
 
         let record = persisted.run_spec();
@@ -744,6 +735,7 @@ impl RunSession {
             sandbox: self.sandbox,
             llm: self.llm,
             interviewer: self.interviewer,
+            steering_hub: Arc::clone(&self.steering_hub),
             lifecycle: self.lifecycle,
             run_options,
             workflow_path: self.workflow_path,
@@ -753,7 +745,6 @@ impl RunSession {
             vault: self.vault,
             devcontainer: self.devcontainer,
             git: self.git,
-            worktree_mode: self.worktree_mode,
             registry_override: self.registry_override,
             artifact_sink: self.artifact_sink,
             run_control: self.run_control,
@@ -764,45 +755,36 @@ impl RunSession {
         initialized.on_node = on_node;
 
         let sandbox_for_cleanup = Arc::clone(&initialized.engine.run.sandbox);
+        let stop_on_terminal = self.stop_on_terminal;
         let cleanup_guard = scopeguard::guard((), move |()| {
-            if preserve_sandbox {
+            if !stop_on_terminal {
                 return;
             }
             if let Ok(handle) = Handle::try_current() {
                 handle.spawn(async move {
-                    let _ = sandbox_for_cleanup.cleanup().await;
+                    let _ = sandbox_for_cleanup.stop().await;
                 });
             }
+        });
+
+        // Drain any unconsumed pending steers on every exit path
+        // (success, error, panic). The emit lands in the progress log via
+        // the explicit flush below; the scopeguard is a panic-only fallback.
+        let steering_hub_for_drain = Arc::clone(&self.steering_hub);
+        let _drain_guard = scopeguard::guard((), move |()| {
+            steering_hub_for_drain.drain_pending_at_run_end();
         });
 
         let executed = pipeline::execute(initialized).await;
         store_progress_logger.flush().await;
         let final_context = Some(executed.final_context.clone());
-        let failed = !executed
-            .outcome
-            .as_ref()
-            .is_ok_and(|outcome| outcome.status.is_successful());
-
-        let retro_opts = RetroOptions {
-            run_id: executed.run_options.run_id,
-            services: Arc::clone(&executed.engine.run),
-            workflow_name: executed.graph.name.clone(),
-            goal: executed.graph.goal().to_string(),
-            failed,
-            run_duration_ms: executed.duration_ms,
-            enabled: self.retro_enabled,
-            model: executed.model.clone(),
-        };
-
-        let retro_start = Instant::now();
-        let retroed = Box::pin(pipeline::retro(executed, &retro_opts)).await;
-        let retro_duration = retro_start.elapsed();
 
         let finalize_opts = FinalizeOptions {
-            run_dir:          retroed.run_options.run_dir.clone(),
-            run_id:           retroed.run_options.run_id,
-            workflow_name:    retroed.graph.name.clone(),
+            run_dir:          executed.run_options.run_dir.clone(),
+            run_id:           executed.run_options.run_id,
+            workflow_name:    executed.graph.name.clone(),
             preserve_sandbox: self.preserve_sandbox,
+            stop_on_terminal: self.stop_on_terminal,
             last_git_sha:     last_git_sha.lock().unwrap().clone(),
         };
         let pr_opts = PullRequestOptions {
@@ -812,9 +794,20 @@ impl RunSession {
             model:      self.pr_model,
         };
 
-        let retro = retroed.retro.clone();
-        let concluded = Box::pin(pipeline::finalize(retroed, &finalize_opts)).await?;
+        let concluded = match Box::pin(pipeline::finalize(executed, &finalize_opts)).await {
+            Ok(concluded) => concluded,
+            Err(err) => {
+                self.steering_hub.drain_pending_at_run_end();
+                store_progress_logger.flush().await;
+                return Err(err);
+            }
+        };
         let finalized = Box::pin(pipeline::pull_request(concluded, &pr_opts)).await;
+        // Emit `agent.steer.dropped { reason: run_ended }` for any
+        // unconsumed pending steers on the success path, then flush. The
+        // scopeguard above re-runs as a no-op (drain is idempotent on an
+        // already-empty buffer) on the way out of scope.
+        self.steering_hub.drain_pending_at_run_end();
         store_progress_logger.flush().await;
 
         scopeguard::ScopeGuard::into_inner(cleanup_guard);
@@ -822,8 +815,6 @@ impl RunSession {
         Ok(Started {
             finalized,
             final_context,
-            retro,
-            retro_duration,
         })
     }
 }
@@ -831,7 +822,7 @@ impl RunSession {
 struct DetachedRunBootstrapGuard {
     run_id:       RunId,
     event_sink:   RunEventSink,
-    cancel_token: Option<Arc<AtomicBool>>,
+    cancel_token: CancellationToken,
     active:       bool,
 }
 
@@ -840,7 +831,7 @@ impl DetachedRunBootstrapGuard {
         run_id: RunId,
         _run_dir: &Path,
         event_sink: RunEventSink,
-        cancel_token: Option<Arc<AtomicBool>>,
+        cancel_token: CancellationToken,
     ) -> Self {
         Self {
             run_id,
@@ -858,10 +849,7 @@ impl DetachedRunBootstrapGuard {
 impl Drop for DetachedRunBootstrapGuard {
     fn drop(&mut self) {
         if self.active {
-            let cancelled = self
-                .cancel_token
-                .as_ref()
-                .is_some_and(|token| token.load(Ordering::SeqCst));
+            let cancelled = self.cancel_token.is_cancelled();
             let reason = if cancelled {
                 FailureReason::Cancelled
             } else {
@@ -877,6 +865,7 @@ impl Drop for DetachedRunBootstrapGuard {
                         reason,
                         git_commit_sha: None,
                         final_patch: None,
+                        diff_summary: None,
                     })
                     .await;
                 });
@@ -891,12 +880,12 @@ const POSTRUN_CANCELLED_MESSAGE: &str = "Run cancelled before post-run finalizat
 struct DetachedRunCompletionGuard {
     event_sink:   RunEventSink,
     run_id:       RunId,
-    cancel_token: Option<Arc<AtomicBool>>,
+    cancel_token: CancellationToken,
     active:       bool,
 }
 
 impl DetachedRunCompletionGuard {
-    fn arm(run_id: RunId, event_sink: RunEventSink, cancel_token: Option<Arc<AtomicBool>>) -> Self {
+    fn arm(run_id: RunId, event_sink: RunEventSink, cancel_token: CancellationToken) -> Self {
         Self {
             event_sink,
             run_id,
@@ -916,10 +905,7 @@ impl Drop for DetachedRunCompletionGuard {
             return;
         }
 
-        let cancelled = self
-            .cancel_token
-            .as_ref()
-            .is_some_and(|token| token.load(Ordering::SeqCst));
+        let cancelled = self.cancel_token.is_cancelled();
         let reason = if cancelled {
             FailureReason::Cancelled
         } else {
@@ -945,6 +931,7 @@ impl Drop for DetachedRunCompletionGuard {
                     reason,
                     git_commit_sha: None,
                     final_patch: None,
+                    diff_summary: None,
                 })
                 .await;
                 let _ = append_event_to_sink(&event_sink, &run_id, &Event::RunNotice {
@@ -975,6 +962,7 @@ async fn persist_detached_failure(
         reason,
         git_commit_sha: None,
         final_patch: None,
+        diff_summary: None,
     })
     .await
     {
@@ -1078,9 +1066,9 @@ mod tests {
                 workflow_bundle: None,
                 submitted_manifest_bytes: None,
                 run_id: Some(fixtures::RUN_1),
+                title: None,
                 git: None,
                 fork_source_ref: None,
-                in_place: false,
                 provenance: None,
                 configured_providers: Vec::new(),
                 web_url: None,
@@ -1106,11 +1094,13 @@ mod tests {
         emitter: Arc<Emitter>,
         registry: Arc<HandlerRegistry>,
     ) -> StartServices {
+        let steering_hub = Arc::new(crate::steering_hub::SteeringHub::new(emitter.clone()));
         StartServices {
             run_id: fixtures::RUN_1,
-            cancel_token: None,
+            cancel_token: CancellationToken::new(),
             emitter,
             interviewer: Arc::new(fabro_interview::AutoApproveInterviewer::engine()),
+            steering_hub,
             run_store: store.open_run(&fixtures::RUN_1).await.unwrap().into(),
             event_sink: RunEventSink::store(store.open_run(&fixtures::RUN_1).await.unwrap()),
             artifact_sink: None,
@@ -1156,6 +1146,7 @@ mod tests {
                         restart_failure_signatures: HashMap::new().into_iter().collect(),
                         node_visits: HashMap::new().into_iter().collect(),
                         diff: None,
+                        diff_summary: None,
                     });
                 }
             });
@@ -1174,7 +1165,6 @@ mod tests {
             Some("sha-test")
         );
         assert_eq!(started.finalized.conclusion.status, StageOutcome::Succeeded);
-        assert!(started.retro.is_none());
     }
 
     #[tokio::test]
@@ -1265,9 +1255,9 @@ mod tests {
                 workflow_bundle: Some(workflow_bundle),
                 submitted_manifest_bytes: None,
                 run_id: Some(fixtures::RUN_1),
+                title: None,
                 git: None,
                 fork_source_ref: None,
-                in_place: false,
                 provenance: None,
                 configured_providers: Vec::new(),
                 web_url: None,
@@ -1368,6 +1358,7 @@ mod tests {
                     .collect(),
                 node_visits: checkpoint.node_visits.clone().into_iter().collect(),
                 diff: None,
+                diff_summary: None,
             },
         )
         .await
@@ -1434,6 +1425,7 @@ mod tests {
             stages:               vec![],
             billing:              None,
             total_retries:        0,
+            diff:                 fabro_types::RunDiff::default(),
         };
         let run_store = store.open_run(&fixtures::RUN_1).await.unwrap();
         crate::event::append_event(&run_store, &fixtures::RUN_1, &Event::CheckpointCompleted {
@@ -1458,6 +1450,7 @@ mod tests {
                 .collect(),
             node_visits: checkpoint.node_visits.clone().into_iter().collect(),
             diff: None,
+            diff_summary: None,
         })
         .await
         .unwrap();
@@ -1475,6 +1468,7 @@ mod tests {
             total_usd_micros:     None,
             final_git_commit_sha: None,
             final_patch:          None,
+            diff_summary:         None,
             billing:              None,
         })
         .await

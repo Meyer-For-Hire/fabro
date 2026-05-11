@@ -13,7 +13,7 @@ pub(crate) async fn run(args: SshArgs, base_ctx: &CommandContext) -> Result<()> 
     let ctx = base_ctx.with_target(&args.server)?;
     let printer = ctx.printer();
     let client = ctx.server().await?;
-    let run_id = client.resolve_run(&args.run).await?.run_id;
+    let run_id = client.resolve_run(&args.run).await?.id;
     let ssh = client.create_run_ssh_access(&run_id, args.ttl).await?;
 
     info!(run_id = %args.run, ttl_minutes = args.ttl, "Creating SSH access");

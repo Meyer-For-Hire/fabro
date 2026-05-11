@@ -10,7 +10,7 @@ pub(crate) async fn run(args: &ForkArgs, styles: &Styles, base_ctx: &CommandCont
     let printer = base_ctx.printer();
     let ctx = base_ctx.with_target(&args.server)?;
     let client = ctx.server().await?;
-    let run_id = client.resolve_run(&args.run_id).await?.run_id;
+    let run_id = client.resolve_run(&args.run_id).await?.id;
     super::checkpoints::ensure_origin_if_local(client.as_ref(), &run_id, "fork").await?;
 
     if args.list {

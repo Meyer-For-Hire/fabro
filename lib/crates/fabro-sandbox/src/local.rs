@@ -4,12 +4,14 @@ use std::time::Instant;
 use async_trait::async_trait;
 use fabro_static::EnvVars;
 use fabro_types::{CommandOutputStream, CommandTermination};
+use fabro_util::time::elapsed_ms;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 use tokio::task::spawn_blocking;
 use tokio::{fs, time};
 use tokio_util::sync::CancellationToken;
 
+use crate::sandbox::optional_timeout;
 use crate::{
     CommandOutputCallback, DirEntry, ExecResult, ExecStreamingResult, GrepOptions, Sandbox,
     SandboxEvent, SandboxEventCallback, format_lines_numbered,
@@ -124,6 +126,19 @@ impl LocalSandbox {
 )]
 fn process_env_vars() -> Vec<(String, String)> {
     std::env::vars().collect()
+}
+
+async fn drain_pipe<R>(mut pipe: Option<R>, stream: CommandOutputStream) -> String
+where
+    R: AsyncRead + Unpin,
+{
+    let mut buf = String::new();
+    if let Some(ref mut reader) = pipe {
+        if let Err(err) = reader.read_to_string(&mut buf).await {
+            tracing::warn!(error = %err, ?stream, "Failed to drain child output");
+        }
+    }
+    buf
 }
 
 #[async_trait]
@@ -277,22 +292,12 @@ impl Sandbox for LocalSandbox {
         // it writes more than the OS pipe buffer (~64 KB) the write() syscall
         // blocks until the parent drains the pipe, but the parent is blocked
         // on child.wait().
-        let mut stdout_pipe = child.stdout.take();
-        let mut stderr_pipe = child.stderr.take();
-        let stdout_task = tokio::spawn(async move {
-            let mut buf = String::new();
-            if let Some(ref mut r) = stdout_pipe {
-                let _ = r.read_to_string(&mut buf).await;
-            }
-            buf
-        });
-        let stderr_task = tokio::spawn(async move {
-            let mut buf = String::new();
-            if let Some(ref mut r) = stderr_pipe {
-                let _ = r.read_to_string(&mut buf).await;
-            }
-            buf
-        });
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
+        let stdout_task =
+            tokio::spawn(async move { drain_pipe(stdout_pipe, CommandOutputStream::Stdout).await });
+        let stderr_task =
+            tokio::spawn(async move { drain_pipe(stderr_pipe, CommandOutputStream::Stderr).await });
 
         let (termination, exit_code) = tokio::select! {
             status_result = child.wait() => {
@@ -310,7 +315,7 @@ impl Sandbox for LocalSandbox {
             }
         };
 
-        let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let duration_ms = elapsed_ms(start);
 
         let stdout_str = stdout_task.await.unwrap_or_default();
         let stderr_str = stderr_task.await.unwrap_or_default();
@@ -327,7 +332,7 @@ impl Sandbox for LocalSandbox {
     async fn exec_command_streaming(
         &self,
         command: &str,
-        timeout_ms: u64,
+        timeout_ms: Option<u64>,
         working_dir: Option<&str>,
         env_vars: Option<&std::collections::HashMap<String, String>>,
         cancel_token: Option<CancellationToken>,
@@ -367,7 +372,8 @@ impl Sandbox for LocalSandbox {
             .spawn()
             .map_err(|e| crate::Error::context("Failed to spawn command", e))?;
 
-        let timeout_duration = std::time::Duration::from_millis(timeout_ms);
+        let timeout_future = optional_timeout(timeout_ms);
+        tokio::pin!(timeout_future);
         let token = cancel_token.unwrap_or_default();
 
         let stdout_pipe = child.stdout.take();
@@ -387,7 +393,7 @@ impl Sandbox for LocalSandbox {
                     .map_err(|e| crate::Error::context("Failed to wait for process", e))?;
                 (CommandTermination::Exited, status.code())
             }
-            () = time::sleep(timeout_duration) => {
+            () = &mut timeout_future => {
                 sigterm_then_kill(&mut child).await;
                 (CommandTermination::TimedOut, None)
             }
@@ -397,7 +403,7 @@ impl Sandbox for LocalSandbox {
             }
         };
 
-        let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let duration_ms = elapsed_ms(start);
         let stdout_bytes = stdout_task
             .await
             .map_err(|e| crate::Error::context("stdout stream task failed", e))??;
@@ -615,6 +621,23 @@ impl Sandbox for LocalSandbox {
         Ok(())
     }
 
+    async fn stop(&self) -> crate::Result<()> {
+        self.emit(SandboxEvent::StopStarted {
+            provider: "local".into(),
+        });
+        let start = Instant::now();
+        let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.emit(SandboxEvent::StopCompleted {
+            provider: "local".into(),
+            duration_ms,
+        });
+        Ok(())
+    }
+
+    async fn delete(&self) -> crate::Result<()> {
+        Ok(())
+    }
+
     fn working_directory(&self) -> &str {
         self.working_directory.to_str().unwrap_or(".")
     }
@@ -712,7 +735,12 @@ where
 )]
 mod tests {
     use std::collections::HashMap;
+    use std::io;
     use std::path::PathBuf;
+    use std::pin::Pin;
+    use std::task::{Context as TaskContext, Poll};
+
+    use tokio::io::ReadBuf;
 
     use super::*;
 
@@ -720,6 +748,25 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("local_env_test_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[tokio::test]
+    async fn drain_pipe_returns_empty_buffer_after_read_failure() {
+        struct FailingReader;
+
+        impl AsyncRead for FailingReader {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut TaskContext<'_>,
+                _buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Err(io::Error::other("simulated read failure")))
+            }
+        }
+
+        let output = drain_pipe(Some(FailingReader), CommandOutputStream::Stdout).await;
+
+        assert!(output.is_empty());
     }
 
     #[tokio::test]
@@ -1012,6 +1059,35 @@ mod tests {
         );
         assert!(
             matches!(&captured[1], SandboxEvent::CleanupCompleted { provider, .. } if provider == "local")
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_emits_events() {
+        use std::sync::{Arc, Mutex};
+
+        use crate::SandboxEvent;
+
+        let dir = temp_dir();
+        let events: Arc<Mutex<Vec<SandboxEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_clone = Arc::clone(&events);
+
+        let mut env = LocalSandbox::new(dir.clone());
+        env.set_event_callback(Arc::new(move |e| {
+            events_clone.lock().unwrap().push(e);
+        }));
+
+        env.stop().await.unwrap();
+
+        let captured = events.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        assert!(
+            matches!(&captured[0], SandboxEvent::StopStarted { provider } if provider == "local")
+        );
+        assert!(
+            matches!(&captured[1], SandboxEvent::StopCompleted { provider, .. } if provider == "local")
         );
 
         std::fs::remove_dir_all(&dir).unwrap();

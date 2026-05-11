@@ -57,28 +57,28 @@ impl RunInfo {
     pub fn run_id(&self) -> RunId {
         self.summary
             .as_ref()
-            .map(|summary| summary.run_id)
+            .map(|summary| summary.id)
             .or_else(|| parse_run_id(&self.dir_name))
             .expect("RunInfo must have a run id")
     }
 
     pub fn workflow_name(&self) -> String {
-        self.summary
-            .as_ref()
-            .and_then(|summary| summary.workflow_name.clone())
-            .unwrap_or_else(|| "[no run spec]".to_string())
+        self.summary.as_ref().map_or_else(
+            || "[no run spec]".to_string(),
+            |summary| summary.workflow.name.clone(),
+        )
     }
 
     pub fn workflow_slug(&self) -> Option<&str> {
         self.summary
             .as_ref()
-            .and_then(|summary| summary.workflow_slug.as_deref())
+            .and_then(|summary| summary.workflow.slug.as_deref())
     }
 
     pub fn status(&self) -> RunStatus {
         self.summary
             .as_ref()
-            .map_or(RunStatus::Submitted, |summary| summary.status)
+            .map_or(RunStatus::Submitted, |summary| summary.lifecycle.status)
     }
 
     pub fn status_reason(&self) -> Option<String> {
@@ -92,7 +92,12 @@ impl RunInfo {
     pub fn start_time(&self) -> String {
         self.summary
             .as_ref()
-            .and_then(|summary| summary.start_time.or(Some(summary.run_id.created_at())))
+            .and_then(|summary| {
+                summary
+                    .timestamps
+                    .started_at
+                    .or(Some(summary.id.created_at()))
+            })
             .or(self.start_time_dt)
             .map(|time| time.to_rfc3339())
             .unwrap_or_default()
@@ -109,20 +114,20 @@ impl RunInfo {
     pub fn duration_ms(&self) -> Option<u64> {
         self.summary
             .as_ref()
-            .and_then(|summary| summary.duration_ms)
+            .and_then(|summary| summary.timestamps.duration_ms)
     }
 
     pub fn total_cost(&self) -> Option<f64> {
         self.summary
             .as_ref()
-            .and_then(|summary| summary.total_usd_micros)
+            .and_then(|summary| summary.billing.as_ref()?.total_usd_micros)
             .map(|value| value as f64 / 1_000_000.0)
     }
 
     pub fn total_usd_micros(&self) -> Option<i64> {
         self.summary
             .as_ref()
-            .and_then(|summary| summary.total_usd_micros)
+            .and_then(|summary| summary.billing.as_ref()?.total_usd_micros)
     }
 
     pub fn source_directory(&self) -> Option<&str> {
@@ -134,7 +139,7 @@ impl RunInfo {
     pub fn repo_origin_url(&self) -> Option<&str> {
         self.summary
             .as_ref()
-            .and_then(|summary| summary.repo_origin_url.as_deref())
+            .and_then(|summary| summary.repository.as_ref()?.origin_url.as_deref())
     }
 
     pub fn goal(&self) -> String {
@@ -243,14 +248,14 @@ pub fn scan_runs_with_summaries(summaries: &[RunSummary], base: &Path) -> Result
 }
 
 fn run_info_from_summary(summary: &RunSummary, scratch_base: &Path) -> Option<RunInfo> {
-    let path = make_run_dir(scratch_base, &summary.run_id);
+    let path = make_run_dir(scratch_base, &summary.id);
     if !path.exists() {
         return None;
     }
     let dir_name = path.file_name()?.to_string_lossy().to_string();
-    let start_time_dt = summary.run_id.created_at();
-    let end_time = if summary.status.is_terminal() {
-        summary.duration_ms.and_then(|duration_ms| {
+    let start_time_dt = summary.id.created_at();
+    let end_time = if summary.lifecycle.status.is_terminal() {
+        summary.timestamps.duration_ms.and_then(|duration_ms| {
             Some(start_time_dt + chrono::Duration::milliseconds(i64::try_from(duration_ms).ok()?))
         })
     } else {
@@ -437,6 +442,7 @@ mod tests {
             run_id:           fixtures::RUN_1,
             settings:         WorkflowSettings::default(),
             graph:            Graph::new("test"),
+            graph_source:     None,
             workflow_slug:    Some("test".to_string()),
             source_directory: Some("/tmp/project".to_string()),
             git:              Some(fabro_types::GitContext {
@@ -451,7 +457,6 @@ mod tests {
             manifest_blob:    None,
             definition_blob:  None,
             fork_source_ref:  None,
-            in_place:         false,
         }
     }
 
@@ -466,6 +471,7 @@ mod tests {
         let run_store = store.create_run(&fixtures::RUN_1).await.unwrap();
         append_event(&run_store, &fixtures::RUN_1, &Event::RunCreated {
             run_id:           fixtures::RUN_1,
+            title:            None,
             settings:         serde_json::to_value(&run_spec.settings).unwrap(),
             graph:            serde_json::to_value(&run_spec.graph).unwrap(),
             workflow_source:  None,
@@ -479,7 +485,6 @@ mod tests {
             manifest_blob:    None,
             git:              run_spec.git.clone(),
             fork_source_ref:  run_spec.fork_source_ref.clone(),
-            in_place:         run_spec.in_place,
             web_url:          None,
         })
         .await

@@ -5,13 +5,14 @@ use std::path::PathBuf;
     reason = "Feature-gated branches consume these imports when optional backends are enabled."
 )]
 use anyhow::{Context, Result, bail};
+use fabro_types::{RunId, RunSandbox, SandboxProvider};
 
+use crate::SandboxEventCallback;
 #[cfg(feature = "daytona")]
 use crate::daytona::DaytonaSandbox;
 #[cfg(feature = "docker")]
 use crate::docker::DockerSandbox;
 use crate::local::LocalSandbox;
-use crate::sandbox_record::SandboxRecord;
 
 /// Reconnect to a sandbox from a saved record.
 ///
@@ -23,54 +24,88 @@ use crate::sandbox_record::SandboxRecord;
     reason = "Feature-gated sandbox backends leave some parameters unused on partial builds."
 )]
 pub async fn reconnect(
-    record: &SandboxRecord,
+    record: &RunSandbox,
     daytona_api_key: Option<String>,
 ) -> Result<Box<dyn crate::Sandbox>> {
-    match record.provider.as_str() {
-        "local" => {
-            let sandbox = LocalSandbox::new(PathBuf::from(&record.working_directory));
+    reconnect_for_run(record, daytona_api_key, None).await
+}
+
+#[allow(
+    unused_variables,
+    reason = "Feature-gated sandbox backends leave parameters unused on partial builds."
+)]
+pub async fn reconnect_for_run(
+    record: &RunSandbox,
+    daytona_api_key: Option<String>,
+    run_id: Option<RunId>,
+) -> Result<Box<dyn crate::Sandbox>> {
+    reconnect_for_run_with_callback(record, daytona_api_key, run_id, None).await
+}
+
+#[allow(
+    unused_variables,
+    reason = "Feature-gated sandbox backends leave parameters unused on partial builds."
+)]
+pub async fn reconnect_for_run_with_callback(
+    record: &RunSandbox,
+    daytona_api_key: Option<String>,
+    run_id: Option<RunId>,
+    event_callback: Option<SandboxEventCallback>,
+) -> Result<Box<dyn crate::Sandbox>> {
+    let runtime = record
+        .runtime
+        .as_ref()
+        .context("run sandbox missing runtime metadata")?;
+    match record.provider {
+        SandboxProvider::Local => {
+            let mut sandbox = LocalSandbox::new(PathBuf::from(&runtime.working_directory));
+            if let Some(callback) = event_callback {
+                sandbox.set_event_callback(callback);
+            }
             Ok(Box::new(sandbox))
         }
         #[cfg(feature = "docker")]
-        "docker" => {
-            let identifier = record
-                .identifier
-                .as_deref()
-                .context("Docker sandbox record missing identifier (container ID/name)")?;
-            let repo_cloned = record
+        SandboxProvider::Docker => {
+            let repo_cloned = runtime
                 .repo_cloned
-                .context("Docker sandbox record missing repo_cloned metadata")?;
-            let sandbox = DockerSandbox::reconnect(
-                identifier,
+                .context("Docker run sandbox missing repo_cloned metadata")?;
+            let mut sandbox = DockerSandbox::reconnect(
+                &runtime.id,
                 repo_cloned,
-                record.clone_origin_url.clone(),
-                record.clone_branch.clone(),
+                runtime.clone_origin_url.clone(),
+                runtime.clone_branch.clone(),
+                run_id,
             )
             .await
             .context("Failed to reconnect Docker sandbox")?;
+            if let Some(callback) = event_callback {
+                sandbox.set_event_callback(callback);
+            }
             Ok(Box::new(sandbox))
         }
+        #[cfg(not(feature = "docker"))]
+        SandboxProvider::Docker => bail!("Docker sandbox support is not enabled"),
         #[cfg(feature = "daytona")]
-        "daytona" => {
-            let name = record
-                .identifier
-                .as_deref()
-                .context("Daytona sandbox record missing identifier (sandbox name)")?;
-            let repo_cloned = record
+        SandboxProvider::Daytona => {
+            let repo_cloned = runtime
                 .repo_cloned
-                .context("Daytona sandbox record missing repo_cloned metadata")?;
+                .context("Daytona run sandbox missing repo_cloned metadata")?;
 
-            let sandbox = DaytonaSandbox::reconnect(
-                name,
+            let mut sandbox = DaytonaSandbox::reconnect(
+                &runtime.id,
                 daytona_api_key,
                 repo_cloned,
-                record.clone_origin_url.clone(),
-                record.clone_branch.clone(),
+                runtime.clone_origin_url.clone(),
+                runtime.clone_branch.clone(),
             )
             .await
             .map_err(anyhow::Error::new)?;
+            if let Some(callback) = event_callback {
+                sandbox.set_event_callback(callback);
+            }
             Ok(Box::new(sandbox))
         }
-        other => bail!("Unknown sandbox provider: {other}"),
+        #[cfg(not(feature = "daytona"))]
+        SandboxProvider::Daytona => bail!("Daytona sandbox support is not enabled"),
     }
 }

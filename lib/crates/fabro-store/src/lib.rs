@@ -23,8 +23,8 @@ pub(crate) use keyed_mutex::KeyedMutex;
 pub use run_state::RunProjectionReducer;
 pub use serializable_projection::SerializableProjection;
 pub use slate::{
-    AuthCode, AuthCodeStore, Blob, BlobStore, ConsumeOutcome, Database, RefreshToken,
-    RefreshTokenStore, RunCatalogIndex, RunDatabase, Runs,
+    AuthCode, AuthCodeStore, Blob, BlobStore, CachedRunProjection, ConsumeOutcome, Database,
+    RefreshToken, RefreshTokenStore, RunCatalogIndex, RunDatabase, Runs, UnreadableRun,
 };
 pub use types::EventPayload;
 

@@ -3,14 +3,17 @@ use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
 use fabro_types::run_event::{
-    AgentCliStartedProps, AgentSessionStartedProps, CheckpointCompletedProps, RunCompletedProps,
+    AgentCliStartedProps, AgentSessionActivatedProps, CheckpointCompletedProps, RunCompletedProps,
     RunFailedProps, StageCompletedProps, StagePromptProps,
 };
+use fabro_types::settings::run::RunSandboxSettings;
 use fabro_types::{
-    BilledModelUsage, Checkpoint, Conclusion, EventBody, FailureSignature, InterviewQuestionRecord,
-    Outcome, PendingInterviewRecord, PullRequestRecord, RunControlAction, RunEvent, RunId,
-    RunProjection, RunSpec, RunStatus, RunSummary, SandboxRecord, StageCompletion, StageOutcome,
-    StageProjection, StartRecord, TerminalStatus, first_event_seq,
+    BilledModelUsage, Checkpoint, CheckpointRecord, CommandTermination, Conclusion, EventBody,
+    FailureSignature, InterviewQuestionRecord, Outcome, PendingInterviewRecord, PullRequestRecord,
+    RepositoryRef, RunBillingSummary, RunControlAction, RunDiff, RunEvent, RunId, RunLifecycle,
+    RunLinks, RunModel, RunOrigin, RunProjection, RunSandbox, RunSandboxRuntime, RunSpec,
+    RunStatus, RunSummary, RunTimestamps, SandboxProvider, StageCompletion, StageHandler, StageId,
+    StageOutcome, StageProjection, StageState, StartRecord, WorkflowRef, first_event_seq,
 };
 use fabro_util::error::render_with_causes;
 use serde_json::Value;
@@ -20,7 +23,7 @@ use crate::{Error, EventEnvelope, Result};
 #[derive(Debug, Clone, Default)]
 pub(crate) struct EventProjectionCache {
     pub last_seq: u32,
-    pub state:    RunProjection,
+    pub state:    Option<RunProjection>,
 }
 
 pub trait RunProjectionReducer {
@@ -33,8 +36,13 @@ pub trait RunProjectionReducer {
 
 impl RunProjectionReducer for RunProjection {
     fn apply_events(events: &[EventEnvelope]) -> Result<Self> {
-        let mut state = Self::default();
-        for event in events {
+        let Some((first, rest)) = events.split_first() else {
+            return Err(Error::InvalidEvent(
+                "run projection requires a run.created event".to_string(),
+            ));
+        };
+        let mut state = projection_from_created(first)?;
+        for event in rest {
             state.apply_event(event)?;
         }
         Ok(state)
@@ -43,40 +51,24 @@ impl RunProjectionReducer for RunProjection {
     fn apply_event(&mut self, event: &EventEnvelope) -> Result<()> {
         let stored = &event.event;
         let ts = stored.ts;
-        let run_id = stored.run_id;
+
+        self.last_event_at = ts;
 
         match &stored.body {
-            EventBody::RunCreated(props) => {
-                let labels = props.labels.clone().into_iter().collect::<HashMap<_, _>>();
-                self.spec = Some(RunSpec {
-                    run_id,
-                    settings: props.settings.clone(),
-                    graph: props.graph.clone(),
-                    workflow_slug: props.workflow_slug.clone(),
-                    source_directory: props.source_directory.clone(),
-                    labels,
-                    provenance: props.provenance.clone(),
-                    manifest_blob: props.manifest_blob,
-                    definition_blob: None,
-                    git: props.git.clone(),
-                    fork_source_ref: props.fork_source_ref.clone(),
-                    in_place: props.in_place,
-                });
-                self.graph_source.clone_from(&props.workflow_source);
+            EventBody::RunCreated(_) => {
+                return Err(Error::InvalidEvent(
+                    "run.created cannot be applied to an initialized projection".to_string(),
+                ));
             }
             EventBody::RunStarted(props) => {
                 self.start = Some(StartRecord {
-                    run_id,
                     start_time: ts,
                     run_branch: props.run_branch.clone(),
-                    base_sha: props.base_sha.clone(),
+                    base_sha:   props.base_sha.clone(),
                 });
             }
             EventBody::RunSubmitted(props) => {
-                if let Some(spec) = self.spec.as_mut() {
-                    spec.definition_blob = props.definition_blob;
-                }
-                self.try_apply_status(RunStatus::Submitted, ts)?;
+                self.spec.definition_blob = props.definition_blob;
             }
             EventBody::RunQueued(_) => {
                 self.try_apply_status(RunStatus::Queued, ts)?;
@@ -88,7 +80,7 @@ impl RunProjectionReducer for RunProjection {
                 self.try_apply_status(RunStatus::Running, ts)?;
             }
             EventBody::RunBlocked(props) => {
-                let next = if matches!(self.status, Some(RunStatus::Paused { .. })) {
+                let next = if matches!(self.status, RunStatus::Paused { .. }) {
                     RunStatus::Paused {
                         prior_block: Some(props.blocked_reason),
                     }
@@ -101,10 +93,10 @@ impl RunProjectionReducer for RunProjection {
             }
             EventBody::RunUnblocked(_) => {
                 let next = match self.status {
-                    Some(RunStatus::Paused {
+                    RunStatus::Paused {
                         prior_block: Some(_),
-                    }) => RunStatus::Paused { prior_block: None },
-                    Some(RunStatus::Paused { prior_block: None }) => {
+                    } => RunStatus::Paused { prior_block: None },
+                    RunStatus::Paused { prior_block: None } => {
                         RunStatus::Paused { prior_block: None }
                     }
                     _ => RunStatus::Running,
@@ -126,7 +118,7 @@ impl RunProjectionReducer for RunProjection {
             EventBody::RunPaused(_) => {
                 self.try_apply_status(
                     RunStatus::Paused {
-                        prior_block: self.status().and_then(RunStatus::blocked_reason),
+                        prior_block: self.status.blocked_reason(),
                     },
                     ts,
                 )?;
@@ -134,9 +126,9 @@ impl RunProjectionReducer for RunProjection {
             }
             EventBody::RunUnpaused(_) => {
                 let next = match self.status {
-                    Some(RunStatus::Paused {
+                    RunStatus::Paused {
                         prior_block: Some(blocked_reason),
-                    }) => RunStatus::Blocked { blocked_reason },
+                    } => RunStatus::Blocked { blocked_reason },
                     _ => RunStatus::Running,
                 };
                 self.try_apply_status(next, ts)?;
@@ -151,7 +143,6 @@ impl RunProjectionReducer for RunProjection {
                 )?;
                 self.pending_control = None;
                 self.conclusion = Some(conclusion_from_completed(props, ts)?);
-                self.final_patch.clone_from(&props.final_patch);
                 self.pending_interviews.clear();
             }
             EventBody::RunFailed(props) => {
@@ -163,33 +154,29 @@ impl RunProjectionReducer for RunProjection {
                 )?;
                 self.pending_control = None;
                 self.conclusion = Some(conclusion_from_failed(props, ts));
-                self.final_patch.clone_from(&props.final_patch);
                 self.pending_interviews.clear();
             }
             EventBody::RunSupersededBy(props) => {
                 self.superseded_by = Some(props.new_run_id);
             }
             EventBody::RunArchived(_props) => {
-                if let Some(current) = self.status {
-                    if matches!(current, RunStatus::Archived { .. }) {
-                        return Ok(());
-                    }
-                    let Some(prior) = current.terminal_status() else {
-                        return Err(fabro_types::InvalidTransition {
-                            from: current,
-                            to:   RunStatus::Archived {
-                                prior: TerminalStatus::Dead,
-                            },
-                        }
-                        .into());
-                    };
-                    self.try_apply_status(RunStatus::Archived { prior }, ts)?;
+                if self.archived_at.is_some() {
+                    return Ok(());
                 }
+                if !self.status.is_terminal() {
+                    return Err(fabro_types::InvalidTransition {
+                        from: self.status,
+                        to:   self.status,
+                    }
+                    .into());
+                }
+                self.archived_at = Some(ts);
             }
             EventBody::RunUnarchived(_props) => {
-                if let Some(RunStatus::Archived { prior }) = self.status {
-                    self.try_apply_status(prior.into(), ts)?;
-                }
+                self.archived_at = None;
+            }
+            EventBody::RunTitleUpdated(props) => {
+                self.title.clone_from(&props.title);
             }
             EventBody::CheckpointCompleted(props) => {
                 let checkpoint = checkpoint_from_props(props, ts);
@@ -219,36 +206,35 @@ impl RunProjectionReducer for RunProjection {
                     {
                         continue;
                     }
-                    self.stage_entry(node_id, visit, first_event_seq(event.seq))
-                        .completion = Some(stage_completion_from_outcome(outcome, ts));
+                    let stage = self.stage_entry(node_id, visit, first_event_seq(event.seq));
+                    stage.completion = Some(stage_completion_from_outcome(outcome, ts));
+                    stage.state = StageState::Skipped;
                 }
-                self.checkpoint = Some(checkpoint.clone());
-                self.checkpoints.push((event.seq, checkpoint));
+                self.checkpoints.push(CheckpointRecord {
+                    seq: event.seq,
+                    checkpoint,
+                    diff: diff_from_checkpoint_props(props),
+                });
             }
             EventBody::SandboxInitialized(props) => {
-                self.sandbox = Some(SandboxRecord {
-                    provider:          props.provider.clone(),
+                let sandbox = self.sandbox.get_or_insert(RunSandbox {
+                    provider: props.provider,
+                    image:    None,
+                    snapshot: None,
+                    runtime:  None,
+                });
+                sandbox.provider = props.provider;
+                sandbox.runtime = Some(RunSandboxRuntime {
+                    id:                props.id.clone(),
                     working_directory: props.working_directory.clone(),
-                    identifier:        props.identifier.clone(),
                     repo_cloned:       props.repo_cloned,
                     clone_origin_url:  props.clone_origin_url.clone(),
                     clone_branch:      props.clone_branch.clone(),
                 });
             }
-            EventBody::RetroStarted(props) => {
-                self.retro_prompt.clone_from(&props.prompt);
-            }
-            EventBody::RetroCompleted(props) => {
-                self.retro_response.clone_from(&props.response);
-                self.retro = props
-                    .retro
-                    .clone()
-                    .map(serde_json::from_value)
-                    .transpose()
-                    .map_err(|err| Error::InvalidEvent(format!("invalid retro payload: {err}")))?;
-            }
             EventBody::PullRequestCreated(props) => {
                 self.pull_request = Some(PullRequestRecord {
+                    provider:    "github".to_string(),
                     html_url:    props.pr_url.clone(),
                     number:      props.pr_number,
                     owner:       props.owner.clone(),
@@ -274,7 +260,7 @@ impl RunProjectionReducer for RunProjection {
                             timeout_seconds: props.timeout_seconds,
                             context_display: props.context_display.clone(),
                         },
-                        started_at: Some(ts),
+                        started_at: ts,
                     });
             }
             EventBody::InterviewCompleted(props) if !props.question_id.is_empty() => {
@@ -286,63 +272,101 @@ impl RunProjectionReducer for RunProjection {
             EventBody::InterviewInterrupted(props) if !props.question_id.is_empty() => {
                 self.pending_interviews.remove(&props.question_id);
             }
-            EventBody::StageStarted(_) => {
+            EventBody::StageStarted(props) => {
                 let Some(stage_id) = stored.stage_id.as_ref() else {
                     return Ok(());
                 };
-                self.stage_entry(
+                let stage = self.stage_entry(
                     stage_id.node_id(),
                     stage_id.visit(),
                     first_event_seq(event.seq),
                 );
+                stage.begin_attempt(
+                    ts,
+                    StageHandler::from_handler_type(Some(&props.handler_type)),
+                );
+            }
+            EventBody::StageRetrying(_) => {
+                let Some(stage) = stage_at_stored_or_current_visit(self, stored, event.seq) else {
+                    return Ok(());
+                };
+                stage.state = StageState::Retrying;
             }
             EventBody::StagePrompt(props) => {
-                let Some(stage) = stage_at_visit(self, stored, props.visit, event.seq) else {
+                let Some(stage) = stage_at_stored_or_visit(self, stored, props.visit, event.seq)
+                else {
                     return Ok(());
                 };
                 stage.prompt = Some(props.text.clone());
                 stage.provider_used = provider_used_from_prompt(props);
             }
             EventBody::PromptCompleted(props) => {
-                let Some(stage) = stage_at_current_visit(self, stored, event.seq) else {
+                let Some(stage) = stage_at_stored_or_current_visit(self, stored, event.seq) else {
                     return Ok(());
                 };
                 stage.response = Some(props.response.clone());
+                if let Some(billing) = &props.billing {
+                    stage.usage.replace_with_billed_usage(billing);
+                    stage.model = Some(billing.model().clone());
+                }
             }
             EventBody::StageCompleted(props) => {
-                let Some(node_id) = stored.node_id.as_deref() else {
-                    return Ok(());
-                };
-                let visit = stage_visit(node_id, props.node_visits.as_ref(), self).unwrap_or(1);
                 let response = props.response.clone();
                 let outcome = stage_outcome_from_props(props);
                 let completion = stage_completion_from_outcome(&outcome, ts);
-                let stage = self.stage_entry(node_id, visit, first_event_seq(event.seq));
+                let Some(stage) =
+                    stage_at_completed_visit(self, stored, props.node_visits.as_ref(), event.seq)
+                else {
+                    return Ok(());
+                };
                 stage.response = response;
                 stage.completion = Some(completion);
+                stage.duration_ms = Some(props.duration_ms);
+                if let Some(billing) = &props.billing {
+                    stage.usage.replace_with_billed_usage(billing);
+                    stage.model = Some(billing.model().clone());
+                }
+                stage.state = StageState::from(outcome.status);
             }
             EventBody::StageFailed(props) => {
                 let failure_reason = props.failure.as_ref().map(|detail| detail.message.clone());
-                let Some(stage) = stage_at_current_visit(self, stored, event.seq) else {
+                let Some(stage) = stage_at_stored_or_current_visit(self, stored, event.seq) else {
                     return Ok(());
                 };
+                let outcome = StageOutcome::Failed {
+                    retry_requested: props.will_retry,
+                };
                 stage.completion = Some(StageCompletion {
-                    outcome: StageOutcome::Failed {
-                        retry_requested: false,
-                    },
+                    outcome,
                     notes: None,
                     failure_reason,
                     timestamp: ts,
                 });
+                stage.duration_ms = Some(props.duration_ms);
+                if let Some(billing) = &props.billing {
+                    stage.usage.replace_with_billed_usage(billing);
+                    stage.model = Some(billing.model().clone());
+                }
+                stage.state = StageState::from(outcome);
             }
-            EventBody::AgentSessionStarted(props) => {
-                let Some(stage) = stage_at_visit(self, stored, props.visit, event.seq) else {
+            EventBody::AgentMessage(props) => {
+                let Some(stage) = stage_at_stored_or_visit(self, stored, props.visit, event.seq)
+                else {
                     return Ok(());
                 };
-                stage.provider_used = Some(provider_used_from_agent_session_started(props));
+                stage.usage.add_counts(&props.billing);
+                stage.model = Some(props.model.clone());
+            }
+            EventBody::AgentSessionActivated(props) => {
+                let Some(stage) = stage_at_stored_or_visit(self, stored, props.visit, event.seq)
+                else {
+                    return Ok(());
+                };
+                stage.provider_used = Some(provider_used_from_agent_session_activated(props));
             }
             EventBody::AgentCliStarted(props) => {
-                let Some(stage) = stage_at_visit(self, stored, props.visit, event.seq) else {
+                let Some(stage) = stage_at_stored_or_visit(self, stored, props.visit, event.seq)
+                else {
                     return Ok(());
                 };
                 stage.provider_used = Some(provider_used_from_agent_cli_started(props));
@@ -351,7 +375,7 @@ impl RunProjectionReducer for RunProjection {
                 let script_invocation = serde_json::to_value(props).map_err(|err| {
                     Error::InvalidEvent(format!("invalid command.started payload: {err}"))
                 })?;
-                let Some(stage) = stage_at_current_visit(self, stored, event.seq) else {
+                let Some(stage) = stage_at_stored_or_current_visit(self, stored, event.seq) else {
                     return Ok(());
                 };
                 stage.script_invocation = Some(script_invocation);
@@ -360,23 +384,53 @@ impl RunProjectionReducer for RunProjection {
                 let script_timing = serde_json::to_value(props).map_err(|err| {
                     Error::InvalidEvent(format!("invalid command.completed payload: {err}"))
                 })?;
-                let Some(stage) = stage_at_current_visit(self, stored, event.seq) else {
+                let Some(stage) = stage_at_stored_or_current_visit(self, stored, event.seq) else {
                     return Ok(());
                 };
-                stage.stdout = Some(props.stdout.clone());
-                stage.stderr = Some(props.stderr.clone());
-                stage.stdout_bytes = Some(props.stdout_bytes);
-                stage.stderr_bytes = Some(props.stderr_bytes);
-                stage.streams_separated = Some(props.streams_separated);
+                stage.output = Some(props.output.clone());
+                stage.output_bytes = Some(props.output_bytes);
                 stage.live_streaming = Some(props.live_streaming);
                 stage.termination = Some(props.termination);
                 stage.script_timing = Some(script_timing);
+            }
+            EventBody::AgentCliCompleted(props) => {
+                let Some(stage) = stage_at_current_visit(self, stored, event.seq) else {
+                    return Ok(());
+                };
+                apply_agent_cli_terminal(
+                    stage,
+                    props,
+                    merge_agent_cli_output(&props.stdout, &props.stderr),
+                    CommandTermination::Exited,
+                )?;
+            }
+            EventBody::AgentCliCancelled(props) => {
+                let Some(stage) = stage_at_current_visit(self, stored, event.seq) else {
+                    return Ok(());
+                };
+                apply_agent_cli_terminal(
+                    stage,
+                    props,
+                    merge_agent_cli_output(&props.stdout, &props.stderr),
+                    CommandTermination::Cancelled,
+                )?;
+            }
+            EventBody::AgentCliTimedOut(props) => {
+                let Some(stage) = stage_at_current_visit(self, stored, event.seq) else {
+                    return Ok(());
+                };
+                apply_agent_cli_terminal(
+                    stage,
+                    props,
+                    merge_agent_cli_output(&props.stdout, &props.stderr),
+                    CommandTermination::TimedOut,
+                )?;
             }
             EventBody::ParallelCompleted(props) => {
                 let parallel_results = serde_json::to_value(&props.results).map_err(|err| {
                     Error::InvalidEvent(format!("invalid parallel.completed payload: {err}"))
                 })?;
-                let Some(stage) = stage_at_current_visit(self, stored, event.seq) else {
+                let Some(stage) = stage_at_stored_or_current_visit(self, stored, event.seq) else {
                     return Ok(());
                 };
                 stage.parallel_results = Some(parallel_results);
@@ -388,12 +442,71 @@ impl RunProjectionReducer for RunProjection {
     }
 }
 
+fn projection_from_created(event: &EventEnvelope) -> Result<RunProjection> {
+    let stored = &event.event;
+    let EventBody::RunCreated(props) = &stored.body else {
+        return Err(Error::InvalidEvent(format!(
+            "run projection must start with run.created, got {}",
+            stored.body.event_name()
+        )));
+    };
+
+    let labels = props.labels.clone().into_iter().collect::<HashMap<_, _>>();
+    let title = props
+        .title
+        .clone()
+        .unwrap_or_else(|| fabro_types::infer_run_title(props.graph.goal()));
+    let spec = RunSpec {
+        run_id: stored.run_id,
+        settings: props.settings.clone(),
+        graph: props.graph.clone(),
+        graph_source: props.workflow_source.clone(),
+        workflow_slug: props.workflow_slug.clone(),
+        source_directory: props.source_directory.clone(),
+        labels,
+        provenance: props.provenance.clone(),
+        manifest_blob: props.manifest_blob,
+        definition_blob: None,
+        git: props.git.clone(),
+        fork_source_ref: props.fork_source_ref.clone(),
+    };
+
+    let mut projection = RunProjection::new(title, spec, stored.ts);
+    projection.web_url.clone_from(&props.web_url);
+    projection.sandbox = Some(planned_sandbox(&projection.spec.settings.run.sandbox));
+    Ok(projection)
+}
+
+fn planned_sandbox(settings: &RunSandboxSettings) -> RunSandbox {
+    let provider = settings
+        .provider
+        .parse::<SandboxProvider>()
+        .unwrap_or(SandboxProvider::Local);
+    RunSandbox {
+        provider,
+        image: settings
+            .docker
+            .as_ref()
+            .map(|docker| docker.image.clone())
+            .filter(|image| !image.is_empty()),
+        snapshot: settings
+            .daytona
+            .as_ref()
+            .and_then(|daytona| daytona.snapshot.as_ref())
+            .map(|snapshot| snapshot.name.clone()),
+        runtime: None,
+    }
+}
+
 fn stage_at_visit<'a>(
     state: &'a mut RunProjection,
     stored: &RunEvent,
     visit: u32,
     seq: u32,
 ) -> Option<&'a mut StageProjection> {
+    if visit == 0 {
+        return None;
+    }
     let node_id = stored.node_id.as_deref()?;
     Some(state.stage_entry(node_id, visit, first_event_seq(seq)))
 }
@@ -408,56 +521,170 @@ fn stage_at_current_visit<'a>(
     Some(state.stage_entry(node_id, visit, first_event_seq(seq)))
 }
 
+fn stage_at_stored_stage_id<'a>(
+    state: &'a mut RunProjection,
+    stage_id: &StageId,
+    seq: u32,
+) -> &'a mut StageProjection {
+    state.stage_entry(stage_id.node_id(), stage_id.visit(), first_event_seq(seq))
+}
+
+fn stage_at_stored_or_visit<'a>(
+    state: &'a mut RunProjection,
+    stored: &RunEvent,
+    visit: u32,
+    seq: u32,
+) -> Option<&'a mut StageProjection> {
+    if let Some(stage_id) = stored.stage_id.as_ref() {
+        return Some(stage_at_stored_stage_id(state, stage_id, seq));
+    }
+    stage_at_visit(state, stored, visit, seq)
+}
+
+fn stage_at_stored_or_current_visit<'a>(
+    state: &'a mut RunProjection,
+    stored: &RunEvent,
+    seq: u32,
+) -> Option<&'a mut StageProjection> {
+    if let Some(stage_id) = stored.stage_id.as_ref() {
+        return Some(stage_at_stored_stage_id(state, stage_id, seq));
+    }
+    stage_at_current_visit(state, stored, seq)
+}
+
+fn stage_at_completed_visit<'a>(
+    state: &'a mut RunProjection,
+    stored: &RunEvent,
+    node_visits: Option<&BTreeMap<String, usize>>,
+    seq: u32,
+) -> Option<&'a mut StageProjection> {
+    if let Some(stage_id) = stored.stage_id.as_ref() {
+        return Some(stage_at_stored_stage_id(state, stage_id, seq));
+    }
+    let node_id = stored.node_id.as_deref()?;
+    let visit = stage_visit(node_id, node_visits, state).unwrap_or(1);
+    Some(state.stage_entry(node_id, visit, first_event_seq(seq)))
+}
+
 pub(crate) fn build_summary(state: &RunProjection, run_id: &RunId) -> RunSummary {
-    let workflow_name = state.spec.as_ref().map(|spec| {
-        if spec.graph.name.is_empty() {
-            "unnamed".to_string()
-        } else {
-            spec.graph.name.clone()
-        }
-    });
-    let goal = state
-        .spec
+    let workflow_name = if state.spec.graph.name.is_empty() {
+        "unnamed".to_string()
+    } else {
+        state.spec.graph.name.clone()
+    };
+    let goal = state.spec.graph.goal().to_string();
+    let diff_summary = state
+        .conclusion
         .as_ref()
-        .map(|spec| spec.graph.goal().to_string())
-        .unwrap_or_default();
-    RunSummary::new(
-        *run_id,
-        workflow_name,
-        state
-            .spec
-            .as_ref()
-            .and_then(|spec| spec.workflow_slug.clone()),
+        .and_then(|conclusion| conclusion.diff.summary)
+        .or_else(|| {
+            state
+                .checkpoints
+                .iter()
+                .rev()
+                .find_map(|checkpoint| checkpoint.diff.summary)
+        });
+
+    let current_question = state
+        .pending_interviews
+        .iter()
+        .min_by(|(left_id, left), (right_id, right)| {
+            left.started_at
+                .cmp(&right.started_at)
+                .then_with(|| left_id.cmp(right_id))
+        })
+        .map(|(_, record)| record.question.clone());
+    let models = run_models(state);
+    let created_by = state
+        .spec
+        .provenance
+        .as_ref()
+        .and_then(|provenance| provenance.subject.clone());
+    let source_directory = state.spec.source_directory.clone();
+    let repo_origin_url = state.spec.git.as_ref().map(|git| git.origin_url.clone());
+    let start_time = state.start.as_ref().map(|start| start.start_time);
+    let completed_at = state
+        .conclusion
+        .as_ref()
+        .map(|conclusion| conclusion.timestamp);
+    let duration_ms = state
+        .conclusion
+        .as_ref()
+        .map(|conclusion| conclusion.duration_ms);
+    let total_usd_micros = state
+        .conclusion
+        .as_ref()
+        .and_then(|conclusion| conclusion.billing.as_ref())
+        .and_then(|billing| billing.total_usd_micros);
+
+    RunSummary {
+        id: *run_id,
+        title: state.title().into_owned(),
         goal,
-        state
-            .spec
-            .as_ref()
-            .map(|spec| spec.labels.clone())
-            .unwrap_or_default(),
-        state
-            .spec
-            .as_ref()
-            .and_then(|spec| spec.source_directory.clone()),
-        state.spec.as_ref().is_some_and(|spec| spec.in_place),
-        state
-            .spec
-            .as_ref()
-            .and_then(|spec| spec.git.as_ref())
-            .map(|git| git.origin_url.clone()),
-        state.start.as_ref().map(|start| start.start_time),
-        state.status.unwrap_or(RunStatus::Submitted),
-        state.pending_control,
-        state
-            .conclusion
-            .as_ref()
-            .map(|conclusion| conclusion.duration_ms),
-        state
-            .conclusion
-            .as_ref()
-            .and_then(|conclusion| conclusion.billing.as_ref())
-            .and_then(|billing| billing.total_usd_micros),
-        state.superseded_by,
-    )
+        workflow: WorkflowRef {
+            slug: state.spec.workflow_slug.clone(),
+            name: workflow_name,
+        },
+        automation: None,
+        repository: Some(RepositoryRef::from_origin_and_source(
+            repo_origin_url,
+            source_directory.as_deref(),
+        )),
+        created_by,
+        origin: RunOrigin::default(),
+        labels: state.spec.labels.clone(),
+        lifecycle: RunLifecycle {
+            status:          state.status,
+            pending_control: state.pending_control,
+            queue_position:  None,
+            error:           None,
+            archived:        state.archived_at.is_some(),
+            archived_at:     state.archived_at,
+        },
+        sandbox: state.sandbox.clone(),
+        models,
+        source_directory,
+        timestamps: RunTimestamps {
+            created_at: run_id.created_at(),
+            started_at: start_time,
+            last_event_at: Some(state.last_event_at),
+            completed_at,
+            duration_ms,
+            elapsed_secs: elapsed_secs(duration_ms),
+        },
+        billing: total_usd_micros.map(|total_usd_micros| RunBillingSummary {
+            total_usd_micros: Some(total_usd_micros),
+        }),
+        diff: diff_summary,
+        pull_request: state.pull_request.clone(),
+        current_question,
+        superseded_by: state.superseded_by,
+        links: RunLinks {
+            web: state.web_url.clone(),
+        },
+    }
+}
+
+fn run_models(state: &RunProjection) -> Vec<RunModel> {
+    let mut models = state
+        .iter_stages()
+        .filter_map(|(_, stage)| stage.model.as_ref())
+        .map(|model| RunModel {
+            provider: Some(model.provider.to_string()),
+            name:     model.model_id.clone(),
+        })
+        .collect::<Vec<_>>();
+    models.sort_by(|left, right| {
+        left.provider
+            .cmp(&right.provider)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    models.dedup_by(|left, right| left.provider == right.provider && left.name == right.name);
+    models
+}
+
+fn elapsed_secs(duration_ms: Option<u64>) -> Option<f64> {
+    duration_ms.map(|ms| ms as f64 / 1000.0)
 }
 
 fn checkpoint_from_props(props: &CheckpointCompletedProps, timestamp: DateTime<Utc>) -> Checkpoint {
@@ -489,6 +716,13 @@ fn checkpoint_from_props(props: &CheckpointCompletedProps, timestamp: DateTime<U
     }
 }
 
+fn diff_from_checkpoint_props(props: &CheckpointCompletedProps) -> RunDiff {
+    RunDiff {
+        patch:   props.diff.clone(),
+        summary: props.diff_summary,
+    }
+}
+
 fn conclusion_from_completed(
     props: &RunCompletedProps,
     timestamp: DateTime<Utc>,
@@ -503,6 +737,10 @@ fn conclusion_from_completed(
         stages: Vec::new(),
         billing: props.billing.clone(),
         total_retries: 0,
+        diff: RunDiff {
+            patch:   props.final_patch.clone(),
+            summary: props.diff_summary,
+        },
     })
 }
 
@@ -518,6 +756,10 @@ fn conclusion_from_failed(props: &RunFailedProps, timestamp: DateTime<Utc>) -> C
         stages: Vec::new(),
         billing: None,
         total_retries: 0,
+        diff: RunDiff {
+            patch:   props.final_patch.clone(),
+            summary: props.diff_summary,
+        },
     }
 }
 
@@ -529,6 +771,7 @@ fn stage_visit(
     node_visits
         .and_then(|visits| visits.get(node_id).copied())
         .and_then(|visit| u32::try_from(visit).ok())
+        .filter(|visit| *visit > 0)
         .or_else(|| state.current_visit_for(node_id))
 }
 
@@ -581,7 +824,7 @@ fn provider_used_from_prompt(props: &StagePromptProps) -> Option<Value> {
     (!provider_used.is_empty()).then_some(Value::Object(provider_used))
 }
 
-fn provider_used_from_agent_session_started(props: &AgentSessionStartedProps) -> Value {
+fn provider_used_from_agent_session_activated(props: &AgentSessionActivatedProps) -> Value {
     let mut provider_used = serde_json::Map::new();
     provider_used.insert("mode".to_string(), Value::String("agent".to_string()));
     if let Some(provider) = props.provider.clone() {
@@ -605,6 +848,29 @@ fn provider_used_from_agent_cli_started(props: &AgentCliStartedProps) -> Value {
     Value::Object(provider_used)
 }
 
+fn apply_agent_cli_terminal(
+    stage: &mut StageProjection,
+    props: &impl serde::Serialize,
+    output: String,
+    termination: CommandTermination,
+) -> Result<()> {
+    let script_timing = serde_json::to_value(props)
+        .map_err(|err| Error::InvalidEvent(format!("invalid agent.cli terminal payload: {err}")))?;
+    stage.output = Some(output);
+    stage.termination = Some(termination);
+    stage.script_timing = Some(script_timing);
+    Ok(())
+}
+
+fn merge_agent_cli_output(stdout: &str, stderr: &str) -> String {
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => stdout.to_string(),
+        (true, false) => stderr.to_string(),
+        (false, false) => format!("{stdout}\n{stderr}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap};
@@ -612,13 +878,17 @@ mod tests {
     use chrono::Utc;
     use fabro_types::run_event::run::RunFailedProps;
     use fabro_types::run_event::{
+        AgentCliCancelledProps, AgentCliCompletedProps, AgentCliTimedOutProps, AgentMessageProps,
+        AgentSessionActivatedProps, AgentSessionEndedProps, AgentSessionStartedProps,
         CheckpointCompletedProps, InterviewCompletedProps, InterviewOption, InterviewStartedProps,
-        RunControlEffectProps, StagePromptProps, StageStartedProps,
+        RunControlEffectProps, StageCompletedProps, StageFailedProps, StagePromptProps,
+        StageRetryingProps, StageStartedProps,
     };
     use fabro_types::{
-        BlockedReason, Checkpoint, EventBody, FailureReason, Outcome, QuestionType, RunBlobId,
-        RunControlAction, RunEvent, RunStatus, StageOutcome, SuccessReason, TerminalStatus,
-        WorkflowSettings, first_event_seq, fixtures,
+        BilledModelUsage, BilledTokenCounts, BlockedReason, Checkpoint, CheckpointRecord,
+        CommandTermination, EventBody, FailureCategory, FailureDetail, FailureReason, Graph,
+        Outcome, QuestionType, RunBlobId, RunControlAction, RunDiff, RunEvent, RunSpec, RunStatus,
+        StageOutcome, StageState, SuccessReason, WorkflowSettings, first_event_seq, fixtures,
     };
     use serde_json::json;
 
@@ -649,6 +919,68 @@ mod tests {
         let mut event = test_event(seq, body, Some(stage_id.node_id()));
         event.event.stage_id = Some(stage_id);
         event
+    }
+
+    fn test_usage(model_id: &str, input_tokens: i64, output_tokens: i64) -> BilledModelUsage {
+        serde_json::from_value(json!({
+            "input": {
+                "usage": {
+                    "model": {
+                        "provider": "openai",
+                        "model_id": model_id
+                    },
+                    "tokens": {
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens
+                    }
+                },
+                "facts": {
+                    "provider": "open_ai"
+                }
+            },
+            "total_usd_micros": input_tokens + output_tokens
+        }))
+        .unwrap()
+    }
+
+    fn usage_json(usage: &BilledModelUsage) -> serde_json::Value {
+        serde_json::to_value(usage).unwrap()
+    }
+
+    fn usage_counts(usage: &BilledModelUsage) -> BilledTokenCounts {
+        BilledTokenCounts::from_billed_usage(std::slice::from_ref(usage))
+    }
+
+    fn test_run_spec() -> RunSpec {
+        RunSpec {
+            run_id:           fixtures::RUN_1,
+            settings:         WorkflowSettings::default(),
+            graph:            Graph::new("test"),
+            graph_source:     Some("digraph test {}".to_string()),
+            workflow_slug:    None,
+            source_directory: None,
+            labels:           HashMap::new(),
+            provenance:       None,
+            manifest_blob:    None,
+            definition_blob:  None,
+            git:              None,
+            fork_source_ref:  None,
+        }
+    }
+
+    fn initialized_projection() -> RunProjection {
+        RunProjection::new("Test run".to_string(), test_run_spec(), Utc::now())
+    }
+
+    fn running_projection() -> RunProjection {
+        let mut state = initialized_projection();
+        state
+            .apply_event(&test_raw_event(1, "run.starting", &json!({}), None))
+            .unwrap();
+        state
+            .apply_event(&test_raw_event(2, "run.running", &json!({}), None))
+            .unwrap();
+        state
     }
 
     fn test_raw_event(
@@ -693,15 +1025,13 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_projection_defaults_missing_stages_and_checkpoints() {
-        let state: RunProjection = serde_json::from_value(serde_json::json!({
-            "pending_control": "pause"
-        }))
-        .unwrap();
+    fn last_event_at_tracks_most_recent_event_timestamp() {
+        let mut state = initialized_projection();
+        let later = test_raw_event_at(2, "2026-04-20T12:05:30Z", "run.starting", &json!({}), None);
 
-        assert_eq!(state.pending_control, Some(RunControlAction::Pause));
-        assert!(state.checkpoints.is_empty());
-        assert!(state.is_empty());
+        state.apply_event(&later).unwrap();
+
+        assert_eq!(state.last_event_at, later.event.ts);
     }
 
     #[test]
@@ -718,28 +1048,46 @@ mod tests {
                 "labels": {},
                 "provenance": null,
                 "manifest_blob": null,
-                "definition_blob": null
+                "definition_blob": null,
+                "git": null,
+                "fork_source_ref": null
             },
+            "status": { "kind": "submitted" },
+            "status_updated_at": "2026-04-07T12:00:00Z",
+            "last_event_at": "2026-04-07T12:00:00Z",
             "pending_control": "cancel",
-            "checkpoints": [[
-                0,
+            "checkpoints": [
                 {
-                    "timestamp": "2026-04-07T12:00:00Z",
-                    "current_node": "build",
-                    "completed_nodes": ["build"],
-                    "node_retries": {},
-                    "context_values": {},
-                    "node_outcomes": {},
-                    "loop_failure_signatures": {},
-                    "restart_failure_signatures": {},
-                    "node_visits": { "build": 2 }
+                    "seq": 0,
+                    "diff": {},
+                    "checkpoint": {
+                        "timestamp": "2026-04-07T12:00:00Z",
+                        "current_node": "build",
+                        "completed_nodes": ["build"],
+                        "node_retries": {},
+                        "context_values": {},
+                        "node_outcomes": {},
+                        "loop_failure_signatures": {},
+                        "restart_failure_signatures": {},
+                        "node_visits": { "build": 2 }
+                    }
                 }
-            ]],
+            ],
+            "pending_interviews": {},
             "stages": {
                 "build@2": {
                     "first_event_seq": 1,
                     "diff": "diff --git a/file b/file",
-                    "stdout": "done"
+                    "output": "done",
+                    "usage": {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "total_tokens": 0,
+                        "reasoning_tokens": 0,
+                        "cache_read_tokens": 0,
+                        "cache_write_tokens": 0
+                    },
+                    "state": "running"
                 }
             }
         }))
@@ -756,7 +1104,7 @@ mod tests {
             serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
         let serialized = serde_json::to_value(&state).unwrap();
         let round_tripped_node = round_tripped.stage(&stage_id).unwrap();
-        assert_eq!(round_tripped_node.stdout.as_deref(), Some("done"));
+        assert_eq!(round_tripped_node.output.as_deref(), Some("done"));
         assert_eq!(round_tripped.list_node_visits("build"), vec![2]);
         assert_eq!(
             round_tripped.pending_control,
@@ -768,22 +1116,26 @@ mod tests {
 
     #[test]
     fn stage_entry_round_trips_through_json() {
-        let mut state = RunProjection::default();
+        let mut state = running_projection();
         state.pending_control = Some(RunControlAction::Unpause);
-        state.checkpoints = vec![(7, Checkpoint {
-            timestamp:                  "2026-04-07T12:00:00Z".parse().unwrap(),
-            current_node:               "build".to_string(),
-            completed_nodes:            vec!["build".to_string()],
-            node_retries:               HashMap::new(),
-            context_values:             HashMap::new(),
-            node_outcomes:              HashMap::new(),
-            next_node_id:               None,
-            git_commit_sha:             None,
-            loop_failure_signatures:    HashMap::new(),
-            restart_failure_signatures: HashMap::new(),
-            node_visits:                HashMap::from([("build".to_string(), 2usize)]),
-        })];
-        state.stage_entry("build", 2, first_event_seq(7)).stdout = Some("done".to_string());
+        state.checkpoints = vec![CheckpointRecord {
+            seq:        7,
+            checkpoint: Checkpoint {
+                timestamp:                  "2026-04-07T12:00:00Z".parse().unwrap(),
+                current_node:               "build".to_string(),
+                completed_nodes:            vec!["build".to_string()],
+                node_retries:               HashMap::new(),
+                context_values:             HashMap::new(),
+                node_outcomes:              HashMap::new(),
+                next_node_id:               None,
+                git_commit_sha:             None,
+                loop_failure_signatures:    HashMap::new(),
+                restart_failure_signatures: HashMap::new(),
+                node_visits:                HashMap::from([("build".to_string(), 2usize)]),
+            },
+            diff:       RunDiff::default(),
+        }];
+        state.stage_entry("build", 2, first_event_seq(7)).output = Some("done".to_string());
 
         let round_tripped: RunProjection =
             serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
@@ -792,7 +1144,7 @@ mod tests {
             round_tripped
                 .stage(&StageId::new("build", 2))
                 .unwrap()
-                .stdout
+                .output
                 .as_deref(),
             Some("done")
         );
@@ -805,7 +1157,7 @@ mod tests {
 
     #[test]
     fn stage_started_sets_first_event_seq() {
-        let mut state = RunProjection::default();
+        let mut state = initialized_projection();
         let stage_id = StageId::new("build", 1);
 
         state
@@ -827,7 +1179,7 @@ mod tests {
 
     #[test]
     fn later_stage_events_do_not_overwrite_first_event_seq() {
-        let mut state = RunProjection::default();
+        let mut state = initialized_projection();
         let stage_id = StageId::new("build", 1);
 
         state
@@ -861,9 +1213,375 @@ mod tests {
         assert_eq!(stage.prompt.as_deref(), Some("prompt"));
     }
 
+    fn start_stage(state: &mut RunProjection, stage_id: &StageId) {
+        state
+            .apply_event(&test_stage_event(
+                3,
+                EventBody::StageStarted(StageStartedProps {
+                    index:        0,
+                    handler_type: "agent".to_string(),
+                    attempt:      1,
+                    max_attempts: 1,
+                }),
+                stage_id.clone(),
+            ))
+            .unwrap();
+    }
+
+    #[test]
+    fn agent_session_activated_updates_stage_provider_used() {
+        let mut state = initialized_projection();
+        let stage_id = StageId::new("code", 1);
+        start_stage(&mut state, &stage_id);
+
+        state
+            .apply_event(&test_stage_event(
+                4,
+                EventBody::AgentSessionActivated(AgentSessionActivatedProps {
+                    thread_id:    Some("thread-1".to_string()),
+                    provider:     Some("openai".to_string()),
+                    model:        Some("gpt-5.4".to_string()),
+                    capabilities: vec![fabro_types::SessionCapability::Steer],
+                    visit:        1,
+                }),
+                stage_id.clone(),
+            ))
+            .unwrap();
+
+        let stage = state.stage(&stage_id).unwrap();
+        assert_eq!(
+            stage.provider_used.as_ref().unwrap(),
+            &json!({
+                "mode": "agent",
+                "provider": "openai",
+                "model": "gpt-5.4"
+            })
+        );
+    }
+
+    #[test]
+    fn object_lifecycle_session_events_do_not_update_stage_provider_used() {
+        let mut state = initialized_projection();
+        let stage_id = StageId::new("code", 1);
+        start_stage(&mut state, &stage_id);
+
+        state
+            .apply_event(&test_event(
+                4,
+                EventBody::AgentSessionStarted(AgentSessionStartedProps {
+                    provider: Some("openai".to_string()),
+                    model:    Some("gpt-5.4".to_string()),
+                }),
+                None,
+            ))
+            .unwrap();
+        state
+            .apply_event(&test_event(
+                5,
+                EventBody::AgentSessionEnded(AgentSessionEndedProps {}),
+                None,
+            ))
+            .unwrap();
+
+        let stage = state.stage(&stage_id).unwrap();
+        assert!(stage.provider_used.is_none());
+    }
+
+    #[test]
+    fn agent_cli_completed_updates_stage_output_projection() {
+        let mut state = initialized_projection();
+        let stage_id = StageId::new("code", 1);
+        start_stage(&mut state, &stage_id);
+
+        state
+            .apply_event(&test_stage_event(
+                4,
+                EventBody::AgentCliCompleted(AgentCliCompletedProps {
+                    stdout:      "done".to_string(),
+                    stderr:      "warn".to_string(),
+                    exit_code:   0,
+                    duration_ms: 42,
+                }),
+                stage_id.clone(),
+            ))
+            .unwrap();
+
+        let stage = state.stage(&stage_id).unwrap();
+        assert_eq!(stage.output.as_deref(), Some("done\nwarn"));
+        assert_eq!(stage.termination, Some(CommandTermination::Exited));
+        assert_eq!(
+            stage.script_timing.as_ref().unwrap()["duration_ms"],
+            serde_json::json!(42)
+        );
+    }
+
+    #[test]
+    fn agent_cli_cancelled_updates_stage_output_projection() {
+        let mut state = initialized_projection();
+        let stage_id = StageId::new("code", 1);
+        start_stage(&mut state, &stage_id);
+
+        state
+            .apply_event(&test_stage_event(
+                4,
+                EventBody::AgentCliCancelled(AgentCliCancelledProps {
+                    stdout:      "partial".to_string(),
+                    stderr:      "cancelled".to_string(),
+                    duration_ms: 7,
+                }),
+                stage_id.clone(),
+            ))
+            .unwrap();
+
+        let stage = state.stage(&stage_id).unwrap();
+        assert_eq!(stage.output.as_deref(), Some("partial\ncancelled"));
+        assert_eq!(stage.termination, Some(CommandTermination::Cancelled));
+        assert_eq!(
+            stage.script_timing.as_ref().unwrap()["duration_ms"],
+            serde_json::json!(7)
+        );
+    }
+
+    #[test]
+    fn agent_cli_timed_out_updates_stage_output_projection() {
+        let mut state = initialized_projection();
+        let stage_id = StageId::new("code", 1);
+        start_stage(&mut state, &stage_id);
+
+        state
+            .apply_event(&test_stage_event(
+                4,
+                EventBody::AgentCliTimedOut(AgentCliTimedOutProps {
+                    stdout:      "partial".to_string(),
+                    stderr:      "timeout".to_string(),
+                    duration_ms: 600,
+                }),
+                stage_id.clone(),
+            ))
+            .unwrap();
+
+        let stage = state.stage(&stage_id).unwrap();
+        assert_eq!(stage.output.as_deref(), Some("partial\ntimeout"));
+        assert_eq!(stage.termination, Some(CommandTermination::TimedOut));
+        assert_eq!(
+            stage.script_timing.as_ref().unwrap()["duration_ms"],
+            serde_json::json!(600)
+        );
+    }
+
+    #[test]
+    fn stage_completed_event_captures_duration_and_usage_per_visit() {
+        let mut state = initialized_projection();
+        let usage = test_usage("gpt-5.2", 123, 45);
+
+        state
+            .apply_event(&test_event(
+                3,
+                EventBody::StageCompleted(StageCompletedProps {
+                    index: 0,
+                    duration_ms: 789,
+                    status: StageOutcome::Succeeded,
+                    preferred_label: None,
+                    suggested_next_ids: Vec::new(),
+                    billing: Some(usage.clone()),
+                    failure: None,
+                    notes: None,
+                    files_touched: Vec::new(),
+                    context_updates: None,
+                    jump_to_node: None,
+                    context_values: None,
+                    node_visits: None,
+                    loop_failure_signatures: None,
+                    restart_failure_signatures: None,
+                    response: Some("done".to_string()),
+                    attempt: 1,
+                    max_attempts: 1,
+                }),
+                Some("build"),
+            ))
+            .unwrap();
+
+        let stage = state.stage(&StageId::new("build", 1)).unwrap();
+        assert_eq!(stage.duration_ms, Some(789));
+        assert_eq!(stage.usage, usage_counts(&usage));
+        assert_eq!(stage.model.as_ref(), Some(usage.model()));
+    }
+
+    #[test]
+    fn stage_failed_event_captures_duration_and_usage_per_visit() {
+        let mut state = initialized_projection();
+        let stage_id = StageId::new("build", 1);
+        let usage = test_usage("gpt-5.2", 321, 54);
+
+        state
+            .apply_event(&test_stage_event(
+                2,
+                EventBody::StageStarted(StageStartedProps {
+                    index:        0,
+                    handler_type: "agent".to_string(),
+                    attempt:      1,
+                    max_attempts: 1,
+                }),
+                stage_id.clone(),
+            ))
+            .unwrap();
+        state
+            .apply_event(&test_raw_event(
+                3,
+                "stage.failed",
+                &json!({
+                    "index": 0,
+                    "failure": {
+                        "message": "provider failed",
+                        "failure_class": "transient_infra"
+                    },
+                    "will_retry": false,
+                    "duration_ms": 654,
+                    "billing": usage_json(&usage)
+                }),
+                Some("build"),
+            ))
+            .unwrap();
+
+        let stage = state.stage(&stage_id).unwrap();
+        assert_eq!(stage.duration_ms, Some(654));
+        assert_eq!(stage.usage, usage_counts(&usage));
+        assert_eq!(stage.model.as_ref(), Some(usage.model()));
+    }
+
+    #[test]
+    fn two_visits_of_one_node_retain_distinct_usage() {
+        let mut state = initialized_projection();
+        let first_usage = test_usage("gpt-5.2", 100, 10);
+        let second_usage = test_usage("gpt-5.2", 200, 20);
+
+        for (seq, visit, duration_ms, usage) in [
+            (3, 1usize, 111, first_usage.clone()),
+            (4, 2usize, 222, second_usage.clone()),
+        ] {
+            state
+                .apply_event(&test_event(
+                    seq,
+                    EventBody::StageCompleted(StageCompletedProps {
+                        index: 0,
+                        duration_ms,
+                        status: StageOutcome::Succeeded,
+                        preferred_label: None,
+                        suggested_next_ids: Vec::new(),
+                        billing: Some(usage),
+                        failure: None,
+                        notes: None,
+                        files_touched: Vec::new(),
+                        context_updates: None,
+                        jump_to_node: None,
+                        context_values: None,
+                        node_visits: Some(BTreeMap::from([("build".to_string(), visit)])),
+                        loop_failure_signatures: None,
+                        restart_failure_signatures: None,
+                        response: None,
+                        attempt: 1,
+                        max_attempts: 1,
+                    }),
+                    Some("build"),
+                ))
+                .unwrap();
+        }
+
+        let first_stage = state.stage(&StageId::new("build", 1)).unwrap();
+        let second_stage = state.stage(&StageId::new("build", 2)).unwrap();
+        assert_eq!(first_stage.duration_ms, Some(111));
+        assert_eq!(first_stage.usage, usage_counts(&first_usage));
+        assert_eq!(first_stage.model.as_ref(), Some(first_usage.model()));
+        assert_eq!(second_stage.duration_ms, Some(222));
+        assert_eq!(second_stage.usage, usage_counts(&second_usage));
+        assert_eq!(second_stage.model.as_ref(), Some(second_usage.model()));
+    }
+
+    #[test]
+    fn stage_completed_prefers_stored_stage_id_over_legacy_node_visits() {
+        let mut state = initialized_projection();
+        let usage = test_usage("gpt-5.2", 300, 30);
+        let scoped_stage_id = StageId::new("build", 2);
+
+        state
+            .apply_event(&test_stage_event(
+                3,
+                EventBody::StageCompleted(StageCompletedProps {
+                    index: 0,
+                    duration_ms: 333,
+                    status: StageOutcome::Succeeded,
+                    preferred_label: None,
+                    suggested_next_ids: Vec::new(),
+                    billing: Some(usage.clone()),
+                    failure: None,
+                    notes: None,
+                    files_touched: Vec::new(),
+                    context_updates: None,
+                    jump_to_node: None,
+                    context_values: None,
+                    node_visits: Some(BTreeMap::from([("build".to_string(), 1usize)])),
+                    loop_failure_signatures: None,
+                    restart_failure_signatures: None,
+                    response: Some("done".to_string()),
+                    attempt: 1,
+                    max_attempts: 1,
+                }),
+                scoped_stage_id.clone(),
+            ))
+            .unwrap();
+
+        assert!(
+            state.stage(&StageId::new("build", 1)).is_none(),
+            "legacy node_visits must not override stored stage_id"
+        );
+        let stage = state.stage(&scoped_stage_id).unwrap();
+        assert_eq!(stage.duration_ms, Some(333));
+        assert_eq!(stage.usage, usage_counts(&usage));
+        assert_eq!(stage.model.as_ref(), Some(usage.model()));
+        assert_eq!(stage.response.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn stage_failed_prefers_stored_stage_id_and_preserves_retry_request() {
+        let mut state = initialized_projection();
+        let usage = test_usage("gpt-5.2", 400, 40);
+        let scoped_stage_id = StageId::new("build", 2);
+
+        state
+            .apply_event(&test_stage_event(
+                3,
+                EventBody::StageFailed(StageFailedProps {
+                    index:       0,
+                    failure:     Some(fabro_types::FailureDetail::new(
+                        "try again",
+                        fabro_types::FailureCategory::TransientInfra,
+                    )),
+                    will_retry:  true,
+                    duration_ms: 444,
+                    billing:     Some(usage.clone()),
+                }),
+                scoped_stage_id.clone(),
+            ))
+            .unwrap();
+
+        assert!(
+            state.stage(&StageId::new("build", 1)).is_none(),
+            "current-visit fallback must not override stored stage_id"
+        );
+        let stage = state.stage(&scoped_stage_id).unwrap();
+        assert_eq!(stage.duration_ms, Some(444));
+        assert_eq!(stage.usage, usage_counts(&usage));
+        assert_eq!(stage.model.as_ref(), Some(usage.model()));
+        let completion = stage.completion.as_ref().unwrap();
+        assert_eq!(completion.outcome, StageOutcome::Failed {
+            retry_requested: true,
+        });
+        assert_eq!(completion.failure_reason.as_deref(), Some("try again"));
+    }
+
     #[test]
     fn checkpoint_completed_creates_projection_entry_for_skipped_stage() {
-        let mut state = RunProjection::default();
+        let mut state = initialized_projection();
         let stage_id = StageId::new("skip_me", 1);
 
         state
@@ -885,6 +1603,7 @@ mod tests {
                     restart_failure_signatures: BTreeMap::new(),
                     node_visits: BTreeMap::from([("skip_me".to_string(), 1usize)]),
                     diff: None,
+                    diff_summary: None,
                 }),
                 None,
             ))
@@ -899,7 +1618,7 @@ mod tests {
 
     #[test]
     fn interview_events_populate_and_clear_pending_interviews() {
-        let mut state = RunProjection::default();
+        let mut state = initialized_projection();
         state
             .apply_event(&test_event(
                 1,
@@ -962,12 +1681,12 @@ mod tests {
 
     #[test]
     fn queued_and_blocked_events_drive_projection_and_summary_fields() {
-        let mut state = RunProjection::default();
+        let mut state = initialized_projection();
 
         state
             .apply_event(&test_raw_event(1, "run.queued", &json!({}), None))
             .unwrap();
-        assert_eq!(state.status(), Some(RunStatus::Queued));
+        assert_eq!(state.status(), RunStatus::Queued);
 
         state
             .apply_event(&test_raw_event(2, "run.starting", &json!({}), None))
@@ -991,13 +1710,10 @@ mod tests {
             ))
             .unwrap();
 
-        let status_json = serde_json::to_value(state.status().unwrap()).unwrap();
-        assert_eq!(
-            state.status(),
-            Some(RunStatus::Paused {
-                prior_block: Some(BlockedReason::HumanInputRequired),
-            })
-        );
+        let status_json = serde_json::to_value(state.status()).unwrap();
+        assert_eq!(state.status(), RunStatus::Paused {
+            prior_block: Some(BlockedReason::HumanInputRequired),
+        });
         assert_eq!(
             status_json,
             json!({
@@ -1009,7 +1725,7 @@ mod tests {
         let summary = build_summary(&state, &fixtures::RUN_1);
         let summary_json = serde_json::to_value(summary).unwrap();
         assert_eq!(
-            summary_json["status"],
+            summary_json["lifecycle"]["status"],
             json!({
                 "kind": "paused",
                 "prior_block": "human_input_required"
@@ -1019,7 +1735,7 @@ mod tests {
 
     #[test]
     fn run_unblocked_clears_blocked_reason_and_restores_running() {
-        let mut state = RunProjection::default();
+        let mut state = running_projection();
 
         state
             .apply_event(&test_raw_event(
@@ -1033,14 +1749,14 @@ mod tests {
             .apply_event(&test_raw_event(2, "run.unblocked", &json!({}), None))
             .unwrap();
 
-        assert_eq!(state.status(), Some(RunStatus::Running));
-        let status_json = serde_json::to_value(state.status().unwrap()).unwrap();
+        assert_eq!(state.status(), RunStatus::Running);
+        let status_json = serde_json::to_value(state.status()).unwrap();
         assert_eq!(status_json, json!({ "kind": "running" }));
     }
 
     #[test]
     fn run_unblocked_while_paused_clears_blocked_reason_without_changing_paused_status() {
-        let mut state = RunProjection::default();
+        let mut state = running_projection();
 
         state
             .apply_event(&test_raw_event(
@@ -1061,11 +1777,8 @@ mod tests {
             .apply_event(&test_raw_event(3, "run.unblocked", &json!({}), None))
             .unwrap();
 
-        assert_eq!(
-            state.status(),
-            Some(RunStatus::Paused { prior_block: None })
-        );
-        let status_json = serde_json::to_value(state.status().unwrap()).unwrap();
+        assert_eq!(state.status(), RunStatus::Paused { prior_block: None });
+        let status_json = serde_json::to_value(state.status()).unwrap();
         assert_eq!(
             status_json,
             json!({
@@ -1077,7 +1790,7 @@ mod tests {
 
     #[test]
     fn unpause_to_still_blocked_yields_visible_blocked_after_event_sequence() {
-        let mut state = RunProjection::default();
+        let mut state = running_projection();
 
         state
             .apply_event(&test_raw_event(
@@ -1110,13 +1823,10 @@ mod tests {
             ))
             .unwrap();
 
-        assert_eq!(
-            state.status(),
-            Some(RunStatus::Blocked {
-                blocked_reason: BlockedReason::HumanInputRequired,
-            })
-        );
-        let status_json = serde_json::to_value(state.status().unwrap()).unwrap();
+        assert_eq!(state.status(), RunStatus::Blocked {
+            blocked_reason: BlockedReason::HumanInputRequired,
+        });
+        let status_json = serde_json::to_value(state.status()).unwrap();
         assert_eq!(
             status_json,
             json!({
@@ -1128,11 +1838,12 @@ mod tests {
 
     #[test]
     fn summary_synthesizes_submitted_when_run_exists_without_status() {
-        let mut state = RunProjection::default();
-        state.spec = Some(fabro_types::RunSpec {
+        let mut state = initialized_projection();
+        state.spec = fabro_types::RunSpec {
             run_id:           fixtures::RUN_1,
             settings:         WorkflowSettings::default(),
             graph:            fabro_types::Graph::new("test"),
+            graph_source:     None,
             workflow_slug:    Some("test".to_string()),
             source_directory: Some("/tmp/repo".to_string()),
             git:              None,
@@ -1141,11 +1852,104 @@ mod tests {
             manifest_blob:    None,
             definition_blob:  None,
             fork_source_ref:  None,
-            in_place:         false,
-        });
+        };
 
         let summary_json = serde_json::to_value(build_summary(&state, &fixtures::RUN_1)).unwrap();
-        assert_eq!(summary_json["status"], json!({ "kind": "submitted" }));
+        assert_eq!(
+            summary_json["lifecycle"]["status"],
+            json!({ "kind": "submitted" })
+        );
+    }
+
+    #[test]
+    fn run_created_title_populates_projection_and_summary() {
+        let event = test_raw_event(
+            1,
+            "run.created",
+            &json!({
+                "title": "Explicit title",
+                "settings": WorkflowSettings::default(),
+                "graph": {
+                    "name": "test",
+                    "nodes": {},
+                    "edges": [],
+                    "attrs": { "goal": { "String": "Goal title" } }
+                },
+                "labels": {},
+                "run_dir": "/tmp/run"
+            }),
+            None,
+        );
+
+        let state = RunProjection::apply_events(&[event]).unwrap();
+        assert_eq!(state.title, "Explicit title");
+        assert_eq!(
+            build_summary(&state, &fixtures::RUN_1).title,
+            "Explicit title"
+        );
+    }
+
+    #[test]
+    fn legacy_run_created_without_title_infers_projection_title() {
+        let event = test_raw_event(
+            1,
+            "run.created",
+            &json!({
+                "settings": WorkflowSettings::default(),
+                "graph": {
+                    "name": "test",
+                    "nodes": {},
+                    "edges": [],
+                    "attrs": { "goal": { "String": "## Plan: Legacy title\n\nDetails" } }
+                },
+                "labels": {},
+                "run_dir": "/tmp/run"
+            }),
+            None,
+        );
+
+        let state = RunProjection::apply_events(&[event]).unwrap();
+        assert_eq!(state.title, "Legacy title");
+        assert_eq!(
+            build_summary(&state, &fixtures::RUN_1).title,
+            "Legacy title"
+        );
+    }
+
+    #[test]
+    fn run_title_updated_changes_projection_and_summary() {
+        let events = vec![
+            test_raw_event(
+                1,
+                "run.created",
+                &json!({
+                    "title": "Original title",
+                    "settings": WorkflowSettings::default(),
+                    "graph": {
+                        "name": "test",
+                        "nodes": {},
+                        "edges": [],
+                        "attrs": { "goal": { "String": "Goal title" } }
+                    },
+                    "labels": {},
+                    "run_dir": "/tmp/run"
+                }),
+                None,
+            ),
+            test_raw_event(
+                2,
+                "run.title.updated",
+                &json!({ "title": "Renamed title" }),
+                None,
+            ),
+        ];
+
+        let state = RunProjection::apply_events(&events).unwrap();
+        assert_eq!(state.title, "Renamed title");
+        assert_eq!(
+            build_summary(&state, &fixtures::RUN_1).title,
+            "Renamed title"
+        );
     }
 
     #[test]
@@ -1207,7 +2011,7 @@ mod tests {
 
     #[test]
     fn run_failed_with_final_patch_populates_projection() {
-        let mut state = RunProjection::default();
+        let mut state = running_projection();
         let patch = "diff --git a/foo.rs b/foo.rs\n@@ -1 +1 @@\n-a\n+b\n";
         state
             .apply_event(&test_event(
@@ -1219,17 +2023,138 @@ mod tests {
                     reason:         FailureReason::WorkflowError,
                     git_commit_sha: Some("abc123".to_string()),
                     final_patch:    Some(patch.to_string()),
+                    diff_summary:   None,
                 }),
                 None,
             ))
             .unwrap();
 
-        assert_eq!(state.final_patch.as_deref(), Some(patch));
+        assert_eq!(
+            state
+                .conclusion
+                .as_ref()
+                .and_then(|conclusion| conclusion.diff.patch.as_deref()),
+            Some(patch)
+        );
+    }
+
+    #[test]
+    fn patch_bearing_events_roll_up_diff_summary_without_blanking_prior_value() {
+        let mut state = initialized_projection();
+
+        state
+            .apply_event(&test_raw_event(1, "run.starting", &json!({}), None))
+            .unwrap();
+        state
+            .apply_event(&test_raw_event(2, "run.running", &json!({}), None))
+            .unwrap();
+        state
+            .apply_event(&test_raw_event(
+                3,
+                "checkpoint.completed",
+                &json!({
+                    "status": "running",
+                    "current_node": "build",
+                    "completed_nodes": ["build"],
+                    "diff_summary": {
+                        "files_changed": 2,
+                        "additions": 10,
+                        "deletions": 3
+                    }
+                }),
+                Some("build"),
+            ))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(build_summary(&state, &fixtures::RUN_1)).unwrap()["diff"],
+            json!({
+                "files_changed": 2,
+                "additions": 10,
+                "deletions": 3
+            })
+        );
+
+        state
+            .apply_event(&test_raw_event(
+                4,
+                "checkpoint.completed",
+                &json!({
+                    "status": "running",
+                    "current_node": "review",
+                    "completed_nodes": ["build", "review"]
+                }),
+                Some("review"),
+            ))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(build_summary(&state, &fixtures::RUN_1)).unwrap()["diff"]["files_changed"],
+            2
+        );
+
+        state
+            .apply_event(&test_raw_event(
+                5,
+                "run.completed",
+                &json!({
+                    "duration_ms": 42,
+                    "artifact_count": 0,
+                    "status": "succeeded",
+                    "reason": "completed",
+                    "diff_summary": {
+                        "files_changed": 4,
+                        "additions": 18,
+                        "deletions": 7
+                    }
+                }),
+                None,
+            ))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(build_summary(&state, &fixtures::RUN_1)).unwrap()["diff"],
+            json!({
+                "files_changed": 4,
+                "additions": 18,
+                "deletions": 7
+            })
+        );
+
+        let mut failed_state = initialized_projection();
+        failed_state
+            .apply_event(&test_raw_event(1, "run.starting", &json!({}), None))
+            .unwrap();
+        failed_state
+            .apply_event(&test_raw_event(2, "run.running", &json!({}), None))
+            .unwrap();
+        failed_state
+            .apply_event(&test_raw_event(
+                3,
+                "run.failed",
+                &json!({
+                    "error": "boom",
+                    "duration_ms": 42,
+                    "reason": "workflow_error",
+                    "diff_summary": {
+                        "files_changed": 5,
+                        "additions": 20,
+                        "deletions": 8
+                    }
+                }),
+                None,
+            ))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(build_summary(&failed_state, &fixtures::RUN_1)).unwrap()["diff"],
+            json!({
+                "files_changed": 5,
+                "additions": 20,
+                "deletions": 8
+            })
+        );
     }
 
     #[test]
     fn run_failed_projection_renders_causes() {
-        let mut state = RunProjection::default();
+        let mut state = running_projection();
         state
             .apply_event(&test_event(
                 1,
@@ -1243,6 +2168,7 @@ mod tests {
                     reason:         FailureReason::WorkflowError,
                     git_commit_sha: None,
                     final_patch:    None,
+                    diff_summary:   None,
                 }),
                 None,
             ))
@@ -1260,7 +2186,7 @@ mod tests {
     fn run_archived_captures_prior_status_and_preserves_reason() {
         use fabro_types::run_event::{RunArchivedProps, RunCompletedProps};
 
-        let mut state = RunProjection::default();
+        let mut state = running_projection();
         state
             .apply_event(&test_event(
                 1,
@@ -1272,6 +2198,7 @@ mod tests {
                     total_usd_micros:     None,
                     final_git_commit_sha: None,
                     final_patch:          None,
+                    diff_summary:         None,
                     billing:              None,
                 }),
                 None,
@@ -1285,21 +2212,17 @@ mod tests {
             ))
             .unwrap();
 
-        assert_eq!(
-            state.status(),
-            Some(RunStatus::Archived {
-                prior: TerminalStatus::Succeeded {
-                    reason: SuccessReason::Completed,
-                },
-            })
-        );
+        assert_eq!(state.status(), RunStatus::Succeeded {
+            reason: SuccessReason::Completed,
+        });
+        assert!(state.archived_at.is_some());
     }
 
     #[test]
     fn run_superseded_by_populates_projection_and_summary() {
         use fabro_types::run_event::RunSupersededByProps;
 
-        let mut state = RunProjection::default();
+        let mut state = running_projection();
         state
             .apply_event(&test_event(
                 1,
@@ -1320,10 +2243,46 @@ mod tests {
     }
 
     #[test]
+    fn pull_request_created_populates_projection_and_summary() {
+        use fabro_types::run_event::PullRequestCreatedProps;
+
+        let mut state = running_projection();
+        state
+            .apply_event(&test_event(
+                1,
+                EventBody::PullRequestCreated(PullRequestCreatedProps {
+                    pr_url:      "https://github.com/fabro-sh/fabro/pull/123".to_string(),
+                    pr_number:   123,
+                    owner:       "fabro-sh".to_string(),
+                    repo:        "fabro".to_string(),
+                    base_branch: "main".to_string(),
+                    head_branch: "fabro/run/demo".to_string(),
+                    title:       "Add run PR chip".to_string(),
+                    draft:       false,
+                }),
+                None,
+            ))
+            .unwrap();
+
+        let pull_request = state
+            .pull_request
+            .as_ref()
+            .expect("projection should store pull request");
+        assert_eq!(
+            pull_request.html_url,
+            "https://github.com/fabro-sh/fabro/pull/123"
+        );
+        assert_eq!(pull_request.number, 123);
+
+        let summary = build_summary(&state, &fixtures::RUN_1);
+        assert_eq!(summary.pull_request, state.pull_request);
+    }
+
+    #[test]
     fn run_unarchived_restores_prior_status() {
         use fabro_types::run_event::{RunArchivedProps, RunCompletedProps, RunUnarchivedProps};
 
-        let mut state = RunProjection::default();
+        let mut state = running_projection();
         state
             .apply_event(&test_event(
                 1,
@@ -1335,6 +2294,7 @@ mod tests {
                     total_usd_micros:     None,
                     final_git_commit_sha: None,
                     final_patch:          None,
+                    diff_summary:         None,
                     billing:              None,
                 }),
                 None,
@@ -1355,28 +2315,23 @@ mod tests {
             ))
             .unwrap();
 
-        assert_eq!(
-            state.status(),
-            Some(RunStatus::Succeeded {
-                reason: SuccessReason::PartialSuccess,
-            })
-        );
+        assert_eq!(state.status(), RunStatus::Succeeded {
+            reason: SuccessReason::PartialSuccess,
+        });
     }
 
     #[test]
     fn duplicate_event_noops_without_bumping_status_updated_at() {
-        let mut state = RunProjection::default();
+        let mut state = initialized_projection();
         state
             .apply_event(&test_raw_event_at(
                 1,
                 "2026-04-07T12:00:00Z",
-                "run.running",
+                "run.starting",
                 &json!({}),
                 None,
             ))
             .unwrap();
-        let first_updated_at = state.status_updated_at;
-
         state
             .apply_event(&test_raw_event_at(
                 2,
@@ -1386,20 +2341,34 @@ mod tests {
                 None,
             ))
             .unwrap();
+        let first_updated_at = state.status_updated_at;
 
-        assert_eq!(state.status(), Some(RunStatus::Running));
+        state
+            .apply_event(&test_raw_event_at(
+                3,
+                "2026-04-07T12:02:00Z",
+                "run.running",
+                &json!({}),
+                None,
+            ))
+            .unwrap();
+
+        assert_eq!(state.status(), RunStatus::Running);
         assert_eq!(state.status_updated_at, first_updated_at);
     }
 
     #[test]
     fn paused_over_blocked_round_trips_back_to_blocked() {
-        let mut state = RunProjection::default();
+        let mut state = initialized_projection();
         state
-            .apply_event(&test_raw_event(1, "run.running", &json!({}), None))
+            .apply_event(&test_raw_event(1, "run.starting", &json!({}), None))
+            .unwrap();
+        state
+            .apply_event(&test_raw_event(2, "run.running", &json!({}), None))
             .unwrap();
         state
             .apply_event(&test_raw_event(
-                2,
+                3,
                 "run.blocked",
                 &json!({ "blocked_reason": "human_input_required" }),
                 None,
@@ -1407,53 +2376,53 @@ mod tests {
             .unwrap();
         state
             .apply_event(&test_event(
-                3,
+                4,
                 EventBody::RunPaused(RunControlEffectProps::default()),
                 None,
             ))
             .unwrap();
         state
             .apply_event(&test_event(
-                4,
+                5,
                 EventBody::RunUnpaused(RunControlEffectProps::default()),
                 None,
             ))
             .unwrap();
 
-        assert_eq!(
-            state.status(),
-            Some(RunStatus::Blocked {
-                blocked_reason: BlockedReason::HumanInputRequired,
-            })
-        );
+        assert_eq!(state.status(), RunStatus::Blocked {
+            blocked_reason: BlockedReason::HumanInputRequired,
+        });
     }
 
     #[test]
     fn run_archived_on_non_terminal_projection_is_rejected() {
         use fabro_types::run_event::RunArchivedProps;
 
-        let mut state = RunProjection::default();
+        let mut state = initialized_projection();
         state
-            .apply_event(&test_raw_event(1, "run.running", &json!({}), None))
+            .apply_event(&test_raw_event(1, "run.starting", &json!({}), None))
+            .unwrap();
+        state
+            .apply_event(&test_raw_event(2, "run.running", &json!({}), None))
             .unwrap();
 
         let err = state
             .apply_event(&test_event(
-                2,
+                3,
                 EventBody::RunArchived(RunArchivedProps::default()),
                 None,
             ))
             .unwrap_err();
 
         assert!(matches!(err, Error::InvalidTransition(_)));
-        assert_eq!(state.status(), Some(RunStatus::Running));
+        assert_eq!(state.status(), RunStatus::Running);
     }
 
     #[test]
     fn run_unarchived_replayed_on_non_archived_projection_is_ignored() {
         use fabro_types::run_event::{RunCompletedProps, RunUnarchivedProps};
 
-        let mut state = RunProjection::default();
+        let mut state = running_projection();
         state
             .apply_event(&test_event(
                 1,
@@ -1465,6 +2434,7 @@ mod tests {
                     total_usd_micros:     None,
                     final_git_commit_sha: None,
                     final_patch:          None,
+                    diff_summary:         None,
                     billing:              None,
                 }),
                 None,
@@ -1480,12 +2450,421 @@ mod tests {
             ))
             .unwrap();
 
-        assert_eq!(
-            state.status(),
-            Some(RunStatus::Succeeded {
-                reason: SuccessReason::Completed,
-            })
-        );
+        assert_eq!(state.status(), RunStatus::Succeeded {
+            reason: SuccessReason::Completed,
+        });
         assert_eq!(state.status_updated_at, updated_at);
+    }
+
+    fn started_props() -> StageStartedProps {
+        StageStartedProps {
+            index:        0,
+            handler_type: "agent".to_string(),
+            attempt:      1,
+            max_attempts: 3,
+        }
+    }
+
+    fn failed_props(duration_ms: u64, will_retry: bool) -> StageFailedProps {
+        StageFailedProps {
+            index: 0,
+            failure: Some(FailureDetail::new("boom", FailureCategory::TransientInfra)),
+            will_retry,
+            duration_ms,
+            billing: None,
+        }
+    }
+
+    fn retrying_props() -> StageRetryingProps {
+        StageRetryingProps {
+            index:        0,
+            attempt:      2,
+            max_attempts: 3,
+            delay_ms:     0,
+        }
+    }
+
+    fn completed_props(duration_ms: u64, status: StageOutcome) -> StageCompletedProps {
+        StageCompletedProps {
+            index: 0,
+            duration_ms,
+            status,
+            preferred_label: None,
+            suggested_next_ids: Vec::new(),
+            billing: None,
+            failure: None,
+            notes: None,
+            files_touched: Vec::new(),
+            context_updates: None,
+            jump_to_node: None,
+            context_values: None,
+            node_visits: None,
+            loop_failure_signatures: None,
+            restart_failure_signatures: None,
+            response: None,
+            attempt: 1,
+            max_attempts: 3,
+        }
+    }
+
+    fn billed_usage() -> BilledModelUsage {
+        serde_json::from_value(json!({
+            "input": {
+                "usage": {
+                    "model": {
+                        "provider": "openai",
+                        "model_id": "gpt-test"
+                    },
+                    "tokens": {
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "reasoning_tokens": 2,
+                        "cache_read_tokens": 3,
+                        "cache_write_tokens": 4
+                    }
+                },
+                "facts": { "provider": "open_ai" }
+            },
+            "total_usd_micros": 123
+        }))
+        .expect("billing fixture should deserialize")
+    }
+
+    fn live_agent_message_props(billing: BilledTokenCounts) -> AgentMessageProps {
+        AgentMessageProps {
+            text: "assistant text".to_string(),
+            model: billed_usage().model().clone(),
+            billing,
+            tool_call_count: 0,
+            visit: 1,
+        }
+    }
+
+    fn live_counts(input_tokens: i64, output_tokens: i64) -> BilledTokenCounts {
+        BilledTokenCounts {
+            input_tokens,
+            output_tokens,
+            total_tokens: input_tokens + output_tokens,
+            reasoning_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            total_usd_micros: None,
+        }
+    }
+
+    #[test]
+    fn stage_started_records_started_at_and_running_state() {
+        let mut state = initialized_projection();
+        let stage_id = StageId::new("build", 1);
+
+        state
+            .apply_event(&test_stage_event(
+                3,
+                EventBody::StageStarted(started_props()),
+                stage_id.clone(),
+            ))
+            .unwrap();
+
+        let stage = state.stage(&stage_id).unwrap();
+        assert_eq!(stage.state, StageState::Running);
+        assert!(stage.started_at.is_some());
+        assert_eq!(stage.effective_state(), StageState::Running);
+    }
+
+    #[test]
+    fn agent_message_accumulates_live_usage_on_stage_projection() {
+        let mut state = initialized_projection();
+        let stage_id = StageId::new("build", 1);
+        let model = billed_usage().model().clone();
+
+        state
+            .apply_event(&test_stage_event(
+                1,
+                EventBody::StageStarted(started_props()),
+                stage_id.clone(),
+            ))
+            .unwrap();
+        state
+            .apply_event(&test_stage_event(
+                2,
+                EventBody::AgentMessage(live_agent_message_props(live_counts(10, 5))),
+                stage_id.clone(),
+            ))
+            .unwrap();
+        state
+            .apply_event(&test_stage_event(
+                3,
+                EventBody::AgentMessage(live_agent_message_props(live_counts(20, 7))),
+                stage_id.clone(),
+            ))
+            .unwrap();
+
+        let stage = state.stage(&stage_id).unwrap();
+        assert_eq!(stage.usage, live_counts(30, 12));
+        assert_eq!(stage.model, Some(model));
+    }
+
+    #[test]
+    fn stage_completed_replaces_live_usage_with_terminal_billing() {
+        let mut state = initialized_projection();
+        let stage_id = StageId::new("build", 1);
+        let usage = billed_usage();
+
+        state
+            .apply_event(&test_stage_event(
+                1,
+                EventBody::StageStarted(started_props()),
+                stage_id.clone(),
+            ))
+            .unwrap();
+        state
+            .apply_event(&test_stage_event(
+                2,
+                EventBody::AgentMessage(live_agent_message_props(live_counts(100, 50))),
+                stage_id.clone(),
+            ))
+            .unwrap();
+        let mut props = completed_props(42, StageOutcome::Succeeded);
+        props.billing = Some(usage.clone());
+        state
+            .apply_event(&test_stage_event(
+                3,
+                EventBody::StageCompleted(props),
+                stage_id.clone(),
+            ))
+            .unwrap();
+
+        let stage = state.stage(&stage_id).unwrap();
+        assert_eq!(stage.usage, usage_counts(&usage));
+        assert_eq!(stage.model.as_ref(), Some(usage.model()));
+    }
+
+    #[test]
+    fn stage_completed_without_billing_preserves_live_usage() {
+        let mut state = initialized_projection();
+        let stage_id = StageId::new("build", 1);
+        let model = billed_usage().model().clone();
+
+        state
+            .apply_event(&test_stage_event(
+                1,
+                EventBody::StageStarted(started_props()),
+                stage_id.clone(),
+            ))
+            .unwrap();
+        state
+            .apply_event(&test_stage_event(
+                2,
+                EventBody::AgentMessage(live_agent_message_props(live_counts(10, 5))),
+                stage_id.clone(),
+            ))
+            .unwrap();
+        state
+            .apply_event(&test_stage_event(
+                3,
+                EventBody::StageCompleted(completed_props(42, StageOutcome::Succeeded)),
+                stage_id.clone(),
+            ))
+            .unwrap();
+
+        let stage = state.stage(&stage_id).unwrap();
+        assert_eq!(stage.usage, live_counts(10, 5));
+        assert_eq!(stage.model, Some(model));
+    }
+
+    #[test]
+    fn stage_failed_replaces_live_usage_with_terminal_billing() {
+        let mut state = initialized_projection();
+        let stage_id = StageId::new("build", 1);
+        let usage = billed_usage();
+
+        state
+            .apply_event(&test_stage_event(
+                1,
+                EventBody::StageStarted(started_props()),
+                stage_id.clone(),
+            ))
+            .unwrap();
+        state
+            .apply_event(&test_stage_event(
+                2,
+                EventBody::AgentMessage(live_agent_message_props(live_counts(100, 50))),
+                stage_id.clone(),
+            ))
+            .unwrap();
+        let mut props = failed_props(42, false);
+        props.billing = Some(usage.clone());
+        state
+            .apply_event(&test_stage_event(
+                3,
+                EventBody::StageFailed(props),
+                stage_id.clone(),
+            ))
+            .unwrap();
+
+        let stage = state.stage(&stage_id).unwrap();
+        assert_eq!(stage.usage, usage_counts(&usage));
+        assert_eq!(stage.model.as_ref(), Some(usage.model()));
+    }
+
+    #[test]
+    fn stage_started_resets_live_usage_for_new_attempt() {
+        let mut state = initialized_projection();
+        let stage_id = StageId::new("build", 1);
+
+        state
+            .apply_event(&test_stage_event(
+                1,
+                EventBody::StageStarted(started_props()),
+                stage_id.clone(),
+            ))
+            .unwrap();
+        state
+            .apply_event(&test_stage_event(
+                2,
+                EventBody::AgentMessage(live_agent_message_props(live_counts(10, 5))),
+                stage_id.clone(),
+            ))
+            .unwrap();
+        state
+            .apply_event(&test_stage_event(
+                3,
+                EventBody::StageStarted(started_props()),
+                stage_id.clone(),
+            ))
+            .unwrap();
+
+        let stage = state.stage(&stage_id).unwrap();
+        assert!(stage.usage.is_zero());
+        assert_eq!(stage.model, None);
+        assert_eq!(stage.state, StageState::Running);
+    }
+
+    #[test]
+    fn stage_completed_records_duration_usage_and_terminal_state() {
+        let mut state = initialized_projection();
+        let stage_id = StageId::new("build", 1);
+        let usage = billed_usage();
+
+        state
+            .apply_event(&test_stage_event(
+                1,
+                EventBody::StageStarted(started_props()),
+                stage_id.clone(),
+            ))
+            .unwrap();
+        let mut props = completed_props(42, StageOutcome::Succeeded);
+        props.billing = Some(usage.clone());
+        state
+            .apply_event(&test_event(
+                2,
+                EventBody::StageCompleted(props),
+                Some("build"),
+            ))
+            .unwrap();
+
+        let stage = state.stage(&stage_id).unwrap();
+        assert_eq!(stage.duration_ms, Some(42));
+        assert_eq!(stage.usage, usage_counts(&usage));
+        assert_eq!(stage.model.as_ref(), Some(usage.model()));
+        assert_eq!(stage.state, StageState::Succeeded);
+        assert_eq!(stage.effective_state(), StageState::Succeeded);
+    }
+
+    #[test]
+    fn stage_failed_records_duration_and_failed_state() {
+        let mut state = initialized_projection();
+        let stage_id = StageId::new("build", 1);
+
+        state
+            .apply_event(&test_stage_event(
+                1,
+                EventBody::StageStarted(started_props()),
+                stage_id.clone(),
+            ))
+            .unwrap();
+        state
+            .apply_event(&test_event(
+                2,
+                EventBody::StageFailed(failed_props(10, false)),
+                Some("build"),
+            ))
+            .unwrap();
+
+        let stage = state.stage(&stage_id).unwrap();
+        assert_eq!(stage.duration_ms, Some(10));
+        assert_eq!(stage.state, StageState::Failed);
+    }
+
+    #[test]
+    fn stage_retrying_sets_retrying_state() {
+        let mut state = initialized_projection();
+        let stage_id = StageId::new("build", 1);
+
+        state
+            .apply_event(&test_stage_event(
+                1,
+                EventBody::StageStarted(started_props()),
+                stage_id.clone(),
+            ))
+            .unwrap();
+        state
+            .apply_event(&test_event(
+                2,
+                EventBody::StageFailed(failed_props(10, true)),
+                Some("build"),
+            ))
+            .unwrap();
+        state
+            .apply_event(&test_event(
+                3,
+                EventBody::StageRetrying(retrying_props()),
+                Some("build"),
+            ))
+            .unwrap();
+
+        let stage = state.stage(&stage_id).unwrap();
+        assert_eq!(stage.state, StageState::Retrying);
+    }
+
+    #[test]
+    fn stage_started_after_retrying_returns_to_running_and_resets_attempt_data() {
+        let mut state = initialized_projection();
+        let stage_id = StageId::new("build", 1);
+
+        state
+            .apply_event(&test_stage_event(
+                1,
+                EventBody::StageStarted(started_props()),
+                stage_id.clone(),
+            ))
+            .unwrap();
+        state
+            .apply_event(&test_event(
+                2,
+                EventBody::StageFailed(failed_props(10, true)),
+                Some("build"),
+            ))
+            .unwrap();
+        state
+            .apply_event(&test_event(
+                3,
+                EventBody::StageRetrying(retrying_props()),
+                Some("build"),
+            ))
+            .unwrap();
+        state
+            .apply_event(&test_stage_event(
+                4,
+                EventBody::StageStarted(started_props()),
+                stage_id.clone(),
+            ))
+            .unwrap();
+
+        let stage = state.stage(&stage_id).unwrap();
+        assert_eq!(stage.state, StageState::Running);
+        // Prior attempt's terminal data must not leak into the new attempt.
+        assert!(stage.completion.is_none());
+        assert_eq!(stage.duration_ms, None);
     }
 }

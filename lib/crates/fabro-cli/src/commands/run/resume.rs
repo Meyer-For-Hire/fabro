@@ -17,7 +17,7 @@ pub(crate) async fn resume_command(
     let printer = base_ctx.printer();
     let ctx = base_ctx.with_target(&args.server)?;
     let client = ctx.server().await?;
-    let run_id = client.resolve_run(&args.run).await?.run_id;
+    let run_id = client.resolve_run(&args.run).await?.id;
 
     super::start::start_run_with_client(client.as_ref(), &run_id, true).await?;
 
@@ -40,8 +40,13 @@ pub(crate) async fn resume_command(
         ))
         .await?;
         if !json {
-            super::output::print_run_summary_with_client(client.as_ref(), &run_id, styles, printer)
-                .await?;
+            Box::pin(super::output::print_run_summary_with_client(
+                client.as_ref(),
+                &run_id,
+                styles,
+                printer,
+            ))
+            .await?;
         }
         if exit_code != std::process::ExitCode::SUCCESS {
             std::process::exit(1);

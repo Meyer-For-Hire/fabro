@@ -26,7 +26,7 @@ pub(crate) async fn run(args: &WaitArgs, styles: &Styles, base_ctx: &CommandCont
     let printer = base_ctx.printer();
     let ctx = base_ctx.with_target(&args.server)?;
     let client = ctx.server().await?;
-    let run_id = client.resolve_run(&args.run).await?.run_id;
+    let run_id = client.resolve_run(&args.run).await?.id;
     info!(run_id = %run_id, "Waiting for run to complete");
 
     let deadline = args
@@ -34,7 +34,7 @@ pub(crate) async fn run(args: &WaitArgs, styles: &Styles, base_ctx: &CommandCont
         .map(|secs| std::time::Instant::now() + std::time::Duration::from_secs(secs));
     let interval = std::time::Duration::from_millis(args.interval);
     let final_status = loop {
-        let status = client.retrieve_run(&run_id).await?.status;
+        let status = client.retrieve_run(&run_id).await?.lifecycle.status;
 
         if status.is_terminal() {
             break status;
@@ -105,8 +105,7 @@ fn print_human_output(
         RunStatus::Succeeded { .. } => (&styles.bold_green, "Succeeded"),
         RunStatus::Failed { .. } => (&styles.bold_red, "Failed"),
         RunStatus::Dead => (&styles.bold_red, "Dead"),
-        RunStatus::Archived { .. } => (&styles.dim, "Archived"),
-        // Poll loop only breaks on is_terminal() which is the four arms above.
+        // Poll loop only breaks on is_terminal() which is the three arms above.
         _ => unreachable!(),
     };
     let status_display = style.apply_to(label);
@@ -135,7 +134,9 @@ fn print_human_output(
 
 #[cfg(test)]
 mod tests {
-    use fabro_types::{BilledTokenCounts, RunStatus, StageOutcome, SuccessReason, fixtures};
+    use fabro_types::{
+        BilledTokenCounts, RunDiff, RunStatus, StageOutcome, SuccessReason, fixtures,
+    };
     use fabro_workflow::records::Conclusion;
 
     use super::*;
@@ -164,6 +165,7 @@ mod tests {
                 total_usd_micros:   Some(420_000),
             }),
             total_retries:        0,
+            diff:                 RunDiff::default(),
         };
         let json = build_json_output(
             RunStatus::Succeeded {
@@ -214,6 +216,7 @@ mod tests {
             stages:               vec![],
             billing:              None,
             total_retries:        0,
+            diff:                 RunDiff::default(),
         };
         let json = build_json_output(
             RunStatus::Failed {
@@ -247,6 +250,7 @@ mod tests {
                 total_usd_micros:   Some(150_000),
             }),
             total_retries:        0,
+            diff:                 RunDiff::default(),
         };
         // Just verify no panic; actual stderr output is hard to capture
         print_human_output(

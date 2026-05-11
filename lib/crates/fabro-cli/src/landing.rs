@@ -54,7 +54,8 @@ pub(crate) fn print() {
     section(
         "Inspect runs",
         &[
-            ("logs", "View the event log of a workflow run"),
+            ("events", "View the event log of a workflow run"),
+            ("logs", "View the raw worker tracing log of a workflow run"),
             ("sandbox ssh", "SSH into a run's sandbox"),
         ],
         cmd_width,

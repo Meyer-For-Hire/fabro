@@ -66,7 +66,7 @@ describe("RunBilling", () => {
     delete (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT;
   });
 
-  test("renders non-LLM-only stage rows without the by-model section", () => {
+  test("shows a no-model-usage empty state when every stage is non-billable", () => {
     const renderer = renderBilling(
       billing({
         stages: [
@@ -75,12 +75,14 @@ describe("RunBilling", () => {
             model: null,
             billing: zeroBilling(),
             runtime_secs: 0,
+            state: "succeeded",
           },
           {
             stage: { id: "command", name: "command" },
             model: null,
             billing: zeroBilling(),
             runtime_secs: 61,
+            state: "succeeded",
           },
         ],
         totals: {
@@ -91,12 +93,12 @@ describe("RunBilling", () => {
     );
 
     const text = textFromNode(renderer.toJSON());
-    expect(text).toContain("start");
-    expect(text).toContain("command");
-    expect(text).toMatch(/—\s*\/\s*—/);
-    expect(text).toContain("1m 1s");
+    expect(text).toContain("No model usage");
+    expect(text).toContain("This run didn't call any AI models.");
+    expect(text).not.toContain("No stages yet");
     expect(text).not.toContain("By model");
-    expect(text).not.toContain("No completed stages yet");
+    expect(text).not.toContain("start");
+    expect(text).not.toContain("command");
   });
 
   test("renders mixed LLM and non-LLM rows while counting only LLM rows by model", () => {
@@ -108,6 +110,7 @@ describe("RunBilling", () => {
             model: null,
             billing: zeroBilling(),
             runtime_secs: 0,
+            state: "succeeded",
           },
           {
             stage: { id: "agent", name: "agent" },
@@ -119,6 +122,7 @@ describe("RunBilling", () => {
               total_usd_micros: 240000,
             }),
             runtime_secs: 42,
+            state: "succeeded",
           },
         ],
         totals: {
@@ -146,7 +150,7 @@ describe("RunBilling", () => {
     );
 
     const text = textFromNode(renderer.toJSON());
-    expect(text).toContain("start");
+    expect(text).not.toContain("start");
     expect(text).toContain("agent");
     expect(text).toContain("By model");
 
@@ -155,11 +159,86 @@ describe("RunBilling", () => {
     expect(textFromInstance(byModelFooterCells[1])).toBe("1");
   });
 
-  test("keeps the empty state for runs with no completed stages", () => {
+  test("keeps the empty state for runs with no stages", () => {
     const renderer = renderBilling(billing());
 
     const text = textFromNode(renderer.toJSON());
-    expect(text).toContain("No completed stages yet");
-    expect(text).toContain("Stages will appear once the run produces completed nodes.");
+    expect(text).toContain("No stages yet");
+    expect(text).toContain("Stages will appear as soon as the run starts executing.");
+  });
+
+  test("renders an in-flight row with live billing and includes its elapsed time in the footer", () => {
+    const originalNow = Date.now;
+    // Pin "now" to 30s after the in-flight row started.
+    const startedAt = "2026-04-29T12:00:00.000Z";
+    const fakeNow = new Date("2026-04-29T12:00:30.000Z").getTime();
+    Date.now = () => fakeNow;
+
+    try {
+      const renderer = renderBilling(
+        billing({
+          stages: [
+            {
+              stage: { id: "in-flight", name: "in-flight" },
+              model: { id: "claude-opus-4-6" },
+              billing: zeroBilling({
+                input_tokens: 1200,
+                output_tokens: 300,
+                total_tokens: 1500,
+                total_usd_micros: 240000,
+              }),
+              runtime_secs: 0,
+              started_at: startedAt,
+              state: "running",
+            },
+          ],
+          totals: {
+            runtime_secs: 0,
+            ...zeroBilling({
+              input_tokens: 1200,
+              output_tokens: 300,
+              total_tokens: 1500,
+              total_usd_micros: 240000,
+            }),
+          },
+          by_model: [
+            {
+              model: { id: "claude-opus-4-6" },
+              stages: 1,
+              billing: zeroBilling({
+                input_tokens: 1200,
+                output_tokens: 300,
+                total_tokens: 1500,
+                total_usd_micros: 240000,
+              }),
+            },
+          ],
+        }),
+      );
+
+      const text = textFromNode(renderer.toJSON());
+      // Empty-state must NOT show — the table should appear as soon as the
+      // first stage starts.
+      expect(text).not.toContain("No stages yet");
+      expect(text).toContain("in-flight");
+      expect(text).toContain("claude-opus-4-6");
+      expect(text).toContain("1.2k");
+      expect(text).toContain("0.3k");
+      expect(text).toContain("$0.24");
+      expect(text).toContain("By model");
+
+      // Both the row's runtime cell and the footer total should reflect
+      // ~30s elapsed since started_at.
+      expect(text).toContain("30s");
+
+      const footers = renderer.root.findAll((node) => node.type === "tfoot");
+      const footerCells = footers[0].findAll((node) => node.type === "td");
+      // The Run time column in the footer is index 3 (Total / [empty Model] /
+      // Tokens / Run time / Billing).
+      const footerRuntime = textFromInstance(footerCells[3]);
+      expect(footerRuntime).toContain("30s");
+    } finally {
+      Date.now = originalNow;
+    }
   });
 });

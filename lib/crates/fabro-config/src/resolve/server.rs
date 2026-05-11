@@ -1,12 +1,12 @@
 use fabro_types::settings::InterpString;
 use fabro_types::settings::server::{
-    DiscordIntegrationSettings, GithubIntegrationSettings, GithubIntegrationStrategy,
-    IntegrationWebhooksSettings, IpAllowEntry, ObjectStoreProvider, ObjectStoreSettings,
-    ServerApiSettings, ServerArtifactsSettings, ServerAuthGithubSettings, ServerAuthMethod,
-    ServerAuthSettings, ServerIntegrationsSettings, ServerIpAllowlistOverrideSettings,
-    ServerIpAllowlistSettings, ServerListenSettings, ServerLoggingSettings, ServerNamespace,
-    ServerSchedulerSettings, ServerSlateDbSettings, ServerStorageSettings, ServerWebSettings,
-    SlackIntegrationSettings, TeamsIntegrationSettings, WebhookStrategy,
+    GithubIntegrationSettings, GithubIntegrationStrategy, IntegrationWebhooksSettings,
+    IpAllowEntry, ObjectStoreProvider, ObjectStoreSettings, ServerApiSettings,
+    ServerArtifactsSettings, ServerAuthGithubSettings, ServerAuthMethod, ServerAuthSettings,
+    ServerIntegrationsSettings, ServerIpAllowlistOverrideSettings, ServerIpAllowlistSettings,
+    ServerListenSettings, ServerLoggingSettings, ServerNamespace, ServerSchedulerSettings,
+    ServerSlateDbSettings, ServerStorageSettings, ServerWebSettings, SlackIntegrationSettings,
+    WebhookStrategy,
 };
 use fabro_util::Home;
 
@@ -454,37 +454,24 @@ fn resolve_integrations(
     errors: &mut Vec<ResolveError>,
 ) -> ServerIntegrationsSettings {
     ServerIntegrationsSettings {
-        github:  layer
+        github: layer
             .and_then(|integrations| integrations.github.as_ref())
             .map(|github| GithubIntegrationSettings {
-                enabled:     github.enabled.unwrap_or(true),
-                strategy:    github.strategy.unwrap_or_default(),
-                app_id:      github.app_id.clone(),
-                client_id:   github.client_id.clone(),
-                slug:        github.slug.clone(),
-                permissions: github.permissions.clone().into_inner(),
-                webhooks:    github.webhooks.as_ref().map(|webhooks| {
+                enabled:   github.enabled.unwrap_or(true),
+                strategy:  github.strategy.unwrap_or_default(),
+                app_id:    github.app_id.clone(),
+                client_id: github.client_id.clone(),
+                slug:      github.slug.clone(),
+                webhooks:  github.webhooks.as_ref().map(|webhooks| {
                     resolve_github_webhooks(webhooks, "server.integrations.github.webhooks", errors)
                 }),
             })
             .unwrap_or_default(),
-        slack:   layer
+        slack:  layer
             .and_then(|integrations| integrations.slack.as_ref())
             .map(|slack| SlackIntegrationSettings {
                 enabled:         slack.enabled.unwrap_or(true),
                 default_channel: slack.default_channel.clone(),
-            })
-            .unwrap_or_default(),
-        discord: layer
-            .and_then(|integrations| integrations.discord.as_ref())
-            .map(|discord| DiscordIntegrationSettings {
-                enabled: discord.enabled.unwrap_or(true),
-            })
-            .unwrap_or_default(),
-        teams:   layer
-            .and_then(|integrations| integrations.teams.as_ref())
-            .map(|teams| TeamsIntegrationSettings {
-                enabled: teams.enabled.unwrap_or(true),
             })
             .unwrap_or_default(),
     }

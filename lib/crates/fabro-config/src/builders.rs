@@ -1,7 +1,7 @@
 use std::fmt;
 use std::path::Path;
 
-use fabro_types::settings::{ProjectNamespace, RunNamespace, WorkflowNamespace};
+use fabro_types::settings::{RunNamespace, WorkflowNamespace};
 use fabro_types::{ServerSettings, UserSettings, WorkflowSettings};
 use fabro_util::error::SharedError;
 
@@ -419,15 +419,6 @@ impl WorkflowSettingsBuilder {
         )
     }
 
-    pub(crate) fn project_from_layer(
-        layer: &SettingsLayer,
-    ) -> std::result::Result<ProjectNamespace, ResolveErrors> {
-        let layer = layer.clone().combine(DEFAULTS_LAYER.clone());
-        let mut errors = Vec::new();
-        let project = resolve_project(&layer.project.clone().unwrap_or_default(), &mut errors);
-        finish_dense_result(project, errors)
-    }
-
     pub(crate) fn workflow_from_layer(
         layer: &SettingsLayer,
     ) -> std::result::Result<WorkflowNamespace, ResolveErrors> {
@@ -502,7 +493,6 @@ command = ["demo-mcp"]
                 execution: Some(RunExecutionLayer {
                     mode:     Some(RunMode::DryRun),
                     approval: Some(ApprovalMode::Auto),
-                    retros:   Some(false),
                 }),
                 ..RunLayer::default()
             })
@@ -540,6 +530,5 @@ command = ["demo-mcp"]
         );
         assert_eq!(settings.run.execution.mode, RunMode::DryRun);
         assert_eq!(settings.run.execution.approval, ApprovalMode::Auto);
-        assert!(!settings.run.execution.retros);
     }
 }

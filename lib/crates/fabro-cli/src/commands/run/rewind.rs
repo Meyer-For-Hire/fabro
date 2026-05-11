@@ -15,7 +15,7 @@ pub(crate) async fn run(
     let printer = base_ctx.printer();
     let ctx = base_ctx.with_target(&args.server)?;
     let client = ctx.server().await?;
-    let run_id = client.resolve_run(&args.run_id).await?.run_id;
+    let run_id = client.resolve_run(&args.run_id).await?.id;
     ensure_origin_if_local(client.as_ref(), &run_id, "rewind").await?;
 
     if args.list || args.target.is_none() {

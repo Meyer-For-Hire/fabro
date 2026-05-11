@@ -6,7 +6,8 @@ use httpmock::MockServer;
 use serde_json::Value;
 
 use super::support::{
-    local_dev_token, setup_seeded_completed_dry_run, setup_seeded_created_dry_run,
+    local_dev_token, remote_run_summary_json, setup_seeded_completed_dry_run,
+    setup_seeded_created_dry_run,
 };
 use crate::support::{fatal_error_line, seed_dev_token_auth, unique_run_id};
 
@@ -282,25 +283,13 @@ fn ps_filters_by_workflow_and_label() {
 
     context
         .run_cmd()
-        .args([
-            "--dry-run",
-            "--auto-approve",
-            "--no-retro",
-            "--label",
-            "suite=alpha",
-        ])
+        .args(["--dry-run", "--auto-approve", "--label", "suite=alpha"])
         .arg(&simple)
         .assert()
         .success();
     context
         .create_cmd()
-        .args([
-            "--dry-run",
-            "--auto-approve",
-            "--no-retro",
-            "--label",
-            "suite=beta",
-        ])
+        .args(["--dry-run", "--auto-approve", "--label", "suite=beta"])
         .arg(&branching)
         .assert()
         .success();
@@ -341,32 +330,27 @@ fn ps_uses_configured_server_target_without_server_flag() {
     let context = test_context!();
     let server = MockServer::start();
     let run_id = unique_run_id();
+    let mut summary = remote_run_summary_json(
+        &run_id,
+        "Remote Workflow",
+        "remote-workflow",
+        "Remote goal",
+        &serde_json::json!({
+            "kind": "succeeded",
+            "reason": "completed"
+        }),
+        "2026-04-05T12:00:00Z",
+    );
+    summary["labels"] = serde_json::json!({
+        "suite": "remote"
+    });
     let mock = server.mock(|when, then| {
         when.method("GET").path("/api/v1/runs");
         then.status(200)
             .header("Content-Type", "application/json")
             .body(
                 serde_json::json!({
-                    "data": [{
-                        "run_id": run_id,
-                        "workflow_name": "Remote Workflow",
-                        "workflow_slug": "remote-workflow",
-                        "goal": "Remote goal",
-                        "title": "Remote goal",
-                        "labels": {
-                            "suite": "remote"
-                        },
-                        "source_directory": "/srv/repo",
-                        "repository": { "name": "repo" },
-                        "start_time": "2026-04-05T12:00:00Z",
-                        "created_at": "2026-04-05T12:00:00Z",
-                        "status": {
-                            "kind": "succeeded",
-                            "reason": "completed"
-                        },
-                        "duration_ms": 123,
-                        "total_usd_micros": null
-                    }],
+                    "data": [summary],
                     "meta": { "has_more": false }
                 })
                 .to_string(),
@@ -393,30 +377,24 @@ fn ps_explicit_remote_target_ignores_broken_local_storage_settings() {
     let context = test_context!();
     let server = MockServer::start();
     let run_id = unique_run_id();
+    let summary = remote_run_summary_json(
+        &run_id,
+        "Explicit Remote",
+        "explicit-remote",
+        "Remote goal",
+        &serde_json::json!({
+            "kind": "succeeded",
+            "reason": "completed"
+        }),
+        "2026-04-20T12:00:00Z",
+    );
     let mock = server.mock(|when, then| {
         when.method("GET").path("/api/v1/runs");
         then.status(200)
             .header("Content-Type", "application/json")
             .body(
                 serde_json::json!({
-                    "data": [{
-                        "run_id": run_id,
-                        "workflow_name": "Explicit Remote",
-                        "workflow_slug": "explicit-remote",
-                        "goal": "Remote goal",
-                        "title": "Remote goal",
-                        "labels": {},
-                        "source_directory": "/srv/repo",
-                        "repository": { "name": "repo" },
-                        "start_time": "2026-04-20T12:00:00Z",
-                        "created_at": "2026-04-20T12:00:00Z",
-                        "status": {
-                            "kind": "succeeded",
-                            "reason": "completed"
-                        },
-                        "duration_ms": 123,
-                        "total_usd_micros": null
-                    }],
+                    "data": [summary],
                     "meta": { "has_more": false }
                 })
                 .to_string(),

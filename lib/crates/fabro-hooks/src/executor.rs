@@ -424,9 +424,9 @@ impl HookExecutorImpl {
                 for tc in &tool_calls {
                     let tool = registry.get(&tc.name).cloned();
                     let ctx = ToolContext {
-                        env:      sandbox.clone(),
-                        cancel:   cancel.child_token(),
-                        tool_env: None,
+                        env:               sandbox.clone(),
+                        cancel:            cancel.child_token(),
+                        tool_env_provider: None,
                     };
                     let result = match tool {
                         Some(t) => match (t.executor)(tc.arguments.clone(), ctx).await {

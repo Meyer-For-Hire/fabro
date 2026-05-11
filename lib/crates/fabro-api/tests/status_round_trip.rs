@@ -3,10 +3,10 @@ use std::any::{TypeId, type_name};
 use fabro_api::types::{
     BlockedReason as ApiBlockedReason, FailureReason as ApiFailureReason,
     RunControlAction as ApiRunControlAction, RunStatus as ApiRunStatus,
-    SuccessReason as ApiSuccessReason, TerminalStatus as ApiTerminalStatus,
+    SuccessReason as ApiSuccessReason,
 };
 use fabro_types::status::{
-    BlockedReason, FailureReason, RunControlAction, RunStatus, SuccessReason, TerminalStatus,
+    BlockedReason, FailureReason, RunControlAction, RunStatus, SuccessReason,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -16,7 +16,6 @@ fn status_family_reuses_domain_types() {
     assert_same_type::<ApiRunStatus, RunStatus>();
     assert_same_type::<ApiSuccessReason, SuccessReason>();
     assert_same_type::<ApiFailureReason, FailureReason>();
-    assert_same_type::<ApiTerminalStatus, TerminalStatus>();
     assert_same_type::<ApiBlockedReason, BlockedReason>();
     assert_same_type::<ApiRunControlAction, RunControlAction>();
 }
@@ -93,20 +92,6 @@ fn run_status_json_matches_openapi_shape() {
             "kind": "dead"
         }),
     );
-    assert_json(
-        RunStatus::Archived {
-            prior: TerminalStatus::Succeeded {
-                reason: SuccessReason::PartialSuccess,
-            },
-        },
-        json!({
-            "kind": "archived",
-            "prior": {
-                "kind": "succeeded",
-                "reason": "partial_success"
-            }
-        }),
-    );
 }
 
 #[test]
@@ -137,34 +122,6 @@ fn run_control_action_json_tokens_match_openapi() {
     assert_string_json(RunControlAction::Cancel, "cancel");
     assert_string_json(RunControlAction::Pause, "pause");
     assert_string_json(RunControlAction::Unpause, "unpause");
-}
-
-#[test]
-fn terminal_status_json_matches_openapi_shape() {
-    assert_json(
-        TerminalStatus::Succeeded {
-            reason: SuccessReason::Completed,
-        },
-        json!({
-            "kind": "succeeded",
-            "reason": "completed"
-        }),
-    );
-    assert_json(
-        TerminalStatus::Failed {
-            reason: FailureReason::Cancelled,
-        },
-        json!({
-            "kind": "failed",
-            "reason": "cancelled"
-        }),
-    );
-    assert_json(
-        TerminalStatus::Dead,
-        json!({
-            "kind": "dead"
-        }),
-    );
 }
 
 fn assert_same_type<T: 'static, U: 'static>() {

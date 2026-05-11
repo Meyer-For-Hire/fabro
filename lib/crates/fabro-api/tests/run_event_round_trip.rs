@@ -20,8 +20,7 @@ fn run_event_round_trips_run_created() {
             "settings": WorkflowSettings::default(),
             "graph": Graph::new("test"),
             "run_dir": "/tmp/fabro/run-1",
-            "source_directory": "/tmp/fabro/run-1",
-            "in_place": false
+            "source_directory": "/tmp/fabro/run-1"
         }
     });
 
@@ -40,8 +39,57 @@ fn run_event_round_trips_run_created_with_web_url() {
             "graph": Graph::new("test"),
             "run_dir": "/tmp/fabro/run-1",
             "source_directory": "/tmp/fabro/run-1",
-            "in_place": false,
             "web_url": format!("http://localhost:3000/runs/{}", fixtures::RUN_1)
+        }
+    });
+
+    assert_run_event_round_trip(value);
+}
+
+#[test]
+fn run_event_round_trips_run_interrupt() {
+    let value = json!({
+        "id": "evt_run_interrupt",
+        "ts": "2026-04-29T12:00:00Z",
+        "run_id": fixtures::RUN_1,
+        "event": "run.interrupt",
+        "actor": { "kind": "system", "system_kind": "engine" },
+        "properties": {}
+    });
+
+    assert_run_event_round_trip(value);
+}
+
+#[test]
+fn run_event_round_trips_run_steer() {
+    let value = json!({
+        "id": "evt_run_steer",
+        "ts": "2026-04-29T12:00:00Z",
+        "run_id": fixtures::RUN_1,
+        "event": "run.steer",
+        "actor": { "kind": "system", "system_kind": "engine" },
+        "properties": {
+            "text": "try another approach"
+        }
+    });
+
+    assert_run_event_round_trip(value);
+}
+
+#[test]
+fn run_event_round_trips_agent_interrupt_injected() {
+    let value = json!({
+        "id": "evt_interrupt_injected",
+        "ts": "2026-04-29T12:00:00Z",
+        "run_id": fixtures::RUN_1,
+        "event": "agent.interrupt.injected",
+        "node_id": "code",
+        "node_label": "code",
+        "stage_id": "code@2",
+        "session_id": "ses_1",
+        "actor": { "kind": "system", "system_kind": "engine" },
+        "properties": {
+            "visit": 2
         }
     });
 

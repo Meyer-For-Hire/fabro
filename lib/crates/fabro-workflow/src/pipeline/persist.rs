@@ -37,11 +37,9 @@ pub(crate) async fn load_from_store(
         .state()
         .await
         .map_err(|err| Error::engine(err.to_string()))?;
-    let run_spec = state
-        .spec
-        .ok_or_else(|| Error::Precondition("run spec missing from store".to_string()))?;
+    let run_spec = state.spec;
     let graph = run_spec.graph.clone();
-    let source = state.graph_source.unwrap_or_default();
+    let source = run_spec.graph_source.clone().unwrap_or_default();
 
     Ok(Persisted::new(
         graph,
@@ -135,6 +133,7 @@ mod tests {
                 ..fabro_types::WorkflowSettings::default()
             },
             graph,
+            graph_source: None,
             workflow_slug: Some("ship".to_string()),
             source_directory: Some("/tmp/project".to_string()),
             git: Some(fabro_types::GitContext {
@@ -152,7 +151,6 @@ mod tests {
             manifest_blob: None,
             definition_blob: None,
             fork_source_ref: None,
-            in_place: false,
         }
     }
 
@@ -161,6 +159,7 @@ mod tests {
         let run_store = store.create_run(&record.run_id).await.unwrap();
         append_event(&run_store, &record.run_id, &Event::RunCreated {
             run_id:           record.run_id,
+            title:            None,
             settings:         serde_json::to_value(&record.settings).unwrap(),
             graph:            serde_json::to_value(&record.graph).unwrap(),
             workflow_source:  source.map(ToOwned::to_owned),
@@ -174,7 +173,6 @@ mod tests {
             manifest_blob:    None,
             git:              record.git.clone(),
             fork_source_ref:  record.fork_source_ref.clone(),
-            in_place:         record.in_place,
             web_url:          None,
         })
         .await

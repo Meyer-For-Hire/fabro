@@ -10,12 +10,14 @@ use axum::{Json, Router};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use bytes::Bytes;
-use fabro_api::types::{RunManifest, RunStatusResponse, SubmitAnswerRequest};
+use fabro_api::types::{
+    BoardColumn, BoardColumnDefinition, RunManifest, SubmitAnswerRequest, UpdateRunRequest,
+};
 use fabro_config::Storage;
 use fabro_interview::AnswerSubmission;
 use fabro_types::{
-    CommandOutputStream, Principal, RunClientProvenance, RunId, RunProvenance, RunServerProvenance,
-    UserPrincipal, parse_blob_ref,
+    Principal, RunClientProvenance, RunId, RunProvenance, RunServerProvenance, UserPrincipal,
+    parse_blob_ref,
 };
 use fabro_util::version::FABRO_VERSION;
 use fabro_workflow::command_log::{command_log_path, read_json_string_blob, read_log_slice};
@@ -28,13 +30,13 @@ use super::super::{
     AppState, ListResponse, MAX_PAGE_OFFSET, PaginationParams, RunExecutionMode,
     answer_from_request, api_question_from_pending_interview, default_page_limit,
     delete_run_internal, load_pending_interview, managed_run, parse_run_id_path,
-    reject_if_archived, resolve_interp_string, submit_pending_interview_answer,
+    reject_if_archived, resolve_interp_string, submit_pending_interview_answer, workflow_event,
 };
 use crate::error::ApiError;
 use crate::principal_middleware::{
     RequestAuth, RequireCommandLog, RequireRunScoped, RequiredUser, require_user,
 };
-use crate::run_files::list_run_files;
+use crate::run_files::{list_run_commits, list_run_files};
 use crate::run_manifest;
 use crate::run_selector::{ResolveRunError, resolve_run_by_selector};
 
@@ -49,17 +51,21 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         .route("/runs", get(list_runs).post(create_run))
         .route("/runs/resolve", get(resolve_run))
         .route("/boards/runs", get(list_board_runs))
-        .route("/runs/{id}", get(get_run_status).delete(delete_run))
+        .route(
+            "/runs/{id}",
+            get(get_run_status).patch(update_run).delete(delete_run),
+        )
         .route("/runs/{id}/questions", get(get_questions))
         .route("/runs/{id}/questions/{qid}/answer", post(submit_answer))
         .route("/runs/{id}/state", get(get_run_state))
         .route("/runs/{id}/logs", get(get_run_logs))
         .route(
-            "/runs/{id}/stages/{stageId}/logs/{stream}",
+            "/runs/{id}/stages/{stageId}/logs/output",
             get(get_run_stage_command_log),
         )
         .route("/runs/{id}/settings", get(get_run_settings))
         .route("/runs/{id}/files", get(list_run_files))
+        .route("/runs/{id}/commits", get(list_run_commits))
         .merge(manifest_routes())
 }
 
@@ -82,82 +88,55 @@ impl ListRunsParams {
     }
 }
 
-fn board_column(status: RunStatus) -> Option<&'static str> {
+fn board_column(status: RunStatus, archived: bool) -> Option<BoardColumn> {
+    if archived {
+        return Some(BoardColumn::Archived);
+    }
     match status {
-        RunStatus::Submitted | RunStatus::Queued | RunStatus::Starting => Some("initializing"),
-        RunStatus::Running | RunStatus::Paused { .. } => Some("running"),
-        RunStatus::Blocked { .. } => Some("blocked"),
-        RunStatus::Succeeded { .. } => Some("succeeded"),
-        RunStatus::Failed { .. } | RunStatus::Dead => Some("failed"),
-        RunStatus::Removing | RunStatus::Archived { .. } => None,
+        RunStatus::Submitted | RunStatus::Queued => Some(BoardColumn::Queued),
+        RunStatus::Starting => Some(BoardColumn::Initializing),
+        RunStatus::Running | RunStatus::Paused { .. } => Some(BoardColumn::Running),
+        RunStatus::Blocked { .. } => Some(BoardColumn::Blocked),
+        RunStatus::Succeeded { .. } => Some(BoardColumn::Succeeded),
+        RunStatus::Failed { .. } | RunStatus::Dead => Some(BoardColumn::Failed),
+        RunStatus::Removing => None,
     }
 }
 
-pub(crate) fn board_columns() -> serde_json::Value {
-    serde_json::json!([
-        {"id": "initializing", "name": "Initializing"},
-        {"id": "running", "name": "Running"},
-        {"id": "blocked", "name": "Blocked"},
-        {"id": "succeeded", "name": "Succeeded"},
-        {"id": "failed", "name": "Failed"},
-    ])
-}
-
-async fn board_run_metadata(
-    state: &AppState,
-    run_id: RunId,
-) -> serde_json::Map<String, serde_json::Value> {
-    let mut metadata = serde_json::Map::new();
-    let Ok(run_store) = state.store.open_run_reader(&run_id).await else {
-        return metadata;
-    };
-    let Ok(run_state) = run_store.state().await else {
-        return metadata;
-    };
-
-    if let Some(pull_request) = run_state.pull_request {
-        metadata.insert(
-            "pull_request".to_string(),
-            serde_json::json!({
-                "number": pull_request.number,
-            }),
-        );
+pub(crate) fn board_columns(include_archived: bool) -> Vec<BoardColumnDefinition> {
+    let mut columns = vec![
+        BoardColumnDefinition {
+            id:   BoardColumn::Queued,
+            name: "Queued".into(),
+        },
+        BoardColumnDefinition {
+            id:   BoardColumn::Initializing,
+            name: "Initializing".into(),
+        },
+        BoardColumnDefinition {
+            id:   BoardColumn::Running,
+            name: "Running".into(),
+        },
+        BoardColumnDefinition {
+            id:   BoardColumn::Blocked,
+            name: "Blocked".into(),
+        },
+        BoardColumnDefinition {
+            id:   BoardColumn::Succeeded,
+            name: "Succeeded".into(),
+        },
+        BoardColumnDefinition {
+            id:   BoardColumn::Failed,
+            name: "Failed".into(),
+        },
+    ];
+    if include_archived {
+        columns.push(BoardColumnDefinition {
+            id:   BoardColumn::Archived,
+            name: "Archived".into(),
+        });
     }
-
-    if let Some(sandbox) = run_state.sandbox {
-        let mut sandbox_metadata = serde_json::Map::new();
-        sandbox_metadata.insert(
-            "working_directory".to_string(),
-            serde_json::json!(sandbox.working_directory),
-        );
-        if let Some(identifier) = sandbox.identifier {
-            sandbox_metadata.insert("id".to_string(), serde_json::json!(identifier));
-        }
-        metadata.insert(
-            "sandbox".to_string(),
-            serde_json::Value::Object(sandbox_metadata),
-        );
-    }
-
-    if let Some((_, record)) =
-        run_state
-            .pending_interviews
-            .iter()
-            .min_by(|(left_id, left), (right_id, right)| {
-                left.started_at
-                    .cmp(&right.started_at)
-                    .then_with(|| left_id.cmp(right_id))
-            })
-    {
-        metadata.insert(
-            "question".to_string(),
-            serde_json::json!({
-                "text": record.question.text,
-            }),
-        );
-    }
-
-    metadata
+    columns
 }
 
 fn paginate_items<T>(items: Vec<T>, pagination: &PaginationParams) -> (Vec<T>, bool) {
@@ -172,11 +151,11 @@ fn paginate_items<T>(items: Vec<T>, pagination: &PaginationParams) -> (Vec<T>, b
 async fn list_board_runs(
     _auth: RequiredUser,
     State(state): State<Arc<AppState>>,
-    Query(pagination): Query<PaginationParams>,
+    Query(params): Query<ListRunsParams>,
 ) -> Response {
-    let summaries = match state
+    let entries = match state
         .store
-        .list_runs(&fabro_store::ListRunsQuery::default())
+        .list_cached_runs(&fabro_store::ListRunsQuery::default())
         .await
     {
         Ok(runs) => runs,
@@ -185,31 +164,30 @@ async fn list_board_runs(
                 .into_response();
         }
     };
-    let board_summaries: Vec<_> = summaries
+    let include_archived = params.include_archived;
+    let board_summaries: Vec<_> = entries
         .into_iter()
-        .filter_map(|summary| {
-            let column = board_column(summary.status)?;
-            Some((summary, column))
+        .filter_map(|entry| {
+            let column = board_column(
+                entry.summary.lifecycle.status,
+                entry.summary.lifecycle.archived,
+            )?;
+            if column == BoardColumn::Archived && !include_archived {
+                return None;
+            }
+            Some(entry)
         })
         .collect();
-    let (page_summaries, has_more) = paginate_items(board_summaries, &pagination);
+    let (page_summaries, has_more) = paginate_items(board_summaries, &params.pagination());
 
-    let mut data = Vec::with_capacity(page_summaries.len());
-    for (summary, column) in page_summaries {
-        let run_id = summary.run_id;
-        let mut item =
-            serde_json::to_value(&summary).expect("RunSummary serialization is infallible");
-        item["column"] = serde_json::json!(column);
-        if let Some(object) = item.as_object_mut() {
-            object.extend(board_run_metadata(state.as_ref(), run_id).await);
-        }
-        data.push(item);
-    }
     (
         StatusCode::OK,
         Json(serde_json::json!({
-            "columns": board_columns(),
-            "data": data,
+            "columns": board_columns(include_archived),
+            "data": page_summaries
+                .into_iter()
+                .map(|entry| entry.summary)
+                .collect::<Vec<_>>(),
             "meta": { "has_more": has_more }
         })),
     )
@@ -223,16 +201,15 @@ async fn list_runs(
 ) -> Response {
     match state
         .store
-        .list_runs(&fabro_store::ListRunsQuery::default())
+        .list_cached_runs(&fabro_store::ListRunsQuery::default())
         .await
     {
-        Ok(runs) => {
+        Ok(entries) => {
             let include_archived = params.include_archived;
-            let items = runs
+            let items = entries
                 .into_iter()
-                .filter(|summary| {
-                    include_archived || !matches!(summary.status, RunStatus::Archived { .. })
-                })
+                .map(|entry| entry.summary)
+                .filter(|summary| include_archived || !summary.lifecycle.archived)
                 .collect::<Vec<_>>();
             let (data, has_more) = paginate_items(items, &params.pagination());
             (
@@ -275,7 +252,6 @@ struct CommandLogQuery {
 
 #[derive(Debug, serde::Serialize)]
 struct CommandLogResponseBody {
-    stream:         CommandOutputStream,
     offset:         u64,
     next_offset:    u64,
     total_bytes:    u64,
@@ -305,12 +281,16 @@ async fn resolve_run(
     match resolve_run_by_selector(
         &runs,
         &query.selector,
-        |run| run.run_id.to_string(),
-        |run| run.workflow_slug.clone(),
-        |run| run.workflow_name.clone(),
-        |run| run.run_id.created_at(),
-        |run| run.run_id.created_at().to_rfc3339(),
-        |run| run.repo_origin_url.clone(),
+        |run| run.id.to_string(),
+        |run| run.workflow.slug.clone(),
+        |run| Some(run.workflow.name.clone()),
+        |run| run.id.created_at(),
+        |run| run.id.created_at().to_rfc3339(),
+        |run| {
+            run.repository
+                .as_ref()
+                .and_then(|repository| repository.origin_url.clone())
+        },
     ) {
         Ok(run) => (StatusCode::OK, Json(run.clone())).into_response(),
         Err(err @ (ResolveRunError::InvalidSelector | ResolveRunError::AmbiguousPrefix { .. })) => {
@@ -334,8 +314,67 @@ async fn delete_run(
     };
 
     match delete_run_internal(&state, id, query.force).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(super::super::DeleteRunOutcome::NoContent) => StatusCode::NO_CONTENT.into_response(),
+        Ok(super::super::DeleteRunOutcome::Preserved(response)) => {
+            (StatusCode::OK, Json(response)).into_response()
+        }
         Err(response) => response,
+    }
+}
+
+async fn update_run(
+    subject: RequiredUser,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Response {
+    let id = match parse_run_id_path(&id) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    let request = match serde_json::from_slice::<UpdateRunRequest>(&body) {
+        Ok(request) => request,
+        Err(err) => return ApiError::bad_request(err.to_string()).into_response(),
+    };
+    let title = match fabro_types::normalize_explicit_run_title(request.title.as_str()) {
+        Ok(title) => title,
+        Err(err) => return ApiError::bad_request(err.to_string()).into_response(),
+    };
+    let current = match state.store.get_cached_summary(&id).await {
+        Ok(Some(summary)) => summary,
+        Ok(None) => return ApiError::not_found("Run not found.").into_response(),
+        Err(err) => {
+            return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+                .into_response();
+        }
+    };
+    if current.title == title {
+        return (StatusCode::OK, Json(current)).into_response();
+    }
+
+    let run_store = match state.store.open_run(&id).await {
+        Ok(run_store) => run_store,
+        Err(err) => {
+            return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+                .into_response();
+        }
+    };
+    if let Err(err) =
+        workflow_event::append_event(&run_store, &id, &workflow_event::Event::RunTitleUpdated {
+            title,
+            actor: Some(Principal::User(subject.0)),
+        })
+        .await
+    {
+        return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
+    }
+
+    match state.store.get_cached_summary(&id).await {
+        Ok(Some(summary)) => (StatusCode::OK, Json(summary)).into_response(),
+        Ok(None) => ApiError::not_found("Run not found.").into_response(),
+        Err(err) => {
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
+        }
     }
 }
 
@@ -399,6 +438,14 @@ async fn create_run(
         }
     };
     let created_at = created.run_id.created_at();
+    let summary = match state.store.get_cached_summary(&created.run_id).await {
+        Ok(Some(summary)) => summary,
+        Ok(None) => return ApiError::not_found("Run not found.").into_response(),
+        Err(err) => {
+            return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+                .into_response();
+        }
+    };
 
     {
         let mut runs = state.runs.lock().expect("runs lock poisoned");
@@ -414,19 +461,7 @@ async fn create_run(
         );
     }
 
-    (
-        StatusCode::CREATED,
-        Json(RunStatusResponse {
-            id: run_id.to_string(),
-            status: RunStatus::Submitted,
-            error: None,
-            queue_position: None,
-            pending_control: None,
-            created_at,
-            web_url,
-        }),
-    )
-        .into_response()
+    (StatusCode::CREATED, Json(summary)).into_response()
 }
 
 fn run_provenance(headers: &HeaderMap, subject: &UserPrincipal) -> RunProvenance {
@@ -527,15 +562,9 @@ async fn get_run_status(
         Ok(id) => id,
         Err(response) => return response,
     };
-    match state
-        .store
-        .list_runs(&fabro_store::ListRunsQuery::default())
-        .await
-    {
-        Ok(runs) => match runs.into_iter().find(|run| run.run_id == id) {
-            Some(run) => (StatusCode::OK, Json(run)).into_response(),
-            None => ApiError::not_found("Run not found.").into_response(),
-        },
+    match state.store.get_cached_summary(&id).await {
+        Ok(Some(run)) => (StatusCode::OK, Json(run)).into_response(),
+        Ok(None) => ApiError::not_found("Run not found.").into_response(),
         Err(err) => {
             ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
         }
@@ -551,27 +580,19 @@ async fn get_run_settings(
         Ok(id) => id,
         Err(response) => return response,
     };
-    let run_store = match state.store.open_run_reader(&id).await {
-        Ok(store) => store,
-        Err(fabro_store::Error::RunNotFound(_)) => {
-            return ApiError::not_found("Run not found.").into_response();
-        }
+    let cached = match state.store.get_cached_run(&id).await {
+        Ok(Some(cached)) => cached,
+        Ok(None) => return ApiError::not_found("Run not found.").into_response(),
         Err(err) => {
             return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
                 .into_response();
         }
     };
-    let run_state = match run_store.state().await {
-        Ok(state) => state,
-        Err(err) => {
-            return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
-                .into_response();
-        }
-    };
-    let Some(run_spec) = run_state.spec else {
-        return ApiError::not_found("Run not found.").into_response();
-    };
-    (StatusCode::OK, Json(run_spec.settings)).into_response()
+    (
+        StatusCode::OK,
+        Json(cached.projection.spec.settings.clone()),
+    )
+        .into_response()
 }
 
 async fn get_questions(
@@ -583,23 +604,17 @@ async fn get_questions(
         Ok(id) => id,
         Err(response) => return response,
     };
-    match state.store.open_run_reader(&id).await {
-        Ok(run_store) => match run_store.state().await {
-            Ok(run_state) => {
-                let questions = run_state
-                    .pending_interviews
-                    .values()
-                    .map(api_question_from_pending_interview)
-                    .collect::<Vec<_>>();
-                (StatusCode::OK, Json(ListResponse::new(questions))).into_response()
-            }
-            Err(err) => {
-                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
-            }
-        },
-        Err(fabro_store::Error::RunNotFound(_)) => {
-            ApiError::not_found("Run not found.").into_response()
+    match state.store.get_cached_run(&id).await {
+        Ok(Some(cached)) => {
+            let questions = cached
+                .projection
+                .pending_interviews
+                .values()
+                .map(api_question_from_pending_interview)
+                .collect::<Vec<_>>();
+            (StatusCode::OK, Json(ListResponse::new(questions))).into_response()
         }
+        Ok(None) => ApiError::not_found("Run not found.").into_response(),
         Err(err) => {
             ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
         }
@@ -638,14 +653,12 @@ async fn get_run_state(
     RequireRunScoped(id): RequireRunScoped,
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    match state.store.open_run_reader(&id).await {
-        Ok(run_store) => match run_store.state().await {
-            Ok(run_state) => Json(run_state).into_response(),
-            Err(err) => {
-                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
-            }
-        },
-        Err(_) => ApiError::not_found("Run not found.").into_response(),
+    match state.store.get_cached_run(&id).await {
+        Ok(Some(cached)) => Json((*cached.projection).clone()).into_response(),
+        Ok(None) => ApiError::not_found("Run not found.").into_response(),
+        Err(err) => {
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
+        }
     }
 }
 
@@ -673,7 +686,7 @@ async fn get_run_logs(
 }
 
 async fn get_run_stage_command_log(
-    RequireCommandLog(id, stage_id, stream): RequireCommandLog,
+    RequireCommandLog(id, stage_id): RequireCommandLog,
     State(state): State<Arc<AppState>>,
     Query(query): Query<CommandLogQuery>,
 ) -> Response {
@@ -697,10 +710,7 @@ async fn get_run_stage_command_log(
         return ApiError::not_found("Stage not found.").into_response();
     };
 
-    let stream_value = match stream {
-        CommandOutputStream::Stdout => node.stdout.as_deref(),
-        CommandOutputStream::Stderr => node.stderr.as_deref(),
-    };
+    let stream_value = node.output.as_deref();
     let cas_ref = stream_value
         .filter(|value| parse_blob_ref(value).is_some())
         .map(str::to_string);
@@ -711,12 +721,11 @@ async fn get_run_stage_command_log(
         .run_scratch(&id)
         .root()
         .to_path_buf();
-    let scratch_path = command_log_path(&run_dir, &stage_id, stream);
+    let scratch_path = command_log_path(&run_dir, &stage_id);
 
     match read_log_slice(&scratch_path, query.offset, limit).await {
         Ok((bytes, total_bytes)) => {
             return build_command_log_response(
-                stream,
                 query.offset,
                 limit,
                 LogSource::Sliced { bytes, total_bytes },
@@ -742,7 +751,6 @@ async fn get_run_stage_command_log(
             }
         };
         return build_command_log_response(
-            stream,
             query.offset,
             limit,
             LogSource::Full(text.as_bytes()),
@@ -754,7 +762,6 @@ async fn get_run_stage_command_log(
 
     if let Some(inline_text) = stream_value {
         return build_command_log_response(
-            stream,
             query.offset,
             limit,
             LogSource::Full(inline_text.as_bytes()),
@@ -765,7 +772,6 @@ async fn get_run_stage_command_log(
     }
 
     build_command_log_response(
-        stream,
         query.offset,
         limit,
         LogSource::Full(&[]),
@@ -784,7 +790,6 @@ enum LogSource<'a> {
 }
 
 fn build_command_log_response(
-    stream: CommandOutputStream,
     requested_offset: u64,
     limit: u64,
     source: LogSource<'_>,
@@ -808,7 +813,6 @@ fn build_command_log_response(
         }
     };
     Json(CommandLogResponseBody {
-        stream,
         offset,
         next_offset: offset + u64::try_from(body_bytes.len()).unwrap_or(u64::MAX),
         total_bytes,

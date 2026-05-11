@@ -5,12 +5,14 @@ use serde::{Deserialize, Serialize};
 use super::{BilledTokenCounts, ExecOutputTail, RunNoticeLevel};
 use crate::status::{BlockedReason, FailureReason, SuccessReason};
 use crate::{
-    ForkSourceRef, GitContext, Graph, RunBlobId, RunControlAction, RunId, RunProvenance,
-    WorkflowSettings,
+    DiffSummary, ForkSourceRef, GitContext, Graph, RunBlobId, RunControlAction, RunId,
+    RunProvenance, WorkflowSettings,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunCreatedProps {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title:            Option<String>,
     pub settings:         WorkflowSettings,
     pub graph:            Graph,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -34,8 +36,6 @@ pub struct RunCreatedProps {
     pub git:              Option<GitContext>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fork_source_ref:  Option<ForkSourceRef>,
-    #[serde(default)]
-    pub in_place:         bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_url:          Option<String>,
 }
@@ -69,6 +69,18 @@ pub struct RunStatusTransitionProps {}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct RunStatusEffectProps {}
 
+#[allow(
+    clippy::empty_structs_with_brackets,
+    reason = "This type must serialize as {} rather than null."
+)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct RunInterruptProps {}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunSteerProps {
+    pub text: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunSubmittedProps {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -100,6 +112,11 @@ pub struct RunSupersededByProps {
     pub target_visit:              usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunTitleUpdatedProps {
+    pub title: String,
+}
+
 #[allow(
     clippy::empty_structs_with_brackets,
     reason = "This type must serialize as {} rather than null."
@@ -127,6 +144,8 @@ pub struct RunCompletedProps {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_patch:          Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_summary:         Option<DiffSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub billing:              Option<BilledTokenCounts>,
 }
 
@@ -143,6 +162,8 @@ pub struct RunFailedProps {
     // pre-change events replay with `final_patch: None` via serde default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_patch:    Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_summary:   Option<DiffSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

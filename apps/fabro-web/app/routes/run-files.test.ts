@@ -4,7 +4,12 @@ import {
   deepLinkToastMessage,
   emptyTransitionToastMessage,
   extractRequestId,
+  normalizeRunFileScope,
 } from "./run-files";
+import {
+  buildRunCommitOptions,
+  fabroGeneratedCommitStage,
+} from "./run-files/commit-options";
 
 function buildRunFilesPayload({
   files = [],
@@ -23,6 +28,8 @@ function buildRunFilesPayload({
     meta: {
       degraded,
       total_changed: files.length,
+      source: "sandbox",
+      scope: "committed",
       stats: { additions: 0, deletions: 0 },
       truncated: false,
     },
@@ -88,6 +95,57 @@ describe("emptyTransitionToastMessage", () => {
     expect(emptyTransitionToastMessage(0, 0)).toBeNull();
     expect(emptyTransitionToastMessage(null, 0)).toBeNull();
     expect(emptyTransitionToastMessage(2, 1)).toBeNull();
+  });
+});
+
+describe("normalizeRunFileScope", () => {
+  test("defaults missing or invalid values to committed", () => {
+    expect(normalizeRunFileScope(null)).toBe("committed");
+    expect(normalizeRunFileScope("dirty")).toBe("committed");
+  });
+
+  test("accepts supported scope values", () => {
+    expect(normalizeRunFileScope("committed")).toBe("committed");
+    expect(normalizeRunFileScope("uncommitted")).toBe("uncommitted");
+    expect(normalizeRunFileScope("all")).toBe("all");
+  });
+});
+
+describe("buildRunCommitOptions", () => {
+  test("shortens Fabro-generated subjects to stage visits", () => {
+    const commits = [
+      {
+        sha:       "a".repeat(40),
+        short_sha: "aaaaaaa",
+        subject:   "fabro(run_1): implement (succeeded)",
+        parents:   [{ sha: "1".repeat(40), short_sha: "1111111" }],
+      },
+      {
+        sha:       "b".repeat(40),
+        short_sha: "bbbbbbb",
+        subject:   "fabro(run_1): implement (succeeded)",
+        parents:   [{ sha: "a".repeat(40), short_sha: "aaaaaaa" }],
+      },
+    ];
+
+    expect(buildRunCommitOptions(commits).map((commit) => commit.label)).toEqual([
+      "implement@1",
+      "implement@2",
+    ]);
+  });
+
+  test("leaves externally generated commit subjects intact", () => {
+    const [option] = buildRunCommitOptions([
+      {
+        sha:       "a".repeat(40),
+        short_sha: "aaaaaaa",
+        subject:   "Fix README typo",
+        parents:   [{ sha: "1".repeat(40), short_sha: "1111111" }],
+      },
+    ]);
+
+    expect(fabroGeneratedCommitStage("Fix README typo")).toBeNull();
+    expect(option.label).toBe("Fix README typo");
   });
 });
 

@@ -34,7 +34,7 @@ Files that omit `_version` are treated as version `1`. The legacy top-level `ver
 | Scope | Examples |
 |---|---|
 | CLI-only | `[cli.target]`, `[cli.auth]`, `[cli.exec]`, `[cli.output]`, `[cli.updates]`, `[cli.logging]` |
-| Shared run defaults | `[run.model]`, `[run.sandbox]`, `[run.checkpoint]`, `[run.inputs]`, `[run.prepare]`, `[run.pull_request]`, `[run.hooks]`, `[run.agent.mcps]` |
+| Shared run defaults | `[run.model]`, `[run.sandbox]`, `[run.checkpoint]`, `[run.inputs]`, `[run.prepare]`, `[run.pull_request]`, `[run.integrations.github.permissions]`, `[run.hooks]`, `[run.agent.mcps]` |
 | Server-only | `[server.listen]`, `[server.api]`, `[server.web]`, `[server.auth]`, `[server.storage]`, `[server.artifacts]`, `[server.slatedb]`, `[server.scheduler]`, `[server.logging]`, `[server.integrations]` |
 
 `[cli.*]` and `[server.*]` stanzas are owner-specific: they are only consumed from `~/.fabro/settings.toml` (plus process-local flags and env overrides). The same stanzas in `.fabro/project.toml` or `workflow.toml` remain schema-valid but runtime-inert.
@@ -92,6 +92,10 @@ email = "fabro-bot@company.com"
 
 [run.pull_request]
 enabled = true
+
+[run.integrations.github.permissions]
+contents = "write"
+pull_requests = "write"
 
 [run.agent.mcps.filesystem]
 type = "stdio"

@@ -7,9 +7,7 @@ use fabro_interview::Interviewer;
 use fabro_llm::Provider;
 use fabro_mcp::config::McpServerSettings;
 use fabro_model::FallbackTarget;
-use fabro_retro::retro::Retro;
 use fabro_sandbox::SandboxSpec;
-use fabro_sandbox::config::WorktreeMode;
 use fabro_types::RunId;
 use fabro_types::settings::run::PullRequestSettings;
 use fabro_validate::{Diagnostic, Severity};
@@ -29,6 +27,7 @@ use crate::run_control::RunControlState;
 use crate::run_options::{GitCheckpointOptions, LifecycleOptions, RunOptions};
 use crate::runtime_store::RunStoreHandle;
 use crate::services::{EngineServices, RunServices};
+use crate::steering_hub::SteeringHub;
 use crate::transforms::Transform;
 use crate::workflow_bundle::WorkflowBundle;
 
@@ -240,6 +239,7 @@ pub struct InitOptions {
     pub sandbox:           SandboxSpec,
     pub llm:               LlmSpec,
     pub interviewer:       Arc<dyn Interviewer>,
+    pub steering_hub:      Arc<SteeringHub>,
     pub lifecycle:         LifecycleOptions,
     pub run_options:       RunOptions,
     pub workflow_path:     Option<ManifestPath>,
@@ -249,7 +249,6 @@ pub struct InitOptions {
     pub vault:             Option<Arc<AsyncRwLock<Vault>>>,
     pub devcontainer:      Option<DevcontainerSpec>,
     pub git:               Option<GitCheckpointOptions>,
-    pub worktree_mode:     Option<WorktreeMode>,
     pub registry_override: Option<Arc<HandlerRegistry>>,
     pub artifact_sink:     Option<ArtifactSink>,
     pub run_control:       Option<Arc<RunControlState>>,
@@ -284,17 +283,6 @@ pub struct Executed {
     pub model:         String,
 }
 
-/// Output of the RETRO phase.
-#[non_exhaustive]
-pub struct Retroed {
-    pub graph:       Graph,
-    pub outcome:     Result<Outcome, Error>,
-    pub run_options: RunOptions,
-    pub duration_ms: u64,
-    pub services:    Arc<RunServices>,
-    pub retro:       Option<Retro>,
-}
-
 /// Output of the FINALIZE phase.
 #[non_exhaustive]
 pub struct Concluded {
@@ -323,24 +311,13 @@ pub struct TransformOptions {
     pub custom_transforms: Vec<Box<dyn Transform>>,
 }
 
-/// Options for the RETRO phase.
-pub struct RetroOptions {
-    pub run_id:          RunId,
-    pub services:        Arc<RunServices>,
-    pub workflow_name:   String,
-    pub goal:            String,
-    pub failed:          bool,
-    pub run_duration_ms: u64,
-    pub enabled:         bool,
-    pub model:           String,
-}
-
 /// Options for the FINALIZE phase.
 pub struct FinalizeOptions {
     pub run_dir:          PathBuf,
     pub run_id:           RunId,
     pub workflow_name:    String,
     pub preserve_sandbox: bool,
+    pub stop_on_terminal: bool,
     pub last_git_sha:     Option<String>,
 }
 

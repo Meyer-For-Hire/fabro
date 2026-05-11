@@ -93,6 +93,7 @@ async fn spawn_served_listener(
             },
             styles,
             Some(storage_dir),
+            None,
             move |bind| {
                 let sender = tx.take().expect("server should only report readiness once");
                 sender.send(bind.clone()).ok();

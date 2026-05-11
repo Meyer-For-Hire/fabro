@@ -14,6 +14,7 @@ pub(crate) mod command;
 pub(crate) mod cp;
 pub(crate) mod create;
 pub(crate) mod diff;
+pub(crate) mod events;
 pub(crate) mod fork;
 pub(crate) mod logs;
 pub(crate) mod output;
@@ -25,6 +26,7 @@ pub(crate) mod run_progress;
 pub(crate) mod runner;
 pub(crate) mod ssh;
 pub(crate) mod start;
+pub(crate) mod steer;
 pub(crate) mod wait;
 
 pub(crate) async fn dispatch(
@@ -50,7 +52,7 @@ pub(crate) async fn dispatch(
         RunCommands::Start(StartArgs { server, run }) => {
             let ctx = base_ctx.with_target(&server)?;
             let client = ctx.server().await?;
-            let run_id = client.resolve_run(&run).await?.run_id;
+            let run_id = client.resolve_run(&run).await?.id;
             start::start_run_with_client(client.as_ref(), &run_id, false).await?;
             if ctx.json_output() {
                 print_json_pretty(&serde_json::json!({ "run_id": run_id }))?;
@@ -61,7 +63,7 @@ pub(crate) async fn dispatch(
             let styles: &'static Styles = Box::leak(Box::new(Styles::detect_stderr()));
             let ctx = base_ctx.with_target(&server)?;
             let client = ctx.server().await?;
-            let run_id = client.resolve_run(&run).await?.run_id;
+            let run_id = client.resolve_run(&run).await?.id;
             let json = ctx.json_output();
             let exit_code = Box::pin(attach::attach_run_with_client(
                 client.as_ref(),
@@ -98,10 +100,11 @@ pub(crate) async fn dispatch(
             .await
         }
         RunCommands::Diff(args) => diff::run(args, base_ctx).await,
-        RunCommands::Logs(args) => {
+        RunCommands::Events(args) => {
             let styles = Styles::detect_stdout();
-            logs::run(&args, &styles, base_ctx).await
+            events::run(&args, &styles, base_ctx).await
         }
+        RunCommands::Logs(args) => logs::run(&args, base_ctx).await,
         RunCommands::Resume(args) => {
             let styles: &'static Styles = Box::leak(Box::new(Styles::detect_stderr()));
             #[cfg(feature = "sleep_inhibitor")]
@@ -123,5 +126,6 @@ pub(crate) async fn dispatch(
             let styles = Styles::detect_stderr();
             wait::run(&args, &styles, base_ctx).await
         }
+        RunCommands::Steer(args) => steer::run(args, base_ctx).await,
     }
 }

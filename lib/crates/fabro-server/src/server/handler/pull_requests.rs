@@ -148,12 +148,7 @@ impl<'a> RunPrInputs<'a> {
                 "pull_request_exists",
             ));
         }
-        let run_spec = run_state.spec.as_ref().ok_or_else(|| {
-            ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Run spec missing from store.",
-            )
-        })?;
+        let run_spec = &run_state.spec;
         let origin_url = run_spec.repo_origin_url().ok_or_else(|| {
             ApiError::with_code(
                 StatusCode::BAD_REQUEST,
@@ -180,8 +175,9 @@ impl<'a> RunPrInputs<'a> {
                 )
             })?;
         let diff = run_state
-            .final_patch
-            .as_deref()
+            .conclusion
+            .as_ref()
+            .and_then(|conclusion| conclusion.diff.patch.as_deref())
             .filter(|d| !d.trim().is_empty())
             .ok_or_else(|| {
                 ApiError::with_code(
@@ -316,8 +312,22 @@ async fn get_run_pull_request(
     .await
     {
         Ok(github) => Json(fabro_types::PullRequestDetail {
-            record: ctx.record,
-            github,
+            pull_request:  ctx.record,
+            state:         github.state,
+            draft:         github.draft,
+            merged:        github.merged,
+            merged_at:     github.merged_at,
+            mergeable:     github.mergeable,
+            additions:     github.additions,
+            deletions:     github.deletions,
+            changed_files: github.changed_files,
+            comments:      0,
+            checks:        Vec::new(),
+            author:        github.user,
+            timestamps:    fabro_types::PullRequestTimestamps {
+                created_at: github.created_at,
+                updated_at: github.updated_at,
+            },
         })
         .into_response(),
         Err(fabro_github::PullRequestApiError::NotFound { .. }) => {

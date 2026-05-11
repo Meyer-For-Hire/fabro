@@ -5,7 +5,7 @@
   "scripts": {
     "build": "bun run scripts/build.ts",
     "dev": "bun run scripts/build.ts --watch",
-    "test": "bun test",
+    "test": "bun test --isolate",
     "typecheck": "tsc"
   },
   "dependencies": {
@@ -20,6 +20,9 @@
     "@qltysh/fabro-api-client": "workspace:*",
     "@tailwindcss/typography": "^0.5.19",
     "@viz-js/viz": "^3.24.0",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
+    "axios": "^1.7.0",
     "marked": "^18.0.0",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",

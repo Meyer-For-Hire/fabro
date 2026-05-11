@@ -2,7 +2,9 @@ use fabro_test::{fabro_snapshot, test_context};
 use httpmock::MockServer;
 use serde_json::Value;
 
-use super::support::{setup_seeded_completed_dry_run, setup_seeded_created_dry_run};
+use super::support::{
+    remote_run_summary_json, setup_seeded_completed_dry_run, setup_seeded_created_dry_run,
+};
 use crate::support::unique_run_id;
 
 fn ulid_filter() -> (String, String) {
@@ -96,9 +98,8 @@ fn archive_succeeded_run_hides_it_from_default_ps() {
     assert!(output.status.success());
     let runs: Vec<Value> = serde_json::from_slice(&output.stdout).expect("ps JSON should parse");
     assert_eq!(runs.len(), 1, "ps -a should show the archived run");
-    assert_eq!(runs[0]["status"]["kind"], "archived");
-    assert_eq!(runs[0]["status"]["prior"]["kind"], "succeeded");
-    assert_eq!(runs[0]["status"]["prior"]["reason"], "completed");
+    assert_eq!(runs[0]["status"]["kind"], "succeeded");
+    assert_eq!(runs[0]["status"]["reason"], "completed");
     assert_eq!(runs[0]["run_id"], run.run_id);
 }
 
@@ -214,26 +215,17 @@ fn archive_resolves_selector_via_server_endpoint() {
         then.status(200)
             .header("Content-Type", "application/json")
             .body(
-                serde_json::json!({
-                    "run_id": run_id,
-                    "workflow_name": "Nightly Build",
-                    "workflow_slug": "nightly-build",
-                    "goal": "Nightly run",
-                    "title": "Nightly run",
-                    "labels": {},
-                    "source_directory": null,
-                    "repository": { "name": "unknown" },
-                    "start_time": "2026-04-05T12:00:00Z",
-                    "created_at": "2026-04-05T12:00:00Z",
-                    "status": {
+                remote_run_summary_json(
+                    &run_id,
+                    "Nightly Build",
+                    "nightly-build",
+                    "Nightly run",
+                    &serde_json::json!({
                         "kind": "succeeded",
                         "reason": "completed"
-                    },
-                    "pending_control": null,
-                    "duration_ms": 123,
-                    "elapsed_secs": 0,
-                    "total_usd_micros": null
-                })
+                    }),
+                    "2026-04-05T12:00:00Z",
+                )
                 .to_string(),
             );
     });
@@ -243,20 +235,17 @@ fn archive_resolves_selector_via_server_endpoint() {
         then.status(200)
             .header("Content-Type", "application/json")
             .body(
-                serde_json::json!({
-                    "id": run_id,
-                    "status": {
-                        "kind": "archived",
-                        "prior": {
-                            "kind": "succeeded",
-                            "reason": "completed"
-                        }
-                    },
-                    "error": null,
-                    "queue_position": null,
-                    "pending_control": null,
-                    "created_at": "2026-04-05T12:00:00Z"
-                })
+                remote_run_summary_json(
+                    &run_id,
+                    "Nightly Build",
+                    "nightly-build",
+                    "Nightly run",
+                    &serde_json::json!({
+                        "kind": "succeeded",
+                        "reason": "completed"
+                    }),
+                    "2026-04-05T12:00:00Z",
+                )
                 .to_string(),
             );
     });

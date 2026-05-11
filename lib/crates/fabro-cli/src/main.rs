@@ -48,6 +48,9 @@ async fn main() {
     let raw_args: Vec<String> = std::env::args().collect();
     let subcommand = raw_args.get(1).map(String::as_str);
     let subcommand_arg = raw_args.get(2).map(String::as_str);
+    if subcommand == Some("__cli-reference") && !matches!(subcommand_arg, Some("--help" | "-h")) {
+        std::process::exit(commands::cli_reference::execute());
+    }
     if subcommand == Some("__render-graph") && !matches!(subcommand_arg, Some("--help" | "-h")) {
         std::process::exit(commands::render_graph::execute());
     }
@@ -387,6 +390,9 @@ async fn main_inner(worker_token: Option<String>) -> (String, Result<()>) {
                 let _ = std::fs::remove_file(&path);
                 result?;
             }
+            Commands::CliReference => {
+                unreachable!("__cli-reference handled before CLI bootstrap")
+            }
             Commands::RenderGraph => unreachable!("__render-graph handled before CLI bootstrap"),
             #[cfg(debug_assertions)]
             Commands::TestPanic { message } => {
@@ -471,8 +477,15 @@ async fn prepare_server_bootstrap(
     let local_config = local_server::LocalServerConfig::load(config_path, storage_dir)?;
     let storage_dir = local_config.storage_dir().to_path_buf();
     let runtime_directory = fabro_config::RuntimeDirectory::new(storage_dir.clone());
+    let default_log_destination = if foreground {
+        LogDestination::Stdout
+    } else {
+        LogDestination::File
+    };
     let log_destination = fabro_config::resolve_log_destination(
-        local_config.config_log_destination().unwrap_or_default(),
+        local_config
+            .config_log_destination()
+            .unwrap_or(default_log_destination),
     )?;
     let foreground_server_log_bootstrap = if foreground {
         Some(
@@ -535,6 +548,7 @@ mod tests {
         AuthCommand, AuthNamespace, Commands, InstallGitHubStrategyArg, ModelsCommand,
         ProviderCommand, ProviderNamespace,
     };
+    use clap::error::ErrorKind;
     use temp_env::with_var;
     use tokio::runtime::Runtime;
 
@@ -546,6 +560,19 @@ mod tests {
 
     fn write_test_settings(path: &std::path::Path) {
         write_test_settings_with_logging(path, "warn", "stdout");
+    }
+
+    fn write_test_settings_without_log_destination(path: &std::path::Path) {
+        std::fs::write(
+            path,
+            r#"
+_version = 1
+
+[server.logging]
+level = "warn"
+"#,
+        )
+        .unwrap();
     }
 
     fn write_test_settings_with_logging(path: &std::path::Path, level: &str, destination: &str) {
@@ -736,6 +763,37 @@ destination = "{destination}"
     }
 
     #[test]
+    fn pre_tracing_bootstrap_defaults_foreground_start_to_stdout() {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("settings.toml");
+        write_test_settings_without_log_destination(&config_path);
+
+        let cli = Cli::try_parse_from([
+            "fabro",
+            "server",
+            "start",
+            "--foreground",
+            "--storage-dir",
+            storage_dir.path().to_str().unwrap(),
+            "--config",
+            config_path.to_str().unwrap(),
+        ])
+        .expect("should parse");
+        let command = cli.command.as_deref().unwrap();
+
+        let bootstrap = runtime()
+            .block_on(pre_tracing_bootstrap(command))
+            .expect("bootstrap should resolve");
+
+        assert_eq!(bootstrap.sink, logging::InternalLogSink::Server {
+            log: logging::LogSink::Stdout,
+        });
+        assert_eq!(bootstrap.config_log_level.as_deref(), Some("warn"));
+        assert!(bootstrap.foreground_server_log_bootstrap.is_some());
+    }
+
+    #[test]
     fn pre_tracing_bootstrap_uses_server_sink_for_server_restart_foreground() {
         let storage_dir = tempfile::tempdir().unwrap();
         let config_dir = tempfile::tempdir().unwrap();
@@ -767,6 +825,37 @@ destination = "{destination}"
     }
 
     #[test]
+    fn pre_tracing_bootstrap_explicit_file_keeps_foreground_start_on_file() {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("settings.toml");
+        write_test_settings_with_logging(&config_path, "warn", "file");
+
+        let cli = Cli::try_parse_from([
+            "fabro",
+            "server",
+            "start",
+            "--foreground",
+            "--storage-dir",
+            storage_dir.path().to_str().unwrap(),
+            "--config",
+            config_path.to_str().unwrap(),
+        ])
+        .expect("should parse");
+        let command = cli.command.as_deref().unwrap();
+
+        let bootstrap = runtime()
+            .block_on(pre_tracing_bootstrap(command))
+            .expect("bootstrap should resolve");
+
+        assert_eq!(bootstrap.sink, logging::InternalLogSink::Server {
+            log: logging::LogSink::File(storage_dir.path().join("logs").join("server.log")),
+        });
+        assert_eq!(bootstrap.config_log_level.as_deref(), Some("warn"));
+        assert!(bootstrap.foreground_server_log_bootstrap.is_some());
+    }
+
+    #[test]
     fn pre_tracing_bootstrap_uses_server_sink_for_server_serve() {
         let storage_dir = tempfile::tempdir().unwrap();
         let config_dir = tempfile::tempdir().unwrap();
@@ -790,6 +879,35 @@ destination = "{destination}"
 
         assert_eq!(bootstrap.sink, logging::InternalLogSink::Server {
             log: logging::LogSink::Stdout,
+        });
+        assert_eq!(bootstrap.config_log_level.as_deref(), Some("warn"));
+        assert!(bootstrap.foreground_server_log_bootstrap.is_none());
+    }
+
+    #[test]
+    fn pre_tracing_bootstrap_defaults_server_serve_to_file() {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let config_path = config_dir.path().join("settings.toml");
+        write_test_settings_without_log_destination(&config_path);
+        let cli = Cli::try_parse_from([
+            "fabro",
+            "server",
+            "__serve",
+            "--storage-dir",
+            storage_dir.path().to_str().unwrap(),
+            "--config",
+            config_path.to_str().unwrap(),
+        ])
+        .expect("should parse");
+        let command = cli.command.as_deref().unwrap();
+
+        let bootstrap = runtime()
+            .block_on(pre_tracing_bootstrap(command))
+            .expect("bootstrap should resolve");
+
+        assert_eq!(bootstrap.sink, logging::InternalLogSink::Server {
+            log: logging::LogSink::File(storage_dir.path().join("logs").join("server.log")),
         });
         assert_eq!(bootstrap.config_log_level.as_deref(), Some("warn"));
         assert!(bootstrap.foreground_server_log_bootstrap.is_none());
@@ -1061,6 +1179,64 @@ destination = "{destination}"
     }
 
     #[test]
+    fn parse_run_input_short_flag() {
+        let cli = Cli::try_parse_from(["fabro", "run", "workflow.toml", "-I", "foo=bar"])
+            .expect("should parse");
+        match *cli.command.unwrap() {
+            Commands::RunCmd(RunCommands::Run(args)) => {
+                assert_eq!(args.inputs.values, vec!["foo=bar"]);
+            }
+            _ => panic!("unexpected command variant"),
+        }
+    }
+
+    #[test]
+    fn run_manifest_args_preserves_input_only_manifest_args() {
+        let cli = Cli::try_parse_from(["fabro", "run", "workflow.toml", "-I", "foo=bar"])
+            .expect("should parse");
+        match *cli.command.unwrap() {
+            Commands::RunCmd(RunCommands::Run(args)) => {
+                let manifest_args = manifest_builder::run_manifest_args(&args)
+                    .expect("input-only args should be retained");
+                assert_eq!(manifest_args.input, vec!["foo=bar"]);
+            }
+            _ => panic!("unexpected command variant"),
+        }
+    }
+
+    #[test]
+    fn parse_create_input_long_flag() {
+        let cli = Cli::try_parse_from(["fabro", "create", "workflow.toml", "--input", "foo=bar"])
+            .expect("should parse");
+        match *cli.command.unwrap() {
+            Commands::RunCmd(RunCommands::Create(args)) => {
+                assert_eq!(args.inputs.values, vec!["foo=bar"]);
+            }
+            _ => panic!("unexpected command variant"),
+        }
+    }
+
+    #[test]
+    fn parse_preflight_input_short_flag() {
+        let cli = Cli::try_parse_from(["fabro", "preflight", "workflow.toml", "-I", "foo=bar"])
+            .expect("should parse");
+        match *cli.command.unwrap() {
+            Commands::Preflight(args) => {
+                assert_eq!(args.inputs.values, vec!["foo=bar"]);
+            }
+            _ => panic!("unexpected command variant"),
+        }
+    }
+
+    #[test]
+    fn parse_top_level_short_version_still_reports_version() {
+        let Err(err) = Cli::try_parse_from(["fabro", "-V"]) else {
+            panic!("should report version");
+        };
+        assert_eq!(err.kind(), ErrorKind::DisplayVersion);
+    }
+
+    #[test]
     fn parse_run_storage_dir_after_subcommand_is_rejected() {
         let result = Cli::try_parse_from([
             "fabro",
@@ -1271,6 +1447,15 @@ destination = "{destination}"
         let cli = Cli::try_parse_from(["fabro", "__render-graph"]).expect("should parse");
         match *cli.command.unwrap() {
             Commands::RenderGraph => {}
+            _ => panic!("unexpected command variant"),
+        }
+    }
+
+    #[test]
+    fn parse_cli_reference_command() {
+        let cli = Cli::try_parse_from(["fabro", "__cli-reference"]).expect("should parse");
+        match *cli.command.unwrap() {
+            Commands::CliReference => {}
             _ => panic!("unexpected command variant"),
         }
     }

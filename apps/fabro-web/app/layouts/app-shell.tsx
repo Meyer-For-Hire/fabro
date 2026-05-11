@@ -13,7 +13,7 @@ import {
   ChartBarIcon,
   Cog6ToothIcon,
   PlayIcon,
-  RectangleStackIcon,
+  SparklesIcon,
   XMarkIcon,
 } from "@heroicons/react/24/outline";
 import { Link, Outlet, useLocation, useMatches } from "react-router";
@@ -24,7 +24,7 @@ import { useToggleDemoMode } from "../lib/mutations";
 import { useAuthMe } from "../lib/queries";
 
 const allNavigation = [
-  { name: "Workflows", href: "/workflows", icon: RectangleStackIcon, demoOnly: true },
+  { name: "Automations", href: "/automations", icon: SparklesIcon, demoOnly: true },
   { name: "Runs", href: "/runs", icon: PlayIcon, demoOnly: false },
   { name: "Insights", href: "/insights", icon: ChartBarIcon, demoOnly: true },
   { name: "Settings", href: "/settings", icon: Cog6ToothIcon, demoOnly: false },
@@ -68,6 +68,9 @@ export default function AppShell() {
   const headerExtra = handle?.headerExtra;
   const hideHeader = matches.some((m) => (m.handle as { hideHeader?: boolean } | undefined)?.hideHeader);
   const wide = matches.some((m) => (m.handle as { wide?: boolean } | undefined)?.wide);
+  const fullHeight = matches.some(
+    (m) => (m.handle as { fullHeight?: boolean } | undefined)?.fullHeight,
+  );
   const maxWidth = wide ? "" : "max-w-5xl";
 
   async function toggleDemoMode() {
@@ -77,8 +80,16 @@ export default function AppShell() {
   return (
     <DemoModeProvider value={demoMode}>
     <ToastProvider>
-    <div className="isolate min-h-full">
-      <Disclosure as="nav" className="bg-panel">
+    <div
+      className={classNames(
+        "isolate",
+        fullHeight ? "flex h-dvh flex-col" : "min-h-full",
+      )}
+    >
+      <Disclosure
+        as="nav"
+        className={classNames("bg-panel", fullHeight && "shrink-0")}
+      >
         <div className="px-4 sm:px-6 lg:px-8">
           <div className="flex h-16 items-center justify-between">
             <div className="flex items-center">
@@ -140,6 +151,14 @@ export default function AppShell() {
                     transition
                     className="absolute right-0 z-10 mt-2 w-48 origin-top-right rounded-md bg-panel py-1 outline-1 -outline-offset-1 outline-line-strong transition data-closed:scale-95 data-closed:transform data-closed:opacity-0 data-enter:duration-100 data-enter:ease-out data-leave:duration-75 data-leave:ease-in"
                   >
+                    <MenuItem>
+                      <Link
+                        to="/profile"
+                        className="block w-full px-4 py-2 text-left text-sm text-fg-3 data-focus:bg-overlay data-focus:outline-hidden"
+                      >
+                        Profile
+                      </Link>
+                    </MenuItem>
                     <MenuItem>
                       <form method="POST" action="/auth/logout">
                         <button
@@ -226,8 +245,15 @@ export default function AppShell() {
                 </button>
               </div>
             </div>
-            {provider !== "tailscale" && (
-              <div className="mt-3 space-y-1 px-2">
+            <div className="mt-3 space-y-1 px-2">
+              <DisclosureButton
+                as={Link}
+                to="/profile"
+                className="block w-full rounded-md px-3 py-2 text-left text-base font-medium text-fg-muted hover:bg-overlay hover:text-fg"
+              >
+                Profile
+              </DisclosureButton>
+              {provider !== "tailscale" && (
                 <form method="POST" action="/auth/logout">
                   <DisclosureButton
                     as="button"
@@ -237,14 +263,19 @@ export default function AppShell() {
                     Sign out
                   </DisclosureButton>
                 </form>
-              </div>
-            )}
+              )}
+            </div>
           </div>
         </DisclosurePanel>
       </Disclosure>
 
       {!hideHeader && (
-        <header className="relative bg-panel after:pointer-events-none after:absolute after:inset-x-0 after:bottom-0 after:border-b after:border-line-strong">
+        <header
+          className={classNames(
+            "relative bg-panel after:pointer-events-none after:absolute after:inset-x-0 after:bottom-0 after:border-b after:border-line-strong",
+            fullHeight && "shrink-0",
+          )}
+        >
           <div className={`mx-auto ${maxWidth} px-4 py-4 sm:px-6 lg:px-8`}>
             <div className="flex items-center">
               <h1 className="text-xl font-semibold tracking-tight text-fg">
@@ -255,8 +286,13 @@ export default function AppShell() {
           </div>
         </header>
       )}
-      <main>
-        <div className={`mx-auto ${maxWidth} px-4 py-6 sm:px-6 lg:px-8`}>
+      <main className={fullHeight ? "min-h-0 flex-1" : undefined}>
+        <div
+          className={classNames(
+            `mx-auto ${maxWidth} px-4 py-6 sm:px-6 lg:px-8`,
+            fullHeight && "box-border flex h-full min-h-0 flex-col",
+          )}
+        >
           <Outlet />
         </div>
       </main>

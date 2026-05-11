@@ -9,12 +9,12 @@ pub(super) async fn view_command(args: PrViewArgs, base_ctx: &CommandContext) ->
     let (ctx, client, run_id) =
         super::resolve_run_for_pr(base_ctx, &args.server, &args.run_id).await?;
     let detail = client.get_run_pull_request(&run_id).await?;
-    let github = &detail.github;
+    let pull_request = &detail.pull_request;
 
     info!(
-        number = github.number,
-        owner = %detail.record.owner,
-        repo = %detail.record.repo,
+        number = pull_request.number,
+        owner = %pull_request.owner,
+        repo = %pull_request.repo,
         "Viewing pull request"
     );
 
@@ -24,36 +24,30 @@ pub(super) async fn view_command(args: PrViewArgs, base_ctx: &CommandContext) ->
     }
 
     let printer = ctx.printer();
-    fabro_util::printout!(printer, "#{} {}", github.number, github.title);
-    let state_display = if github.merged {
+    fabro_util::printout!(printer, "#{} {}", pull_request.number, pull_request.title);
+    let state_display = if detail.merged {
         "merged"
-    } else if github.draft {
+    } else if detail.draft {
         "draft"
     } else {
-        &github.state
+        &detail.state
     };
     fabro_util::printout!(printer, "State:   {state_display}");
-    fabro_util::printout!(printer, "URL:     {}", github.html_url);
+    fabro_util::printout!(printer, "URL:     {}", pull_request.html_url);
     fabro_util::printout!(
         printer,
         "Branch:  {} -> {}",
-        github.head.ref_name,
-        github.base.ref_name
+        pull_request.head_branch,
+        pull_request.base_branch
     );
-    fabro_util::printout!(printer, "Author:  {}", github.user.login);
+    fabro_util::printout!(printer, "Author:  {}", detail.author.login);
     fabro_util::printout!(
         printer,
         "Changes: +{} -{} ({} files)",
-        github.additions,
-        github.deletions,
-        github.changed_files
+        detail.additions,
+        detail.deletions,
+        detail.changed_files
     );
-    if let Some(body) = &github.body {
-        if !body.is_empty() {
-            fabro_util::printout!(printer, "");
-            fabro_util::printout!(printer, "{body}");
-        }
-    }
 
     Ok(())
 }

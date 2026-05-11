@@ -11,6 +11,8 @@ tags:
     description: First-run browser install workflow
   - name: Integrations
     description: External provider callbacks and integration endpoints
+  - name: Auth
+    description: Browser authentication and demo-mode controls
   - name: Runs
     description: Run management operations
   - name: Human-in-the-Loop
@@ -621,6 +623,174 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 
+  # ── Auth ─────────────────────────────────────────────────────────────
+
+  /api/v1/auth/config:
+    get:
+      operationId: getAuthConfig
+      tags: [Auth]
+      summary: Retrieve auth configuration
+      description: Returns the browser login methods enabled for this server.
+      security: []
+      responses:
+        "200":
+          description: Enabled authentication methods
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthConfigResponse"
+
+  /api/v1/auth/me:
+    get:
+      operationId: getAuthMe
+      tags: [Auth]
+      summary: Retrieve current browser user
+      description: Returns the authenticated browser session user and demo-mode state.
+      responses:
+        "200":
+          description: Current authenticated browser user
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthMeResponse"
+        "401":
+          description: Not authenticated
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/auth/sessions:
+    get:
+      operationId: listAuthSessions
+      tags: [Auth]
+      summary: List authenticated sessions
+      description: Returns the current browser session and active CLI session chains for the authenticated user.
+      responses:
+        "200":
+          description: Authenticated sessions known to the server
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthSessionsResponse"
+        "401":
+          description: Not authenticated
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/auth/sessions/{id}:
+    delete:
+      operationId: deleteAuthSession
+      tags: [Auth]
+      summary: Revoke an authenticated session
+      description: Revokes an active CLI session chain. Browser sessions are not revocable in this API version.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Session revoked
+        "400":
+          description: Malformed or non-revocable session id
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Not authenticated
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Session not found
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/demo/toggle:
+    post:
+      operationId: toggleDemo
+      tags: [Auth]
+      summary: Toggle browser demo mode
+      description: Enables or disables demo-mode routing for the current browser session.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DemoToggleRequest"
+      responses:
+        "200":
+          description: Demo-mode state updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DemoToggleResponse"
+        "401":
+          description: Not authenticated
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /auth/login/dev-token:
+    post:
+      operationId: loginDevToken
+      tags: [Auth]
+      summary: Login with development token
+      description: Creates a browser session from an enabled development token.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DevTokenLoginRequest"
+      responses:
+        "200":
+          description: Browser session created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DevTokenLoginResponse"
+        "401":
+          description: Invalid or disabled development token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Session secret is not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
   # ── Runs ──────────────────────────────────────────────────────────────
 
   /api/v1/runs:
@@ -657,7 +827,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/RunStatusResponse"
+                $ref: "#/components/schemas/Run"
         "400":
           description: Invalid Graphviz source
           headers:
@@ -682,7 +852,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/RunSummary"
+                $ref: "#/components/schemas/Run"
         "400":
           description: Selector is invalid or ambiguous
           headers:
@@ -804,7 +974,45 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/RunSummary"
+                $ref: "#/components/schemas/Run"
+        "404":
+          description: Run not found
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    patch:
+      operationId: updateRun
+      tags: [Runs]
+      summary: Update Run
+      description: Updates mutable run metadata. Title updates are allowed for all run states, including archived runs.
+      parameters:
+        - $ref: "#/components/parameters/RunId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateRunRequest"
+      responses:
+        "200":
+          description: Updated durable run summary
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Run"
+        "400":
+          description: Invalid title
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "404":
           description: Run not found
           headers:
@@ -818,11 +1026,17 @@ paths:
       operationId: deleteRun
       tags: [Runs]
       summary: Delete Run
-      description: Deletes durable store state for a run. This does not remove any local run directory. Active runs require `force=true`.
+      description: Deletes durable store state, local run scratch data, and the run-owned sandbox unless sandbox preservation is enabled. Active runs require `force=true`.
       parameters:
         - $ref: "#/components/parameters/RunId"
         - $ref: "#/components/parameters/ForceRunDelete"
       responses:
+        "200":
+          description: Run deleted and sandbox preservation details returned
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeleteRunResponse"
         "204":
           description: Run deleted or already absent
         "404":
@@ -858,7 +1072,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/RunStatusResponse"
+                $ref: "#/components/schemas/Run"
         "404":
           description: Run not found
           headers:
@@ -870,6 +1084,114 @@ paths:
                 $ref: "#/components/schemas/ErrorResponse"
         "409":
           description: Run is not running
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/runs/{id}/steer:
+    post:
+      operationId: steerRun
+      tags: [Human-in-the-Loop]
+      summary: Steer Run
+      description: |
+        Send a mid-run steering message to the live agent session(s) of a
+        running run. Set `interrupt=true` to atomically interrupt the active
+        API-mode agent round first, then deliver this message as the next
+        user turn. Without `interrupt=true`, the message is appended to the
+        steering queue and may buffer until the next API-mode agent session.
+      parameters:
+        - $ref: "#/components/parameters/RunId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SteerRunRequest"
+      responses:
+        "202":
+          description: Steer accepted and forwarded to the worker
+        "400":
+          description: Invalid request body
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Run not found
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: |
+            Run is not currently steerable. Returned when the run is in a
+            terminal state, blocked (use the answer endpoint instead), or
+            all currently running agent stages are CLI-mode.
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Worker control channel unavailable
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/runs/{id}/interrupt:
+    post:
+      operationId: interruptRun
+      tags: [Human-in-the-Loop]
+      summary: Interrupt Run
+      description: |
+        Interrupt the active API-mode agent round without sending steering
+        text. The agent keeps its steering lease and waits for a later steer
+        message before starting another LLM round.
+      parameters:
+        - $ref: "#/components/parameters/RunId"
+      responses:
+        "202":
+          description: Interrupt accepted and forwarded to the worker
+        "404":
+          description: Run not found
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: |
+            Run is not currently interruptible. Returned when the run is in a
+            terminal state, blocked (use the answer endpoint instead), has no
+            active API-mode agent session, or all currently running agent
+            stages are CLI-mode.
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Worker control channel unavailable
           headers:
             x-request-id:
               $ref: "#/components/headers/XRequestId"
@@ -898,7 +1220,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/RunStatusResponse"
+                $ref: "#/components/schemas/Run"
         "404":
           description: Run not found
           headers:
@@ -932,7 +1254,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/RunStatusResponse"
+                $ref: "#/components/schemas/Run"
         "404":
           description: Run not found
           headers:
@@ -966,7 +1288,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/RunStatusResponse"
+                $ref: "#/components/schemas/Run"
         "404":
           description: Run not found
           headers:
@@ -1004,7 +1326,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/RunStatusResponse"
+                $ref: "#/components/schemas/Run"
         "404":
           description: Run not found
           headers:
@@ -1207,7 +1529,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/RunStatusResponse"
+                $ref: "#/components/schemas/Run"
         "404":
           description: Run not found
           headers:
@@ -1235,6 +1557,17 @@ paths:
       description: Renders the workflow graph as an SVG image using Graphviz.
       parameters:
         - $ref: "#/components/parameters/RunId"
+        - name: direction
+          in: query
+          required: false
+          description: Optional Graphviz rank direction override for the rendered graph.
+          schema:
+            type: string
+            enum:
+              - LR
+              - TB
+              - BT
+              - RL
       responses:
         "200":
           description: SVG image of the workflow graph
@@ -1309,10 +1642,11 @@ paths:
       operationId: listBoardRuns
       tags: [Runs]
       summary: List Board Runs
-      description: Temporary board-view list of managed runs. This endpoint is UI-oriented and may change as the app evolves.
+      description: Temporary board-view list of managed runs. This endpoint is UI-oriented and may change as the app evolves. Archived runs are hidden by default; pass `include_archived=true` to include them under the `archived` column.
       parameters:
         - $ref: "#/components/parameters/PageLimit"
         - $ref: "#/components/parameters/PageOffset"
+        - $ref: "#/components/parameters/IncludeArchived"
       responses:
         "200":
           description: Paginated list of runs for the board view
@@ -1391,7 +1725,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/PullRequestRecord"
+                $ref: "#/components/schemas/PullRequest"
         "400":
           description: Pull request creation does not apply to this run
           headers:
@@ -1452,7 +1786,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/PullRequestDetail"
+                $ref: "#/components/schemas/PullRequestDetails"
         "400":
           description: Pull request lookup does not apply to this run
           headers:
@@ -1768,16 +2102,15 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 
-  /api/v1/runs/{id}/stages/{stageId}/logs/{stream}:
+  /api/v1/runs/{id}/stages/{stageId}/logs/output:
     get:
       operationId: getRunStageCommandLog
       tags: [Run Internals]
       summary: Tail Command Log
-      description: Returns a byte-offset slice of a command stage stdout or stderr log. Bytes are base64-encoded and are not snapped to UTF-8 boundaries.
+      description: Returns a byte-offset slice of a command stage output log. Bytes are base64-encoded and are not snapped to UTF-8 boundaries.
       parameters:
         - $ref: "#/components/parameters/RunId"
         - $ref: "#/components/parameters/StageId"
-        - $ref: "#/components/parameters/CommandLogStream"
         - $ref: "#/components/parameters/CommandLogOffset"
         - $ref: "#/components/parameters/CommandLogLimit"
       responses:
@@ -1788,7 +2121,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/CommandLogResponse"
         "400":
-          description: Invalid stage, stream, offset, or limit.
+          description: Invalid stage, offset, or limit.
           headers:
             x-request-id:
               $ref: "#/components/headers/XRequestId"
@@ -1906,26 +2239,26 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 
-  /api/v1/runs/{id}/stages/{stageId}/turns:
+  /api/v1/runs/{id}/stages/{stageId}/events:
     get:
-      operationId: listStageTurns
+      operationId: listStageEvents
       tags: [Run Internals]
-      summary: List Stage Turns
-      description: Returns a paginated list of conversation turns within a specific stage, including system prompts, assistant responses, and tool invocations.
+      summary: List Stage Events
+      description: Returns a paginated JSON list of stored run events scoped to a single stage visit.
       parameters:
         - $ref: "#/components/parameters/RunId"
         - $ref: "#/components/parameters/StageId"
-        - $ref: "#/components/parameters/PageLimit"
-        - $ref: "#/components/parameters/PageOffset"
+        - $ref: "#/components/parameters/SinceSeq"
+        - $ref: "#/components/parameters/EventLimit"
       responses:
         "200":
-          description: Paginated list of conversation turns
+          description: Paginated list of stage events
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/PaginatedStageTurnList"
+                $ref: "#/components/schemas/PaginatedEventList"
         "404":
-          description: Run or stage not found
+          description: Run not found.
           headers:
             x-request-id:
               $ref: "#/components/headers/XRequestId"
@@ -1974,17 +2307,28 @@ paths:
         - $ref: "#/components/parameters/RunId"
         - $ref: "#/components/parameters/PageLimit"
         - $ref: "#/components/parameters/PageOffset"
+        - name: scope
+          in: query
+          required: false
+          description: Diff scope to return. Defaults to committed changes only. Sandbox-backed responses honor all scopes for tracked files; untracked files are excluded. Final-patch fallback responses always represent the stored committed/final diff.
+          schema:
+            type: string
+            default: committed
+            enum:
+              - committed
+              - uncommitted
+              - all
         - name: from_sha
           in: query
           required: false
-          description: Reserved for future use. Only the default value is accepted in the current API version; any other value returns 400.
+          description: Explicit start SHA for a commit-range diff. Must be supplied together with `to_sha`; when present, `scope` must be omitted and the response scope is `range`.
           schema:
             type: string
             pattern: "^[0-9a-f]{7,40}$"
         - name: to_sha
           in: query
           required: false
-          description: Reserved for future use. Only the default value is accepted in the current API version; any other value returns 400.
+          description: Explicit end SHA for a commit-range diff. Must be supplied together with `from_sha`; when present, `scope` must be omitted and the response scope is `range`.
           schema:
             type: string
             pattern: "^[0-9a-f]{7,40}$"
@@ -1996,7 +2340,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/PaginatedRunFileList"
         "400":
-          description: Malformed query parameter (invalid SHA format, or non-default value for `from_sha`/`to_sha`).
+          description: Malformed query parameter (invalid SHA format, one-sided SHA range, or `scope` combined with an explicit SHA range).
           headers:
             x-request-id:
               $ref: "#/components/headers/XRequestId"
@@ -2015,6 +2359,70 @@ paths:
                 $ref: "#/components/schemas/ErrorResponse"
         "503":
           description: Transient sandbox subprocess failure (timeout, process kill). Safe to retry.
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/runs/{id}/commits:
+    get:
+      operationId: listRunCommits
+      tags: [Run Outputs]
+      summary: List Run Commits
+      description: |
+        Returns commits on the run branch since the run's base SHA, sourced directly from sandbox Git.
+
+        The list uses first-parent chronological history and is capped by `limit` (default and maximum: 100). Commit data is Git-authoritative; Fabro-generated commit messages are not required for correctness.
+      parameters:
+        - $ref: "#/components/parameters/RunId"
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of commits to return. Defaults to 100 and is capped at 100.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 100
+      responses:
+        "200":
+          description: Commits on the run branch since the run base.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaginatedRunCommitList"
+        "400":
+          description: Malformed run id or query parameter.
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Run not found.
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Run has no active sandbox or no base SHA.
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Sandbox Git history is temporarily unavailable.
           headers:
             x-request-id:
               $ref: "#/components/headers/XRequestId"
@@ -2232,8 +2640,8 @@ paths:
     post:
       operationId: createRunSshAccess
       tags: [Human-in-the-Loop]
-      summary: SSH Access
-      description: Creates a time-limited SSH command for the run's sandbox environment.
+      summary: Sandbox Access Command
+      description: Creates a command for connecting to the run's sandbox environment. Daytona runs return a time-limited SSH command; Docker runs return a local docker exec command.
       parameters:
         - $ref: "#/components/parameters/RunId"
       requestBody:
@@ -2244,7 +2652,7 @@ paths:
               $ref: "#/components/schemas/SshAccessRequest"
       responses:
         "201":
-          description: SSH command created
+          description: Sandbox access command created
           content:
             application/json:
               schema:
@@ -2259,7 +2667,127 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
         "409":
-          description: Run has no active sandbox or provider does not support SSH
+          description: Run has no active sandbox or provider does not support access commands
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/runs/{id}/sandbox:
+    get:
+      operationId: retrieveRunSandbox
+      tags: [Human-in-the-Loop]
+      summary: Retrieve Run Sandbox Details
+      description: Returns provider-neutral details about the sandbox owned by this run, including identity, normalized state, image/snapshot, resources, labels, and timestamps.
+      parameters:
+        - $ref: "#/components/parameters/RunId"
+      responses:
+        "200":
+          description: Sandbox details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SandboxDetails"
+        "404":
+          description: Run not found or run has no sandbox
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Sandbox provider exists but inspection failed because the sandbox is gone or inaccessible
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "501":
+          description: Sandbox provider has no details implementation
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/runs/{id}/sandbox/services:
+    get:
+      operationId: listSandboxServices
+      tags: [Human-in-the-Loop]
+      summary: List Sandbox Services
+      description: Lists listening TCP services discovered inside the run sandbox.
+      parameters:
+        - $ref: "#/components/parameters/RunId"
+      responses:
+        "200":
+          description: Listening TCP services
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SandboxServiceListResponse"
+        "404":
+          description: Run not found
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Run has no active sandbox or service discovery failed
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/runs/{id}/sandbox/vnc:
+    post:
+      operationId: createSandboxVncPreview
+      tags: [Human-in-the-Loop]
+      summary: Create Sandbox VNC Preview
+      description: Starts or ensures Daytona Computer Use for the run sandbox and returns a signed noVNC preview URL.
+      parameters:
+        - $ref: "#/components/parameters/RunId"
+      responses:
+        "201":
+          description: Signed noVNC preview URL created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VncPreviewResponse"
+        "404":
+          description: Run not found
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Run has no active sandbox, Computer Use startup failed, or signed preview generation failed
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "501":
+          description: Sandbox provider does not support VNC previews
           headers:
             x-request-id:
               $ref: "#/components/headers/XRequestId"
@@ -2385,6 +2913,114 @@ paths:
                 $ref: "#/components/schemas/ErrorResponse"
         "409":
           description: Run has no active sandbox
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  # ── Workflows ────────────────────────────────────────────────────────
+
+  /api/v1/workflows:
+    get:
+      operationId: listWorkflows
+      tags: [Workflows]
+      summary: List workflows
+      description: Returns workflow definitions available to the browser workflow pages. Real-mode servers may return 501 until workflow cataloging is implemented.
+      parameters:
+        - $ref: "#/components/parameters/PageLimit"
+        - $ref: "#/components/parameters/PageOffset"
+      responses:
+        "200":
+          description: Paginated workflow summaries
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaginatedWorkflowListResponse"
+        "501":
+          description: Workflow cataloging is not implemented in real mode
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/workflows/{name}:
+    get:
+      operationId: retrieveWorkflow
+      tags: [Workflows]
+      summary: Retrieve workflow
+      description: Returns a single workflow definition and its dense settings snapshot.
+      parameters:
+        - name: name
+          in: path
+          required: true
+          description: Workflow slug or name.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Workflow details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkflowDetailResponse"
+        "404":
+          description: Workflow not found
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "501":
+          description: Workflow cataloging is not implemented in real mode
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/workflows/{name}/runs:
+    get:
+      operationId: listWorkflowRuns
+      tags: [Workflows]
+      summary: List workflow runs
+      description: Returns durable runs associated with one workflow.
+      parameters:
+        - name: name
+          in: path
+          required: true
+          description: Workflow slug or name.
+          schema:
+            type: string
+        - $ref: "#/components/parameters/PageLimit"
+        - $ref: "#/components/parameters/PageOffset"
+      responses:
+        "200":
+          description: Paginated durable runs for the workflow
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaginatedRunList"
+        "404":
+          description: Workflow not found
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "501":
+          description: Workflow cataloging is not implemented in real mode
           headers:
             x-request-id:
               $ref: "#/components/headers/XRequestId"
@@ -2623,6 +3259,20 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/DiskUsageResponse"
+
+  /api/v1/system/repair/runs:
+    get:
+      operationId: getSystemRepairRuns
+      tags: [System]
+      summary: List Run Repair Issues
+      description: Lists cataloged runs that cannot be loaded from durable storage.
+      responses:
+        "200":
+          description: Run repair issues
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SystemRepairRunsResponse"
 
   /api/v1/system/prune/runs:
     post:
@@ -2931,15 +3581,6 @@ components:
         type: string
       example: code@2
 
-    CommandLogStream:
-      name: stream
-      in: path
-      required: true
-      description: Command output stream to read.
-      schema:
-        $ref: "#/components/schemas/CommandOutputStream"
-      example: stdout
-
     CommandLogOffset:
       name: offset
       in: query
@@ -3124,6 +3765,148 @@ components:
         format: uuid
 
   schemas:
+    AuthConfigResponse:
+      description: Browser login methods enabled by server auth settings.
+      type: object
+      required:
+        - methods
+      properties:
+        methods:
+          type: array
+          items:
+            type: string
+          example: ["dev-token", "github"]
+
+    AuthMeResponse:
+      description: Current authenticated browser user and session state.
+      type: object
+      required:
+        - user
+        - provider
+        - demoMode
+      properties:
+        user:
+          $ref: "#/components/schemas/AuthSessionUser"
+        provider:
+          type: string
+          example: dev-token
+        demoMode:
+          type: boolean
+
+    AuthSessionsResponse:
+      type: object
+      required:
+        - sessions
+      properties:
+        sessions:
+          type: array
+          items:
+            $ref: "#/components/schemas/AuthSession"
+
+    AuthSession:
+      type: object
+      required:
+        - id
+        - kind
+        - current
+        - provider
+        - login
+        - label
+        - createdAt
+        - lastSeenAt
+        - expiresAt
+        - revocable
+      properties:
+        id:
+          type: string
+        kind:
+          type: string
+          enum: [browser, cli]
+        current:
+          type: boolean
+        provider:
+          type: string
+          example: github
+        login:
+          type: string
+        label:
+          type: string
+        userAgent:
+          type: string
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+        lastSeenAt:
+          type: string
+          format: date-time
+        expiresAt:
+          type: string
+          format: date-time
+        revocable:
+          type: boolean
+
+    AuthSessionUser:
+      description: Browser session user profile.
+      type: object
+      required:
+        - login
+        - name
+        - email
+        - avatarUrl
+        - userUrl
+      properties:
+        login:
+          type: string
+        name:
+          type: string
+        email:
+          type: string
+        idpIssuer:
+          type: string
+        idpSubject:
+          type: string
+        avatarUrl:
+          type: string
+        userUrl:
+          type: string
+
+    DemoToggleRequest:
+      description: Desired browser demo-mode state.
+      type: object
+      required:
+        - enabled
+      properties:
+        enabled:
+          type: boolean
+
+    DemoToggleResponse:
+      description: Updated browser demo-mode state.
+      type: object
+      required:
+        - enabled
+      properties:
+        enabled:
+          type: boolean
+
+    DevTokenLoginRequest:
+      description: Browser login payload for development-token auth.
+      type: object
+      required:
+        - token
+      properties:
+        token:
+          type: string
+
+    DevTokenLoginResponse:
+      description: Browser development-token login result.
+      type: object
+      required:
+        - ok
+      properties:
+        ok:
+          type: boolean
+
     InstallSessionResponse:
       description: Current browser-install session snapshot with secrets redacted.
       type: object
@@ -3477,7 +4260,7 @@ components:
         data:
           type: array
           items:
-            $ref: "#/components/schemas/RunSummary"
+            $ref: "#/components/schemas/Run"
         meta:
           $ref: "#/components/schemas/PaginationMeta"
 
@@ -3496,9 +4279,89 @@ components:
         data:
           type: array
           items:
-            $ref: "#/components/schemas/RunListItem"
+            $ref: "#/components/schemas/Run"
         meta:
           $ref: "#/components/schemas/PaginationMeta"
+
+    WorkflowScheduleSummary:
+      description: Workflow schedule summary shown in workflow lists.
+      type: object
+      required:
+        - expression
+      properties:
+        expression:
+          type: string
+        next_run:
+          type: ["string", "null"]
+          format: date-time
+
+    WorkflowLastRunSummary:
+      description: Most recent run timestamp for a workflow.
+      type: object
+      properties:
+        ran_at:
+          type: ["string", "null"]
+          format: date-time
+
+    WorkflowListItem:
+      description: Workflow summary shown in workflow list pages.
+      type: object
+      required:
+        - name
+        - slug
+        - filename
+      properties:
+        name:
+          type: string
+        slug:
+          type: string
+        filename:
+          type: string
+        last_run:
+          oneOf:
+            - $ref: "#/components/schemas/WorkflowLastRunSummary"
+            - type: "null"
+        schedule:
+          oneOf:
+            - $ref: "#/components/schemas/WorkflowScheduleSummary"
+            - type: "null"
+
+    PaginatedWorkflowListResponse:
+      description: Paginated list of workflows.
+      type: object
+      required:
+        - data
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/WorkflowListItem"
+        pagination:
+          $ref: "#/components/schemas/PaginationMeta"
+
+    WorkflowDetailResponse:
+      description: Workflow definition and dense settings snapshot.
+      type: object
+      required:
+        - name
+        - slug
+        - description
+        - filename
+        - settings
+        - graph
+      properties:
+        name:
+          type: string
+        slug:
+          type: string
+        description:
+          type: string
+        filename:
+          type: string
+        settings:
+          $ref: "#/components/schemas/WorkflowSettings"
+        graph:
+          type: string
 
     PaginatedModelList:
       description: Paginated list of models.
@@ -3856,20 +4719,6 @@ components:
         meta:
           $ref: "#/components/schemas/PaginationMeta"
 
-    PaginatedStageTurnList:
-      description: Paginated list of stage turns.
-      type: object
-      required:
-        - data
-        - meta
-      properties:
-        data:
-          type: array
-          items:
-            $ref: "#/components/schemas/StageTurn"
-        meta:
-          $ref: "#/components/schemas/PaginationMeta"
-
     PaginatedApiQuestionList:
       description: Paginated list of pending questions.
       type: object
@@ -3902,10 +4751,8 @@ components:
 
     RunStatus:
       description: >
-        Lifecycle status of a run. `archived` is a terminal status reached by
-        an explicit user action on a previously terminal (`succeeded`, `failed`,
-        or `dead`) run; archived runs are hidden from default listings and are
-        read-only until unarchived.
+        Execution status of a run. Archive state is represented separately on
+        `RunLifecycle.archived` so terminal status payloads remain intact.
       oneOf:
         - $ref: "#/components/schemas/RunStatusSubmitted"
         - $ref: "#/components/schemas/RunStatusQueued"
@@ -3917,7 +4764,6 @@ components:
         - $ref: "#/components/schemas/RunStatusSucceeded"
         - $ref: "#/components/schemas/RunStatusFailed"
         - $ref: "#/components/schemas/RunStatusDead"
-        - $ref: "#/components/schemas/RunStatusArchived"
       discriminator:
         propertyName: kind
         mapping:
@@ -3931,7 +4777,6 @@ components:
           succeeded: "#/components/schemas/RunStatusSucceeded"
           failed: "#/components/schemas/RunStatusFailed"
           dead: "#/components/schemas/RunStatusDead"
-          archived: "#/components/schemas/RunStatusArchived"
 
     RunStatusSubmitted:
       type: object
@@ -4047,32 +4892,6 @@ components:
           enum:
             - dead
 
-    RunStatusArchived:
-      type: object
-      required:
-        - kind
-        - prior
-      properties:
-        kind:
-          type: string
-          enum:
-            - archived
-        prior:
-          $ref: "#/components/schemas/TerminalStatus"
-
-    TerminalStatus:
-      description: Terminal run status captured inside an archived run.
-      oneOf:
-        - $ref: "#/components/schemas/RunStatusSucceeded"
-        - $ref: "#/components/schemas/RunStatusFailed"
-        - $ref: "#/components/schemas/RunStatusDead"
-      discriminator:
-        propertyName: kind
-        mapping:
-          succeeded: "#/components/schemas/RunStatusSucceeded"
-          failed: "#/components/schemas/RunStatusFailed"
-          dead: "#/components/schemas/RunStatusDead"
-
     SuccessReason:
       description: Reason attached to a successful terminal run status.
       type: string
@@ -4110,6 +4929,11 @@ components:
           type: ["string", "null"]
           description: Optional pre-generated run ID to use instead of allocating a new ULID.
           example: "01HV6D7S5YF4Z4B2M7K4N0Q6T9"
+        title:
+          type: ["string", "null"]
+          maxLength: 100
+          description: Optional explicit run title. The server trims leading/trailing whitespace, rejects blank values, rejects control characters and newline characters, and requires at most 100 characters.
+          example: "Add rate limiting to auth endpoints"
         cwd:
           type: string
           description: CLI working directory at invocation time.
@@ -4284,17 +5108,15 @@ components:
           type: boolean
         auto_approve:
           type: boolean
-        no_retro:
-          type: boolean
         preserve_sandbox:
           type: boolean
-        worktree_mode:
-          type: string
-          description: |
-            Override `run.sandbox.local.worktree_mode` (e.g. `never` for
-            `--in-place`).
         label:
           type: array
+          items:
+            type: string
+        input:
+          type: array
+          description: Raw repeated CLI input overrides, each in `KEY=VALUE` form.
           items:
             type: string
 
@@ -4546,6 +5368,27 @@ components:
         warn:
           type: boolean
 
+    SteerRunRequest:
+      description: Request body for steering a running run mid-execution.
+      type: object
+      required:
+        - text
+      properties:
+        text:
+          type: string
+          description: The steering message text to deliver as a user turn.
+          minLength: 1
+          maxLength: 8192
+          example: Try a different approach
+        interrupt:
+          type: boolean
+          description: |
+            When true, apply a worker-control interrupt first, then deliver
+            this text as steering in the same control operation. When false
+            (default), append to the steering queue and let the agent pick it
+            up at the next turn boundary.
+          default: false
+
     StartRunRequest:
       description: Request body for starting or resuming a run.
       type: object
@@ -4555,43 +5398,38 @@ components:
           description: Resume from checkpoint instead of starting from submitted state.
           default: false
 
-    RunStatusResponse:
-      description: Current status of a run with optional error and queue position.
+    UpdateRunRequest:
+      description: Request body for updating mutable run metadata.
       type: object
       required:
-        - id
-        - status
-        - created_at
+        - title
       properties:
+        title:
+          type: string
+          maxLength: 100
+          description: New run title. The server trims leading/trailing whitespace, rejects blank values, rejects control characters and newline characters, and requires at most 100 characters.
+          example: "Add rate limiting to auth endpoints"
+
+    DeleteRunResponse:
+      description: Returned when a run is deleted but its sandbox is intentionally preserved.
+      type: object
+      required: [deleted, sandbox_preserved, sandbox]
+      properties:
+        deleted:
+          type: boolean
+        sandbox_preserved:
+          type: boolean
+        sandbox:
+          $ref: "#/components/schemas/DeleteRunSandbox"
+
+    DeleteRunSandbox:
+      type: object
+      required: [provider, id]
+      properties:
+        provider:
+          $ref: "#/components/schemas/SandboxProvider"
         id:
           type: string
-          description: Unique run identifier (ULID).
-          example: 01JNQVR7M0EJ5GKAT2SC4ERS1Z
-        status:
-          $ref: "#/components/schemas/RunStatus"
-        error:
-          $ref: "#/components/schemas/RunError"
-        queue_position:
-          type: integer
-          description: Position in the queue (1-based). Only present when the status kind is `queued`.
-          example: 3
-        pending_control:
-          oneOf:
-            - $ref: "#/components/schemas/RunControlAction"
-            - type: "null"
-        created_at:
-          type: string
-          format: date-time
-          description: Timestamp when the run was created.
-          example: "2026-03-06T14:30:00Z"
-        web_url:
-          type: string
-          format: uri
-          description: |
-            Public URL where the run can be viewed in the web UI. Present when
-            the server has the web UI enabled (`server.web.enabled = true`) and
-            `server.web.url` is non-empty; absent otherwise.
-          example: "http://localhost:3000/runs/01JNQVR7M0EJ5GKAT2SC4ERS1Z"
 
     ApiQuestionOption:
       description: A selectable option for a multiple-choice or multi-select question.
@@ -4665,24 +5503,89 @@ components:
 
     SubmitAnswerRequest:
       description: >
-        Request body for submitting an answer to a pending question.
-        At least one of `value`, `selected_option_key`, or `selected_option_keys` must be provided.
+        Request body for submitting an answer to a pending question. The
+        `kind` discriminator determines which answer shape is submitted.
+      oneOf:
+        - $ref: "#/components/schemas/SubmitAnswerYesRequest"
+        - $ref: "#/components/schemas/SubmitAnswerNoRequest"
+        - $ref: "#/components/schemas/SubmitAnswerSelectedRequest"
+        - $ref: "#/components/schemas/SubmitAnswerMultiSelectedRequest"
+        - $ref: "#/components/schemas/SubmitAnswerTextRequest"
+      discriminator:
+        propertyName: kind
+        mapping:
+          "yes": "#/components/schemas/SubmitAnswerYesRequest"
+          "no": "#/components/schemas/SubmitAnswerNoRequest"
+          selected: "#/components/schemas/SubmitAnswerSelectedRequest"
+          multi_selected: "#/components/schemas/SubmitAnswerMultiSelectedRequest"
+          text: "#/components/schemas/SubmitAnswerTextRequest"
+
+    SubmitAnswerYesRequest:
       type: object
+      required:
+        - kind
       properties:
-        value:
+        kind:
           type: string
-          description: Freeform answer text.
-          example: "Yes, proceed with the changes."
-        selected_option_key:
+          enum: ["yes"]
+          description: Affirmative answer for yes/no and confirmation questions.
+
+    SubmitAnswerNoRequest:
+      type: object
+      required:
+        - kind
+      properties:
+        kind:
           type: string
-          description: Key of the selected option (for single-select multiple-choice questions).
+          enum: ["no"]
+          description: Negative answer for yes/no questions.
+
+    SubmitAnswerSelectedRequest:
+      type: object
+      required:
+        - kind
+        - option_key
+      properties:
+        kind:
+          type: string
+          enum: [selected]
+          description: Single selected option answer.
+        option_key:
+          type: string
+          description: Key of the selected option.
           example: option_a
-        selected_option_keys:
+
+    SubmitAnswerMultiSelectedRequest:
+      type: object
+      required:
+        - kind
+        - option_keys
+      properties:
+        kind:
+          type: string
+          enum: [multi_selected]
+          description: Multiple selected option answer.
+        option_keys:
           type: array
           items:
             type: string
-          description: Keys of selected options (for multi-select questions).
+          description: Keys of selected options.
           example: ["option_a", "option_b"]
+
+    SubmitAnswerTextRequest:
+      type: object
+      required:
+        - kind
+        - text
+      properties:
+        kind:
+          type: string
+          enum: [text]
+          description: Freeform text answer.
+        text:
+          type: string
+          description: Freeform answer text.
+          example: "Yes, proceed with the changes."
 
     ErrorResponseEntry:
       description: A single error entry in an error response.
@@ -5053,13 +5956,6 @@ components:
           description: Blob identifier.
           example: 550e8400-e29b-41d4-a716-446655440000
 
-    CommandOutputStream:
-      description: Command output stream name.
-      type: string
-      enum:
-        - stdout
-        - stderr
-
     CommandTermination:
       description: Terminal state for a command execution.
       type: string
@@ -5072,7 +5968,6 @@ components:
       description: Byte-offset command log slice.
       type: object
       required:
-        - stream
         - offset
         - next_offset
         - total_bytes
@@ -5081,8 +5976,6 @@ components:
         - cas_ref
         - live_streaming
       properties:
-        stream:
-          $ref: "#/components/schemas/CommandOutputStream"
         offset:
           type: integer
           minimum: 0
@@ -5096,7 +5989,7 @@ components:
         total_bytes:
           type: integer
           minimum: 0
-          description: Total bytes currently available for the stream.
+          description: Total bytes currently available for the output log.
           example: 8192
         bytes_base64:
           type: string
@@ -5104,7 +5997,7 @@ components:
           example: aGVsbG8K
         eof:
           type: boolean
-          description: Whether the stream is finalized.
+          description: Whether the output log is finalized.
           example: false
         cas_ref:
           oneOf:
@@ -5281,6 +6174,8 @@ components:
       type: object
       required:
         - first_event_seq
+        - usage
+        - state
       properties:
         first_event_seq:
           type: integer
@@ -5310,24 +6205,35 @@ components:
           items:
             type: object
           description: Per-branch result objects produced by a parallel stage.
-        stdout:
+        output:
           type: ["string", "null"]
-        stderr:
-          type: ["string", "null"]
-        stdout_bytes:
+        output_bytes:
           type: ["integer", "null"]
           minimum: 0
-        stderr_bytes:
-          type: ["integer", "null"]
-          minimum: 0
-        streams_separated:
-          type: ["boolean", "null"]
         live_streaming:
           type: ["boolean", "null"]
         termination:
           oneOf:
             - $ref: "#/components/schemas/CommandTermination"
             - type: "null"
+        started_at:
+          type: ["string", "null"]
+          format: date-time
+          description: Wall-clock time the latest attempt of this stage started, if known.
+        duration_ms:
+          type: ["integer", "null"]
+          format: uint64
+          minimum: 0
+          description: Wall-clock duration of the stage's latest terminal attempt, if known.
+        usage:
+          $ref: "#/components/schemas/BilledTokenCounts"
+        model:
+          oneOf:
+            - $ref: "#/components/schemas/BillingModelRef"
+            - type: "null"
+        state:
+          $ref: "#/components/schemas/StageState"
+          description: Lifecycle state of the stage projection.
 
     InterviewOption:
       description: Option stored with an interview question in the event log.
@@ -5376,11 +6282,12 @@ components:
       type: object
       required:
         - question
+        - started_at
       properties:
         question:
           $ref: "#/components/schemas/InterviewQuestionRecord"
         started_at:
-          type: ["string", "null"]
+          type: string
           format: date-time
 
     DirtyStatus:
@@ -5409,7 +6316,6 @@ components:
         - run_id
         - settings
         - graph
-        - in_place
       properties:
         run_id:
           type: string
@@ -5418,6 +6324,8 @@ components:
         graph:
           type: object
           additionalProperties: true
+        graph_source:
+          type: ["string", "null"]
         workflow_slug:
           type: ["string", "null"]
         source_directory:
@@ -5442,67 +6350,153 @@ components:
           oneOf:
             - $ref: "#/components/schemas/ForkSourceRef"
             - type: "null"
-        in_place:
-          type: boolean
+
+    StartRecord:
+      description: Metadata captured when execution starts.
+      type: object
+      required:
+        - start_time
+      properties:
+        start_time:
+          type: string
+          format: date-time
+        run_branch:
+          type: ["string", "null"]
+        base_sha:
+          type: ["string", "null"]
+
+    StageSummary:
+      description: Terminal summary for one stage in a run conclusion.
+      type: object
+      required:
+        - stage_id
+        - stage_label
+        - duration_ms
+        - retries
+      properties:
+        stage_id:
+          type: string
+        stage_label:
+          type: string
+        duration_ms:
+          type: integer
+          format: uint64
+          minimum: 0
+        billing_usd_micros:
+          type: ["integer", "null"]
+          format: int64
+        retries:
+          type: integer
+          format: uint32
+          minimum: 0
+
+    Conclusion:
+      description: Terminal run conclusion derived from final workflow execution.
+      type: object
+      required:
+        - timestamp
+        - status
+        - duration_ms
+        - stages
+        - total_retries
+        - diff
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+        status:
+          $ref: "#/components/schemas/StageOutcome"
+        duration_ms:
+          type: integer
+          format: uint64
+          minimum: 0
+        failure_reason:
+          type: ["string", "null"]
+        final_git_commit_sha:
+          type: ["string", "null"]
+        stages:
+          type: array
+          items:
+            $ref: "#/components/schemas/StageSummary"
+        billing:
+          oneOf:
+            - $ref: "#/components/schemas/BilledTokenCounts"
+            - type: "null"
+        total_retries:
+          type: integer
+          format: uint32
+          minimum: 0
+        diff:
+          $ref: "#/components/schemas/RunDiff"
+
+    CheckpointRecord:
+      description: Sequence-tagged checkpoint history entry with the diff observed at that checkpoint.
+      type: object
+      required:
+        - seq
+        - checkpoint
+        - diff
+      properties:
+        seq:
+          type: integer
+          format: uint32
+        checkpoint:
+          $ref: "#/components/schemas/RunCheckpoint"
+        diff:
+          $ref: "#/components/schemas/RunDiff"
 
     RunProjection:
       description: Raw internal run projection derived from the event log.
       type: object
       required:
+        - spec
+        - status
+        - status_updated_at
+        - last_event_at
+        - checkpoints
+        - pending_interviews
         - stages
       properties:
+        title:
+          type: string
+          description: Resolved run title from the event log.
         spec:
-          oneOf:
-            - $ref: "#/components/schemas/RunSpec"
-            - type: "null"
-        graph_source:
+          $ref: "#/components/schemas/RunSpec"
+        web_url:
           type: ["string", "null"]
+          description: Absolute web UI URL for this run when server web settings are configured.
         start:
-          type: ["object", "null"]
-          additionalProperties: true
+          oneOf:
+            - $ref: "#/components/schemas/StartRecord"
+            - type: "null"
         status:
-          oneOf:
-            - $ref: "#/components/schemas/RunStatus"
-            - type: "null"
+          $ref: "#/components/schemas/RunStatus"
+        archived_at:
+          type: ["string", "null"]
+          format: date-time
         status_updated_at:
-          oneOf:
-            - type: string
-              format: date-time
-            - type: "null"
+          type: string
+          format: date-time
+        last_event_at:
+          type: string
+          format: date-time
         pending_control:
           oneOf:
             - $ref: "#/components/schemas/RunControlAction"
             - type: "null"
-        checkpoint:
-          oneOf:
-            - $ref: "#/components/schemas/RunCheckpoint"
-            - type: "null"
         checkpoints:
           type: array
-          description: Sequence-tagged checkpoint history entries as `[seq, checkpoint]`.
+          description: Sequence-tagged checkpoint history entries.
           items:
-            type: array
-            minItems: 2
-            maxItems: 2
-            items:
-              oneOf:
-                - type: integer
-                - $ref: "#/components/schemas/RunCheckpoint"
+            $ref: "#/components/schemas/CheckpointRecord"
         conclusion:
-          type: ["object", "null"]
-          additionalProperties: true
-        retro:
-          type: ["object", "null"]
-          additionalProperties: true
-        retro_prompt:
-          type: ["string", "null"]
-        retro_response:
-          type: ["string", "null"]
+          oneOf:
+            - $ref: "#/components/schemas/Conclusion"
+            - type: "null"
         sandbox:
-          type: ["object", "null"]
-          additionalProperties: true
-        final_patch:
-          type: ["string", "null"]
+          oneOf:
+            - $ref: "#/components/schemas/RunSandbox"
+            - type: "null"
         pull_request:
           type: ["object", "null"]
           additionalProperties: true
@@ -5518,63 +6512,186 @@ components:
           additionalProperties:
             $ref: "#/components/schemas/StageProjection"
 
-    RunSummary:
-      description: Durable run summary derived from the backing store.
+    Run:
+      description: Canonical public run shape.
       type: object
       required:
-        - run_id
-        - goal
+        - id
         - title
-        - labels
-        - status
+        - goal
+        - workflow
+        - automation
         - repository
-        - created_at
+        - created_by
+        - origin
+        - labels
+        - lifecycle
+        - sandbox
+        - models
+        - source_directory
+        - timestamps
+        - billing
+        - diff
+        - pull_request
+        - current_question
+        - superseded_by
+        - links
       properties:
-        run_id:
-          type: string
-        workflow_name:
-          type: ["string", "null"]
-        workflow_slug:
-          type: ["string", "null"]
-        goal:
+        id:
           type: string
         title:
           type: string
+        goal:
+          type: string
+        workflow:
+          $ref: "#/components/schemas/WorkflowRef"
+        automation:
+          oneOf:
+            - $ref: "#/components/schemas/AutomationRef"
+            - type: "null"
+        repository:
+          oneOf:
+            - $ref: "#/components/schemas/RepositoryRef"
+            - type: "null"
+        created_by:
+          oneOf:
+            - $ref: "#/components/schemas/Principal"
+            - type: "null"
+        origin:
+          $ref: "#/components/schemas/RunOrigin"
         labels:
           type: object
           additionalProperties:
             type: string
+        lifecycle:
+          $ref: "#/components/schemas/RunLifecycle"
+        sandbox:
+          oneOf:
+            - $ref: "#/components/schemas/RunSandbox"
+            - type: "null"
+        models:
+          type: array
+          items:
+            $ref: "#/components/schemas/RunModel"
         source_directory:
           type: ["string", "null"]
-        in_place:
-          type: boolean
-        repo_origin_url:
+        timestamps:
+          $ref: "#/components/schemas/RunTimestamps"
+        billing:
+          oneOf:
+            - $ref: "#/components/schemas/RunBillingSummary"
+            - type: "null"
+        diff:
+          oneOf:
+            - $ref: "#/components/schemas/DiffSummary"
+            - type: "null"
+        pull_request:
+          oneOf:
+            - $ref: "#/components/schemas/PullRequest"
+            - type: "null"
+        current_question:
+          oneOf:
+            - $ref: "#/components/schemas/RunQuestion"
+            - type: "null"
+        superseded_by:
           type: ["string", "null"]
-        repository:
-          $ref: "#/components/schemas/RepositoryReference"
-        start_time:
+        links:
+          $ref: "#/components/schemas/RunLinks"
+
+    WorkflowRef:
+      type: object
+      required: [slug, name]
+      properties:
+        slug:
           type: ["string", "null"]
-          format: date-time
-        created_at:
+        name:
           type: string
-          format: date-time
+
+    AutomationRef:
+      type: object
+      required: [id, name]
+      properties:
+        id:
+          type: string
+        name:
+          type: ["string", "null"]
+
+    RunOrigin:
+      type: object
+      required: [kind]
+      properties:
+        kind:
+          type: string
+          enum: [api]
+
+    RunLifecycle:
+      type: object
+      required: [status, pending_control, queue_position, error, archived, archived_at]
+      properties:
         status:
           $ref: "#/components/schemas/RunStatus"
         pending_control:
           oneOf:
             - $ref: "#/components/schemas/RunControlAction"
             - type: "null"
+        queue_position:
+          type: ["integer", "null"]
+        error:
+          oneOf:
+            - $ref: "#/components/schemas/RunError"
+            - type: "null"
+        archived:
+          type: boolean
+        archived_at:
+          type: ["string", "null"]
+          format: date-time
+
+    RunModel:
+      type: object
+      required: [provider, name]
+      properties:
+        provider:
+          type: ["string", "null"]
+        name:
+          type: string
+
+    RunTimestamps:
+      type: object
+      required: [created_at, started_at, last_event_at, completed_at]
+      properties:
+        created_at:
+          type: string
+          format: date-time
+        started_at:
+          type: ["string", "null"]
+          format: date-time
+        last_event_at:
+          type: ["string", "null"]
+          format: date-time
+        completed_at:
+          type: ["string", "null"]
+          format: date-time
         duration_ms:
           type: ["integer", "null"]
           format: int64
-          minimum: 0
         elapsed_secs:
           type: ["number", "null"]
+
+    RunBillingSummary:
+      type: object
+      required: [total_usd_micros]
+      properties:
         total_usd_micros:
           type: ["integer", "null"]
           format: int64
-        superseded_by:
+
+    RunLinks:
+      type: object
+      required: [web]
+      properties:
+        web:
           type: ["string", "null"]
+          format: uri
 
     ForkRequest:
       description: Request body for creating a new run from a source run checkpoint.
@@ -5656,11 +6773,13 @@ components:
       description: Board column status for a run in the list view.
       type: string
       enum:
+        - queued
         - initializing
         - running
         - blocked
         - succeeded
         - failed
+        - archived
 
     BoardColumnDefinition:
       type: object
@@ -5669,7 +6788,7 @@ components:
         - name
       properties:
         id:
-          type: string
+          $ref: "#/components/schemas/BoardColumn"
         name:
           type: string
 
@@ -5741,16 +6860,23 @@ components:
           description: Human-readable run title.
           example: "PR #312 — Add OAuth2 PKCE flow"
 
-    RepositoryReference:
-      description: Reference to a repository by name.
+    RepositoryRef:
+      description: Durable repository metadata for a run.
       type: object
       required:
         - name
+        - origin_url
+        - provider
       properties:
         name:
           type: string
-          description: Repository name.
-          example: api-server
+          example: fabro-sh/fabro
+        origin_url:
+          type: ["string", "null"]
+          example: https://github.com/fabro-sh/fabro.git
+        provider:
+          type: string
+          enum: [github, git, unknown]
 
     BilledTokenCounts:
       description: Token counts with optional billed USD micros totals.
@@ -5799,6 +6925,29 @@ components:
           description: Billed USD amount in micros.
           example: 720000
 
+    BillingModelRef:
+      description: Provider-qualified billing model identity used for cost estimates.
+      type: object
+      required:
+        - provider
+        - model_id
+      properties:
+        provider:
+          $ref: "#/components/schemas/Provider"
+        model_id:
+          type: string
+        speed:
+          oneOf:
+            - $ref: "#/components/schemas/BillingSpeed"
+            - type: "null"
+
+    BillingSpeed:
+      description: Optional provider-specific model speed tier used for cost estimates.
+      type: string
+      enum:
+        - standard
+        - fast
+
     CodeLocation:
       description: A file and line location in the codebase.
       type: object
@@ -5825,38 +6974,11 @@ components:
           description: Error message.
           example: "Stage 'apply-changes' exceeded maximum retries."
 
-    RunPullRequest:
-      description: Pull request information for a run.
-      type: object
-      required:
-        - number
-      properties:
-        number:
-          type: integer
-          description: Pull request number.
-          example: 889
-        additions:
-          type: integer
-          description: Lines added.
-          example: 234
-        deletions:
-          type: integer
-          description: Lines deleted.
-          example: 67
-        comments:
-          type: integer
-          description: Number of review comments.
-          example: 4
-        checks:
-          type: array
-          description: CI check run results.
-          items:
-            $ref: "#/components/schemas/CheckRun"
-
-    PullRequestRecord:
+    PullRequest:
       description: Persisted record of a pull request created for a run.
       type: object
       required:
+        - provider
         - html_url
         - number
         - owner
@@ -5865,6 +6987,9 @@ components:
         - head_branch
         - title
       properties:
+        provider:
+          type: string
+          enum: [github]
         html_url:
           type: string
           format: uri
@@ -5908,39 +7033,26 @@ components:
           type: string
           example: fabro/run/demo
 
-    PullRequestDetail:
-      description: Stored pull request record plus live GitHub fields.
+    PullRequestDetails:
+      description: Stored pull request record plus live GitHub-enriched fields.
       type: object
       required:
-        - record
-        - number
-        - title
+        - pull_request
         - state
         - draft
         - merged
+        - merged_at
+        - mergeable
         - additions
         - deletions
         - changed_files
-        - html_url
-        - user
-        - head
-        - base
-        - created_at
-        - updated_at
+        - comments
+        - checks
+        - author
+        - timestamps
       properties:
-        record:
-          $ref: "#/components/schemas/PullRequestRecord"
-        number:
-          type: integer
-          example: 123
-        title:
-          type: string
-          example: Move PR commands server-side
-        body:
-          type: ["string", "null"]
-          example: |
-            ## Summary
-            - Move PR commands server-side
+        pull_request:
+          $ref: "#/components/schemas/PullRequest"
         state:
           type: string
           example: open
@@ -5966,24 +7078,25 @@ components:
         changed_files:
           type: integer
           example: 5
-        html_url:
-          type: string
-          format: uri
-          example: https://github.com/fabro-sh/fabro/pull/123
-        user:
+        comments:
+          type: integer
+          example: 4
+        checks:
+          type: array
+          items:
+            $ref: "#/components/schemas/CheckRun"
+        author:
           $ref: "#/components/schemas/PullRequestUser"
-        head:
-          $ref: "#/components/schemas/PullRequestRef"
-        base:
-          $ref: "#/components/schemas/PullRequestRef"
-        created_at:
-          type: string
-          format: date-time
-          example: "2026-04-23T15:40:00Z"
-        updated_at:
-          type: string
-          format: date-time
-          example: "2026-04-23T15:45:00Z"
+        timestamps:
+          type: object
+          required: [created_at, updated_at]
+          properties:
+            created_at:
+              type: string
+              format: date-time
+            updated_at:
+              type: string
+              format: date-time
 
     CreateRunPullRequestRequest:
       description: Request body for creating a run pull request.
@@ -6065,36 +7178,53 @@ components:
           description: Whether the elapsed time exceeds the expected threshold.
           example: false
 
-    SandboxResources:
-      description: Compute resources allocated to a sandbox.
-      type: object
-      required:
-        - cpu
-        - memory
-      properties:
-        cpu:
-          type: integer
-          description: Number of CPU cores.
-          example: 4
-        memory:
-          type: integer
-          description: Memory in GB.
-          example: 8
+    SandboxProvider:
+      description: Sandbox execution provider.
+      type: string
+      enum:
+        - local
+        - docker
+        - daytona
 
     RunSandbox:
-      description: Sandbox environment for a run.
+      description: Canonical sandbox environment record for a run.
       type: object
+      required:
+        - provider
+        - image
+        - snapshot
+        - runtime
+      properties:
+        provider:
+          $ref: "#/components/schemas/SandboxProvider"
+        image:
+          type: ["string", "null"]
+        snapshot:
+          type: ["string", "null"]
+        runtime:
+          oneOf:
+            - $ref: "#/components/schemas/RunSandboxRuntime"
+            - type: "null"
+
+    RunSandboxRuntime:
+      type: object
+      required:
+        - id
+        - working_directory
+        - repo_cloned
+        - clone_origin_url
+        - clone_branch
       properties:
         id:
-          type: ["string", "null"]
-          description: Sandbox identifier.
-          example: sb-a1b2c3d4
+          type: string
         working_directory:
+          type: string
+        repo_cloned:
+          type: ["boolean", "null"]
+        clone_origin_url:
           type: ["string", "null"]
-          description: Path where the run executed inside the sandbox.
-          example: /workspace
-        resources:
-          $ref: "#/components/schemas/SandboxResources"
+        clone_branch:
+          type: ["string", "null"]
 
     RunQuestion:
       description: A pending human-in-the-loop question summary.
@@ -6159,7 +7289,7 @@ components:
           example: 3501.0
 
     BillingStageRef:
-      description: Reference to a billing stage.
+      description: Reference to a workflow node in a billing stage row.
       type: object
       required:
         - id
@@ -6173,79 +7303,6 @@ components:
           type: string
           description: Human-readable stage name.
           example: Propose Changes
-
-    # ── Run Board Schemas (updated) ─────────────────────────────────────
-
-    RunListItem:
-      description: Canonical run summary shown in the board view, extended with board-specific metadata.
-      type: object
-      required:
-        - run_id
-        - goal
-        - title
-        - status
-        - labels
-        - repository
-        - created_at
-        - column
-      properties:
-        run_id:
-          type: string
-          description: Unique run identifier (ULID).
-          example: 01JNQVR7M0EJ5GKAT2SC4ERS1Z
-        workflow_name:
-          type: ["string", "null"]
-        workflow_slug:
-          type: ["string", "null"]
-        goal:
-          type: string
-        repository:
-          $ref: "#/components/schemas/RepositoryReference"
-        title:
-          type: string
-          description: Human-readable title describing the run's goal.
-          example: Add rate limiting to auth endpoints
-        status:
-          $ref: "#/components/schemas/RunStatus"
-        labels:
-          type: object
-          additionalProperties:
-            type: string
-        source_directory:
-          type: ["string", "null"]
-        in_place:
-          type: boolean
-        repo_origin_url:
-          type: ["string", "null"]
-        start_time:
-          type: ["string", "null"]
-          format: date-time
-        pending_control:
-          oneOf:
-            - $ref: "#/components/schemas/RunControlAction"
-            - type: "null"
-        duration_ms:
-          type: ["integer", "null"]
-          format: int64
-          minimum: 0
-        elapsed_secs:
-          type: ["number", "null"]
-        total_usd_micros:
-          type: ["integer", "null"]
-          format: int64
-        column:
-          $ref: "#/components/schemas/BoardColumn"
-        pull_request:
-          $ref: "#/components/schemas/RunPullRequest"
-        sandbox:
-          $ref: "#/components/schemas/RunSandbox"
-        question:
-          $ref: "#/components/schemas/RunQuestion"
-        created_at:
-          type: string
-          format: date-time
-          description: Timestamp when the run was created.
-          example: "2026-03-06T14:30:00Z"
 
     RunCheckpoint:
       description: Serializable snapshot of execution state for crash recovery and resume.
@@ -6312,129 +7369,64 @@ components:
         - skipped
         - cancelled
 
+    StageHandler:
+      description: Canonical workflow stage handler kind.
+      type: string
+      enum:
+        - start
+        - exit
+        - agent
+        - prompt
+        - command
+        - human
+        - conditional
+        - parallel
+        - parallel.fan_in
+        - stack.manager_loop
+        - wait
+
     RunStage:
       description: A single stage in a run's workflow graph.
       type: object
       required:
         - id
         - name
+        - handler
         - status
+        - node_id
+        - visit
       properties:
         id:
           type: string
-          description: Unique stage identifier within the run.
-          example: propose-changes
+          description: StageId in "node_id@visit" form, e.g. verify@2.
+          example: verify@2
         name:
           type: string
           description: Human-readable stage name.
           example: Propose Changes
+        handler:
+          $ref: "#/components/schemas/StageHandler"
         status:
           $ref: "#/components/schemas/StageState"
         duration_secs:
           type: number
           description: Time spent in this stage, in seconds.
           example: 154.0
-        dot_id:
+        node_id:
           type: string
-          description: Node identifier in the Graphviz graph source.
-          example: propose
-
-    ToolUse:
-      description: A single tool invocation with its input, result, and execution metadata.
-      type: object
-      required:
-        - id
-        - tool_name
-        - input
-        - result
-        - is_error
-      properties:
-        id:
-          type: string
-          description: Unique identifier for this tool invocation. Enables correlation in parallel tool use.
-          example: toolu_01A09q90qw90lq917835lq9
-        tool_name:
-          type: string
-          description: Name of the tool that was invoked.
-          example: read_file
-        input:
-          type: string
-          description: JSON-encoded input passed to the tool.
-          example: '{ "path": "src/routes/auth.ts" }'
-        result:
-          type: string
-          description: Output returned by the tool. Contains the error message when is_error is true.
-          example: 'import { Router } from "express";'
-        is_error:
-          type: boolean
-          description: Whether the tool invocation failed. When true, the result field contains the error message.
-          example: false
-        duration_ms:
+          description: Node id in the workflow graph; multiple stages with different visits share the same node_id.
+          example: verify
+        visit:
           type: integer
-          description: Wall-clock execution time of the tool invocation in milliseconds.
-          example: 142
-
-    StageTurn:
-      description: A single turn in a stage conversation — a system prompt, assistant response, or tool invocation block.
-      discriminator:
-        propertyName: kind
-        mapping:
-          system: "#/components/schemas/SystemStageTurn"
-          assistant: "#/components/schemas/AssistantStageTurn"
-          tool: "#/components/schemas/ToolStageTurn"
-      oneOf:
-        - $ref: "#/components/schemas/SystemStageTurn"
-        - $ref: "#/components/schemas/AssistantStageTurn"
-        - $ref: "#/components/schemas/ToolStageTurn"
-
-    SystemStageTurn:
-      description: A system prompt turn that sets the stage's instructions.
-      type: object
-      required:
-        - kind
-        - content
-      properties:
-        kind:
-          type: string
-          enum: [system]
-        content:
-          type: string
-          description: System prompt text.
-          example: You are a drift detection agent. Compare the production and staging environments.
-
-    AssistantStageTurn:
-      description: An assistant response turn within a stage.
-      type: object
-      required:
-        - kind
-        - content
-      properties:
-        kind:
-          type: string
-          enum: [assistant]
-        content:
-          type: string
-          description: Assistant response text.
-          example: I'll start by loading the environment configurations for both production and staging.
-
-    ToolStageTurn:
-      description: A tool invocation turn containing one or more tool calls.
-      type: object
-      required:
-        - kind
-        - tools
-      properties:
-        kind:
-          type: string
-          enum: [tool]
-        content:
-          type: string
-          description: Text accompanying the tool invocations, or null when the turn contains only tool calls.
-        tools:
-          type: array
-          description: Tool invocations executed in this turn.
-          items:
-            $ref: "#/components/schemas/ToolUse"
+          format: uint32
+          minimum: 1
+          description: 1-based visit count; bumped each time the workflow re-enters this node.
+          example: 2
+        started_at:
+          type: ["string", "null"]
+          format: date-time
+          description: Wall-clock time the latest attempt of this stage started, if known.
+          example: "2026-04-29T12:34:56Z"
 
     # ── File Diff Schemas ──────────────────────────────────────────────
 
@@ -6541,6 +7533,38 @@ components:
           description: Total lines deleted.
           example: 234
 
+    DiffSummary:
+      description: Cheap aggregate file and line counts for a run diff.
+      type: object
+      required:
+        - files_changed
+        - additions
+        - deletions
+      properties:
+        files_changed:
+          type: integer
+          description: Total number of changed files, including binary files.
+          example: 42
+        additions:
+          type: integer
+          description: Total lines added across text files.
+          example: 567
+        deletions:
+          type: integer
+          description: Total lines deleted across text files.
+          example: 234
+
+    RunDiff:
+      description: Patch text and aggregate counts captured for a run-level diff.
+      type: object
+      properties:
+        patch:
+          type: ["string", "null"]
+        summary:
+          oneOf:
+            - $ref: "#/components/schemas/DiffSummary"
+            - type: "null"
+
     RunFilesMeta:
       description: |
         Metadata for a `PaginatedRunFileList` response.
@@ -6548,10 +7572,26 @@ components:
         Replaces `PaginationMeta` on the files endpoint — the naturally-bounded list does not use cursor pagination but exposes caps and a degraded-response path instead.
       type: object
       required:
+        - source
+        - scope
         - truncated
         - total_changed
         - stats
       properties:
+        source:
+          type: string
+          description: Source used to materialize this response. `sandbox` honors the requested scope from the run-owned sandbox; `final_patch` is fallback committed/final diff data from stored run state.
+          enum:
+            - sandbox
+            - final_patch
+        scope:
+          type: string
+          description: Diff scope materialized for this response.
+          enum:
+            - committed
+            - uncommitted
+            - all
+            - range
         stats:
           $ref: "#/components/schemas/DiffStats"
         truncated:
@@ -6604,10 +7644,127 @@ components:
         meta:
           $ref: "#/components/schemas/RunFilesMeta"
 
+    RunCommitParent:
+      description: Parent commit pointer.
+      type: object
+      required:
+        - sha
+        - short_sha
+      properties:
+        sha:
+          type: string
+          pattern: "^[0-9a-f]{7,40}$"
+        short_sha:
+          type: string
+          pattern: "^[0-9a-f]{7,12}$"
+
+    RunCommitPerson:
+      description: Git author or committer identity.
+      type: object
+      required:
+        - name
+        - email
+        - date
+      properties:
+        name:
+          type: string
+        email:
+          type: string
+        date:
+          type: ["string", "null"]
+          format: date-time
+
+    RunCommit:
+      description: A Git commit on a run branch.
+      type: object
+      required:
+        - sha
+        - short_sha
+        - parents
+        - author
+        - committer
+        - subject
+        - message
+        - trailers
+        - tree_sha
+      properties:
+        sha:
+          type: string
+          pattern: "^[0-9a-f]{7,40}$"
+        short_sha:
+          type: string
+          pattern: "^[0-9a-f]{7,12}$"
+        parents:
+          type: array
+          items:
+            $ref: "#/components/schemas/RunCommitParent"
+        author:
+          $ref: "#/components/schemas/RunCommitPerson"
+        committer:
+          $ref: "#/components/schemas/RunCommitPerson"
+        subject:
+          type: string
+        body:
+          type: ["string", "null"]
+        message:
+          type: string
+        trailers:
+          type: object
+          additionalProperties:
+            type: string
+        tree_sha:
+          type: ["string", "null"]
+          pattern: "^[0-9a-f]{7,40}$"
+
+    RunCommitsMeta:
+      description: Metadata for a `PaginatedRunCommitList` response.
+      type: object
+      required:
+        - source
+        - base_sha
+        - head_sha
+        - limit
+        - total_returned
+        - truncated
+      properties:
+        source:
+          type: string
+          enum:
+            - sandbox
+        base_sha:
+          type: string
+          pattern: "^[0-9a-f]{7,40}$"
+        head_sha:
+          type: string
+          pattern: "^[0-9a-f]{7,40}$"
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 100
+        total_returned:
+          type: integer
+          minimum: 0
+        truncated:
+          type: boolean
+
+    PaginatedRunCommitList:
+      description: Git commits on a run branch since the run base.
+      type: object
+      required:
+        - data
+        - meta
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/RunCommit"
+        meta:
+          $ref: "#/components/schemas/RunCommitsMeta"
+
     # ── Billing Schemas ──────────────────────────────────────────────────
 
     RunBillingStage:
-      description: Token counts and billed totals for a single stage within a run.
+      description: Token counts and billed totals for one workflow node within a run. Rows are grouped by node; billing and runtime sum every visit of that node.
       type: object
       required:
         - stage
@@ -6618,7 +7775,7 @@ components:
         stage:
           $ref: "#/components/schemas/BillingStageRef"
         model:
-          description: Model used for this stage; null for non-LLM stages.
+          description: Latest usage-bearing visit model for this node; null when no visit used an LLM model.
           oneOf:
             - $ref: "#/components/schemas/ModelReference"
             - type: "null"
@@ -6626,8 +7783,18 @@ components:
           $ref: "#/components/schemas/BilledTokenCounts"
         runtime_secs:
           type: number
-          description: Wall-clock runtime in seconds.
+          description: Wall-clock runtime in seconds, summed across every visit of this node.
           example: 154.0
+        started_at:
+          type: ["string", "null"]
+          format: date-time
+          description: Wall-clock time the latest attempt of this stage started, if known.
+          example: "2026-04-29T12:34:56Z"
+        state:
+          oneOf:
+            - $ref: "#/components/schemas/StageState"
+            - type: "null"
+          description: Lifecycle state of the stage. Use to detect in-flight rows for client-side runtime ticking.
 
     RunBillingTotals:
       description: Aggregate billing totals across all stages of a run.
@@ -6687,7 +7854,7 @@ components:
           $ref: "#/components/schemas/ModelReference"
         stages:
           type: integer
-          description: Number of stages that used this model.
+          description: Number of usage-bearing stage visits that used this model.
           example: 2
         billing:
           $ref: "#/components/schemas/BilledTokenCounts"
@@ -6702,7 +7869,7 @@ components:
       properties:
         stages:
           type: array
-          description: Per-stage billing breakdown.
+          description: Per-node billing breakdown. Each row sums billing and runtime across all visits of that node.
           items:
             $ref: "#/components/schemas/RunBillingStage"
         totals:
@@ -6766,28 +7933,108 @@ components:
           example: "preview-token-123"
 
     SshAccessRequest:
-      description: Request body for creating SSH access for a sandbox-backed run.
+      description: Request body for creating sandbox access for a sandbox-backed run.
       type: object
       required:
         - ttl_minutes
       properties:
         ttl_minutes:
           type: number
-          description: Time-to-live for the SSH command in minutes.
+          description: Time-to-live for time-limited access commands in minutes. Ignored by providers whose commands are not time-limited.
           minimum: 1
           maximum: 1440
           example: 60
 
     SshAccessResponse:
-      description: Response containing an SSH command for the sandbox.
+      description: Response containing a command for connecting to the sandbox.
       type: object
       required:
         - command
       properties:
         command:
           type: string
-          description: SSH command to connect to the sandbox.
-          example: ssh daytona@preview.example.com -p 2222
+          description: Command to connect to the sandbox.
+          example: docker exec -it fabro-run-01HY0000000000000000000000 sh -lc 'cd /workspace && exec sh -l'
+
+    SandboxState:
+      description: Normalized sandbox lifecycle state used by the control plane and UI. The original provider-specific state string is preserved in `native_state`.
+      type: string
+      enum:
+        - unknown
+        - provisioning
+        - starting
+        - running
+        - stopping
+        - stopped
+        - paused
+        - deleting
+        - deleted
+        - archived
+        - restoring
+        - resizing
+        - error
+
+    SandboxResources:
+      description: Resource configuration for a sandbox. Fields are nullable when the provider does not surface a value or no limit is configured.
+      type: object
+      properties:
+        cpu_cores:
+          type: number
+          format: double
+          description: Configured CPU cores. Null when unavailable.
+        memory_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Memory limit in bytes. Null when unavailable or unlimited.
+        disk_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Disk size in bytes. Null when unavailable.
+
+    SandboxTimestamps:
+      description: Lifecycle timestamps for a sandbox. Fields are nullable when the provider does not surface a value.
+      type: object
+      properties:
+        created_at:
+          type: string
+          format: date-time
+          description: When the sandbox was created.
+        last_activity_at:
+          type: string
+          format: date-time
+          description: Most recent activity timestamp reported by the provider.
+
+    SandboxDetails:
+      description: Provider-neutral details about the sandbox owned by a run.
+      type: object
+      required:
+        - sandbox
+        - state
+        - resources
+        - labels
+        - timestamps
+      properties:
+        sandbox:
+          $ref: "#/components/schemas/RunSandbox"
+        state:
+          $ref: "#/components/schemas/SandboxState"
+        native_state:
+          type: ["string", "null"]
+          description: Original provider state string before normalization. Display/debugging only; UI behavior keys off `state`.
+        region:
+          type: ["string", "null"]
+          description: Provider region or target. Null for local-style providers.
+        resources:
+          $ref: "#/components/schemas/SandboxResources"
+        labels:
+          type: object
+          additionalProperties:
+            type: string
+          description: Provider-reported labels.
+        timestamps:
+          $ref: "#/components/schemas/SandboxTimestamps"
 
     SandboxFileEntry:
       description: A directory entry in a run sandbox.
@@ -6817,6 +8064,97 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/SandboxFileEntry"
+
+    SandboxService:
+      description: A listening TCP service discovered inside a run sandbox.
+      type: object
+      required:
+        - port
+        - addresses
+        - processes
+        - preview_supported
+      properties:
+        port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+          description: Listening TCP port.
+          example: 3000
+        addresses:
+          type: array
+          description: Local bind addresses discovered from `ss` or `/proc/net/tcp*`.
+          items:
+            type: string
+          example: ["127.0.0.1:3000", "[::]:3000"]
+        processes:
+          type: array
+          description: Visible process summaries when available. Empty when the sandbox only supports `/proc/net/tcp*` discovery.
+          items:
+            type: string
+          example: ['users:(("node",pid=42,fd=23))']
+        preview_supported:
+          type: boolean
+          description: Whether the provider supports an external preview URL for this port.
+          example: true
+
+    SandboxServiceListResponse:
+      description: Non-paginated list of listening TCP services in a run sandbox.
+      type: object
+      required:
+        - data
+        - meta
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/SandboxService"
+        meta:
+          $ref: "#/components/schemas/SandboxServiceListMeta"
+
+    SandboxServiceListMeta:
+      description: Metadata about sandbox service discovery.
+      type: object
+      required:
+        - source
+      properties:
+        source:
+          $ref: "#/components/schemas/SandboxServiceDiscoverySource"
+
+    SandboxServiceDiscoverySource:
+      description: Tool or kernel interface used to discover sandbox services.
+      type: string
+      enum:
+        - ss
+        - procfs
+
+    VncPreviewResponse:
+      description: Response containing a signed noVNC preview URL for a Daytona sandbox.
+      type: object
+      required:
+        - url
+        - provider
+        - port
+        - expires_in_secs
+      properties:
+        url:
+          type: string
+          description: Signed noVNC preview URL.
+          example: "https://preview.example.com/sb-a1b2c3d4/6080?token=..."
+        provider:
+          type: string
+          description: Sandbox provider that produced the VNC preview.
+          example: daytona
+        port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+          description: noVNC port exposed by the sandbox.
+          example: 6080
+        expires_in_secs:
+          type: integer
+          minimum: 1
+          description: Signed URL time-to-live in seconds.
+          example: 3600
 
     # ── Insights Schemas ─────────────────────────────────────────────────
 
@@ -7189,16 +8527,12 @@ components:
 
     ServerIntegrationsSettings:
       type: object
-      required: [github, slack, discord, teams]
+      required: [github, slack]
       properties:
         github:
           $ref: "#/components/schemas/GithubIntegrationSettings"
         slack:
           $ref: "#/components/schemas/SlackIntegrationSettings"
-        discord:
-          $ref: "#/components/schemas/DiscordIntegrationSettings"
-        teams:
-          $ref: "#/components/schemas/TeamsIntegrationSettings"
 
     GithubIntegrationSettings:
       type: object
@@ -7208,7 +8542,6 @@ components:
         - app_id
         - client_id
         - slug
-        - permissions
         - webhooks
       properties:
         enabled:
@@ -7221,10 +8554,6 @@ components:
           type: ["string", "null"]
         slug:
           type: ["string", "null"]
-        permissions:
-          type: object
-          additionalProperties:
-            type: string
         webhooks:
           oneOf:
             - $ref: "#/components/schemas/IntegrationWebhooksSettings"
@@ -7242,20 +8571,6 @@ components:
           type: boolean
         default_channel:
           type: ["string", "null"]
-
-    DiscordIntegrationSettings:
-      type: object
-      required: [enabled]
-      properties:
-        enabled:
-          type: boolean
-
-    TeamsIntegrationSettings:
-      type: object
-      required: [enabled]
-      properties:
-        enabled:
-          type: boolean
 
     IntegrationWebhooksSettings:
       type: object
@@ -7305,14 +8620,12 @@ components:
 
     ProjectNamespace:
       type: object
-      required: [name, description, directory, metadata]
+      required: [name, description, metadata]
       properties:
         name:
           type: ["string", "null"]
         description:
           type: ["string", "null"]
-        directory:
-          type: string
         metadata:
           $ref: "#/components/schemas/StringMap"
 
@@ -7349,6 +8662,7 @@ components:
         - scm
         - pull_request
         - artifacts
+        - integrations
       properties:
         goal:
           oneOf:
@@ -7396,6 +8710,24 @@ components:
             - type: "null"
         artifacts:
           $ref: "#/components/schemas/ArtifactsSettings"
+        integrations:
+          $ref: "#/components/schemas/RunIntegrationsSettings"
+
+    RunIntegrationsSettings:
+      type: object
+      required: [github]
+      properties:
+        github:
+          $ref: "#/components/schemas/RunIntegrationsGithubSettings"
+
+    RunIntegrationsGithubSettings:
+      type: object
+      required: [permissions]
+      properties:
+        permissions:
+          type: object
+          additionalProperties:
+            type: string
 
     RunGoal:
       oneOf:
@@ -7470,14 +8802,12 @@ components:
 
     RunExecutionSettings:
       type: object
-      required: [mode, approval, retros]
+      required: [mode, approval]
       properties:
         mode:
           $ref: "#/components/schemas/RunMode"
         approval:
           $ref: "#/components/schemas/ApprovalMode"
-        retros:
-          type: boolean
 
     RunMode:
       type: string
@@ -7498,11 +8828,13 @@ components:
 
     RunSandboxSettings:
       type: object
-      required: [provider, preserve, devcontainer, env, local, docker, daytona]
+      required: [provider, preserve, stop_on_terminal, devcontainer, env, docker, daytona]
       properties:
         provider:
-          type: string
+          $ref: "#/components/schemas/SandboxProvider"
         preserve:
+          type: boolean
+        stop_on_terminal:
           type: boolean
         devcontainer:
           type: boolean
@@ -7510,8 +8842,6 @@ components:
           type: object
           additionalProperties:
             $ref: "#/components/schemas/InterpString"
-        local:
-          $ref: "#/components/schemas/LocalSandboxSettings"
         docker:
           oneOf:
             - $ref: "#/components/schemas/DockerSettings"
@@ -7520,17 +8850,6 @@ components:
           oneOf:
             - $ref: "#/components/schemas/DaytonaSettings"
             - type: "null"
-
-    LocalSandboxSettings:
-      type: object
-      required: [worktree_mode]
-      properties:
-        worktree_mode:
-          $ref: "#/components/schemas/WorktreeMode"
-
-    WorktreeMode:
-      type: string
-      enum: [always, clean, dirty, never]
 
     DockerSettings:
       type: object
@@ -7637,7 +8956,7 @@ components:
 
     NotificationRouteSettings:
       type: object
-      required: [enabled, provider, events, slack, discord, teams]
+      required: [enabled, provider, events, slack]
       properties:
         enabled:
           type: boolean
@@ -7651,14 +8970,6 @@ components:
           oneOf:
             - $ref: "#/components/schemas/NotificationProviderSettings"
             - type: "null"
-        discord:
-          oneOf:
-            - $ref: "#/components/schemas/NotificationProviderSettings"
-            - type: "null"
-        teams:
-          oneOf:
-            - $ref: "#/components/schemas/NotificationProviderSettings"
-            - type: "null"
 
     NotificationProviderSettings:
       type: object
@@ -7669,19 +8980,11 @@ components:
 
     RunInterviewsSettings:
       type: object
-      required: [provider, slack, discord, teams]
+      required: [provider, slack]
       properties:
         provider:
           type: ["string", "null"]
         slack:
-          oneOf:
-            - $ref: "#/components/schemas/InterviewProviderSettings"
-            - type: "null"
-        discord:
-          oneOf:
-            - $ref: "#/components/schemas/InterviewProviderSettings"
-            - type: "null"
-        teams:
           oneOf:
             - $ref: "#/components/schemas/InterviewProviderSettings"
             - type: "null"
@@ -7930,9 +9233,6 @@ components:
         session_sandboxes:
           type: boolean
           description: Whether session sandboxes are enabled.
-        retros:
-          type: boolean
-          description: Whether workflow retros are enabled.
 
     SystemRunCounts:
       description: Counts of known runs in the active server process.
@@ -7946,6 +9246,36 @@ components:
           type: integer
           format: int64
           description: Runs currently queued or executing.
+
+    SystemRepairRunsResponse:
+      description: Runs that need manual repair or deletion because they cannot be loaded.
+      type: object
+      required: [runs, total_count]
+      properties:
+        runs:
+          type: array
+          items:
+            $ref: "#/components/schemas/SystemRepairRunIssue"
+        total_count:
+          type: integer
+          format: int64
+          description: Count of run repair issues.
+
+    SystemRepairRunIssue:
+      description: One cataloged run that cannot be loaded from durable storage.
+      type: object
+      required: [run_id, created_at, error]
+      properties:
+        run_id:
+          type: string
+          description: Run identifier.
+        created_at:
+          type: string
+          format: date-time
+          description: Timestamp encoded in the run identifier.
+        error:
+          type: string
+          description: Error produced while loading the run projection.
 
     DiskUsageResponse:
       description: Disk usage summary for server-managed data.

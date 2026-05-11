@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
 use super::super::{
-    ApiError, AppState, FailureReason, ForkRequest, ForkResponse, IntoResponse, Json, Ordering,
-    Path, Principal, RequiredUser, Response, RewindRequest, RewindResponse, Router,
-    RunAnswerTransport, RunControlAction, RunExecutionMode, RunId, RunStatus, RunStatusResponse,
-    StartRunRequest, State, StatusCode, Storage, TimelineEntryResponse, WORKER_CANCEL_GRACE,
-    WorkflowError, append_control_request, get, load_pending_control, managed_run, operations,
-    parse_run_id_path, persist_cancelled_run_status, post, reject_if_archived, sleep,
-    update_live_run_from_event, workflow_event,
+    ApiError, AppState, FailureReason, ForkRequest, ForkResponse, IntoResponse, Json, Path,
+    Principal, RequiredUser, Response, RewindRequest, RewindResponse, Router, RunAnswerTransport,
+    RunControlAction, RunExecutionMode, RunId, RunStatus, StartRunRequest, State, StatusCode,
+    Storage, TimelineEntryResponse, WORKER_CANCEL_GRACE, WorkflowError, append_control_request,
+    get, load_pending_control, managed_run, operations, parse_run_id_path,
+    persist_cancelled_run_status, post, reject_if_archived, sleep, update_live_run_from_event,
+    workflow_event,
 };
 
 pub(super) fn routes() -> Router<Arc<AppState>> {
@@ -21,6 +21,16 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         .route("/runs/{id}/fork", post(fork_run))
         .route("/runs/{id}/timeline", get(run_timeline))
         .route("/runs/{id}/unarchive", post(unarchive_run))
+}
+
+async fn run_response(state: &AppState, id: RunId, status: StatusCode) -> Response {
+    match state.store.get_cached_summary(&id).await {
+        Ok(Some(summary)) => (status, Json(summary)).into_response(),
+        Ok(None) => ApiError::not_found("Run not found.").into_response(),
+        Err(err) => {
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
+        }
+    }
 }
 
 async fn start_run(
@@ -77,11 +87,12 @@ async fn start_run(
     };
 
     if resume {
-        if run_state.checkpoint.is_none() {
+        if run_state.current_checkpoint().is_none() {
             return ApiError::new(StatusCode::CONFLICT, "no checkpoint to resume from")
                 .into_response();
         }
-    } else if let Some(status) = run_state.status {
+    } else {
+        let status = run_state.status;
         if !matches!(
             status,
             RunStatus::Submitted | RunStatus::Queued | RunStatus::Starting
@@ -94,18 +105,11 @@ async fn start_run(
         }
     }
 
-    if run_state.spec.is_none() {
-        return ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "run spec missing from store",
-        )
-        .into_response();
-    }
     let run_dir = Storage::new(state.server_storage_dir())
         .run_scratch(&id)
         .root()
         .to_path_buf();
-    let dot_source = run_state.graph_source.unwrap_or_default();
+    let dot_source = run_state.spec.graph_source.clone().unwrap_or_default();
     if let Err(err) =
         workflow_event::append_event(&run_store, &id, &workflow_event::Event::RunQueued).await
     {
@@ -130,21 +134,8 @@ async fn start_run(
         );
     }
 
-    let web_url = state.run_web_url(&id);
     state.scheduler_notify.notify_one();
-    (
-        StatusCode::OK,
-        Json(RunStatusResponse {
-            id: id.to_string(),
-            status: RunStatus::Queued,
-            error: None,
-            queue_position: None,
-            pending_control: None,
-            created_at: id.created_at(),
-            web_url,
-        }),
-    )
-        .into_response()
+    run_response(state.as_ref(), id, StatusCode::OK).await
 }
 
 fn schedule_worker_kill(state: Arc<AppState>, run_id: RunId, worker_pid: u32) {
@@ -180,15 +171,7 @@ async fn cancel_run(
                 .into_response();
         }
     };
-    let (
-        created_at,
-        response_status,
-        persist_cancelled_status,
-        answer_transport,
-        cancel_token,
-        cancel_tx,
-        worker_pid,
-    ) = {
+    let (persist_cancelled_status, answer_transport, cancel_token, cancel_tx, worker_pid) = {
         let mut runs = state.runs.lock().expect("runs lock poisoned");
         match runs.get_mut(&id) {
             Some(managed_run) => match managed_run.status {
@@ -204,18 +187,12 @@ async fn cancel_run(
                     );
                     let persist_cancelled_status =
                         matches!(managed_run.status, RunStatus::Submitted | RunStatus::Queued);
-                    let response_status = if persist_cancelled_status {
-                        let cancelled = RunStatus::Failed {
+                    if persist_cancelled_status {
+                        managed_run.status = RunStatus::Failed {
                             reason: FailureReason::Cancelled,
                         };
-                        managed_run.status = cancelled;
-                        cancelled
-                    } else {
-                        managed_run.status
-                    };
+                    }
                     (
-                        managed_run.created_at,
-                        response_status,
                         persist_cancelled_status,
                         managed_run.answer_transport.clone(),
                         managed_run.cancel_token.clone(),
@@ -249,7 +226,7 @@ async fn cancel_run(
     }
 
     if let Some(token) = &cancel_token {
-        token.store(true, Ordering::SeqCst);
+        token.cancel();
     }
     let sent_cancel_signal = if let Some(cancel_tx) = cancel_tx {
         let _ = cancel_tx.send(());
@@ -275,28 +252,8 @@ async fn cancel_run(
                 .into_response();
         }
     }
-    let pending_control = match load_pending_control(state.as_ref(), id).await {
-        Ok(pending_control) => pending_control,
-        Err(err) => {
-            return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
-                .into_response();
-        }
-    };
-    let web_url = state.run_web_url(&id);
 
-    (
-        StatusCode::OK,
-        Json(RunStatusResponse {
-            id: id.to_string(),
-            status: response_status,
-            error: None,
-            queue_position: None,
-            pending_control,
-            created_at,
-            web_url,
-        }),
-    )
-        .into_response()
+    run_response(state.as_ref(), id, StatusCode::OK).await
 }
 
 /// How `pause_run` should enact the transition, chosen from the current run
@@ -338,7 +295,7 @@ async fn pause_run(
                 .into_response();
         }
     };
-    let (created_at, mode) = {
+    let mode = {
         let runs = state.runs.lock().expect("runs lock poisoned");
         match runs.get(&id) {
             Some(managed_run) if managed_run.status == RunStatus::Running => {
@@ -346,10 +303,10 @@ async fn pause_run(
                     return ApiError::new(StatusCode::CONFLICT, "Run worker is not available.")
                         .into_response();
                 };
-                (managed_run.created_at, PauseMode::Signal { worker_pid })
+                PauseMode::Signal { worker_pid }
             }
             Some(managed_run) if matches!(managed_run.status, RunStatus::Blocked { .. }) => {
-                (managed_run.created_at, PauseMode::AppendEvent)
+                PauseMode::AppendEvent
             }
             Some(_) => {
                 return ApiError::new(StatusCode::CONFLICT, "Run is not pausable.").into_response();
@@ -375,13 +332,12 @@ async fn pause_run(
     {
         return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
     }
-    let response_status = match mode {
+    match mode {
         PauseMode::Signal { worker_pid } => {
             #[cfg(unix)]
             fabro_proc::sigusr1(worker_pid);
             #[cfg(not(unix))]
             let _ = worker_pid;
-            RunStatus::Running
         }
         PauseMode::AppendEvent => {
             if let Some(response) = synchronous_transition(state.as_ref(), id, |events| {
@@ -391,36 +347,10 @@ async fn pause_run(
             {
                 return response;
             }
-            state
-                .runs
-                .lock()
-                .expect("runs lock poisoned")
-                .get(&id)
-                .map_or(RunStatus::Paused { prior_block: None }, |run| run.status)
         }
-    };
-    let pending_control = match load_pending_control(state.as_ref(), id).await {
-        Ok(pending_control) => pending_control,
-        Err(err) => {
-            return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
-                .into_response();
-        }
-    };
-    let web_url = state.run_web_url(&id);
+    }
 
-    (
-        StatusCode::OK,
-        Json(RunStatusResponse {
-            id: id.to_string(),
-            status: response_status,
-            error: None,
-            queue_position: None,
-            pending_control,
-            created_at,
-            web_url,
-        }),
-    )
-        .into_response()
+    run_response(state.as_ref(), id, StatusCode::OK).await
 }
 
 async fn unpause_run(
@@ -442,19 +372,19 @@ async fn unpause_run(
                 .into_response();
         }
     };
-    let (created_at, mode) = {
+    let mode = {
         let runs = state.runs.lock().expect("runs lock poisoned");
         match runs.get(&id) {
             Some(managed_run) => match managed_run.status {
                 RunStatus::Paused {
                     prior_block: Some(_),
-                } => (managed_run.created_at, UnpauseMode::AppendEvent),
+                } => UnpauseMode::AppendEvent,
                 RunStatus::Paused { prior_block: None } => {
                     let Some(worker_pid) = managed_run.worker_pid else {
                         return ApiError::new(StatusCode::CONFLICT, "Run worker is not available.")
                             .into_response();
                     };
-                    (managed_run.created_at, UnpauseMode::Signal { worker_pid })
+                    UnpauseMode::Signal { worker_pid }
                 }
                 _ => {
                     return ApiError::new(StatusCode::CONFLICT, "Run is not paused.")
@@ -482,13 +412,12 @@ async fn unpause_run(
     {
         return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
     }
-    let response_status = match mode {
+    match mode {
         UnpauseMode::Signal { worker_pid } => {
             #[cfg(unix)]
             fabro_proc::sigusr2(worker_pid);
             #[cfg(not(unix))]
             let _ = worker_pid;
-            RunStatus::Paused { prior_block: None }
         }
         UnpauseMode::AppendEvent => {
             if let Some(response) = synchronous_transition(state.as_ref(), id, |events| {
@@ -498,36 +427,10 @@ async fn unpause_run(
             {
                 return response;
             }
-            state
-                .runs
-                .lock()
-                .expect("runs lock poisoned")
-                .get(&id)
-                .map_or(RunStatus::Running, |run| run.status)
         }
-    };
-    let pending_control = match load_pending_control(state.as_ref(), id).await {
-        Ok(pending_control) => pending_control,
-        Err(err) => {
-            return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
-                .into_response();
-        }
-    };
-    let web_url = state.run_web_url(&id);
+    }
 
-    (
-        StatusCode::OK,
-        Json(RunStatusResponse {
-            id: id.to_string(),
-            status: response_status,
-            error: None,
-            queue_position: None,
-            pending_control,
-            created_at,
-            web_url,
-        }),
-    )
-        .into_response()
+    run_response(state.as_ref(), id, StatusCode::OK).await
 }
 
 async fn archive_run(
@@ -739,41 +642,8 @@ async fn run_archive_action(
     }
 }
 
-/// Build a `RunStatusResponse` reflecting the durable projection after an
-/// archive/unarchive transition. The run is terminal in both directions, so no
-/// live queue position or worker-only fields apply.
 async fn archive_status_response(state: &AppState, id: RunId) -> Response {
-    let Ok(run_store) = state.store.open_run_reader(&id).await else {
-        return ApiError::not_found("Run not found.").into_response();
-    };
-    let projection = match run_store.state().await {
-        Ok(projection) => projection,
-        Err(err) => {
-            return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
-                .into_response();
-        }
-    };
-    let Some(status) = projection.status else {
-        return ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "run has no status after archive/unarchive",
-        )
-        .into_response();
-    };
-    let web_url = state.run_web_url(&id);
-    (
-        StatusCode::OK,
-        Json(RunStatusResponse {
-            id: id.to_string(),
-            status,
-            error: None,
-            queue_position: None,
-            pending_control: None,
-            created_at: id.created_at(),
-            web_url,
-        }),
-    )
-        .into_response()
+    run_response(state, id, StatusCode::OK).await
 }
 
 /// Persist a synchronous pause/unpause transition: append the caller-supplied

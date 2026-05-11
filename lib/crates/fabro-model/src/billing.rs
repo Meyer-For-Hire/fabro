@@ -124,6 +124,13 @@ pub struct ModelRef {
     pub speed:    Option<Speed>,
 }
 
+/// Token counts for one LLM call.
+///
+/// All five fields are disjoint: each token is counted in exactly one bucket,
+/// and `total_tokens()` is their sum. Provider mappings normalize their wire
+/// formats into this shape. For example, OpenAI's nested cached tokens are
+/// subtracted out of `input_tokens`, while Anthropic thinking tokens remain in
+/// `output_tokens` because Anthropic does not expose a separate billed count.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct TokenCounts {
     pub input_tokens:       i64,
@@ -356,6 +363,46 @@ impl BilledTokenCounts {
             total_usd_micros:   has_total.then_some(total_usd_micros),
         }
     }
+
+    pub fn add_counts(&mut self, source: &Self) {
+        self.input_tokens += source.input_tokens;
+        self.output_tokens += source.output_tokens;
+        self.total_tokens += source.total_tokens;
+        self.reasoning_tokens += source.reasoning_tokens;
+        self.cache_read_tokens += source.cache_read_tokens;
+        self.cache_write_tokens += source.cache_write_tokens;
+        if let Some(value) = source.total_usd_micros {
+            *self.total_usd_micros.get_or_insert(0) += value;
+        }
+    }
+
+    pub fn add_billed_usage(&mut self, usage: &BilledModelUsage) {
+        let tokens = usage.tokens();
+        self.input_tokens += tokens.input_tokens;
+        self.output_tokens += tokens.output_tokens;
+        self.reasoning_tokens += tokens.reasoning_tokens;
+        self.cache_read_tokens += tokens.cache_read_tokens;
+        self.cache_write_tokens += tokens.cache_write_tokens;
+        self.total_tokens += tokens.total_tokens();
+        if let Some(value) = usage.total_usd_micros {
+            *self.total_usd_micros.get_or_insert(0) += value;
+        }
+    }
+
+    pub fn replace_with_billed_usage(&mut self, usage: &BilledModelUsage) {
+        *self = Self::from_billed_usage(std::slice::from_ref(usage));
+    }
+
+    #[must_use]
+    pub fn is_zero(&self) -> bool {
+        self.input_tokens == 0
+            && self.output_tokens == 0
+            && self.total_tokens == 0
+            && self.reasoning_tokens == 0
+            && self.cache_read_tokens == 0
+            && self.cache_write_tokens == 0
+            && self.total_usd_micros.unwrap_or(0) == 0
+    }
 }
 
 impl Model {
@@ -575,6 +622,146 @@ fn bill_gemini(
 mod tests {
     use super::*;
     use crate::Catalog;
+
+    fn billed_usage(
+        input_tokens: i64,
+        output_tokens: i64,
+        total_usd_micros: Option<i64>,
+    ) -> BilledModelUsage {
+        BilledModelUsage {
+            input: ModelBillingInput {
+                usage: ModelUsage {
+                    model:  ModelRef {
+                        provider: Provider::OpenAi,
+                        model_id: "gpt-5.4".to_string(),
+                        speed:    None,
+                    },
+                    tokens: TokenCounts {
+                        input_tokens,
+                        output_tokens,
+                        reasoning_tokens: 3,
+                        cache_read_tokens: 5,
+                        cache_write_tokens: 7,
+                    },
+                },
+                facts: ModelBillingFacts::OpenAi(OpenAiBillingFacts::default()),
+            },
+            total_usd_micros,
+        }
+    }
+
+    #[test]
+    fn billed_token_counts_add_counts_accumulates_cost_when_known() {
+        let mut counts = BilledTokenCounts {
+            input_tokens:       1,
+            output_tokens:      2,
+            total_tokens:       3,
+            reasoning_tokens:   4,
+            cache_read_tokens:  5,
+            cache_write_tokens: 6,
+            total_usd_micros:   None,
+        };
+        counts.add_counts(&BilledTokenCounts {
+            input_tokens:       10,
+            output_tokens:      20,
+            total_tokens:       30,
+            reasoning_tokens:   40,
+            cache_read_tokens:  50,
+            cache_write_tokens: 60,
+            total_usd_micros:   Some(70),
+        });
+
+        assert_eq!(counts, BilledTokenCounts {
+            input_tokens:       11,
+            output_tokens:      22,
+            total_tokens:       33,
+            reasoning_tokens:   44,
+            cache_read_tokens:  55,
+            cache_write_tokens: 66,
+            total_usd_micros:   Some(70),
+        });
+    }
+
+    #[test]
+    fn billed_token_counts_add_billed_usage_preserves_unknown_cost() {
+        let mut counts = BilledTokenCounts::default();
+
+        counts.add_billed_usage(&billed_usage(10, 20, None));
+
+        assert_eq!(counts, BilledTokenCounts {
+            input_tokens:       10,
+            output_tokens:      20,
+            total_tokens:       45,
+            reasoning_tokens:   3,
+            cache_read_tokens:  5,
+            cache_write_tokens: 7,
+            total_usd_micros:   None,
+        });
+    }
+
+    #[test]
+    fn billed_token_counts_add_billed_usage_accumulates_known_cost() {
+        let mut counts = BilledTokenCounts::default();
+
+        counts.add_billed_usage(&billed_usage(10, 20, Some(100)));
+        counts.add_billed_usage(&billed_usage(1, 2, Some(50)));
+
+        assert_eq!(counts.input_tokens, 11);
+        assert_eq!(counts.output_tokens, 22);
+        assert_eq!(counts.total_tokens, 63);
+        assert_eq!(counts.total_usd_micros, Some(150));
+    }
+
+    #[test]
+    fn billed_token_counts_replace_with_billed_usage_discards_previous_values() {
+        let mut counts = BilledTokenCounts {
+            input_tokens:       100,
+            output_tokens:      200,
+            total_tokens:       300,
+            reasoning_tokens:   400,
+            cache_read_tokens:  500,
+            cache_write_tokens: 600,
+            total_usd_micros:   Some(700),
+        };
+
+        counts.replace_with_billed_usage(&billed_usage(1, 2, None));
+
+        assert_eq!(counts, BilledTokenCounts {
+            input_tokens:       1,
+            output_tokens:      2,
+            total_tokens:       18,
+            reasoning_tokens:   3,
+            cache_read_tokens:  5,
+            cache_write_tokens: 7,
+            total_usd_micros:   None,
+        });
+    }
+
+    #[test]
+    fn billed_token_counts_is_zero_treats_missing_and_zero_cost_as_zero() {
+        assert!(BilledTokenCounts::default().is_zero());
+        assert!(
+            BilledTokenCounts {
+                total_usd_micros: Some(0),
+                ..BilledTokenCounts::default()
+            }
+            .is_zero()
+        );
+        assert!(
+            !BilledTokenCounts {
+                input_tokens: 1,
+                ..BilledTokenCounts::default()
+            }
+            .is_zero()
+        );
+        assert!(
+            !BilledTokenCounts {
+                total_usd_micros: Some(1),
+                ..BilledTokenCounts::default()
+            }
+            .is_zero()
+        );
+    }
 
     #[test]
     fn openai_pricing_bills_cached_input_and_reasoning_output() {

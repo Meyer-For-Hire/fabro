@@ -150,8 +150,8 @@ fn run_startup_failure(context: &TestContext, mode: ServerStartMode, case: &Star
     let log_path = storage_dir.join("logs/server.log");
     match mode {
         ServerStartMode::Foreground => assert!(
-            log_path.exists(),
-            "foreground validation intentionally runs after log bootstrap for {}",
+            !log_path.exists(),
+            "foreground stdout bootstrap should fail before creating server.log for {}",
             case.name
         ),
         ServerStartMode::Daemon => assert!(
@@ -418,7 +418,7 @@ fn start_without_default_settings_reports_missing_web_assets_for_browser_install
     clippy::disallowed_methods,
     reason = "This sync integration test spawns the real foreground server process to verify log ownership."
 )]
-fn foreground_start_writes_tracing_to_storage_server_log() {
+fn foreground_start_writes_tracing_to_stdout_by_default() {
     let home_dir = tempfile::tempdir_in("/tmp").unwrap();
     let storage_root = isolated_storage_dir();
     let storage_dir = storage_root.path().join("storage");
@@ -426,6 +426,112 @@ fn foreground_start_writes_tracing_to_storage_server_log() {
     let config_dir = tempfile::tempdir_in("/tmp").unwrap();
     let config_path = config_dir.path().join("settings.toml");
     write_dev_token_server_settings(&config_path, "");
+    provision_dev_token_auth(home_dir.path(), &storage_dir);
+    let storage_log_path = storage_dir.join("logs").join("server.log");
+    std::fs::create_dir_all(storage_log_path.parent().unwrap()).unwrap();
+    std::fs::write(&storage_log_path, "stale pre-start log entry\n").unwrap();
+
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_fabro"));
+    apply_test_isolation(&mut cmd, home_dir.path());
+    cmd.args(["server", "start", "--foreground"])
+        .arg("--storage-dir")
+        .arg(&storage_dir)
+        .arg("--bind")
+        .arg(&socket_path)
+        .arg("--config")
+        .arg(&config_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().expect("server start should spawn");
+    let record_path = storage_dir.join("server.json");
+    let deadline = Instant::now() + Duration::from_secs(5);
+
+    while Instant::now() < deadline {
+        if record_path.exists() {
+            break;
+        }
+        if let Some(status) = child.try_wait().expect("server start should poll") {
+            let output = child
+                .wait_with_output()
+                .expect("server start output should be readable");
+            panic!(
+                "foreground server exited before writing server.json with status {status}:\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        record_path.exists(),
+        "expected foreground start to create server.json"
+    );
+
+    let stop_output = {
+        let mut stop = std::process::Command::new(env!("CARGO_BIN_EXE_fabro"));
+        apply_test_isolation(&mut stop, home_dir.path());
+        stop.args(["server", "stop"])
+            .arg("--storage-dir")
+            .arg(&storage_dir)
+            .output()
+            .expect("server stop should run")
+    };
+    assert!(
+        stop_output.status.success(),
+        "server stop should succeed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&stop_output.stdout),
+        String::from_utf8_lossy(&stop_output.stderr)
+    );
+
+    let output = child
+        .wait_with_output()
+        .expect("server start output should be readable");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("API server started"),
+        "expected foreground stdout to contain server tracing, got:\n{stdout}\nforeground stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("Shutdown signal received, stopping server"),
+        "expected foreground stdout to contain shutdown tracing, got:\n{stdout}"
+    );
+    assert!(
+        stdout.find("API server started")
+            < stdout.find("Shutdown signal received, stopping server"),
+        "expected shutdown trace to append after startup trace, got:\n{stdout}",
+    );
+    let storage_log = std::fs::read_to_string(&storage_log_path).unwrap_or_default();
+    assert_eq!(storage_log, "stale pre-start log entry\n");
+
+    let home_server_logs = server_log_files(&home_dir.path().join(".fabro").join("logs"));
+    assert!(
+        home_server_logs.is_empty(),
+        "expected foreground server start to avoid home server logs, found: {home_server_logs:?}"
+    );
+}
+
+#[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "This sync integration test spawns the real foreground server process to verify log ownership."
+)]
+fn foreground_start_with_file_destination_writes_tracing_to_storage_server_log() {
+    let home_dir = tempfile::tempdir_in("/tmp").unwrap();
+    let storage_root = isolated_storage_dir();
+    let storage_dir = storage_root.path().join("storage");
+    let socket_path = storage_root.path().join("foreground-file.sock");
+    let config_dir = tempfile::tempdir_in("/tmp").unwrap();
+    let config_path = config_dir.path().join("settings.toml");
+    write_dev_token_server_settings(
+        &config_path,
+        r#"
+[server.logging]
+destination = "file"
+"#,
+    );
     provision_dev_token_auth(home_dir.path(), &storage_dir);
     let storage_log_path = storage_dir.join("logs").join("server.log");
     std::fs::create_dir_all(storage_log_path.parent().unwrap()).unwrap();

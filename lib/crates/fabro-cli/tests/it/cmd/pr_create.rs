@@ -150,6 +150,7 @@ fn pr_create_passes_force_and_model_to_server() {
     exit_code: 0
     ----- stdout -----
     {
+      "provider": "github",
       "html_url": "https://github.com/fabro-sh/fabro/pull/123",
       "number": 123,
       "owner": "fabro-sh",

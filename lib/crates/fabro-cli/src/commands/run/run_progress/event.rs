@@ -217,13 +217,6 @@ pub(super) enum ProgressEvent {
         from_node: String,
         to_node:   String,
     },
-    RetroStarted,
-    RetroCompleted {
-        duration_ms: u64,
-    },
-    RetroFailed {
-        duration_ms: u64,
-    },
     MetadataSnapshotFailed {
         phase:        String,
         failure_kind: String,
@@ -389,7 +382,7 @@ pub(super) fn from_run_event(stored: &RunEvent) -> Option<ProgressEvent> {
         EventBody::ParallelCompleted(_) => Some(ProgressEvent::ParallelCompleted),
         EventBody::AgentMessage(props) => Some(ProgressEvent::AssistantMessage {
             stage_node_id: node_id,
-            model:         props.model.clone(),
+            model:         props.model.model_id.clone(),
         }),
         EventBody::AgentToolStarted(props) => Some(ProgressEvent::ToolCallStarted {
             stage_node_id: node_id,
@@ -462,13 +455,6 @@ pub(super) fn from_run_event(stored: &RunEvent) -> Option<ProgressEvent> {
             from_node: props.from_node.clone(),
             to_node:   props.to_node.clone(),
         }),
-        EventBody::RetroStarted(_) => Some(ProgressEvent::RetroStarted),
-        EventBody::RetroCompleted(props) => Some(ProgressEvent::RetroCompleted {
-            duration_ms: props.duration_ms,
-        }),
-        EventBody::RetroFailed(props) => Some(ProgressEvent::RetroFailed {
-            duration_ms: props.duration_ms,
-        }),
         EventBody::MetadataSnapshotFailed(props) => Some(ProgressEvent::MetadataSnapshotFailed {
             phase:        props.phase.to_string(),
             failure_kind: props.failure_kind.to_string(),
@@ -527,7 +513,7 @@ fn display_value(value: &Value) -> Option<String> {
 mod tests {
     use fabro_agent::AgentEvent;
     use fabro_types::{MetadataSnapshotFailureKind, MetadataSnapshotPhase, fixtures};
-    use fabro_workflow::event::{Event, to_run_event};
+    use fabro_workflow::event::{Event, RunNoticeCode, to_run_event};
 
     use super::*;
 
@@ -804,10 +790,11 @@ mod tests {
     fn round_trip_run_notice() {
         let event = Event::RunNotice {
             level:            RunNoticeLevel::Warn,
-            code:             "sandbox_cleanup_failed".into(),
+            code:             RunNoticeCode::SandboxCleanupFailed.to_string(),
             message:          "sandbox cleanup failed".into(),
             exec_output_tail: None,
         };
+        let expected_code = RunNoticeCode::SandboxCleanupFailed.to_string();
 
         let stored = to_run_event(&fixtures::RUN_1, &event);
         let parsed = from_run_event(&stored).unwrap();
@@ -817,7 +804,7 @@ mod tests {
                 level: RunNoticeLevel::Warn,
                 code,
                 message,
-            } if code == "sandbox_cleanup_failed" && message == "sandbox cleanup failed"
+            } if code == expected_code && message == "sandbox cleanup failed"
         ));
     }
 

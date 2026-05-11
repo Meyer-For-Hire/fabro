@@ -134,6 +134,23 @@ fn patch_codegen_request_body_media_types(value: &mut serde_json::Value) {
     }
 }
 
+/// Progenitor currently panics when an operation advertises a typed success
+/// response alongside a no-content success response. Keep the source spec
+/// accurate for docs and other generators, but preserve the existing Rust
+/// client shape for `DELETE /runs/{id}`: success with no body.
+fn patch_codegen_delete_run_responses(value: &mut serde_json::Value) {
+    let Some(responses) = value
+        .get_mut("paths")
+        .and_then(|paths| paths.get_mut("/api/v1/runs/{id}"))
+        .and_then(|path| path.get_mut("delete"))
+        .and_then(|operation| operation.get_mut("responses"))
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    responses.remove("200");
+}
+
 fn spec_path_from_manifest_dir(manifest_dir: &Path) -> PathBuf {
     manifest_dir
         .ancestors()
@@ -161,6 +178,7 @@ fn main() {
     spec_value["openapi"] = serde_json::Value::String("3.0.3".to_string());
     patch_nullable(&mut spec_value);
     patch_codegen_request_body_media_types(&mut spec_value);
+    patch_codegen_delete_run_responses(&mut spec_value);
 
     let spec: openapiv3::OpenAPI =
         serde_json::from_value(spec_value).expect("failed to deserialize OpenAPI spec");
@@ -171,19 +189,15 @@ fn main() {
         ("RunStatus", "fabro_types::status::RunStatus", &[]),
         ("SuccessReason", "fabro_types::status::SuccessReason", &[]),
         ("FailureReason", "fabro_types::status::FailureReason", &[]),
-        ("TerminalStatus", "fabro_types::status::TerminalStatus", &[]),
         ("BlockedReason", "fabro_types::status::BlockedReason", &[]),
         (
             "RunControlAction",
             "fabro_types::status::RunControlAction",
             &[],
         ),
-        ("RunSummary", "fabro_types::RunSummary", &[]),
-        (
-            "RepositoryReference",
-            "fabro_types::RepositoryReference",
-            &[],
-        ),
+        ("Run", "fabro_types::Run", &[]),
+        ("DiffSummary", "fabro_types::DiffSummary", &[]),
+        ("RepositoryRef", "fabro_types::RepositoryRef", &[]),
         ("WorkflowSettings", "fabro_types::WorkflowSettings", &[]),
         ("ServerSettings", "fabro_types::ServerSettings", &[]),
         (
@@ -297,16 +311,6 @@ fn main() {
             &[],
         ),
         (
-            "DiscordIntegrationSettings",
-            "fabro_types::settings::server::DiscordIntegrationSettings",
-            &[],
-        ),
-        (
-            "TeamsIntegrationSettings",
-            "fabro_types::settings::server::TeamsIntegrationSettings",
-            &[],
-        ),
-        (
             "IntegrationWebhooksSettings",
             "fabro_types::settings::server::IntegrationWebhooksSettings",
             &[],
@@ -335,12 +339,8 @@ fn main() {
         ("QuestionType", "fabro_types::QuestionType", &[]),
         ("StageCompletion", "fabro_types::StageCompletion", &[]),
         ("StageOutcome", "fabro_types::StageOutcome", &[]),
+        ("StageHandler", "fabro_types::StageHandler", &[]),
         ("StageState", "fabro_types::StageState", &[]),
-        (
-            "CommandOutputStream",
-            "fabro_types::CommandOutputStream",
-            &[],
-        ),
         ("CommandTermination", "fabro_types::CommandTermination", &[]),
         ("StageProjection", "fabro_types::StageProjection", &[]),
         ("SecretMetadata", "fabro_types::SecretMetadata", &[]),
@@ -365,8 +365,9 @@ fn main() {
         ("RunProjection", "fabro_types::RunProjection", &[]),
         ("RunEvent", "fabro_types::RunEvent", &[]),
         ("EventEnvelope", "fabro_types::EventEnvelope", &[]),
-        ("PullRequestRecord", "fabro_types::PullRequestRecord", &[]),
-        ("PullRequestDetail", "fabro_types::PullRequestDetail", &[]),
+        ("PullRequest", "fabro_types::PullRequest", &[]),
+        ("PullRequestDetails", "fabro_types::PullRequestDetails", &[]),
+        ("RunSandboxRuntime", "fabro_types::RunSandboxRuntime", &[]),
         ("PullRequestUser", "fabro_types::PullRequestUser", &[]),
         ("PullRequestRef", "fabro_types::PullRequestRef", &[]),
         (
@@ -379,6 +380,28 @@ fn main() {
         ("PreRunPushOutcome", "fabro_types::PreRunPushOutcome", &[]),
         ("DirtyStatus", "fabro_types::DirtyStatus", &[]),
         ("GitContext", "fabro_types::GitContext", &[]),
+        ("SandboxProvider", "fabro_types::SandboxProvider", &[]),
+        ("RunSandbox", "fabro_types::RunSandbox", &[]),
+        ("SandboxDetails", "fabro_types::SandboxDetails", &[]),
+        ("SandboxService", "fabro_types::SandboxService", &[]),
+        (
+            "SandboxServiceDiscoverySource",
+            "fabro_types::SandboxServiceDiscoverySource",
+            &[],
+        ),
+        (
+            "SandboxServiceListMeta",
+            "fabro_types::SandboxServiceListMeta",
+            &[],
+        ),
+        (
+            "SandboxServiceListResponse",
+            "fabro_types::SandboxServiceListResponse",
+            &[],
+        ),
+        ("SandboxState", "fabro_types::SandboxState", &[]),
+        ("SandboxResources", "fabro_types::SandboxResources", &[]),
+        ("SandboxTimestamps", "fabro_types::SandboxTimestamps", &[]),
     ];
     for (name, path, impls) in replacements {
         settings.with_replacement(*name, *path, impls.iter().copied());

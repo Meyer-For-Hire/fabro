@@ -200,6 +200,10 @@ async fn create_completion(
                 .to_string(),
             ))),
         });
+        let sse_stream = futures_util::StreamExt::take_until(
+            sse_stream,
+            state.shutdown_token().cancelled_owned(),
+        );
 
         Sse::new(sse_stream)
             .keep_alive(

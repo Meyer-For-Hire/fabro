@@ -55,7 +55,6 @@
               "execution/checkpoints",
               "execution/outcomes",
               "execution/failures",
-              "execution/retros",
               "execution/observability",
               "execution/devcontainers"
             ]
@@ -214,7 +213,7 @@
                 "pages": [
                   "GET /api/v1/runs/{id}/checkpoint",
                   "GET /api/v1/runs/{id}/stages",
-                  "GET /api/v1/runs/{id}/stages/{stageId}/turns",
+                  "GET /api/v1/runs/{id}/stages/{stageId}/events",
                   "GET /api/v1/runs/{id}/settings"
                 ]
               }
@@ -251,6 +250,10 @@
             "group": "May 2026",
             "icon": "clock-rotate-left",
             "pages": [
+              "changelog/2026-05-08",
+              "changelog/2026-05-07",
+              "changelog/2026-05-06",
+              "changelog/2026-05-05",
               "changelog/2026-05-04",
               "changelog/2026-05-03",
               "changelog/2026-05-02",

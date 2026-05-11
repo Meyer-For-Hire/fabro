@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::BilledTokenCounts;
+use crate::ModelRef;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentSessionStartedProps {
@@ -9,11 +10,35 @@ pub struct AgentSessionStartedProps {
     pub provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model:    Option<String>,
-    pub visit:    u32,
+}
+
+#[allow(
+    clippy::empty_structs_with_brackets,
+    reason = "This type must serialize as {} rather than null."
+)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgentSessionEndedProps {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionCapability {
+    Steer,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AgentSessionEndedProps {
+pub struct AgentSessionActivatedProps {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id:    Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider:     Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model:        Option<String>,
+    pub capabilities: Vec<SessionCapability>,
+    pub visit:        u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentSessionDeactivatedProps {
     pub visit: u32,
 }
 
@@ -31,7 +56,7 @@ pub struct AgentInputProps {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentMessageProps {
     pub text:            String,
-    pub model:           String,
+    pub model:           ModelRef,
     pub billing:         BilledTokenCounts,
     pub tool_call_count: usize,
     pub visit:           u32,
@@ -83,6 +108,31 @@ pub struct AgentTurnLimitReachedProps {
 pub struct AgentSteeringInjectedProps {
     pub text:  String,
     pub visit: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentInterruptInjectedProps {
+    pub visit: u32,
+}
+
+#[allow(
+    clippy::empty_structs_with_brackets,
+    reason = "This type must serialize as {} rather than null."
+)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AgentSteerBufferedProps {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSteerDroppedReason {
+    QueueFull,
+    RunEnded,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentSteerDroppedProps {
+    pub reason: AgentSteerDroppedReason,
+    pub count:  u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

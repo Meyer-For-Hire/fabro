@@ -54,12 +54,12 @@ pub(crate) async fn execute(mut args: RunArgs, base_ctx: &CommandContext) -> Res
         ))
         .await?;
         if !json {
-            super::output::print_run_summary_with_client(
+            Box::pin(super::output::print_run_summary_with_client(
                 &client,
                 &created_run.run_id,
                 styles,
                 printer,
-            )
+            ))
             .await?;
         }
         if exit_code != std::process::ExitCode::SUCCESS {

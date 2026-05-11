@@ -1,6 +1,6 @@
 # Fabro Logging Strategy
 
-Fabro uses the `tracing` crate for structured logging. CLI logs write to `~/.fabro/logs/cli.YYYY-MM-DD.log`, rotated daily by `tracing-appender`; logs older than 7 days are cleaned up on startup. By default the server writes one main log at `<storage>/logs/server.log`, and worker subprocesses append their tracing events to that same file. Set `[server.logging].destination = "stdout"` (or `FABRO_LOG_DESTINATION=stdout`) to stream the server log to stdout instead — required for container deployments where the platform captures stdout.
+Fabro uses the `tracing` crate for structured logging. CLI logs write to `~/.fabro/logs/cli.YYYY-MM-DD.log`, rotated daily by `tracing-appender`; logs older than 7 days are cleaned up on startup. Daemonized server starts write one main log at `<storage>/logs/server.log` by default. Foreground server starts (`fabro server start --foreground` and `fabro server restart --foreground`) stream server logs to stdout by default when `[server.logging].destination` is absent. Interactive foreground stdout uses a compact colored one-line format with local date-bearing timestamps (`YYYY-MM-DD HH:MM:SS.mmm`); piped stdout and file logs keep the plain tracing format with ANSI disabled. Set `[server.logging].destination = "file"` to force file logging, or `FABRO_LOG_DESTINATION=stdout` to force stdout where compatible. Default install-generated `settings.toml` intentionally omits `[server.logging].destination` so foreground mode can use its stdout default.
 
 Each worker also writes its tracing events to the run-scoped log at `<scratch>/runtime/server.log`. This per-run file is worker tracing only: parent-side scheduling/cancel/delete events stay in the main server log, and unstructured worker stderr is still drained by the parent into `<storage>/logs/server.log`.
 
@@ -31,7 +31,7 @@ Fixed server and per-run logs use a per-event-buffered writer opened with `O_APP
 
 - Hot loops or per-token streaming events (use DEBUG only if truly needed for diagnosis)
 - Data that belongs in user-facing output (`eprintln!` for interactive CLI feedback, not tracing)
-- Detached user-visible warnings or errors that need to survive `attach`/`logs` (`detach.log` is debug-only; emit an `Event` into the run event stream instead)
+- Detached user-visible warnings or errors that need to survive `attach`/`events` (`detach.log` is debug-only; emit an `Event` into the run event stream instead)
 - Redundant information already captured by a parent event (if you logged "starting X", you don't need to log every sub-step at the same level)
 - Events that are already traced via `EventEnum::trace()` — the event enums (`AgentEvent`, `PipelineEvent`, `ExecutionEnvEvent`) each have a `trace()` method called automatically at their emit site; do not add manual `info!`/`debug!` calls that duplicate what `trace()` already emits
 - Wrapper/forwarding variants that re-emit an inner event — `PipelineEvent::Agent`, `PipelineEvent::ExecutionEnv`, and `AgentEvent::SubAgentEvent` are no-ops in `trace()` because the inner event is already traced at its origin
@@ -192,7 +192,7 @@ The domain event enums (`AgentEvent`, `PipelineEvent`, `ExecutionEnvEvent`) each
 
 - **Add tracing for new variants** by adding a match arm in the enum's `trace()` method. Choose the level based on the guidelines above (INFO for lifecycle boundaries, DEBUG for individual steps, WARN/ERROR for failures).
 - **Do not add manual log calls at emit sites.** The `trace()` call in the emitter handles it. Adding `info!` or `debug!` next to an `emit()` call will double-log.
-- **Detached UX belongs in events, not stderr.** If an attached user needs to see the message later via `fabro attach` or `fabro logs`, emit a workflow event (for example `RunNotice`) and let tracing capture the developer-oriented copy separately.
+- **Detached UX belongs in events, not stderr.** If an attached user needs to see the message later via `fabro attach` or `fabro events`, emit a workflow event (for example `RunNotice`) and let tracing capture the developer-oriented copy separately.
 - **Wrapper variants are no-ops.** When one event enum wraps another (`PipelineEvent::Agent` wraps `AgentEvent`, `AgentEvent::SubAgentEvent` wraps a child `AgentEvent`), the wrapper's `trace()` arm is `{}` because the inner event was already traced at its origin. This prevents double-logging.
 - **Streaming noise variants are no-ops.** `TextDelta` and `ToolCallOutputDelta` produce no log output — per-token events would flood the logs even at DEBUG level.
 

@@ -103,6 +103,8 @@ impl EnvVars {
     pub const CARGO_HOME: &'static str = "CARGO_HOME";
     pub const CARGO_MANIFEST_DIR: &'static str = "CARGO_MANIFEST_DIR";
     pub const CI: &'static str = "CI";
+    pub const CLICOLOR: &'static str = "CLICOLOR";
+    pub const CLICOLOR_FORCE: &'static str = "CLICOLOR_FORCE";
     pub const HOME: &'static str = "HOME";
     pub const KUBERNETES_SERVICE_HOST: &'static str = "KUBERNETES_SERVICE_HOST";
     pub const LANG: &'static str = "LANG";
@@ -230,6 +232,8 @@ mod tests {
             EnvVars::CARGO_HOME,
             EnvVars::CARGO_MANIFEST_DIR,
             EnvVars::CI,
+            EnvVars::CLICOLOR,
+            EnvVars::CLICOLOR_FORCE,
             EnvVars::HOME,
             EnvVars::KUBERNETES_SERVICE_HOST,
             EnvVars::LANG,

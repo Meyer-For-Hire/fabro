@@ -62,6 +62,10 @@ pub enum EventBody {
     RunStarting(RunStatusTransitionProps),
     #[serde(rename = "run.running")]
     RunRunning(RunStatusTransitionProps),
+    #[serde(rename = "run.interrupt")]
+    RunInterrupt(RunInterruptProps),
+    #[serde(rename = "run.steer")]
+    RunSteer(RunSteerProps),
     #[serde(rename = "run.blocked")]
     RunBlocked(RunBlockedProps),
     #[serde(rename = "run.unblocked")]
@@ -84,6 +88,8 @@ pub enum EventBody {
     RunArchived(RunArchivedProps),
     #[serde(rename = "run.unarchived")]
     RunUnarchived(RunUnarchivedProps),
+    #[serde(rename = "run.title.updated")]
+    RunTitleUpdated(RunTitleUpdatedProps),
     #[serde(rename = "run.completed")]
     RunCompleted(RunCompletedProps),
     #[serde(rename = "run.failed")]
@@ -148,6 +154,10 @@ pub enum EventBody {
     PromptCompleted(PromptCompletedProps),
     #[serde(rename = "agent.session.started")]
     AgentSessionStarted(AgentSessionStartedProps),
+    #[serde(rename = "agent.session.activated")]
+    AgentSessionActivated(AgentSessionActivatedProps),
+    #[serde(rename = "agent.session.deactivated")]
+    AgentSessionDeactivated(AgentSessionDeactivatedProps),
     #[serde(rename = "agent.session.ended")]
     AgentSessionEnded(AgentSessionEndedProps),
     #[serde(rename = "agent.processing.end")]
@@ -170,6 +180,12 @@ pub enum EventBody {
     AgentTurnLimitReached(AgentTurnLimitReachedProps),
     #[serde(rename = "agent.steering.injected")]
     AgentSteeringInjected(AgentSteeringInjectedProps),
+    #[serde(rename = "agent.interrupt.injected")]
+    AgentInterruptInjected(AgentInterruptInjectedProps),
+    #[serde(rename = "agent.steer.buffered")]
+    AgentSteerBuffered(AgentSteerBufferedProps),
+    #[serde(rename = "agent.steer.dropped")]
+    AgentSteerDropped(AgentSteerDroppedProps),
     #[serde(rename = "agent.compaction.started")]
     AgentCompactionStarted(AgentCompactionStartedProps),
     #[serde(rename = "agent.compaction.completed")]
@@ -204,6 +220,24 @@ pub enum EventBody {
     SandboxCleanupCompleted(SandboxCleanupCompletedProps),
     #[serde(rename = "sandbox.cleanup.failed")]
     SandboxCleanupFailed(SandboxCleanupFailedProps),
+    #[serde(rename = "sandbox.start.started")]
+    SandboxStartStarted(SandboxStartStartedProps),
+    #[serde(rename = "sandbox.start.completed")]
+    SandboxStartCompleted(SandboxStartCompletedProps),
+    #[serde(rename = "sandbox.start.failed")]
+    SandboxStartFailed(SandboxStartFailedProps),
+    #[serde(rename = "sandbox.stop.started")]
+    SandboxStopStarted(SandboxStopStartedProps),
+    #[serde(rename = "sandbox.stop.completed")]
+    SandboxStopCompleted(SandboxStopCompletedProps),
+    #[serde(rename = "sandbox.stop.failed")]
+    SandboxStopFailed(SandboxStopFailedProps),
+    #[serde(rename = "sandbox.delete.started")]
+    SandboxDeleteStarted(SandboxDeleteStartedProps),
+    #[serde(rename = "sandbox.delete.completed")]
+    SandboxDeleteCompleted(SandboxDeleteCompletedProps),
+    #[serde(rename = "sandbox.delete.failed")]
+    SandboxDeleteFailed(SandboxDeleteFailedProps),
     #[serde(rename = "sandbox.snapshot.pulling")]
     SnapshotPulling(SnapshotNameProps),
     #[serde(rename = "sandbox.snapshot.creating")]
@@ -252,6 +286,10 @@ pub enum EventBody {
     AgentCliStarted(AgentCliStartedProps),
     #[serde(rename = "agent.cli.completed")]
     AgentCliCompleted(AgentCliCompletedProps),
+    #[serde(rename = "agent.cli.cancelled")]
+    AgentCliCancelled(AgentCliCancelledProps),
+    #[serde(rename = "agent.cli.timed_out")]
+    AgentCliTimedOut(AgentCliTimedOutProps),
     #[serde(rename = "pull_request.created")]
     PullRequestCreated(PullRequestCreatedProps),
     #[serde(rename = "pull_request.failed")]
@@ -268,12 +306,6 @@ pub enum EventBody {
     DevcontainerLifecycleCompleted(DevcontainerLifecycleCompletedProps),
     #[serde(rename = "devcontainer.lifecycle.failed")]
     DevcontainerLifecycleFailed(DevcontainerLifecycleFailedProps),
-    #[serde(rename = "retro.started")]
-    RetroStarted(RetroStartedProps),
-    #[serde(rename = "retro.completed")]
-    RetroCompleted(RetroCompletedProps),
-    #[serde(rename = "retro.failed")]
-    RetroFailed(RetroFailedProps),
     Unknown {
         name:       String,
         properties: Value,
@@ -338,6 +370,8 @@ impl EventBody {
             Self::RunQueued(_) => "run.queued",
             Self::RunStarting(_) => "run.starting",
             Self::RunRunning(_) => "run.running",
+            Self::RunInterrupt(_) => "run.interrupt",
+            Self::RunSteer(_) => "run.steer",
             Self::RunBlocked(_) => "run.blocked",
             Self::RunUnblocked(_) => "run.unblocked",
             Self::RunRemoving(_) => "run.removing",
@@ -349,6 +383,7 @@ impl EventBody {
             Self::RunSupersededBy(_) => "run.superseded_by",
             Self::RunArchived(_) => "run.archived",
             Self::RunUnarchived(_) => "run.unarchived",
+            Self::RunTitleUpdated(_) => "run.title.updated",
             Self::RunCompleted(_) => "run.completed",
             Self::RunFailed(_) => "run.failed",
             Self::RunNotice(_) => "run.notice",
@@ -381,6 +416,8 @@ impl EventBody {
             Self::StagePrompt(_) => "stage.prompt",
             Self::PromptCompleted(_) => "prompt.completed",
             Self::AgentSessionStarted(_) => "agent.session.started",
+            Self::AgentSessionActivated(_) => "agent.session.activated",
+            Self::AgentSessionDeactivated(_) => "agent.session.deactivated",
             Self::AgentSessionEnded(_) => "agent.session.ended",
             Self::AgentProcessingEnd(_) => "agent.processing.end",
             Self::AgentInput(_) => "agent.input",
@@ -392,6 +429,9 @@ impl EventBody {
             Self::AgentLoopDetected(_) => "agent.loop.detected",
             Self::AgentTurnLimitReached(_) => "agent.turn.limit",
             Self::AgentSteeringInjected(_) => "agent.steering.injected",
+            Self::AgentInterruptInjected(_) => "agent.interrupt.injected",
+            Self::AgentSteerBuffered(_) => "agent.steer.buffered",
+            Self::AgentSteerDropped(_) => "agent.steer.dropped",
             Self::AgentCompactionStarted(_) => "agent.compaction.started",
             Self::AgentCompactionCompleted(_) => "agent.compaction.completed",
             Self::AgentLlmRetry(_) => "agent.llm.retry",
@@ -409,6 +449,15 @@ impl EventBody {
             Self::SandboxCleanupStarted(_) => "sandbox.cleanup.started",
             Self::SandboxCleanupCompleted(_) => "sandbox.cleanup.completed",
             Self::SandboxCleanupFailed(_) => "sandbox.cleanup.failed",
+            Self::SandboxStartStarted(_) => "sandbox.start.started",
+            Self::SandboxStartCompleted(_) => "sandbox.start.completed",
+            Self::SandboxStartFailed(_) => "sandbox.start.failed",
+            Self::SandboxStopStarted(_) => "sandbox.stop.started",
+            Self::SandboxStopCompleted(_) => "sandbox.stop.completed",
+            Self::SandboxStopFailed(_) => "sandbox.stop.failed",
+            Self::SandboxDeleteStarted(_) => "sandbox.delete.started",
+            Self::SandboxDeleteCompleted(_) => "sandbox.delete.completed",
+            Self::SandboxDeleteFailed(_) => "sandbox.delete.failed",
             Self::SnapshotPulling(_) => "sandbox.snapshot.pulling",
             Self::SnapshotCreating(_) => "sandbox.snapshot.creating",
             Self::SnapshotReady(_) => "sandbox.snapshot.ready",
@@ -433,6 +482,8 @@ impl EventBody {
             Self::CommandCompleted(_) => "command.completed",
             Self::AgentCliStarted(_) => "agent.cli.started",
             Self::AgentCliCompleted(_) => "agent.cli.completed",
+            Self::AgentCliCancelled(_) => "agent.cli.cancelled",
+            Self::AgentCliTimedOut(_) => "agent.cli.timed_out",
             Self::PullRequestCreated(_) => "pull_request.created",
             Self::PullRequestFailed(_) => "pull_request.failed",
             Self::DevcontainerResolved(_) => "devcontainer.resolved",
@@ -445,9 +496,6 @@ impl EventBody {
             }
             Self::DevcontainerLifecycleCompleted(_) => "devcontainer.lifecycle.completed",
             Self::DevcontainerLifecycleFailed(_) => "devcontainer.lifecycle.failed",
-            Self::RetroStarted(_) => "retro.started",
-            Self::RetroCompleted(_) => "retro.completed",
-            Self::RetroFailed(_) => "retro.failed",
             Self::Unknown { name, .. } => name.as_str(),
         }
     }
@@ -475,6 +523,8 @@ fn is_known_event_name(event: &str) -> bool {
             | "run.queued"
             | "run.starting"
             | "run.running"
+            | "run.interrupt"
+            | "run.steer"
             | "run.blocked"
             | "run.unblocked"
             | "run.removing"
@@ -513,6 +563,8 @@ fn is_known_event_name(event: &str) -> bool {
             | "stage.prompt"
             | "prompt.completed"
             | "agent.session.started"
+            | "agent.session.activated"
+            | "agent.session.deactivated"
             | "agent.session.ended"
             | "agent.processing.end"
             | "agent.input"
@@ -524,6 +576,9 @@ fn is_known_event_name(event: &str) -> bool {
             | "agent.loop.detected"
             | "agent.turn.limit"
             | "agent.steering.injected"
+            | "agent.interrupt.injected"
+            | "agent.steer.buffered"
+            | "agent.steer.dropped"
             | "agent.compaction.started"
             | "agent.compaction.completed"
             | "agent.llm.retry"
@@ -541,6 +596,15 @@ fn is_known_event_name(event: &str) -> bool {
             | "sandbox.cleanup.started"
             | "sandbox.cleanup.completed"
             | "sandbox.cleanup.failed"
+            | "sandbox.start.started"
+            | "sandbox.start.completed"
+            | "sandbox.start.failed"
+            | "sandbox.stop.started"
+            | "sandbox.stop.completed"
+            | "sandbox.stop.failed"
+            | "sandbox.delete.started"
+            | "sandbox.delete.completed"
+            | "sandbox.delete.failed"
             | "sandbox.snapshot.pulling"
             | "sandbox.snapshot.creating"
             | "sandbox.snapshot.ready"
@@ -573,9 +637,6 @@ fn is_known_event_name(event: &str) -> bool {
             | "devcontainer.lifecycle.command.completed"
             | "devcontainer.lifecycle.completed"
             | "devcontainer.lifecycle.failed"
-            | "retro.started"
-            | "retro.completed"
-            | "retro.failed"
     )
 }
 
@@ -900,6 +961,149 @@ mod tests {
     }
 
     #[test]
+    fn run_interrupt_round_trips_with_empty_properties_and_actor() {
+        let line = json!({
+            "id": "evt_interrupt",
+            "ts": "2026-04-04T12:00:00Z",
+            "run_id": fixtures::RUN_1,
+            "event": "run.interrupt",
+            "actor": { "kind": "system", "system_kind": "engine" },
+            "properties": {}
+        });
+
+        let parsed = RunEvent::from_value(line.clone()).unwrap();
+        assert!(matches!(parsed.body, EventBody::RunInterrupt(_)));
+        assert_eq!(parsed.to_value().unwrap(), line);
+    }
+
+    #[test]
+    fn run_steer_round_trips_with_text_and_actor() {
+        let line = json!({
+            "id": "evt_steer",
+            "ts": "2026-04-04T12:00:00Z",
+            "run_id": fixtures::RUN_1,
+            "event": "run.steer",
+            "actor": { "kind": "system", "system_kind": "engine" },
+            "properties": { "text": "try another approach" }
+        });
+
+        let parsed = RunEvent::from_value(line.clone()).unwrap();
+        assert!(matches!(
+            &parsed.body,
+            EventBody::RunSteer(props) if props.text == "try another approach"
+        ));
+        assert_eq!(parsed.to_value().unwrap(), line);
+    }
+
+    #[test]
+    fn agent_interrupt_injected_round_trips_with_stage_session_and_actor() {
+        let line = json!({
+            "id": "evt_interrupt_injected",
+            "ts": "2026-04-04T12:00:00Z",
+            "run_id": fixtures::RUN_1,
+            "event": "agent.interrupt.injected",
+            "node_id": "code",
+            "node_label": "code",
+            "stage_id": "code@2",
+            "session_id": "ses_1",
+            "actor": { "kind": "system", "system_kind": "engine" },
+            "properties": { "visit": 2 }
+        });
+
+        let parsed = RunEvent::from_value(line.clone()).unwrap();
+        assert!(matches!(
+            &parsed.body,
+            EventBody::AgentInterruptInjected(props) if props.visit == 2
+        ));
+        assert_eq!(parsed.to_value().unwrap(), line);
+    }
+
+    #[test]
+    fn run_interrupt_then_steer_is_not_a_known_persisted_event() {
+        let line = json!({
+            "id": "evt_combined",
+            "ts": "2026-04-04T12:00:00.000Z",
+            "run_id": fixtures::RUN_1,
+            "event": "run.interrupt_then_steer",
+            "properties": { "text": "try another approach" }
+        });
+
+        let parsed = RunEvent::from_value(line).unwrap();
+        assert!(matches!(
+            parsed.body,
+            EventBody::Unknown { ref name, .. } if name == "run.interrupt_then_steer"
+        ));
+    }
+
+    #[test]
+    fn patch_bearing_events_round_trip_diff_summary() {
+        for (event_name, properties) in [
+            (
+                "checkpoint.completed",
+                json!({
+                    "status": "running",
+                    "current_node": "build",
+                    "completed_nodes": ["build"],
+                    "diff_summary": {
+                        "files_changed": 2,
+                        "additions": 10,
+                        "deletions": 3
+                    }
+                }),
+            ),
+            (
+                "run.completed",
+                json!({
+                    "duration_ms": 42,
+                    "artifact_count": 0,
+                    "status": "succeeded",
+                    "reason": "completed",
+                    "diff_summary": {
+                        "files_changed": 2,
+                        "additions": 10,
+                        "deletions": 3
+                    }
+                }),
+            ),
+            (
+                "run.failed",
+                json!({
+                    "error": "boom",
+                    "duration_ms": 42,
+                    "reason": "workflow_error",
+                    "diff_summary": {
+                        "files_changed": 2,
+                        "additions": 10,
+                        "deletions": 3
+                    }
+                }),
+            ),
+        ] {
+            let line = json!({
+                "id": format!("evt_{event_name}"),
+                "ts": "2026-04-04T12:00:00Z",
+                "run_id": fixtures::RUN_1,
+                "event": event_name,
+                "node_id": "build",
+                "properties": properties
+            });
+
+            let parsed = RunEvent::from_value(line).unwrap();
+            let serialized = parsed.to_value().unwrap();
+
+            assert_eq!(
+                serialized["properties"]["diff_summary"],
+                json!({
+                    "files_changed": 2,
+                    "additions": 10,
+                    "deletions": 3
+                }),
+                "{event_name} should preserve diff_summary"
+            );
+        }
+    }
+
+    #[test]
     fn run_submitted_round_trip_preserves_definition_blob() {
         let line = json!({
             "id": "evt_submitted_blob",
@@ -1022,6 +1226,35 @@ mod tests {
         );
         assert_eq!(serialized["tool_call_id"], value["tool_call_id"]);
         assert_eq!(serialized["actor"], value["actor"]);
+    }
+
+    #[test]
+    fn agent_session_ended_serializes_empty_properties() {
+        let event = RunEvent {
+            id:                 "evt_session_ended".to_string(),
+            ts:                 DateTime::parse_from_rfc3339("2026-04-04T12:00:00.000Z")
+                .unwrap()
+                .with_timezone(&Utc),
+            run_id:             fixtures::RUN_1,
+            node_id:            None,
+            node_label:         None,
+            stage_id:           None,
+            parallel_group_id:  None,
+            parallel_branch_id: None,
+            session_id:         Some("ses_abc".to_string()),
+            parent_session_id:  None,
+            tool_call_id:       None,
+            actor:              None,
+            body:               EventBody::AgentSessionEnded(AgentSessionEndedProps {}),
+        };
+
+        let serialized = event.to_value().unwrap();
+
+        assert_eq!(serialized["event"], "agent.session.ended");
+        assert_eq!(serialized["session_id"], "ses_abc");
+        assert_eq!(serialized["properties"], json!({}));
+        assert!(serialized.get("node_id").is_none());
+        assert!(serialized.get("stage_id").is_none());
     }
 
     #[test]
@@ -1263,6 +1496,41 @@ mod tests {
     }
 
     #[test]
+    fn retired_retro_events_deserialize_as_unknown() {
+        for (event_name, expected_properties) in [
+            (
+                "retro.started",
+                json!({"prompt": "Analyze the run", "provider": "openai", "model": "gpt-5"}),
+            ),
+            (
+                "retro.completed",
+                json!({"duration_ms": 1200, "response": "done", "retro": {"smoothness": "smooth"}}),
+            ),
+            (
+                "retro.failed",
+                json!({"duration_ms": 1200, "error": "state unavailable"}),
+            ),
+        ] {
+            let value = json!({
+                "id": "evt_retired_retro",
+                "ts": "2026-05-08T12:00:00.000Z",
+                "run_id": fixtures::RUN_1,
+                "event": event_name,
+                "properties": expected_properties
+            });
+
+            let parsed = RunEvent::from_value(value).unwrap();
+            match parsed.body {
+                EventBody::Unknown { name, properties } => {
+                    assert_eq!(name, event_name);
+                    assert_eq!(properties, expected_properties);
+                }
+                other => panic!("expected Unknown body, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn metadata_snapshot_failed_omits_empty_optional_fields() {
         let body = EventBody::MetadataSnapshotFailed(MetadataSnapshotFailedProps {
             phase:            MetadataSnapshotPhase::Init,
@@ -1366,7 +1634,7 @@ mod tests {
         for body in [
             EventBody::RunNotice(RunNoticeProps {
                 level:            RunNoticeLevel::Warn,
-                code:             "git_diff_failed".to_string(),
+                code:             RunNoticeCode::GitDiffFailed.to_string(),
                 message:          "git diff failed".to_string(),
                 exec_output_tail: Some(tail.clone()),
             }),
@@ -1377,11 +1645,6 @@ mod tests {
             EventBody::GitPush(GitPushProps {
                 branch:           "refs/heads/run:refs/heads/run".to_string(),
                 success:          false,
-                exec_output_tail: Some(tail.clone()),
-            }),
-            EventBody::RetroFailed(RetroFailedProps {
-                error:            "state unavailable".to_string(),
-                duration_ms:      10,
                 exec_output_tail: Some(tail.clone()),
             }),
         ] {
@@ -1402,7 +1665,7 @@ mod tests {
         for body in [
             EventBody::RunNotice(RunNoticeProps {
                 level:            RunNoticeLevel::Warn,
-                code:             "git_diff_failed".to_string(),
+                code:             RunNoticeCode::GitDiffFailed.to_string(),
                 message:          "git diff failed".to_string(),
                 exec_output_tail: None,
             }),
@@ -1413,11 +1676,6 @@ mod tests {
             EventBody::GitPush(GitPushProps {
                 branch:           "refs/heads/run:refs/heads/run".to_string(),
                 success:          false,
-                exec_output_tail: None,
-            }),
-            EventBody::RetroFailed(RetroFailedProps {
-                error:            "state unavailable".to_string(),
-                duration_ms:      10,
                 exec_output_tail: None,
             }),
         ] {

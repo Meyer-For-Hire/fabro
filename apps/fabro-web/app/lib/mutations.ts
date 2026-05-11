@@ -2,11 +2,18 @@ import useSWRMutation from "swr/mutation";
 import { useSWRConfig } from "swr";
 import type {
   PreviewUrlResponse,
-  RunStatusResponse,
+  Run,
+  SteerRunRequest,
   SubmitAnswerRequest,
+  UpdateRunRequest,
 } from "@qltysh/fabro-api-client";
 
-import { apiJsonMutation } from "./api-client";
+import {
+  apiData,
+  authApi,
+  humanInTheLoopApi,
+  runsApi,
+} from "./api-client";
 import { queryKeys } from "./query-keys";
 import type { LifecycleAction, LifecycleActionError } from "./run-actions";
 import {
@@ -19,6 +26,7 @@ import {
 export type PreviewRunArg = {
   port: number;
   expires_in_secs: number;
+  signed?: boolean;
 };
 
 export type PreviewMutationResult = {
@@ -30,7 +38,7 @@ export type LifecycleMutationResult =
   | {
       intent: LifecycleAction;
       ok: true;
-      run: RunStatusResponse;
+      run: Run;
     }
   | {
       intent: LifecycleAction;
@@ -41,8 +49,10 @@ export type LifecycleMutationResult =
 export function usePreviewRun(id: string | undefined) {
   return useSWRMutation(
     id ? queryKeys.runs.preview(id) : null,
-    async (key: string, { arg }: { arg: PreviewRunArg }): Promise<PreviewMutationResult> => {
-      const result = await apiJsonMutation<PreviewUrlResponse, PreviewRunArg>(key, { arg });
+    async (_key, { arg }: { arg: PreviewRunArg }): Promise<PreviewMutationResult> => {
+      const result = await apiData<PreviewUrlResponse>(() =>
+        humanInTheLoopApi.generatePreviewUrl(id!, arg),
+      );
       return { intent: "preview", url: result.url };
     },
   );
@@ -63,7 +73,7 @@ export function useUnarchiveRun(id: string | undefined) {
 function useLifecycleMutation(
   id: string | undefined,
   intent: LifecycleAction,
-  action: (id: string) => Promise<RunStatusResponse>,
+  action: (id: string) => Promise<Run>,
 ) {
   const { mutate } = useSWRConfig();
   const key = id ? queryKeys.runs[intent](id) : null;
@@ -94,7 +104,29 @@ function useLifecycleMutation(
   );
 }
 
-export type SubmitInterviewAnswerArg = SubmitAnswerRequest & { questionId: string };
+export function useUpdateRunTitle(id: string | undefined) {
+  const { mutate } = useSWRConfig();
+  return useSWRMutation(
+    id ? queryKeys.runs.updateTitle(id) : null,
+    async (_key, { arg }: { arg: UpdateRunRequest }): Promise<Run> => {
+      if (!id) throw new Error("id is required");
+      return apiData(() => runsApi.updateRun(id, arg));
+    },
+    {
+      onSuccess: (run) => {
+        if (!id) return;
+        void mutate(queryKeys.runs.detail(id), run, { revalidate: false });
+        void mutate(queryKeys.boards.runs());
+        void mutate(queryKeys.boards.runs(true));
+      },
+    },
+  );
+}
+
+export type SubmitInterviewAnswerArg = {
+  questionId: string;
+  answer: SubmitAnswerRequest;
+};
 
 export function useSubmitInterviewAnswer(runId: string | undefined) {
   const { mutate } = useSWRConfig();
@@ -102,9 +134,9 @@ export function useSubmitInterviewAnswer(runId: string | undefined) {
     runId ? `interview-answer:${runId}` : null,
     async (_key: string, { arg }: { arg: SubmitInterviewAnswerArg }) => {
       if (!runId) throw new Error("runId is required");
-      const { questionId, ...body } = arg;
-      const path = `/api/v1/runs/${encodeURIComponent(runId)}/questions/${encodeURIComponent(questionId)}/answer`;
-      await apiJsonMutation<void, SubmitAnswerRequest>(path, { arg: body });
+      await apiData(() =>
+        humanInTheLoopApi.submitRunAnswer(runId, arg.questionId, arg.answer),
+      );
     },
     {
       onSuccess: () => {
@@ -116,12 +148,48 @@ export function useSubmitInterviewAnswer(runId: string | undefined) {
   );
 }
 
+export type SteerRunArg = SteerRunRequest;
+
+export function useInterruptRun(runId: string | undefined) {
+  const { mutate } = useSWRConfig();
+  return useSWRMutation(
+    runId ? `interrupt-run:${runId}` : null,
+    async (_key: string) => {
+      if (!runId) throw new Error("runId is required");
+      await apiData(() => humanInTheLoopApi.interruptRun(runId));
+    },
+    {
+      onSuccess: () => {
+        if (!runId) return;
+        void mutate(queryKeys.runs.detail(runId));
+      },
+    },
+  );
+}
+
+export function useSteerRun(runId: string | undefined) {
+  const { mutate } = useSWRConfig();
+  return useSWRMutation(
+    runId ? `steer-run:${runId}` : null,
+    async (_key: string, { arg }: { arg: SteerRunArg }) => {
+      if (!runId) throw new Error("runId is required");
+      await apiData(() => humanInTheLoopApi.steerRun(runId, arg));
+    },
+    {
+      onSuccess: () => {
+        if (!runId) return;
+        void mutate(queryKeys.runs.detail(runId));
+      },
+    },
+  );
+}
+
 export function useToggleDemoMode() {
   const { mutate } = useSWRConfig();
   return useSWRMutation(
     queryKeys.demo.toggle(),
-    async (key: string, { arg }: { arg: { enabled: boolean } }) => {
-      await apiJsonMutation<void, { enabled: boolean }>(key, { arg });
+    async (_key, { arg }: { arg: { enabled: boolean } }) => {
+      await apiData(() => authApi.toggleDemo(arg));
     },
     {
       onSuccess: () => {
@@ -133,18 +201,11 @@ export function useToggleDemoMode() {
 
 export function useLoginDevToken() {
   return useSWRMutation(
-    "/auth/login/dev-token",
-    async (key: string, { arg }: { arg: { token: string } }) => {
-      const response = await fetch(key, {
-        method: "POST",
-        credentials: "include",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(arg),
+    queryKeys.auth.loginDevToken(),
+    async (_key, { arg }: { arg: { token: string } }) => {
+      return apiData(() => authApi.loginDevToken(arg), {
+        redirectOnUnauthorized: false,
       });
-      if (!response.ok) {
-        throw new Error(response.statusText || `HTTP ${response.status}`);
-      }
-      return response.json() as Promise<{ ok: boolean }>;
     },
   );
 }

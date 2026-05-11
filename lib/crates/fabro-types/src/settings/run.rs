@@ -35,6 +35,101 @@ pub struct RunNamespace {
     pub scm:           RunScmSettings,
     pub pull_request:  Option<PullRequestSettings>,
     pub artifacts:     ArtifactsSettings,
+    pub integrations:  RunIntegrationsSettings,
+}
+
+/// `[run.integrations]` — run-level integration knobs.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RunIntegrationsSettings {
+    pub github: RunIntegrationsGithubSettings,
+}
+
+/// `[run.integrations.github]` — runtime GitHub token shape.
+///
+/// `permissions` is empty when no token should be requested. The
+/// presence-vs-clear distinction is only meaningful at the layer-merge
+/// stage; the resolved form collapses both `None` and `Some({})` into an
+/// empty map.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RunIntegrationsGithubSettings {
+    pub permissions: HashMap<String, InterpString>,
+}
+
+impl RunIntegrationsGithubSettings {
+    /// Whether the run config asks Fabro to mint a `GITHUB_TOKEN` for the
+    /// sandbox. Empty `permissions` means "no token requested" — the only
+    /// resolved-form sentinel for this state.
+    pub fn is_token_requested(&self) -> bool {
+        !self.permissions.is_empty()
+    }
+
+    /// Resolve every `permissions` value's `{{ env.* }}` tokens via
+    /// `lookup`, falling back to `InterpString::as_source()` when
+    /// resolution fails so callers see a recognizable diagnostic instead
+    /// of a silently dropped key. The `lookup` seam keeps tests free of
+    /// process-env coupling; production callers pass a thin wrapper over
+    /// `std::env::var`.
+    pub fn resolve_permissions<F>(&self, mut lookup: F) -> HashMap<String, String>
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        self.permissions
+            .iter()
+            .map(|(name, value)| {
+                let resolved = value
+                    .resolve(&mut lookup)
+                    .map_or_else(|_| value.as_source(), |resolved| resolved.value);
+                (name.clone(), resolved)
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod run_integrations_github_tests {
+    use super::{HashMap, InterpString, RunIntegrationsGithubSettings};
+
+    fn settings(permissions: &[(&str, &str)]) -> RunIntegrationsGithubSettings {
+        RunIntegrationsGithubSettings {
+            permissions: permissions
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), InterpString::parse(v)))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn is_token_requested_reflects_permissions_presence() {
+        assert!(!settings(&[]).is_token_requested());
+        assert!(settings(&[("issues", "read")]).is_token_requested());
+    }
+
+    #[test]
+    fn resolve_permissions_substitutes_env_tokens_via_lookup() {
+        let s = settings(&[("issues", "{{ env.GH_PERM_LEVEL }}"), ("contents", "read")]);
+        let resolved = s.resolve_permissions(|name| match name {
+            "GH_PERM_LEVEL" => Some("write".to_string()),
+            _ => None,
+        });
+        assert_eq!(resolved.get("issues"), Some(&"write".to_string()));
+        assert_eq!(resolved.get("contents"), Some(&"read".to_string()));
+    }
+
+    #[test]
+    fn resolve_permissions_falls_back_to_source_when_lookup_fails() {
+        let s = settings(&[("issues", "{{ env.GH_PERM_MISSING }}")]);
+        let resolved = s.resolve_permissions(|_| None);
+        assert_eq!(
+            resolved.get("issues"),
+            Some(&"{{ env.GH_PERM_MISSING }}".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_permissions_is_empty_for_empty_settings() {
+        let s: HashMap<String, String> = settings(&[]).resolve_permissions(|_| None);
+        assert!(s.is_empty());
+    }
 }
 
 /// The resolved source of a run goal.
@@ -93,7 +188,6 @@ impl Default for RunPrepareSettings {
 pub struct RunExecutionSettings {
     pub mode:     RunMode,
     pub approval: ApprovalMode,
-    pub retros:   bool,
 }
 
 impl Default for RunExecutionSettings {
@@ -101,7 +195,6 @@ impl Default for RunExecutionSettings {
         Self {
             mode:     RunMode::Normal,
             approval: ApprovalMode::Prompt,
-            retros:   true,
         }
     }
 }
@@ -113,32 +206,32 @@ pub struct RunCheckpointSettings {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunSandboxSettings {
-    pub provider:     String,
-    pub preserve:     bool,
-    pub devcontainer: bool,
-    pub env:          HashMap<String, InterpString>,
-    pub local:        LocalSandboxSettings,
-    pub docker:       Option<DockerSettings>,
-    pub daytona:      Option<DaytonaSettings>,
+    pub provider:         String,
+    pub preserve:         bool,
+    #[serde(default = "default_stop_on_terminal")]
+    pub stop_on_terminal: bool,
+    pub devcontainer:     bool,
+    pub env:              HashMap<String, InterpString>,
+    pub docker:           Option<DockerSettings>,
+    pub daytona:          Option<DaytonaSettings>,
+}
+
+fn default_stop_on_terminal() -> bool {
+    true
 }
 
 impl Default for RunSandboxSettings {
     fn default() -> Self {
         Self {
-            provider:     "local".to_string(),
-            preserve:     false,
-            devcontainer: false,
-            env:          HashMap::new(),
-            local:        LocalSandboxSettings::default(),
-            docker:       None,
-            daytona:      None,
+            provider:         "local".to_string(),
+            preserve:         false,
+            stop_on_terminal: true,
+            devcontainer:     false,
+            env:              HashMap::new(),
+            docker:           None,
+            daytona:          None,
         }
     }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct LocalSandboxSettings {
-    pub worktree_mode: WorktreeMode,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -220,8 +313,6 @@ pub struct NotificationRouteSettings {
     pub provider: Option<String>,
     pub events:   Vec<String>,
     pub slack:    Option<NotificationProviderSettings>,
-    pub discord:  Option<NotificationProviderSettings>,
-    pub teams:    Option<NotificationProviderSettings>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -233,8 +324,6 @@ pub struct NotificationProviderSettings {
 pub struct RunInterviewsSettings {
     pub provider: Option<String>,
     pub slack:    Option<InterviewProviderSettings>,
-    pub discord:  Option<InterviewProviderSettings>,
-    pub teams:    Option<InterviewProviderSettings>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -494,16 +583,6 @@ pub enum RunMode {
 pub enum ApprovalMode {
     Prompt,
     Auto,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorktreeMode {
-    Always,
-    #[default]
-    Clean,
-    Dirty,
-    Never,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

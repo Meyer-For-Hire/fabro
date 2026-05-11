@@ -17,7 +17,10 @@ pub(crate) fn build_github_credentials(
         GithubIntegrationStrategy::Token => {
             let token = lookup_github_token(vault);
             match token {
-                Some(t) => Ok(Some(GitHubCredentials::Token(t))),
+                Some(t) => {
+                    fabro_github::validate_static_github_token(&t)?;
+                    Ok(Some(GitHubCredentials::Pat(t)))
+                }
                 None => Err(anyhow!(
                     "GITHUB_TOKEN not configured — run fabro install or set GITHUB_TOKEN"
                 )),

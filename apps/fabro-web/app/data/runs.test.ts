@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import type { Run, RunStatus as ApiRunStatus } from "@qltysh/fabro-api-client";
 import {
   columnForStatus,
   columnStatusDisplay,
@@ -8,26 +9,75 @@ import {
   runStatusDisplay,
 } from "./runs";
 
+function makeRun(overrides: Partial<Run> = {}): Run {
+  return {
+    id:               "01ABC",
+    goal:             "Fix the build",
+    title:            "Fix the build",
+    workflow:         { slug: "fix_build", name: "Fix Build" },
+    automation:       null,
+    repository:       { name: "myrepo", origin_url: null, provider: "unknown" },
+    created_by:       null,
+    origin:           { kind: "api" },
+    labels:           {},
+    lifecycle:        {
+      status:          { kind: "running" },
+      pending_control: null,
+      queue_position:  null,
+      error:           null,
+      archived:        false,
+      archived_at:     null,
+    },
+    sandbox:          null,
+    models:           [],
+    source_directory: "/home/user/myrepo",
+    timestamps:       {
+      created_at:     "2026-04-08T12:00:00Z",
+      started_at:     "2026-04-08T12:00:00Z",
+      last_event_at:  null,
+      completed_at:   null,
+      duration_ms:    65000,
+      elapsed_secs:   65,
+    },
+    billing:          { total_usd_micros: 500000 },
+    diff:             null,
+    pull_request:     null,
+    current_question: null,
+    superseded_by:    null,
+    links:            { web: null },
+    ...overrides,
+  };
+}
+
+function withStatus(status: ApiRunStatus): Pick<Run, "lifecycle"> {
+  return {
+    lifecycle: {
+      status,
+      pending_control: null,
+      queue_position:  null,
+      error:           null,
+      archived:        false,
+      archived_at:     null,
+    },
+  };
+}
+
 describe("mapRunListItem", () => {
   test("trusts shared server fields for board items", () => {
-    const summary = {
-      run_id: "01ABC",
-      goal: "## Fix the build",
-      title: "Server supplied title",
-      workflow_slug: "fix_build",
-      workflow_name: "Fix Build",
-      source_directory: "/home/user/myrepo",
-      repository: { name: "myrepo" },
-      status: { kind: "paused", prior_block: null },
-      labels: {},
-      column: "running",
-      elapsed_secs: 65,
-      duration_ms: 65000,
-      total_usd_micros: 500000,
-      created_at: "2026-04-08T12:00:00Z",
-      start_time: "2026-04-08T12:00:00Z",
-      pending_control: null,
-    } as const;
+    const summary = makeRun({
+      title:         "Server supplied title",
+      ...withStatus({ kind: "paused", prior_block: null }),
+      pull_request: {
+        number: 123,
+        html_url: "https://github.com/fabro-sh/fabro/pull/123",
+        provider: "github",
+        owner: "fabro-sh",
+        repo: "fabro",
+        base_branch: "main",
+        head_branch: "fabro/run/demo",
+        title: "Add run PR chip",
+      },
+    });
     const item = mapRunListItem(summary);
     expect(item.id).toBe("01ABC");
     expect(item.title).toBe("Server supplied title");
@@ -37,27 +87,12 @@ describe("mapRunListItem", () => {
     expect(item.elapsed).toBeDefined();
     expect(item.column).toBe("running");
     expect(item.lifecycleStatus).toBe("paused");
+    expect(item.number).toBe(123);
+    expect(item.pullRequestUrl).toBe("https://github.com/fabro-sh/fabro/pull/123");
   });
 
   test("uses a fallback title when the server title is blank", () => {
-    const summary = {
-      run_id: "01EMPTY",
-      goal: "",
-      title: "",
-      workflow_slug: "fix_build",
-      workflow_name: "Fix Build",
-      source_directory: "/home/user/myrepo",
-      repository: { name: "myrepo" },
-      status: { kind: "running" },
-      labels: {},
-      column: "running",
-      elapsed_secs: null,
-      duration_ms: null,
-      total_usd_micros: null,
-      created_at: "2026-04-08T12:00:00Z",
-      start_time: null,
-      pending_control: null,
-    } as const;
+    const summary = makeRun({ id: "01EMPTY", goal: "", title: "" });
 
     expect(mapRunListItem(summary).title).toBe("Untitled run");
   });
@@ -65,23 +100,18 @@ describe("mapRunListItem", () => {
 
 describe("mapRunSummaryToRunItem", () => {
   test("maps canonical run summary to RunItem", () => {
-    const summary = {
-      run_id: "01ABC",
-      goal: "Fix the build",
-      title: "Fix the build",
-      workflow_slug: "fix_build",
-      workflow_name: "Fix Build",
-      source_directory: "/home/user/myrepo",
-      repository: { name: "myrepo" },
-      status: { kind: "running" },
-      duration_ms: 65000,
-      elapsed_secs: 65,
-      total_usd_micros: 500000,
-      labels: {},
-      created_at: "2026-04-08T12:00:00Z",
-      start_time: "2026-04-08T12:00:00Z",
-      pending_control: null,
-    };
+    const summary = makeRun({
+      pull_request: {
+        html_url: "https://github.com/fabro-sh/fabro/pull/456",
+        number: 456,
+        provider: "github",
+        owner: "fabro-sh",
+        repo: "fabro",
+        base_branch: "main",
+        head_branch: "fabro/run/demo",
+        title: "Add run PR chip",
+      },
+    });
     const item = mapRunSummaryToRunItem(summary);
     expect(item.id).toBe("01ABC");
     expect(item.title).toBe("Fix the build");
@@ -90,26 +120,29 @@ describe("mapRunSummaryToRunItem", () => {
     expect(item.sourceDirectory).toBe("/home/user/myrepo");
     expect(item.elapsed).toBeDefined();
     expect(item.lifecycleStatus).toBe("running");
+    expect(item.number).toBe(456);
+    expect(item.pullRequestUrl).toBe("https://github.com/fabro-sh/fabro/pull/456");
   });
 
   test("handles missing optional fields", () => {
-    const summary = {
-      run_id: "01DEF",
-      goal: "",
-      title: "",
-      workflow_slug: null,
-      workflow_name: null,
+    const summary = makeRun({
+      id:               "01DEF",
+      goal:             "",
+      title:            "",
+      workflow:         { slug: null, name: "unknown" },
       source_directory: null,
-      repository: { name: "unknown" },
-      status: { kind: "submitted" },
-      duration_ms: null,
-      elapsed_secs: null,
-      total_usd_micros: null,
-      labels: {},
-      created_at: "2026-04-08T12:00:00Z",
-      start_time: null,
-      pending_control: null,
-    };
+      repository:       { name: "unknown", origin_url: null, provider: "unknown" },
+      ...withStatus({ kind: "submitted" }),
+      timestamps:       {
+        created_at:     "2026-04-08T12:00:00Z",
+        started_at:     null,
+        last_event_at:  null,
+        completed_at:   null,
+        duration_ms:    null,
+        elapsed_secs:   null,
+      },
+      billing:          null,
+    });
     const item = mapRunSummaryToRunItem(summary);
     expect(item.id).toBe("01DEF");
     expect(item.title).toBe("Untitled run");

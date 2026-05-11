@@ -168,6 +168,13 @@ pub(crate) struct ServerConnectionArgs {
     pub(crate) target: ServerTargetArgs,
 }
 
+#[derive(Args, Debug, Clone, Default)]
+pub(crate) struct InputOverrideArgs {
+    /// Override a workflow input value (repeatable, format: KEY=VALUE)
+    #[arg(short = 'I', long = "input", value_name = "KEY=VALUE")]
+    pub(crate) values: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub(crate) enum CliSandboxProvider {
     Local,
@@ -199,6 +206,9 @@ impl From<fabro_sandbox::SandboxProvider> for CliSandboxProvider {
 pub(crate) struct RunArgs {
     #[command(flatten)]
     pub(crate) target: ServerTargetArgs,
+
+    #[command(flatten)]
+    pub(crate) inputs: InputOverrideArgs,
 
     /// Path to a .fabro workflow file or .toml task config
     #[arg(required = true)]
@@ -236,17 +246,9 @@ pub(crate) struct RunArgs {
     #[arg(long, value_enum)]
     pub(crate) sandbox: Option<CliSandboxProvider>,
 
-    /// Run directly in the source checkout without git checkpoints
-    #[arg(long, conflicts_with = "sandbox")]
-    pub(crate) in_place: bool,
-
     /// Attach a label to this run (repeatable, format: KEY=VALUE)
     #[arg(long = "label", value_name = "KEY=VALUE")]
     pub(crate) label: Vec<String>,
-
-    /// Skip retro generation after the run
-    #[arg(long)]
-    pub(crate) no_retro: bool,
 
     /// Keep the sandbox alive after the run finishes (for debugging)
     #[arg(long)]
@@ -265,6 +267,9 @@ pub(crate) struct RunArgs {
 pub(crate) struct PreflightArgs {
     #[command(flatten)]
     pub(crate) target: ServerTargetArgs,
+
+    #[command(flatten)]
+    pub(crate) inputs: InputOverrideArgs,
 
     /// Path to a .fabro workflow file or .toml task config
     pub(crate) workflow: PathBuf,
@@ -365,16 +370,16 @@ pub(crate) struct RunsUnarchiveArgs {
 }
 
 #[derive(Args)]
-pub(crate) struct LogsArgs {
+pub(crate) struct EventsArgs {
     #[command(flatten)]
     pub(crate) server: ServerTargetArgs,
 
     /// Run ID prefix or workflow name (most recent run)
     pub(crate) run:    String,
-    /// Follow log output
+    /// Follow event output
     #[arg(short, long)]
     pub(crate) follow: bool,
-    /// Logs since timestamp or relative (e.g. "42m", "2h",
+    /// Events since timestamp or relative (e.g. "42m", "2h",
     /// "2026-01-02T13:00:00Z")
     #[arg(long)]
     pub(crate) since:  Option<String>,
@@ -384,6 +389,18 @@ pub(crate) struct LogsArgs {
     /// Formatted colored output with rendered assistant text
     #[arg(short = 'p', long)]
     pub(crate) pretty: bool,
+}
+
+#[derive(Args)]
+pub(crate) struct LogsArgs {
+    #[command(flatten)]
+    pub(crate) server: ServerTargetArgs,
+
+    /// Run ID prefix or workflow name (most recent run)
+    pub(crate) run:  String,
+    /// Lines from end (default: all)
+    #[arg(short = 'n', long)]
+    pub(crate) tail: Option<usize>,
 }
 
 #[derive(Args)]
@@ -497,9 +514,9 @@ pub(crate) struct CpArgs {
     #[command(flatten)]
     pub(crate) server: ServerTargetArgs,
 
-    /// Source: <run-id>:<path> or local path
+    /// Source: `<run-id>:<path>` or local path
     pub(crate) src:       String,
-    /// Destination: <run-id>:<path> or local path
+    /// Destination: `<run-id>:<path>` or local path
     pub(crate) dst:       String,
     /// Recurse into directories
     #[arg(short, long)]
@@ -671,6 +688,27 @@ pub(crate) struct WaitArgs {
 }
 
 #[derive(Args)]
+pub(crate) struct SteerArgs {
+    #[command(flatten)]
+    pub(crate) server: ServerTargetArgs,
+
+    /// Run ID prefix to steer
+    pub(crate) run: String,
+
+    /// Steer message text (omit when --text-stdin is used)
+    pub(crate) text: Option<String>,
+
+    /// Read steer text from stdin instead of a positional arg
+    #[arg(long, conflicts_with = "text")]
+    pub(crate) text_stdin: bool,
+
+    /// Cancel the in-flight LLM stream / tool calls and deliver the message
+    /// as the next user turn (default: append to the steering queue).
+    #[arg(long)]
+    pub(crate) interrupt: bool,
+}
+
+#[derive(Args)]
 pub(crate) struct WorkflowListArgs;
 
 #[derive(Args)]
@@ -749,6 +787,32 @@ pub(crate) struct SystemEventsArgs {
     /// Filter by run ID (repeatable)
     #[arg(long = "run-id")]
     pub(crate) run_ids: Vec<String>,
+}
+
+#[derive(Args)]
+pub(crate) struct SystemRepairArgs {
+    #[command(subcommand)]
+    pub(crate) command: SystemRepairCommand,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum SystemRepairCommand {
+    /// List runs that cannot be loaded from durable storage
+    Runs(SystemRepairRunsArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct SystemRepairRunsArgs {
+    #[command(flatten)]
+    pub(crate) connection: ServerConnectionArgs,
+
+    /// Preview deleting unreadable runs
+    #[arg(long)]
+    pub(crate) delete: bool,
+
+    /// Actually delete unreadable runs (default is dry-run)
+    #[arg(long)]
+    pub(crate) yes: bool,
 }
 
 #[derive(Args)]
@@ -935,6 +999,8 @@ pub(crate) enum RunCommands {
     #[command(hide = true)]
     Diff(DiffArgs),
     /// View the event log of a workflow run
+    Events(EventsArgs),
+    /// View the raw worker tracing log of a workflow run
     Logs(LogsArgs),
     /// Resume an interrupted workflow run
     Resume(ResumeArgs),
@@ -944,6 +1010,8 @@ pub(crate) enum RunCommands {
     Fork(ForkArgs),
     /// Block until a workflow run completes
     Wait(WaitArgs),
+    /// Steer a running agent mid-execution
+    Steer(SteerArgs),
 }
 
 impl RunCommands {
@@ -955,9 +1023,11 @@ impl RunCommands {
             Self::Attach(_) => "attach",
             Self::RunWorker(_) => "__run-worker",
             Self::Diff(_) => "diff",
+            Self::Events(_) => "events",
             Self::Logs(_) => "logs",
             Self::Resume(_) => "resume",
             Self::Rewind(_) => "rewind",
+            Self::Steer(_) => "steer",
             Self::Fork(_) => "fork",
             Self::Wait(_) => "wait",
         }
@@ -1104,6 +1174,9 @@ pub(crate) enum Commands {
         /// Path to the JSON event file
         path: PathBuf,
     },
+    /// Print generated CLI reference Markdown (internal)
+    #[command(name = "__cli-reference", hide = true)]
+    CliReference,
     /// Render a DOT graph to SVG (internal)
     #[command(name = "__render-graph", hide = true)]
     RenderGraph,
@@ -1188,9 +1261,13 @@ impl Commands {
                 SystemCommand::Prune(_) => "system prune",
                 SystemCommand::Df(_) => "system df",
                 SystemCommand::Events(_) => "system events",
+                SystemCommand::Repair(args) => match &args.command {
+                    SystemRepairCommand::Runs(_) => "system repair runs",
+                },
             },
             Self::SendAnalytics { .. } => "__send_analytics",
             Self::SendPanic { .. } => "__send_panic",
+            Self::CliReference => "__cli-reference",
             Self::RenderGraph => "__render-graph",
             #[cfg(debug_assertions)]
             Self::TestPanic { .. } => "__test_panic",
@@ -1349,6 +1426,8 @@ pub(crate) enum SystemCommand {
     Df(DfArgs),
     /// Stream run events from the server
     Events(SystemEventsArgs),
+    /// Inspect and repair durable server data
+    Repair(SystemRepairArgs),
 }
 
 #[derive(Args)]
@@ -1415,7 +1494,7 @@ pub(crate) struct InstallGithubArgs {
     #[arg(long)]
     pub(crate) strategy: Option<InstallGitHubStrategyArg>,
 
-    /// GitHub App owner: 'personal' or 'org:<slug>' (app only, requires
+    /// GitHub App owner: `personal` or `org:<slug>` (app only, requires
     /// --non-interactive)
     #[arg(long)]
     pub(crate) owner: Option<String>,

@@ -1,96 +1,236 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useParams } from "react-router";
-import { Marked } from "marked";
+import {
+  ChevronDownIcon,
+  ChevronRightIcon,
+  CpuChipIcon,
+} from "@heroicons/react/16/solid";
+import { CircleStackIcon, ClockIcon } from "@heroicons/react/20/solid";
 
-const SAFE_HTTP_URL_RE = /^https?:\/\//i;
-const SAFE_MAILTO_URL_RE = /^mailto:/i;
-
-export function isSafeMarkdownHref(href: string): boolean {
-  return (
-    SAFE_HTTP_URL_RE.test(href) ||
-    SAFE_MAILTO_URL_RE.test(href) ||
-    href.startsWith("#") ||
-    (href.startsWith("/") && !href.startsWith("//"))
-  );
-}
-
-const markedSafe = new Marked();
-markedSafe.use({
-  async: false,
-  walkTokens(token) {
-    if (
-      (token.type === "link" || token.type === "image") &&
-      typeof token.href === "string" &&
-      !isSafeMarkdownHref(token.href)
-    ) {
-      token.href = "";
-    }
-  },
-  renderer: {
-    html() {
-      return "";
-    },
-  },
-});
-import { CommandLineIcon, ChatBubbleLeftIcon, PlayIcon } from "@heroicons/react/24/outline";
-import { ToolBlock } from "../components/tool-use";
-import type { ToolUse } from "../components/tool-use";
-import { StageSidebar, statusConfig } from "../components/stage-sidebar";
+import {
+  DebugDnaStrip,
+  DebugEventDetailsPanel,
+  DebugEventRow,
+  DetailsPanel,
+  EventSearchInput,
+  MultiSelectFilter,
+  ThreadDnaStrip,
+  debugCategory,
+  debugCategoryLabel,
+  formatElapsed,
+} from "../components/event-debug";
+import type {
+  DebugCategory,
+  ThreadDnaItem,
+  ThreadDnaSelection,
+} from "../components/event-debug";
+import { StageSidebar } from "../components/stage-sidebar";
 import type { Stage } from "../components/stage-sidebar";
 import { EmptyState } from "../components/state";
-import { CopyButton } from "../components/ui";
-import { formatDurationSecs } from "../lib/format";
-import { fetchRunCommandLog, useRunEventsList, useRunStageTurns, useRunStages } from "../lib/queries";
+import { Tooltip } from "../components/ui";
+import { ConditionalDecision } from "../components/stage-renderers/conditional-decision";
+import { FanInResults } from "../components/stage-renderers/fan-in-results";
+import { extractStageNotes } from "../components/stage-renderers/helpers";
+import { HumanQA } from "../components/stage-renderers/human-qa";
+import { ParallelChildren } from "../components/stage-renderers/parallel-children";
+import {
+  CodeBlock,
+  DetailField,
+  JsonBlock,
+  Markdown,
+} from "../components/stage-renderers/primitives";
+import { StageSummary } from "../components/stage-renderers/stage-summary";
+import { WaitStatus } from "../components/stage-renderers/wait-status";
+import {
+  formatAbsoluteTs,
+  formatBytes,
+  formatDurationMs,
+  formatTokenCount,
+} from "../lib/format";
+import {
+  useRun,
+  useRunEventsList,
+  useRunStageEvents,
+  useRunStageLog,
+  useRunStages,
+} from "../lib/queries";
+import { STAGE_ACTIVITY_EVENT_TYPES, type StageActivityEventType } from "../lib/run-events";
 import { mapRunStagesToSidebarStages } from "../lib/stage-sidebar";
 import { getNumber, getString, type UnknownRecord } from "../lib/unknown";
-import {
-  CommandOutputStream,
-  CommandTermination,
-  type EventEnvelope,
-  type StageTurn as ApiStageTurn,
-  type PaginatedStageTurnList,
-  type PaginatedEventList,
-} from "@qltysh/fabro-api-client";
+import type { EventEnvelope, StageHandler } from "@qltysh/fabro-api-client";
 
-export const handle = { wide: true };
+export const handle = { wide: true, fullHeight: true };
 
 type TurnType =
-  | { kind: "system"; content: string }
-  | { kind: "assistant"; content: string }
-  | { kind: "tool"; tools: ToolUse[] }
-  | { kind: "command"; stageId: string; script: string; language: string; stdout?: string; stderr?: string; exitCode?: number | null; durationMs?: number; termination?: CommandTermination; running: boolean };
+  | { kind: "system"; ts: string; content: string }
+  | { kind: "steer"; ts: string; content: string }
+  | { kind: "interrupt"; ts: string; content: string }
+  | { kind: "assistant"; ts: string; content: string; inputTokens: number; outputTokens: number }
+  | { kind: "tool"; ts: string; toolName: string; input: string; result: string; isError: boolean; durationMs: number }
+  | {
+      kind: "command";
+      ts: string;
+      script: string;
+      running: boolean;
+      exitCode: number | null;
+      durationMs: number;
+      outputBytes: number;
+    };
 
-function readTermination(props: UnknownRecord): CommandTermination {
-  const v = props.termination;
-  if (v === CommandTermination.EXITED || v === CommandTermination.TIMED_OUT || v === CommandTermination.CANCELLED) {
-    return v;
-  }
-  return CommandTermination.EXITED;
+type CommandTurn = Extract<TurnType, { kind: "command" }>;
+
+export type StageRenderer =
+  | "agent"
+  | "command"
+  | "human"
+  | "conditional"
+  | "parallel"
+  | "fan_in"
+  | "wait"
+  | "summary";
+
+type PanelSelection = ThreadDnaSelection;
+
+const STAGE_ACTIVITY_EVENT_SET = new Set<string>(STAGE_ACTIVITY_EVENT_TYPES);
+
+const EVENT_KINDS = ["system", "steer", "interrupt", "assistant", "tool", "command"] as const;
+type EventKind = (typeof EVENT_KINDS)[number];
+
+const EVENT_KIND_LABEL: Record<EventKind, string> = {
+  system: "System",
+  steer: "Steer",
+  interrupt: "Interrupt",
+  assistant: "Agent",
+  tool: "Tool",
+  command: "Command",
+};
+
+const EVENTS_TABS = ["primary", "debug"] as const;
+type EventsTab = (typeof EVENTS_TABS)[number];
+
+const PRIMARY_TAB_LABEL: Record<StageRenderer, string> = {
+  agent: "Thread",
+  command: "Logs",
+  human: "Q&A",
+  conditional: "Decision",
+  parallel: "Children",
+  fan_in: "Results",
+  wait: "Status",
+  summary: "Summary",
+};
+
+export function eventsTabLabel(tab: EventsTab, renderer: StageRenderer): string {
+  if (tab === "debug") return "Debug";
+  return PRIMARY_TAB_LABEL[renderer];
 }
 
-function turnsFromEvents(events: EventEnvelope[], stageId: string): TurnType[] {
-  const stageEvents = events.filter((e) => e.node_id === stageId);
-  const turns: TurnType[] = [];
-  // Collect tool pairs: started → completed
-  const pendingTools = new Map<string, { toolName: string; input: string }>();
-  // Track pending command for pairing started → completed
-  let pendingCommand: { stageId: string; script: string; language: string } | undefined;
+function assertNever(value: never): never {
+  throw new Error(`Unhandled stage activity event type: ${value}`);
+}
 
-  for (const e of stageEvents) {
-    const props = e.properties ?? {};
-    switch (e.event) {
+export function selectStageRenderer(handler: StageHandler): StageRenderer {
+  switch (handler) {
+    case "agent":
+    case "prompt":
+      return "agent";
+    case "command":
+      return "command";
+    case "human":
+      return "human";
+    case "conditional":
+      return "conditional";
+    case "parallel":
+      return "parallel";
+    case "parallel.fan_in":
+      return "fan_in";
+    case "wait":
+      return "wait";
+    default:
+      return "summary";
+  }
+}
+
+function activityEventStageId(event: EventEnvelope): string | undefined {
+  if (typeof event.stage_id === "string") return event.stage_id;
+  if (typeof event.node_id === "string") return event.node_id;
+  return getString(event.properties ?? {}, "node_id");
+}
+
+interface PendingTool {
+  ts: string;
+  toolName: string;
+  input: string;
+}
+
+interface PendingCommand {
+  ts: string;
+  script: string;
+}
+
+export function eventsToActivity(events: EventEnvelope[], stageId: string): TurnType[] {
+  const turns: TurnType[] = [];
+  const pendingTools = new Map<string, PendingTool>();
+  let pendingCommand: PendingCommand | undefined;
+  let sawAssistantMessage = false;
+
+  for (const e of events) {
+    const eventName = e.event;
+    if (
+      activityEventStageId(e) !== stageId ||
+      !eventName ||
+      !STAGE_ACTIVITY_EVENT_SET.has(eventName)
+    ) {
+      continue;
+    }
+    const eventType = eventName as StageActivityEventType;
+    const props: UnknownRecord = e.properties ?? {};
+    switch (eventType) {
       case "stage.prompt":
-        turns.push({ kind: "system", content: getString(props, "text") ?? e.text ?? "" });
+        turns.push({ kind: "system", ts: e.ts, content: getString(props, "text") ?? e.text ?? "" });
         break;
       case "agent.message": {
+        sawAssistantMessage = true;
         const msg = getString(props, "text") ?? e.text ?? "";
-        if (msg) turns.push({ kind: "assistant", content: msg });
+        if (msg) {
+          const billing = (props.billing ?? {}) as UnknownRecord;
+          turns.push({
+            kind: "assistant",
+            ts: e.ts,
+            content: msg,
+            inputTokens: getNumber(billing, "input_tokens") ?? 0,
+            outputTokens: getNumber(billing, "output_tokens") ?? 0,
+          });
+        }
         break;
       }
+      case "prompt.completed": {
+        if (!sawAssistantMessage) {
+          const billing = (props.billing ?? {}) as UnknownRecord;
+          turns.push({
+            kind: "assistant",
+            ts: e.ts,
+            content: getString(props, "response") ?? "",
+            inputTokens: getNumber(billing, "input_tokens") ?? 0,
+            outputTokens: getNumber(billing, "output_tokens") ?? 0,
+          });
+        }
+        break;
+      }
+      case "agent.steering.injected": {
+        const text = getString(props, "text") ?? e.text ?? "";
+        if (text) {
+          turns.push({ kind: "steer", ts: e.ts, content: text });
+        }
+        break;
+      }
+      case "agent.interrupt.injected":
+        turns.push({ kind: "interrupt", ts: e.ts, content: "Agent interrupted" });
+        break;
       case "agent.tool.started": {
         const callId = getString(props, "tool_call_id") ?? e.tool_call_id ?? "";
         const args = props.arguments ?? e.arguments;
         pendingTools.set(callId, {
+          ts: e.ts,
           toolName: getString(props, "tool_name") ?? e.tool_name ?? "",
           input: typeof args === "string" ? args : JSON.stringify(args ?? ""),
         });
@@ -99,505 +239,1021 @@ function turnsFromEvents(events: EventEnvelope[], stageId: string): TurnType[] {
       case "agent.tool.completed": {
         const callId = getString(props, "tool_call_id") ?? e.tool_call_id ?? "";
         const started = pendingTools.get(callId);
+        pendingTools.delete(callId);
         const output = props.output ?? e.output ?? "";
-        const result = typeof output === "string" ? output : JSON.stringify(output);
-        const tool: ToolUse = {
-          id: callId,
+        const result = typeof output === "string" ? output : JSON.stringify(output, null, 2);
+        turns.push({
+          kind: "tool",
+          ts: started?.ts ?? e.ts,
           toolName: started?.toolName ?? getString(props, "tool_name") ?? e.tool_name ?? "",
           input: started?.input ?? "",
           result,
           isError: (props.is_error ?? e.is_error) === true,
-        };
-        pendingTools.delete(callId);
-        turns.push({ kind: "tool", tools: [tool] });
+          durationMs: durationBetween(started?.ts, e.ts),
+        });
         break;
       }
       case "command.started": {
         pendingCommand = {
-          stageId: e.stage_id ?? `${stageId}@1`,
+          ts: e.ts,
           script: getString(props, "script") ?? "",
-          language: getString(props, "language") ?? "shell",
         };
         break;
       }
       case "command.completed": {
         turns.push({
           kind: "command",
-          stageId: pendingCommand?.stageId ?? e.stage_id ?? `${stageId}@1`,
+          ts: pendingCommand?.ts ?? e.ts,
           script: pendingCommand?.script ?? "",
-          language: pendingCommand?.language ?? "shell",
-          stdout: getString(props, "stdout") ?? "",
-          stderr: getString(props, "stderr") ?? "",
+          running: false,
           exitCode: getNumber(props, "exit_code") ?? null,
           durationMs: getNumber(props, "duration_ms") ?? 0,
-          termination: readTermination(props),
-          running: false,
+          outputBytes: getNumber(props, "output_bytes") ?? 0,
         });
         pendingCommand = undefined;
         break;
       }
+      default:
+        assertNever(eventType);
     }
   }
 
-  // If command.started was seen but no command.completed, it's still running
   if (pendingCommand) {
     turns.push({
       kind: "command",
-      stageId: pendingCommand.stageId,
+      ts: pendingCommand.ts,
       script: pendingCommand.script,
-      language: pendingCommand.language,
       running: true,
+      exitCode: null,
+      durationMs: 0,
+      outputBytes: 0,
     });
   }
 
   return turns;
 }
 
-function mapApiStageTurn(t: ApiStageTurn): TurnType {
-  switch (t.kind) {
-    case "tool":
-      return {
-        kind: "tool",
-        tools: (t.tools ?? []).map((tu) => ({
-          id: tu.id,
-          toolName: tu.tool_name,
-          input: tu.input,
-          result: tu.result,
-          isError: tu.is_error,
-          durationMs: tu.duration_ms,
-        })),
+type ToolTurn = Extract<TurnType, { kind: "tool" }>;
+
+export type DisplayItem =
+  | { kind: "single"; turn: TurnType; turnIndex: number }
+  | {
+      kind: "group";
+      toolName: string;
+      ts: string;
+      durationMs: number;
+      children: { turn: ToolTurn; turnIndex: number }[];
+    };
+
+export function groupConsecutiveTools(
+  filtered: { turn: TurnType; index: number }[],
+): DisplayItem[] {
+  const out: DisplayItem[] = [];
+  let buf: { turn: ToolTurn; turnIndex: number }[] = [];
+
+  function flush() {
+    if (buf.length === 0) return;
+    if (buf.length === 1) {
+      out.push({ kind: "single", turn: buf[0].turn, turnIndex: buf[0].turnIndex });
+    } else {
+      const first = buf[0].turn;
+      const totalMs = buf.reduce((sum, b) => sum + b.turn.durationMs, 0);
+      out.push({
+        kind: "group",
+        toolName: first.toolName,
+        ts: first.ts,
+        durationMs: totalMs,
+        children: buf,
+      });
+    }
+    buf = [];
+  }
+
+  for (const { turn, index } of filtered) {
+    const groupable = turn.kind === "tool" && !turn.isError;
+    if (groupable && (buf.length === 0 || buf[0].turn.toolName === turn.toolName)) {
+      buf.push({ turn, turnIndex: index });
+      continue;
+    }
+    flush();
+    if (groupable) {
+      buf.push({ turn, turnIndex: index });
+    } else {
+      out.push({ kind: "single", turn, turnIndex: index });
+    }
+  }
+  flush();
+  return out;
+}
+
+// Convert the event list / grouped tool view into bars for the Thread DNA
+// strip. Each bar carries the same selection identifier the event list uses,
+// so clicking a bar opens the same side-panel entry as clicking its row.
+//
+// Duration semantics:
+//   - tool / command turns use their explicit durationMs
+//   - tool groups span from the first child's start to the last child's end
+//   - assistant turns have no native duration; we treat the time from the
+//     previous activity's end to this message's ts as "thinking" time
+//   - system / steer / interrupt are instants (durationMs = 0)
+export function buildThreadDnaItems(
+  items: DisplayItem[],
+  runStart: string | undefined,
+): ThreadDnaItem[] {
+  if (items.length === 0) return [];
+
+  const anchorMs = (() => {
+    if (runStart) {
+      const parsed = Date.parse(runStart);
+      if (!Number.isNaN(parsed)) return parsed;
+    }
+    const firstTs =
+      items[0].kind === "single" ? items[0].turn.ts : items[0].ts;
+    const parsedFirst = Date.parse(firstTs);
+    return Number.isNaN(parsedFirst) ? null : parsedFirst;
+  })();
+  if (anchorMs == null) return [];
+
+  const out: ThreadDnaItem[] = [];
+  let prevEndMs: number | null = null;
+
+  for (const item of items) {
+    if (item.kind === "single") {
+      const turn = item.turn;
+      const tsMs = Date.parse(turn.ts);
+      if (Number.isNaN(tsMs)) continue;
+      const selection: ThreadDnaSelection = {
+        kind: "single",
+        turnIndex: item.turnIndex,
       };
+
+      switch (turn.kind) {
+        case "system":
+          out.push({
+            category: "system",
+            label: "stage.prompt",
+            startMs: Math.max(0, tsMs - anchorMs),
+            durationMs: 0,
+            selection,
+          });
+          prevEndMs = tsMs;
+          break;
+        case "steer":
+          out.push({
+            category: "user",
+            label: "user.steer",
+            startMs: Math.max(0, tsMs - anchorMs),
+            durationMs: 0,
+            selection,
+          });
+          prevEndMs = tsMs;
+          break;
+        case "interrupt":
+          out.push({
+            category: "interrupt",
+            label: "interrupt",
+            startMs: Math.max(0, tsMs - anchorMs),
+            durationMs: 0,
+            selection,
+          });
+          prevEndMs = tsMs;
+          break;
+        case "assistant": {
+          // turn.ts is the moment the assistant message arrived (end of
+          // generation). Its bar represents the gap from the last activity
+          // to that moment, so the visual width approximates "thinking".
+          const startSourceMs = prevEndMs ?? tsMs;
+          const startMs = Math.max(0, startSourceMs - anchorMs);
+          const durationMs = Math.max(0, tsMs - startSourceMs);
+          out.push({
+            category: "agent",
+            label: "agent.message",
+            startMs,
+            durationMs,
+            selection,
+          });
+          prevEndMs = tsMs;
+          break;
+        }
+        case "tool": {
+          const startMs = Math.max(0, tsMs - anchorMs);
+          const durationMs = Math.max(0, turn.durationMs);
+          out.push({
+            category: "tool",
+            label: humanizeToolName(turn.toolName),
+            startMs,
+            durationMs,
+            selection,
+          });
+          prevEndMs = tsMs + durationMs;
+          break;
+        }
+        case "command": {
+          const startMs = Math.max(0, tsMs - anchorMs);
+          const durationMs = Math.max(0, turn.durationMs);
+          out.push({
+            category: "tool",
+            label: "command",
+            startMs,
+            durationMs,
+            selection,
+          });
+          prevEndMs = tsMs + durationMs;
+          break;
+        }
+      }
+    } else {
+      const firstStart = Date.parse(item.ts);
+      const lastChild = item.children[item.children.length - 1].turn;
+      const lastEnd = Date.parse(lastChild.ts) + lastChild.durationMs;
+      if (Number.isNaN(firstStart) || Number.isNaN(lastEnd)) continue;
+
+      const startMs = Math.max(0, firstStart - anchorMs);
+      const durationMs = Math.max(0, lastEnd - firstStart);
+      out.push({
+        category: "tool",
+        label: `${humanizeToolName(item.toolName)} ×${item.children.length}`,
+        startMs,
+        durationMs,
+        selection: {
+          kind: "group",
+          childTurnIndices: item.children.map((c) => c.turnIndex),
+        },
+      });
+      prevEndMs = lastEnd;
+    }
+  }
+
+  return out;
+}
+
+const STAGE_MODEL_EVENT_NAMES = new Set([
+  "stage.prompt",
+  "agent.session.activated",
+  "agent.cli.started",
+]);
+
+export function extractStageModel(
+  events: EventEnvelope[],
+  stageId: string,
+): string | null {
+  let model: string | null = null;
+  for (const e of events) {
+    if (activityEventStageId(e) !== stageId) continue;
+    if (!e.event || !STAGE_MODEL_EVENT_NAMES.has(e.event)) continue;
+    const candidate = getString(e.properties ?? {}, "model");
+    if (candidate) model = candidate;
+  }
+  return model;
+}
+
+function turnLabel(turn: TurnType): string {
+  switch (turn.kind) {
     case "system":
+      return "System";
+    case "steer":
+      return "Steer";
+    case "interrupt":
+      return "Interrupt";
     case "assistant":
-      return { kind: t.kind, content: t.content ?? "" };
+      return "Agent";
+    case "tool":
+      return "Tool";
+    case "command":
+      return "Command";
   }
 }
 
-function mapTurns(
-  turnsResult: PaginatedStageTurnList | null | undefined,
-  eventsResult: PaginatedEventList | null | undefined,
-  selectedStageId: string | undefined,
-): TurnType[] {
-  if (!selectedStageId) return [];
-  if (turnsResult?.data?.length) {
-    return turnsResult.data.map(mapApiStageTurn);
+function turnTone(turn: TurnType): string {
+  switch (turn.kind) {
+    case "system":
+      return "bg-amber/15 text-amber";
+    case "steer":
+      return "bg-overlay-strong text-fg-2";
+    case "interrupt":
+      return "bg-coral/15 text-coral";
+    case "assistant":
+      return "bg-teal-500/15 text-teal-500";
+    case "tool":
+    case "command":
+      return "bg-mint/15 text-mint";
   }
-  if (eventsResult?.data) {
-    return turnsFromEvents(eventsResult.data, selectedStageId);
+}
+
+const SUMMARY_MAX_CHARS = 80;
+
+function oneLine(text: string): string {
+  const collapsed = text.replace(/\s+/g, " ").trim();
+  if (collapsed.length <= SUMMARY_MAX_CHARS) return collapsed;
+  return `${collapsed.slice(0, SUMMARY_MAX_CHARS - 1)}…`;
+}
+
+const TOOL_NAME_DISPLAY: Record<string, string> = {
+  read_file: "Read",
+  write_file: "Write",
+  edit_file: "Edit",
+  shell: "Bash",
+  grep: "Grep",
+  glob: "Glob",
+  read_many_files: "Read Many",
+  list_dir: "List Dir",
+  web_search: "Web Search",
+  web_fetch: "Web Fetch",
+};
+
+export function humanizeToolName(raw: string): string {
+  if (!raw) return "tool";
+  if (TOOL_NAME_DISPLAY[raw]) return TOOL_NAME_DISPLAY[raw];
+  // MCP tools are namespaced like `mcp__<server>__<tool>`; display the trailing segment.
+  const lastSegment = raw.split("__").pop() ?? raw;
+  return lastSegment
+    .split(/[_-]+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+export function turnSummary(turn: TurnType): string {
+  switch (turn.kind) {
+    case "system":
+    case "steer":
+    case "interrupt":
+    case "assistant":
+      return oneLine(turn.content);
+    case "tool":
+      return humanizeToolName(turn.toolName);
+    case "command":
+      return oneLine(turn.script) || (turn.running ? "running…" : "");
   }
-  return [];
 }
 
-function Markdown({ content }: { content: string }) {
-  const html = useMemo(() => markedSafe.parse(content, { async: false }) as string, [content]);
-  return (
-    <div
-      className="prose prose-sm max-w-none text-fg-3 prose-headings:text-fg-2 prose-strong:text-fg-2 prose-code:rounded prose-code:bg-overlay-strong prose-code:px-1 prose-code:py-0.5 prose-code:text-[0.8em] prose-code:font-mono prose-code:text-fg-3 prose-code:before:content-none prose-code:after:content-none prose-pre:bg-overlay-strong prose-pre:text-fg-3 prose-a:text-teal-500"
-      dangerouslySetInnerHTML={{ __html: html }}
-    />
-  );
+function durationBetween(startTs: string | undefined, endTs: string): number {
+  if (!startTs) return 0;
+  const startMs = Date.parse(startTs);
+  const endMs = Date.parse(endTs);
+  if (Number.isNaN(startMs) || Number.isNaN(endMs)) return 0;
+  return Math.max(0, endMs - startMs);
 }
 
-function SystemBlock({ content }: { content: string }) {
-  return (
-    <section className="group relative border-l-2 border-amber/50 pl-4">
-      <header className="mb-1.5 flex items-center gap-2">
-        <CommandLineIcon className="size-4 shrink-0 text-amber" />
-        <span className="text-xs font-medium text-fg-3">System prompt</span>
-        <div className="ml-auto opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
-          <CopyButton value={content} label="Copy system prompt" />
-        </div>
-      </header>
-      <Markdown content={content} />
-    </section>
-  );
+export function turnMetric(turn: TurnType): string | null {
+  switch (turn.kind) {
+    case "assistant": {
+      if (turn.inputTokens === 0 && turn.outputTokens === 0) return null;
+      return `${formatTokenCount(turn.inputTokens)} / ${formatTokenCount(turn.outputTokens)}`;
+    }
+    case "tool":
+    case "command":
+      return turn.durationMs > 0 ? formatDurationMs(turn.durationMs) : null;
+    case "steer":
+    case "interrupt":
+    case "system":
+      return null;
+  }
 }
 
-function AssistantBlock({ content }: { content: string }) {
-  return (
-    <section className="group relative border-l-2 border-teal-500/50 pl-4">
-      <header className="mb-1.5 flex items-center gap-2">
-        <ChatBubbleLeftIcon className="size-4 shrink-0 text-teal-500" />
-        <span className="text-xs font-medium text-fg-3">Assistant</span>
-        <div className="ml-auto opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
-          <CopyButton value={content} label="Copy assistant message" />
-        </div>
-      </header>
-      <Markdown content={content} />
-    </section>
-  );
+export function searchableText(turn: TurnType): string {
+  switch (turn.kind) {
+    case "system":
+    case "steer":
+    case "interrupt":
+    case "assistant":
+      return turn.content;
+    case "tool":
+      return `${humanizeToolName(turn.toolName)} ${turn.toolName} ${turn.input} ${turn.result}`;
+    case "command":
+      return turn.script;
+  }
 }
 
-function StatusPill({
-  tone,
-  children,
+function EventRow({
+  turn,
+  runStart,
+  selected,
+  onSelect,
 }: {
-  tone: "running" | "failed" | "success" | "neutral";
-  children: React.ReactNode;
+  turn: TurnType;
+  runStart: string | undefined;
+  selected: boolean;
+  onSelect: () => void;
 }) {
-  const toneClass = {
-    running: "bg-teal-500/15 text-teal-500",
-    failed: "bg-coral/15 text-coral",
-    success: "bg-mint/15 text-mint",
-    neutral: "bg-overlay text-fg-3",
-  }[tone];
+  const metric = turnMetric(turn);
+  const MetricIcon = metric == null ? null : turn.kind === "assistant" ? CircleStackIcon : ClockIcon;
+  const metricSpan = (
+    <span className="inline-flex items-center justify-end gap-1.5 font-mono text-xs tabular-nums text-fg-muted">
+      {turn.kind === "tool" && turn.isError && (
+        <span className="rounded bg-coral/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider text-coral">
+          Error
+        </span>
+      )}
+      {MetricIcon && <MetricIcon className="size-3" aria-hidden="true" />}
+      {metric ?? ""}
+    </span>
+  );
   return (
-    <span className={`rounded px-1.5 py-0.5 text-[11px] font-medium ${toneClass}`}>
-      {children}
+    <button
+      type="button"
+      onClick={onSelect}
+      aria-pressed={selected}
+      className={`grid w-full grid-cols-[5rem_1fr_auto_auto] items-center gap-4 px-5 py-2.5 text-left transition-colors hover:bg-overlay focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-teal-500 ${
+        selected ? "bg-overlay" : ""
+      }`}
+    >
+      <span
+        className={`inline-flex w-fit items-center rounded-full px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider ${turnTone(turn)}`}
+      >
+        {turnLabel(turn)}
+      </span>
+      <span className="min-w-0 truncate text-sm text-fg-3">
+        {turnSummary(turn)}
+      </span>
+      {turn.kind === "assistant" && metric != null ? (
+        <Tooltip
+          label={
+            <div className="px-1 py-1">
+              <div className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-fg-muted">
+                Tokens in / out
+              </div>
+              <div className="grid grid-cols-[auto_auto] items-baseline gap-x-3 gap-y-1 tabular-nums">
+                <span className="text-right font-medium text-fg">
+                  {formatTokenCount(turn.inputTokens)}
+                </span>
+                <span className="text-fg-3">input</span>
+                <span className="text-right font-medium text-fg">
+                  {formatTokenCount(turn.outputTokens)}
+                </span>
+                <span className="text-fg-3">output</span>
+              </div>
+            </div>
+          }
+        >
+          {metricSpan}
+        </Tooltip>
+      ) : (
+        metricSpan
+      )}
+      <Tooltip label={formatAbsoluteTs(turn.ts)}>
+        <span className="pl-3 font-mono text-xs tabular-nums text-fg-muted">
+          {formatElapsed(turn.ts, runStart)}
+        </span>
+      </Tooltip>
+    </button>
+  );
+}
+
+const TOOL_GROUP_TONE = "bg-mint/15 text-mint";
+
+function ToolGroupRow({
+  group,
+  runStart,
+  selected,
+  onSelect,
+}: {
+  group: Extract<DisplayItem, { kind: "group" }>;
+  runStart: string | undefined;
+  selected: boolean;
+  onSelect: () => void;
+}) {
+  const metric = group.durationMs > 0 ? formatDurationMs(group.durationMs) : null;
+  return (
+    <button
+      type="button"
+      onClick={onSelect}
+      aria-pressed={selected}
+      className={`grid w-full grid-cols-[5rem_1fr_auto_auto] items-center gap-4 px-5 py-2.5 text-left transition-colors hover:bg-overlay focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-teal-500 ${
+        selected ? "bg-overlay" : ""
+      }`}
+    >
+      <span
+        className={`inline-flex w-fit items-center rounded-full px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider ${TOOL_GROUP_TONE}`}
+      >
+        Tool
+      </span>
+      <span className="min-w-0 truncate text-sm text-fg-3">
+        {humanizeToolName(group.toolName)} x{group.children.length}
+      </span>
+      <span className="inline-flex items-center justify-end gap-1.5 font-mono text-xs tabular-nums text-fg-muted">
+        {metric && <ClockIcon className="size-3" aria-hidden="true" />}
+        {metric ?? ""}
+      </span>
+      <Tooltip label={formatAbsoluteTs(group.ts)}>
+        <span className="pl-3 font-mono text-xs tabular-nums text-fg-muted">
+          {formatElapsed(group.ts, runStart)}
+        </span>
+      </Tooltip>
+    </button>
+  );
+}
+
+function EventDetails({
+  turn,
+  runStart,
+  hideMeta = false,
+}: {
+  turn: TurnType;
+  runStart: string | undefined;
+  hideMeta?: boolean;
+}) {
+  const elapsed = formatElapsed(turn.ts, runStart);
+  const absolute = (() => {
+    const ms = Date.parse(turn.ts);
+    if (Number.isNaN(ms)) return turn.ts;
+    return new Date(ms).toLocaleString();
+  })();
+
+  return (
+    <div className="space-y-5">
+      {!hideMeta && (
+        <DetailField label="When" mono>
+          {elapsed ? `${elapsed} · ${absolute}` : absolute}
+        </DetailField>
+      )}
+
+      {(turn.kind === "system" ||
+        turn.kind === "steer" ||
+        turn.kind === "interrupt" ||
+        turn.kind === "assistant") && (
+        <DetailField label="Content">
+          <Markdown content={turn.content} />
+        </DetailField>
+      )}
+
+      {turn.kind === "tool" && (
+        <>
+          {!hideMeta && (
+            <DetailField label="Tool" mono>
+              {humanizeToolName(turn.toolName)}{" "}
+              <span className="text-fg-muted">({turn.toolName})</span>
+            </DetailField>
+          )}
+          <DetailField label="Input">
+            <JsonBlock value={turn.input} />
+          </DetailField>
+          <DetailField label={turn.isError ? "Error" : "Result"}>
+            <JsonBlock value={turn.result} />
+          </DetailField>
+        </>
+      )}
+
+      {turn.kind === "command" && (
+        <>
+          <DetailField label="Status" mono>
+            {turn.running
+              ? "Running…"
+              : `exit ${turn.exitCode ?? "?"}${
+                  turn.durationMs ? ` · ${formatDurationMs(turn.durationMs)}` : ""
+                }`}
+          </DetailField>
+          <DetailField label="Script">
+            <CodeBlock>{turn.script}</CodeBlock>
+          </DetailField>
+        </>
+      )}
+    </div>
+  );
+}
+
+function decodeBase64Utf8(b64: string): string {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  return new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+}
+
+function LogStream({
+  runId,
+  stageId,
+  label,
+  byteCount,
+  enabled,
+}: {
+  runId: string;
+  stageId: string;
+  label: string;
+  byteCount: number;
+  enabled: boolean;
+}) {
+  const { data, error, isLoading } = useRunStageLog(runId, stageId, enabled && byteCount > 0);
+  const text = useMemo(() => {
+    if (!data?.bytes_base64) return "";
+    try {
+      return decodeBase64Utf8(data.bytes_base64);
+    } catch {
+      return "";
+    }
+  }, [data]);
+  const truncated =
+    data && data.total_bytes > data.next_offset ? data.total_bytes - data.next_offset : 0;
+
+  return (
+    <section>
+      <header className="mb-1 flex items-baseline justify-between gap-2">
+        <h3 className="text-xs font-medium uppercase tracking-wider text-fg-muted">
+          {label}
+        </h3>
+        {byteCount > 0 && (
+          <span className="font-mono text-[11px] tabular-nums text-fg-muted">
+            {formatBytes(byteCount)}
+          </span>
+        )}
+      </header>
+      <pre
+        className="overflow-x-auto whitespace-pre-wrap rounded-md bg-overlay-strong p-3 font-mono text-xs leading-relaxed text-fg-3"
+      >
+        {byteCount === 0 ? (
+          <span className="text-fg-muted">empty</span>
+        ) : isLoading && !data ? (
+          <span className="text-fg-muted">loading…</span>
+        ) : error ? (
+          <span className="text-coral">Failed to load output.</span>
+        ) : (
+          text || <span className="text-fg-muted">empty</span>
+        )}
+      </pre>
+      {truncated > 0 && (
+        <p className="mt-1 text-[11px] text-fg-muted">
+          Showing first {formatBytes(data!.next_offset)} of {formatBytes(data!.total_bytes)}.
+        </p>
+      )}
+    </section>
+  );
+}
+
+function CommandStatus({ turn }: { turn: CommandTurn }) {
+  const exitTone =
+    turn.exitCode == null
+      ? "text-fg-muted"
+      : turn.exitCode === 0
+        ? "text-mint"
+        : "text-coral";
+  return (
+    <span className="ml-auto inline-flex items-center gap-x-3 text-xs">
+      {turn.running ? (
+        <span className="inline-flex items-center gap-1.5 text-amber">
+          <span className="size-1.5 animate-pulse rounded-full bg-amber" />
+          Running…
+        </span>
+      ) : (
+        <span className={`font-mono tabular-nums ${exitTone}`}>
+          exit {turn.exitCode ?? "?"}
+        </span>
+      )}
+      {turn.durationMs > 0 && (
+        <span className="font-mono tabular-nums text-fg-muted">
+          {formatDurationMs(turn.durationMs)}
+        </span>
+      )}
     </span>
   );
 }
 
-const COLLAPSE_AFTER_LINES = 20;
-const LOG_POLL_INTERVAL_MS = 1000;
-const LOG_FETCH_LIMIT_BYTES = 65_536;
-const LOG_MEMORY_CAP_BYTES = 5 * 1024 * 1024;
-
-function StreamLabel({ label }: { label: string }) {
+function CommandScript({ script }: { script: string }) {
   return (
-    <div className="font-mono text-[11px] uppercase tracking-wider text-fg-muted">
-      {label}
-    </div>
+    <section>
+      <h3 className="mb-1 text-xs font-medium uppercase tracking-wider text-fg-muted">
+        Command
+      </h3>
+      <pre className="overflow-x-auto whitespace-pre-wrap rounded-md bg-overlay-strong p-3 font-mono text-xs leading-relaxed text-fg-3">
+        {script || <span className="text-fg-muted">empty</span>}
+      </pre>
+    </section>
   );
 }
 
-interface CommandLogState {
-  text: string;
-  eof: boolean;
-  loading: boolean;
-  error: boolean;
-  truncated: boolean;
-  casRef: string | null;
-  liveStreaming: boolean;
-  totalBytes: number;
-}
-
-function decodeBase64Bytes(value: string): Uint8Array {
-  if (!value) return new Uint8Array();
-  const binary = atob(value);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return bytes;
-}
-
-function trimTextToBytes(text: string, maxBytes: number) {
-  // Each UTF-16 code unit encodes to at most 3 bytes in UTF-8 (4-byte encodings
-  // come from surrogate pairs counted as 2 units). Skip the full encode when
-  // the upper bound is already under the cap.
-  if (text.length * 3 <= maxBytes) {
-    return { text, truncated: false };
-  }
-  const encoded = new TextEncoder().encode(text);
-  if (encoded.byteLength <= maxBytes) {
-    return { text, truncated: false };
-  }
-  const start = encoded.byteLength - maxBytes;
-  const trimmed = new TextDecoder().decode(encoded.slice(start));
-  return { text: trimmed.replace(/^\uFFFD/, ""), truncated: true };
-}
-
-function useCommandLog(
-  runId: string | undefined,
-  stageId: string | undefined,
-  stream: CommandOutputStream,
-  running: boolean,
-): CommandLogState {
-  const [state, setState] = useState<CommandLogState>({
-    text: "",
-    eof: false,
-    loading: true,
-    error: false,
-    truncated: false,
-    casRef: null,
-    liveStreaming: false,
-    totalBytes: 0,
-  });
-  const offsetRef = useRef(0);
-  const finalPollDoneRef = useRef(false);
-  const decoderRef = useRef(new TextDecoder());
-
-  useEffect(() => {
-    offsetRef.current = 0;
-    finalPollDoneRef.current = false;
-    decoderRef.current = new TextDecoder();
-    setState({
-      text: "",
-      eof: false,
-      loading: true,
-      error: false,
-      truncated: false,
-      casRef: null,
-      liveStreaming: false,
-      totalBytes: 0,
-    });
-  }, [runId, stageId, stream]);
-
-  useEffect(() => {
-    if (!runId || !stageId) return;
-    let cancelled = false;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-
-    async function poll() {
-      try {
-        const chunk = await fetchRunCommandLog(
-          runId,
-          stageId,
-          stream,
-          offsetRef.current,
-          LOG_FETCH_LIMIT_BYTES,
-        );
-        if (cancelled) return;
-
-        offsetRef.current = chunk.next_offset;
-        const bytes = decodeBase64Bytes(chunk.bytes_base64);
-        const decoded = decoderRef.current.decode(bytes, { stream: !chunk.eof });
-        finalPollDoneRef.current = chunk.eof;
-        setState((current) => {
-          if (
-            decoded.length === 0 &&
-            current.eof === chunk.eof &&
-            current.totalBytes === chunk.total_bytes &&
-            current.casRef === chunk.cas_ref &&
-            current.liveStreaming === chunk.live_streaming &&
-            !current.loading &&
-            !current.error
-          ) {
-            return current;
-          }
-          const next = trimTextToBytes(current.text + decoded, LOG_MEMORY_CAP_BYTES);
-          return {
-            text: next.text,
-            eof: chunk.eof,
-            loading: false,
-            error: false,
-            truncated: current.truncated || next.truncated,
-            casRef: chunk.cas_ref,
-            liveStreaming: chunk.live_streaming,
-            totalBytes: chunk.total_bytes,
-          };
-        });
-      } catch {
-        if (!cancelled) {
-          setState((current) => ({ ...current, loading: false, error: true }));
-        }
-      }
-
-      if (!cancelled && (running || !finalPollDoneRef.current)) {
-        timer = setTimeout(poll, LOG_POLL_INTERVAL_MS);
-      }
-    }
-
-    void poll();
-    return () => {
-      cancelled = true;
-      if (timer) clearTimeout(timer);
-    };
-  }, [runId, running, stageId, stream]);
-
-  return state;
-}
-
-function streamStatus(state: CommandLogState, hasContent: boolean): string {
-  if (state.error) return "Failed to load";
-  if (state.loading) return "Waiting";
-  if (hasContent) {
-    if (state.eof) return state.casRef ? "Stored" : "Complete";
-    return state.liveStreaming ? "Streaming" : "Running";
-  }
-  return state.eof ? "No output" : "Waiting";
-}
-
-function OutputStream({
-  label,
-  state,
-  tone = "normal",
-  forceExpanded = false,
-}: {
-  label: string;
-  state: CommandLogState;
-  tone?: "normal" | "error";
-  forceExpanded?: boolean;
-}) {
-  const content = state.text;
-  const lines = content.split("\n");
-  const isLong = lines.length > COLLAPSE_AFTER_LINES;
-  const [expanded, setExpanded] = useState(forceExpanded);
-  const scrollRef = useRef<HTMLPreElement>(null);
-  const followTailRef = useRef(true);
-  const visible = isLong && !expanded
-    ? lines.slice(-COLLAPSE_AFTER_LINES).join("\n")
-    : content;
-  const hiddenLines = isLong && !expanded ? lines.length - COLLAPSE_AFTER_LINES : 0;
-  const preClass =
-    tone === "error"
-      ? "whitespace-pre-wrap font-mono text-sm leading-relaxed text-coral sm:text-xs"
-      : "whitespace-pre-wrap font-mono text-sm leading-relaxed text-fg-3 sm:text-xs";
-  const status = streamStatus(state, content.length > 0);
-
-  useEffect(() => {
-    if (!forceExpanded) return;
-    setExpanded(true);
-  }, [forceExpanded]);
-
-  useEffect(() => {
-    const el = scrollRef.current;
-    if (el && followTailRef.current) {
-      el.scrollTop = el.scrollHeight;
-    }
-  }, [visible]);
-
-  return (
-    <div>
-      <div className="mb-1 flex items-center gap-2">
-        <StreamLabel label={label} />
-        <span className="text-[11px] text-fg-muted">{status}</span>
-        {state.truncated ? (
-          <span className="text-[11px] text-amber">Last 5 MiB</span>
-        ) : null}
-        <CopyButton
-          value={visible}
-          label={`Copy ${label}`}
-          className="-my-1"
-        />
-      </div>
-      {isLong && !expanded ? (
-        <button
-          type="button"
-          onClick={() => setExpanded(true)}
-          className="mb-2 text-[11px] font-medium text-teal-500 hover:text-teal-300 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 rounded"
-        >
-          Show {hiddenLines} earlier lines
-        </button>
-      ) : null}
-      {content.length === 0 ? (
-        <div className="font-mono text-sm text-fg-muted sm:text-xs">
-          {state.error ? "Unable to fetch this stream." : "No bytes received yet."}
-        </div>
-      ) : (
-        <pre
-          ref={scrollRef}
-          onScroll={(event) => {
-            const el = event.currentTarget;
-            followTailRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
-          }}
-          className={`${preClass} max-h-96 overflow-auto`}
-        >
-          {visible}
-        </pre>
-      )}
-    </div>
-  );
-}
-
-function CommandBlock({
+function CommandLogs({
   runId,
+  stageId,
   turn,
 }: {
-  runId: string | undefined;
-  turn: Extract<TurnType, { kind: "command" }>;
+  runId: string;
+  stageId: string;
+  turn: CommandTurn | null;
 }) {
-  const failed = !turn.running && (turn.termination !== CommandTermination.EXITED || turn.exitCode !== 0);
-  const stdout = useCommandLog(runId, turn.stageId, CommandOutputStream.STDOUT, turn.running);
-  const stderr = useCommandLog(runId, turn.stageId, CommandOutputStream.STDERR, turn.running);
-  const borderColor = turn.running ? "border-teal-500/20" : failed ? "border-coral/15" : "border-mint/15";
-  const bgColor = turn.running ? "bg-teal-500/5" : failed ? "bg-coral/5" : "bg-mint/5";
-
+  if (!turn) {
+    return (
+      <div className="pl-3 pr-4 text-sm text-fg-muted sm:pr-6 lg:pr-8">
+        No command output yet.
+      </div>
+    );
+  }
   return (
-    <div className={`group rounded-md border ${borderColor} ${bgColor} overflow-hidden`}>
-      {/* Header */}
-      <div className="flex items-center gap-2 px-3 py-2">
-        <PlayIcon className={`size-4 shrink-0 ${turn.running ? "text-teal-500 animate-pulse" : failed ? "text-coral" : "text-mint"}`} />
-        <span className="text-xs font-medium text-fg-3">
-          {turn.language === "python" ? "Python" : "Shell"}
-        </span>
-        <div className="ml-auto flex items-center gap-2">
-          {turn.running ? (
-            <StatusPill tone="running">Running…</StatusPill>
-          ) : turn.termination === CommandTermination.TIMED_OUT ? (
-            <StatusPill tone="failed">Timed out</StatusPill>
-          ) : turn.termination === CommandTermination.CANCELLED ? (
-            <StatusPill tone="failed">Cancelled</StatusPill>
-          ) : (
-            <>
-              <StatusPill tone={failed ? "failed" : "success"}>
-                exit {turn.exitCode ?? "?"}
-              </StatusPill>
-              {turn.durationMs != null && (
-                <StatusPill tone="neutral">
-                  {turn.durationMs < 1000
-                    ? `${turn.durationMs}ms`
-                    : `${(turn.durationMs / 1000).toFixed(1)}s`}
-                </StatusPill>
-              )}
-            </>
-          )}
-          {turn.script ? (
-            <div className="opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
-              <CopyButton value={turn.script} label="Copy script" />
-            </div>
-          ) : null}
-        </div>
-      </div>
-
-      {/* Script */}
-      {turn.script && (
-        <div className="border-t border-line px-3 py-2.5">
-          <pre className="whitespace-pre-wrap font-mono text-sm leading-relaxed text-fg-3 sm:text-xs">{turn.script}</pre>
-        </div>
-      )}
-
-      <div className="grid border-t border-line md:grid-cols-2">
-        <div className="border-line px-3 py-2.5 md:border-r">
-          <OutputStream label="stdout" state={stdout} />
-        </div>
-        <div className="border-t border-line px-3 py-2.5 md:border-t-0">
-          <OutputStream
-            label="stderr"
-            state={stderr}
-            tone="error"
-            forceExpanded={failed || stderr.text.length > 0}
-          />
-        </div>
-      </div>
+    <div className="space-y-5 pl-3 pr-4 sm:pr-6 lg:pr-8">
+      <CommandScript script={turn.script} />
+      <LogStream
+        runId={runId}
+        stageId={stageId}
+        label="Output"
+        byteCount={turn.outputBytes}
+        enabled={!turn.running}
+      />
     </div>
   );
 }
 
-function RunningStageDuration({
-  isRunning,
-  duration,
+function EventDetailsPanel({
+  turn,
+  runStart,
+  onClose,
 }: {
-  isRunning: boolean;
-  duration: string;
+  turn: TurnType | null;
+  runStart: string | undefined;
+  onClose: () => void;
 }) {
-  const [startedAt, setStartedAt] = useState<number | null>(() =>
-    isRunning ? Date.now() : null,
+  return (
+    <DetailsPanel
+      title={turn ? `${turnLabel(turn)} event` : ""}
+      isOpen={turn != null}
+      onClose={onClose}
+    >
+      {turn ? <EventDetails turn={turn} runStart={runStart} /> : null}
+    </DetailsPanel>
   );
-  const [, setTick] = useState(0);
+}
 
-  useEffect(() => {
-    setStartedAt((current) => {
-      if (!isRunning) return null;
-      return current ?? Date.now();
-    });
-  }, [isRunning]);
+const TOOL_INPUT_PREVIEW_KEYS = ["command", "path", "pattern", "url", "query", "script"];
 
-  useEffect(() => {
-    if (!isRunning) return;
-    const interval = setInterval(() => setTick((tick) => tick + 1), 1000);
-    return () => clearInterval(interval);
-  }, [isRunning]);
-
-  if (isRunning && startedAt) {
-    return formatDurationSecs(Math.floor((Date.now() - startedAt) / 1000));
+function toolInputPreview(turn: ToolTurn): string {
+  const raw = turn.input;
+  if (!raw) return "";
+  try {
+    const parsed = JSON.parse(raw);
+    if (typeof parsed === "string") return oneLine(parsed);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const obj = parsed as Record<string, unknown>;
+      for (const k of TOOL_INPUT_PREVIEW_KEYS) {
+        const v = obj[k];
+        if (typeof v === "string" && v) return oneLine(v);
+      }
+    }
+  } catch {
+    // input wasn't valid JSON; fall through to oneLine of the raw string
   }
-  return duration;
+  return oneLine(raw);
+}
+
+function ToolGroupChildRow({
+  child,
+  runStart,
+  expanded,
+  onToggle,
+}: {
+  child: { turn: ToolTurn; turnIndex: number };
+  runStart: string | undefined;
+  expanded: boolean;
+  onToggle: () => void;
+}) {
+  const { turn } = child;
+  const metric = turn.durationMs > 0 ? formatDurationMs(turn.durationMs) : null;
+  const elapsed = formatElapsed(turn.ts, runStart);
+  const Chevron = expanded ? ChevronDownIcon : ChevronRightIcon;
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      aria-expanded={expanded}
+      className={`grid w-full grid-cols-[1fr_auto_auto] items-center gap-3 px-5 py-2.5 text-left transition-colors hover:bg-overlay focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-teal-500 ${
+        expanded ? "bg-overlay" : ""
+      }`}
+    >
+      <span className="min-w-0 truncate font-mono text-xs text-fg-3">
+        {toolInputPreview(turn)}
+      </span>
+      <span className="inline-flex items-center justify-end gap-1.5 font-mono text-xs tabular-nums text-fg-muted">
+        {metric && <ClockIcon className="size-3" aria-hidden="true" />}
+        {metric ?? ""}
+        <Tooltip label={formatAbsoluteTs(turn.ts)}>
+          <span className="pl-3 tabular-nums">{elapsed}</span>
+        </Tooltip>
+      </span>
+      <Chevron className="size-4 text-fg-muted" aria-hidden="true" />
+    </button>
+  );
+}
+
+function ToolGroupDetails({
+  group,
+  runStart,
+}: {
+  group: Extract<DisplayItem, { kind: "group" }>;
+  runStart: string | undefined;
+}) {
+  const [expandedIndex, setExpandedIndex] = useState<number | null>(null);
+  useEffect(() => {
+    setExpandedIndex(null);
+  }, [group]);
+
+  const elapsed = formatElapsed(group.ts, runStart);
+  const totalDuration = group.durationMs > 0 ? formatDurationMs(group.durationMs) : null;
+
+  return (
+    <div className="-mx-5 -mt-4">
+      <div className="flex items-baseline gap-3 border-b border-line px-5 py-3">
+        <span className="text-sm font-medium text-fg">
+          {humanizeToolName(group.toolName)}{" "}
+          <span className="text-fg-muted">x{group.children.length}</span>
+        </span>
+        <span className="ml-auto inline-flex items-center gap-1.5 font-mono text-xs tabular-nums text-fg-muted">
+          {elapsed}
+          {totalDuration && (
+            <>
+              <span aria-hidden="true">·</span>
+              <ClockIcon className="size-3" aria-hidden="true" />
+              {totalDuration}
+            </>
+          )}
+        </span>
+      </div>
+      <ul className="divide-y divide-line">
+        {group.children.map((child, i) => (
+          <li key={`group-child-${child.turnIndex}`}>
+            <ToolGroupChildRow
+              child={child}
+              runStart={runStart}
+              expanded={expandedIndex === i}
+              onToggle={() =>
+                setExpandedIndex((current) => (current === i ? null : i))
+              }
+            />
+            {expandedIndex === i && (
+              <div className="bg-overlay/50 px-5 py-4">
+                <EventDetails turn={child.turn} runStart={runStart} hideMeta />
+              </div>
+            )}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function ToolGroupDetailsPanel({
+  group,
+  runStart,
+  onClose,
+}: {
+  group: Extract<DisplayItem, { kind: "group" }> | null;
+  runStart: string | undefined;
+  onClose: () => void;
+}) {
+  return (
+    <DetailsPanel
+      title={group ? "Tool group" : ""}
+      isOpen={group != null}
+      onClose={onClose}
+    >
+      {group ? <ToolGroupDetails group={group} runStart={runStart} /> : null}
+    </DetailsPanel>
+  );
+}
+
+function EventsTabToggle({
+  tab,
+  renderer,
+  onTabChange,
+}: {
+  tab: EventsTab;
+  renderer: StageRenderer;
+  onTabChange: (tab: EventsTab) => void;
+}) {
+  return (
+    <div
+      role="group"
+      aria-label="View"
+      className="inline-flex rounded-md bg-panel p-0.5 outline-1 -outline-offset-1 outline-line-strong"
+    >
+      {EVENTS_TABS.map((value) => {
+        const active = tab === value;
+        return (
+          <button
+            key={value}
+            type="button"
+            onClick={() => onTabChange(value)}
+            aria-pressed={active}
+            className={`rounded px-2.5 py-1 text-xs font-medium transition-colors focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-teal-500 ${
+              active
+                ? "bg-overlay-strong text-fg"
+                : "text-fg-muted hover:text-fg-2"
+            }`}
+          >
+            {eventsTabLabel(value, renderer)}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function EventsToolbar({
+  tab,
+  renderer,
+  commandTurn,
+  onTabChange,
+  selectedKinds,
+  onKindsChange,
+  selectedDebugCategories,
+  onDebugCategoriesChange,
+  availableDebugCategories,
+  search,
+  onSearchChange,
+  filteredCount,
+  totalCount,
+  model,
+}: {
+  tab: EventsTab;
+  renderer: StageRenderer;
+  commandTurn: CommandTurn | null;
+  onTabChange: (tab: EventsTab) => void;
+  selectedKinds: EventKind[];
+  onKindsChange: (kinds: EventKind[]) => void;
+  selectedDebugCategories: DebugCategory[];
+  onDebugCategoriesChange: (categories: DebugCategory[]) => void;
+  availableDebugCategories: readonly DebugCategory[];
+  search: string;
+  onSearchChange: (value: string) => void;
+  filteredCount: number;
+  totalCount: number;
+  model: string | null;
+}) {
+  // Filters apply to: the agent transcript (filter event kinds) and the Debug
+  // tab (filter event categories). Specialized renderers (human, parallel,
+  // wait, etc.) and the command logs view don't have a filterable list.
+  const showFilters = tab === "debug" || (tab === "primary" && renderer === "agent");
+  const transcriptAllSelected = selectedKinds.length === EVENT_KINDS.length;
+  const debugAllSelected =
+    selectedDebugCategories.length === 0 ||
+    selectedDebugCategories.length === availableDebugCategories.length;
+  const isFiltering =
+    showFilters &&
+    (tab === "primary"
+      ? !transcriptAllSelected || search.length > 0
+      : !debugAllSelected || search.length > 0);
+
+  function clearFilters() {
+    if (tab === "primary") onKindsChange([...EVENT_KINDS]);
+    else onDebugCategoriesChange([]);
+    onSearchChange("");
+  }
+
+  return (
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-2 pb-3">
+      <EventsTabToggle tab={tab} renderer={renderer} onTabChange={onTabChange} />
+      {showFilters && (
+        <div className="flex flex-1 flex-wrap items-center gap-2">
+          {tab === "primary" ? (
+            <MultiSelectFilter<EventKind>
+              selected={selectedKinds}
+              options={EVENT_KINDS}
+              labelOf={(k) => EVENT_KIND_LABEL[k]}
+              onChange={onKindsChange}
+            />
+          ) : (
+            <MultiSelectFilter<DebugCategory>
+              selected={selectedDebugCategories}
+              options={availableDebugCategories}
+              labelOf={debugCategoryLabel}
+              onChange={onDebugCategoriesChange}
+              emptyMeansAll
+            />
+          )}
+          <EventSearchInput value={search} onChange={onSearchChange} />
+          {isFiltering && (
+            <button
+              type="button"
+              onClick={clearFilters}
+              className="rounded px-2 py-1 text-xs text-fg-muted transition-colors hover:bg-overlay hover:text-fg-2 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-teal-500"
+            >
+              Clear
+            </button>
+          )}
+        </div>
+      )}
+      {totalCount > 0 && (tab === "debug" || isFiltering) && (
+        <span className="text-xs tabular-nums text-fg-muted">
+          {isFiltering
+            ? `${filteredCount.toLocaleString()} of ${totalCount.toLocaleString()} events`
+            : `${totalCount.toLocaleString()} events`}
+        </span>
+      )}
+      {model && (
+        <span
+          className={`inline-flex items-center gap-1.5 text-xs text-fg-muted ${
+            showFilters ? "" : "ml-auto"
+          }`}
+          title="LLM model used for this stage"
+        >
+          <CpuChipIcon className="size-3.5" aria-hidden="true" />
+          <span className="font-mono">{model}</span>
+        </span>
+      )}
+      {tab === "primary" && renderer === "command" && commandTurn && (
+        <CommandStatus turn={commandTurn} />
+      )}
+    </div>
+  );
 }
 
 export default function RunStages() {
   const { id, stageId } = useParams();
+  const runQuery = useRun(id);
   const stagesQuery = useRunStages(id);
   const stages = useMemo(
     () => mapRunStagesToSidebarStages(stagesQuery.data),
@@ -605,16 +1261,125 @@ export default function RunStages() {
   );
 
   const selectedStage = stages.find((s: Stage) => s.id === stageId) ?? stages[0];
-  const turnsQuery = useRunStageTurns(id, selectedStage?.id);
-  const hasStageTurns = (turnsQuery.data?.data.length ?? 0) > 0;
-  const shouldLoadEventFallback =
-    !!selectedStage?.id && !turnsQuery.isLoading && !turnsQuery.error && !hasStageTurns;
-  const eventsQuery = useRunEventsList(id, shouldLoadEventFallback);
+  const selectedStageId = selectedStage?.id;
+  const runStart =
+    selectedStage?.startedAt ??
+    runQuery.data?.timestamps.started_at ??
+    runQuery.data?.timestamps.created_at;
+  const stageEventsQuery = useRunStageEvents(id, selectedStageId);
   const turns = useMemo(
-    () => mapTurns(turnsQuery.data, eventsQuery.data, selectedStage?.id),
-    [eventsQuery.data, selectedStage?.id, turnsQuery.data],
+    () =>
+      selectedStageId
+        ? eventsToActivity(stageEventsQuery.data ?? [], selectedStageId)
+        : [],
+    [stageEventsQuery.data, selectedStageId],
   );
-  const isRunning = selectedStage?.status === "running";
+  const renderer: StageRenderer = selectedStage
+    ? selectStageRenderer(selectedStage.handler)
+    : "summary";
+  // Some renderers need run-scoped events (e.g. conditional renders the
+  // engine-level edge.selected event, which has no stage_id). Only fetch when
+  // the active renderer actually needs it to keep this off the hot path.
+  const needsRunEvents = renderer === "conditional";
+  const runEventsQuery = useRunEventsList(needsRunEvents ? id : undefined);
+  const commandTurn = useMemo<CommandTurn | null>(() => {
+    for (let i = turns.length - 1; i >= 0; i -= 1) {
+      const t = turns[i];
+      if (t.kind === "command") return t;
+    }
+    return null;
+  }, [turns]);
+
+  const [panelSelection, setPanelSelection] = useState<PanelSelection | null>(null);
+  const [openDebugSeq, setOpenDebugSeq] = useState<number | null>(null);
+  useEffect(() => {
+    setPanelSelection(null);
+    setOpenDebugSeq(null);
+  }, [selectedStageId]);
+
+  const [tab, setTab] = useState<EventsTab>("primary");
+  const effectiveTab: EventsTab = tab;
+  const [selectedKinds, setSelectedKinds] = useState<EventKind[]>([
+    ...EVENT_KINDS,
+  ]);
+  const [selectedDebugCategories, setSelectedDebugCategories] = useState<DebugCategory[]>([]);
+  const [search, setSearch] = useState("");
+  const filteredTurns = useMemo<{ turn: TurnType; index: number }[]>(() => {
+    const kindSet = new Set(selectedKinds);
+    const needle = search.toLowerCase();
+    const out: { turn: TurnType; index: number }[] = [];
+    turns.forEach((turn, i) => {
+      if (!kindSet.has(turn.kind)) return;
+      if (needle && !searchableText(turn).toLowerCase().includes(needle)) return;
+      out.push({ turn, index: i });
+    });
+    return out;
+  }, [turns, selectedKinds, search]);
+  const displayItems = useMemo(
+    () => groupConsecutiveTools(filteredTurns),
+    [filteredTurns],
+  );
+  const threadDnaItems = useMemo(
+    () => buildThreadDnaItems(displayItems, runStart),
+    [displayItems, runStart],
+  );
+
+  const openTurn =
+    panelSelection?.kind === "single" ? turns[panelSelection.turnIndex] ?? null : null;
+  const openGroup = useMemo<Extract<DisplayItem, { kind: "group" }> | null>(() => {
+    if (panelSelection?.kind !== "group") return null;
+    const wanted = panelSelection.childTurnIndices;
+    for (const item of displayItems) {
+      if (item.kind !== "group") continue;
+      if (item.children.length !== wanted.length) continue;
+      const matches = item.children.every((c, i) => c.turnIndex === wanted[i]);
+      if (matches) return item;
+    }
+    return null;
+  }, [displayItems, panelSelection]);
+
+  const debugEvents = useMemo<EventEnvelope[]>(() => {
+    if (!selectedStageId) return [];
+    return (stageEventsQuery.data ?? []).filter(
+      (e) => activityEventStageId(e) === selectedStageId,
+    );
+  }, [stageEventsQuery.data, selectedStageId]);
+  const openDebugEvent = useMemo<EventEnvelope | null>(
+    () =>
+      openDebugSeq != null
+        ? debugEvents.find((e) => e.seq === openDebugSeq) ?? null
+        : null,
+    [debugEvents, openDebugSeq],
+  );
+  const availableDebugCategories = useMemo<DebugCategory[]>(() => {
+    const set = new Set<DebugCategory>();
+    for (const event of debugEvents) {
+      if (event.event) set.add(debugCategory(event.event));
+    }
+    return Array.from(set).sort();
+  }, [debugEvents]);
+  const stageModel = useMemo(
+    () =>
+      selectedStageId
+        ? extractStageModel(stageEventsQuery.data ?? [], selectedStageId)
+        : null,
+    [stageEventsQuery.data, selectedStageId],
+  );
+
+  const filteredDebugEvents = useMemo<EventEnvelope[]>(() => {
+    const useCategoryFilter = selectedDebugCategories.length > 0;
+    const cats = new Set(selectedDebugCategories);
+    const needle = search.toLowerCase();
+    return debugEvents.filter((event) => {
+      const name = event.event ?? "";
+      if (useCategoryFilter && !cats.has(debugCategory(name))) return false;
+      if (needle) {
+        const blob = `${name} ${JSON.stringify(event.properties ?? {})}`.toLowerCase();
+        if (!blob.includes(needle)) return false;
+      }
+      return true;
+    });
+  }, [debugEvents, selectedDebugCategories, search]);
 
   if (!id || !stages.length) {
     return (
@@ -627,38 +1392,173 @@ export default function RunStages() {
     );
   }
 
-  const selectedConfig = statusConfig[selectedStage.status];
-  const SelectedIcon = selectedConfig.icon;
-
   return (
-    <div className="flex gap-6">
-      <StageSidebar stages={stages} runId={id} selectedStageId={selectedStage.id} />
-
-      <div className="min-w-0 flex-1 space-y-3">
-        <div className="sticky top-0 z-10 -mx-2 flex items-center gap-2 bg-page/85 px-2 py-2 backdrop-blur">
-          <SelectedIcon className={`size-5 ${selectedConfig.color} ${isRunning ? "animate-spin" : ""}`} />
-          <h3 className="text-base font-semibold text-fg">{selectedStage.name}</h3>
-          <span className="font-mono text-xs tabular-nums text-fg-muted">
-            <RunningStageDuration
-              isRunning={isRunning}
-              duration={selectedStage.duration}
-            />
-          </span>
-        </div>
-
-        {turns.map((turn: TurnType, i: number) => {
-          switch (turn.kind) {
-            case "system":
-              return <SystemBlock key={`turn-${i}`} content={turn.content} />;
-            case "assistant":
-              return <AssistantBlock key={`turn-${i}`} content={turn.content} />;
-            case "tool":
-              return <ToolBlock key={`turn-${i}`} tools={turn.tools} />;
-            case "command":
-              return <CommandBlock key={`turn-${i}`} runId={id} turn={turn} />;
-          }
-        })}
+    <div className="-mr-4 -mt-6 flex min-h-0 flex-1 sm:-mr-6 lg:-mr-8">
+      <div className="shrink-0 pb-6 pr-3 pt-6">
+        <StageSidebar stages={stages} runId={id} selectedStageId={selectedStage.id} />
       </div>
+
+      <div className="relative w-px shrink-0">
+        <div
+          aria-hidden="true"
+          className="absolute inset-x-0 top-0 -bottom-6 bg-line"
+        />
+      </div>
+
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col pt-3">
+        <div className="shrink-0 border-b border-line">
+          <div className="pl-3 pr-3">
+            <EventsToolbar
+              tab={effectiveTab}
+              renderer={renderer}
+              commandTurn={commandTurn}
+              onTabChange={setTab}
+              selectedKinds={selectedKinds}
+              onKindsChange={setSelectedKinds}
+              selectedDebugCategories={selectedDebugCategories}
+              onDebugCategoriesChange={setSelectedDebugCategories}
+              availableDebugCategories={availableDebugCategories}
+              search={search}
+              onSearchChange={setSearch}
+              filteredCount={effectiveTab === "primary" ? filteredTurns.length : filteredDebugEvents.length}
+              totalCount={effectiveTab === "primary" ? turns.length : debugEvents.length}
+              model={stageModel}
+            />
+            {effectiveTab === "debug" && (
+              <div className="pb-3">
+                <DebugDnaStrip
+                  events={debugEvents}
+                  selectedSeq={openDebugSeq}
+                  onSelect={setOpenDebugSeq}
+                  runStart={runStart}
+                />
+              </div>
+            )}
+            {effectiveTab === "primary" && renderer === "agent" && (
+              <div className="pb-3">
+                <ThreadDnaStrip
+                  items={threadDnaItems}
+                  selection={panelSelection}
+                  onSelect={setPanelSelection}
+                />
+              </div>
+            )}
+          </div>
+        </div>
+        <div className="min-h-0 flex-1 overflow-y-auto pt-6 pb-[calc(1.5rem+var(--fabro-interview-dock-clearance,0px))]">
+          {effectiveTab === "primary" ? (
+            renderer === "agent" ? (
+              turns.length > 0 && filteredTurns.length === 0 ? (
+                <div className="px-2 py-6 text-sm text-fg-muted">
+                  No events match these filters.
+                </div>
+              ) : (
+                displayItems.map((item) => {
+                  if (item.kind === "single") {
+                    return (
+                      <EventRow
+                        key={`turn-${item.turnIndex}`}
+                        turn={item.turn}
+                        runStart={runStart}
+                        selected={
+                          panelSelection?.kind === "single" &&
+                          panelSelection.turnIndex === item.turnIndex
+                        }
+                        onSelect={() =>
+                          setPanelSelection({ kind: "single", turnIndex: item.turnIndex })
+                        }
+                      />
+                    );
+                  }
+                  const childIndices = item.children.map((c) => c.turnIndex);
+                  const groupKey = `group-${childIndices.join("-")}`;
+                  const isSelected =
+                    panelSelection?.kind === "group" &&
+                    panelSelection.childTurnIndices.length === childIndices.length &&
+                    panelSelection.childTurnIndices.every((v, i) => v === childIndices[i]);
+                  return (
+                    <ToolGroupRow
+                      key={groupKey}
+                      group={item}
+                      runStart={runStart}
+                      selected={isSelected}
+                      onSelect={() =>
+                        setPanelSelection({
+                          kind: "group",
+                          childTurnIndices: childIndices,
+                        })
+                      }
+                    />
+                  );
+                })
+              )
+            ) : renderer === "command" ? (
+              <CommandLogs runId={id} stageId={selectedStage.id} turn={commandTurn} />
+            ) : renderer === "human" ? (
+              <HumanQA stage={selectedStage} events={debugEvents} />
+            ) : renderer === "conditional" ? (
+              <ConditionalDecision
+                stage={selectedStage}
+                runEvents={runEventsQuery.data ?? []}
+                allStages={stages}
+                runId={id}
+              />
+            ) : renderer === "parallel" ? (
+              <ParallelChildren
+                stage={selectedStage}
+                events={debugEvents}
+                runId={id}
+                allStages={stages}
+              />
+            ) : renderer === "fan_in" ? (
+              <FanInResults
+                stage={selectedStage}
+                events={debugEvents}
+                notes={extractStageNotes(debugEvents)}
+              />
+            ) : renderer === "wait" ? (
+              <WaitStatus stage={selectedStage} />
+            ) : (
+              <StageSummary stage={selectedStage} events={debugEvents} />
+            )
+          ) : debugEvents.length > 0 && filteredDebugEvents.length === 0 ? (
+            <div className="px-2 py-6 text-sm text-fg-muted">
+              No events match these filters.
+            </div>
+          ) : (
+            filteredDebugEvents.map((event) => (
+              <DebugEventRow
+                key={`debug-${event.seq}`}
+                event={event}
+                runStart={runStart}
+                selected={openDebugSeq === event.seq}
+                onSelect={() => setOpenDebugSeq(event.seq)}
+              />
+            ))
+          )}
+        </div>
+      </div>
+
+      {effectiveTab === "primary" && renderer === "agent" ? (
+        panelSelection?.kind === "group" ? (
+          <ToolGroupDetailsPanel
+            group={openGroup}
+            runStart={runStart}
+            onClose={() => setPanelSelection(null)}
+          />
+        ) : (
+          <EventDetailsPanel
+            turn={openTurn}
+            runStart={runStart}
+            onClose={() => setPanelSelection(null)}
+          />
+        )
+      ) : effectiveTab === "debug" ? (
+        <DebugEventDetailsPanel
+          event={openDebugEvent}
+          onClose={() => setOpenDebugSeq(null)}
+        />
+      ) : null}
     </div>
   );
 }

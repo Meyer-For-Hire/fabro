@@ -16,6 +16,7 @@ mod pull_requests;
 mod runs;
 mod sandbox;
 mod secrets;
+mod steer;
 pub(in crate::server) mod system;
 
 pub(super) use system::{health, openapi_spec};
@@ -43,7 +44,7 @@ pub(super) fn demo_routes() -> Router<Arc<AppState>> {
         .route("/runs/{id}/blobs", post(not_implemented))
         .route("/runs/{id}/blobs/{blobId}", get(not_implemented))
         .route(
-            "/runs/{id}/stages/{stageId}/logs/{stream}",
+            "/runs/{id}/stages/{stageId}/logs/output",
             get(not_implemented),
         )
         .route("/runs/{id}/checkpoint", get(demo::checkpoint_stub))
@@ -56,9 +57,10 @@ pub(super) fn demo_routes() -> Router<Arc<AppState>> {
         .route("/runs/{id}/stages", get(demo::get_run_stages))
         .route("/runs/{id}/artifacts", get(demo::list_run_artifacts_stub))
         .route("/runs/{id}/files", get(demo::list_run_files_stub))
+        .route("/runs/{id}/commits", get(demo::list_run_commits_stub))
         .route(
-            "/runs/{id}/stages/{stageId}/turns",
-            get(demo::get_stage_turns),
+            "/runs/{id}/stages/{stageId}/events",
+            get(demo::get_stage_events),
         )
         .route(
             "/runs/{id}/stages/{stageId}/artifacts",
@@ -75,6 +77,10 @@ pub(super) fn demo_routes() -> Router<Arc<AppState>> {
         .route(
             "/runs/{id}/sandbox/files",
             get(demo::list_sandbox_files_stub),
+        )
+        .route(
+            "/runs/{id}/sandbox/services",
+            get(demo::list_sandbox_services_stub),
         )
         .route(
             "/runs/{id}/sandbox/file",
@@ -103,8 +109,12 @@ pub(super) fn demo_routes() -> Router<Arc<AppState>> {
         .route("/settings", get(demo::get_server_settings))
         .route("/system/info", get(demo::get_system_info))
         .route("/system/df", get(demo::get_system_disk_usage))
+        .route("/system/repair/runs", get(demo::get_system_repair_runs))
         .route("/system/prune/runs", post(demo::prune_runs))
         .route("/billing", get(demo::get_aggregate_billing))
+        .route("/workflows", get(demo::list_workflows))
+        .route("/workflows/{name}", get(demo::get_workflow))
+        .route("/workflows/{name}/runs", get(demo::list_workflow_runs))
         .merge(runs::manifest_routes())
         .merge(graph::manifest_routes())
         .merge(models::routes())
@@ -114,7 +124,6 @@ pub(super) fn demo_routes() -> Router<Arc<AppState>> {
 pub(super) fn real_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/runs/{id}/stages/{stageId}/turns", get(not_implemented))
-        .route("/runs/{id}/steer", post(not_implemented))
         .route("/workflows", get(not_implemented))
         .route("/workflows/{name}", get(not_implemented))
         .route("/workflows/{name}/runs", get(not_implemented))
@@ -137,6 +146,7 @@ pub(super) fn real_routes() -> Router<Arc<AppState>> {
         .merge(artifacts::routes())
         .merge(sandbox::routes())
         .merge(lifecycle::routes())
+        .merge(steer::routes())
         .merge(graph::manifest_routes())
         .merge(graph::run_routes())
         .merge(models::routes())

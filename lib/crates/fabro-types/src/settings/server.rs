@@ -5,7 +5,6 @@
 //! scheduler, logging, integrations). Same-host and split-host deployments
 //! use the same schema.
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration as StdDuration;
 
@@ -259,37 +258,24 @@ pub struct ServerLoggingSettings {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerIntegrationsSettings {
-    pub github:  GithubIntegrationSettings,
-    pub slack:   SlackIntegrationSettings,
-    pub discord: DiscordIntegrationSettings,
-    pub teams:   TeamsIntegrationSettings,
+    pub github: GithubIntegrationSettings,
+    pub slack:  SlackIntegrationSettings,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GithubIntegrationSettings {
-    pub enabled:     bool,
-    pub strategy:    GithubIntegrationStrategy,
-    pub app_id:      Option<InterpString>,
-    pub client_id:   Option<InterpString>,
-    pub slug:        Option<InterpString>,
-    pub permissions: HashMap<String, InterpString>,
-    pub webhooks:    Option<IntegrationWebhooksSettings>,
+    pub enabled:   bool,
+    pub strategy:  GithubIntegrationStrategy,
+    pub app_id:    Option<InterpString>,
+    pub client_id: Option<InterpString>,
+    pub slug:      Option<InterpString>,
+    pub webhooks:  Option<IntegrationWebhooksSettings>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlackIntegrationSettings {
     pub enabled:         bool,
     pub default_channel: Option<InterpString>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DiscordIntegrationSettings {
-    pub enabled: bool,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TeamsIntegrationSettings {
-    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

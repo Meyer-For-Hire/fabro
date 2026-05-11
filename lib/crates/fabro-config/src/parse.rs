@@ -140,9 +140,12 @@ fn rename_hint(key: &str) -> Option<String> {
         "artifact_storage" => "rename to `[server.artifacts]`",
         "storage_dir" | "data_dir" => "rename to `[server.storage] root`",
         "max_concurrent_runs" => "rename to `[server.scheduler]` field",
-        "fabro" => "rename to `[project]`; `fabro.root` becomes `project.directory`",
+        "fabro" => "rename to `[project]`; project workflows now live under `.fabro/workflows`",
         "git" => "split into `[run.git]` (local git behavior) and `[server.integrations.github]`",
-        "github" => "rename to `[server.integrations.github]`",
+        "github" => {
+            "split into `[server.integrations.github]` (App identity/auth) and \
+             `[run.integrations.github.permissions]` (sandbox token scopes)"
+        }
         "slack" => "move under `[server.integrations.slack]`",
         "log" => "rename to `[server.logging]` or `[cli.logging]` depending on owner",
         "prevent_idle_sleep" => "rename to `[cli.exec] prevent_idle_sleep`",
@@ -150,7 +153,6 @@ fn rename_hint(key: &str) -> Option<String> {
         "upgrade_check" => "rename to `[cli.updates] check`",
         "dry_run" => "rename to `[run.execution] mode = \"dry_run\"`",
         "auto_approve" => "rename to `[run.execution] approval = \"auto\"`",
-        "no_retro" => "rename to `[run.execution] retros = false`",
         _ => return None,
     };
     Some(target.to_owned())

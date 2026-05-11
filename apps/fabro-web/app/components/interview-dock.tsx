@@ -22,6 +22,7 @@ import {
   useSubmitInterviewAnswer,
   type SubmitInterviewAnswerArg,
 } from "../lib/mutations";
+import { ApiError } from "../lib/api-client";
 import { ErrorMessage } from "./ui";
 
 const PRIMARY_BUTTON =
@@ -32,6 +33,8 @@ const CHOICE_BUTTON =
 
 const CHOICE_BUTTON_SELECTED =
   "inline-flex items-center justify-center gap-1.5 rounded-lg bg-teal-500/15 px-3.5 py-2 text-sm font-medium text-fg outline-1 -outline-offset-1 outline-teal-500/60 transition-colors hover:bg-teal-500/20 focus-visible:outline-2 focus-visible:-outline-offset-1 focus-visible:outline-teal-500";
+
+type SubmitInterviewAnswer = SubmitInterviewAnswerArg["answer"];
 
 export interface InterviewDockProps {
   runId: string;
@@ -52,15 +55,13 @@ export function InterviewDock({ runId, questions }: InterviewDockProps) {
   }, [question?.id, submitMutation.reset]);
 
   const submit = useCallback(
-    async (arg: Omit<SubmitInterviewAnswerArg, "questionId">) => {
+    async (answer: SubmitInterviewAnswer) => {
       if (!question) return;
       setError(null);
       try {
-        await submitMutation.trigger({ ...arg, questionId: question.id });
+        await submitMutation.trigger({ questionId: question.id, answer });
       } catch (caught) {
-        setError(
-          caught instanceof Error ? caught.message : "Couldn't submit your answer.",
-        );
+        setError(interviewSubmitErrorMessage(caught));
       }
     },
     [question, submitMutation],
@@ -72,47 +73,37 @@ export function InterviewDock({ runId, questions }: InterviewDockProps) {
   const submitting = submitMutation.isMutating;
 
   return (
-    <div
-      role="region"
-      aria-label="Interview question"
-      className="pointer-events-none fixed inset-x-0 bottom-0 z-30"
-    >
-      <div className="bg-linear-to-t from-page via-page/80 to-transparent pt-10">
-        <div className="pointer-events-auto mx-auto max-w-5xl px-4 sm:px-6 lg:px-8">
-          <div className="overflow-hidden rounded-t-2xl bg-panel shadow-[0_-12px_40px_-8px_rgba(0,0,0,0.5)] ring-1 ring-line-strong">
-            <DockHeader
-              stage={question.stage}
-              moreCount={moreCount}
-              onCycle={() =>
-                setActiveIndex((index) => (index + 1) % questions.length)
-              }
-            />
-            <div className="space-y-5 p-5 sm:p-6">
-              <div>
-                <p className="text-pretty text-base/6 font-medium text-fg">
-                  {question.text}
-                </p>
-                <p className="mt-1 text-xs/5 text-fg-muted">
-                  {questionTypeLabel(question.question_type)}
-                </p>
-              </div>
-
-              {question.context_display && (
-                <ContextPanel text={question.context_display} />
-              )}
-
-              <QuestionBody
-                question={question}
-                submitting={submitting}
-                onSubmit={submit}
-              />
-
-              {error && <ErrorMessage message={error} />}
-            </div>
-          </div>
+    <section role="region" aria-label="Interview question">
+      <DockHeader
+        stage={question.stage}
+        moreCount={moreCount}
+        onCycle={() =>
+          setActiveIndex((index) => (index + 1) % questions.length)
+        }
+      />
+      <div className="space-y-5 px-5 py-4 sm:px-6">
+        <div>
+          <p className="text-pretty text-base/6 font-medium text-fg">
+            {question.text}
+          </p>
+          <p className="mt-1 text-xs/5 text-fg-muted">
+            {questionTypeLabel(question.question_type)}
+          </p>
         </div>
+
+        {question.context_display && (
+          <ContextPanel text={question.context_display} />
+        )}
+
+        <QuestionBody
+          question={question}
+          submitting={submitting}
+          onSubmit={submit}
+        />
+
+        {error && <ErrorMessage message={error} />}
       </div>
-    </div>
+    </section>
   );
 }
 
@@ -182,7 +173,7 @@ function QuestionBody({
 }: {
   question: ApiQuestion;
   submitting: boolean;
-  onSubmit: (arg: Omit<SubmitInterviewAnswerArg, "questionId">) => Promise<void>;
+  onSubmit: (answer: SubmitInterviewAnswer) => Promise<void>;
 }) {
   switch (question.question_type) {
     case QuestionType.YES_NO:
@@ -226,14 +217,14 @@ function YesNoBody({
   onSubmit,
 }: {
   submitting: boolean;
-  onSubmit: (arg: Omit<SubmitInterviewAnswerArg, "questionId">) => Promise<void>;
+  onSubmit: (answer: SubmitInterviewAnswer) => Promise<void>;
 }) {
   return (
     <div className="flex flex-wrap items-center gap-2">
       <button
         type="button"
         disabled={submitting}
-        onClick={() => void onSubmit({ value: "no" })}
+        onClick={() => void onSubmit({ kind: "no" })}
         className={CHOICE_BUTTON}
       >
         No
@@ -241,7 +232,7 @@ function YesNoBody({
       <button
         type="button"
         disabled={submitting}
-        onClick={() => void onSubmit({ value: "yes" })}
+        onClick={() => void onSubmit({ kind: "yes" })}
         className={PRIMARY_BUTTON}
       >
         {submitting ? <Spinner /> : <CheckIcon className="size-4" aria-hidden="true" />}
@@ -256,14 +247,14 @@ function ConfirmationBody({
   onSubmit,
 }: {
   submitting: boolean;
-  onSubmit: (arg: Omit<SubmitInterviewAnswerArg, "questionId">) => Promise<void>;
+  onSubmit: (answer: SubmitInterviewAnswer) => Promise<void>;
 }) {
   return (
     <div className="flex flex-wrap items-center gap-2">
       <button
         type="button"
         disabled={submitting}
-        onClick={() => void onSubmit({ value: "yes" })}
+        onClick={() => void onSubmit({ kind: "yes" })}
         className={PRIMARY_BUTTON}
       >
         {submitting ? <Spinner /> : <CheckIcon className="size-4" aria-hidden="true" />}
@@ -282,7 +273,7 @@ function ChoiceBody({
   options: ApiQuestionOption[];
   allowFreeform: boolean;
   submitting: boolean;
-  onSubmit: (arg: Omit<SubmitInterviewAnswerArg, "questionId">) => Promise<void>;
+  onSubmit: (answer: SubmitInterviewAnswer) => Promise<void>;
 }) {
   return (
     <div className="space-y-4">
@@ -293,7 +284,7 @@ function ChoiceBody({
               key={option.key}
               type="button"
               disabled={submitting}
-              onClick={() => void onSubmit({ selected_option_key: option.key })}
+              onClick={() => void onSubmit({ kind: "selected", option_key: option.key })}
               className={CHOICE_BUTTON}
             >
               {displayLabel(option.label)}
@@ -325,7 +316,7 @@ function MultiSelectBody({
 }: {
   options: ApiQuestionOption[];
   submitting: boolean;
-  onSubmit: (arg: Omit<SubmitInterviewAnswerArg, "questionId">) => Promise<void>;
+  onSubmit: (answer: SubmitInterviewAnswer) => Promise<void>;
 }) {
   const [selected, setSelected] = useState<Set<string>>(new Set());
 
@@ -367,7 +358,7 @@ function MultiSelectBody({
         <button
           type="button"
           disabled={submitting || selectedKeys.length === 0}
-          onClick={() => void onSubmit({ selected_option_keys: selectedKeys })}
+          onClick={() => void onSubmit({ kind: "multi_selected", option_keys: selectedKeys })}
           className={PRIMARY_BUTTON}
         >
           {submitting ? <Spinner /> : <CheckIcon className="size-4" aria-hidden="true" />}
@@ -387,7 +378,7 @@ function FreeformBody({
   divider = false,
 }: {
   submitting: boolean;
-  onSubmit: (arg: Omit<SubmitInterviewAnswerArg, "questionId">) => Promise<void>;
+  onSubmit: (answer: SubmitInterviewAnswer) => Promise<void>;
   placeholder: string;
   submitLabel: string;
   autoFocus?: boolean;
@@ -404,7 +395,7 @@ function FreeformBody({
     event.preventDefault();
     const trimmed = value.trim();
     if (!trimmed || submitting) return;
-    await onSubmit({ value: trimmed });
+    await onSubmit({ kind: "text", text: trimmed });
     setValue("");
   }
 
@@ -493,4 +484,13 @@ export function displayLabel(label: string): string {
     .replace(/^[A-Za-z0-9]+\s*-\s+/, "")
     .trim();
   return stripped || trimmed;
+}
+
+function interviewSubmitErrorMessage(error: unknown): string {
+  if (error instanceof ApiError) {
+    return error.requestId
+      ? `${error.message} Request ID: ${error.requestId}`
+      : error.message;
+  }
+  return error instanceof Error ? error.message : "Couldn't submit your answer.";
 }

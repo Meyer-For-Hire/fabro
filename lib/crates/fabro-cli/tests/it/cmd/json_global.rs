@@ -172,20 +172,20 @@ fn ps_supports_global_flag_and_env_var() {
 }
 
 #[test]
-fn logs_json_wins_over_pretty() {
+fn events_json_wins_over_pretty() {
     let context = test_context!();
     let run = setup_seeded_completed_dry_run(&context);
 
     let output = context
         .command()
-        .args(["--json", "logs", "--pretty", &run.run_id])
+        .args(["--json", "events", "--pretty", &run.run_id])
         .output()
         .expect("command should run");
 
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     let first_line = stdout.lines().find(|line| !line.is_empty()).unwrap();
-    let value: Value = serde_json::from_str(first_line).expect("logs output should remain JSONL");
+    let value: Value = serde_json::from_str(first_line).expect("events output should remain JSONL");
     assert!(value.get("event").is_some());
 }
 

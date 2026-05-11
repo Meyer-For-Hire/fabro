@@ -4,11 +4,9 @@
               std::io::BufReader; not on a Tokio path"
 )]
 
-use std::collections::HashMap;
 use std::io::{BufRead as StdBufRead, BufReader as StdBufReader};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -19,7 +17,7 @@ use fabro_interview::{
 };
 use fabro_store::{EventEnvelope, RunProjection, RunProjectionReducer};
 use fabro_types::settings::InterpString;
-use fabro_types::settings::run::RunMode;
+use fabro_types::settings::run::{RunMode, RunNamespace};
 use fabro_types::{
     ArtifactUpload, EventBody, FailureReason, Principal, RunBlobId, RunEvent, RunId,
     WorkflowSettings,
@@ -34,6 +32,7 @@ use fabro_workflow::runtime_store::{RunStoreBackend, RunStoreHandle};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{Mutex, RwLock as AsyncRwLock, mpsc};
 use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 
 use crate::args::RunWorkerMode;
 use crate::server_client;
@@ -76,20 +75,23 @@ pub(crate) async fn execute(
         .state()
         .await
         .with_context(|| format!("failed to load run state for {run_id}"))?;
-    let run_spec = run_state
-        .spec
-        .as_ref()
-        .ok_or_else(|| anyhow!("Run {run_id} has no run spec in store"))?;
+    let run_spec = &run_state.spec;
     let artifact_sink = Some(ArtifactSink::Uploader(build_artifact_uploader(
         run_id,
         client.clone_for_reuse(),
         worker_token.to_owned(),
     )));
     let interviewer = Arc::new(ControlInterviewer::new());
-    let cancel_token = Arc::new(AtomicBool::new(false));
-    spawn_worker_control_stream(Arc::clone(&interviewer), Arc::clone(&cancel_token))?;
+    let cancel_token = CancellationToken::new();
+    let emitter = Arc::new(Emitter::new(run_id));
+    let steering_hub = Arc::new(fabro_workflow::SteeringHub::new(Arc::clone(&emitter)));
+    spawn_worker_control_stream(
+        Arc::clone(&interviewer),
+        cancel_token.clone(),
+        Arc::clone(&steering_hub),
+    )?;
     let run_control = RunControlState::new();
-    install_signal_handlers(Arc::clone(&run_control), Arc::clone(&cancel_token))?;
+    install_signal_handlers(Arc::clone(&run_control), cancel_token.clone())?;
     let vault = load_worker_vault(storage_dir.as_deref())?;
     let github_app = {
         let vault_guard = match &vault {
@@ -100,9 +102,10 @@ pub(crate) async fn execute(
     };
     let services = StartServices {
         run_id,
-        cancel_token: Some(Arc::clone(&cancel_token)),
-        emitter: Arc::new(Emitter::new(run_id)),
+        cancel_token: cancel_token.clone(),
+        emitter,
         interviewer,
+        steering_hub,
         run_store: run_store.clone(),
         event_sink: RunEventSink::map(
             stamp_system_worker,
@@ -117,7 +120,12 @@ pub(crate) async fn execute(
         artifact_sink,
         run_control: Some(run_control),
         github_app,
-        github_permissions: HashMap::new(),
+        github_permissions: run_spec
+            .settings
+            .run
+            .integrations
+            .github
+            .resolve_permissions(process_env_var),
         vault,
         on_node: None,
         registry_override: None,
@@ -162,12 +170,14 @@ enum WorkerControlStreamEvent {
 )]
 fn spawn_worker_control_stream(
     interviewer: Arc<ControlInterviewer>,
-    cancel_token: Arc<AtomicBool>,
+    cancel_token: CancellationToken,
+    steering_hub: Arc<fabro_workflow::SteeringHub>,
 ) -> Result<()> {
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     tokio::spawn(handle_worker_control_stream_events(
         interviewer,
         cancel_token,
+        steering_hub,
         event_rx,
     ));
     std::thread::Builder::new()
@@ -205,13 +215,14 @@ fn read_worker_control_stream_blocking<R>(
 
 async fn handle_worker_control_stream_events(
     interviewer: Arc<ControlInterviewer>,
-    cancel_token: Arc<AtomicBool>,
+    cancel_token: CancellationToken,
+    steering_hub: Arc<fabro_workflow::SteeringHub>,
     mut event_rx: mpsc::UnboundedReceiver<WorkerControlStreamEvent>,
 ) {
     while let Some(event) = event_rx.recv().await {
         match event {
             WorkerControlStreamEvent::Line(line) => {
-                apply_worker_control_line(&interviewer, &cancel_token, &line).await;
+                apply_worker_control_line(&interviewer, &cancel_token, &steering_hub, &line).await;
             }
             WorkerControlStreamEvent::Eof => {
                 interviewer.interrupt_all().await;
@@ -225,7 +236,8 @@ async fn handle_worker_control_stream_events(
 
 async fn apply_worker_control_line(
     interviewer: &ControlInterviewer,
-    cancel_token: &AtomicBool,
+    cancel_token: &CancellationToken,
+    steering_hub: &fabro_workflow::SteeringHub,
     line: &str,
 ) {
     if line.trim().is_empty() {
@@ -243,8 +255,17 @@ async fn apply_worker_control_line(
                 .await;
         }
         WorkerControlMessage::RunCancel => {
-            cancel_token.store(true, Ordering::SeqCst);
+            cancel_token.cancel();
             interviewer.interrupt_all().await;
+        }
+        WorkerControlMessage::Steer { text, actor } => {
+            steering_hub.deliver_steer(text, Some(actor));
+        }
+        WorkerControlMessage::Interrupt { actor } => {
+            steering_hub.interrupt(Some(&actor));
+        }
+        WorkerControlMessage::InterruptThenSteer { text, actor } => {
+            steering_hub.interrupt_then_steer(&text, Some(&actor));
         }
     }
 }
@@ -517,30 +538,23 @@ fn maybe_build_github_credentials(
 ) -> Result<Option<fabro_github::GitHubCredentials>> {
     let resolved_run = &settings.run;
     let resolved_server = ServerSettingsBuilder::load_default().ok();
-    let required_github_credentials = (resolved_run.execution.mode != RunMode::DryRun
-        && clone_sandbox_requires_github_credentials(&resolved_run.sandbox.provider))
-        || resolved_server
-            .as_ref()
-            .is_some_and(|settings| !settings.server.integrations.github.permissions.is_empty());
-    let pull_request_enabled =
-        resolved_run.execution.mode != RunMode::DryRun && resolved_run.pull_request.is_some();
-    let strategy = resolved_server
-        .as_ref()
-        .map(|settings| settings.server.integrations.github.strategy)
+    let server_ns = resolved_server.as_ref().map(|s| &s.server);
+    let strategy = server_ns
+        .map(|server| server.integrations.github.strategy)
         .unwrap_or_default();
-    let app_id = resolved_server
-        .as_ref()
-        .and_then(|settings| settings.server.integrations.github.app_id.as_ref())
+    let app_id = server_ns
+        .and_then(|server| server.integrations.github.app_id.as_ref())
         .map(InterpString::as_source);
-    let app_slug = resolved_server
-        .as_ref()
-        .and_then(|settings| settings.server.integrations.github.slug.as_ref())
+    let app_slug = server_ns
+        .and_then(|server| server.integrations.github.slug.as_ref())
         .map(InterpString::as_source);
 
-    if required_github_credentials {
+    if requires_github_credentials(resolved_run) {
         return build_github_credentials(strategy, app_id.as_deref(), app_slug.as_deref(), vault);
     }
 
+    let pull_request_enabled =
+        resolved_run.execution.mode != RunMode::DryRun && resolved_run.pull_request.is_some();
     if pull_request_enabled {
         return Ok(build_github_credentials(
             strategy,
@@ -555,13 +569,33 @@ fn maybe_build_github_credentials(
     Ok(None)
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "CLI worker InterpString resolution facade for {{ env.* }} values."
+)]
+fn process_env_var(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
+/// Hard-gate for the CLI worker path: a run-level token is requested, or
+/// a clone-based sandbox in non-dry-run mode will need credentials to
+/// pull the repository. Pull-request-driven credential acquisition is
+/// handled separately by the caller as a soft fallback.
+fn requires_github_credentials(run: &RunNamespace) -> bool {
+    if run.integrations.github.is_token_requested() {
+        return true;
+    }
+    run.execution.mode != RunMode::DryRun
+        && clone_sandbox_requires_github_credentials(&run.sandbox.provider)
+}
+
 fn clone_sandbox_requires_github_credentials(provider: &str) -> bool {
     matches!(provider, "docker" | "daytona")
 }
 
 fn install_signal_handlers(
     run_control: Arc<RunControlState>,
-    cancel_token: Arc<AtomicBool>,
+    cancel_token: CancellationToken,
 ) -> Result<()> {
     #[cfg(unix)]
     {
@@ -581,17 +615,17 @@ fn install_signal_handlers(
         });
 
         let mut terminate = signal(SignalKind::terminate())?;
-        let terminate_cancel = Arc::clone(&cancel_token);
+        let terminate_cancel = cancel_token.clone();
         tokio::spawn(async move {
             while terminate.recv().await.is_some() {
-                terminate_cancel.store(true, Ordering::SeqCst);
+                terminate_cancel.cancel();
             }
         });
 
         let mut interrupt = signal(SignalKind::interrupt())?;
         tokio::spawn(async move {
             while interrupt.recv().await.is_some() {
-                cancel_token.store(true, Ordering::SeqCst);
+                cancel_token.cancel();
             }
         });
     }
@@ -606,7 +640,6 @@ fn install_signal_handlers(
 )]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
 
     use chrono::Utc;
     use fabro_auth::{AuthCredential, AuthDetails};
@@ -623,6 +656,7 @@ mod tests {
     };
     use fabro_vault::{SecretType, Vault};
     use fabro_workflow::event::RunEventSink;
+    use tokio_util::sync::CancellationToken;
 
     use super::{
         WorkerControlStreamEvent, WorkerTitlePhase, apply_worker_control_line,
@@ -631,6 +665,11 @@ mod tests {
         worker_title_phase_for_event,
     };
     use crate::args::RunWorkerMode;
+
+    fn test_steering_hub() -> Arc<fabro_workflow::SteeringHub> {
+        let emitter = Arc::new(fabro_workflow::event::Emitter::new(fixtures::RUN_1));
+        Arc::new(fabro_workflow::SteeringHub::new(emitter))
+    }
 
     #[test]
     fn clone_sandbox_credentials_are_required_for_clone_based_providers() {
@@ -731,6 +770,7 @@ mod tests {
                 total_usd_micros:     None,
                 final_git_commit_sha: None,
                 final_patch:          None,
+                diff_summary:         None,
                 billing:              None,
             })),
             Some(WorkerTitlePhase::Succeeded)
@@ -743,6 +783,7 @@ mod tests {
                 reason:         FailureReason::Cancelled,
                 git_commit_sha: None,
                 final_patch:    None,
+                diff_summary:   None,
             })),
             Some(WorkerTitlePhase::Cancelled)
         );
@@ -754,6 +795,7 @@ mod tests {
                 reason:         FailureReason::Terminated,
                 git_commit_sha: None,
                 final_patch:    None,
+                diff_summary:   None,
             })),
             Some(WorkerTitlePhase::Failed)
         );
@@ -823,44 +865,48 @@ mod tests {
     #[tokio::test]
     async fn worker_control_line_routes_answer_by_question_id() {
         let interviewer = Arc::new(ControlInterviewer::new());
-        let cancel_token = Arc::new(AtomicBool::new(false));
+        let cancel_token = CancellationToken::new();
         let mut question = Question::new("Approve?", QuestionType::YesNo);
         question.id = "q-1".to_string();
         let ask_interviewer = Arc::clone(&interviewer);
         let answer_task = tokio::spawn(async move { ask_interviewer.ask(question).await });
 
+        let hub = test_steering_hub();
         apply_worker_control_line(
             &interviewer,
             &cancel_token,
+            &hub,
             r#"{"v":1,"type":"interview.answer","qid":"q-1","answer":{"kind":"yes"},"actor":{"kind":"system","system_kind":"engine"}}"#,
         )
         .await;
 
         let answer = answer_task.await.unwrap().answer;
         assert_eq!(answer.value, AnswerValue::Yes);
-        assert!(!cancel_token.load(Ordering::SeqCst));
+        assert!(!cancel_token.is_cancelled());
     }
 
     #[tokio::test]
     async fn worker_control_line_cancel_sets_cancel_token_and_interrupts_pending_interviews() {
         let interviewer = Arc::new(ControlInterviewer::new());
-        let cancel_token = Arc::new(AtomicBool::new(false));
+        let cancel_token = CancellationToken::new();
         let mut question = Question::new("Approve?", QuestionType::YesNo);
         question.id = "q-1".to_string();
         let ask_interviewer = Arc::clone(&interviewer);
         let answer_task = tokio::spawn(async move { ask_interviewer.ask(question).await });
         tokio::task::yield_now().await;
 
+        let hub = test_steering_hub();
         apply_worker_control_line(
             &interviewer,
             &cancel_token,
+            &hub,
             r#"{"v":1,"type":"run.cancel"}"#,
         )
         .await;
 
         let answer = answer_task.await.unwrap().answer;
         assert_eq!(answer.value, AnswerValue::Interrupted);
-        assert!(cancel_token.load(Ordering::SeqCst));
+        assert!(cancel_token.is_cancelled());
     }
 
     #[tokio::test]
@@ -893,7 +939,7 @@ mod tests {
     #[tokio::test]
     async fn worker_control_event_loop_eof_interrupts_pending_interviews() {
         let interviewer = Arc::new(ControlInterviewer::new());
-        let cancel_token = Arc::new(AtomicBool::new(false));
+        let cancel_token = CancellationToken::new();
         let mut question = Question::new("Approve?", QuestionType::YesNo);
         question.id = "q-1".to_string();
         let ask_interviewer = Arc::clone(&interviewer);
@@ -903,16 +949,18 @@ mod tests {
         event_tx.send(WorkerControlStreamEvent::Eof).unwrap();
         drop(event_tx);
 
+        let hub = test_steering_hub();
         handle_worker_control_stream_events(
             Arc::clone(&interviewer),
-            Arc::clone(&cancel_token),
+            cancel_token.clone(),
+            hub,
             event_rx,
         )
         .await;
 
         let answer = answer_task.await.unwrap().answer;
         assert_eq!(answer.value, AnswerValue::Interrupted);
-        assert!(!cancel_token.load(Ordering::SeqCst));
+        assert!(!cancel_token.is_cancelled());
     }
 
     #[tokio::test]
@@ -940,5 +988,68 @@ mod tests {
         let credential = guard.get("anthropic").unwrap();
 
         assert!(credential.contains("vault-key"));
+    }
+
+    mod requires_github_credentials_truth_table {
+        //! Truth-table coverage for the worker-side credential gate.
+        //! `InterpString` → `String` resolution is tested in `fabro-types`
+        //! next to `RunIntegrationsGithubSettings::resolve_permissions`.
+
+        use std::collections::HashMap;
+
+        use fabro_types::settings::InterpString;
+        use fabro_types::settings::run::{
+            RunIntegrationsGithubSettings, RunIntegrationsSettings, RunMode, RunNamespace,
+            RunSandboxSettings,
+        };
+
+        use super::super::requires_github_credentials;
+
+        fn run_with(
+            permissions: HashMap<String, InterpString>,
+            provider: &str,
+            mode: RunMode,
+        ) -> RunNamespace {
+            let mut run = RunNamespace::default();
+            run.execution.mode = mode;
+            run.sandbox = RunSandboxSettings {
+                provider: provider.to_string(),
+                ..RunSandboxSettings::default()
+            };
+            run.integrations = RunIntegrationsSettings {
+                github: RunIntegrationsGithubSettings { permissions },
+            };
+            run
+        }
+
+        #[test]
+        fn requires_github_credentials_when_permissions_non_empty() {
+            let permissions = HashMap::from([("issues".to_string(), InterpString::parse("read"))]);
+            // Even with local sandbox + dry-run, non-empty permissions
+            // force credential acquisition.
+            let run = run_with(permissions, "local", RunMode::DryRun);
+            assert!(requires_github_credentials(&run));
+        }
+
+        #[test]
+        fn requires_github_credentials_for_clone_based_provider() {
+            let run = run_with(HashMap::new(), "docker", RunMode::Normal);
+            assert!(requires_github_credentials(&run));
+
+            let daytona = run_with(HashMap::new(), "daytona", RunMode::Normal);
+            assert!(requires_github_credentials(&daytona));
+        }
+
+        #[test]
+        fn does_not_require_github_credentials_for_local_clean_run() {
+            let run = run_with(HashMap::new(), "local", RunMode::Normal);
+            assert!(!requires_github_credentials(&run));
+        }
+
+        #[test]
+        fn does_not_require_github_credentials_for_clone_provider_in_dry_run() {
+            let run = run_with(HashMap::new(), "docker", RunMode::DryRun);
+            assert!(!requires_github_credentials(&run));
+        }
     }
 }

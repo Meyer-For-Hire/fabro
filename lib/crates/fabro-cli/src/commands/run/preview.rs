@@ -9,7 +9,7 @@ pub(crate) async fn run(args: PreviewArgs, base_ctx: &CommandContext) -> Result<
     let ctx = base_ctx.with_target(&args.server)?;
     let printer = ctx.printer();
     let client = ctx.server().await?;
-    let run_id = client.resolve_run(&args.run).await?.run_id;
+    let run_id = client.resolve_run(&args.run).await?.id;
     let expires_in_secs =
         u64::try_from(args.ttl).map_err(|_| anyhow::anyhow!("--ttl must be positive"))?;
     let response = client

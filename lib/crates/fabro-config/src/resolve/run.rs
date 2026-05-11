@@ -1,12 +1,12 @@
 use fabro_types::settings::InterpString;
 use fabro_types::settings::run::{
     ArtifactsSettings, DaytonaSettings, DaytonaSnapshotSettings, DockerSettings, DockerfileSource,
-    GitAuthorSettings, HookDefinition, HookType, InterviewProviderSettings, LocalSandboxSettings,
-    McpServerSettings, McpTransport, MergeStrategy, NotificationProviderSettings,
-    NotificationRouteSettings, PullRequestSettings, RunAgentSettings, RunCheckpointSettings,
-    RunExecutionSettings, RunGitSettings, RunGoal, RunInterviewsSettings, RunModelControls,
-    RunModelSettings, RunNamespace, RunPrepareSettings, RunSandboxSettings, RunScmSettings,
-    ScmGitHubSettings, TlsMode,
+    GitAuthorSettings, HookDefinition, HookType, InterviewProviderSettings, McpServerSettings,
+    McpTransport, MergeStrategy, NotificationProviderSettings, NotificationRouteSettings,
+    PullRequestSettings, RunAgentSettings, RunCheckpointSettings, RunExecutionSettings,
+    RunGitSettings, RunGoal, RunIntegrationsGithubSettings, RunIntegrationsSettings,
+    RunInterviewsSettings, RunModelControls, RunModelSettings, RunNamespace, RunPrepareSettings,
+    RunSandboxSettings, RunScmSettings, ScmGitHubSettings, TlsMode,
 };
 
 use super::ResolveError;
@@ -14,8 +14,9 @@ use crate::{
     DaytonaDockerfileLayer, DaytonaSandboxLayer, HookAgentMarker, HookEntry, HookTlsMode,
     InterviewProviderLayer, InterviewsLayer, McpEntryLayer, ModelRefOrSplice,
     NotificationProviderLayer, NotificationRouteLayer, RunAgentLayer, RunArtifactsLayer,
-    RunCheckpointLayer, RunExecutionLayer, RunGitLayer, RunGoalLayer, RunLayer, RunModelLayer,
-    RunPrepareLayer, RunPullRequestLayer, RunSandboxLayer, RunScmLayer, StringOrSplice,
+    RunCheckpointLayer, RunExecutionLayer, RunGitLayer, RunGoalLayer, RunIntegrationsLayer,
+    RunLayer, RunModelLayer, RunPrepareLayer, RunPullRequestLayer, RunSandboxLayer, RunScmLayer,
+    StringOrSplice,
 };
 
 pub fn resolve_run(layer: &RunLayer, errors: &mut Vec<ResolveError>) -> RunNamespace {
@@ -46,7 +47,21 @@ pub fn resolve_run(layer: &RunLayer, errors: &mut Vec<ResolveError>) -> RunNames
         scm:           resolve_scm(layer.scm.as_ref()),
         pull_request:  resolve_pull_request(layer.pull_request.as_ref()),
         artifacts:     resolve_artifacts(layer.artifacts.as_ref()),
+        integrations:  resolve_integrations(layer.integrations.as_ref()),
     }
+}
+
+fn resolve_integrations(layer: Option<&RunIntegrationsLayer>) -> RunIntegrationsSettings {
+    let github = layer
+        .and_then(|integrations| integrations.github.as_ref())
+        .map(|github| RunIntegrationsGithubSettings {
+            // Collapse `Option<HashMap<...>>` -> `HashMap<...>`: both `None`
+            // and `Some({})` resolve to an empty map (no token requested).
+            // The presence distinction is only meaningful at merge time.
+            permissions: github.permissions.clone().unwrap_or_default(),
+        })
+        .unwrap_or_default();
+    RunIntegrationsSettings { github }
 }
 
 fn resolve_goal(goal: Option<&RunGoalLayer>) -> Option<RunGoal> {
@@ -135,9 +150,6 @@ fn resolve_execution(execution: Option<&RunExecutionLayer>) -> RunExecutionSetti
         approval: execution
             .approval
             .expect("defaults.toml should provide run.execution.approval"),
-        retros:   execution
-            .retros
-            .expect("defaults.toml should provide run.execution.retros"),
     }
 }
 
@@ -172,26 +184,15 @@ fn resolve_sandbox(
         preserve: sandbox
             .preserve
             .expect("defaults.toml should provide run.sandbox.preserve"),
+        stop_on_terminal: sandbox
+            .stop_on_terminal
+            .expect("defaults.toml should provide run.sandbox.stop_on_terminal"),
         devcontainer: sandbox
             .devcontainer
             .expect("defaults.toml should provide run.sandbox.devcontainer"),
         env: sandbox.env.clone().into_inner(),
-        local: resolve_local_sandbox(sandbox),
         docker: sandbox.docker.as_ref().map(resolve_docker),
         daytona: sandbox.daytona.as_ref().map(resolve_daytona),
-    }
-}
-
-fn resolve_local_sandbox(sandbox: &RunSandboxLayer) -> LocalSandboxSettings {
-    let local = sandbox
-        .local
-        .as_ref()
-        .expect("defaults.toml should provide run.sandbox.local");
-
-    LocalSandboxSettings {
-        worktree_mode: local
-            .worktree_mode
-            .expect("defaults.toml should provide run.sandbox.local.worktree_mode"),
     }
 }
 
@@ -249,8 +250,6 @@ fn resolve_notification_route(route: &NotificationRouteLayer) -> NotificationRou
             })
             .collect(),
         slack:    route.slack.as_ref().map(resolve_notification_provider),
-        discord:  route.discord.as_ref().map(resolve_notification_provider),
-        teams:    route.teams.as_ref().map(resolve_notification_provider),
     }
 }
 
@@ -270,8 +269,6 @@ fn resolve_interviews(interviews: Option<&InterviewsLayer>) -> RunInterviewsSett
     RunInterviewsSettings {
         provider: interviews.provider.clone(),
         slack:    interviews.slack.as_ref().map(resolve_interview_provider),
-        discord:  interviews.discord.as_ref().map(resolve_interview_provider),
-        teams:    interviews.teams.as_ref().map(resolve_interview_provider),
     }
 }
 

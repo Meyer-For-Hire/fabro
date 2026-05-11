@@ -122,7 +122,7 @@ async fn resolve_client_and_run_id(
 ) -> Result<(Client, fabro_types::RunId)> {
     let ctx = base_ctx.with_target(server)?;
     let client = ctx.server().await?;
-    let run_id = client.resolve_run(run_prefix).await?.run_id;
+    let run_id = client.resolve_run(run_prefix).await?.id;
     Ok((client.clone_for_reuse(), run_id))
 }
 

@@ -44,7 +44,7 @@ fn sandbox_ssh_rejects_non_daytona_run() {
     exit_code: 1
     ----- stdout -----
     ----- stderr -----
-      × Sandbox provider does not support this capability.
+      × Sandbox provider does not support access commands.
     ");
 }
 

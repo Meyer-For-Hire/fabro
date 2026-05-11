@@ -7,11 +7,21 @@ use fabro_llm::types::ToolDefinition;
 use tokio_util::sync::CancellationToken;
 
 use crate::sandbox::Sandbox;
+use crate::session::ToolEnvProvider;
 
 pub struct ToolContext {
-    pub env:      Arc<dyn Sandbox>,
-    pub cancel:   CancellationToken,
-    pub tool_env: Option<HashMap<String, String>>,
+    pub env:               Arc<dyn Sandbox>,
+    pub cancel:            CancellationToken,
+    pub tool_env_provider: Option<Arc<dyn ToolEnvProvider>>,
+}
+
+impl ToolContext {
+    pub async fn resolve_tool_env(&self) -> anyhow::Result<Option<HashMap<String, String>>> {
+        match &self.tool_env_provider {
+            Some(provider) => Ok(Some(provider.resolve().await?)),
+            None => Ok(None),
+        }
+    }
 }
 
 pub type ToolExecutor = Arc<
@@ -179,7 +189,7 @@ mod tests {
         let ctx = ToolContext {
             env,
             cancel: CancellationToken::new(),
-            tool_env: None,
+            tool_env_provider: None,
         };
         let result = (tool.executor)(serde_json::json!({}), ctx).await;
         assert_eq!(result.unwrap(), "ok");

@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::clone_source::{self, CloneDecision, EmptyWorkspaceReason};
 use crate::redact::redact_auth_url;
-use crate::sandbox::resolve_path;
+use crate::sandbox::{optional_timeout, resolve_path};
 use crate::{
     CommandOutputCallback, DirEntry, ExecResult, ExecStreamingResult, GrepOptions, Sandbox,
     SandboxEvent, SandboxEventCallback, format_lines_numbered, shell_quote,
@@ -37,6 +37,9 @@ const DEFAULT_SNAPSHOT: &str = "daytona-medium";
 pub const DEFAULT_DAYTONA_API_URL: &str = "https://app.daytona.io/api";
 const FABRO_SANDBOX_USER_AGENT: &str = concat!("fabro-sandbox/", env!("CARGO_PKG_VERSION"));
 const DAYTONA_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Upper bound on `DaytonaSession::close` so a stalled Daytona REST call cannot
+/// block cancellation/timeout paths from returning.
+const DAYTONA_SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Permissions a Daytona API key needs for Fabro's snapshot and sandbox flow.
 pub const REQUIRED_DAYTONA_PERMISSIONS: &[Permissions] = &[
@@ -397,6 +400,16 @@ impl DaytonaSandbox {
         })
     }
 
+    /// Read-only access to the SDK sandbox once initialized. Returns `None`
+    /// before `initialize()` or `reconnect()` has populated the cell.
+    pub fn sandbox_handle(&self) -> Option<&daytona_sdk::Sandbox> {
+        self.sandbox.get()
+    }
+
+    pub(crate) fn daytona_id(&self) -> crate::Result<&str> {
+        Ok(&self.sandbox()?.id)
+    }
+
     fn repo_cloned(&self) -> bool {
         self.repo_cloned.get().copied().unwrap_or(false)
     }
@@ -422,7 +435,8 @@ impl DaytonaSandbox {
             name: Some(name),
             auto_stop_interval: self.config.auto_stop_interval,
             labels: self.config.labels.clone(),
-            ephemeral: Some(true),
+            auto_delete_interval: Some(-1),
+            ephemeral: Some(false),
             network_block_all,
             network_allow_list,
             ..Default::default()
@@ -899,16 +913,62 @@ impl Sandbox for DaytonaSandbox {
         Ok(())
     }
 
-    async fn cleanup(&self) -> crate::Result<()> {
-        self.emit(SandboxEvent::CleanupStarted {
+    async fn start(&self) -> crate::Result<()> {
+        self.emit(SandboxEvent::StartStarted {
+            provider: "daytona".into(),
+        });
+        let start = Instant::now();
+        let sandbox = self.sandbox()?;
+        if let Err(e) = self.client.start(&sandbox.name).await {
+            let err = crate::Error::context("Failed to start Daytona sandbox", e);
+            self.emit(SandboxEvent::StartFailed {
+                provider: "daytona".into(),
+                error:    err.to_string(),
+                causes:   err.causes(),
+            });
+            return Err(err);
+        }
+        let duration_ms = elapsed_ms(start);
+        self.emit(SandboxEvent::StartCompleted {
+            provider: "daytona".into(),
+            duration_ms,
+        });
+        Ok(())
+    }
+
+    async fn stop(&self) -> crate::Result<()> {
+        self.emit(SandboxEvent::StopStarted {
+            provider: "daytona".into(),
+        });
+        let start = Instant::now();
+        let sandbox = self.sandbox()?;
+        if let Err(e) = self.client.stop(&sandbox.name).await {
+            let err = crate::Error::context("Failed to stop Daytona sandbox", e);
+            self.emit(SandboxEvent::StopFailed {
+                provider: "daytona".into(),
+                error:    err.to_string(),
+                causes:   err.causes(),
+            });
+            return Err(err);
+        }
+        let duration_ms = elapsed_ms(start);
+        self.emit(SandboxEvent::StopCompleted {
+            provider: "daytona".into(),
+            duration_ms,
+        });
+        Ok(())
+    }
+
+    async fn delete(&self) -> crate::Result<()> {
+        self.emit(SandboxEvent::DeleteStarted {
             provider: "daytona".into(),
         });
         let start = Instant::now();
         if let Some(sandbox) = self.sandbox.get() {
-            tracing::info!("Destroying Daytona sandbox");
+            tracing::info!("Deleting Daytona sandbox");
             if let Err(e) = sandbox.delete().await {
                 let err = crate::Error::context("Failed to delete Daytona sandbox", e);
-                self.emit(SandboxEvent::CleanupFailed {
+                self.emit(SandboxEvent::DeleteFailed {
                     provider: "daytona".into(),
                     error:    err.to_string(),
                     causes:   err.causes(),
@@ -916,12 +976,16 @@ impl Sandbox for DaytonaSandbox {
                 return Err(err);
             }
         }
-        let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-        self.emit(SandboxEvent::CleanupCompleted {
+        let duration_ms = elapsed_ms(start);
+        self.emit(SandboxEvent::DeleteCompleted {
             provider: "daytona".into(),
             duration_ms,
         });
         Ok(())
+    }
+
+    async fn cleanup(&self) -> crate::Result<()> {
+        self.delete().await
     }
 
     fn working_directory(&self) -> &str {
@@ -1307,7 +1371,7 @@ impl Sandbox for DaytonaSandbox {
     async fn exec_command_streaming(
         &self,
         command: &str,
-        timeout_ms: u64,
+        timeout_ms: Option<u64>,
         working_dir: Option<&str>,
         env_vars: Option<&HashMap<String, String>>,
         cancel_token: Option<CancellationToken>,
@@ -1397,7 +1461,7 @@ impl Sandbox for DaytonaSandbox {
             &session,
             &command_id,
             session_exec.exit_code,
-            Duration::from_millis(timeout_ms),
+            timeout_ms,
             cancel_token.unwrap_or_default(),
             &mut stream_task,
         )
@@ -1673,19 +1737,39 @@ impl DaytonaSession {
     }
 
     /// Idempotent: a second call after `active=false` is a no-op.
+    ///
+    /// `delete_session` is bounded by [`DAYTONA_SESSION_CLOSE_TIMEOUT`] so a
+    /// stalled Daytona REST call cannot block cancellation paths indefinitely.
     async fn close(&mut self, reason: &'static str) {
         if !self.active {
             return;
         }
         self.active = false;
         if let Some(svc) = self.process_svc.take() {
-            if let Err(err) = svc.delete_session(&self.session_id).await {
-                tracing::warn!(
-                    error = %err,
-                    session_id = %self.session_id,
-                    reason,
-                    "failed to delete Daytona session"
-                );
+            match time::timeout(
+                DAYTONA_SESSION_CLOSE_TIMEOUT,
+                svc.delete_session(&self.session_id),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    tracing::warn!(
+                        error = %err,
+                        session_id = %self.session_id,
+                        reason,
+                        "failed to delete Daytona session"
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        session_id = %self.session_id,
+                        reason,
+                        timeout_ms = u64::try_from(DAYTONA_SESSION_CLOSE_TIMEOUT.as_millis())
+                            .unwrap_or(u64::MAX),
+                        "timed out deleting Daytona session"
+                    );
+                }
             }
         }
     }
@@ -1730,7 +1814,7 @@ async fn wait_for_completion(
     session: &DaytonaSession,
     command_id: &str,
     initial_exit_code: Option<i32>,
-    timeout: Duration,
+    timeout_ms: Option<u64>,
     cancel_token: CancellationToken,
     stream_task: &mut JoinHandle<Result<(), DaytonaError>>,
 ) -> crate::Result<WaitOutcome> {
@@ -1742,8 +1826,8 @@ async fn wait_for_completion(
         });
     }
 
-    let timeout_sleep = time::sleep(timeout);
-    tokio::pin!(timeout_sleep);
+    let timeout_future = optional_timeout(timeout_ms);
+    tokio::pin!(timeout_future);
     loop {
         tokio::select! {
             () = time::sleep(Duration::from_millis(250)) => {
@@ -1765,7 +1849,7 @@ async fn wait_for_completion(
                     });
                 }
             }
-            () = &mut timeout_sleep => {
+            () = &mut timeout_future => {
                 return Ok(WaitOutcome {
                     exit_code:   None,
                     termination: CommandTermination::TimedOut,
@@ -1944,6 +2028,25 @@ mod tests {
         assert!(config.snapshot.is_none());
         assert!(config.auto_stop_interval.is_none());
         assert!(config.labels.is_none());
+    }
+
+    #[tokio::test]
+    async fn base_params_create_run_owned_non_ephemeral_sandbox() {
+        let sandbox = DaytonaSandbox::new(
+            DaytonaConfig::default(),
+            None,
+            None,
+            None,
+            None,
+            Some("dtn_test".to_string()),
+        )
+        .await
+        .expect("sandbox config should be valid");
+
+        let params = sandbox.base_params();
+
+        assert_eq!(params.ephemeral, Some(false));
+        assert_eq!(params.auto_delete_interval, Some(-1));
     }
 
     #[test]

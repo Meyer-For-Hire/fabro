@@ -17,7 +17,7 @@ use crate::handler::HandlerRegistry;
 use crate::outcome::Outcome;
 use crate::pipeline;
 use crate::pipeline::types::{Executed, Initialized};
-use crate::pipeline::{billing_from_checkpoint, build_terminal_event};
+use crate::pipeline::{billing_from_projection, build_terminal_event};
 use crate::records::Checkpoint;
 use crate::run_metadata::RunMetadataRuntime;
 use crate::run_options::RunOptions;
@@ -36,14 +36,12 @@ async fn execute_and_emit_terminal(initialized: InitializedState) -> Executed {
     let executed = Box::pin(pipeline::execute(initialized.initialized)).await;
     initialized.store_logger.flush().await;
     let state = executed.engine.run.run_store.state().await.ok();
-    let billing = state
-        .as_ref()
-        .and_then(|s| s.checkpoint.as_ref())
-        .and_then(billing_from_checkpoint);
+    let billing = state.as_ref().and_then(billing_from_projection);
     let event = build_terminal_event(
         &executed.outcome,
         executed.duration_ms,
         0,
+        None,
         None,
         None,
         billing,
@@ -109,6 +107,7 @@ async fn initialized(
     let run_store = inner_store;
     append_event(&run_store, &run_options.run_id, &Event::RunCreated {
         run_id:           run_options.run_id,
+        title:            None,
         settings:         serde_json::to_value(&run_options.settings)
             .expect("failed to serialize settings"),
         graph:            serde_json::to_value(graph).expect("failed to serialize graph"),
@@ -127,11 +126,13 @@ async fn initialized(
         manifest_blob:    None,
         git:              run_options.pre_run_git.clone(),
         fork_source_ref:  run_options.fork_source_ref.clone(),
-        in_place:         false,
         web_url:          None,
     })
     .await
     .expect("failed to seed run.created event in run store");
+    append_event(&run_store, &run_options.run_id, &Event::RunStarting)
+        .await
+        .expect("failed to seed run.starting event in run store");
     let emitter = bound_emitter(run_options.run_id, &emitter);
     let store_logger = StoreProgressLogger::new(run_store.clone());
     store_logger.register(emitter.as_ref());
@@ -169,7 +170,8 @@ async fn initialized(
                 ),
                 registry:        Arc::new(registry),
                 git_state:       std::sync::RwLock::new(None),
-                env:             options.env,
+                base_env:        options.env,
+                github_token:    None,
                 inputs:          run_options.settings.run.inputs.clone(),
                 dry_run:         run_options.dry_run_enabled(),
                 workflow_path:   None,

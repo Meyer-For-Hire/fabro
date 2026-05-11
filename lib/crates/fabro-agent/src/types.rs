@@ -2,6 +2,7 @@ use std::time::SystemTime;
 
 use fabro_llm::Error as LlmError;
 use fabro_llm::types::{ContentPart, ThinkingData, TokenCounts, ToolCall, ToolResult};
+use fabro_model::ModelRef;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
@@ -117,7 +118,7 @@ pub enum AgentEvent {
     },
     AssistantMessage {
         text:            String,
-        model:           String,
+        model:           ModelRef,
         usage:           TokenCounts,
         tool_call_count: usize,
     },
@@ -157,7 +158,12 @@ pub enum AgentEvent {
         skill_name: String,
     },
     SteeringInjected {
-        text: String,
+        text:  String,
+        /// Principal that authored the steer. Lifted to top-level
+        /// `RunEvent.actor` by the workflow event-conversion layer; never
+        /// serialized into event props.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<fabro_types::Principal>,
     },
     CompactionStarted {
         estimated_tokens:    usize,
@@ -252,7 +258,8 @@ impl AgentEvent {
             } => {
                 info!(
                     session_id,
-                    model,
+                    provider = %model.provider,
+                    model = model.model_id.as_str(),
                     input_tokens = usage.input_tokens,
                     output_tokens = usage.output_tokens,
                     tool_call_count,
@@ -309,7 +316,7 @@ impl AgentEvent {
             Self::SkillExpanded { skill_name } => {
                 debug!(session_id, skill = skill_name.as_str(), "Skill expanded");
             }
-            Self::SteeringInjected { text } => {
+            Self::SteeringInjected { text, .. } => {
                 debug!(session_id, text_len = text.len(), "Steering injected");
             }
             Self::CompactionStarted {
@@ -422,6 +429,8 @@ pub struct SessionEvent {
 
 #[cfg(test)]
 mod tests {
+    use fabro_model::Provider;
+
     use super::*;
 
     #[test]
@@ -661,7 +670,11 @@ mod tests {
         };
         let event = AgentEvent::AssistantMessage {
             text:            "Hello".into(),
-            model:           "test-model".into(),
+            model:           ModelRef {
+                provider: Provider::OpenAi,
+                model_id: "test-model".into(),
+                speed:    None,
+            },
             usage:           usage.clone(),
             tool_call_count: 2,
         };

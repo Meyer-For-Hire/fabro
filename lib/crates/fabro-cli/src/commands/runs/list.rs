@@ -46,7 +46,6 @@ pub(crate) async fn list_command(
                     "total_usd_micros": run.total_usd_micros(),
                     "source_directory": run.source_directory(),
                     "repo_origin_url": run.repo_origin_url(),
-                    "in_place": run.in_place(),
                     "goal": run.goal(),
                 })
             })
@@ -83,7 +82,6 @@ pub(crate) async fn list_command(
         "RUN ID".cell().bold(use_color),
         "WORKFLOW".cell().bold(use_color),
         "STATUS".cell().bold(use_color),
-        "IN-PLACE".cell().bold(use_color),
         "DIRECTORY".cell().bold(use_color),
         "DURATION".cell().bold(use_color),
         "GOAL".cell().bold(use_color),
@@ -113,7 +111,6 @@ pub(crate) async fn list_command(
                     .foreground_color(color_if(use_color, Color::Ansi256(8))),
                 run.workflow_name().cell(),
                 status_cell(run.status(), use_color),
-                in_place_cell(run.in_place(), use_color),
                 dir_display.cell(),
                 duration_display.cell(),
                 truncate_goal(&run.goal(), 50)
@@ -140,23 +137,13 @@ pub(crate) async fn list_command(
     Ok(())
 }
 
-fn in_place_cell(in_place: bool, use_color: bool) -> CellStruct {
-    if in_place {
-        return "yes"
-            .cell()
-            .foreground_color(color_if(use_color, Color::Yellow));
-    }
-    "no".cell()
-        .foreground_color(color_if(use_color, Color::Ansi256(8)))
-}
-
 fn status_cell(status: RunStatus, use_color: bool) -> CellStruct {
     let text = run_status_kind(status);
     let color = match status {
         RunStatus::Succeeded { .. } => Some(Color::Green),
         RunStatus::Failed { .. } => Some(Color::Red),
         RunStatus::Running | RunStatus::Starting | RunStatus::Submitted => Some(Color::Cyan),
-        RunStatus::Queued | RunStatus::Dead | RunStatus::Archived { .. } => Some(Color::Ansi256(8)),
+        RunStatus::Queued | RunStatus::Dead => Some(Color::Ansi256(8)),
         RunStatus::Blocked { .. } | RunStatus::Removing => Some(Color::Yellow),
         RunStatus::Paused { .. } => Some(Color::Magenta),
     };

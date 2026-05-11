@@ -138,7 +138,6 @@ pub(crate) fn run_status_kind(status: RunStatus) -> &'static str {
         RunStatus::Succeeded { .. } => "succeeded",
         RunStatus::Failed { .. } => "failed",
         RunStatus::Dead => "dead",
-        RunStatus::Archived { .. } => "archived",
     }
 }
 

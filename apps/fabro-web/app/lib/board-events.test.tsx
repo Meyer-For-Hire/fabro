@@ -4,7 +4,12 @@ import {
   shouldRefreshBoardForEvent,
   subscribeToBoardEvents,
 } from "./board-events";
+import {
+  createCrossTabSseCoordinator,
+  type BroadcastChannelLike,
+} from "./cross-tab-sse";
 import { queryKeys } from "./query-keys";
+import type { EventSourceLike, SseKey } from "./sse";
 
 type MessageHandler = ((event: { data: string }) => void) | null;
 
@@ -21,6 +26,14 @@ class FakeEventSource {
   }
 }
 
+class FakeBroadcastChannel implements BroadcastChannelLike {
+  onmessage: ((event: { data: unknown }) => void) | null = null;
+
+  postMessage() {}
+
+  close() {}
+}
+
 describe("shouldRefreshBoardForEvent", () => {
   test("refreshes board for run and interview status changes only", () => {
     expect(shouldRefreshBoardForEvent("run.running")).toBe(true);
@@ -31,11 +44,47 @@ describe("shouldRefreshBoardForEvent", () => {
 });
 
 describe("subscribeToBoardEvents", () => {
-  test("shares one source and invalidates the board runs key", () => {
+  test("coordinated mode shares one global source and invalidates the board runs key", async () => {
     const source = new FakeEventSource();
     const created: string[] = [];
-    const keys: string[] = [];
-    const mutate = (key: string) => {
+    const keys: SseKey[] = [];
+    const coordinator = createCoordinator((url) => {
+      created.push(url);
+      return source;
+    });
+    const mutate = (key: SseKey) => {
+      keys.push(key);
+      return Promise.resolve();
+    };
+
+    const firstCleanup = subscribeToBoardEvents(mutate, () => {
+      throw new Error("source should be created by coordinator");
+    }, { debounceMs: 0, coordinator });
+    const secondCleanup = subscribeToBoardEvents(mutate, () => {
+      throw new Error("source should be reused");
+    }, { debounceMs: 0, coordinator });
+
+    await waitFor(() => created.length === 1);
+    keys.length = 0;
+
+    source.emit({ event: "run.running" });
+
+    expect(created).toEqual(["/api/v1/attach"]);
+    expect(keys).toEqual([queryKeys.boards.runs(false), queryKeys.boards.runs(true)]);
+
+    firstCleanup();
+    expect(source.closed).toBe(false);
+    secondCleanup();
+    expect(source.closed).toBe(true);
+    coordinator.close();
+  });
+
+  test("fallback mode preserves the existing shared board EventSource", () => {
+    const source = new FakeEventSource();
+    const created: string[] = [];
+    const keys: SseKey[] = [];
+    const coordinator = createFallbackCoordinator();
+    const mutate = (key: SseKey) => {
       keys.push(key);
       return Promise.resolve();
     };
@@ -43,19 +92,52 @@ describe("subscribeToBoardEvents", () => {
     const firstCleanup = subscribeToBoardEvents(mutate, (url) => {
       created.push(url);
       return source;
-    }, { debounceMs: 0 });
+    }, { debounceMs: 0, coordinator });
     const secondCleanup = subscribeToBoardEvents(mutate, () => {
       throw new Error("source should be reused");
-    }, { debounceMs: 0 });
+    }, { debounceMs: 0, coordinator });
 
     source.emit({ event: "run.running" });
 
     expect(created).toEqual(["/api/v1/attach"]);
-    expect(keys).toEqual([queryKeys.boards.runs()]);
+    expect(keys).toEqual([queryKeys.boards.runs(false), queryKeys.boards.runs(true)]);
 
     firstCleanup();
     expect(source.closed).toBe(false);
     secondCleanup();
     expect(source.closed).toBe(true);
+    coordinator.close();
   });
 });
+
+function createCoordinator(eventSourceFactory: (url: string) => EventSourceLike) {
+  return createCrossTabSseCoordinator({
+    tabId: "board-test",
+    channelFactory: () => new FakeBroadcastChannel(),
+    eventSourceFactory,
+    addVisibilityChangeListener: () => () => {},
+    addPagehideListener: () => () => {},
+    timing: {
+      heartbeatMs: 10,
+      leaderStaleMs: 50,
+      electionJitterMs: 0,
+    },
+  });
+}
+
+function createFallbackCoordinator() {
+  return createCrossTabSseCoordinator({
+    channelFactory: () => {
+      throw new Error("BroadcastChannel unavailable");
+    },
+  });
+}
+
+async function waitFor(condition: () => boolean, timeoutMs = 200) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (condition()) return;
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  throw new Error("condition did not become true before timeout");
+}

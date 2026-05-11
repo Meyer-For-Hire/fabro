@@ -41,11 +41,9 @@ pub async fn rewind(
         .state()
         .await
         .map_err(|err| Error::engine(err.to_string()))?;
-    let current = projection.status.ok_or_else(|| {
-        Error::Precondition(format!("run {} has no status; cannot rewind", input.run_id))
-    })?;
+    let current = projection.status;
 
-    archive::ensure_not_archived(Some(current), &input.run_id)?;
+    archive::ensure_not_archived(projection.archived_at.is_some(), &input.run_id)?;
     if current.terminal_status().is_none() {
         return Err(Error::Precondition(format!(
             "run {} must be terminal (succeeded, failed, or dead) to rewind; current status is {current}",

@@ -32,7 +32,6 @@ fabro-install = { path = "../fabro-install" }
 fabro-interview = { path = "../fabro-interview" }
 fabro-mcp = { path = "../fabro-mcp" }
 fabro-proc = { path = "../fabro-proc" }
-fabro-retro = { path = "../fabro-retro" }
 fabro-sandbox = { path = "../fabro-sandbox", features = ["daytona"] }
 fabro-checkpoint = { path = "../fabro-checkpoint" }
 fabro-graphviz = { path = "../fabro-graphviz" }
@@ -50,6 +49,7 @@ fabro-redact.workspace = true
 fabro-util = { path = "../fabro-util" }
 fabro-http.workspace = true
 fabro-static.workspace = true
+fabro-template = { path = "../fabro-template" }
 clap.workspace = true
 clap_complete.workspace = true
 cli-table.workspace = true
@@ -96,6 +96,7 @@ object_store.workspace = true
 bytes.workspace = true
 tokio-util.workspace = true
 libc = "0.2"
+nix = { version = "0.30", features = ["fs"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = { version = "0.9", optional = true }
@@ -107,10 +108,12 @@ core-foundation = { version = "0.9", optional = true }
 openssl = { version = "0.10", features = ["vendored"] }
 
 [build-dependencies]
+fabro-build-support = { path = "../build-support" }
 chrono = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = "2"
+fabro-build-support = { path = "../build-support" }
 fabro-server = { path = "../fabro-server", features = ["test-support"] }
 insta = { workspace = true, features = ["filters"] }
 paste = "1"

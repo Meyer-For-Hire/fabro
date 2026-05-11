@@ -230,7 +230,7 @@ On a same-machine setup, `settings.toml` is the shared machine-default layer und
 
 On a remote setup, the client bundles workflow, project, and user config into the run manifest. The server then layers those bundled client configs over its own local defaults for run-shaped fields. Server-owned values like `[server.storage]`, `[server.api]`, `[server.web]`, `[features]`, and `[server.scheduler]` always come from the server machine's own `settings.toml` or `fabro server start` flags.
 
-Merge rules follow the normative matrix: `[run.inputs]` replaces wholesale, `[run.sandbox.env]` and `[run.sandbox.daytona.labels]` merge by key, `[run.prepare.steps]` replaces whole-list, and `[[run.hooks]]` merge by optional `id`. Most other fields use "higher-precedence wins" field-wise merging.
+Merge rules follow the normative matrix: TOML `[run.inputs]` tables replace wholesale, CLI `-I` / `--input` values replayed from run manifests merge per key at highest precedence, `[run.sandbox.env]` and `[run.sandbox.daytona.labels]` merge by key, `[run.prepare.steps]` replaces whole-list, and `[[run.hooks]]` merge by optional `id`. Most other fields use "higher-precedence wins" field-wise merging.
 
 ### `[server.logging]` section
 
@@ -239,11 +239,11 @@ Configure the server log level and destination.
 | Key | Description | Default |
 |---|---|---|
 | `level` | Log level: `error`, `warn`, `info`, `debug`, `trace` | `"info"` |
-| `destination` | Where server logs are written: `file` (rotated daily under `<storage>/logs/`) or `stdout` | `"file"` |
+| `destination` | Where server logs are written: `file` (rotated daily under `<storage>/logs/`) or `stdout` | Daemon: `"file"`; foreground: `"stdout"` |
 
 Level precedence: `FABRO_LOG` env var > `--debug` flag > `[server.logging].level` > `"info"`.
 
-Destination precedence: `FABRO_LOG_DESTINATION` env var > `[server.logging].destination` > `"file"`. `stdout` is incompatible with daemon mode — use `fabro server start --foreground` (which is what container images do).
+Destination precedence: `FABRO_LOG_DESTINATION` env var > `[server.logging].destination` > command-mode default. `stdout` is incompatible with daemon mode — use `fabro server start --foreground` (which is what container images do). Default install-generated `settings.toml` omits `destination` so foreground mode streams logs to stdout without extra config.
 
 The CLI has its own `[cli.logging]` section.
 
@@ -409,4 +409,4 @@ Fabro resolves these from `process env -> server.env`.
 | Variable | Default | Description |
 |---|---|---|
 | `FABRO_LOG` | `info` | Log level: `error`, `warn`, `info`, `debug` |
-| `FABRO_LOG_DESTINATION` | `file` | Server log destination: `file` or `stdout` (containers default to `stdout`) |
+| `FABRO_LOG_DESTINATION` | Command-mode default | Server log destination: `file` or `stdout` |

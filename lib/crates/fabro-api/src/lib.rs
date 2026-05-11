@@ -16,28 +16,32 @@ mod generated {
 pub mod types {
     pub use fabro_model::{Model, ModelCosts, ModelFeatures, ModelLimits, ModelTestMode, Provider};
     pub use fabro_types::settings::server::{
-        DiscordIntegrationSettings, GithubIntegrationSettings, GithubIntegrationStrategy,
-        IntegrationWebhooksSettings, IpAllowEntry, LogDestination, ObjectStoreSettings,
-        ServerApiSettings, ServerArtifactsSettings, ServerAuthGithubSettings, ServerAuthMethod,
-        ServerAuthSettings, ServerIntegrationsSettings, ServerIpAllowlistOverrideSettings,
-        ServerIpAllowlistSettings, ServerListenSettings, ServerLoggingSettings,
-        ServerSchedulerSettings, ServerSlateDbSettings, ServerStorageSettings, ServerWebSettings,
-        SlackIntegrationSettings, TeamsIntegrationSettings, WebhookStrategy,
+        GithubIntegrationSettings, GithubIntegrationStrategy, IntegrationWebhooksSettings,
+        IpAllowEntry, LogDestination, ObjectStoreSettings, ServerApiSettings,
+        ServerArtifactsSettings, ServerAuthGithubSettings, ServerAuthMethod, ServerAuthSettings,
+        ServerIntegrationsSettings, ServerIpAllowlistOverrideSettings, ServerIpAllowlistSettings,
+        ServerListenSettings, ServerLoggingSettings, ServerSchedulerSettings,
+        ServerSlateDbSettings, ServerStorageSettings, ServerWebSettings, SlackIntegrationSettings,
+        WebhookStrategy,
     };
     pub use fabro_types::settings::{FeaturesNamespace, ServerNamespace};
     pub use fabro_types::status::{
-        BlockedReason, FailureReason, RunControlAction, RunStatus, SuccessReason, TerminalStatus,
+        BlockedReason, FailureReason, RunControlAction, RunStatus, SuccessReason,
     };
     pub use fabro_types::{
-        AuthMethod, BilledTokenCounts, CommandOutputStream, CommandTermination, DiffStats,
-        DirtyStatus, EventEnvelope, GitContext, IdpIdentity, InterviewOption,
-        InterviewQuestionRecord, PendingInterviewRecord, PreRunPushOutcome, Principal,
-        QuestionType, RepositoryReference, RunClientProvenance, RunEvent, RunProjection,
-        RunProvenance, RunServerProvenance, RunSummary, SecretMetadata, SecretType, ServerSettings,
-        StageCompletion, StageOutcome, StageProjection, StageState, SystemActorKind, UserPrincipal,
-        WorkflowSettings,
+        AuthMethod, BilledTokenCounts, CommandTermination, DiffStats, DiffSummary, DirtyStatus,
+        EventEnvelope, GitContext, IdpIdentity, InterviewOption, InterviewQuestionRecord,
+        PendingInterviewRecord, PreRunPushOutcome, Principal, PullRequest, PullRequestDetails,
+        QuestionType, RepositoryRef, Run, RunClientProvenance, RunEvent, RunProjection,
+        RunProvenance, RunSandbox, RunSandboxRuntime, RunServerProvenance, SandboxDetails,
+        SandboxProvider, SandboxResources, SandboxService, SandboxServiceListResponse,
+        SandboxState, SandboxTimestamps, SecretMetadata, SecretType, ServerSettings,
+        StageCompletion, StageHandler, StageOutcome, StageProjection, StageState, SystemActorKind,
+        UserPrincipal, WorkflowSettings,
     };
 
     pub use crate::generated::types::*;
+
+    pub type RunSummary = fabro_types::Run;
 }
 pub use generated::Client as ApiClient;

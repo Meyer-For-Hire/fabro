@@ -18,22 +18,19 @@ impl ServerRunSummaryInfo {
     }
 
     pub(crate) fn run_id(&self) -> RunId {
-        self.summary.run_id
+        self.summary.id
     }
 
     pub(crate) fn workflow_name(&self) -> String {
-        self.summary
-            .workflow_name
-            .clone()
-            .unwrap_or_else(|| "[no run spec]".to_string())
+        self.summary.workflow.name.clone()
     }
 
     pub(crate) fn workflow_slug(&self) -> Option<&str> {
-        self.summary.workflow_slug.as_deref()
+        self.summary.workflow.slug.as_deref()
     }
 
     pub(crate) fn status(&self) -> RunStatus {
-        self.summary.status
+        self.summary.lifecycle.status
     }
 
     pub(crate) fn start_time(&self) -> String {
@@ -44,8 +41,9 @@ impl ServerRunSummaryInfo {
 
     pub(crate) fn start_time_dt(&self) -> Option<DateTime<Utc>> {
         self.summary
-            .start_time
-            .or(Some(self.summary.run_id.created_at()))
+            .timestamps
+            .started_at
+            .or(Some(self.summary.id.created_at()))
     }
 
     pub(crate) fn labels(&self) -> &HashMap<String, String> {
@@ -53,11 +51,14 @@ impl ServerRunSummaryInfo {
     }
 
     pub(crate) fn duration_ms(&self) -> Option<u64> {
-        self.summary.duration_ms
+        self.summary.timestamps.duration_ms
     }
 
     pub(crate) fn total_usd_micros(&self) -> Option<i64> {
-        self.summary.total_usd_micros
+        self.summary
+            .billing
+            .as_ref()
+            .and_then(|billing| billing.total_usd_micros)
     }
 
     pub(crate) fn source_directory(&self) -> Option<&str> {
@@ -65,11 +66,10 @@ impl ServerRunSummaryInfo {
     }
 
     pub(crate) fn repo_origin_url(&self) -> Option<&str> {
-        self.summary.repo_origin_url.as_deref()
-    }
-
-    pub(crate) fn in_place(&self) -> bool {
-        self.summary.in_place
+        self.summary
+            .repository
+            .as_ref()
+            .and_then(|repository| repository.origin_url.as_deref())
     }
 
     pub(crate) fn goal(&self) -> String {

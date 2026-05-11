@@ -463,6 +463,7 @@ impl InstallInputSource for InteractiveInstallInputSource {
                 } else {
                     spawn_blocking(|| prompt_password("GitHub Personal Access Token")).await??
                 };
+                fabro_github::validate_static_github_token(&token)?;
                 Ok(GitHubInstallSelection::Token { token })
             }
             1 => {
@@ -620,6 +621,7 @@ impl InstallInputSource for NonInteractiveInstallInputSource {
                 let token = fabro_github::gh_auth_token()
                     .await
                     .context("Run `gh auth login` and rerun `fabro install`.")?;
+                fabro_github::validate_static_github_token(&token)?;
                 Ok(GitHubInstallSelection::Token { token })
             }
             Some(InstallGitHubStrategyArg::App) => Ok(GitHubInstallSelection::App {
@@ -705,6 +707,7 @@ async fn choose_install_github_selection(
             let token = fabro_github::gh_auth_token()
                 .await
                 .context("Run `gh auth login` and rerun `fabro install github`.")?;
+            fabro_github::validate_static_github_token(&token)?;
             Ok(GitHubInstallSelection::Token { token })
         }
         Some(InstallGitHubStrategyArg::App) => Ok(GitHubInstallSelection::App {

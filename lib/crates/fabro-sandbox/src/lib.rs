@@ -11,13 +11,13 @@ pub mod read_guard;
 #[cfg(any(feature = "docker", feature = "daytona", test))]
 pub mod redact;
 
+pub mod details;
+
 pub mod reconnect;
 
-pub mod sandbox_provider;
-
-pub mod sandbox_record;
-
 pub mod worktree;
+
+pub mod terminal;
 
 pub mod local;
 
@@ -30,18 +30,20 @@ pub mod daytona;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
+pub use details::sandbox_details;
 #[cfg(feature = "docker")]
 pub use docker::{DockerSandbox, DockerSandboxOptions};
 pub use error::{Error, Result, default_redacted_output_tail, display_for_log};
+pub use fabro_types::{RunSandbox, SandboxProvider};
 pub use local::LocalSandbox;
 pub use read_guard::ReadBeforeWriteSandbox;
+pub use reconnect::{reconnect, reconnect_for_run, reconnect_for_run_with_callback};
 pub use sandbox::{
     CommandOutputCallback, DEFAULT_EXEC_OUTPUT_TAIL_BYTES, DirEntry, ExecResult,
     ExecStreamingResult, GitRunInfo, GitSetupIntent, GrepOptions, Sandbox, SandboxEvent,
     SandboxEventCallback, format_lines_numbered, git_push_via_exec, redacted_output_tail,
     setup_git_via_exec, shell_quote,
 };
-pub use sandbox_provider::SandboxProvider;
-pub use sandbox_record::SandboxRecord;
 pub use sandbox_spec::SandboxSpec;
+pub use terminal::{TerminalSession, TerminalSize, open_terminal_for_run};
 pub use worktree::{WorktreeEvent, WorktreeEventCallback, WorktreeOptions, WorktreeSandbox};

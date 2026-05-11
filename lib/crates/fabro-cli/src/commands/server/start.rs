@@ -28,7 +28,8 @@ const SERVER_START_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 
 pub(crate) struct ForegroundServerLogBootstrap {
     #[expect(dead_code, reason = "held for its Drop to release the server lock")]
-    lock_file: std::fs::File,
+    lock_file:              std::fs::File,
+    pub(crate) destination: LogDestination,
 }
 
 pub(crate) async fn execute(
@@ -89,7 +90,10 @@ pub(crate) async fn prepare_foreground_server_log(
             .with_context(|| format!("creating server log file {}", log_path.display()))?;
     }
 
-    Ok(ForegroundServerLogBootstrap { lock_file })
+    Ok(ForegroundServerLogBootstrap {
+        lock_file,
+        destination,
+    })
 }
 
 pub(crate) async fn ensure_server_running_for_storage(
@@ -234,11 +238,18 @@ async fn execute_foreground(
     bind: BindRequest,
     serve_args: ServeArgs,
     storage_dir: PathBuf,
-    _log_bootstrap: ForegroundServerLogBootstrap,
+    log_bootstrap: ForegroundServerLogBootstrap,
     styles: &'static Styles,
     _printer: Printer,
 ) -> Result<()> {
-    super::foreground::serve_with_daemon_record(serve_args, bind, storage_dir, styles).await
+    super::foreground::serve_with_daemon_record(
+        serve_args,
+        bind,
+        storage_dir,
+        styles,
+        Some(log_bootstrap.destination),
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------

@@ -15,6 +15,7 @@ pub mod daemon;
 pub mod envfile;
 pub mod error;
 pub mod home;
+pub mod input_overrides;
 mod load;
 pub mod logging;
 pub mod parse;
@@ -35,24 +36,24 @@ pub use builders::{
 pub use error::{Error, Result};
 pub use fabro_util::path::expand_tilde;
 pub use home::Home;
+pub use input_overrides::{InputOverrideParseError, parse_input_overrides};
 pub use layers::{
     CliAuthLayer, CliExecAgentLayer, CliExecLayer, CliExecModelLayer, CliLayer, CliLoggingLayer,
     CliOutputLayer, CliTargetLayer, CliUpdatesLayer, CostRates, CredentialRef,
     CredentialRefParseError, DaytonaDockerfileLayer, DaytonaSandboxLayer, DaytonaSnapshotLayer,
-    DiscordIntegrationLayer, DockerSandboxLayer, FeaturesLayer, GitAuthorLayer,
-    GithubIntegrationLayer, HookAgentMarker, HookEntry, HookTlsMode, IntegrationWebhooksLayer,
-    InterviewProviderLayer, InterviewsLayer, LlmLayer, LlmModelFeatures, LlmModelLimits,
-    LocalSandboxLayer, LogFilter, McpEntryLayer, MergeMap, ModelControls, ModelCostTable,
-    ModelRefOrSplice, ModelSettings, NotificationProviderLayer, NotificationRouteLayer,
-    ObjectStoreLocalLayer, ObjectStoreS3Layer, PrepareStep, ProjectLayer, ProviderSettings,
-    ReplaceMap, RunAgentLayer, RunArtifactsLayer, RunCheckpointLayer, RunExecutionLayer,
-    RunGitLayer, RunGoalLayer, RunLayer, RunModelControlsLayer, RunModelLayer, RunPrepareLayer,
-    RunPullRequestLayer, RunSandboxLayer, RunScmLayer, ScmGitHubLayer, ServerApiLayer,
-    ServerArtifactsLayer, ServerAuthGithubLayer, ServerAuthLayer, ServerIntegrationsLayer,
-    ServerIpAllowlistLayer, ServerIpAllowlistOverrideLayer, ServerLayer, ServerListenLayer,
-    ServerLoggingLayer, ServerSchedulerLayer, ServerSlateDbLayer, ServerStorageLayer,
-    ServerWebLayer, SlackIntegrationLayer, StickyMap, StringOrSplice, TeamsIntegrationLayer,
-    WorkflowLayer,
+    DockerSandboxLayer, FeaturesLayer, GitAuthorLayer, GithubIntegrationLayer, HookAgentMarker,
+    HookEntry, HookTlsMode, IntegrationWebhooksLayer, InterviewProviderLayer, InterviewsLayer,
+    LlmLayer, LlmModelFeatures, LlmModelLimits, LogFilter, McpEntryLayer, MergeMap, ModelControls,
+    ModelCostTable, ModelRefOrSplice, ModelSettings, NotificationProviderLayer,
+    NotificationRouteLayer, ObjectStoreLocalLayer, ObjectStoreS3Layer, PrepareStep, ProjectLayer,
+    ProviderSettings, ReplaceMap, RunAgentLayer, RunArtifactsLayer, RunCheckpointLayer,
+    RunExecutionLayer, RunGitLayer, RunGoalLayer, RunIntegrationsGithubLayer, RunIntegrationsLayer,
+    RunLayer, RunModelControlsLayer, RunModelLayer, RunPrepareLayer, RunPullRequestLayer,
+    RunSandboxLayer, RunScmLayer, ScmGitHubLayer, ServerApiLayer, ServerArtifactsLayer,
+    ServerAuthGithubLayer, ServerAuthLayer, ServerIntegrationsLayer, ServerIpAllowlistLayer,
+    ServerIpAllowlistOverrideLayer, ServerLayer, ServerListenLayer, ServerLoggingLayer,
+    ServerSchedulerLayer, ServerSlateDbLayer, ServerStorageLayer, ServerWebLayer,
+    SlackIntegrationLayer, StickyMap, StringOrSplice, WorkflowLayer,
 };
 pub(crate) use layers::{Combine, SettingsLayer};
 pub use logging::{resolve_log_destination, resolve_log_destination_with_env};

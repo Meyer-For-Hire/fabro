@@ -6,6 +6,7 @@ use fabro_llm::client::Client;
 use fabro_llm::types::{Message, Request, ToolDefinition};
 use fabro_model::ModelHandle;
 use fabro_static::EnvVars;
+use futures::future::join_all;
 
 use crate::config::SessionOptions;
 use crate::sandbox::GrepOptions;
@@ -234,26 +235,25 @@ pub fn make_shell_tool_with_config(config: &SessionOptions) -> RegisteredTool {
         executor:   Arc::new(move |args, ctx| {
             Box::pin(async move {
                 let command = required_str(&args, "command")?;
+                let command = format!("exec 2>&1\n{command}");
                 let timeout_ms = args
                     .get("timeout_ms")
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(default_timeout)
                     .min(max_timeout);
 
+                let tool_env = ctx.resolve_tool_env().await.map_err(|e| format!("{e:#}"))?;
                 tracing::debug!(
-                    env_var_count = ctx
-                        .tool_env
-                        .as_ref()
-                        .map_or(0, std::collections::HashMap::len),
+                    env_var_count = tool_env.as_ref().map_or(0, std::collections::HashMap::len),
                     "Injecting sandbox env vars into tool execution"
                 );
                 let result = ctx
                     .env
                     .exec_command(
-                        command,
+                        &command,
                         timeout_ms,
                         None,
-                        ctx.tool_env.as_ref(),
+                        tool_env.as_ref(),
                         Some(ctx.cancel),
                     )
                     .await
@@ -267,12 +267,11 @@ pub fn make_shell_tool_with_config(config: &SessionOptions) -> RegisteredTool {
                 }
                 let _ = write!(
                     output,
-                    "Exit code: {}\nstdout:\n{}\nstderr:\n{}",
+                    "Exit code: {}\noutput:\n{}",
                     result
                         .exit_code
                         .map_or_else(|| "none".to_string(), |code| code.to_string()),
-                    result.stdout,
-                    result.stderr
+                    result.stdout
                 );
                 Ok(output)
             })
@@ -395,16 +394,25 @@ pub(crate) fn make_read_many_files_tool() -> RegisteredTool {
         },
         executor:   Arc::new(|args, ctx| {
             Box::pin(async move {
-                let paths = args["paths"]
+                let paths: Vec<&str> = args["paths"]
                     .as_array()
-                    .ok_or_else(|| "paths must be an array".to_string())?;
+                    .ok_or_else(|| "paths must be an array".to_string())?
+                    .iter()
+                    .map(|p| {
+                        p.as_str()
+                            .ok_or_else(|| "each path must be a string".to_string())
+                    })
+                    .collect::<Result<_, _>>()?;
+
+                let reads = paths.iter().map(|path| {
+                    let env = Arc::clone(&ctx.env);
+                    async move { (*path, env.read_file(path, None, None).await) }
+                });
+                let results = join_all(reads).await;
 
                 let mut output = String::new();
-                for path_val in paths {
-                    let path = path_val
-                        .as_str()
-                        .ok_or_else(|| "each path must be a string".to_string())?;
-                    match ctx.env.read_file(path, None, None).await {
+                for (path, result) in results {
+                    match result {
                         Ok(content) => {
                             ctx.env.mark_agent_read(path);
                             let _ = write!(output, "=== {path} ===\n{content}\n\n");
@@ -609,13 +617,14 @@ pub(crate) fn make_web_fetch_tool(summarizer: Option<WebFetchSummarizer>) -> Reg
                     "curl -sL --max-time {timeout_secs} -H 'User-Agent: fabro-agent/0.1' {escaped_url}"
                 );
 
+                let tool_env = ctx.resolve_tool_env().await.map_err(|e| format!("{e:#}"))?;
                 let result = ctx
                     .env
                     .exec_command(
                         &command,
                         timeout_ms,
                         None,
-                        ctx.tool_env.as_ref(),
+                        tool_env.as_ref(),
                         Some(ctx.cancel),
                     )
                     .await
@@ -698,7 +707,7 @@ mod tests {
         let result = (tool.executor)(serde_json::json!({"file_path": "/test.txt"}), ToolContext {
             env,
             cancel: CancellationToken::new(),
-            tool_env: None,
+            tool_env_provider: None,
         })
         .await;
         assert_eq!(result.unwrap(), "  1 | hello\n  2 | world");
@@ -722,7 +731,7 @@ mod tests {
             ToolContext {
                 env,
                 cancel: CancellationToken::new(),
-                tool_env: None,
+                tool_env_provider: None,
             },
         )
         .await;
@@ -737,9 +746,9 @@ mod tests {
         let result = (tool.executor)(
             serde_json::json!({"file_path": "/out.txt", "content": "hello"}),
             ToolContext {
-                env:      env_clone,
-                cancel:   CancellationToken::new(),
-                tool_env: None,
+                env:               env_clone,
+                cancel:            CancellationToken::new(),
+                tool_env_provider: None,
             },
         )
         .await;
@@ -767,9 +776,9 @@ mod tests {
                 "new_string": "goodbye"
             }),
             ToolContext {
-                env:      env_clone,
-                cancel:   CancellationToken::new(),
-                tool_env: None,
+                env:               env_clone,
+                cancel:            CancellationToken::new(),
+                tool_env_provider: None,
             },
         )
         .await;
@@ -797,7 +806,7 @@ mod tests {
             ToolContext {
                 env,
                 cancel: CancellationToken::new(),
-                tool_env: None,
+                tool_env_provider: None,
             },
         )
         .await;
@@ -822,7 +831,7 @@ mod tests {
             ToolContext {
                 env,
                 cancel: CancellationToken::new(),
-                tool_env: None,
+                tool_env_provider: None,
             },
         )
         .await;
@@ -849,9 +858,9 @@ mod tests {
                 "replace_all": true
             }),
             ToolContext {
-                env:      env_clone,
-                cancel:   CancellationToken::new(),
-                tool_env: None,
+                env:               env_clone,
+                cancel:            CancellationToken::new(),
+                tool_env_provider: None,
             },
         )
         .await;
@@ -877,7 +886,7 @@ mod tests {
         let result = (tool.executor)(serde_json::json!({"command": "echo hello"}), ToolContext {
             env,
             cancel: CancellationToken::new(),
-            tool_env: None,
+            tool_env_provider: None,
         })
         .await;
         let output = result.unwrap();
@@ -893,9 +902,9 @@ mod tests {
         let _result = (tool.executor)(
             serde_json::json!({"command": "sleep 1", "timeout_ms": 5000}),
             ToolContext {
-                env:      env_clone,
-                cancel:   CancellationToken::new(),
-                tool_env: None,
+                env:               env_clone,
+                cancel:            CancellationToken::new(),
+                tool_env_provider: None,
             },
         )
         .await;
@@ -907,8 +916,8 @@ mod tests {
         let tool = make_shell_tool();
         let env: Arc<dyn Sandbox> = Arc::new(MockSandbox {
             exec_result: ExecResult {
-                stdout:      String::new(),
-                stderr:      "error".into(),
+                stdout:      "error".into(),
+                stderr:      String::new(),
                 exit_code:   Some(1),
                 termination: CommandTermination::Exited,
                 duration_ms: 10,
@@ -918,7 +927,7 @@ mod tests {
         let result = (tool.executor)(serde_json::json!({"command": "false"}), ToolContext {
             env,
             cancel: CancellationToken::new(),
-            tool_env: None,
+            tool_env_provider: None,
         })
         .await;
         let output = result.unwrap();
@@ -942,7 +951,7 @@ mod tests {
         let result = (tool.executor)(serde_json::json!({"command": "sleep 100"}), ToolContext {
             env,
             cancel: CancellationToken::new(),
-            tool_env: None,
+            tool_env_provider: None,
         })
         .await;
         let output = result.unwrap();
@@ -959,14 +968,123 @@ mod tests {
         let _result = (tool.executor)(
             serde_json::json!({"command": "echo $MY_KEY"}),
             ToolContext {
-                env:      env_clone,
-                cancel:   CancellationToken::new(),
-                tool_env: Some(tool_env.clone()),
+                env:               env_clone,
+                cancel:            CancellationToken::new(),
+                tool_env_provider: Some(Arc::new(crate::StaticEnvProvider(tool_env.clone()))),
             },
         )
         .await;
         let captured = env.captured_env_vars.lock().unwrap().clone();
         assert_eq!(captured, Some(tool_env));
+    }
+
+    struct SequenceToolEnvProvider {
+        values: std::sync::Mutex<Vec<HashMap<String, String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ToolEnvProvider for SequenceToolEnvProvider {
+        async fn resolve(&self) -> anyhow::Result<HashMap<String, String>> {
+            Ok(self.values.lock().unwrap().remove(0))
+        }
+    }
+
+    struct FailingToolEnvProvider;
+
+    #[async_trait::async_trait]
+    impl crate::ToolEnvProvider for FailingToolEnvProvider {
+        async fn resolve(&self) -> anyhow::Result<HashMap<String, String>> {
+            Err(anyhow::anyhow!("GITHUB_TOKEN refresh failed"))
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_resolves_tool_env_for_each_call() {
+        let tool = make_shell_tool();
+        let env = Arc::new(MockSandbox::default());
+        let provider = Arc::new(SequenceToolEnvProvider {
+            values: std::sync::Mutex::new(vec![
+                HashMap::from([("GITHUB_TOKEN".to_string(), "t1".to_string())]),
+                HashMap::from([("GITHUB_TOKEN".to_string(), "t2".to_string())]),
+            ]),
+        });
+
+        let _result = (tool.executor)(
+            serde_json::json!({"command": "echo $GITHUB_TOKEN"}),
+            ToolContext {
+                env:               env.clone(),
+                cancel:            CancellationToken::new(),
+                tool_env_provider: Some(provider.clone()),
+            },
+        )
+        .await;
+        assert_eq!(
+            env.captured_env_vars.lock().unwrap().clone(),
+            Some(HashMap::from([(
+                "GITHUB_TOKEN".to_string(),
+                "t1".to_string()
+            )]))
+        );
+
+        let _result = (tool.executor)(
+            serde_json::json!({"command": "echo $GITHUB_TOKEN"}),
+            ToolContext {
+                env:               env.clone(),
+                cancel:            CancellationToken::new(),
+                tool_env_provider: Some(provider),
+            },
+        )
+        .await;
+        assert_eq!(
+            env.captured_env_vars.lock().unwrap().clone(),
+            Some(HashMap::from([(
+                "GITHUB_TOKEN".to_string(),
+                "t2".to_string()
+            )]))
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_returns_provider_error_for_env_resolution_failure() {
+        let tool = make_shell_tool();
+        let env: Arc<dyn Sandbox> = Arc::new(MockSandbox::default());
+
+        let result = (tool.executor)(
+            serde_json::json!({"command": "echo $GITHUB_TOKEN"}),
+            ToolContext {
+                env,
+                cancel: CancellationToken::new(),
+                tool_env_provider: Some(Arc::new(FailingToolEnvProvider)),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            result.contains("GITHUB_TOKEN refresh failed"),
+            "got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_does_not_resolve_failing_tool_env_provider() {
+        let tool = make_read_file_tool();
+        let mut files = HashMap::new();
+        files.insert("/test.txt".into(), "  1 | hello".into());
+        let env: Arc<dyn Sandbox> = Arc::new(MockSandbox {
+            files,
+            apply_read_offset_limit: true,
+            ..Default::default()
+        });
+
+        let result = (tool.executor)(serde_json::json!({"file_path": "/test.txt"}), ToolContext {
+            env,
+            cancel: CancellationToken::new(),
+            tool_env_provider: Some(Arc::new(FailingToolEnvProvider)),
+        })
+        .await;
+
+        assert_eq!(result.unwrap(), "  1 | hello");
     }
 
     #[tokio::test]
@@ -975,9 +1093,9 @@ mod tests {
         let env = Arc::new(MockSandbox::default());
         let env_clone: Arc<dyn Sandbox> = env.clone();
         let _result = (tool.executor)(serde_json::json!({"command": "echo hello"}), ToolContext {
-            env:      env_clone,
-            cancel:   CancellationToken::new(),
-            tool_env: None,
+            env:               env_clone,
+            cancel:            CancellationToken::new(),
+            tool_env_provider: None,
         })
         .await;
         let captured = env.captured_env_vars.lock().unwrap().clone();
@@ -1003,9 +1121,9 @@ mod tests {
         let _result = (tool.executor)(
             serde_json::json!({"url": "https://example.com"}),
             ToolContext {
-                env:      env_clone,
-                cancel:   CancellationToken::new(),
-                tool_env: Some(tool_env.clone()),
+                env:               env_clone,
+                cancel:            CancellationToken::new(),
+                tool_env_provider: Some(Arc::new(crate::StaticEnvProvider(tool_env.clone()))),
             },
         )
         .await;
@@ -1026,7 +1144,7 @@ mod tests {
         let result = (tool.executor)(serde_json::json!({"pattern": "fn"}), ToolContext {
             env,
             cancel: CancellationToken::new(),
-            tool_env: None,
+            tool_env_provider: None,
         })
         .await;
         let output = result.unwrap();
@@ -1044,7 +1162,7 @@ mod tests {
         let result = (tool.executor)(serde_json::json!({"pattern": "src/**/*.rs"}), ToolContext {
             env,
             cancel: CancellationToken::new(),
-            tool_env: None,
+            tool_env_provider: None,
         })
         .await;
         let output = result.unwrap();
@@ -1059,7 +1177,7 @@ mod tests {
         let result = (tool.executor)(serde_json::json!({"query": "test"}), ToolContext {
             env,
             cancel: CancellationToken::new(),
-            tool_env: None,
+            tool_env_provider: None,
         })
         .await;
         let err = result.unwrap_err();
@@ -1076,7 +1194,7 @@ mod tests {
         let result = (tool.executor)(serde_json::json!({}), ToolContext {
             env,
             cancel: CancellationToken::new(),
-            tool_env: None,
+            tool_env_provider: None,
         })
         .await;
         let err = result.unwrap_err();
@@ -1126,9 +1244,9 @@ mod tests {
         let result = (tool.executor)(
             serde_json::json!({"url": "https://example.com"}),
             ToolContext {
-                env:      env_clone,
-                cancel:   CancellationToken::new(),
-                tool_env: None,
+                env:               env_clone,
+                cancel:            CancellationToken::new(),
+                tool_env_provider: None,
             },
         )
         .await;
@@ -1165,7 +1283,7 @@ mod tests {
             ToolContext {
                 env,
                 cancel: CancellationToken::new(),
-                tool_env: None,
+                tool_env_provider: None,
             },
         )
         .await;
@@ -1184,9 +1302,9 @@ mod tests {
         let _result = (tool.executor)(
             serde_json::json!({"url": "https://example.com", "timeout_ms": 15000}),
             ToolContext {
-                env:      env_clone,
-                cancel:   CancellationToken::new(),
-                tool_env: None,
+                env:               env_clone,
+                cancel:            CancellationToken::new(),
+                tool_env_provider: None,
             },
         )
         .await;
@@ -1206,9 +1324,9 @@ mod tests {
         let _result = (tool.executor)(
             serde_json::json!({"url": "https://example.com", "timeout_ms": 120_000}),
             ToolContext {
-                env:      env_clone,
-                cancel:   CancellationToken::new(),
-                tool_env: None,
+                env:               env_clone,
+                cancel:            CancellationToken::new(),
+                tool_env_provider: None,
             },
         )
         .await;
@@ -1239,7 +1357,7 @@ mod tests {
             ToolContext {
                 env,
                 cancel: CancellationToken::new(),
-                tool_env: None,
+                tool_env_provider: None,
             },
         )
         .await;
@@ -1266,7 +1384,7 @@ mod tests {
             ToolContext {
                 env,
                 cancel: CancellationToken::new(),
-                tool_env: None,
+                tool_env_provider: None,
             },
         )
         .await;
@@ -1314,7 +1432,7 @@ mod tests {
             ToolContext {
                 env,
                 cancel: CancellationToken::new(),
-                tool_env: None,
+                tool_env_provider: None,
             },
         )
         .await;
@@ -1345,7 +1463,7 @@ mod tests {
             ToolContext {
                 env,
                 cancel: CancellationToken::new(),
-                tool_env: None,
+                tool_env_provider: None,
             },
         )
         .await;
@@ -1414,7 +1532,7 @@ mod tests {
             ToolContext {
                 env,
                 cancel: CancellationToken::new(),
-                tool_env: None,
+                tool_env_provider: None,
             },
         )
         .await;
@@ -1468,7 +1586,7 @@ mod tests {
             ToolContext {
                 env,
                 cancel: CancellationToken::new(),
-                tool_env: None,
+                tool_env_provider: None,
             },
         )
         .await;
@@ -1492,9 +1610,9 @@ mod tests {
         // read_file tool should mark the file as agent-read
         let tool = make_read_file_tool();
         (tool.executor)(serde_json::json!({"file_path": "a.ts"}), ToolContext {
-            env:      Arc::clone(&env),
-            cancel:   CancellationToken::new(),
-            tool_env: None,
+            env:               Arc::clone(&env),
+            cancel:            CancellationToken::new(),
+            tool_env_provider: None,
         })
         .await
         .unwrap();
@@ -1521,9 +1639,9 @@ mod tests {
         // grep tool should mark matched files as agent-read
         let tool = make_grep_tool();
         (tool.executor)(serde_json::json!({"pattern": "content"}), ToolContext {
-            env:      Arc::clone(&env),
-            cancel:   CancellationToken::new(),
-            tool_env: None,
+            env:               Arc::clone(&env),
+            cancel:            CancellationToken::new(),
+            tool_env_provider: None,
         })
         .await
         .unwrap();

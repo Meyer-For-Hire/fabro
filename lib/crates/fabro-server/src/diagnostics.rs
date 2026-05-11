@@ -230,7 +230,23 @@ async fn check_github_app(state: &AppState) -> CheckResult {
     let settings = state.server_settings();
     if settings.server.integrations.github.strategy == GithubIntegrationStrategy::Token {
         let token = match state.github_credentials(&settings.server.integrations.github) {
-            Ok(Some(fabro_github::GitHubCredentials::Token(token))) => token,
+            Ok(Some(fabro_github::GitHubCredentials::Pat(token))) => token,
+            Ok(Some(fabro_github::GitHubCredentials::Installation(token))) => {
+                match token.valid_token() {
+                    Ok(token) => token.to_string(),
+                    Err(err) => {
+                        return CheckResult {
+                            name:        "GitHub Token".to_string(),
+                            status:      CheckStatus::Error,
+                            summary:     "token expired".to_string(),
+                            details:     vec![CheckDetail::new(err.to_string())],
+                            remediation: Some(
+                                "Run fabro install or update GITHUB_TOKEN".to_string(),
+                            ),
+                        };
+                    }
+                }
+            }
             Ok(Some(_)) => unreachable!("token strategy should not return app credentials"),
             Ok(None) => {
                 return CheckResult {

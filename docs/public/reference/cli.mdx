@@ -73,11 +73,12 @@ fabro [OPTIONS] [COMMAND]
 | `fabro docs` | Open the docs website in the browser |
 | `fabro doctor` | Check environment and integration health |
 | `fabro dump` | Export a run's durable state to a directory |
+| `fabro events` | View the event log of a workflow run |
 | `fabro fork` | Fork a workflow run from an earlier checkpoint into a new run |
 | `fabro graph` | Render a workflow graph as SVG |
 | `fabro inspect` | Show detailed information about a workflow run |
 | `fabro install` | Set up the Fabro environment (LLMs, certs, GitHub) |
-| `fabro logs` | View the event log of a workflow run |
+| `fabro logs` | View the raw worker tracing log of a workflow run |
 | `fabro model` | List and test LLM models |
 | `fabro pr` | Pull request operations |
 | `fabro preflight` | Validate run configuration without executing |
@@ -92,6 +93,7 @@ fabro [OPTIONS] [COMMAND]
 | `fabro server` | Server operations |
 | `fabro settings` | Inspect effective settings |
 | `fabro start` | Start a created workflow run on the server |
+| `fabro steer` | Steer a running agent mid-execution |
 | `fabro system` | System maintenance commands |
 | `fabro unarchive` | Restore archived runs to their prior terminal status |
 | `fabro uninstall` | Uninstall Fabro from this machine |
@@ -301,14 +303,13 @@ fabro create [OPTIONS] <WORKFLOW>
 | `--dry-run` | Execute with simulated LLM backend |
 | `--goal <goal>` | Override the workflow goal (available as {{ goal }} in prompts) |
 | `--goal-file <goal_file>` | Read the workflow goal from a file |
-| `--in-place` | Run directly in the source checkout without git checkpoints |
 | `--label <key=value>` | Attach a label to this run (repeatable, format: KEY=VALUE) |
 | `--model <model>` | Override default LLM model |
-| `--no-retro` | Skip retro generation after the run |
 | `--preserve-sandbox` | Keep the sandbox alive after the run finishes (for debugging) |
 | `--provider <provider>` | Override default LLM provider |
 | `--sandbox <sandbox>` | Sandbox for agent tools<br />Values: `local`, `docker`, `daytona` |
 | `--server <server>` | Fabro server target: http(s) URL or absolute Unix socket path |
+| `-I, --input <key=value>` | Override a workflow input value (repeatable, format: KEY=VALUE) |
 | `-v, --verbose` | Enable verbose output |
 
 ### `fabro discord`
@@ -362,6 +363,30 @@ fabro dump [OPTIONS] --output <OUTPUT> <RUN>
 | --- | --- |
 | `-o, --output <output>` | Output directory (must not exist or be empty) |
 | `--server <server>` | Fabro server target: http(s) URL or absolute Unix socket path |
+
+### `fabro events`
+
+View the event log of a workflow run
+
+```bash
+fabro events [OPTIONS] <RUN>
+```
+
+#### Arguments
+
+| Name | Description |
+| --- | --- |
+| `RUN` | Run ID prefix or workflow name (most recent run) |
+
+#### Options
+
+| Option | Description |
+| --- | --- |
+| `-f, --follow` | Follow event output |
+| `-p, --pretty` | Formatted colored output with rendered assistant text |
+| `--server <server>` | Fabro server target: http(s) URL or absolute Unix socket path |
+| `--since <since>` | Events since timestamp or relative (e.g. "42m", "2h", "2026-01-02T13:00:00Z") |
+| `-n, --tail <tail>` | Lines from end (default: all) |
 
 ### `fabro fork`
 
@@ -461,12 +486,12 @@ fabro install github [OPTIONS]
 
 | Option | Description |
 | --- | --- |
-| `--owner <owner>` | GitHub App owner: 'personal' or 'org:<slug>' (app only, requires --non-interactive) |
+| `--owner <owner>` | GitHub App owner: `personal` or `org:<slug>` (app only, requires --non-interactive) |
 | `--strategy <strategy>` | GitHub authentication strategy (requires --non-interactive)<br />Values: `token`, `app` |
 
 ### `fabro logs`
 
-View the event log of a workflow run
+View the raw worker tracing log of a workflow run
 
 ```bash
 fabro logs [OPTIONS] <RUN>
@@ -482,10 +507,7 @@ fabro logs [OPTIONS] <RUN>
 
 | Option | Description |
 | --- | --- |
-| `-f, --follow` | Follow log output |
-| `-p, --pretty` | Formatted colored output with rendered assistant text |
 | `--server <server>` | Fabro server target: http(s) URL or absolute Unix socket path |
-| `--since <since>` | Logs since timestamp or relative (e.g. "42m", "2h", "2026-01-02T13:00:00Z") |
 | `-n, --tail <tail>` | Lines from end (default: all) |
 
 ### `fabro model`
@@ -661,6 +683,7 @@ fabro preflight [OPTIONS] <WORKFLOW>
 | `--provider <provider>` | Override default LLM provider |
 | `--sandbox <sandbox>` | Sandbox for agent tools<br />Values: `local`, `docker`, `daytona` |
 | `--server <server>` | Fabro server target: http(s) URL or absolute Unix socket path |
+| `-I, --input <key=value>` | Override a workflow input value (repeatable, format: KEY=VALUE) |
 | `-v, --verbose` | Enable verbose output |
 
 ### `fabro provider`
@@ -817,14 +840,13 @@ fabro run [OPTIONS] <WORKFLOW>
 | `--dry-run` | Execute with simulated LLM backend |
 | `--goal <goal>` | Override the workflow goal (available as {{ goal }} in prompts) |
 | `--goal-file <goal_file>` | Read the workflow goal from a file |
-| `--in-place` | Run directly in the source checkout without git checkpoints |
 | `--label <key=value>` | Attach a label to this run (repeatable, format: KEY=VALUE) |
 | `--model <model>` | Override default LLM model |
-| `--no-retro` | Skip retro generation after the run |
 | `--preserve-sandbox` | Keep the sandbox alive after the run finishes (for debugging) |
 | `--provider <provider>` | Override default LLM provider |
 | `--sandbox <sandbox>` | Sandbox for agent tools<br />Values: `local`, `docker`, `daytona` |
 | `--server <server>` | Fabro server target: http(s) URL or absolute Unix socket path |
+| `-I, --input <key=value>` | Override a workflow input value (repeatable, format: KEY=VALUE) |
 | `-v, --verbose` | Enable verbose output |
 
 ### `fabro sandbox`
@@ -855,8 +877,8 @@ fabro sandbox cp [OPTIONS] <SRC> <DST>
 
 | Name | Description |
 | --- | --- |
-| `SRC` | Source: <run-id>:<path> or local path |
-| `DST` | Destination: <run-id>:<path> or local path |
+| `SRC` | Source: `<run-id>:<path>` or local path |
+| `DST` | Destination: `<run-id>:<path>` or local path |
 
 #### Options
 
@@ -1108,6 +1130,29 @@ fabro start [OPTIONS] <RUN>
 | --- | --- |
 | `--server <server>` | Fabro server target: http(s) URL or absolute Unix socket path |
 
+### `fabro steer`
+
+Steer a running agent mid-execution
+
+```bash
+fabro steer [OPTIONS] <RUN> [TEXT]
+```
+
+#### Arguments
+
+| Name | Description |
+| --- | --- |
+| `RUN` | Run ID prefix to steer |
+| `TEXT` | Steer message text (omit when --text-stdin is used) |
+
+#### Options
+
+| Option | Description |
+| --- | --- |
+| `--interrupt` | Cancel the in-flight LLM stream / tool calls and deliver the message as the next user turn (default: append to the steering queue) |
+| `--server <server>` | Fabro server target: http(s) URL or absolute Unix socket path |
+| `--text-stdin` | Read steer text from stdin instead of a positional arg |
+
 ### `fabro system`
 
 System maintenance commands
@@ -1124,6 +1169,7 @@ fabro system [OPTIONS] <COMMAND>
 | `fabro system events` | Stream run events from the server |
 | `fabro system info` | Show server runtime information |
 | `fabro system prune` | Delete old workflow runs |
+| `fabro system repair` | Inspect and repair durable server data |
 
 #### `fabro system df`
 
@@ -1192,6 +1238,37 @@ fabro system prune [OPTIONS]
 | `--storage-dir <storage_dir>` | Local storage directory (default: ~/.fabro/storage) |
 | `--workflow <workflow>` | Filter by workflow name (substring match) |
 | `--yes` | Actually delete (default is dry-run) |
+
+#### `fabro system repair`
+
+Inspect and repair durable server data
+
+```bash
+fabro system repair [OPTIONS] <COMMAND>
+```
+
+#### Subcommands
+
+| Command | Description |
+| --- | --- |
+| `fabro system repair runs` | List runs that cannot be loaded from durable storage |
+
+##### `fabro system repair runs`
+
+List runs that cannot be loaded from durable storage
+
+```bash
+fabro system repair runs [OPTIONS]
+```
+
+#### Options
+
+| Option | Description |
+| --- | --- |
+| `--delete` | Preview deleting unreadable runs |
+| `--server <server>` | Fabro server target: http(s) URL or absolute Unix socket path |
+| `--storage-dir <storage_dir>` | Local storage directory (default: ~/.fabro/storage) |
+| `--yes` | Actually delete unreadable runs (default is dry-run) |
 
 ### `fabro unarchive`
 

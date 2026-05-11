@@ -455,6 +455,27 @@ mod tests {
 
         let store = test_store();
         let run = store.create_run(&fixtures::RUN_1).await.unwrap();
+        append_event(&run, &fixtures::RUN_1, &Event::RunCreated {
+            run_id:           fixtures::RUN_1,
+            title:            None,
+            settings:         serde_json::to_value(fabro_types::WorkflowSettings::default())
+                .unwrap(),
+            graph:            serde_json::to_value(fabro_types::Graph::new("test")).unwrap(),
+            workflow_source:  None,
+            workflow_config:  None,
+            labels:           std::collections::BTreeMap::default(),
+            run_dir:          "/tmp".to_string(),
+            source_directory: None,
+            workflow_slug:    None,
+            db_prefix:        None,
+            provenance:       None,
+            manifest_blob:    None,
+            git:              None,
+            fork_source_ref:  None,
+            web_url:          None,
+        })
+        .await
+        .unwrap();
         append_event(&run, &fixtures::RUN_1, &Event::Prompt {
             stage:    "work".into(),
             visit:    2,
@@ -508,16 +529,13 @@ mod tests {
         .await
         .unwrap();
         append_event(&run, &fixtures::RUN_1, &Event::CommandCompleted {
-            node_id:           "work".into(),
-            stdout:            "hi\n".into(),
-            stderr:            String::new(),
-            exit_code:         Some(0),
-            duration_ms:       10,
-            termination:       CommandTermination::Exited,
-            stdout_bytes:      3,
-            stderr_bytes:      0,
-            streams_separated: true,
-            live_streaming:    true,
+            node_id:        "work".into(),
+            output:         "hi\n".into(),
+            exit_code:      Some(0),
+            duration_ms:    10,
+            termination:    CommandTermination::Exited,
+            output_bytes:   3,
+            live_streaming: true,
         })
         .await
         .unwrap();
@@ -545,6 +563,7 @@ mod tests {
             restart_failure_signatures: std::collections::BTreeMap::new(),
             node_visits: std::collections::BTreeMap::from([("work".into(), 2)]),
             diff: Some("diff --git a/story.txt b/story.txt".into()),
+            diff_summary: None,
         })
         .await
         .unwrap();

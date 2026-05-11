@@ -57,7 +57,7 @@ pub async fn fork_run(
         ))
     })?;
 
-    validate_source_spec(state.spec.as_ref(), &checkpoint_sha)?;
+    validate_source_spec(&state.spec, &checkpoint_sha)?;
 
     let events = run_store
         .list_events()
@@ -69,10 +69,7 @@ pub async fn fork_run(
         .collect::<Vec<_>>();
     let mut projection = RunProjection::apply_events(&historical_events)
         .map_err(|err| Error::engine(err.to_string()))?;
-    let mut run_spec = projection
-        .spec
-        .clone()
-        .ok_or_else(|| Error::engine("source run projection has no spec"))?;
+    let mut run_spec = projection.spec.clone();
 
     let new_run_id = RunId::new();
     run_spec.run_id = new_run_id;
@@ -80,18 +77,14 @@ pub async fn fork_run(
         source_run_id,
         checkpoint_sha: checkpoint_sha.clone(),
     });
-    projection.spec = Some(run_spec);
+    projection.spec = run_spec;
     projection.start = None;
     projection.sandbox = None;
     projection.conclusion = None;
-    projection.retro = None;
-    projection.retro_prompt = None;
-    projection.retro_response = None;
-    projection.final_patch = None;
     projection.pull_request = None;
     projection.superseded_by = None;
-    if let Some(checkpoint) = projection.checkpoint.as_mut() {
-        checkpoint.git_commit_sha = Some(checkpoint_sha);
+    if let Some(record) = projection.checkpoints.last_mut() {
+        record.checkpoint.git_commit_sha = Some(checkpoint_sha);
     }
 
     persist_forked_run(store, &projection, &historical_events).await?;
@@ -107,17 +100,7 @@ pub async fn fork_run(
     })
 }
 
-fn validate_source_spec(
-    spec: Option<&RunSpec>,
-    checkpoint_sha: &str,
-) -> std::result::Result<(), Error> {
-    let spec = spec.ok_or_else(|| Error::engine("source run projection has no spec"))?;
-    if spec.in_place {
-        return Err(Error::Validation(
-            "source run was created with --in-place; cannot fork (no git checkpoint history)"
-                .to_string(),
-        ));
-    }
+fn validate_source_spec(spec: &RunSpec, checkpoint_sha: &str) -> std::result::Result<(), Error> {
     if checkpoint_sha.trim().is_empty() {
         return Err(Error::Validation(
             "target checkpoint has an empty git_commit_sha; cannot fork".to_string(),
@@ -155,13 +138,9 @@ async fn persist_forked_run(
     projection: &RunProjection,
     historical_events: &[EventEnvelope],
 ) -> std::result::Result<(), Error> {
-    let spec = projection
-        .spec
-        .as_ref()
-        .ok_or_else(|| Error::engine("forked run projection has no spec"))?;
+    let spec = &projection.spec;
     let checkpoint = projection
-        .checkpoint
-        .as_ref()
+        .current_checkpoint()
         .ok_or_else(|| Error::engine("forked run projection has no checkpoint"))?;
 
     let run_store = store
@@ -171,11 +150,12 @@ async fn persist_forked_run(
 
     event::append_event(&run_store, &spec.run_id, &Event::RunCreated {
         run_id:           spec.run_id,
+        title:            None,
         settings:         serde_json::to_value(&spec.settings)
             .map_err(|err| Error::engine(err.to_string()))?,
         graph:            serde_json::to_value(&spec.graph)
             .map_err(|err| Error::engine(err.to_string()))?,
-        workflow_source:  projection.graph_source.clone(),
+        workflow_source:  projection.spec.graph_source.clone(),
         workflow_config:  None,
         labels:           spec.labels.clone().into_iter().collect(),
         run_dir:          String::new(),
@@ -186,7 +166,6 @@ async fn persist_forked_run(
         manifest_blob:    spec.manifest_blob,
         git:              spec.git.clone(),
         fork_source_ref:  spec.fork_source_ref.clone(),
-        in_place:         spec.in_place,
         web_url:          None,
     })
     .await
@@ -248,8 +227,10 @@ fn replay_event_for_fork_projection(body: &EventBody) -> bool {
             | EventBody::InterviewCompleted(_)
             | EventBody::InterviewTimeout(_)
             | EventBody::InterviewInterrupted(_)
-            | EventBody::AgentSessionStarted(_)
+            | EventBody::AgentSessionActivated(_)
             | EventBody::AgentCliStarted(_)
+            | EventBody::AgentCliCancelled(_)
+            | EventBody::AgentCliTimedOut(_)
             | EventBody::CommandStarted(_)
             | EventBody::CommandCompleted(_)
             | EventBody::ParallelCompleted(_)
@@ -287,6 +268,7 @@ fn checkpoint_completed_event(checkpoint: &Checkpoint) -> Event {
             .collect(),
         node_visits: checkpoint.node_visits.clone().into_iter().collect(),
         diff: None,
+        diff_summary: None,
     }
 }
 
@@ -312,6 +294,28 @@ mod tests {
         )
     }
 
+    #[test]
+    fn fork_replay_keeps_stage_scoped_session_activation_only() {
+        assert!(replay_event_for_fork_projection(
+            &EventBody::AgentSessionActivated(fabro_types::run_event::AgentSessionActivatedProps {
+                thread_id:    None,
+                provider:     Some("openai".to_string()),
+                model:        Some("gpt-5.4".to_string()),
+                capabilities: vec![fabro_types::SessionCapability::Steer],
+                visit:        1,
+            })
+        ));
+        assert!(!replay_event_for_fork_projection(
+            &EventBody::AgentSessionStarted(fabro_types::run_event::AgentSessionStartedProps {
+                provider: Some("openai".to_string()),
+                model:    Some("gpt-5.4".to_string()),
+            })
+        ));
+        assert!(!replay_event_for_fork_projection(
+            &EventBody::AgentSessionEnded(fabro_types::run_event::AgentSessionEndedProps {})
+        ));
+    }
+
     #[tokio::test]
     async fn fork_persists_historical_node_projection_through_target_checkpoint() {
         let store = test_store();
@@ -322,6 +326,7 @@ mod tests {
 
         event::append_event(&source, &source_run_id, &Event::RunCreated {
             run_id:           source_run_id,
+            title:            None,
             settings:         serde_json::to_value(&settings).unwrap(),
             graph:            serde_json::to_value(&graph).unwrap(),
             workflow_source:  Some("digraph fork_source {}".to_string()),
@@ -341,7 +346,6 @@ mod tests {
                 push_outcome: fabro_types::PreRunPushOutcome::NotAttempted,
             }),
             fork_source_ref:  None,
-            in_place:         false,
             web_url:          None,
         })
         .await
@@ -388,6 +392,7 @@ mod tests {
             restart_failure_signatures: BTreeMap::new(),
             node_visits,
             diff: None,
+            diff_summary: None,
         })
         .await
         .unwrap();
@@ -409,12 +414,7 @@ mod tests {
         assert_eq!(node.response.as_deref(), Some("historical response"));
         assert_eq!(forked_state.checkpoints.len(), 1);
         assert_eq!(
-            forked_state
-                .spec
-                .unwrap()
-                .fork_source_ref
-                .unwrap()
-                .source_run_id,
+            forked_state.spec.fork_source_ref.unwrap().source_run_id,
             source_run_id
         );
     }

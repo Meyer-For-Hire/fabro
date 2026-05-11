@@ -1,11 +1,28 @@
-import { useEffect, useRef } from "react";
-import { ArrowPathIcon, ChevronRightIcon } from "@heroicons/react/20/solid";
-import { Link, Outlet, useLocation } from "react-router";
+import {
+  useEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+} from "react";
+import {
+  ArrowPathIcon,
+  ChevronDownIcon,
+  ChevronRightIcon,
+  ClockIcon,
+  FolderIcon,
+  RectangleStackIcon,
+  SignalIcon,
+} from "@heroicons/react/20/solid";
+import { Link, Outlet, useLocation, useMatches, useNavigate } from "react-router";
+import { Menu, MenuButton, MenuItem, MenuItems } from "@headlessui/react";
 
+import { EditableRunTitle } from "../components/editable-run-title";
 import { InterviewDock } from "../components/interview-dock";
+import { PullRequestChip } from "../components/pull-request-chip";
+import { SteerBar, type SteerBarHandle } from "../components/steer-bar";
 import { ErrorState } from "../components/state";
 import { useToast } from "../components/toast";
-import { PRIMARY_BUTTON_CLASS, SECONDARY_BUTTON_CLASS } from "../components/ui";
+import { ConfirmDialog, SECONDARY_BUTTON_CLASS, Tooltip } from "../components/ui";
 import {
   isRunStatus,
   mapRunSummaryToRunItem,
@@ -13,20 +30,28 @@ import {
   type RunSummary,
 } from "../data/runs";
 import { useDemoMode } from "../lib/demo-mode";
+import { useSWRConfig } from "swr";
 import {
   useArchiveRun,
   useCancelRun,
+  useInterruptRun,
   usePreviewRun,
   useUnarchiveRun,
   type LifecycleMutationResult,
   type PreviewMutationResult,
 } from "../lib/mutations";
+import { formatAbsoluteTs, formatRelativeTime } from "../lib/format";
+import { queryKeys } from "../lib/query-keys";
 import { useRunEvents } from "../lib/run-events";
-import { useRun, useRunQuestions } from "../lib/queries";
+import { useRunToasts } from "../hooks/use-run-toasts";
+import { useRun, useRunQuestions, useRunState } from "../lib/queries";
 import {
   canArchive,
   canCancel,
+  canDelete,
   canUnarchive,
+  deleteErrorMessage,
+  deleteRun,
   isTerminalCancelledRun,
   mapError,
   type LifecycleAction,
@@ -37,17 +62,50 @@ const allTabs = [
   { name: "Overview", path: "", count: null, demoOnly: false },
   { name: "Stages", path: "/stages", count: null, demoOnly: false },
   { name: "Files Changed", path: "/files", count: null, demoOnly: false },
-  { name: "Graph", path: "/graph", count: null, demoOnly: false },
+  { name: "Sandbox", path: "/sandbox", count: null, demoOnly: false, requiresSandbox: true },
   { name: "Billing", path: "/billing", count: null, demoOnly: false },
 ];
 
 export const handle = { hideHeader: true };
 
-const CANCEL_BUTTON_CLASS =
-  "inline-flex items-center justify-center gap-2 rounded-lg border border-coral/30 bg-coral/10 px-4 py-2 text-sm font-medium text-coral transition-colors hover:bg-coral/15 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:bg-coral/10";
+export function focusSteerAfterMenuClose(focus: () => void) {
+  globalThis.setTimeout(focus, 0);
+}
 
-const MUTATION_BUTTON_CLASS =
+export function actionMenuSeparatorVisibility({
+  hasLifecycle,
+  hasDestructive,
+}: {
+  hasLifecycle: boolean;
+  hasDestructive: boolean;
+}) {
+  return {
+    afterOperations:   hasLifecycle || hasDestructive,
+    beforeDestructive: hasLifecycle && hasDestructive,
+  };
+}
+
+const ACTIONS_TRIGGER_CLASS =
   `${SECONDARY_BUTTON_CLASS} disabled:cursor-not-allowed disabled:opacity-60`;
+
+const MENU_ITEM_CLASS =
+  "flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-fg-3 transition-colors data-focus:bg-overlay data-focus:text-fg data-focus:outline-hidden disabled:cursor-not-allowed disabled:opacity-60";
+
+const MENU_ITEM_DANGER_CLASS =
+  "flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-coral transition-colors data-focus:bg-coral/10 data-focus:text-coral data-focus:outline-hidden disabled:cursor-not-allowed disabled:opacity-60";
+
+function classNames(...classes: Array<string | false | null | undefined>) {
+  return classes.filter(Boolean).join(" ");
+}
+
+function useTickingNow(intervalMs: number): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), intervalMs);
+    return () => clearInterval(id);
+  }, [intervalMs]);
+  return now;
+}
 
 type RunDetailRun = ReturnType<typeof mapRunSummaryToRunItem> & {
   statusLabel: string;
@@ -74,12 +132,22 @@ export function lifecycleActionVisibility(status: string | null | undefined) {
     showPrimaryCancel: canCancel(status),
     showArchive: canArchive(status),
     showUnarchive: canUnarchive(status),
+    showDelete: canDelete(status),
   };
+}
+
+function runHasSandbox(runState: unknown): boolean {
+  return !!(
+    runState &&
+    typeof runState === "object" &&
+    "sandbox" in runState &&
+    (runState as { sandbox?: unknown }).sandbox
+  );
 }
 
 function buildRunDetailRun(summary: RunSummary): RunDetailRun {
   const item = mapRunSummaryToRunItem(summary);
-  const rawStatus = summary.status;
+  const rawStatus = summary.lifecycle.status;
   const statusKind = rawStatus.kind;
   const display = isRunStatus(statusKind)
     ? runStatusDisplay[statusKind]
@@ -101,22 +169,41 @@ export function meta({ data }: any) {
 export default function RunDetail({ params }: { params: { id: string } }) {
   const demoMode = useDemoMode();
   const runQuery = useRun(params.id);
+  const runStateQuery = useRunState(params.id);
   const run = runQuery.data ? buildRunDetailRun(runQuery.data) : null;
-  const statusKind = runQuery.data?.status?.kind;
+  const statusKind = runQuery.data?.lifecycle.status.kind;
   const isBlocked = statusKind === "blocked";
   const questionsQuery = useRunQuestions(params.id, isBlocked);
   const pendingQuestions = questionsQuery.data ?? [];
   const { pathname } = useLocation();
+  const matches = useMatches();
   const basePath = `/runs/${params.id}`;
   const previewMutation = usePreviewRun(params.id);
   const cancelMutation = useCancelRun(params.id);
   const archiveMutation = useArchiveRun(params.id);
   const unarchiveMutation = useUnarchiveRun(params.id);
+  const interruptMutation = useInterruptRun(params.id);
+  const navigate = useNavigate();
+  const { mutate } = useSWRConfig();
+  const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
+  const [deletePending, setDeletePending] = useState(false);
   const { push, dismiss } = useToast();
-  const tabs = allTabs.filter((t) => !t.demoOnly || demoMode);
+  const filesCount = runQuery.data?.diff?.files_changed ?? null;
+  const hasSandbox = runHasSandbox(runStateQuery.data);
+  const tabs = allTabs
+    .map((tab) =>
+      tab.name === "Files Changed" ? { ...tab, count: filesCount } : tab,
+    )
+    .filter((t) => (!t.demoOnly || demoMode) && (!t.requiresSandbox || hasSandbox));
   const lifecycleToastStateRef = useRef<LifecycleToastState>(INITIAL_LIFECYCLE_TOAST_STATE);
+  const steerBarRef = useRef<SteerBarHandle | null>(null);
+  const now = useTickingNow(30_000);
+  const fullHeight = matches.some(
+    (m) => (m.handle as { fullHeight?: boolean } | undefined)?.fullHeight,
+  );
 
   useRunEvents(params.id);
+  useRunToasts(params.id);
 
   useEffect(() => {
     if (previewMutation.data?.intent === "preview") {
@@ -171,101 +258,148 @@ export default function RunDetail({ params }: { params: { id: string } }) {
   const cancelPending = cancelMutation.isMutating;
   const archivePending = archiveMutation.isMutating;
   const unarchivePending = unarchiveMutation.isMutating;
+  const handleConfirmDelete = async () => {
+    setDeletePending(true);
+    try {
+      await deleteRun(params.id);
+      void mutate(queryKeys.boards.runs());
+      void mutate(queryKeys.boards.runs(true));
+      push({ message: "Run deleted." });
+      navigate("/runs");
+    } catch (error) {
+      push({ message: deleteErrorMessage(error), tone: "error" });
+    } finally {
+      setDeletePending(false);
+      setDeleteDialogOpen(false);
+    }
+  };
+  const hasPendingQuestions = isBlocked && pendingQuestions.length > 0;
+  const dockClearance = hasPendingQuestions ? "18rem" : "5rem";
+  const rootStyle = {
+    "--fabro-interview-dock-clearance": dockClearance,
+  } as CSSProperties;
 
   return (
-    <div>
-      <nav className="mb-4 flex items-center gap-1 text-sm text-fg-muted">
-        <Link to="/runs" className="text-fg-3 hover:text-fg">Runs</Link>
-        {demoMode && (
-          <>
-            <ChevronRightIcon className="size-3" />
-            <Link to={`/workflows/${run.workflow}`} className="text-fg-3 hover:text-fg">
-              {run.workflow}
-            </Link>
-          </>
+    <div
+      className={fullHeight ? "flex h-full min-h-0 flex-col" : undefined}
+      style={rootStyle}
+    >
+      <nav
+        className={classNames(
+          "mb-4 flex items-center gap-1 text-sm text-fg-muted",
+          fullHeight && "shrink-0",
         )}
+      >
+        <Link to="/runs" className="text-fg-3 hover:text-fg">Runs</Link>
+        <ChevronRightIcon className="size-3" />
+        <Link
+          to={`/runs?workflow=${encodeURIComponent(run.workflow)}`}
+          className="text-fg-3 hover:text-fg"
+        >
+          {run.workflow}
+        </Link>
         <ChevronRightIcon className="size-3" />
         <span>{run.title}</span>
       </nav>
 
-      <div className="mb-6 flex flex-wrap items-start gap-4">
+      <div
+        className={classNames(
+          "mb-6 flex flex-wrap items-start gap-4",
+          fullHeight && "shrink-0",
+        )}
+      >
         <div className="min-w-0 flex-1">
-          <h2 className="text-xl font-semibold text-fg">{run.title}</h2>
-          <div className="mt-2 flex items-center gap-3 text-sm">
+          <EditableRunTitle runId={params.id} title={run.title} />
+          <div className="mt-2 flex flex-wrap items-center gap-x-5 gap-y-2 text-sm">
             <span className="flex items-center gap-1.5">
               <span className={`size-2 rounded-full ${run.statusDot}`} />
               <span className={`font-medium ${run.statusText}`}>{run.statusLabel}</span>
             </span>
-            <span className="font-mono text-xs text-fg-muted">{run.repo}</span>
+            <span className="flex items-center gap-1.5 font-mono text-xs text-fg-muted">
+              <FolderIcon className="size-3.5" aria-hidden="true" />
+              {run.repo}
+            </span>
+            <span className="flex items-center gap-1.5 font-mono text-xs text-fg-muted">
+              <RectangleStackIcon className="size-3.5" aria-hidden="true" />
+              {run.workflow}
+            </span>
             {run.elapsed && (
-              <span className="font-mono text-xs text-fg-muted">{run.elapsed}</span>
+              <span className="flex items-center gap-1.5 font-mono text-xs text-fg-muted">
+                <ClockIcon className="size-3.5" aria-hidden="true" />
+                {run.elapsed}
+              </span>
+            )}
+            {run.lastEventAt && (
+              <Tooltip label={`Last event ${formatAbsoluteTs(run.lastEventAt)}`}>
+                <span className="flex items-center gap-1.5 font-mono text-xs text-fg-muted">
+                  <SignalIcon className="size-3.5" aria-hidden="true" />
+                  {formatRelativeTime(run.lastEventAt, now)}
+                </span>
+              </Tooltip>
+            )}
+            {run.number != null && run.pullRequestUrl && (
+              <PullRequestChip
+                number={run.number}
+                url={run.pullRequestUrl}
+                iconClassName="size-3.5"
+              />
             )}
           </div>
         </div>
 
-        <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
-          {visibility.showPrimaryCancel && (
-            <div>
-              <button
-                type="button"
-                onClick={() => void cancelMutation.trigger()}
-                disabled={cancelPending}
-                className={CANCEL_BUTTON_CLASS}
-              >
-                {cancelPending && <ArrowPathIcon className="size-4 animate-spin" aria-hidden="true" />}
-                {cancelPending ? "Cancelling…" : "Cancel"}
-              </button>
-            </div>
-          )}
+        {demoMode && <ConnectMenu />}
 
-          {visibility.showArchive && (
-            <div>
-              <button
-                type="button"
-                onClick={() => void archiveMutation.trigger()}
-                disabled={archivePending}
-                className={MUTATION_BUTTON_CLASS}
-              >
-                {archivePending && <ArrowPathIcon className="size-4 animate-spin" aria-hidden="true" />}
-                {archivePending ? "Archiving…" : "Archive"}
-              </button>
-            </div>
-          )}
-
-          {visibility.showUnarchive && (
-            <div>
-              <button
-                type="button"
-                onClick={() => void unarchiveMutation.trigger()}
-                disabled={unarchivePending}
-                className={MUTATION_BUTTON_CLASS}
-              >
-                {unarchivePending && <ArrowPathIcon className="size-4 animate-spin" aria-hidden="true" />}
-                {unarchivePending ? "Restoring…" : "Unarchive"}
-              </button>
-            </div>
-          )}
-
-          {run.sandboxId && (
-            <div>
-              <button
-                type="button"
-                onClick={() => void previewMutation.trigger({
-                  port: 3000,
-                  expires_in_secs: 3600,
-                })}
-                disabled={previewPending}
-                className={PRIMARY_BUTTON_CLASS}
-              >
-                {previewPending && <ArrowPathIcon className="size-4 animate-spin" aria-hidden="true" />}
-                {previewPending ? "Opening…" : "Preview"}
-              </button>
-            </div>
-          )}
-        </div>
+        <ActionsMenu
+          canSendInterrupt={statusKind === "running"}
+          interruptPending={interruptMutation.isMutating}
+          onSendInterrupt={() => void interruptMutation.trigger()}
+          canFocusSteer={statusKind === "running" && !hasPendingQuestions}
+          onFocusSteer={() => {
+            focusSteerAfterMenuClose(() => steerBarRef.current?.focus());
+          }}
+          canPreview={hasSandbox}
+          previewPending={previewPending}
+          onPreview={() => void previewMutation.trigger({
+            port: 3000,
+            expires_in_secs: 3600,
+          })}
+          canArchive={visibility.showArchive}
+          archivePending={archivePending}
+          onArchive={() => void archiveMutation.trigger()}
+          canUnarchive={visibility.showUnarchive}
+          unarchivePending={unarchivePending}
+          onUnarchive={() => void unarchiveMutation.trigger()}
+          canDelete={visibility.showDelete}
+          deletePending={deletePending}
+          onDelete={() => setDeleteDialogOpen(true)}
+          canCancel={visibility.showPrimaryCancel}
+          cancelPending={cancelPending}
+          onCancel={() => void cancelMutation.trigger()}
+        />
       </div>
 
-      <div className="border-b border-line">
+      <ConfirmDialog
+        open={deleteDialogOpen}
+        title="Delete this run?"
+        description={
+          <>
+            This permanently removes <span className="font-mono text-fg-2">{run.title}</span> and its
+            durable state. This action cannot be undone.
+          </>
+        }
+        confirmLabel="Delete run"
+        pendingLabel="Deleting…"
+        pending={deletePending}
+        onConfirm={() => void handleConfirmDelete()}
+        onCancel={() => setDeleteDialogOpen(false)}
+      />
+
+      <div
+        className={classNames(
+          "relative before:pointer-events-none before:absolute before:bottom-0 before:left-1/2 before:h-px before:w-screen before:-translate-x-1/2 before:bg-line",
+          fullHeight && "shrink-0",
+        )}
+      >
         <nav className="-mb-px flex gap-6">
           {tabs.map((tab) => {
             const tabPath = `${basePath}${tab.path}`;
@@ -296,16 +430,23 @@ export default function RunDetail({ params }: { params: { id: string } }) {
         </nav>
       </div>
 
-      <div className="mt-6">
+      <div
+        className={
+          fullHeight
+            ? "mt-6 flex min-h-0 flex-1 flex-col"
+            : "mt-6 pb-[var(--fabro-interview-dock-clearance)]"
+        }
+      >
         <Outlet />
       </div>
 
-      {isBlocked && pendingQuestions.length > 0 && (
-        <>
-          <div aria-hidden="true" className="h-72" />
+      <div className="fixed inset-x-0 bottom-0 z-30 border-t border-line bg-page">
+        {hasPendingQuestions ? (
           <InterviewDock runId={params.id} questions={pendingQuestions} />
-        </>
-      )}
+        ) : (
+          <SteerBar ref={steerBarRef} runId={params.id} />
+        )}
+      </div>
     </div>
   );
 }
@@ -355,4 +496,179 @@ export function handleLifecycleToastResult(
 
   toastApi.push({ message: "Run restored." });
   return { ...nextState, activeArchiveToastId: null };
+}
+
+function ConnectMenu() {
+  return (
+    <Menu as="div" className="shrink-0">
+      <MenuButton className={ACTIONS_TRIGGER_CLASS}>
+        Connect
+        <ChevronDownIcon className="-mr-1 size-4 text-fg-muted" aria-hidden="true" />
+      </MenuButton>
+      <MenuItems
+        transition
+        anchor={{ to: "bottom end", gap: 4 }}
+        className="z-20 w-44 origin-top-right rounded-md bg-panel py-1 outline-1 -outline-offset-1 outline-line-strong transition data-closed:scale-95 data-closed:opacity-0 data-enter:duration-100 data-enter:ease-out data-leave:duration-75 data-leave:ease-in"
+      >
+        <MenuItem>
+          <button type="button" className={MENU_ITEM_CLASS}>
+            Preview
+          </button>
+        </MenuItem>
+        <MenuItem>
+          <button type="button" className={MENU_ITEM_CLASS}>
+            SSH
+          </button>
+        </MenuItem>
+      </MenuItems>
+    </Menu>
+  );
+}
+
+interface ActionsMenuProps {
+  canSendInterrupt: boolean;
+  interruptPending: boolean;
+  onSendInterrupt: () => void;
+  canFocusSteer: boolean;
+  onFocusSteer: () => void;
+  canPreview: boolean;
+  previewPending: boolean;
+  onPreview: () => void;
+  canArchive: boolean;
+  archivePending: boolean;
+  onArchive: () => void;
+  canUnarchive: boolean;
+  unarchivePending: boolean;
+  onUnarchive: () => void;
+  canDelete: boolean;
+  deletePending: boolean;
+  onDelete: () => void;
+  canCancel: boolean;
+  cancelPending: boolean;
+  onCancel: () => void;
+}
+
+function ActionsMenu(props: ActionsMenuProps) {
+  const {
+    canSendInterrupt, interruptPending, onSendInterrupt,
+    canFocusSteer, onFocusSteer,
+    canPreview, previewPending, onPreview,
+    canArchive, archivePending, onArchive,
+    canUnarchive, unarchivePending, onUnarchive,
+    canDelete, deletePending, onDelete,
+    canCancel, cancelPending, onCancel,
+  } = props;
+
+  const hasOps =
+    canPreview || canSendInterrupt || canFocusSteer;
+  const hasLifecycle = canArchive || canUnarchive;
+  const hasDestructive = canCancel || canDelete;
+  const hasAny = hasOps || hasLifecycle || hasDestructive;
+  const anyPending =
+    previewPending || archivePending || unarchivePending || deletePending || cancelPending || interruptPending;
+  const separators = actionMenuSeparatorVisibility({ hasLifecycle, hasDestructive });
+
+  if (!hasAny) return null;
+
+  return (
+    <Menu as="div" className="shrink-0">
+      <MenuButton className={ACTIONS_TRIGGER_CLASS} disabled={anyPending}>
+        {anyPending && <ArrowPathIcon className="size-4 animate-spin" aria-hidden="true" />}
+        Actions
+        <ChevronDownIcon className="-mr-1 size-4 text-fg-muted" aria-hidden="true" />
+      </MenuButton>
+      <MenuItems
+        transition
+        anchor={{ to: "bottom end", gap: 4 }}
+        className="z-20 w-44 origin-top-right rounded-md bg-panel py-1 outline-1 -outline-offset-1 outline-line-strong transition data-closed:scale-95 data-closed:opacity-0 data-enter:duration-100 data-enter:ease-out data-leave:duration-75 data-leave:ease-in"
+      >
+        {canPreview && (
+          <MenuItem>
+            <button
+              type="button"
+              onClick={onPreview}
+              disabled={previewPending}
+              className={MENU_ITEM_CLASS}
+            >
+              {previewPending ? "Opening…" : "Preview"}
+            </button>
+          </MenuItem>
+        )}
+        <MenuItem>
+          <button
+            type="button"
+            onClick={onSendInterrupt}
+            disabled={!canSendInterrupt || interruptPending}
+            className={MENU_ITEM_CLASS}
+          >
+            {interruptPending ? "Interrupting…" : "Send interrupt"}
+          </button>
+        </MenuItem>
+        <MenuItem>
+          <button
+            type="button"
+            onClick={onFocusSteer}
+            disabled={!canFocusSteer}
+            className={MENU_ITEM_CLASS}
+          >
+            Send steering…
+          </button>
+        </MenuItem>
+        {separators.afterOperations && (
+          <div className="my-1 h-px bg-line" role="separator" />
+        )}
+        {canArchive && (
+          <MenuItem>
+            <button
+              type="button"
+              onClick={onArchive}
+              disabled={archivePending}
+              className={MENU_ITEM_CLASS}
+            >
+              {archivePending ? "Archiving…" : "Archive"}
+            </button>
+          </MenuItem>
+        )}
+        {canUnarchive && (
+          <MenuItem>
+            <button
+              type="button"
+              onClick={onUnarchive}
+              disabled={unarchivePending}
+              className={MENU_ITEM_CLASS}
+            >
+              {unarchivePending ? "Restoring…" : "Unarchive"}
+            </button>
+          </MenuItem>
+        )}
+        {separators.beforeDestructive && (
+          <div className="my-1 h-px bg-line" role="separator" />
+        )}
+        {canCancel && (
+          <MenuItem>
+            <button
+              type="button"
+              onClick={onCancel}
+              disabled={cancelPending}
+              className={MENU_ITEM_DANGER_CLASS}
+            >
+              {cancelPending ? "Cancelling…" : "Cancel"}
+            </button>
+          </MenuItem>
+        )}
+        {canDelete && (
+          <MenuItem>
+            <button
+              type="button"
+              onClick={onDelete}
+              disabled={deletePending}
+              className={MENU_ITEM_DANGER_CLASS}
+            >
+              {deletePending ? "Deleting…" : "Delete"}
+            </button>
+          </MenuItem>
+        )}
+      </MenuItems>
+    </Menu>
+  );
 }

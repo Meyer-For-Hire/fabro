@@ -1,28 +1,16 @@
 use fabro_test::{fabro_snapshot, test_context};
 use httpmock::MockServer;
 
-use crate::support::{LightweightCli, unique_run_id};
+use crate::cmd::support::remote_run_summary_json;
+use crate::support::{LightweightCli, run_projection_json, unique_run_id};
 
-fn live_run_state_response() -> serde_json::Value {
-    serde_json::json!({
-        "spec": null,
-        "graph_source": null,
-        "start": null,
-        "status": {
+fn live_run_state_response(run_id: &str) -> serde_json::Value {
+    run_projection_json(
+        run_id,
+        &serde_json::json!({
             "kind": "running"
-        },
-        "status_updated_at": "2026-04-05T12:00:01Z",
-        "checkpoint": null,
-        "checkpoints": [],
-        "conclusion": null,
-        "retro": null,
-        "retro_prompt": null,
-        "retro_response": null,
-        "sandbox": null,
-        "final_patch": null,
-        "pull_request": null,
-        "stages": {}
-    })
+        }),
+    )
 }
 
 fn run_sse_body(run_id: &str) -> String {
@@ -236,25 +224,16 @@ fn attach_smoke_covers_arg_validation_and_remote_server_behaviors() {
         then.status(200)
             .header("Content-Type", "application/json")
             .body(
-                serde_json::json!({
-                    "run_id": success_run_id,
-                    "workflow_name": "Remote Workflow",
-                    "workflow_slug": "remote-workflow",
-                    "goal": "Remote output",
-                    "title": "Remote output",
-                    "labels": {},
-                    "source_directory": null,
-                    "repository": { "name": "unknown" },
-                    "start_time": "2026-04-05T12:00:00Z",
-                    "created_at": "2026-04-05T12:00:00Z",
-                    "status": {
+                remote_run_summary_json(
+                    &success_run_id,
+                    "Remote Workflow",
+                    "remote-workflow",
+                    "Remote output",
+                    &serde_json::json!({
                         "kind": "running"
-                    },
-                    "pending_control": null,
-                    "duration_ms": 12,
-                    "elapsed_secs": 0,
-                    "total_usd_micros": null
-                })
+                    }),
+                    "2026-04-05T12:00:00Z",
+                )
                 .to_string(),
             );
     });
@@ -283,7 +262,7 @@ fn attach_smoke_covers_arg_validation_and_remote_server_behaviors() {
             .path(format!("/api/v1/runs/{success_run_id}/state"));
         then.status(200)
             .header("Content-Type", "application/json")
-            .body(live_run_state_response().to_string());
+            .body(live_run_state_response(success_run_id.as_str()).to_string());
     });
     success_server.mock(|when, then| {
         when.method("GET")
@@ -334,25 +313,16 @@ fn attach_smoke_covers_arg_validation_and_remote_server_behaviors() {
         then.status(200)
             .header("Content-Type", "application/json")
             .body(
-                serde_json::json!({
-                    "run_id": eof_run_id,
-                    "workflow_name": "Remote Workflow",
-                    "workflow_slug": "remote-workflow",
-                    "goal": "Remote output",
-                    "title": "Remote output",
-                    "labels": {},
-                    "source_directory": null,
-                    "repository": { "name": "unknown" },
-                    "start_time": "2026-04-05T12:00:00Z",
-                    "created_at": "2026-04-05T12:00:00Z",
-                    "status": {
+                remote_run_summary_json(
+                    &eof_run_id,
+                    "Remote Workflow",
+                    "remote-workflow",
+                    "Remote output",
+                    &serde_json::json!({
                         "kind": "running"
-                    },
-                    "pending_control": null,
-                    "duration_ms": 12,
-                    "elapsed_secs": 0,
-                    "total_usd_micros": null
-                })
+                    }),
+                    "2026-04-05T12:00:00Z",
+                )
                 .to_string(),
             );
     });
@@ -381,7 +351,7 @@ fn attach_smoke_covers_arg_validation_and_remote_server_behaviors() {
             .path(format!("/api/v1/runs/{eof_run_id}/state"));
         then.status(200)
             .header("Content-Type", "application/json")
-            .body(live_run_state_response().to_string());
+            .body(live_run_state_response(eof_run_id.as_str()).to_string());
     });
     eof_server.mock(|when, then| {
         when.method("GET")

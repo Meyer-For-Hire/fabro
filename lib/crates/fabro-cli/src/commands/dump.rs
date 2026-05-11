@@ -21,7 +21,7 @@ pub(crate) async fn run(args: &DumpArgs, base_ctx: &CommandContext) -> Result<()
     let ctx = base_ctx.with_target(&args.server)?;
     let printer = ctx.printer();
     let client = ctx.server().await?;
-    let run_id = client.resolve_run(&args.run).await?.run_id;
+    let run_id = client.resolve_run(&args.run).await?.id;
     let state = client.get_run_state(&run_id).await?;
     let file_count = export_run(client.as_ref(), &run_id, &state, &args.output).await?;
     if ctx.json_output() {

@@ -5,8 +5,9 @@ use fabro_store::{RunProjection, SerializableProjection, StageId};
 use fabro_types::graph::Graph;
 use fabro_types::run::RunSpec;
 use fabro_types::{
-    Checkpoint, RunStatus, SandboxRecord, StageCompletion, StageOutcome, StartRecord,
-    TerminalStatus, WorkflowSettings, first_event_seq, fixtures,
+    BilledModelUsage, BilledTokenCounts, Checkpoint, CheckpointRecord, InterviewQuestionRecord,
+    QuestionType, RunDiff, RunSandbox, RunSandboxRuntime, RunStatus, SandboxProvider,
+    StageCompletion, StageOutcome, StartRecord, WorkflowSettings, first_event_seq, fixtures,
 };
 use serde_json::json;
 
@@ -15,6 +16,7 @@ fn sample_run_spec() -> RunSpec {
         run_id:           fixtures::RUN_1,
         settings:         WorkflowSettings::default(),
         graph:            Graph::new("ship"),
+        graph_source:     None,
         workflow_slug:    Some("demo".to_string()),
         source_directory: Some("/tmp/project".to_string()),
         labels:           HashMap::from([("team".to_string(), "platform".to_string())]),
@@ -29,7 +31,6 @@ fn sample_run_spec() -> RunSpec {
             push_outcome: fabro_types::PreRunPushOutcome::NotAttempted,
         }),
         fork_source_ref:  None,
-        in_place:         false,
     }
 }
 
@@ -52,13 +53,39 @@ fn sample_checkpoint() -> Checkpoint {
     }
 }
 
+fn sample_usage() -> BilledModelUsage {
+    serde_json::from_value(json!({
+        "input": {
+            "usage": {
+                "model": {
+                    "provider": "openai",
+                    "model_id": "gpt-5.2"
+                },
+                "tokens": {
+                    "input_tokens": 123,
+                    "output_tokens": 45
+                }
+            },
+            "facts": {
+                "provider": "open_ai"
+            }
+        },
+        "total_usd_micros": 168
+    }))
+    .expect("sample usage should deserialize")
+}
+
 #[test]
 fn serializable_projection_round_trips_and_trims_bulky_node_fields() {
     let stage_id = StageId::new("build", 2);
-    let mut projection = RunProjection::default();
-    projection.spec = Some(sample_run_spec());
+    let mut projection = RunProjection::new(
+        "Demo".to_string(),
+        sample_run_spec(),
+        Utc.with_ymd_and_hms(2026, 4, 20, 12, 0, 0)
+            .single()
+            .unwrap(),
+    );
     projection.start = Some(StartRecord {
-        run_id:     fixtures::RUN_1,
         start_time: Utc
             .with_ymd_and_hms(2026, 4, 20, 12, 0, 0)
             .single()
@@ -66,15 +93,23 @@ fn serializable_projection_round_trips_and_trims_bulky_node_fields() {
         run_branch: Some("fabro/run/demo".to_string()),
         base_sha:   Some("deadbeef".to_string()),
     });
-    projection.status = Some(RunStatus::Running);
-    projection.checkpoint = Some(sample_checkpoint());
-    projection.sandbox = Some(SandboxRecord {
-        provider:          "local".to_string(),
-        working_directory: "/tmp/project".to_string(),
-        identifier:        Some("sandbox-1".to_string()),
-        repo_cloned:       None,
-        clone_origin_url:  None,
-        clone_branch:      None,
+    projection.status = RunStatus::Running;
+    projection.checkpoints.push(CheckpointRecord {
+        seq:        7,
+        checkpoint: sample_checkpoint(),
+        diff:       RunDiff::default(),
+    });
+    projection.sandbox = Some(RunSandbox {
+        provider: SandboxProvider::Local,
+        image:    None,
+        snapshot: None,
+        runtime:  Some(RunSandboxRuntime {
+            id:                "sandbox-1".to_string(),
+            working_directory: "/tmp/project".to_string(),
+            repo_cloned:       None,
+            clone_origin_url:  None,
+            clone_branch:      None,
+        }),
     });
     projection.pending_interviews = BTreeMap::new();
     let stage = projection.stage_entry(stage_id.node_id(), stage_id.visit(), first_event_seq(2));
@@ -94,16 +129,28 @@ fn serializable_projection_round_trips_and_trims_bulky_node_fields() {
     stage.script_invocation = Some(json!({ "command": "cargo test" }));
     stage.script_timing = Some(json!({ "duration_ms": 10 }));
     stage.parallel_results = Some(json!([{ "stage": "fanout@1" }]));
-    stage.stdout = Some("stdout".to_string());
-    stage.stderr = Some("stderr".to_string());
+    stage.duration_ms = Some(1234);
+    let usage = sample_usage();
+    let usage_counts = BilledTokenCounts::from_billed_usage(std::slice::from_ref(&usage));
+    stage.usage = usage_counts.clone();
+    stage.model = Some(usage.model().clone());
+    stage.output = Some("output".to_string());
 
     let serialized = serde_json::to_value(SerializableProjection(&projection))
         .expect("projection should serialize");
+    assert_eq!(
+        serialized["stages"]["build@2"]["usage"]["input_tokens"],
+        json!(123)
+    );
+    assert_eq!(
+        serialized["stages"]["build@2"]["model"]["model_id"],
+        json!("gpt-5.2")
+    );
     let round_tripped: RunProjection =
         serde_json::from_value(serialized).expect("serialized projection should deserialize");
     let node = round_tripped.stage(&stage_id).expect("node should remain");
 
-    assert_eq!(round_tripped.spec().map(RunSpec::id), Some(fixtures::RUN_1));
+    assert_eq!(round_tripped.spec().id(), fixtures::RUN_1);
     assert_eq!(
         round_tripped
             .current_checkpoint()
@@ -111,13 +158,12 @@ fn serializable_projection_round_trips_and_trims_bulky_node_fields() {
             .current_node,
         "build"
     );
-    assert_eq!(round_tripped.status(), Some(RunStatus::Running));
+    assert_eq!(round_tripped.status(), RunStatus::Running);
     assert!(!round_tripped.is_terminal());
     assert_eq!(node.prompt, None);
     assert_eq!(node.response, None);
     assert_eq!(node.diff, None);
-    assert_eq!(node.stdout, None);
-    assert_eq!(node.stderr, None);
+    assert_eq!(node.output, None);
     assert_eq!(node.first_event_seq, first_event_seq(2));
     assert_eq!(
         node.completion
@@ -138,31 +184,39 @@ fn serializable_projection_round_trips_and_trims_bulky_node_fields() {
         node.parallel_results,
         Some(json!([{ "stage": "fanout@1" }]))
     );
+    assert_eq!(node.duration_ms, Some(1234));
+    assert_eq!(node.usage, usage_counts);
+    assert_eq!(node.model.as_ref(), Some(usage.model()));
 }
 
 #[test]
 fn projection_query_methods_expose_common_state() {
-    let mut projection = RunProjection::default();
-    projection.spec = Some(sample_run_spec());
-    projection.status = Some(RunStatus::Archived {
-        prior: TerminalStatus::Dead,
+    let mut projection = RunProjection::new("Demo".to_string(), sample_run_spec(), Utc::now());
+    projection.status = RunStatus::Dead;
+    projection.archived_at = Some(Utc::now());
+    projection.checkpoints.push(CheckpointRecord {
+        seq:        7,
+        checkpoint: sample_checkpoint(),
+        diff:       RunDiff::default(),
     });
-    projection.checkpoint = Some(sample_checkpoint());
-    projection.pending_interviews = BTreeMap::from([(
-        "q-1".to_string(),
-        fabro_store::PendingInterviewRecord::default(),
-    )]);
+    projection.pending_interviews =
+        BTreeMap::from([("q-1".to_string(), fabro_store::PendingInterviewRecord {
+            question:   InterviewQuestionRecord {
+                id:              "q-1".to_string(),
+                text:            "Approve?".to_string(),
+                stage:           "build".to_string(),
+                question_type:   QuestionType::Freeform,
+                options:         Vec::new(),
+                allow_freeform:  true,
+                timeout_seconds: None,
+                context_display: None,
+            },
+            started_at: Utc::now(),
+        })]);
 
-    assert_eq!(
-        projection.spec().map(RunSpec::workflow_slug),
-        Some(Some("demo"))
-    );
-    assert_eq!(
-        projection.status(),
-        Some(RunStatus::Archived {
-            prior: TerminalStatus::Dead,
-        })
-    );
+    assert_eq!(projection.spec().workflow_slug(), Some("demo"));
+    assert_eq!(projection.status(), RunStatus::Dead);
+    assert!(projection.is_archived());
     assert!(projection.is_terminal());
     assert_eq!(
         projection

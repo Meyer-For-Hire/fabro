@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Extension, Json, Router};
+use chrono::{DateTime, Utc};
 use cookie::time::Duration;
 use cookie::{Cookie, CookieJar, Key, SameSite};
 use fabro_redact::DisplaySafeUrl;
@@ -19,6 +20,7 @@ use serde_json::json;
 use tracing::{debug, error, info, warn};
 
 use crate::auth::{GithubEndpoints, browser_shell};
+use crate::error::ApiError;
 use crate::jwt_auth::{AuthMode, auth_method_name, dev_token_matches};
 use crate::principal_middleware::{
     RequestAuth, RequestAuthContext, RequiredUser, UserProfile, require_authenticated_user,
@@ -87,6 +89,27 @@ struct AuthMeResponse {
 }
 
 #[derive(Serialize)]
+struct AuthSessionsResponse {
+    sessions: Vec<AuthSession>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthSession {
+    id:           String,
+    kind:         &'static str,
+    current:      bool,
+    provider:     String,
+    login:        String,
+    label:        String,
+    user_agent:   Option<String>,
+    created_at:   DateTime<Utc>,
+    last_seen_at: DateTime<Utc>,
+    expires_at:   DateTime<Utc>,
+    revocable:    bool,
+}
+
+#[derive(Serialize)]
 struct SessionUser {
     login:       String,
     name:        String,
@@ -133,6 +156,8 @@ pub fn api_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/auth/config", get(auth_config))
         .route("/auth/me", get(auth_me))
+        .route("/auth/sessions", get(list_auth_sessions))
+        .route("/auth/sessions/{id}", delete(delete_auth_session))
         .route("/demo/toggle", post(toggle_demo))
 }
 
@@ -315,6 +340,15 @@ fn session_cookie_secure(state: &AppState) -> bool {
 fn redacted_url_for_log(url: &str) -> String {
     DisplaySafeUrl::parse(url)
         .map_or_else(|_| "<invalid url>".to_string(), |url| url.redacted_string())
+}
+
+fn session_timestamp(timestamp: i64) -> Result<DateTime<Utc>, ApiError> {
+    DateTime::from_timestamp(timestamp, 0).ok_or_else(|| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Authenticated session timestamp is out of range.",
+        )
+    })
 }
 
 #[expect(
@@ -851,6 +885,147 @@ async fn auth_me(RequestAuth(auth_slot): RequestAuth, headers: HeaderMap) -> Res
     .into_response()
 }
 
+async fn list_auth_sessions(
+    State(state): State<Arc<AppState>>,
+    RequestAuth(auth_slot): RequestAuth,
+    headers: HeaderMap,
+) -> Response {
+    let authenticated = match require_authenticated_user(&auth_slot) {
+        Ok(authenticated) => authenticated,
+        Err(err) => return err.into_response(),
+    };
+    let now = Utc::now();
+    let mut sessions = Vec::new();
+
+    if let Some(key) = state.session_key() {
+        if let Some(session) = read_private_session(&headers, &key) {
+            let issued_at = match session_timestamp(session.iat) {
+                Ok(timestamp) => timestamp,
+                Err(err) => return err.into_response(),
+            };
+            let expires_at = match session_timestamp(session.exp) {
+                Ok(timestamp) => timestamp,
+                Err(err) => return err.into_response(),
+            };
+            sessions.push(AuthSession {
+                id: "browser:current".to_string(),
+                kind: "browser",
+                current: true,
+                provider: session_provider(session.auth_method).to_string(),
+                login: session.login,
+                label: "This browser".to_string(),
+                user_agent: None,
+                created_at: issued_at,
+                last_seen_at: issued_at,
+                expires_at,
+                revocable: false,
+            });
+        }
+    }
+
+    let auth_tokens = match state.store_ref().refresh_tokens().await {
+        Ok(store) => store,
+        Err(err) => {
+            error!(error = %err, "Failed to open refresh token store while listing auth sessions");
+            return ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to list auth sessions.",
+            )
+            .into_response();
+        }
+    };
+    let cli_sessions = match auth_tokens
+        .active_cli_sessions(&authenticated.principal.identity, now)
+        .await
+    {
+        Ok(tokens) => tokens,
+        Err(err) => {
+            error!(error = %err, "Failed to scan refresh tokens while listing auth sessions");
+            return ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to list auth sessions.",
+            )
+            .into_response();
+        }
+    };
+
+    sessions.extend(cli_sessions.into_iter().map(|token| AuthSession {
+        id:           format!("cli:{}", token.chain_id),
+        kind:         "cli",
+        current:      false,
+        provider:     "github".to_string(),
+        login:        token.login,
+        label:        "Fabro CLI".to_string(),
+        user_agent:   Some(token.user_agent),
+        created_at:   token.issued_at,
+        last_seen_at: token.last_used_at,
+        expires_at:   token.expires_at,
+        revocable:    true,
+    }));
+    sessions.sort_by(|left, right| {
+        right
+            .current
+            .cmp(&left.current)
+            .then_with(|| right.last_seen_at.cmp(&left.last_seen_at))
+    });
+
+    Json(AuthSessionsResponse { sessions }).into_response()
+}
+
+async fn delete_auth_session(
+    State(state): State<Arc<AppState>>,
+    RequestAuth(auth_slot): RequestAuth,
+    Path(id): Path<String>,
+) -> Response {
+    let authenticated = match require_authenticated_user(&auth_slot) {
+        Ok(authenticated) => authenticated,
+        Err(err) => return err.into_response(),
+    };
+
+    if id == "browser:current" {
+        return ApiError::bad_request("Browser sessions cannot be revoked by this API version.")
+            .into_response();
+    }
+
+    let Some(raw_chain_id) = id.strip_prefix("cli:") else {
+        return ApiError::not_found("Auth session not found.").into_response();
+    };
+    let Ok(chain_id) = uuid::Uuid::parse_str(raw_chain_id) else {
+        return ApiError::bad_request("Malformed CLI auth session id.").into_response();
+    };
+
+    let auth_tokens = match state.store_ref().refresh_tokens().await {
+        Ok(store) => store,
+        Err(err) => {
+            error!(error = %err, "Failed to open refresh token store while deleting auth session");
+            return ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to revoke auth session.",
+            )
+            .into_response();
+        }
+    };
+    let deleted = match auth_tokens
+        .delete_active_chain_for_identity(&authenticated.principal.identity, chain_id, Utc::now())
+        .await
+    {
+        Ok(deleted) => deleted,
+        Err(err) => {
+            error!(error = %err, "Failed to scan refresh tokens while deleting auth session");
+            return ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to revoke auth session.",
+            )
+            .into_response();
+        }
+    };
+    if deleted == 0 {
+        return ApiError::not_found("Auth session not found.").into_response();
+    }
+
+    StatusCode::NO_CONTENT.into_response()
+}
+
 async fn toggle_demo(
     _auth: RequiredUser,
     State(state): State<Arc<AppState>>,
@@ -1356,6 +1531,7 @@ client_id = "github-client-id"
                 ))),
                 github_webhook_ip_allowlist: None,
                 static_asset_root:           None,
+                watch_web:                   false,
             },
         );
 

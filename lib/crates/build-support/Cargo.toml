@@ -1,0 +1,13 @@
+[package]
+name = "fabro-build-support"
+edition.workspace = true
+version.workspace = true
+publish = false
+license.workspace = true
+description = "Build script support utilities for Fabro crates"
+
+[lib]
+path = "git_metadata.rs"
+
+[lints]
+workspace = true

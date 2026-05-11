@@ -31,7 +31,8 @@ async fn archived_runs_reject_mutations_with_actionable_body() {
         format!("POST /api/v1/runs/{run_id}/archive"),
     )
     .await;
-    assert_eq!(body["status"]["kind"], "archived");
+    assert_eq!(body["lifecycle"]["status"]["kind"], "succeeded");
+    assert_eq!(body["lifecycle"]["archived"], true);
 
     for path in &["/cancel", "/pause", "/unpause", "/start"] {
         let req = Request::builder()
@@ -88,7 +89,7 @@ async fn archived_runs_reject_mutations_with_actionable_body() {
         (
             "POST",
             format!("/runs/{run_id}/questions/q-fake/answer"),
-            r#"{"value":"x"}"#,
+            r#"{"kind":"text","text":"x"}"#,
             "application/json",
         ),
         (
@@ -143,7 +144,7 @@ async fn archived_runs_reject_mutations_with_actionable_body() {
         format!("POST /api/v1/runs/{run_id}/unarchive"),
     )
     .await;
-    assert_eq!(body["status"]["kind"], "succeeded");
+    assert_eq!(body["lifecycle"]["status"]["kind"], "succeeded");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -254,7 +255,7 @@ async fn list_runs_respects_include_archived_flag() {
         .as_array()
         .unwrap()
         .iter()
-        .map(|item| item["run_id"].as_str().unwrap().to_string())
+        .map(|item| item["id"].as_str().unwrap().to_string())
         .collect();
     assert!(
         !ids_visible.contains(&run_id),
@@ -278,7 +279,7 @@ async fn list_runs_respects_include_archived_flag() {
         .as_array()
         .unwrap()
         .iter()
-        .map(|item| item["run_id"].as_str().unwrap().to_string())
+        .map(|item| item["id"].as_str().unwrap().to_string())
         .collect();
     assert!(
         ids_all.contains(&run_id),

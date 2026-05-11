@@ -1,3 +1,4 @@
+use std::future::{Future, IntoFuture};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -14,7 +15,7 @@ use fabro_install::{OBJECT_STORE_ACCESS_KEY_ID_ENV, OBJECT_STORE_SECRET_ACCESS_K
 use fabro_sandbox::SandboxProvider;
 use fabro_static::EnvVars;
 use fabro_types::ServerSettings;
-use fabro_types::settings::server::{GithubIntegrationStrategy, WebhookStrategy};
+use fabro_types::settings::server::{GithubIntegrationStrategy, LogDestination, WebhookStrategy};
 use fabro_types::settings::{
     GithubIntegrationSettings, InterpString, ObjectStoreSettings, ServerListenSettings,
     ServerNamespace,
@@ -26,8 +27,9 @@ use object_store::local::LocalFileSystem;
 use object_store::memory::InMemory;
 use object_store::{ClientOptions, ObjectStore, RetryConfig};
 use tokio::net::{TcpListener, UnixListener};
-use tokio::sync::watch;
-use tokio::time::interval;
+use tokio::task::JoinHandle;
+use tokio::time::{interval, sleep};
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::canonical_origin::resolve_canonical_origin;
@@ -44,6 +46,67 @@ use crate::static_files;
 
 pub const DEFAULT_TCP_PORT: u16 = 32276;
 type EnvLookup = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
+const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(5);
+
+async fn force_exit_after_shutdown(token: CancellationToken, grace: Duration) {
+    token.cancelled().await;
+    sleep(grace).await;
+}
+
+async fn serve_until_shutdown<F>(
+    serve_fut: F,
+    shutdown: CancellationToken,
+    grace: Duration,
+) -> std::io::Result<()>
+where
+    F: IntoFuture<Output = std::io::Result<()>>,
+{
+    let fut = serve_fut.into_future();
+    tokio::pin!(fut);
+    tokio::select! {
+        res = &mut fut => res,
+        () = force_exit_after_shutdown(shutdown, grace) => {
+            warn!(
+                grace_ms = grace.as_millis(),
+                "Graceful shutdown timed out; abandoning open connections"
+            );
+            Ok(())
+        }
+    }
+}
+
+fn spawn_shutdown_orchestrator_inner<S, C>(
+    shutdown: CancellationToken,
+    signal: S,
+    cleanup: C,
+) -> JoinHandle<()>
+where
+    S: Future<Output = ()> + Send + 'static,
+    C: Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        signal.await;
+        shutdown.cancel();
+        cleanup.await;
+    })
+}
+
+fn spawn_shutdown_orchestrator(
+    shutdown: CancellationToken,
+    state: Arc<AppState>,
+) -> JoinHandle<()> {
+    let signal = async {
+        shutdown_signal().await;
+        set_server_title(ServerTitlePhase::Stopping, None);
+    };
+    let cleanup = async move {
+        if let Err(err) = shutdown_active_workers(&state).await {
+            error!(error = %err, "Failed to stop active workers during shutdown");
+        }
+    };
+    spawn_shutdown_orchestrator_inner(shutdown, signal, cleanup)
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct ObjectStoreBuildOptions {
@@ -256,10 +319,21 @@ fn resolve_webhook_preconditions(
             )));
         }
     };
-    let Some(fabro_github::GitHubCredentials::App(github_app)) = github_app else {
-        return Ok(WebhookPreconditions::Skip(
-            "GITHUB_APP_PRIVATE_KEY is not available".to_string(),
-        ));
+    let github_app = match github_app {
+        Some(fabro_github::GitHubCredentials::App(github_app)) => github_app,
+        Some(
+            fabro_github::GitHubCredentials::Pat(_)
+            | fabro_github::GitHubCredentials::Installation(_),
+        ) => {
+            return Ok(WebhookPreconditions::Skip(
+                "GitHub webhooks require GitHub App credentials".to_string(),
+            ));
+        }
+        None => {
+            return Ok(WebhookPreconditions::Skip(
+                "GITHUB_APP_PRIVATE_KEY is not available".to_string(),
+            ));
+        }
     };
     Ok(WebhookPreconditions::Ready {
         app_id,
@@ -489,6 +563,15 @@ pub fn resolve_runtime_server_settings_for_start(
     Ok(resolved.server_settings.server)
 }
 
+fn apply_effective_log_destination(
+    settings: &mut ServerSettings,
+    destination: Option<LogDestination>,
+) {
+    if let Some(destination) = destination {
+        settings.server.logging.destination = destination;
+    }
+}
+
 pub fn resolve_bind_request_from_server_settings(
     settings: &ServerSettings,
     explicit_bind: Option<&str>,
@@ -592,6 +675,7 @@ pub async fn serve_command<F>(
     args: ServeArgs,
     styles: &'static Styles,
     storage_dir_override: Option<PathBuf>,
+    effective_log_destination: Option<LogDestination>,
     mut on_ready: F,
 ) -> anyhow::Result<()>
 where
@@ -621,6 +705,10 @@ where
     runtime_settings.server_settings = runtime_settings
         .server_settings
         .with_storage_override(&data_dir);
+    apply_effective_log_destination(
+        &mut runtime_settings.server_settings,
+        effective_log_destination,
+    );
     let resolved_app_settings = ResolvedAppStateSettings {
         server_settings:       runtime_settings.server_settings,
         manifest_run_defaults: runtime_settings.manifest_run_defaults,
@@ -641,8 +729,16 @@ where
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("creating data directory {}", data_dir.display()))?;
     let max_concurrent_runs = resolved_server_settings.scheduler.max_concurrent_runs;
+    // In `--watch-web` mode the build watcher will populate `dist/` shortly
+    // after startup. Treat that the same as assets being present so the web
+    // UI is enabled from the first request rather than getting silently
+    // demoted to API-only on a cold boot.
+    #[cfg(debug_assertions)]
+    let assume_assets_pending = watch_web;
+    #[cfg(not(debug_assertions))]
+    let assume_assets_pending = false;
     let web_enabled = if resolved_server_settings.web.enabled {
-        if static_files::assets_available() {
+        if static_files::assets_available() || assume_assets_pending {
             true
         } else if args.web {
             bail!("--web requires web UI assets, but none were found");
@@ -668,6 +764,10 @@ where
         flush_interval,
         cache_path,
     ));
+    store
+        .warm_projection_cache()
+        .await
+        .context("warming run projection cache")?;
     let auth_code_store = store.auth_codes().await?;
     let auth_token_store = store.refresh_tokens().await?;
     let (artifact_object_store, artifact_prefix) = build_artifact_object_store_with_server_secrets(
@@ -677,6 +777,7 @@ where
     let artifact_store = fabro_store::ArtifactStore::new(artifact_object_store, artifact_prefix);
     let env_lookup: EnvLookup = Arc::new(process_env_var);
     resolve_canonical_origin(&resolved_server_settings, &env_lookup).map_err(anyhow::Error::msg)?;
+    let shutdown = CancellationToken::new();
     let state = build_app_state(AppStateConfig {
         resolved_settings: resolved_app_settings,
         registry_factory_override: None,
@@ -688,6 +789,7 @@ where
         env_lookup,
         github_api_base_url: None,
         http_client: None,
+        shutdown: shutdown.clone(),
     })?;
     let reconciled = reconcile_incomplete_runs_on_startup(&state).await?;
     if reconciled > 0 {
@@ -719,6 +821,8 @@ where
         RouterOptions {
             web_enabled,
             github_webhook_ip_allowlist,
+            #[cfg(debug_assertions)]
+            watch_web,
             ..RouterOptions::default()
         },
     );
@@ -733,21 +837,10 @@ where
     )
     .await?;
 
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let shutdown_state = Arc::clone(&state);
-    tokio::spawn(async move {
-        shutdown_signal().await;
-        set_server_title(ServerTitlePhase::Stopping, None);
-        if let Err(err) = shutdown_active_workers(&shutdown_state).await {
-            error!(error = %err, "Failed to stop active workers during shutdown");
-        }
-        let _ = shutdown_tx.send(true);
-    });
-
     spawn_auth_store_reapers(
         Arc::clone(&auth_code_store),
         Arc::clone(&auth_token_store),
-        shutdown_rx.clone(),
+        shutdown.clone(),
     );
 
     // Spawn config polling task
@@ -757,11 +850,15 @@ where
     let run_overrides_for_poll = run_overrides.clone();
     let server_overrides_for_poll = server_overrides.clone();
     let data_dir_for_poll = data_dir.clone();
+    let shutdown_for_poll = shutdown.clone();
     tokio::spawn(async move {
         let mut interval = interval(Duration::from_secs(5));
         interval.tick().await; // skip first immediate tick
         loop {
-            interval.tick().await;
+            tokio::select! {
+                () = shutdown_for_poll.cancelled() => break,
+                _ = interval.tick() => {}
+            }
             match load_config_file::<toml::Table>(config_path_for_poll.as_deref(), "settings.toml")
             {
                 Ok(new_disk_settings) => {
@@ -851,29 +948,54 @@ where
         None
     };
 
-    match bound_listener.listener {
+    let cleanup_handle = spawn_shutdown_orchestrator(shutdown.clone(), Arc::clone(&state));
+
+    let serve_result = match bound_listener.listener {
         BoundListener::Unix(listener) => {
             announce_server_ready(&bind_addr, styles);
-            axum::serve(listener, router)
-                .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()))
-                .await?;
+            serve_until_shutdown(
+                axum::serve(listener, router).with_graceful_shutdown({
+                    let token = shutdown.clone();
+                    async move { token.cancelled().await }
+                }),
+                shutdown.clone(),
+                SHUTDOWN_GRACE_PERIOD,
+            )
+            .await
         }
         BoundListener::Tcp(listener) => {
             announce_server_ready(&bind_addr, styles);
-            axum::serve(
-                listener,
-                router.into_make_service_with_connect_info::<SocketAddr>(),
+            serve_until_shutdown(
+                axum::serve(
+                    listener,
+                    router.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .with_graceful_shutdown({
+                    let token = shutdown.clone();
+                    async move { token.cancelled().await }
+                }),
+                shutdown.clone(),
+                SHUTDOWN_GRACE_PERIOD,
             )
-            .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()))
-            .await?;
+            .await
         }
-    }
+    };
 
     #[cfg(debug_assertions)]
     if let Some(ref mut child) = watch_web_child {
         let _ = child.kill();
         let _ = child.wait();
     }
+
+    if shutdown.is_cancelled() {
+        if let Err(join_err) = cleanup_handle.await {
+            warn!(error = %join_err, "Shutdown orchestrator task panicked");
+        }
+    } else {
+        cleanup_handle.abort();
+    }
+
+    serve_result?;
 
     if let Some(manager) = webhook_manager {
         manager.shutdown().await;
@@ -977,25 +1099,18 @@ async fn shutdown_signal() {
     info!("Shutdown signal received, stopping server");
 }
 
-async fn wait_for_shutdown(mut shutdown_rx: watch::Receiver<bool>) {
-    if *shutdown_rx.borrow() {
-        return;
-    }
-    let _ = shutdown_rx.changed().await;
-}
-
 fn spawn_auth_store_reapers(
     auth_codes: Arc<fabro_store::AuthCodeStore>,
     auth_tokens: Arc<fabro_store::RefreshTokenStore>,
-    shutdown_rx: watch::Receiver<bool>,
+    shutdown: CancellationToken,
 ) {
-    spawn_auth_code_reaper(auth_codes, shutdown_rx.clone());
-    spawn_refresh_token_reaper(auth_tokens, shutdown_rx);
+    spawn_auth_code_reaper(auth_codes, shutdown.clone());
+    spawn_refresh_token_reaper(auth_tokens, shutdown);
 }
 
 fn spawn_auth_code_reaper(
     auth_codes: Arc<fabro_store::AuthCodeStore>,
-    mut shutdown_rx: watch::Receiver<bool>,
+    shutdown: CancellationToken,
 ) {
     tokio::spawn(async move {
         let mut interval = interval(Duration::from_secs(30));
@@ -1003,7 +1118,7 @@ fn spawn_auth_code_reaper(
 
         loop {
             tokio::select! {
-                _ = shutdown_rx.changed() => break,
+                () = shutdown.cancelled() => break,
                 _ = interval.tick() => {
                     if let Err(err) = auth_codes.gc_expired(chrono::Utc::now()).await {
                         warn!(error = %err, "Failed to garbage collect expired auth codes");
@@ -1016,7 +1131,7 @@ fn spawn_auth_code_reaper(
 
 fn spawn_refresh_token_reaper(
     auth_tokens: Arc<fabro_store::RefreshTokenStore>,
-    mut shutdown_rx: watch::Receiver<bool>,
+    shutdown: CancellationToken,
 ) {
     tokio::spawn(async move {
         let mut interval = interval(Duration::from_hours(6));
@@ -1024,7 +1139,7 @@ fn spawn_refresh_token_reaper(
 
         loop {
             tokio::select! {
-                _ = shutdown_rx.changed() => break,
+                () = shutdown.cancelled() => break,
                 _ = interval.tick() => {
                     let cutoff = chrono::Utc::now() - chrono::Duration::days(7);
                     if let Err(err) = auth_tokens.gc_expired(cutoff).await {
@@ -1082,22 +1197,30 @@ fn server_bind_title(bind: &Bind) -> String {
               test uses tokio::net::TcpListener separately"
 )]
 mod tests {
+    use std::io;
     use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::Poll;
     use std::time::Duration;
 
     use fabro_config::bind::{Bind, BindRequest};
     use fabro_config::{RunSettingsBuilder, ServerSettingsBuilder};
     use fabro_types::ServerSettings;
     use fabro_types::settings::interp::InterpString;
-    use fabro_types::settings::server::ObjectStoreSettings;
+    use fabro_types::settings::server::{LogDestination, ObjectStoreSettings};
     use fabro_util::Home;
+    use tokio::time::sleep;
+    use tokio_util::sync::CancellationToken;
 
     use super::{
-        GitHubMetaResolver, ServeArgs, ServerTitlePhase, bind_tcp_host_with_fallback,
+        GitHubMetaResolver, SHUTDOWN_GRACE_PERIOD, ServeArgs, ServerTitlePhase,
+        apply_effective_log_destination, bind_tcp_host_with_fallback,
         build_local_object_store_with_preference, build_object_store_from_settings_with_lookup,
-        build_slatedb_store, resolve_bind_request_from_server_settings,
+        build_slatedb_store, force_exit_after_shutdown, resolve_bind_request_from_server_settings,
         resolve_github_webhook_ip_allowlist, resolve_startup_github_webhook_ip_allowlist,
-        serve_overrides, server_bind_title, server_title,
+        serve_overrides, serve_until_shutdown, server_bind_title, server_title,
+        spawn_shutdown_orchestrator_inner,
     };
     use crate::server::ResolvedAppStateSettings;
 
@@ -1140,6 +1263,121 @@ mod tests {
             manifest_run_defaults,
             server_settings: server_settings(source),
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn force_exit_after_shutdown_does_not_resolve_before_cancellation() {
+        let token = CancellationToken::new();
+        let future = force_exit_after_shutdown(token, Duration::from_secs(5));
+        tokio::pin!(future);
+
+        tokio::time::advance(Duration::from_hours(1)).await;
+
+        assert!(matches!(futures_util::poll!(&mut future), Poll::Pending));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn force_exit_after_shutdown_resolves_grace_after_cancellation() {
+        let token = CancellationToken::new();
+        let grace = Duration::from_secs(5);
+        let future = force_exit_after_shutdown(token.clone(), grace);
+        tokio::pin!(future);
+
+        token.cancel();
+        assert!(matches!(futures_util::poll!(&mut future), Poll::Pending));
+
+        tokio::time::advance(
+            grace
+                .checked_sub(Duration::from_millis(1))
+                .expect("test grace should be longer than one millisecond"),
+        )
+        .await;
+        assert!(matches!(futures_util::poll!(&mut future), Poll::Pending));
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        future.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_orchestration_backstops_http_independent_of_cleanup() {
+        let shutdown = CancellationToken::new();
+        let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
+        let cleanup_started = Arc::new(AtomicBool::new(false));
+        let cleanup_finished = Arc::new(AtomicBool::new(false));
+        let cleanup_started_for_task = Arc::clone(&cleanup_started);
+        let cleanup_finished_for_task = Arc::clone(&cleanup_finished);
+
+        let cleanup_handle = spawn_shutdown_orchestrator_inner(
+            shutdown.clone(),
+            async move {
+                signal_rx.await.expect("synthetic signal should be sent");
+            },
+            async move {
+                cleanup_started_for_task.store(true, Ordering::SeqCst);
+                sleep(Duration::from_mins(1)).await;
+                cleanup_finished_for_task.store(true, Ordering::SeqCst);
+            },
+        );
+        let serve_handle = tokio::spawn(serve_until_shutdown(
+            std::future::pending::<io::Result<()>>(),
+            shutdown.clone(),
+            SHUTDOWN_GRACE_PERIOD,
+        ));
+
+        tokio::task::yield_now().await;
+        signal_tx
+            .send(())
+            .expect("synthetic signal receiver should still be alive");
+        tokio::task::yield_now().await;
+
+        assert!(shutdown.is_cancelled());
+        assert!(cleanup_started.load(Ordering::SeqCst));
+        assert!(!serve_handle.is_finished());
+
+        tokio::time::advance(SHUTDOWN_GRACE_PERIOD).await;
+        tokio::task::yield_now().await;
+
+        assert!(serve_handle.is_finished());
+        serve_handle
+            .await
+            .expect("serve task should not panic")
+            .expect("serve timeout should be reported as a graceful shutdown");
+        assert!(!cleanup_handle.is_finished());
+        assert!(!cleanup_finished.load(Ordering::SeqCst));
+
+        tokio::time::advance(Duration::from_mins(1)).await;
+        cleanup_handle
+            .await
+            .expect("cleanup task should finish after its own work completes");
+        assert!(cleanup_finished.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn serve_call_site_aborts_cleanup_on_early_serve_error() {
+        let shutdown = CancellationToken::new();
+        let cleanup_handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        let serve_result = serve_until_shutdown(
+            async { Err(io::Error::new(io::ErrorKind::AddrInUse, "listener failed")) },
+            shutdown.clone(),
+            SHUTDOWN_GRACE_PERIOD,
+        )
+        .await;
+
+        assert!(serve_result.is_err());
+        assert!(!shutdown.is_cancelled());
+
+        if shutdown.is_cancelled() {
+            panic!("early serve error should not mark shutdown as cancelled");
+        } else {
+            cleanup_handle.abort();
+        }
+
+        let join_err = cleanup_handle
+            .await
+            .expect_err("cleanup task should be aborted after early serve error");
+        assert!(join_err.is_cancelled());
     }
 
     #[test]
@@ -1190,6 +1428,22 @@ root = "/srv/from-disk"
             fabro_config::RunLayer::default(),
             "manifest defaults should stay free of server-only overrides"
         );
+    }
+
+    #[test]
+    fn effective_log_destination_overrides_resolved_server_settings() {
+        let mut settings = server_settings(
+            r#"
+_version = 1
+
+[server.logging]
+destination = "file"
+"#,
+        );
+
+        apply_effective_log_destination(&mut settings, Some(LogDestination::Stdout));
+
+        assert_eq!(settings.server.logging.destination, LogDestination::Stdout);
     }
 
     #[test]

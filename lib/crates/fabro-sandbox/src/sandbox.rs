@@ -17,6 +17,16 @@ const GIT: &str = "git -c maintenance.auto=0 -c gc.auto=0";
 
 pub const DEFAULT_EXEC_OUTPUT_TAIL_BYTES: usize = 8 * 1024;
 
+/// Sleep for `timeout_ms` if `Some`, otherwise never resolves. Used by
+/// streaming `exec_command` impls to model "no timeout" without scheduling a
+/// `Duration::from_millis(u64::MAX)` sleep.
+pub(crate) async fn optional_timeout(timeout_ms: Option<u64>) {
+    match timeout_ms {
+        Some(ms) => time::sleep(Duration::from_millis(ms)).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
 /// Information returned when a sandbox sets up git for a workflow run.
 #[derive(Debug, Clone)]
 pub struct GitRunInfo {
@@ -93,7 +103,7 @@ macro_rules! delegate_sandbox {
             async fn exec_command_streaming(
                 &self,
                 command: &str,
-                timeout_ms: u64,
+                timeout_ms: Option<u64>,
                 working_dir: Option<&str>,
                 env_vars: Option<&std::collections::HashMap<String, String>>,
                 cancel_token: Option<tokio_util::sync::CancellationToken>,
@@ -133,6 +143,18 @@ macro_rules! delegate_sandbox {
 
             async fn initialize(&self) -> $crate::Result<()> {
                 self.$field.initialize().await
+            }
+
+            async fn start(&self) -> $crate::Result<()> {
+                self.$field.start().await
+            }
+
+            async fn stop(&self) -> $crate::Result<()> {
+                self.$field.stop().await
+            }
+
+            async fn delete(&self) -> $crate::Result<()> {
+                self.$field.delete().await
             }
 
             async fn cleanup(&self) -> $crate::Result<()> {
@@ -253,6 +275,45 @@ pub enum SandboxEvent {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         causes:   Vec<String>,
     },
+    StartStarted {
+        provider: String,
+    },
+    StartCompleted {
+        provider:    String,
+        duration_ms: u64,
+    },
+    StartFailed {
+        provider: String,
+        error:    String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        causes:   Vec<String>,
+    },
+    StopStarted {
+        provider: String,
+    },
+    StopCompleted {
+        provider:    String,
+        duration_ms: u64,
+    },
+    StopFailed {
+        provider: String,
+        error:    String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        causes:   Vec<String>,
+    },
+    DeleteStarted {
+        provider: String,
+    },
+    DeleteCompleted {
+        provider:    String,
+        duration_ms: u64,
+    },
+    DeleteFailed {
+        provider: String,
+        error:    String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        causes:   Vec<String>,
+    },
 
     // -- Snapshot lifecycle --
     SnapshotPulling {
@@ -326,6 +387,54 @@ impl SandboxEvent {
                 causes,
             } => {
                 warn!(provider, error, causes = ?causes, "Sandbox cleanup failed");
+            }
+            Self::StartStarted { provider } => {
+                info!(provider, "Sandbox start started");
+            }
+            Self::StartCompleted {
+                provider,
+                duration_ms,
+            } => {
+                info!(provider, duration_ms, "Sandbox start completed");
+            }
+            Self::StartFailed {
+                provider,
+                error,
+                causes,
+            } => {
+                warn!(provider, error, causes = ?causes, "Sandbox start failed");
+            }
+            Self::StopStarted { provider } => {
+                info!(provider, "Sandbox stop started");
+            }
+            Self::StopCompleted {
+                provider,
+                duration_ms,
+            } => {
+                info!(provider, duration_ms, "Sandbox stop completed");
+            }
+            Self::StopFailed {
+                provider,
+                error,
+                causes,
+            } => {
+                warn!(provider, error, causes = ?causes, "Sandbox stop failed");
+            }
+            Self::DeleteStarted { provider } => {
+                info!(provider, "Sandbox delete started");
+            }
+            Self::DeleteCompleted {
+                provider,
+                duration_ms,
+            } => {
+                info!(provider, duration_ms, "Sandbox delete completed");
+            }
+            Self::DeleteFailed {
+                provider,
+                error,
+                causes,
+            } => {
+                warn!(provider, error, causes = ?causes, "Sandbox delete failed");
             }
             Self::SnapshotPulling { name } => {
                 debug!(name, "Snapshot pulling");
@@ -607,14 +716,21 @@ pub trait Sandbox: Send + Sync {
     async fn exec_command_streaming(
         &self,
         command: &str,
-        timeout_ms: u64,
+        timeout_ms: Option<u64>,
         working_dir: Option<&str>,
         env_vars: Option<&std::collections::HashMap<String, String>>,
         cancel_token: Option<CancellationToken>,
         output_callback: CommandOutputCallback,
     ) -> crate::Result<ExecStreamingResult> {
+        let fallback_timeout_ms = timeout_ms.unwrap_or(u64::MAX);
         let result = self
-            .exec_command(command, timeout_ms, working_dir, env_vars, cancel_token)
+            .exec_command(
+                command,
+                fallback_timeout_ms,
+                working_dir,
+                env_vars,
+                cancel_token,
+            )
             .await?;
         if !result.stdout.is_empty() {
             output_callback(
@@ -658,6 +774,15 @@ pub trait Sandbox: Send + Sync {
         remote_path: &str,
     ) -> crate::Result<()>;
     async fn initialize(&self) -> crate::Result<()>;
+    async fn start(&self) -> crate::Result<()> {
+        Ok(())
+    }
+    async fn stop(&self) -> crate::Result<()> {
+        Ok(())
+    }
+    async fn delete(&self) -> crate::Result<()> {
+        self.cleanup().await
+    }
     async fn cleanup(&self) -> crate::Result<()>;
     fn working_directory(&self) -> &str;
     fn platform(&self) -> &str;

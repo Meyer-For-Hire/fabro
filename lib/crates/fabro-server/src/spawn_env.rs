@@ -13,6 +13,10 @@ const WORKER_ENV_ALLOWLIST: &[&str] = &[
     EnvVars::FABRO_LOG,
     EnvVars::FABRO_HOME,
     EnvVars::FABRO_STORAGE_ROOT,
+    EnvVars::TERM,
+    EnvVars::NO_COLOR,
+    EnvVars::CLICOLOR,
+    EnvVars::CLICOLOR_FORCE,
 ];
 
 const RENDER_GRAPH_ENV_ALLOWLIST: &[&str] = &[EnvVars::PATH, EnvVars::HOME, EnvVars::TMPDIR];
@@ -83,6 +87,10 @@ mod tests {
                 "FABRO_STORAGE_ROOT".to_string(),
                 "/tmp/fabro-storage".to_string(),
             ),
+            ("TERM".to_string(), "xterm-256color".to_string()),
+            ("NO_COLOR".to_string(), "1".to_string()),
+            ("CLICOLOR".to_string(), "0".to_string()),
+            ("CLICOLOR_FORCE".to_string(), "1".to_string()),
             ("SESSION_SECRET".to_string(), "leak".to_string()),
             ("FABRO_JWT_PRIVATE_KEY".to_string(), "leak".to_string()),
             ("FABRO_JWT_PUBLIC_KEY".to_string(), "leak".to_string()),
@@ -106,6 +114,13 @@ mod tests {
         assert_eq!(actual.get("PATH").map(String::as_str), Some("/bin"));
         assert_eq!(actual.get("HOME").map(String::as_str), Some("/tmp/home"));
         assert_eq!(actual.get("FABRO_LOG").map(String::as_str), Some("debug"));
+        assert_eq!(
+            actual.get("TERM").map(String::as_str),
+            Some("xterm-256color")
+        );
+        assert_eq!(actual.get("NO_COLOR").map(String::as_str), Some("1"));
+        assert_eq!(actual.get("CLICOLOR").map(String::as_str), Some("0"));
+        assert_eq!(actual.get("CLICOLOR_FORCE").map(String::as_str), Some("1"));
         assert!(!actual.contains_key("FABRO_LOG_DESTINATION"));
         assert_eq!(
             actual.get("FABRO_DEV_TOKEN").map(String::as_str),

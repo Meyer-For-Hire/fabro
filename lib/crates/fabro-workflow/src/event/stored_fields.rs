@@ -63,9 +63,13 @@ fn stored_event_fields_for_variant(event: &Event) -> StoredEventFields {
         Event::RunCancelRequested { actor }
         | Event::RunPauseRequested { actor }
         | Event::RunUnpauseRequested { actor }
+        | Event::RunInterrupt { actor }
+        | Event::RunSteer { actor, .. }
         | Event::RunArchived { actor }
         | Event::RunUnarchived { actor, .. }
-        | Event::InterviewCompleted { actor, .. } => StoredEventFields {
+        | Event::RunTitleUpdated { actor, .. }
+        | Event::InterviewCompleted { actor, .. }
+        | Event::AgentSteerBuffered { actor, .. } => StoredEventFields {
             actor: actor.clone(),
             ..StoredEventFields::default()
         },
@@ -116,7 +120,82 @@ fn stored_event_fields_for_variant(event: &Event) -> StoredEventFields {
         | Event::CommandStarted { node_id, .. }
         | Event::CommandCompleted { node_id, .. }
         | Event::AgentCliStarted { node_id, .. }
-        | Event::AgentCliCompleted { node_id, .. } => node_stored_fields(Some(node_id.clone())),
+        | Event::AgentCliCompleted { node_id, .. }
+        | Event::AgentCliCancelled { node_id, .. }
+        | Event::AgentCliTimedOut { node_id, .. } => node_stored_fields(Some(node_id.clone())),
+        Event::AgentSessionStarted {
+            session_id,
+            parent_session_id,
+            ..
+        }
+        | Event::AgentSessionEnded {
+            session_id,
+            parent_session_id,
+        } => StoredEventFields {
+            session_id: Some(session_id.clone()),
+            parent_session_id: parent_session_id.clone(),
+            ..StoredEventFields::default()
+        },
+        Event::AgentSessionActivated {
+            node_id,
+            visit,
+            session_id,
+            ..
+        }
+        | Event::AgentSessionDeactivated {
+            node_id,
+            visit,
+            session_id,
+        } => {
+            let node_id_str = node_id.clone();
+            let node_label = default_node_label(Some(&node_id_str), None);
+            StoredEventFields {
+                session_id: Some(session_id.clone()),
+                node_id: Some(node_id_str.clone()),
+                node_label,
+                stage_id: Some(StageId::new(node_id_str, *visit)),
+                ..StoredEventFields::default()
+            }
+        }
+        Event::AgentInterruptInjected {
+            node_id,
+            visit,
+            session_id,
+            actor,
+        } => {
+            let node_id_str = node_id.clone();
+            let node_label = default_node_label(Some(&node_id_str), None);
+            StoredEventFields {
+                session_id: Some(session_id.clone()),
+                node_id: Some(node_id_str.clone()),
+                node_label,
+                stage_id: Some(StageId::new(node_id_str, *visit)),
+                actor: actor.clone(),
+                ..StoredEventFields::default()
+            }
+        }
+        Event::AgentSteerDropped {
+            actor,
+            node_id,
+            visit,
+            ..
+        } => {
+            let node_id_str = node_id.clone();
+            let node_label = node_id_str
+                .as_ref()
+                .and_then(|n| default_node_label(Some(n), None));
+            let stage_id = match (node_id.clone(), visit) {
+                (Some(n), Some(v)) => Some(StageId::new(n, *v)),
+                _ => None,
+            };
+            StoredEventFields {
+                node_id: node_id_str,
+                node_label,
+                stage_id,
+                actor: actor.clone(),
+                ..StoredEventFields::default()
+            }
+        }
         Event::Agent {
             stage,
             visit,
@@ -204,7 +283,7 @@ fn agent_actor_for_event(
         AgentEvent::AssistantMessage { model, .. } => Some(Principal::Agent {
             session_id:        session_id.map(str::to_string),
             parent_session_id: parent_session_id.map(str::to_string),
-            model:             Some(model.clone()),
+            model:             Some(model.model_id.clone()),
         }),
         AgentEvent::ToolCallStarted { .. }
         | AgentEvent::ToolCallOutputDelta { .. }
@@ -213,6 +292,7 @@ fn agent_actor_for_event(
             parent_session_id: parent_session_id.map(str::to_string),
             model:             None,
         }),
+        AgentEvent::SteeringInjected { actor, .. } => actor.clone(),
         _ => None,
     }
 }

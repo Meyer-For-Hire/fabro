@@ -2,25 +2,20 @@ use fabro_test::{fabro_snapshot, test_context};
 use httpmock::MockServer;
 use serde_json::json;
 
-use super::support::{setup_seeded_completed_dry_run, setup_seeded_created_dry_run};
-use crate::support::unique_run_id;
+use super::support::{
+    remote_run_summary_json, setup_seeded_completed_dry_run, setup_seeded_created_dry_run,
+};
+use crate::support::{run_projection_json, unique_run_id};
 
 fn remote_run_summary(run_id: &str, status: &serde_json::Value) -> serde_json::Value {
-    json!({
-        "run_id": run_id,
-        "workflow_name": "Blocked Remote Workflow",
-        "workflow_slug": "blocked-remote-workflow",
-        "goal": "Wait for approval",
-        "title": "Wait for approval",
-        "labels": {},
-        "source_directory": "/srv/repo",
-        "repository": { "name": "repo" },
-        "start_time": "2026-04-19T12:00:00Z",
-        "created_at": "2026-04-19T12:00:00Z",
-        "status": status,
-        "duration_ms": null,
-        "total_usd_micros": null
-    })
+    remote_run_summary_json(
+        run_id,
+        "Blocked Remote Workflow",
+        "blocked-remote-workflow",
+        "Wait for approval",
+        status,
+        "2026-04-19T12:00:00Z",
+    )
 }
 
 #[test]
@@ -169,7 +164,16 @@ fn wait_blocked_run_times_out_without_treating_it_as_terminal() {
             .path(format!("/api/v1/runs/{}/state", run_id.as_str()));
         then.status(200)
             .header("content-type", "application/json")
-            .body("{}");
+            .body(
+                run_projection_json(
+                    run_id.as_str(),
+                    &json!({
+                        "kind": "blocked",
+                        "blocked_reason": "human_input_required"
+                    }),
+                )
+                .to_string(),
+            );
     });
 
     let mut cmd = context.command();

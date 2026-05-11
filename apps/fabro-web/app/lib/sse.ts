@@ -1,6 +1,7 @@
-import type { MutatorCallback } from "swr";
+import type { Key, MutatorCallback } from "swr";
 
-export type MutateFn = (key: string) => ReturnType<MutatorCallback>;
+export type SseKey = Key;
+export type MutateFn = (key: SseKey) => ReturnType<MutatorCallback>;
 
 export interface EventPayload {
   event?: string;
@@ -13,17 +14,24 @@ export interface EventSourceLike {
 }
 
 export interface EventInvalidation {
-  keys: string[];
+  keys: SseKey[];
   close?: boolean;
   immediate?: boolean;
 }
+
+type EventResolver = (payload: EventPayload) => EventInvalidation;
 
 export interface SharedEventSubscription {
   source: EventSourceLike;
   refcount: number;
   mutators: Map<MutateFn, number>;
-  pendingKeys: Set<string>;
+  resolvers: Map<symbol, EventResolver>;
+  pendingKeys: Map<string, SseKey>;
   debounceTimer: ReturnType<typeof setTimeout> | null;
+}
+
+export function sseKeyDedupeId(key: SseKey): string {
+  return stringifyKeyValue(key);
 }
 
 export function createBrowserEventSource(url: string): EventSourceLike {
@@ -54,7 +62,8 @@ export function subscribeToSharedEventSource<TPayload extends EventPayload>({
       source,
       refcount: 0,
       mutators: new Map(),
-      pendingKeys: new Set(),
+      resolvers: new Map(),
+      pendingKeys: new Map(),
       debounceTimer: null,
     };
     subscriptions.set(subscriptionKey, subscription);
@@ -70,24 +79,39 @@ export function subscribeToSharedEventSource<TPayload extends EventPayload>({
         return;
       }
 
-      const invalidation = resolveInvalidation(payload);
-      queueInvalidations(current, invalidation.keys, {
-        debounceMs,
-        immediate: invalidation.immediate,
-      });
+      const keys = new Map<string, SseKey>();
+      let close = false;
+      let immediate = false;
+      for (const resolver of current.resolvers.values()) {
+        const invalidation = resolver(payload);
+        for (const key of invalidation.keys) {
+          keys.set(sseKeyDedupeId(key), key);
+        }
+        close ||= Boolean(invalidation.close);
+        immediate ||= Boolean(invalidation.immediate);
+      }
 
-      if (invalidation.close) {
+      queueInvalidations(current, [...keys.values()], { debounceMs, immediate });
+
+      if (close) {
         closeSharedEventSource(subscriptions, subscriptionKey, { flushPending: true });
       }
     };
   }
 
+  const resolverId = Symbol(subscriptionKey);
+  subscription.resolvers.set(
+    resolverId,
+    resolveInvalidation as EventResolver,
+  );
   subscription.refcount += 1;
   subscription.mutators.set(mutate, (subscription.mutators.get(mutate) ?? 0) + 1);
 
   return () => {
     const current = subscriptions.get(subscriptionKey);
     if (!current) return;
+
+    current.resolvers.delete(resolverId);
 
     const mutateCount = current.mutators.get(mutate) ?? 0;
     if (mutateCount <= 1) {
@@ -105,7 +129,7 @@ export function subscribeToSharedEventSource<TPayload extends EventPayload>({
 
 function queueInvalidations(
   subscription: SharedEventSubscription,
-  keys: string[],
+  keys: SseKey[],
   {
     debounceMs,
     immediate,
@@ -116,7 +140,7 @@ function queueInvalidations(
 ) {
   if (keys.length === 0) return;
   for (const key of keys) {
-    subscription.pendingKeys.add(key);
+    subscription.pendingKeys.set(sseKeyDedupeId(key), key);
   }
 
   if (immediate || debounceMs <= 0) {
@@ -135,7 +159,7 @@ function queueInvalidations(
 
 function flushInvalidations(subscription: SharedEventSubscription) {
   if (subscription.pendingKeys.size === 0) return;
-  const keys = [...subscription.pendingKeys];
+  const keys = [...subscription.pendingKeys.values()];
   subscription.pendingKeys.clear();
 
   for (const mutator of subscription.mutators.keys()) {
@@ -161,4 +185,18 @@ function closeSharedEventSource(
   }
   subscription.source.close();
   subscriptions.delete(subscriptionKey);
+}
+
+function stringifyKeyValue(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stringifyKeyValue(item)).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stringifyKeyValue(record[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value) ?? String(value);
 }

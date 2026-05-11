@@ -22,6 +22,7 @@ use fabro_types::{AuthMethod, IdpIdentity, ServerSettings};
 use fabro_util::error::SharedError;
 use fabro_workflow::handler::HandlerRegistry;
 use object_store::memory::InMemory as MemoryObjectStore;
+use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
 use crate::auth;
@@ -162,6 +163,7 @@ impl TestAppStateBuilder {
             http_client: Some(
                 fabro_http::test_http_client().expect("test HTTP client should build"),
             ),
+            shutdown: CancellationToken::new(),
         })
         .expect("test app state should build")
     }

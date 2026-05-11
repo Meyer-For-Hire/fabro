@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
 
 use ::fabro_types::{
-    BilledTokenCounts, BlockedReason, CommandTermination, FailureReason, ForkSourceRef, GitContext,
-    ParallelBranchId, Principal, PullRequestRecord, RunBlobId, RunId, RunNoticeLevel,
-    RunProvenance, StageId, SuccessReason, run_event as fabro_types,
+    BilledTokenCounts, BlockedReason, CommandTermination, DiffSummary, FailureReason,
+    ForkSourceRef, GitContext, ParallelBranchId, Principal, PullRequestRecord, RunBlobId, RunId,
+    RunNoticeLevel, RunProvenance, SandboxProvider, StageId, SuccessReason,
+    run_event as fabro_types,
 };
 use fabro_agent::{AgentEvent, SandboxEvent};
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,7 @@ use crate::outcome::{BilledModelUsage, FailureDetail, Outcome};
 pub enum Event {
     RunCreated {
         run_id:           RunId,
+        title:            Option<String>,
         settings:         serde_json::Value,
         graph:            serde_json::Value,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -42,8 +44,6 @@ pub enum Event {
         git:              Option<GitContext>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fork_source_ref:  Option<ForkSourceRef>,
-        #[serde(default)]
-        in_place:         bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         web_url:          Option<String>,
     },
@@ -68,6 +68,15 @@ pub enum Event {
     RunQueued,
     RunStarting,
     RunRunning,
+    RunInterrupt {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<Principal>,
+    },
+    RunSteer {
+        text:  String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<Principal>,
+    },
     RunBlocked {
         blocked_reason: BlockedReason,
     },
@@ -101,6 +110,11 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<Principal>,
     },
+    RunTitleUpdated {
+        title: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<Principal>,
+    },
     WorkflowRunCompleted {
         duration_ms:          u64,
         artifact_count:       usize,
@@ -114,6 +128,8 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         final_patch:          Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        diff_summary:         Option<DiffSummary>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         billing:              Option<BilledTokenCounts>,
     },
     WorkflowRunFailed {
@@ -124,6 +140,8 @@ pub enum Event {
         git_commit_sha: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         final_patch:    Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diff_summary:   Option<DiffSummary>,
     },
     RunNotice {
         level:            RunNoticeLevel,
@@ -206,6 +224,7 @@ pub enum Event {
         failure:     FailureDetail,
         will_retry:  bool,
         duration_ms: u64,
+        billing:     Option<BilledModelUsage>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor:       Option<Principal>,
     },
@@ -311,6 +330,8 @@ pub enum Event {
         node_visits: BTreeMap<String, usize>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         diff: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diff_summary: Option<DiffSummary>,
     },
     CheckpointFailed {
         node_id:          String,
@@ -416,9 +437,8 @@ pub enum Event {
     /// Emitted after the sandbox has been initialized (by engine lifecycle).
     SandboxInitialized {
         working_directory: String,
-        provider:          String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        identifier:        Option<String>,
+        provider:          SandboxProvider,
+        id:                String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         repo_cloned:       Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -503,17 +523,14 @@ pub enum Event {
         timeout_ms: Option<u64>,
     },
     CommandCompleted {
-        node_id:           String,
-        stdout:            String,
-        stderr:            String,
+        node_id:        String,
+        output:         String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        exit_code:         Option<i32>,
-        duration_ms:       u64,
-        termination:       CommandTermination,
-        stdout_bytes:      u64,
-        stderr_bytes:      u64,
-        streams_separated: bool,
-        live_streaming:    bool,
+        exit_code:      Option<i32>,
+        duration_ms:    u64,
+        termination:    CommandTermination,
+        output_bytes:   u64,
+        live_streaming: bool,
     },
     AgentCliStarted {
         node_id:  String,
@@ -523,11 +540,85 @@ pub enum Event {
         model:    String,
         command:  String,
     },
+    /// A top-level agent session object started its lifecycle.
+    AgentSessionStarted {
+        session_id:        String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider:          Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model:             Option<String>,
+    },
+    /// A stage has a currently steerable API-mode session binding.
+    AgentSessionActivated {
+        node_id:      String,
+        visit:        u32,
+        session_id:   String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thread_id:    Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider:     Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model:        Option<String>,
+        capabilities: Vec<fabro_types::SessionCapability>,
+    },
+    /// A stage's steerable API-mode session binding ended.
+    AgentSessionDeactivated {
+        node_id:    String,
+        visit:      u32,
+        session_id: String,
+    },
+    /// A top-level agent session object ended its lifecycle.
+    AgentSessionEnded {
+        session_id:        String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_session_id: Option<String>,
+    },
+    /// A run-level interrupt was delivered to a concrete API-mode agent
+    /// session/stage.
+    AgentInterruptInjected {
+        node_id:    String,
+        visit:      u32,
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor:      Option<Principal>,
+    },
+    /// A steer arrived with no active session and was parked in the run-wide
+    /// pending buffer. The actor (steer author) is lifted to top-level.
+    AgentSteerBuffered {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<Principal>,
+    },
+    /// One or more buffered/queued steers were dropped because a cap was
+    /// reached or the run ended before they could be delivered.
+    AgentSteerDropped {
+        reason:  fabro_types::AgentSteerDroppedReason,
+        count:   u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor:   Option<Principal>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        node_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        visit:   Option<u32>,
+    },
     AgentCliCompleted {
         node_id:     String,
         stdout:      String,
         stderr:      String,
         exit_code:   i32,
+        duration_ms: u64,
+    },
+    AgentCliCancelled {
+        node_id:     String,
+        stdout:      String,
+        stderr:      String,
+        duration_ms: u64,
+    },
+    AgentCliTimedOut {
+        node_id:     String,
+        stdout:      String,
+        stderr:      String,
         duration_ms: u64,
     },
     PullRequestCreated {
@@ -578,27 +669,6 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         exec_output_tail: Option<fabro_types::ExecOutputTail>,
     },
-    RetroStarted {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        prompt:   Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        provider: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        model:    Option<String>,
-    },
-    RetroCompleted {
-        duration_ms: u64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        response:    Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        retro:       Option<serde_json::Value>,
-    },
-    RetroFailed {
-        error:            String,
-        duration_ms:      u64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        exec_output_tail: Option<fabro_types::ExecOutputTail>,
-    },
 }
 
 impl Event {
@@ -637,6 +707,12 @@ impl Event {
             }
             Self::RunRunning => {
                 info!("Run running");
+            }
+            Self::RunInterrupt { .. } => {
+                info!("Run interrupt accepted");
+            }
+            Self::RunSteer { text, .. } => {
+                info!(text_len = text.len(), "Run steer accepted");
             }
             Self::RunBlocked { blocked_reason } => {
                 info!(?blocked_reason, "Run blocked");
@@ -681,6 +757,9 @@ impl Event {
             }
             Self::RunUnarchived { actor } => {
                 info!(?actor, "Run unarchived");
+            }
+            Self::RunTitleUpdated { title, actor } => {
+                info!(title, ?actor, "Run title updated");
             }
             Self::WorkflowRunCompleted {
                 duration_ms,
@@ -1058,13 +1137,13 @@ impl Event {
             Self::SandboxInitialized {
                 working_directory,
                 provider,
-                identifier,
+                id,
                 ..
             } => {
                 info!(
                     working_directory,
-                    provider,
-                    identifier = identifier.as_deref().unwrap_or(""),
+                    provider = %provider,
+                    id,
                     "Sandbox initialized"
                 );
             }
@@ -1217,8 +1296,7 @@ impl Event {
                 exit_code,
                 duration_ms,
                 termination,
-                stdout_bytes,
-                stderr_bytes,
+                output_bytes,
                 ..
             } => {
                 debug!(
@@ -1226,8 +1304,7 @@ impl Event {
                     exit_code,
                     duration_ms,
                     termination = %termination,
-                    stdout_bytes,
-                    stderr_bytes,
+                    output_bytes,
                     "Command completed"
                 );
             }
@@ -1246,6 +1323,60 @@ impl Event {
                 ..
             } => {
                 debug!(node_id, exit_code, duration_ms, "Agent CLI completed");
+            }
+            Self::AgentSessionStarted {
+                session_id,
+                provider,
+                model,
+                ..
+            } => {
+                debug!(session_id, ?provider, ?model, "Agent session started");
+            }
+            Self::AgentSessionActivated {
+                node_id,
+                visit,
+                session_id,
+                ..
+            } => {
+                debug!(node_id, visit, session_id, "Agent session activated");
+            }
+            Self::AgentSessionDeactivated {
+                node_id,
+                visit,
+                session_id,
+            } => {
+                debug!(node_id, visit, session_id, "Agent session deactivated");
+            }
+            Self::AgentSessionEnded { session_id, .. } => {
+                debug!(session_id, "Agent session ended");
+            }
+            Self::AgentInterruptInjected {
+                node_id,
+                visit,
+                session_id,
+                ..
+            } => {
+                debug!(node_id, visit, session_id, "Agent interrupt injected");
+            }
+            Self::AgentSteerBuffered { .. } => {
+                debug!("Steer buffered (no active session)");
+            }
+            Self::AgentSteerDropped { reason, count, .. } => {
+                warn!(?reason, count, "Steer dropped");
+            }
+            Self::AgentCliCancelled {
+                node_id,
+                duration_ms,
+                ..
+            } => {
+                debug!(node_id, duration_ms, "Agent CLI cancelled");
+            }
+            Self::AgentCliTimedOut {
+                node_id,
+                duration_ms,
+                ..
+            } => {
+                debug!(node_id, duration_ms, "Agent CLI timed out");
             }
             Self::PullRequestCreated {
                 pr_url,
@@ -1329,37 +1460,6 @@ impl Event {
                     exec_stdout_truncated = tail.stdout_truncated,
                     exec_stderr_truncated = tail.stderr_truncated,
                     "Devcontainer lifecycle command failed"
-                );
-            }
-            Self::RetroStarted {
-                prompt: _,
-                provider,
-                model,
-            } => {
-                info!(
-                    provider = provider.as_deref().unwrap_or(""),
-                    model = model.as_deref().unwrap_or(""),
-                    "Retro started"
-                );
-            }
-            Self::RetroCompleted { duration_ms, .. } => {
-                info!(duration_ms, "Retro completed");
-            }
-            Self::RetroFailed {
-                error,
-                duration_ms,
-                exec_output_tail,
-            } => {
-                let tail = fabro_types::ExecOutputTail::trace_summary(exec_output_tail.as_ref());
-                error!(
-                    error = %error,
-                    duration_ms,
-                    exec_output_tail_present = tail.present,
-                    exec_stdout_tail_bytes = tail.stdout_bytes,
-                    exec_stderr_tail_bytes = tail.stderr_bytes,
-                    exec_stdout_truncated = tail.stdout_truncated,
-                    exec_stderr_truncated = tail.stderr_truncated,
-                    "Retro failed"
                 );
             }
         }

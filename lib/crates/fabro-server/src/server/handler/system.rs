@@ -4,9 +4,10 @@ use super::super::{
     AggregateBilling, AggregateBillingTotals, ApiError, AppState, BilledTokenCounts,
     BillingByModel, DfParams, FABRO_VERSION, GithubIntegrationStrategy, IntoResponse, Json,
     ModelReference, Path, PruneRunsRequest, PruneRunsResponse, Query, RequiredUser, Response,
-    Router, RunStatus, State, StatusCode, SystemInfoResponse, SystemRunCounts,
-    build_disk_usage_response, build_prune_plan, delete_run_internal, diagnostics, get, post,
-    resolve_interp_string, spawn_blocking, system_features, system_sandbox_provider, to_i64,
+    Router, RunStatus, State, StatusCode, SystemInfoResponse, SystemRepairRunIssue,
+    SystemRepairRunsResponse, SystemRunCounts, build_disk_usage_response, build_prune_plan,
+    delete_run_internal, diagnostics, get, post, resolve_interp_string, spawn_blocking,
+    system_features, system_sandbox_provider, to_i64,
 };
 
 pub(super) fn routes() -> Router<Arc<AppState>> {
@@ -16,6 +17,7 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         .route("/settings", get(get_server_settings))
         .route("/system/info", get(get_system_info))
         .route("/system/df", get(get_system_df))
+        .route("/system/repair/runs", get(get_system_repair_runs))
         .route("/system/prune/runs", post(prune_runs))
         .route("/billing", get(get_aggregate_billing))
 }
@@ -115,6 +117,34 @@ async fn get_system_df(
     };
 
     (StatusCode::OK, Json(response)).into_response()
+}
+
+async fn get_system_repair_runs(
+    _auth: RequiredUser,
+    State(state): State<Arc<AppState>>,
+) -> Response {
+    let issues = match state.store.list_unreadable_runs().await {
+        Ok(issues) => issues,
+        Err(err) => {
+            return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+                .into_response();
+        }
+    };
+    let total_count = to_i64(issues.len());
+    let runs = issues
+        .into_iter()
+        .map(|issue| SystemRepairRunIssue {
+            run_id:     issue.run_id.to_string(),
+            created_at: issue.created_at,
+            error:      issue.error,
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(SystemRepairRunsResponse { runs, total_count }),
+    )
+        .into_response()
 }
 
 async fn prune_runs(
@@ -336,7 +366,16 @@ async fn get_github_repo(
         }
         GithubIntegrationStrategy::Token => {
             let token = match state.github_credentials(github_settings) {
-                Ok(Some(fabro_github::GitHubCredentials::Token(token))) => token,
+                Ok(Some(fabro_github::GitHubCredentials::Pat(token))) => token,
+                Ok(Some(fabro_github::GitHubCredentials::Installation(token))) => {
+                    match token.valid_token() {
+                        Ok(token) => token.to_string(),
+                        Err(err) => {
+                            return ApiError::new(StatusCode::SERVICE_UNAVAILABLE, err.to_string())
+                                .into_response();
+                        }
+                    }
+                }
                 Ok(Some(_)) => unreachable!("token strategy should not return app credentials"),
                 Ok(None) => {
                     return ApiError::new(

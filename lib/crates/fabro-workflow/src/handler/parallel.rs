@@ -12,7 +12,7 @@ use tokio::sync::Semaphore;
 use super::{EngineServices, Handler};
 use crate::context::{Context, WorkflowContext, keys};
 use crate::error::Error;
-use crate::event::{Event, StageScope};
+use crate::event::{Event, RunNoticeCode, RunNoticeLevel, StageScope};
 use crate::git::sanitize_ref_component;
 use crate::hook_context::set_hook_node;
 use crate::millis_u64;
@@ -207,6 +207,12 @@ impl Handler for ParallelHandler {
                         error = %fabro_sandbox::display_for_log(&e),
                         "parallel base checkpoint failed"
                     );
+                    services.run.emitter.notice_with_tail(
+                        RunNoticeLevel::Warn,
+                        RunNoticeCode::ParallelBaseCheckpointFailed,
+                        format!("Could not checkpoint base state before parallel branches: {e}"),
+                        fabro_sandbox::default_redacted_output_tail(&e),
+                    );
                     None
                 }
             }
@@ -297,7 +303,8 @@ impl Handler for ParallelHandler {
         for setup in branch_setups {
             let parent_run = Arc::clone(&services.run);
             let registry = Arc::clone(&services.registry);
-            let env = services.env.clone();
+            let base_env = services.base_env.clone();
+            let github_token = services.github_token.clone();
             let inputs = services.inputs.clone();
             let dry_run = services.dry_run;
             let workflow_path = services.workflow_path.clone();
@@ -365,7 +372,8 @@ impl Handler for ParallelHandler {
                     run: parent_run.with_sandbox(Arc::clone(&setup.sandbox)),
                     registry: Arc::clone(&registry),
                     git_state: std::sync::RwLock::new(None),
-                    env: env.clone(),
+                    base_env: base_env.clone(),
+                    github_token: github_token.clone(),
                     inputs: inputs.clone(),
                     dry_run,
                     workflow_path,
@@ -458,10 +466,17 @@ impl Handler for ParallelHandler {
 
         // Collect results
         let mut results: Vec<BranchResult> = Vec::new();
-        for handle in handles {
+        let mut handles = handles.into_iter();
+        while let Some(handle) = handles.next() {
             match handle.await {
                 Ok(Ok(result)) => {
                     results.push(result);
+                }
+                Ok(Err(Error::Cancelled)) => {
+                    for handle in handles {
+                        handle.abort();
+                    }
+                    return Err(Error::Cancelled);
                 }
                 Ok(Err(e)) => {
                     results.push(BranchResult {
@@ -670,6 +685,34 @@ mod tests {
         ))
     }
 
+    async fn seed_created(run_store: &fabro_store::RunDatabase) {
+        crate::event::append_event(
+            run_store,
+            &fixtures::RUN_1,
+            &crate::event::Event::RunCreated {
+                run_id:           fixtures::RUN_1,
+                title:            None,
+                settings:         serde_json::to_value(fabro_types::WorkflowSettings::default())
+                    .unwrap(),
+                graph:            serde_json::to_value(fabro_types::Graph::new("test")).unwrap(),
+                workflow_source:  None,
+                workflow_config:  None,
+                labels:           std::collections::BTreeMap::default(),
+                run_dir:          "/tmp".to_string(),
+                source_directory: None,
+                workflow_slug:    None,
+                db_prefix:        None,
+                provenance:       None,
+                manifest_blob:    None,
+                git:              None,
+                fork_source_ref:  None,
+                web_url:          None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
     fn test_context() -> Context {
         let context = Context::new();
         context.set(
@@ -700,6 +743,7 @@ mod tests {
     async fn parallel_handler_with_branches() {
         let store = test_store();
         let run_store = store.create_run(&fixtures::RUN_1).await.unwrap();
+        seed_created(&run_store).await;
         let mut services = EngineServices::test_default();
         services.run = services
             .run
@@ -752,6 +796,7 @@ mod tests {
     async fn parallel_handler_stores_results_in_run_store() {
         let store = test_store();
         let run_store = store.create_run(&fixtures::RUN_1).await.unwrap();
+        seed_created(&run_store).await;
         let mut services = EngineServices::test_default();
         services.run = services
             .run

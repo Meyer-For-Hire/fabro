@@ -1,15 +1,20 @@
 import {
   lazy,
+  memo,
   Suspense,
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type ReactElement,
-  type ReactNode,
 } from "react";
-import { useParams } from "react-router";
-import * as PierreDiffs from "@pierre/diffs/react";
+import { useLocation, useNavigate, useParams } from "react-router";
+import {
+  MultiFileDiff,
+  PatchDiff,
+  type FileContents,
+} from "@pierre/diffs/react";
 import { useToast } from "../components/toast";
 import type {
   FileDiff as ApiFileDiff,
@@ -29,26 +34,31 @@ import {
   RunFilesErrorBoundary,
 } from "./run-files/states";
 import { useFileKeyboardNav } from "./run-files/keyboard";
-import { Toolbar, type DiffStyle } from "./run-files/toolbar";
+import {
+  Toolbar,
+  type DiffPickerValue,
+  type DiffStyle,
+} from "./run-files/toolbar";
+import { fileCacheKey, stringHash } from "./run-files/cache-keys";
+import { buildRunCommitOptions } from "./run-files/commit-options";
+import { VirtualizedDiffList } from "./run-files/virtualized-diff-list";
 import { ApiError, extractRequestId } from "../lib/api-client";
-import { useRun, useRunFiles } from "../lib/queries";
+import { useRun, useRunCommits, useRunFiles } from "../lib/queries";
+import {
+  runFileScopeSelection,
+  type RunFileScope,
+  type RunFileSelection,
+} from "../lib/query-keys";
 
 export { extractRequestId };
 
-const { MultiFileDiff, PatchDiff } = PierreDiffs;
 const FileTreeSidebar = lazy(() =>
   import("./run-files/file-tree-sidebar").then((module) => ({
     default: module.FileTreeSidebar,
   })),
 );
-const maybeVirtualizer = (PierreDiffs as Record<string, unknown>).Virtualizer;
-const Virtualizer = typeof maybeVirtualizer === "function"
-  ? maybeVirtualizer as ({ children }: { children: ReactNode }) => ReactElement
-  : function VirtualizerFallback({ children }: { children: ReactNode }) {
-      return <>{children}</>;
-    };
 
-export const handle = { wide: true };
+export const handle = { wide: true, fullHeight: true };
 
 const MD_BREAKPOINT_PX = 768;
 const DIFF_STYLE_STORAGE_KEY = "fabro.run-files.diff-style";
@@ -58,6 +68,13 @@ const DIFF_STYLE_STORAGE_KEY = "fabro.run-files.diff-style";
 const MIN_REFRESH_SPIN_MS = 500;
 
 export const ErrorBoundary = RunFilesErrorBoundary;
+
+export function normalizeRunFileScope(value: string | null): RunFileScope {
+  if (value === "all" || value === "uncommitted" || value === "committed") {
+    return value;
+  }
+  return "committed";
+}
 
 function useNarrowViewport(): boolean {
   const [narrow, setNarrow] = useState(() => {
@@ -195,13 +212,169 @@ export function deepLinkToastMessage(
   return resolveDeepLinkToast(hashFile, data)?.message ?? null;
 }
 
+interface RunFileRowProps {
+  file: ApiFileDiff;
+  diffStyle: DiffStyle;
+  isDeepLinkTarget: boolean;
+  runId: string;
+  toSha: string | null | undefined;
+}
+
+function fileDiffRenderKey({
+  file,
+  index,
+  scope,
+  toSha,
+}: {
+  file: ApiFileDiff;
+  index: number;
+  scope: string;
+  toSha: string | null | undefined;
+}): string {
+  const display = file.new_file.name || file.old_file.name || `file-${index}`;
+  const oldContents = file.old_file.contents ?? "";
+  const newContents = file.new_file.contents ?? "";
+  const contentFingerprint = file.unified_patch
+    ? `patch:${stringHash(file.unified_patch)}`
+    : `contents:${stringHash(oldContents)}:${stringHash(newContents)}`;
+  return [
+    scope,
+    toSha ?? "no-sha",
+    display,
+    index,
+    file.change_kind ?? "modified",
+    contentFingerprint,
+  ].join(":");
+}
+
+const RunFileRow = memo(function RunFileRow({
+  file,
+  diffStyle,
+  isDeepLinkTarget,
+  runId,
+  toSha,
+}: RunFileRowProps) {
+  const display = file.new_file.name || file.old_file.name;
+  const placeholder = pickPlaceholder(file);
+
+  const oldContents = file.old_file.contents;
+  const newContents = file.new_file.contents;
+  const oldPath = file.old_file.name || display;
+  const newPath = file.new_file.name || display;
+
+  const oldFile = useMemo<FileContents | null>(() => {
+    if (oldContents == null) return null;
+    return {
+      ...file.old_file,
+      name:     oldPath,
+      contents: oldContents,
+      cacheKey: fileCacheKey({
+        runId,
+        toSha,
+        side: "old",
+        path: oldPath,
+        contents: oldContents,
+      }),
+    };
+  }, [file.old_file, oldContents, oldPath, runId, toSha]);
+
+  const newFile = useMemo<FileContents | null>(() => {
+    if (newContents == null) return null;
+    return {
+      ...file.new_file,
+      name:     newPath,
+      contents: newContents,
+      cacheKey: fileCacheKey({
+        runId,
+        toSha,
+        side: "new",
+        path: newPath,
+        contents: newContents,
+      }),
+    };
+  }, [file.new_file, newContents, newPath, runId, toSha]);
+
+  const multiFileOptions = useMemo(
+    () => ({
+      diffStyle,
+      expandUnchanged: isDeepLinkTarget ? true : undefined,
+    }),
+    [diffStyle, isDeepLinkTarget],
+  );
+  const patchOptions = useMemo(() => ({ diffStyle }), [diffStyle]);
+  const patch = useMemo(() => file.unified_patch ?? null, [file.unified_patch]);
+
+  let body: ReactElement | null = null;
+  if (placeholder) {
+    body = placeholder;
+  } else if (oldFile && newFile) {
+    body = (
+      <MultiFileDiff
+        oldFile={oldFile}
+        newFile={newFile}
+        options={multiFileOptions}
+      />
+    );
+  } else if (patch) {
+    body = (
+      <PatchDiff
+        key={stringHash(patch)}
+        patch={patch}
+        options={patchOptions}
+      />
+    );
+  }
+
+  return (
+    <div
+      id={fileRowId(display)}
+      tabIndex={-1}
+      data-run-file-row="true"
+      role="region"
+      aria-label={`${file.change_kind ?? "modified"}: ${display}`}
+      className="focus:outline-2 focus:outline-focus focus:outline-offset-2 rounded-md"
+    >
+      {body}
+    </div>
+  );
+});
+
 export default function RunFiles() {
   const params = useParams();
-  const filesQuery = useRunFiles(params.id);
+  const location = useLocation();
+  const navigate = useNavigate();
+  const searchParams = useMemo(
+    () => new URLSearchParams(location.search),
+    [location.search],
+  );
+  const selectedScope = normalizeRunFileScope(searchParams.get("scope"));
+  const selectedCommitSha = searchParams.get("commit");
+  const commitsQuery = useRunCommits(params.id);
+  const commitOptions = useMemo(
+    () => buildRunCommitOptions(commitsQuery.data?.data ?? []),
+    [commitsQuery.data],
+  );
+  const selectedCommit = selectedCommitSha
+    ? commitOptions.find((commit) => commit.sha === selectedCommitSha)
+    : undefined;
+  const waitingForCommitSelection =
+    !!selectedCommitSha && commitsQuery.data === undefined && !commitsQuery.error;
+  const fileSelection: RunFileSelection =
+    selectedCommit && selectedCommit.fromSha
+      ? {
+          kind:    "commit",
+          fromSha: selectedCommit.fromSha,
+          toSha:   selectedCommit.toSha,
+        }
+      : runFileScopeSelection(selectedScope);
+  const filesQuery = useRunFiles(
+    waitingForCommitSelection ? undefined : params.id,
+    fileSelection,
+  );
   const runQuery = useRun(params.id);
   const { push } = useToast();
   const narrow = useNarrowViewport();
-  const runStatus = runQuery.data?.status?.kind;
+  const runStatus = runQuery.data?.lifecycle.status.kind;
 
   // Preserve the last successful payload so a failed revalidation can keep
   // rendering the previous files while surfacing an inline banner.
@@ -224,7 +397,7 @@ export default function RunFiles() {
   const data: PaginatedRunFileList | null =
     filesQuery.data ?? lastGoodDataRef.current;
 
-  const isInitialLoading = filesQuery.isLoading && !data;
+  const isInitialLoading = (waitingForCommitSelection || filesQuery.isLoading) && !data;
   const isRevalidating = filesQuery.isValidating;
 
   // Revalidation error is whatever the most recent loader call returned;
@@ -265,6 +438,24 @@ export default function RunFiles() {
     setMinSpinUntil(Date.now() + MIN_REFRESH_SPIN_MS);
     void filesQuery.mutate();
   }, [filesQuery]);
+  const handlePickerChange = useCallback(
+    (selection: DiffPickerValue) => {
+      const search = new URLSearchParams(location.search);
+      if (selection.kind === "commit") {
+        search.set("commit", selection.sha);
+        search.delete("scope");
+      } else {
+        search.set("scope", selection.scope);
+        search.delete("commit");
+      }
+      navigate({
+        pathname: location.pathname,
+        search:   `?${search.toString()}`,
+        hash:     location.hash,
+      });
+    },
+    [location.hash, location.pathname, location.search, navigate],
+  );
   useEffect(() => {
     if (minSpinUntil === 0) return;
     const remaining = minSpinUntil - Date.now();
@@ -292,7 +483,7 @@ export default function RunFiles() {
 
   // Deep-link handling: scroll + focus the matching row. Expansion is
   // handled by passing `expandUnchanged: true` to the targeted MultiFileDiff
-  // via per-file options (see `renderFiles` below) — @pierre/diffs 1.1.x
+  // via per-file options on `RunFileRow` — @pierre/diffs 1.1.x
   // exposes no imperative expand API, so click-based "expand" is not
   // available.
   const [hashFile, setHashFile] = useState<string | null>(() => {
@@ -332,76 +523,6 @@ export default function RunFiles() {
     window.location.hash = next;
   }, []);
 
-  const renderFiles = useCallback(
-    (files: ApiFileDiff[]): ReactElement[] =>
-      files.map((file, idx) => {
-        const display = file.new_file.name || file.old_file.name;
-        const placeholder = pickPlaceholder(file);
-        if (placeholder) {
-          return (
-            <div
-              key={`${display}-${idx}`}
-              id={fileRowId(display)}
-              tabIndex={-1}
-              data-run-file-row="true"
-              role="region"
-              aria-label={`${file.change_kind ?? "changed"}: ${display}`}
-              className="focus:outline-2 focus:outline-focus focus:outline-offset-2 rounded-md"
-            >
-              {placeholder}
-            </div>
-          );
-        }
-        // When the deep-link targets this file, pass expandUnchanged:true so
-        // the full surrounding context renders without per-hunk clicking.
-        const isDeepLinkTarget =
-          !!hashFile &&
-          (file.new_file.name === hashFile || file.old_file.name === hashFile);
-        const oldContents = file.old_file.contents;
-        const newContents = file.new_file.contents;
-        let body: ReactElement | null = null;
-        if (oldContents != null && newContents != null) {
-          const oldFile = { ...file.old_file, contents: oldContents };
-          const newFile = { ...file.new_file, contents: newContents };
-          body = (
-            <MultiFileDiff
-              oldFile={oldFile}
-              newFile={newFile}
-              options={{
-                diffStyle,
-                theme: "pierre-dark",
-                expandUnchanged: isDeepLinkTarget ? true : undefined,
-              }}
-            />
-          );
-        } else if (file.unified_patch) {
-          body = (
-            <PatchDiff
-              patch={file.unified_patch}
-              options={{
-                diffStyle,
-                theme: "pierre-dark",
-              }}
-            />
-          );
-        }
-        return (
-          <div
-            key={`${file.new_file.name}-${idx}`}
-            id={fileRowId(display)}
-            tabIndex={-1}
-            data-run-file-row="true"
-            role="region"
-            aria-label={`${file.change_kind ?? "modified"}: ${file.new_file.name}`}
-            className="focus:outline-2 focus:outline-focus focus:outline-offset-2 rounded-md"
-          >
-            {body}
-          </div>
-        );
-      }),
-    [diffStyle, hashFile],
-  );
-
   if (isInitialLoading) {
     return <LoadingSkeleton reserveSidebar={!narrow} />;
   }
@@ -430,6 +551,14 @@ export default function RunFiles() {
   }
 
   const { data: files, meta } = data;
+  const showScopePicker = data.meta.source === "sandbox";
+  const pickerSelection: DiffPickerValue =
+    selectedCommit && selectedCommit.fromSha
+      ? { kind: "commit", sha: selectedCommit.sha }
+      : { kind: "scope", scope: showScopePicker ? selectedScope : "committed" };
+  const effectiveScope = fileSelection.kind === "commit"
+    ? `commit:${fileSelection.toSha}`
+    : fileSelection.scope;
 
   // Refresh is disabled when the server reports the same `to_sha` it
   // reported on the previous successful fetch — no new checkpoint yet.
@@ -446,6 +575,10 @@ export default function RunFiles() {
         additions: meta.stats.additions,
         deletions: meta.stats.deletions,
       }}
+      selection={pickerSelection}
+      commits={commitOptions}
+      showScopePicker={showScopePicker}
+      onPickerChange={handlePickerChange}
       onRefresh={handleRefresh}
       refreshing={showRefreshing}
       refreshDisabled={refreshDisabled}
@@ -459,7 +592,7 @@ export default function RunFiles() {
 
   if (files.length === 0) {
     return (
-      <div ref={containerRef} className="flex flex-col gap-4">
+      <div ref={containerRef} className="flex min-h-0 flex-1 flex-col gap-4">
         {toolbar}
         {meta.degraded ? (
           <DegradedBanner reason={meta.degraded_reason} />
@@ -475,28 +608,21 @@ export default function RunFiles() {
     );
   }
 
-  // Large result sets get @pierre/diffs Virtualizer for lazy mounting so
-  // 200-file runs don't synchronously mount every diff.
-  const body =
-    files.length > 20 ? (
-      <Virtualizer>{renderFiles(files)}</Virtualizer>
-    ) : (
-      <>{renderFiles(files)}</>
-    );
-
   return (
-    <div ref={containerRef} className="flex flex-col gap-4">
-      {toolbar}
-      {revalidationError ? (
-        <InlineErrorBanner
-          message={revalidationError}
-          onRetry={() => void filesQuery.mutate()}
-        />
-      ) : null}
-      {meta.degraded ? (
-        <DegradedBanner reason={meta.degraded_reason} />
-      ) : null}
-      <div className="flex gap-4">
+    <div ref={containerRef} className="flex min-h-0 flex-1 flex-col gap-4">
+      <div className="shrink-0 space-y-4">
+        {toolbar}
+        {revalidationError ? (
+          <InlineErrorBanner
+            message={revalidationError}
+            onRetry={() => void filesQuery.mutate()}
+          />
+        ) : null}
+        {meta.degraded ? (
+          <DegradedBanner reason={meta.degraded_reason} />
+        ) : null}
+      </div>
+      <div className="flex min-h-0 flex-1 gap-4">
         {!narrow ? (
           <Suspense fallback={<FileTreeSidebarSkeleton />}>
             <FileTreeSidebar
@@ -506,8 +632,30 @@ export default function RunFiles() {
             />
           </Suspense>
         ) : null}
-        <div className="flex min-w-0 flex-1 flex-col gap-4">
-          {body}
+        <div className="flex min-w-0 min-h-0 flex-1 flex-col">
+          <VirtualizedDiffList>
+            {files.map((file, idx) => {
+              const display = file.new_file.name || file.old_file.name;
+              const isDeepLinkTarget =
+                !!hashFile &&
+                (file.new_file.name === hashFile || file.old_file.name === hashFile);
+              return (
+                <RunFileRow
+                  key={fileDiffRenderKey({
+                    file,
+                    index: idx,
+                    scope: effectiveScope,
+                    toSha: meta.to_sha,
+                  })}
+                  file={file}
+                  diffStyle={diffStyle}
+                  isDeepLinkTarget={isDeepLinkTarget}
+                  runId={params.id ?? "unknown-run"}
+                  toSha={meta.to_sha}
+                />
+              );
+            })}
+          </VirtualizedDiffList>
         </div>
       </div>
     </div>

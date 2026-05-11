@@ -19,11 +19,13 @@
  */
 
 export const BoardColumn = {
+    QUEUED: 'queued',
     INITIALIZING: 'initializing',
     RUNNING: 'running',
     BLOCKED: 'blocked',
     SUCCEEDED: 'succeeded',
-    FAILED: 'failed'
+    FAILED: 'failed',
+    ARCHIVED: 'archived'
 } as const;
 
 export type BoardColumn = typeof BoardColumn[keyof typeof BoardColumn];

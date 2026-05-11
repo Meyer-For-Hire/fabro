@@ -210,6 +210,18 @@ impl Sandbox for WorktreeSandbox {
         Ok(())
     }
 
+    async fn start(&self) -> crate::Result<()> {
+        self.inner.start().await
+    }
+
+    async fn stop(&self) -> crate::Result<()> {
+        self.inner.stop().await
+    }
+
+    async fn delete(&self) -> crate::Result<()> {
+        self.inner.delete().await
+    }
+
     fn working_directory(&self) -> &str {
         &self.config.worktree_path
     }
@@ -236,7 +248,7 @@ impl Sandbox for WorktreeSandbox {
     async fn exec_command_streaming(
         &self,
         command: &str,
-        timeout_ms: u64,
+        timeout_ms: Option<u64>,
         working_dir: Option<&str>,
         env_vars: Option<&HashMap<String, String>>,
         cancel_token: Option<CancellationToken>,
@@ -688,6 +700,20 @@ mod tests {
             "cleanup should not issue destructive git commands \
              (worktree must be preserved for fabro cp), but got: {cmds:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_operations_forward_to_inner_sandbox() {
+        let (inner, mock) = make_mock();
+        let wt = WorktreeSandbox::new(inner, make_config("/tmp/wt"));
+
+        wt.start().await.unwrap();
+        wt.stop().await.unwrap();
+        wt.delete().await.unwrap();
+
+        assert_eq!(mock.start_count(), 1);
+        assert_eq!(mock.stop_count(), 1);
+        assert_eq!(mock.delete_count(), 1);
     }
 
     // -----------------------------------------------------------------------

@@ -18,6 +18,7 @@ fn run_spec_round_trips_templated_settings() {
         run_id:           fixtures::RUN_1,
         settings:         templated_settings(),
         graph:            Graph::new("ship"),
+        graph_source:     None,
         workflow_slug:    Some("demo".to_string()),
         source_directory: Some("/Users/client/project".to_string()),
         labels:           HashMap::from([("team".to_string(), "platform".to_string())]),
@@ -38,7 +39,6 @@ fn run_spec_round_trips_templated_settings() {
             source_run_id:  fixtures::RUN_2,
             checkpoint_sha: "def456".to_string(),
         }),
-        in_place:         false,
     };
 
     let json = serde_json::to_value(&record).expect("record should serialize");
@@ -54,8 +54,6 @@ fn run_spec_round_trips_templated_settings() {
     assert_eq!(json["git"]["dirty"], "clean");
     assert_eq!(json["git"]["push_outcome"]["type"], "succeeded");
     assert_eq!(json["fork_source_ref"]["checkpoint_sha"], "def456");
-    assert_eq!(json["in_place"], false);
-
     let round_trip: RunSpec =
         serde_json::from_value(json.clone()).expect("record should deserialize");
 

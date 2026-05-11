@@ -7,10 +7,11 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, anyhow, bail};
 use fabro_api::types;
 use fabro_auth::auth_issue_message;
+use fabro_config::run::parse_run_layer_from_settings_toml;
 use fabro_config::{
-    CliLayer, CliOutputLayer, DaytonaDockerfileLayer, DockerSandboxLayer, LocalSandboxLayer,
-    ReplaceMap, RunExecutionLayer, RunLayer, RunModelLayer, RunSandboxLayer,
-    WorkflowSettingsBuilder,
+    CliLayer, CliOutputLayer, DaytonaDockerfileLayer, DockerSandboxLayer, ReplaceMap,
+    RunExecutionLayer, RunLayer, RunModelLayer, RunSandboxLayer, WorkflowSettingsBuilder,
+    parse_input_overrides,
 };
 use fabro_graphviz::graph::{Graph, is_llm_handler_type};
 use fabro_graphviz::render::apply_direction;
@@ -24,12 +25,11 @@ use fabro_sandbox::daytona::DaytonaConfig;
 use fabro_sandbox::redact::redact_auth_url;
 use fabro_sandbox::{DockerSandboxOptions, Sandbox, SandboxProvider, SandboxSpec};
 use fabro_static::EnvVars;
-use fabro_types::settings::ServerNamespace;
 use fabro_types::settings::cli::OutputVerbosity;
 use fabro_types::settings::interp::InterpString;
 use fabro_types::settings::run::{
     ApprovalMode, DaytonaNetworkLayer, DaytonaSettings, DockerSettings, DockerfileSource, RunGoal,
-    RunMode, RunNamespace, WorktreeMode,
+    RunMode, RunNamespace,
 };
 use fabro_types::{RunId, WorkflowSettings};
 use fabro_util::check_report::{CheckDetail, CheckReport, CheckResult, CheckSection, CheckStatus};
@@ -51,18 +51,19 @@ pub(crate) struct PreparedManifest {
     pub git:              Option<types::GitContext>,
     pub root_source:      String,
     pub run_id:           Option<RunId>,
+    pub title:            Option<String>,
     pub settings:         WorkflowSettings,
     pub target_path:      ManifestPath,
     pub workflow_bundle:  WorkflowBundle,
     pub workflow_input:   BundledWorkflow,
     pub source_directory: PathBuf,
-    pub in_place:         bool,
 }
 
 #[derive(Clone, Debug, Default)]
 struct ManifestSettingsOverrides {
-    run: Option<RunLayer>,
-    cli: Option<CliLayer>,
+    run:             Option<RunLayer>,
+    cli:             Option<CliLayer>,
+    input_overrides: HashMap<String, toml::Value>,
 }
 
 #[cfg(test)]
@@ -88,7 +89,8 @@ pub(crate) fn prepare_manifest(
         .ok_or_else(|| anyhow!("manifest target path is missing from workflows map"))?;
     let root_source = workflow_input.source.clone();
 
-    let args_overrides = manifest_args_overrides(manifest.args.as_ref());
+    let args_overrides =
+        manifest_args_overrides(manifest.args.as_ref()).context("failed to parse manifest args")?;
     let workflow_run_layer = root_workflow_run_layer(&workflow_input)?;
     let mut workflow_settings_builder =
         WorkflowSettingsBuilder::new().server_run_defaults(manifest_run_defaults.clone());
@@ -123,12 +125,15 @@ pub(crate) fn prepare_manifest(
     let mut settings = workflow_settings_builder
         .build()
         .context("failed to resolve manifest settings")?;
+    settings.run.inputs.extend(args_overrides.input_overrides);
     if let Some(goal) = manifest.goal.as_ref() {
         settings.run.goal = Some(RunGoal::Inline(InterpString::parse(&goal.text)));
     }
-
-    let in_place = settings.run.sandbox.provider == "local"
-        && settings.run.sandbox.local.worktree_mode == WorktreeMode::Never;
+    let title = manifest
+        .title
+        .as_ref()
+        .map(|title| fabro_types::normalize_explicit_run_title(title.as_str()))
+        .transpose()?;
 
     Ok(PreparedManifest {
         cwd: cwd.clone(),
@@ -140,12 +145,12 @@ pub(crate) fn prepare_manifest(
             .map(str::parse::<RunId>)
             .transpose()
             .context("invalid run ID")?,
+        title,
         settings: settings.clone(),
         target_path,
         workflow_bundle,
         workflow_input,
         source_directory: resolve_working_directory(&settings, &cwd),
-        in_place,
     })
 }
 
@@ -174,9 +179,9 @@ pub(crate) fn create_run_input(
         workflow_bundle: Some(prepared.workflow_bundle),
         submitted_manifest_bytes: None,
         run_id: prepared.run_id,
+        title: prepared.title,
         git: prepared.git,
         fork_source_ref: None,
-        in_place: prepared.in_place,
         provenance: None,
         configured_providers,
         web_url,
@@ -292,23 +297,23 @@ fn root_workflow_run_layer(workflow: &BundledWorkflow) -> Result<RunLayer> {
         return Ok(RunLayer::default());
     };
 
-    let mut document: toml::Table = config
-        .source
-        .parse()
+    // Parse via `SettingsLayer` so unknown nested keys (like a stale
+    // `[server.integrations.github.permissions]` after the move to
+    // `[run.integrations.github.permissions]`) trip
+    // `deny_unknown_fields`. Other valid top-level domains
+    // (`_version`, `[workflow]`, `[server.*]`) parse cleanly and the
+    // builder ignores everything outside `[run]` for this code path.
+    let mut run = parse_run_layer_from_settings_toml(&config.source)
         .context("Failed to parse run config TOML")?;
-    let mut run = document
-        .remove("run")
-        .map(toml::Value::try_into::<RunLayer>)
-        .transpose()
-        .context("Failed to parse run config TOML")?
-        .unwrap_or_default();
     resolve_manifest_dockerfile(&mut run, &config.path, &workflow.files)?;
     Ok(run)
 }
 
-fn manifest_args_overrides(args: Option<&types::ManifestArgs>) -> ManifestSettingsOverrides {
+fn manifest_args_overrides(
+    args: Option<&types::ManifestArgs>,
+) -> Result<ManifestSettingsOverrides> {
     let Some(args) = args else {
-        return ManifestSettingsOverrides::default();
+        return Ok(ManifestSettingsOverrides::default());
     };
 
     let model = (args.model.is_some() || args.provider.is_some()).then(|| RunModelLayer {
@@ -317,30 +322,19 @@ fn manifest_args_overrides(args: Option<&types::ManifestArgs>) -> ManifestSettin
         fallbacks: Vec::new(),
         controls:  None,
     });
-    let local_worktree = args
-        .worktree_mode
-        .as_deref()
-        .and_then(parse_worktree_mode_arg)
-        .map(|mode| LocalSandboxLayer {
-            worktree_mode: Some(mode),
-        });
-    let sandbox = (args.sandbox.is_some()
-        || args.preserve_sandbox.is_some()
-        || args.docker_image.is_some()
-        || local_worktree.is_some())
-    .then(|| RunSandboxLayer {
-        provider: args.sandbox.clone(),
-        preserve: args.preserve_sandbox,
-        local: local_worktree,
-        docker: args.docker_image.as_ref().map(|image| DockerSandboxLayer {
-            image: Some(image.clone()),
-            ..DockerSandboxLayer::default()
-        }),
-        ..RunSandboxLayer::default()
-    });
+    let sandbox =
+        (args.sandbox.is_some() || args.preserve_sandbox.is_some() || args.docker_image.is_some())
+            .then(|| RunSandboxLayer {
+                provider: args.sandbox.clone(),
+                preserve: args.preserve_sandbox,
+                docker: args.docker_image.as_ref().map(|image| DockerSandboxLayer {
+                    image: Some(image.clone()),
+                    ..DockerSandboxLayer::default()
+                }),
+                ..RunSandboxLayer::default()
+            });
 
-    let execution_has_any =
-        args.dry_run.is_some() || args.auto_approve.is_some() || args.no_retro.is_some();
+    let execution_has_any = args.dry_run.is_some() || args.auto_approve.is_some();
     let execution = execution_has_any.then(|| RunExecutionLayer {
         mode:     args
             .dry_run
@@ -352,7 +346,6 @@ fn manifest_args_overrides(args: Option<&types::ManifestArgs>) -> ManifestSettin
                 ApprovalMode::Prompt
             }
         }),
-        retros:   args.no_retro.map(|nr| !nr),
     });
 
     let run_has_any =
@@ -377,17 +370,11 @@ fn manifest_args_overrides(args: Option<&types::ManifestArgs>) -> ManifestSettin
         })
     });
 
-    ManifestSettingsOverrides { run, cli }
-}
-
-fn parse_worktree_mode_arg(value: &str) -> Option<WorktreeMode> {
-    match value {
-        "always" => Some(WorktreeMode::Always),
-        "clean" => Some(WorktreeMode::Clean),
-        "dirty" => Some(WorktreeMode::Dirty),
-        "never" => Some(WorktreeMode::Never),
-        _ => None,
-    }
+    Ok(ManifestSettingsOverrides {
+        run,
+        cli,
+        input_overrides: parse_input_overrides(&args.input)?,
+    })
 }
 
 fn parse_labels(labels: &[String]) -> HashMap<String, String> {
@@ -495,7 +482,7 @@ async fn build_preflight_report(
             sandbox_provider
         };
     let needs_github_credentials =
-        sandbox_provider.is_clone_based() || !github_integration.permissions.is_empty();
+        sandbox_provider.is_clone_based() || resolved_run.integrations.github.is_token_requested();
     let github_app = if needs_github_credentials {
         state
             .github_credentials(github_integration)
@@ -530,7 +517,7 @@ async fn build_preflight_report(
         &configured_providers,
     )
     .await;
-    run_github_token_check(&mut checks, prepared, &server_settings.server, github_app).await;
+    run_github_token_check(&mut checks, prepared, &resolved_run, github_app).await;
 
     let checks_ok = sandbox_ok && repository_access_ok && llm_ok;
 
@@ -1185,22 +1172,19 @@ fn runtime_docker_config(settings: &DockerSettings) -> DockerSandboxOptions {
 async fn run_github_token_check(
     checks: &mut Vec<CheckResult>,
     prepared: &PreparedManifest,
-    settings: &ServerNamespace,
+    resolved_run: &RunNamespace,
     github_app: Option<fabro_github::GitHubCredentials>,
 ) {
-    if settings.integrations.github.permissions.is_empty() {
+    if !resolved_run.integrations.github.is_token_requested() {
         return;
     }
 
     // Resolve InterpString permission values eagerly for token minting and
     // for display in the preflight report.
-    let github_permissions: HashMap<String, String> = settings
+    let github_permissions = resolved_run
         .integrations
         .github
-        .permissions
-        .iter()
-        .map(|(k, v)| (k.clone(), v.as_source()))
-        .collect();
+        .resolve_permissions(process_env_var);
 
     let perm_details = github_permissions
         .iter()
@@ -1229,7 +1213,7 @@ async fn run_github_token_check(
             name:        "GitHub Token".into(),
             status:      CheckStatus::Warning,
             summary:     "skipped".into(),
-            details:     vec![],
+            details:     perm_details,
             remediation: Some("No GitHub credentials or origin URL available".to_string()),
         }),
     }
@@ -1240,29 +1224,19 @@ async fn mint_github_token(
     origin_url: &str,
     permissions: &HashMap<String, String>,
 ) -> Result<String> {
-    if let fabro_github::GitHubCredentials::Token(token) = creds {
-        return Ok(token.clone());
-    }
-
     let https_url = fabro_github::ssh_url_to_https(origin_url);
     let (owner, repo) = fabro_github::parse_github_owner_repo(&https_url)?;
-    let fabro_github::GitHubCredentials::App(creds) = creds else {
-        unreachable!("token credentials return early");
-    };
-    let jwt = fabro_github::sign_app_jwt(&creds.app_id, &creds.private_key_pem)?;
     let client = fabro_http::http_client()?;
     let perms_json = serde_json::to_value(permissions)?;
-    let install_url = creds.installation_url(&owner);
-    fabro_github::create_installation_access_token_with_permissions_and_install_url(
-        &client,
-        &jwt,
-        &owner,
-        &repo,
-        &fabro_github::github_api_base_url(),
-        perms_json,
-        install_url.as_deref(),
-    )
-    .await
+    creds
+        .resolve_bearer_token(
+            &client,
+            &owner,
+            &repo,
+            &fabro_github::github_api_base_url(),
+            perms_json,
+        )
+        .await
 }
 
 fn preflight_response(
@@ -1361,6 +1335,7 @@ mod tests {
             git:       None,
             goal:      None,
             run_id:    None,
+            title:     None,
             target:    types::ManifestTarget {
                 identifier: "workflow.fabro".to_string(),
                 path:       "workflow.fabro".to_string(),
@@ -1718,13 +1693,12 @@ root = "/srv/fabro"
             dry_run:          Some(true),
             label:            Vec::new(),
             model:            None,
-            no_retro:         None,
             preserve_sandbox: None,
             provider:         None,
             sandbox:          None,
             docker_image:     None,
+            input:            Vec::new(),
             verbose:          None,
-            worktree_mode:    None,
         });
 
         let prepared = prepare_manifest(&server_settings, &manifest).unwrap();
@@ -1732,6 +1706,43 @@ root = "/srv/fabro"
         assert_eq!(
             prepared.settings.run.execution.mode,
             fabro_types::settings::run::RunMode::DryRun
+        );
+    }
+
+    #[test]
+    fn prepare_manifest_applies_input_args_as_sparse_overrides() {
+        let server_settings = manifest_run_defaults(Some(&server_settings_fixture(
+            r#"
+_version = 1
+
+[run.inputs]
+keep = "server"
+override = "server"
+"#,
+        )));
+        let mut manifest = minimal_manifest();
+        manifest.args = Some(types::ManifestArgs {
+            auto_approve:     None,
+            dry_run:          None,
+            label:            Vec::new(),
+            model:            None,
+            preserve_sandbox: None,
+            provider:         None,
+            sandbox:          None,
+            docker_image:     None,
+            input:            vec!["override=cli".to_string()],
+            verbose:          None,
+        });
+
+        let prepared = prepare_manifest(&server_settings, &manifest).unwrap();
+
+        assert_eq!(
+            prepared.settings.run.inputs.get("keep"),
+            Some(&toml::Value::String("server".to_string()))
+        );
+        assert_eq!(
+            prepared.settings.run.inputs.get("override"),
+            Some(&toml::Value::String("cli".to_string()))
         );
     }
 
@@ -1817,6 +1828,57 @@ app_id = "fixture-app-id"
         assert_eq!(response.checks.title, "Run Preflight");
         assert_eq!(response.checks.sections.len(), 1);
         assert_eq!(response.checks.sections[0].checks.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn preflight_runs_github_token_check_when_run_level_permissions_declared() {
+        // When a workflow declares `[run.integrations.github.permissions]`,
+        // `run_github_token_check` is invoked and surfaces a "GitHub Token"
+        // entry in the preflight report. With no configured GitHub App
+        // credentials in the test fixture, the check status is
+        // Warning/skipped — the important assertion is that the entry
+        // *exists*, proving the gate now reads from run-level config.
+        let state = crate::test_support::test_app_state();
+        let mut manifest = minimal_manifest();
+        manifest.workflows.get_mut("workflow.fabro").unwrap().config =
+            Some(types::ManifestWorkflowConfig {
+                path:   "workflow.toml".to_string(),
+                source: r#"_version = 1
+
+[run.sandbox]
+provider = "local"
+
+[run.integrations.github.permissions]
+issues = "read"
+"#
+                .to_string(),
+            });
+
+        let prepared = prepare_manifest(
+            &manifest_run_defaults(Some(&default_settings_fixture())),
+            &manifest,
+        )
+        .unwrap();
+        let validated = validate_prepared_manifest(&prepared).unwrap();
+        assert!(!validated.has_errors());
+
+        let (response, _ok) = run_preflight(state.as_ref(), &prepared, &validated)
+            .await
+            .unwrap();
+
+        assert!(
+            response.checks.sections[0]
+                .checks
+                .iter()
+                .any(|check| check.name == "GitHub Token"),
+            "expected GitHub Token check to run when run-level permissions are set; \
+             checks were {:?}",
+            response.checks.sections[0]
+                .checks
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]
@@ -1980,5 +2042,90 @@ digraph Demo {
                 .contains("Rate limited by openai: quota limited")
         );
         assert!(response_mock.calls_async().await >= 1);
+    }
+
+    mod root_workflow_run_layer_tests {
+        //! `root_workflow_run_layer` parses bundled workflow.toml through
+        //! the strict `SettingsLayer` schema, so unknown fields anywhere in
+        //! the document trip `deny_unknown_fields`.
+
+        use fabro_workflow::ManifestPath;
+        use fabro_workflow::workflow_bundle::{BundledWorkflow, ParsedWorkflowConfig};
+
+        use super::super::root_workflow_run_layer;
+
+        fn workflow_with_config(source: &str) -> BundledWorkflow {
+            BundledWorkflow {
+                path:   ManifestPath::from_wire("workflow.fabro").expect("path should be valid"),
+                source: "digraph G {}".to_string(),
+                config: Some(ParsedWorkflowConfig {
+                    path:   ManifestPath::from_wire("workflow.toml")
+                        .expect("config path should be valid"),
+                    source: source.to_string(),
+                }),
+                files:  std::collections::HashMap::new(),
+            }
+        }
+
+        #[test]
+        fn parses_run_integrations_github_permissions() {
+            let workflow = workflow_with_config(
+                r#"_version = 1
+
+[run.integrations.github.permissions]
+issues = "read"
+"#,
+            );
+
+            let run = root_workflow_run_layer(&workflow).expect("workflow.toml should parse");
+            let github = run
+                .integrations
+                .as_ref()
+                .and_then(|integrations| integrations.github.as_ref())
+                .expect("integrations.github should be present");
+            let permissions = github
+                .permissions
+                .as_ref()
+                .expect("permissions should be present");
+            assert_eq!(permissions.len(), 1);
+            assert!(permissions.contains_key("issues"));
+        }
+
+        #[test]
+        fn rejects_stale_server_integrations_github_permissions() {
+            let workflow = workflow_with_config(
+                r#"_version = 1
+
+[server.integrations.github.permissions]
+issues = "read"
+"#,
+            );
+
+            let err = root_workflow_run_layer(&workflow)
+                .expect_err("stale [server.integrations.github.permissions] should be rejected");
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("permissions") || message.contains("unknown field"),
+                "expected unknown-field error, got: {message}"
+            );
+        }
+
+        #[test]
+        fn accepts_workflow_block_and_version() {
+            let workflow = workflow_with_config(
+                r#"_version = 1
+
+[workflow]
+name = "demo"
+
+[run.integrations.github.permissions]
+contents = "read"
+"#,
+            );
+
+            let run =
+                root_workflow_run_layer(&workflow).expect("workflow + run blocks should parse");
+            assert!(run.integrations.is_some());
+        }
     }
 }

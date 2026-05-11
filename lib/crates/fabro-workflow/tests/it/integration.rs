@@ -54,6 +54,7 @@ use fabro_workflow::test_support::{WorkflowRunner, run_graph_with_hooks, test_st
 use fabro_workflow::transforms::stylesheet::{apply_stylesheet, parse_stylesheet};
 use fabro_workflow::transforms::{StylesheetApplicationTransform, TemplateTransform, Transform};
 use object_store::local::LocalFileSystem;
+use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
 fn local_env() -> Arc<dyn fabro_agent::Sandbox> {
@@ -118,13 +119,13 @@ fn load_run_checkpoint(run_dir: &Path) -> Result<Checkpoint, Box<dyn std::error:
                         .into_iter()
                         .next()
                         .ok_or("test store should contain one run")?
-                        .run_id
+                        .id
                 };
                 let run = runtime.block_on(store.open_run_reader(&run_id))?;
                 let state = runtime.block_on(async {
                     for attempt in 0..20 {
                         let state = run.state().await?;
-                        if state.checkpoint.is_some() || attempt == 19 {
+                        if state.current_checkpoint().is_some() || attempt == 19 {
                             return Ok::<_, fabro_store::Error>(state);
                         }
                         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -156,13 +157,13 @@ fn load_run_checkpoint(run_dir: &Path) -> Result<Checkpoint, Box<dyn std::error:
                 .into_iter()
                 .next()
                 .ok_or("test store should contain one run")?
-                .run_id
+                .id
         };
         let run = runtime.block_on(store.open_run_reader(&run_id))?;
         runtime.block_on(async {
             for attempt in 0..20 {
                 let state = run.state().await?;
-                if state.checkpoint.is_some() || attempt == 19 {
+                if state.current_checkpoint().is_some() || attempt == 19 {
                     return Ok::<_, fabro_store::Error>(state);
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -171,7 +172,8 @@ fn load_run_checkpoint(run_dir: &Path) -> Result<Checkpoint, Box<dyn std::error:
         })?
     };
     state
-        .checkpoint
+        .current_checkpoint()
+        .cloned()
         .ok_or_else(|| "checkpoint should exist in run store".into())
 }
 
@@ -234,7 +236,7 @@ fn resolve_checkpoint_text(
                     .into_iter()
                     .next()
                     .ok_or("test store should contain one run")?
-                    .run_id
+                    .id
             };
             let run = runtime.block_on(store.open_run_reader(&run_id))?;
             let bytes = runtime
@@ -416,7 +418,7 @@ async fn end_to_end_linear_pipeline() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -549,7 +551,7 @@ async fn end_to_end_branching_pipeline() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -566,7 +568,10 @@ async fn end_to_end_branching_pipeline() {
         .expect("run should succeed");
     assert_eq!(outcome.status, StageOutcome::Succeeded);
 
-    let checkpoint = state.checkpoint.expect("checkpoint should be captured");
+    let checkpoint = state
+        .current_checkpoint()
+        .cloned()
+        .expect("checkpoint should be captured");
     assert!(
         checkpoint
             .completed_nodes
@@ -669,7 +674,7 @@ async fn end_to_end_human_gate_pipeline() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -686,7 +691,10 @@ async fn end_to_end_human_gate_pipeline() {
         .expect("run should succeed");
     assert_eq!(outcome.status, StageOutcome::Succeeded);
 
-    let checkpoint = state.checkpoint.expect("checkpoint should be captured");
+    let checkpoint = state
+        .current_checkpoint()
+        .cloned()
+        .expect("checkpoint should be captured");
     assert!(
         checkpoint.completed_nodes.contains(&"reject".to_string()),
         "should have traversed reject path"
@@ -765,7 +773,7 @@ async fn human_gate_interrupted_input_fails_closed_without_fail_route() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -795,7 +803,10 @@ async fn human_gate_interrupted_input_fails_closed_without_fail_route() {
         "unexpected outcome: {outcome:?}"
     );
 
-    let checkpoint = state.checkpoint.expect("checkpoint should be captured");
+    let checkpoint = state
+        .current_checkpoint()
+        .cloned()
+        .expect("checkpoint should be captured");
     assert!(
         checkpoint.node_outcomes.contains_key("gate"),
         "gate outcome should be checkpointed before termination"
@@ -878,7 +889,7 @@ async fn human_gate_interrupted_input_routes_via_outcome_fail_condition() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -895,7 +906,10 @@ async fn human_gate_interrupted_input_routes_via_outcome_fail_condition() {
         .expect("interrupted human gate should follow explicit fail route");
     assert_eq!(outcome.status, StageOutcome::Succeeded);
 
-    let checkpoint = state.checkpoint.expect("checkpoint should be captured");
+    let checkpoint = state
+        .current_checkpoint()
+        .cloned()
+        .expect("checkpoint should be captured");
     assert!(
         checkpoint
             .completed_nodes
@@ -992,7 +1006,7 @@ async fn goal_gate_routes_to_retry_target_on_failure() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -1115,7 +1129,7 @@ async fn goal_gate_routes_to_retry_target_when_present() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -1132,7 +1146,10 @@ async fn goal_gate_routes_to_retry_target_when_present() {
         .expect("run should eventually succeed after retry");
     assert_eq!(outcome.status, StageOutcome::Succeeded);
 
-    let checkpoint = state.checkpoint.expect("checkpoint should be captured");
+    let checkpoint = state
+        .current_checkpoint()
+        .cloned()
+        .expect("checkpoint should be captured");
     // gated_work should appear in completed nodes (at least twice -- first fail,
     // then succeed)
     let gated_work_count = checkpoint
@@ -1430,7 +1447,7 @@ async fn retry_on_failure_then_succeed() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -1505,7 +1522,7 @@ async fn pipeline_with_many_nodes() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -1522,7 +1539,10 @@ async fn pipeline_with_many_nodes() {
         .expect("large pipeline should succeed");
     assert_eq!(outcome.status, StageOutcome::Succeeded);
 
-    let checkpoint = state.checkpoint.expect("checkpoint should be captured");
+    let checkpoint = state
+        .current_checkpoint()
+        .cloned()
+        .expect("checkpoint should be captured");
     // All 10 step nodes should be in completed_nodes
     for name in &node_names {
         assert!(
@@ -1593,6 +1613,7 @@ impl CodergenBackend for MockCodergenBackend {
         _emitter: &Arc<Emitter>,
         _sandbox: &Arc<dyn fabro_agent::Sandbox>,
         _tool_hooks: Option<Arc<dyn fabro_agent::ToolHookCallback>>,
+        _cancel_token: tokio_util::sync::CancellationToken,
     ) -> Result<CodergenResult, Error> {
         Ok(CodergenResult::Text {
             text:              format!(
@@ -1852,7 +1873,7 @@ async fn smoke_test_with_mock_codergen_backend() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -1954,7 +1975,7 @@ async fn end_to_end_parallel_fan_out_fan_in() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -1971,7 +1992,10 @@ async fn end_to_end_parallel_fan_out_fan_in() {
         .expect("parallel pipeline should succeed");
     assert_eq!(outcome.status, StageOutcome::Succeeded);
 
-    let checkpoint = state.checkpoint.expect("checkpoint should be captured");
+    let checkpoint = state
+        .current_checkpoint()
+        .cloned()
+        .expect("checkpoint should be captured");
 
     // The parallel node (fan_out) and fan_in_node should be in completed_nodes.
     // Branch nodes run inside the parallel handler, so they are not recorded
@@ -2067,7 +2091,7 @@ async fn resume_from_checkpoint_completes_pipeline() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -2085,7 +2109,10 @@ async fn resume_from_checkpoint_completes_pipeline() {
     assert_eq!(outcome.status, StageOutcome::Succeeded);
 
     // Verify checkpoint written after resume contains step_b
-    let final_cp = state.checkpoint.expect("checkpoint should be captured");
+    let final_cp = state
+        .current_checkpoint()
+        .cloned()
+        .expect("checkpoint should be captured");
     assert!(
         final_cp.completed_nodes.contains(&"step_b".to_string()),
         "step_b should have been executed after resume"
@@ -2166,7 +2193,7 @@ async fn resume_from_checkpoint_preserves_goal_gate_outcomes() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -2209,7 +2236,7 @@ async fn graph_goal_in_context() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -2225,7 +2252,10 @@ async fn graph_goal_in_context() {
         .await
         .expect("run");
 
-    let cp = state.checkpoint.expect("checkpoint should exist");
+    let cp = state
+        .current_checkpoint()
+        .cloned()
+        .expect("checkpoint should exist");
     assert_eq!(
         cp.context_values.get("graph.goal"),
         Some(&serde_json::json!("Ship the widget"))
@@ -2248,7 +2278,7 @@ async fn event_streaming_lifecycle() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -2328,7 +2358,7 @@ async fn context_flow_between_stages() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -2344,7 +2374,10 @@ async fn context_flow_between_stages() {
         .await
         .expect("run");
 
-    let cp = state.checkpoint.expect("checkpoint should exist");
+    let cp = state
+        .current_checkpoint()
+        .cloned()
+        .expect("checkpoint should exist");
     assert_eq!(
         cp.context_values.get("last_stage"),
         Some(&serde_json::json!("step_b"))
@@ -2384,7 +2417,7 @@ async fn tool_handler_e2e() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -2455,7 +2488,7 @@ async fn auto_approve_interviewer_e2e() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -2495,7 +2528,7 @@ async fn codergen_without_backend_simulated() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -2511,7 +2544,10 @@ async fn codergen_without_backend_simulated() {
         .await
         .expect("run");
 
-    let cp = state.checkpoint.expect("checkpoint should exist");
+    let cp = state
+        .current_checkpoint()
+        .cloned()
+        .expect("checkpoint should exist");
     let last_response = cp
         .context_values
         .get("last_response")
@@ -2600,7 +2636,7 @@ async fn branching_loop_back_on_failure() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -2686,7 +2722,7 @@ async fn human_gate_loops_back() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -2751,7 +2787,7 @@ async fn scenario_ship_a_feature() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -2839,7 +2875,7 @@ async fn scenario_parallel_expert_review() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -2856,7 +2892,10 @@ async fn scenario_parallel_expert_review() {
         .expect("run");
     assert_eq!(outcome.status, StageOutcome::Succeeded);
 
-    let cp = state.checkpoint.expect("checkpoint should exist");
+    let cp = state
+        .current_checkpoint()
+        .cloned()
+        .expect("checkpoint should exist");
     let results = cp
         .context_values
         .get("parallel.results")
@@ -2926,7 +2965,7 @@ async fn scenario_node_retries_on_retry_status() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -2943,7 +2982,10 @@ async fn scenario_node_retries_on_retry_status() {
         .expect("run");
     assert_eq!(outcome.status, StageOutcome::Succeeded);
 
-    let cp = state.checkpoint.expect("checkpoint should exist");
+    let cp = state
+        .current_checkpoint()
+        .cloned()
+        .expect("checkpoint should exist");
     let retry_count = cp
         .node_retries
         .get("flaky")
@@ -2991,7 +3033,7 @@ async fn scenario_loop_restart_resets_context() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -3059,7 +3101,7 @@ async fn scenario_bug_triage_router() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -3076,7 +3118,10 @@ async fn scenario_bug_triage_router() {
         .expect("run");
     assert_eq!(outcome.status, StageOutcome::Succeeded);
 
-    let cp = state.checkpoint.expect("checkpoint should exist");
+    let cp = state
+        .current_checkpoint()
+        .cloned()
+        .expect("checkpoint should exist");
     assert!(
         cp.completed_nodes.contains(&"critical".to_string()),
         "critical should be selected (highest weight)"
@@ -3121,7 +3166,7 @@ async fn scenario_crash_recovery() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -3138,7 +3183,10 @@ async fn scenario_crash_recovery() {
         .expect("run");
     assert_eq!(outcome.status, StageOutcome::Succeeded);
 
-    let cp = state.checkpoint.expect("checkpoint should be captured");
+    let cp = state
+        .current_checkpoint()
+        .cloned()
+        .expect("checkpoint should be captured");
     assert!(cp.completed_nodes.contains(&"b".to_string()));
     assert!(cp.completed_nodes.contains(&"c".to_string()));
     assert!(cp.completed_nodes.contains(&"a".to_string()));
@@ -3231,7 +3279,7 @@ async fn manager_loop_stop_condition_satisfied_e2e() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -3247,7 +3295,10 @@ async fn manager_loop_stop_condition_satisfied_e2e() {
         .await
         .expect("run");
 
-    let cp = state.checkpoint.expect("checkpoint should be captured");
+    let cp = state
+        .current_checkpoint()
+        .cloned()
+        .expect("checkpoint should be captured");
     let manager_outcome = cp.node_outcomes.get("manager").expect("manager outcome");
     assert_eq!(manager_outcome.status, StageOutcome::Succeeded);
     assert!(
@@ -3313,7 +3364,7 @@ async fn manager_loop_max_cycles_exceeded_e2e() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -3329,7 +3380,10 @@ async fn manager_loop_max_cycles_exceeded_e2e() {
         .await
         .expect("run");
 
-    let cp = state.checkpoint.expect("checkpoint should be captured");
+    let cp = state
+        .current_checkpoint()
+        .cloned()
+        .expect("checkpoint should be captured");
     let manager_outcome = cp.node_outcomes.get("manager").expect("manager outcome");
     assert_eq!(manager_outcome.status, StageOutcome::Failed {
         retry_requested: false,
@@ -3456,7 +3510,7 @@ async fn conditional_branching_success_fail_paths() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -3473,7 +3527,10 @@ async fn conditional_branching_success_fail_paths() {
         .expect("run");
     assert_eq!(outcome.status, StageOutcome::Succeeded);
 
-    let cp = state.checkpoint.expect("checkpoint should exist");
+    let cp = state
+        .current_checkpoint()
+        .cloned()
+        .expect("checkpoint should exist");
     assert!(cp.completed_nodes.contains(&"fail_path".to_string()));
     assert!(!cp.completed_nodes.contains(&"success_path".to_string()));
 }
@@ -3512,7 +3569,7 @@ async fn edge_selection_condition_match_wins_over_weight() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -3528,7 +3585,10 @@ async fn edge_selection_condition_match_wins_over_weight() {
         .await
         .expect("run");
 
-    let cp = state.checkpoint.expect("checkpoint should exist");
+    let cp = state
+        .current_checkpoint()
+        .cloned()
+        .expect("checkpoint should exist");
     assert!(cp.completed_nodes.contains(&"cond_target".to_string()));
     assert!(!cp.completed_nodes.contains(&"weighted_target".to_string()));
 }
@@ -3562,7 +3622,7 @@ async fn edge_selection_weight_breaks_ties() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -3578,7 +3638,10 @@ async fn edge_selection_weight_breaks_ties() {
         .await
         .expect("run");
 
-    let cp = state.checkpoint.expect("checkpoint should exist");
+    let cp = state
+        .current_checkpoint()
+        .cloned()
+        .expect("checkpoint should exist");
     assert!(cp.completed_nodes.contains(&"high".to_string()));
     assert!(!cp.completed_nodes.contains(&"low".to_string()));
 }
@@ -3604,7 +3667,7 @@ async fn edge_selection_lexical_tiebreak() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -3620,7 +3683,10 @@ async fn edge_selection_lexical_tiebreak() {
         .await
         .expect("run");
 
-    let cp = state.checkpoint.expect("checkpoint should exist");
+    let cp = state
+        .current_checkpoint()
+        .cloned()
+        .expect("checkpoint should exist");
     assert!(cp.completed_nodes.contains(&"alpha".to_string()));
     assert!(!cp.completed_nodes.contains(&"beta".to_string()));
 }
@@ -3665,7 +3731,7 @@ async fn context_updates_visible_across_nodes() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -3681,7 +3747,10 @@ async fn context_updates_visible_across_nodes() {
         .await
         .expect("run");
 
-    let cp = state.checkpoint.expect("checkpoint should exist");
+    let cp = state
+        .current_checkpoint()
+        .cloned()
+        .expect("checkpoint should exist");
     assert!(cp.completed_nodes.contains(&"yes".to_string()));
     assert!(!cp.completed_nodes.contains(&"no".to_string()));
 }
@@ -3712,7 +3781,7 @@ async fn stylesheet_applies_model_override() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -3768,7 +3837,7 @@ async fn custom_handler_registration_and_execution() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -3784,7 +3853,10 @@ async fn custom_handler_registration_and_execution() {
         .await
         .expect("run");
 
-    let cp = state.checkpoint.expect("checkpoint should exist");
+    let cp = state
+        .current_checkpoint()
+        .cloned()
+        .expect("checkpoint should exist");
     assert_eq!(
         cp.context_values.get("custom.ran"),
         Some(&serde_json::json!("true"))
@@ -3846,7 +3918,7 @@ async fn integration_smoke_plan_implement_review_done() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -3938,7 +4010,7 @@ async fn manager_loop_runs_child_engine_e2e() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -3955,7 +4027,10 @@ async fn manager_loop_runs_child_engine_e2e() {
         .expect("manager loop E2E should succeed");
     assert_eq!(outcome.status, StageOutcome::Succeeded);
 
-    let checkpoint = state.checkpoint.expect("checkpoint should be captured");
+    let checkpoint = state
+        .current_checkpoint()
+        .cloned()
+        .expect("checkpoint should be captured");
     assert!(
         checkpoint
             .completed_nodes
@@ -4072,7 +4147,7 @@ async fn manager_loop_context_flows_e2e() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -4090,7 +4165,10 @@ async fn manager_loop_context_flows_e2e() {
     assert_eq!(outcome.status, StageOutcome::Succeeded);
 
     // Check that child's context updates were propagated through the manager
-    let checkpoint = state.checkpoint.expect("checkpoint should be captured");
+    let checkpoint = state
+        .current_checkpoint()
+        .cloned()
+        .expect("checkpoint should be captured");
     let sup_outcome = checkpoint.node_outcomes.get("supervisor").unwrap();
     assert_eq!(
         sup_outcome.context_updates.get("review.result"),
@@ -4148,7 +4226,7 @@ async fn manager_loop_child_dotfile_e2e() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -4252,7 +4330,7 @@ async fn import_e2e_through_engine() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -4269,7 +4347,10 @@ async fn import_e2e_through_engine() {
         .expect("import E2E should succeed");
     assert_eq!(outcome.status, StageOutcome::Succeeded);
 
-    let checkpoint = state.checkpoint.expect("checkpoint should be captured");
+    let checkpoint = state
+        .current_checkpoint()
+        .cloned()
+        .expect("checkpoint should be captured");
     assert!(
         checkpoint
             .completed_nodes
@@ -4407,7 +4488,7 @@ async fn fidelity_default_is_compact() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -4464,7 +4545,7 @@ async fn fidelity_graph_default_applied() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -4517,7 +4598,7 @@ async fn fidelity_node_overrides_graph_default() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -4576,7 +4657,7 @@ async fn fidelity_edge_overrides_node_and_graph() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -4625,7 +4706,7 @@ async fn fidelity_full_produces_empty_preamble() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -4684,7 +4765,7 @@ async fn fidelity_truncate_preamble_minimal() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -4756,7 +4837,7 @@ async fn fidelity_summary_low_mode() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -4823,7 +4904,7 @@ async fn fidelity_summary_medium_mode() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -4890,7 +4971,7 @@ async fn fidelity_summary_high_mode() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -4950,7 +5031,7 @@ async fn fidelity_full_sets_thread_id_in_context() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -5021,7 +5102,7 @@ async fn fidelity_full_nodes_share_thread_id() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -5102,7 +5183,7 @@ async fn fidelity_resume_degrades_full_to_summary_high() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -5199,7 +5280,7 @@ async fn fidelity_resume_degrade_only_affects_first_hop() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -5283,7 +5364,7 @@ async fn fidelity_resume_no_degrade_when_not_full() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -5325,7 +5406,7 @@ async fn fidelity_stored_in_checkpoint_context() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -5341,7 +5422,10 @@ async fn fidelity_stored_in_checkpoint_context() {
         .await
         .expect("run");
 
-    let cp = state.checkpoint.expect("checkpoint should be captured");
+    let cp = state
+        .current_checkpoint()
+        .cloned()
+        .expect("checkpoint should be captured");
     assert_eq!(
         cp.context_values.get("internal.fidelity"),
         Some(&serde_json::json!("summary:low")),
@@ -5418,7 +5502,7 @@ async fn fidelity_precedence_multi_node_pipeline() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -5486,7 +5570,7 @@ async fn fidelity_compact_preamble_includes_completed_stages_and_context() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -5561,7 +5645,7 @@ async fn fidelity_summary_low_excludes_context_values_in_pipeline() {
     let run_options_low = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir_low.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -5628,7 +5712,7 @@ async fn fidelity_summary_low_excludes_context_values_in_pipeline() {
     let run_options_med = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir_med.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -5700,7 +5784,7 @@ async fn fidelity_thread_id_fallback_to_previous_node_in_pipeline() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -5754,7 +5838,7 @@ async fn fidelity_thread_id_from_node_class_in_pipeline() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -5811,7 +5895,7 @@ async fn fidelity_edge_thread_id_override_in_pipeline() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -5869,7 +5953,7 @@ async fn fidelity_full_without_explicit_thread_id_uses_previous_node() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -5937,7 +6021,7 @@ async fn fidelity_from_parsed_dot_pipeline() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -5986,7 +6070,7 @@ async fn fidelity_checkpoint_roundtrip_preserves_fidelity() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -6003,7 +6087,10 @@ async fn fidelity_checkpoint_roundtrip_preserves_fidelity() {
         .expect("run");
 
     // Save and load again to verify roundtrip
-    let cp1 = state.checkpoint.expect("checkpoint should be captured");
+    let cp1 = state
+        .current_checkpoint()
+        .cloned()
+        .expect("checkpoint should be captured");
     assert_eq!(
         cp1.context_values.get("internal.fidelity"),
         Some(&serde_json::json!("summary:high")),
@@ -6059,7 +6146,7 @@ async fn fidelity_node_thread_id_overrides_edge_thread_id_in_pipeline() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -6146,7 +6233,7 @@ async fn fidelity_resume_preserves_context_values_across_checkpoint() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -6170,7 +6257,10 @@ async fn fidelity_resume_preserves_context_values_across_checkpoint() {
     );
 
     // Verify the final checkpoint still has the fidelity
-    let final_cp = state.checkpoint.expect("checkpoint should be captured");
+    let final_cp = state
+        .current_checkpoint()
+        .cloned()
+        .expect("checkpoint should be captured");
     assert_eq!(
         final_cp.context_values.get("internal.fidelity"),
         Some(&serde_json::json!("summary:low")),
@@ -6194,6 +6284,7 @@ mod real_llm {
     use fabro_workflow::context::Context;
     use fabro_workflow::error::Error;
     use fabro_workflow::handler::agent::{AgentHandler, CodergenBackend, CodergenResult};
+    use tokio_util::sync::CancellationToken;
 
     struct LlmCodergenBackend {
         client:   Arc<Client>,
@@ -6212,6 +6303,7 @@ mod real_llm {
             _emitter: &Arc<Emitter>,
             _sandbox: &Arc<dyn fabro_agent::Sandbox>,
             _tool_hooks: Option<Arc<dyn fabro_agent::ToolHookCallback>>,
+            _cancel_token: tokio_util::sync::CancellationToken,
         ) -> Result<CodergenResult, Error> {
             self.complete(prompt).await
         }
@@ -6221,6 +6313,8 @@ mod real_llm {
             _node: &Node,
             prompt: &str,
             _system_prompt: Option<&str>,
+            _emitter: &Arc<Emitter>,
+            _stage_scope: &fabro_workflow::event::StageScope,
         ) -> Result<CodergenResult, Error> {
             self.complete(prompt).await
         }
@@ -6382,7 +6476,7 @@ mod real_llm {
         let run_options = RunOptions {
             settings:         WorkflowSettings::default(),
             run_dir:          dir.path().to_path_buf(),
-            cancel_token:     None,
+            cancel_token:     CancellationToken::new(),
             run_id:           test_run_id("test-run"),
             labels:           std::collections::HashMap::new(),
             workflow_slug:    None,
@@ -6491,7 +6585,7 @@ mod real_llm {
         let run_options = RunOptions {
             settings:         WorkflowSettings::default(),
             run_dir:          dir.path().to_path_buf(),
-            cancel_token:     None,
+            cancel_token:     CancellationToken::new(),
             run_id:           test_run_id("test-run"),
             labels:           std::collections::HashMap::new(),
             workflow_slug:    None,
@@ -6624,7 +6718,7 @@ mod real_llm {
         let run_options = RunOptions {
             settings:         WorkflowSettings::default(),
             run_dir:          dir.path().to_path_buf(),
-            cancel_token:     None,
+            cancel_token:     CancellationToken::new(),
             run_id:           test_run_id("test-run"),
             labels:           std::collections::HashMap::new(),
             workflow_slug:    None,
@@ -6725,7 +6819,7 @@ mod real_llm {
         let run_options = RunOptions {
             settings:         WorkflowSettings::default(),
             run_dir:          dir.path().to_path_buf(),
-            cancel_token:     None,
+            cancel_token:     CancellationToken::new(),
             run_id:           test_run_id("test-run"),
             labels:           std::collections::HashMap::new(),
             workflow_slug:    None,
@@ -6809,7 +6903,13 @@ async fn workflow_run_with_vault_only_openai_codex_builds_pr_body() {
                 .header("authorization", "Bearer vault-openai-key");
             then.status(200)
                 .header("content-type", "application/json")
-                .json_body(openai_responses_payload("Narrative from vault source."));
+                .json_body(openai_responses_payload(
+                    &serde_json::to_string(&serde_json::json!({
+                        "title": "Vault title",
+                        "body": "Narrative from vault source.",
+                    }))
+                    .unwrap(),
+                ));
         })
         .await;
 
@@ -6863,7 +6963,7 @@ async fn workflow_run_with_vault_only_openai_codex_builds_pr_body() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("vault-only-openai-codex-pr-body"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -6890,7 +6990,7 @@ async fn workflow_run_with_vault_only_openai_codex_builds_pr_body() {
     let run_store = store.open_run_reader(&run_options.run_id).await.unwrap();
     let run_store_handle: fabro_workflow::runtime_store::RunStoreHandle = run_store.into();
 
-    let body = fabro_workflow::pull_request::build_pr_body(
+    let content = fabro_workflow::pull_request::build_pr_content(
         "diff --git a/src/lib.rs b/src/lib.rs\n+fn new_feature() {}\n",
         "Implement feature",
         "gpt-5.4",
@@ -6905,12 +7005,15 @@ async fn workflow_run_with_vault_only_openai_codex_builds_pr_body() {
             stages:               Vec::new(),
             billing:              None,
             total_retries:        0,
+            diff:                 fabro_types::RunDiff::default(),
         }),
+        None,
     )
     .await
     .expect("PR body should build from vault-only credentials");
 
-    assert!(body.contains("Narrative from vault source."));
+    assert_eq!(content.title, "Vault title");
+    assert!(content.body.contains("Narrative from vault source."));
     response_mock.assert_async().await;
 }
 
@@ -6975,7 +7078,7 @@ async fn human_gate_freeform_only_routes_text() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -6992,7 +7095,10 @@ async fn human_gate_freeform_only_routes_text() {
         .expect("run should succeed");
     assert_eq!(outcome.status, StageOutcome::Succeeded);
 
-    let checkpoint = state.checkpoint.expect("checkpoint should be captured");
+    let checkpoint = state
+        .current_checkpoint()
+        .cloned()
+        .expect("checkpoint should be captured");
     assert!(
         checkpoint
             .completed_nodes
@@ -7106,7 +7212,7 @@ async fn human_gate_freeform_with_fixed_choice_match() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -7123,7 +7229,10 @@ async fn human_gate_freeform_with_fixed_choice_match() {
         .expect("run should succeed");
     assert_eq!(outcome.status, StageOutcome::Succeeded);
 
-    let checkpoint = state.checkpoint.expect("checkpoint should be captured");
+    let checkpoint = state
+        .current_checkpoint()
+        .cloned()
+        .expect("checkpoint should be captured");
     assert!(
         checkpoint.completed_nodes.contains(&"approve".to_string()),
         "fixed choice match should route to approve"
@@ -7223,7 +7332,7 @@ async fn human_gate_freeform_fallback_on_unmatched_text() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -7240,7 +7349,10 @@ async fn human_gate_freeform_fallback_on_unmatched_text() {
         .expect("run should succeed");
     assert_eq!(outcome.status, StageOutcome::Succeeded);
 
-    let checkpoint = state.checkpoint.expect("checkpoint should be captured");
+    let checkpoint = state
+        .current_checkpoint()
+        .cloned()
+        .expect("checkpoint should be captured");
     assert!(
         checkpoint
             .completed_nodes
@@ -7351,7 +7463,7 @@ async fn human_gate_freeform_sets_allow_freeform_on_question() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -7460,7 +7572,7 @@ async fn human_gate_without_freeform_sets_allow_freeform_false() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -7764,7 +7876,7 @@ fn make_run_options(dir: &std::path::Path) -> RunOptions {
     RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("hook-test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -8703,7 +8815,7 @@ async fn run_fidelity_prompt_pipeline(fidelity: &str) -> String {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -8748,8 +8860,8 @@ async fn fidelity_prompt_compact() {
         "compact: should show script sub-item for run_tests"
     );
     assert!(
-        prompt.contains("Stdout:"),
-        "compact: should show stdout sub-item for run_tests"
+        prompt.contains("Output:"),
+        "compact: should show output sub-item for run_tests"
     );
 
     // Original prompt at the end
@@ -8819,8 +8931,8 @@ async fn fidelity_prompt_summary_medium() {
         "summary:medium: should show script sub-item for run_tests"
     );
     assert!(
-        prompt.contains("Stdout:"),
-        "summary:medium: should show stdout sub-item for run_tests"
+        prompt.contains("Output:"),
+        "summary:medium: should show output sub-item for run_tests"
     );
 
     // Original prompt at the end
@@ -8905,7 +9017,7 @@ async fn large_context_values_are_offloaded_to_artifact_store() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -9110,7 +9222,7 @@ async fn artifact_pointers_rewritten_for_remote_sandbox() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -9198,7 +9310,7 @@ async fn downstream_local_execution_materializes_blob_refs_to_runtime_files() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -9286,7 +9398,7 @@ async fn downstream_remote_execution_materializes_blob_refs_to_sandbox_files() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -9417,7 +9529,7 @@ async fn node_dir_uses_visit_count_on_revisit() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -9566,46 +9678,11 @@ impl fabro_agent::Sandbox for CliTestEnv {
             });
         }
 
-        // Background launch: return PID
-        if command.contains("echo $!") {
+        // CLI version check during ensure_cli — return success so install path
+        // is skipped.
+        if command.contains("--version") {
             return Ok(fabro_agent::ExecResult {
-                stdout:    "12345\n".into(),
-                stderr:    String::new(),
-                exit_code: Some(0),
-
-                termination: CommandTermination::Exited,
-                duration_ms: 1,
-            });
-        }
-
-        // Poll for completion: return exit code 0 immediately
-        if command.contains("exit_code") && command.contains("echo running") {
-            return Ok(fabro_agent::ExecResult {
-                stdout:    "0\n".into(),
-                stderr:    String::new(),
-                exit_code: Some(0),
-
-                termination: CommandTermination::Exited,
-                duration_ms: 1,
-            });
-        }
-
-        // Read stdout file
-        if command.starts_with("cat") && command.contains("stdout.log") {
-            return Ok(fabro_agent::ExecResult {
-                stdout:    self.cli_stdout.clone(),
-                stderr:    String::new(),
-                exit_code: Some(0),
-
-                termination: CommandTermination::Exited,
-                duration_ms: 1,
-            });
-        }
-
-        // Read stderr file
-        if command.starts_with("cat") && command.contains("stderr.log") {
-            return Ok(fabro_agent::ExecResult {
-                stdout:    String::new(),
+                stdout:    "1.0.0\n".into(),
                 stderr:    String::new(),
                 exit_code: Some(0),
 
@@ -9626,7 +9703,21 @@ impl fabro_agent::Sandbox for CliTestEnv {
             });
         }
 
-        // Fallback
+        // ls -t for last_file_touched
+        if command.starts_with("ls -t ") {
+            return Ok(fabro_agent::ExecResult {
+                stdout:    String::new(),
+                stderr:    String::new(),
+                exit_code: Some(0),
+
+                termination: CommandTermination::Exited,
+                duration_ms: 1,
+            });
+        }
+
+        // Fallback: this is the streaming CLI invocation. The default trait
+        // implementation of `exec_command_streaming` delegates to this path
+        // and replays output through the streaming callback.
         Ok(fabro_agent::ExecResult {
             stdout:    self.cli_stdout.clone(),
             stderr:    String::new(),
@@ -9714,6 +9805,7 @@ async fn cli_backend_run_writes_prompt_and_calls_exec() {
             &emitter,
             &env,
             None,
+            CancellationToken::new(),
         )
         .await
         .expect("CLI backend should succeed");
@@ -9731,20 +9823,21 @@ async fn cli_backend_run_writes_prompt_and_calls_exec() {
     );
     assert_eq!(prompt_file.1, "Fix the authentication bug");
 
-    // Verify the CLI command was called (now wrapped in background launch)
+    // Verify the CLI command was streamed (env file is sourced, then `cat
+    // <prompt> | claude -p ...` runs as the inner shell command).
     let commands = test_env.recorded_commands();
     let cli_cmd = commands
         .iter()
-        .find(|c| c.contains("claude") && c.contains("echo $!"))
-        .expect("should launch claude CLI in background");
+        .find(|c| c.contains("claude") && c.contains("_prompt.txt"))
+        .expect("should run claude CLI command");
     assert!(cli_cmd.contains("-p"), "should use pipe mode");
     assert!(
         cli_cmd.contains("claude-opus-4-6"),
         "should use correct model"
     );
     assert!(
-        cli_cmd.contains("_prompt.txt"),
-        "should reference prompt file"
+        cli_cmd.contains(". /tmp/fabro_cli_") && cli_cmd.contains("_env.sh"),
+        "should source the env file before invoking the CLI: {cli_cmd}"
     );
 
     // Verify parsed response
@@ -9786,6 +9879,7 @@ async fn cli_backend_run_detects_changed_files() {
             &emitter,
             &env,
             None,
+            CancellationToken::new(),
         )
         .await
         .expect("CLI backend should succeed");
@@ -9811,16 +9905,25 @@ async fn cli_backend_run_with_codex_provider() {
     let emitter = Arc::new(Emitter::default());
 
     let result = backend
-        .run(&node, "Build the API", &context, None, &emitter, &env, None)
+        .run(
+            &node,
+            "Build the API",
+            &context,
+            None,
+            &emitter,
+            &env,
+            None,
+            CancellationToken::new(),
+        )
         .await
         .expect("CLI backend should succeed");
 
-    // Verify codex command was called (now wrapped in background launch)
+    // Verify codex command was streamed.
     let commands = test_env.recorded_commands();
     let cli_cmd = commands
         .iter()
-        .find(|c| c.contains("codex") && c.contains("echo $!"))
-        .expect("should launch codex CLI in background");
+        .find(|c| c.contains("codex") && c.contains("_prompt.txt"))
+        .expect("should run codex CLI command");
     assert!(cli_cmd.contains("exec --json"), "should use exec mode");
     assert!(
         cli_cmd.contains("gpt-5.3-codex"),
@@ -9888,10 +9991,10 @@ async fn cli_backend_run_fails_on_nonzero_exit() {
                     duration_ms: 0,
                 });
             }
-            // Background launch: return PID
-            if command.contains("echo $!") {
+            // CLI version check during ensure_cli — pretend already installed.
+            if command.contains("--version") {
                 return Ok(fabro_agent::ExecResult {
-                    stdout:    "12345\n".into(),
+                    stdout:    "1.0.0\n".into(),
                     stderr:    String::new(),
                     exit_code: Some(0),
 
@@ -9899,24 +10002,12 @@ async fn cli_backend_run_fails_on_nonzero_exit() {
                     duration_ms: 0,
                 });
             }
-            // Poll: return non-zero exit code
-            if command.contains("exit_code") && command.contains("echo running") {
+            // The streaming CLI invocation: return non-zero exit with stderr.
+            if command.contains("claude") || command.contains("codex") {
                 return Ok(fabro_agent::ExecResult {
-                    stdout:    "127\n".into(),
-                    stderr:    String::new(),
-                    exit_code: Some(0),
-
-                    termination: CommandTermination::Exited,
-                    duration_ms: 0,
-                });
-            }
-            // Read stderr file
-            if command.starts_with("cat") && command.contains("stderr.log") {
-                return Ok(fabro_agent::ExecResult {
-                    stdout:    "command not found: claude".into(),
-                    stderr:    String::new(),
-                    exit_code: Some(0),
-
+                    stdout:      String::new(),
+                    stderr:      "command not found: claude".into(),
+                    exit_code:   Some(127),
                     termination: CommandTermination::Exited,
                     duration_ms: 0,
                 });
@@ -9990,6 +10081,7 @@ async fn cli_backend_run_fails_on_nonzero_exit() {
             &emitter,
             &failing_env,
             None,
+            CancellationToken::new(),
         )
         .await;
 
@@ -10019,7 +10111,16 @@ async fn cli_backend_run_fails_on_unparseable_output() {
     let emitter = Arc::new(Emitter::default());
 
     let result = backend
-        .run(&node, "do something", &context, None, &emitter, &env, None)
+        .run(
+            &node,
+            "do something",
+            &context,
+            None,
+            &emitter,
+            &env,
+            None,
+            CancellationToken::new(),
+        )
         .await;
 
     let err = match result {
@@ -10052,14 +10153,23 @@ async fn cli_backend_run_uses_node_model_override() {
     let emitter = Arc::new(Emitter::default());
 
     backend
-        .run(&node, "test", &context, None, &emitter, &env, None)
+        .run(
+            &node,
+            "test",
+            &context,
+            None,
+            &emitter,
+            &env,
+            None,
+            CancellationToken::new(),
+        )
         .await
         .expect("should succeed");
 
     let commands = test_env.recorded_commands();
     let cli_cmd = commands
         .iter()
-        .find(|c| c.contains("claude") && c.contains("echo $!"))
+        .find(|c| c.contains("claude") && c.contains("_prompt.txt"))
         .unwrap();
     assert!(
         cli_cmd.contains("claude-sonnet-4-5"),
@@ -10093,14 +10203,23 @@ async fn cli_backend_run_uses_node_provider_override() {
     let emitter = Arc::new(Emitter::default());
 
     backend
-        .run(&node, "test", &context, None, &emitter, &env, None)
+        .run(
+            &node,
+            "test",
+            &context,
+            None,
+            &emitter,
+            &env,
+            None,
+            CancellationToken::new(),
+        )
         .await
         .expect("should succeed");
 
     let commands = test_env.recorded_commands();
     let cli_cmd = commands
         .iter()
-        .find(|c| c.contains("codex") && c.contains("echo $!"))
+        .find(|c| c.contains("codex") && c.contains("_prompt.txt"))
         .expect("should launch codex based on provider override");
     assert!(cli_cmd.contains("gpt-5.3-codex"));
 }
@@ -10118,7 +10237,16 @@ async fn cli_backend_run_returns_text_and_usage() {
     let emitter = Arc::new(Emitter::default());
 
     let result = backend
-        .run(&node, "test", &context, None, &emitter, &env, None)
+        .run(
+            &node,
+            "test",
+            &context,
+            None,
+            &emitter,
+            &env,
+            None,
+            CancellationToken::new(),
+        )
         .await
         .expect("should succeed");
 
@@ -10158,7 +10286,16 @@ async fn backend_router_delegates_to_cli_for_cli_node() {
     let emitter = Arc::new(Emitter::default());
 
     let result = router
-        .run(&node, "Fix the bug", &context, None, &emitter, &env, None)
+        .run(
+            &node,
+            "Fix the bug",
+            &context,
+            None,
+            &emitter,
+            &env,
+            None,
+            CancellationToken::new(),
+        )
         .await
         .expect("router should succeed");
 
@@ -10192,7 +10329,16 @@ async fn backend_router_delegates_to_api_for_normal_node() {
     let emitter = Arc::new(Emitter::default());
 
     let result = router
-        .run(&node, "Plan the work", &context, None, &emitter, &env, None)
+        .run(
+            &node,
+            "Plan the work",
+            &context,
+            None,
+            &emitter,
+            &env,
+            None,
+            CancellationToken::new(),
+        )
         .await
         .expect("router should succeed");
 
@@ -10229,7 +10375,16 @@ async fn backend_router_delegates_to_cli_for_backend_attr() {
     let emitter = Arc::new(Emitter::default());
 
     let result = router
-        .run(&node, "Build it", &context, None, &emitter, &env, None)
+        .run(
+            &node,
+            "Build it",
+            &context,
+            None,
+            &emitter,
+            &env,
+            None,
+            CancellationToken::new(),
+        )
         .await
         .expect("router should succeed");
 
@@ -10322,7 +10477,7 @@ async fn full_pipeline_with_cli_backend_node() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -10441,7 +10596,7 @@ async fn stylesheet_backend_property_routes_to_cli() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -10638,7 +10793,7 @@ async fn git_checkpoint_host_emits_events_and_diff_patch() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          run_dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-docker"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -10804,7 +10959,7 @@ async fn git_checkpoint_host_skips_metadata_branch_without_writer_prereqs() {
     let run_options = RunOptions {
         settings: WorkflowSettings::default(),
         run_dir: run_dir.path().to_path_buf(),
-        cancel_token: None,
+        cancel_token: CancellationToken::new(),
         run_id,
         labels: std::collections::HashMap::new(),
         workflow_slug: None,
@@ -10995,7 +11150,7 @@ async fn parallel_git_branching_host_e2e() {
     let run_options = RunOptions {
         settings: WorkflowSettings::default(),
         run_dir: run_dir.path().to_path_buf(),
-        cancel_token: None,
+        cancel_token: CancellationToken::new(),
         run_id,
         labels: std::collections::HashMap::new(),
         workflow_slug: None,
@@ -11245,7 +11400,7 @@ async fn git_checkpoint_host_skips_empty_diff_patch() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          run_dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("empty-diff"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -11616,7 +11771,7 @@ async fn e2e_circuit_breaker_deterministic_self_loop() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("e2e-circuit-breaker"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -11663,7 +11818,7 @@ async fn e2e_circuit_breaker_custom_limit() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("e2e-custom-limit"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -11703,7 +11858,7 @@ async fn e2e_circuit_breaker_ignores_transient_failures() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("e2e-transient-no-breaker"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -11750,7 +11905,7 @@ async fn e2e_circuit_breaker_different_reasons_separate_counters() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("e2e-varying-reasons"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -11790,7 +11945,7 @@ async fn e2e_circuit_breaker_loop_restart() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("e2e-restart-breaker"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -11853,7 +12008,7 @@ async fn e2e_failure_signature_persisted_in_context() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("e2e-sig-context"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -11870,7 +12025,10 @@ async fn e2e_failure_signature_persisted_in_context() {
     assert_eq!(outcome.status, StageOutcome::Succeeded);
 
     // Verify checkpoint has failure_signature in context
-    let cp = state.checkpoint.expect("checkpoint should be captured");
+    let cp = state
+        .current_checkpoint()
+        .cloned()
+        .expect("checkpoint should be captured");
     let sig_value = cp
         .context_values
         .get("failure_signature")
@@ -11917,7 +12075,7 @@ async fn e2e_failure_signature_hint_overrides_reason_in_context() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("e2e-sig-hint"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -11930,7 +12088,10 @@ async fn e2e_failure_signature_hint_overrides_reason_in_context() {
     };
     let (_outcome, state) = engine.run_with_state(&graph, &run_options).await.unwrap();
 
-    let cp = state.checkpoint.expect("checkpoint should be captured");
+    let cp = state
+        .current_checkpoint()
+        .cloned()
+        .expect("checkpoint should be captured");
     let sig_str = cp
         .context_values
         .get("failure_signature")
@@ -11975,7 +12136,7 @@ async fn e2e_signature_maps_persist_in_checkpoint() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("e2e-sig-persist"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -11990,7 +12151,10 @@ async fn e2e_signature_maps_persist_in_checkpoint() {
     assert_eq!(outcome.status, StageOutcome::Succeeded);
 
     // Verify signature maps persisted to the run state checkpoint.
-    let cp = state.checkpoint.expect("checkpoint should be captured");
+    let cp = state
+        .current_checkpoint()
+        .cloned()
+        .expect("checkpoint should be captured");
     // The pipeline had 3 deterministic failures at "work" before succeeding.
     // loop_failure_signatures should have recorded them.
     assert!(
@@ -12103,7 +12267,7 @@ async fn e2e_circuit_breaker_emits_events_before_abort() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("e2e-events"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -12170,7 +12334,7 @@ async fn e2e_circuit_breaker_does_not_fire_below_limit() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("e2e-below-limit"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -12189,7 +12353,10 @@ async fn e2e_circuit_breaker_does_not_fire_below_limit() {
     );
 
     // Verify signatures were tracked but didn't trigger abort
-    let cp = state.checkpoint.expect("checkpoint should exist");
+    let cp = state
+        .current_checkpoint()
+        .cloned()
+        .expect("checkpoint should exist");
     let total_failures: usize = cp.loop_failure_signatures.values().sum();
     assert_eq!(
         total_failures, 4,
@@ -12266,7 +12433,7 @@ async fn e2e_circuit_breaker_multi_stage_impl_verify_cycle() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("e2e-impl-verify-cycle"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -12364,7 +12531,7 @@ async fn e2e_loop_restart_blocked_for_deterministic_failure() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("e2e-restart-blocked-det"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -12404,7 +12571,7 @@ async fn e2e_loop_restart_blocked_for_structural_failure() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("e2e-restart-blocked-struct"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -12444,7 +12611,7 @@ async fn e2e_loop_restart_blocked_for_budget_exhausted_failure() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("e2e-restart-blocked-budget"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -12484,7 +12651,7 @@ async fn e2e_loop_restart_blocked_for_canceled_failure() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("e2e-restart-blocked-canceled"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -12521,7 +12688,7 @@ async fn e2e_loop_restart_blocked_for_compilation_loop_failure() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("e2e-restart-blocked-comploop"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -12562,7 +12729,7 @@ async fn e2e_loop_restart_allowed_for_transient_infra() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("e2e-restart-allowed-transient"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -12670,7 +12837,7 @@ async fn e2e_stall_watchdog_triggers_from_dot_parsed_pipeline() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("stall-e2e"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -12726,7 +12893,7 @@ async fn e2e_stall_watchdog_kept_alive_by_handler_events() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("stall-alive-e2e"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -12772,7 +12939,7 @@ async fn e2e_stall_watchdog_disabled_with_zero_timeout() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("stall-disabled-e2e"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -12838,7 +13005,7 @@ async fn e2e_stall_watchdog_with_explicit_timeout_override() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("stall-override-e2e"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -12980,7 +13147,7 @@ async fn asset_collection_local_sandbox_success() {
             ..WorkflowSettings::default()
         },
         run_dir:          run_dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("artifact-test-local"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -13116,7 +13283,7 @@ async fn asset_collection_local_sandbox_on_failure() {
             ..WorkflowSettings::default()
         },
         run_dir:          run_dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("artifact-test-fail"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -13226,7 +13393,7 @@ async fn asset_collection_docker_sandbox() {
             ..WorkflowSettings::default()
         },
         run_dir:          run_dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("artifact-test-docker"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -13298,7 +13465,7 @@ async fn wait_timer_e2e() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,

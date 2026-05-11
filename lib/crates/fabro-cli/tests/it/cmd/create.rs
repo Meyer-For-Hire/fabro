@@ -3,7 +3,10 @@ use httpmock::MockServer;
 use insta::assert_snapshot;
 use serde_json::json;
 
-use super::support::{fixture, output_stdout, resolve_run, run_count_for_test_case, run_state};
+use super::support::{
+    fixture, output_stdout, remote_run_summary_json, resolve_run, run_count_for_test_case,
+    run_state,
+};
 use crate::support::unique_run_id;
 
 fn resolved_run(settings: &fabro_types::WorkflowSettings) -> fabro_types::settings::RunNamespace {
@@ -15,11 +18,14 @@ fn run_status_response(run_id: &str, status: &str) -> serde_json::Value {
         "submitted" => json!({ "kind": "submitted" }),
         other => panic!("unsupported test status {other:?}"),
     };
-    serde_json::json!({
-        "id": run_id,
-        "status": status,
-        "created_at": "2026-04-05T12:00:00Z"
-    })
+    remote_run_summary_json(
+        run_id,
+        "Test Workflow",
+        "test-workflow",
+        "Test run",
+        &status,
+        "2026-04-05T12:00:00Z",
+    )
 }
 
 #[test]
@@ -42,19 +48,18 @@ fn help() {
           --json                   Output as JSON [env: FABRO_JSON=]
           --server <SERVER>        Fabro server target: http(s) URL or absolute Unix socket path [env: FABRO_SERVER=]
           --debug                  Enable DEBUG-level logging (default is INFO) [env: FABRO_DEBUG=]
+      -I, --input <KEY=VALUE>      Override a workflow input value (repeatable, format: KEY=VALUE)
           --dry-run                Execute with simulated LLM backend
-          --auto-approve           Auto-approve all human gates
           --no-upgrade-check       Disable automatic upgrade check [env: FABRO_NO_UPGRADE_CHECK=true]
-          --goal <GOAL>            Override the workflow goal (available as {{ goal }} in prompts)
+          --auto-approve           Auto-approve all human gates
           --quiet                  Suppress non-essential output [env: FABRO_QUIET=]
+          --goal <GOAL>            Override the workflow goal (available as {{ goal }} in prompts)
           --goal-file <GOAL_FILE>  Read the workflow goal from a file
           --model <MODEL>          Override default LLM model
           --provider <PROVIDER>    Override default LLM provider
       -v, --verbose                Enable verbose output
           --sandbox <SANDBOX>      Sandbox for agent tools [possible values: local, docker, daytona]
-          --in-place               Run directly in the source checkout without git checkpoints
           --label <KEY=VALUE>      Attach a label to this run (repeatable, format: KEY=VALUE)
-          --no-retro               Skip retro generation after the run
           --preserve-sandbox       Keep the sandbox alive after the run finishes (for debugging)
       -d, --detach                 Run the workflow in the background and print the run ID
       -h, --help                   Print help
@@ -220,13 +225,13 @@ digraph BarBaz {
 
     let run_dir = context.find_run_dir(&run_id);
     let state = run_state(&run_dir);
-    let run = state.spec.as_ref().expect("run spec should exist");
+    let run = &state.spec;
     fabro_json_snapshot!(
         context,
         serde_json::json!({
             "workflow_slug": run.workflow_slug,
             "graph_name": run.graph.name,
-            "cached_graph_lines": state.graph_source.as_ref().expect("graph should exist").lines().collect::<Vec<_>>(),
+            "cached_graph_lines": state.spec.graph_source.as_ref().expect("graph should exist").lines().collect::<Vec<_>>(),
         }),
         @r#"
         {
@@ -277,13 +282,13 @@ digraph FooWorkflow {
 
     let run_dir = context.find_run_dir(&run_id);
     let state = run_state(&run_dir);
-    let run = state.spec.as_ref().expect("run spec should exist");
+    let run = &state.spec;
     fabro_json_snapshot!(
         context,
         serde_json::json!({
             "workflow_slug": run.workflow_slug,
             "graph_name": run.graph.name,
-            "cached_graph_lines": state.graph_source.as_ref().expect("graph should exist").lines().collect::<Vec<_>>(),
+            "cached_graph_lines": state.spec.graph_source.as_ref().expect("graph should exist").lines().collect::<Vec<_>>(),
         }),
         @r#"
         {
@@ -324,7 +329,6 @@ fn create_persists_requested_overrides_into_store() {
         "--label",
         "team=cli",
         "--verbose",
-        "--no-retro",
         "--preserve-sandbox",
         workflow.to_str().unwrap(),
     ]);
@@ -345,7 +349,7 @@ fn create_persists_requested_overrides_into_store() {
         .to_string();
     let run = resolve_run(&context, &run_id);
     let state = run_state(&run.run_dir);
-    let run_spec = state.spec.as_ref().expect("run spec should exist");
+    let run_spec = &state.spec;
     let labels = json!({
         "env": run_spec.labels.get("env"),
         "team": run_spec.labels.get("team"),
@@ -361,7 +365,6 @@ fn create_persists_requested_overrides_into_store() {
             },
             "dry_run": resolved_run.execution.mode == fabro_types::settings::run::RunMode::DryRun,
             "auto_approve": resolved_run.execution.approval == fabro_types::settings::run::ApprovalMode::Auto,
-            "no_retro": !resolved_run.execution.retros,
             "llm": {
                 "model": resolved_run.model.name.as_ref().map(fabro_types::settings::InterpString::as_source),
                 "provider": resolved_run.model.provider.as_ref().map(fabro_types::settings::InterpString::as_source),
@@ -381,7 +384,6 @@ fn create_persists_requested_overrides_into_store() {
         "goal": "Ship the release",
         "dry_run": true,
         "auto_approve": true,
-        "no_retro": true,
         "llm": {
           "model": "gpt-5",
           "provider": "openai"
@@ -425,15 +427,9 @@ fn create_json_does_not_imply_auto_approve() {
     let run = resolve_run(&context, run_id);
 
     assert!(
-        resolved_run(
-            &run_state(&run.run_dir)
-                .spec
-                .as_ref()
-                .expect("run spec should exist")
-                .settings,
-        )
-        .execution
-        .approval
+        resolved_run(&run_state(&run.run_dir).spec.settings,)
+            .execution
+            .approval
             != fabro_types::settings::run::ApprovalMode::Auto
     );
 }

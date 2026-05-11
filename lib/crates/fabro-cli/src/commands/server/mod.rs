@@ -154,6 +154,7 @@ pub(crate) async fn dispatch(
                 bind_addr,
                 storage_dir,
                 styles,
+                None,
             ))
             .await
         }

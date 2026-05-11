@@ -1,5 +1,6 @@
 pub(crate) mod artifact;
 pub(crate) mod auth;
+pub(crate) mod cli_reference;
 pub(crate) mod config;
 pub(crate) mod doctor;
 pub(crate) mod dump;

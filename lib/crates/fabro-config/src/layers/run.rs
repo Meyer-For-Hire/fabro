@@ -4,11 +4,11 @@ use std::collections::HashMap;
 
 use fabro_types::settings::run::{
     AgentPermissions, ApprovalMode, DaytonaNetworkLayer, HookEvent, MergeStrategy, RunMode,
-    WorktreeMode,
 };
 use fabro_types::settings::{Duration, InterpString, ModelRef, Size};
 use serde::{Deserialize, Serialize};
 
+use super::combine::Combine;
 use super::maps::{MergeMap, ReplaceMap, StickyMap};
 use super::splice_array::SPLICE_MARKER;
 
@@ -51,6 +51,44 @@ pub struct RunLayer {
     pub pull_request:  Option<RunPullRequestLayer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifacts:     Option<RunArtifactsLayer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrations:  Option<RunIntegrationsLayer>,
+}
+
+/// `[run.integrations]` — run-level integration knobs.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, fabro_macros::Combine)]
+#[serde(deny_unknown_fields)]
+pub struct RunIntegrationsLayer {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github: Option<RunIntegrationsGithubLayer>,
+}
+
+/// `[run.integrations.github]` — runtime GitHub token shape.
+///
+/// `Combine` is hand-rolled (not derived) for two reasons:
+/// 1. `HashMap<String, InterpString>: Combine` is not implemented in this
+///    crate, so `#[derive(Combine)]` would not even compile.
+/// 2. The `ReplaceMap` "empty inherits from below" semantics (`maps.rs:76-80`)
+///    are the wrong fit: we want `Some({})` from a higher layer to be honored
+///    as an explicit clear (no token requested) rather than fall through to a
+///    lower layer's permissions.
+///
+/// Note: this diverges from sibling map fields like `RunLayer::metadata`
+/// (`ReplaceMap`), where empty-table-means-inherit. Document the
+/// difference for workflow authors reading the schema by analogy.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunIntegrationsGithubLayer {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<HashMap<String, InterpString>>,
+}
+
+impl Combine for RunIntegrationsGithubLayer {
+    fn combine(self, other: Self) -> Self {
+        Self {
+            permissions: self.permissions.or(other.permissions),
+        }
+    }
 }
 
 /// The source of a run's goal, either inline literal text or a reference to
@@ -230,9 +268,6 @@ pub struct RunExecutionLayer {
     pub mode:     Option<RunMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval: Option<ApprovalMode>,
-    /// Positive-form: `true` runs retros, `false` skips them.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub retros:   Option<bool>,
 }
 
 /// `[run.checkpoint]` — checkpoint policy.
@@ -248,27 +283,20 @@ pub struct RunCheckpointLayer {
 #[serde(deny_unknown_fields)]
 pub struct RunSandboxLayer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider:     Option<String>,
+    pub provider:         Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preserve:     Option<bool>,
+    pub preserve:         Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub devcontainer: Option<bool>,
+    pub stop_on_terminal: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub devcontainer:     Option<bool>,
     /// Sticky merge-by-key across layers.
     #[serde(default, skip_serializing_if = "StickyMap::is_empty")]
-    pub env:          StickyMap<InterpString>,
+    pub env:              StickyMap<InterpString>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub local:        Option<LocalSandboxLayer>,
+    pub docker:           Option<DockerSandboxLayer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub docker:       Option<DockerSandboxLayer>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub daytona:      Option<DaytonaSandboxLayer>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LocalSandboxLayer {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub worktree_mode: Option<WorktreeMode>,
+    pub daytona:          Option<DaytonaSandboxLayer>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, fabro_macros::Combine)]
@@ -337,13 +365,9 @@ pub struct NotificationRouteLayer {
     /// Raw Fabro event names. Splice marker supported at layering time.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events:   Vec<StringOrSplice>,
-    /// Provider-specific destination subtables. First-pass chat providers.
+    /// Provider-specific destination subtables.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slack:    Option<NotificationProviderLayer>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub discord:  Option<NotificationProviderLayer>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub teams:    Option<NotificationProviderLayer>,
 }
 
 /// A single string array entry that may be the splice marker.
@@ -389,10 +413,6 @@ pub struct InterviewsLayer {
     pub provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slack:    Option<InterviewProviderLayer>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub discord:  Option<InterviewProviderLayer>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub teams:    Option<InterviewProviderLayer>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

@@ -1,30 +1,17 @@
-#[expect(
-    clippy::disallowed_methods,
-    reason = "Build scripts run outside Tokio and need a synchronous git probe for the embedded build SHA."
-)]
-fn main() {
-    println!("cargo:rerun-if-changed=../../../.git/HEAD");
+use std::path::Path;
 
-    let sha = std::process::Command::new("git")
-        .args(["rev-list", "-1", "HEAD"])
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                String::from_utf8(o.stdout)
-                    .ok()
-                    .map(|s| s.trim().to_string())
-            } else {
-                None
-            }
-        })
-        .unwrap_or_default();
-    let short_sha = if sha.len() >= 7 { &sha[..7] } else { &sha };
-    println!("cargo:rustc-env=FABRO_GIT_SHA={short_sha}");
+fn main() {
+    let metadata = fabro_build_support::collect_from(Path::new("."));
+
+    for path in metadata.rerun_paths {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+
+    println!("cargo:rustc-env=FABRO_GIT_SHA={}", metadata.short_sha);
 
     let build_date = chrono::Utc::now().format("%Y-%m-%d").to_string();
     println!("cargo:rustc-env=FABRO_BUILD_DATE={build_date}");
 
-    let profile = std::env::var("PROFILE").unwrap_or_default();
+    let profile = fabro_build_support::cargo_profile();
     println!("cargo:rustc-env=FABRO_BUILD_PROFILE={profile}");
 }

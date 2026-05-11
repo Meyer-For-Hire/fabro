@@ -27,7 +27,7 @@ goal = "Implement the login feature"
 |---|---|---|
 | `_version` | No (defaults to `1`) | Schema version. Must be `1` in the first pass. |
 | `[workflow].graph` | No | Path to the Graphviz workflow file, relative to the TOML file's directory. Defaults to `workflow.fabro`. |
-| `[run].goal` | No | What the workflow should accomplish. Passed to agents and used in retrospectives. Can also be provided via `--goal` CLI flag or Graphviz graph `goal` attribute. |
+| `[run].goal` | No | What the workflow should accomplish. Passed to agents and available via `--goal` CLI flag or Graphviz graph `goal` attribute. |
 
 Goal precedence: CLI `--goal` > `[run].goal` > Graphviz graph attribute.
 
@@ -74,6 +74,10 @@ dockerfile = "FROM node:20-slim\nRUN apt-get update && apt-get install -y git"
 [run.sandbox.env]
 API_KEY = "{{ env.MY_API_KEY }}"
 NODE_ENV = "production"
+
+[run.integrations.github.permissions]
+contents = "write"
+pull_requests = "write"
 
 [run.checkpoint]
 exclude_globs = ["**/node_modules/**", "**/.cache/**"]
@@ -228,18 +232,9 @@ dockerfile = "FROM rust:1.85-slim-bookworm\nRUN apt-get update"
 | `network` | Network access mode: `"allow_all"` (default), `"block"`, or `{ allow_list = ["..."] }`. See [Sandboxing](/administration/sandboxing#network-access-control). |
 | `skip_clone` | When `true`, start with an empty Daytona workspace instead of cloning the run's GitHub origin. |
 
-#### `[run.sandbox.local]`
+#### Local sandbox
 
-Additional settings when using the local sandbox:
-
-```toml title="run.toml"
-[run.sandbox.local]
-worktree_mode = "always"
-```
-
-| Field | Description |
-|---|---|
-| `worktree_mode` | Legacy compatibility setting. Local Git runs use a run-scoped worktree by default; the explicit in-place/no-checkpoints path is the supported opt-out. |
+When `run.sandbox.provider = "local"`, Fabro runs directly in the resolved working directory. If you want local isolation, create or enter a separate clone or Git worktree yourself, then run with `--sandbox local`.
 
 #### `[run.sandbox.env]`
 
@@ -259,6 +254,21 @@ SERVICE_URL = "https://api.{{ env.REGION }}.example.com"
 | `"prefix-{{ env.X }}-suffix"` | Substring interpolation; multiple tokens per string are supported |
 
 Missing host variables produce a hard error pointing at the specific field and unresolved token. `run.sandbox.env` is a sticky merge-by-key map: entries from all layers combine, with higher-precedence layers overriding individual keys.
+
+### `[run.integrations.github.permissions]`
+
+Request a scoped GitHub App token for workflow stages that need `GITHUB_TOKEN` inside the sandbox. Values map directly to GitHub App permission names and access levels.
+
+```toml title="run.toml"
+[run.integrations.github.permissions]
+contents = "write"
+pull_requests = "write"
+issues = "read"
+```
+
+Only requested permissions are included. The upper bound is the permission set granted to the installed GitHub App, and Fabro logs a warning and continues without `GITHUB_TOKEN` if the app is not configured or is not installed on the repository.
+
+This table follows the normal settings precedence order. A higher-precedence layer can set `permissions = {}` to clear inherited permissions and run without a GitHub token.
 
 ### `[run.checkpoint]`
 
@@ -298,7 +308,15 @@ digraph CI {
 
 If a workflow template references an undefined input like `{{ inputs.langauge }}`, Fabro raises an error immediately.
 
-`[run.inputs]` replaces wholesale across layers. Unlike labels, inputs do not merge by key — the highest-precedence layer that sets `inputs` wins its entire map.
+TOML `[run.inputs]` tables replace wholesale across layers. Unlike labels, TOML input tables do not merge by key — the highest-precedence config layer that sets `inputs` wins its entire map.
+
+CLI input flags are sparse overrides on top of the resolved config inputs:
+
+```bash
+fabro run .fabro/workflows/ci/workflow.toml -I repo_name=fabro-2 --input language=rust
+```
+
+Repeat `-I` / `--input` to override multiple keys. CLI input flags have the highest precedence, merge per key, and preserve unrelated inherited inputs. Duplicate CLI keys are accepted; the last value wins.
 
 ### `[run.artifacts]`
 
@@ -441,7 +459,7 @@ provider = "daytona"
 name = "my-project-snapshot"
 ```
 
-Project defaults and workflow config values merge per the normative merge matrix: most fields merge by field (higher-precedence wins per key), `run.inputs` replaces wholesale, `run.sandbox.env` sticky-merges by key, and `run.prepare.steps` replaces whole-list.
+Project defaults and workflow config values merge per the normative merge matrix: most fields merge by field (higher-precedence wins per key), TOML `run.inputs` tables replace wholesale, CLI input flags merge per key at highest precedence, `run.sandbox.env` sticky-merges by key, and `run.prepare.steps` replaces whole-list.
 
 ### Machine defaults
 

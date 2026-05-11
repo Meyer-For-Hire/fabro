@@ -8,7 +8,6 @@ use fabro_types::settings::{Duration, InterpString};
 use serde::{Deserialize, Serialize};
 
 use super::LogFilter;
-use super::maps::StickyMap;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, fabro_macros::Combine)]
 #[serde(deny_unknown_fields)]
@@ -190,21 +189,15 @@ pub struct ServerLoggingLayer {
     pub destination: Option<LogDestination>,
 }
 
-/// `[server.integrations.<provider>]` — cohesive integration surface for chat
-/// platforms and git providers (GitHub App, webhooks, etc.). First-pass
-/// integrations enumerate known providers rather than using a flatten-HashMap
-/// shape so strict unknown-field validation still holds.
+/// `[server.integrations.<provider>]` — cohesive integration surface for Slack
+/// and git providers (GitHub App, webhooks, etc.).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, fabro_macros::Combine)]
 #[serde(deny_unknown_fields)]
 pub struct ServerIntegrationsLayer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub github:  Option<GithubIntegrationLayer>,
+    pub github: Option<GithubIntegrationLayer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub slack:   Option<SlackIntegrationLayer>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub discord: Option<DiscordIntegrationLayer>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub teams:   Option<TeamsIntegrationLayer>,
+    pub slack:  Option<SlackIntegrationLayer>,
 }
 
 /// `[server.integrations.github]` — GitHub App, credentials, and inbound
@@ -213,19 +206,17 @@ pub struct ServerIntegrationsLayer {
 #[serde(deny_unknown_fields)]
 pub struct GithubIntegrationLayer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub enabled:     Option<bool>,
+    pub enabled:   Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub strategy:    Option<GithubIntegrationStrategy>,
+    pub strategy:  Option<GithubIntegrationStrategy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub app_id:      Option<InterpString>,
+    pub app_id:    Option<InterpString>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub client_id:   Option<InterpString>,
+    pub client_id: Option<InterpString>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub slug:        Option<InterpString>,
-    #[serde(default, skip_serializing_if = "StickyMap::is_empty")]
-    pub permissions: StickyMap<InterpString>,
+    pub slug:      Option<InterpString>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub webhooks:    Option<IntegrationWebhooksLayer>,
+    pub webhooks:  Option<IntegrationWebhooksLayer>,
 }
 
 /// `[server.integrations.slack]` — Slack workspace credentials and defaults.
@@ -236,22 +227,6 @@ pub struct SlackIntegrationLayer {
     pub enabled:         Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_channel: Option<InterpString>,
-}
-
-/// `[server.integrations.discord]` — Discord workspace configuration.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, fabro_macros::Combine)]
-#[serde(deny_unknown_fields)]
-pub struct DiscordIntegrationLayer {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub enabled: Option<bool>,
-}
-
-/// `[server.integrations.teams]` — Microsoft Teams configuration.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, fabro_macros::Combine)]
-#[serde(deny_unknown_fields)]
-pub struct TeamsIntegrationLayer {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, fabro_macros::Combine)]

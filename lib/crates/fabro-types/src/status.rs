@@ -16,24 +16,21 @@ pub enum RunStatus {
     Succeeded { reason: SuccessReason },
     Failed { reason: FailureReason },
     Dead,
-    Archived { prior: TerminalStatus },
 }
 
 impl RunStatus {
     /// Whether the run has reached a terminal outcome and stops poll loops,
-    /// finalization, and similar "done" handling. `Archived` is terminal
-    /// because it is only reachable from another terminal status.
+    /// finalization, and similar "done" handling.
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Succeeded { .. } | Self::Failed { .. } | Self::Dead | Self::Archived { .. }
+            Self::Succeeded { .. } | Self::Failed { .. } | Self::Dead
         )
     }
 
     /// Whether the run's status is frozen and cannot transition outbound
-    /// (except via the `* -> Dead` escape hatch). `Archived` is intentionally
-    /// NOT immutable — it can transition back to its prior terminal status
-    /// via `unarchive`.
+    /// through normal lifecycle events. Deletion and the `* -> Dead` escape
+    /// hatch are allowed separately.
     pub fn is_immutable(self) -> bool {
         matches!(
             self,
@@ -52,6 +49,10 @@ impl RunStatus {
                 | Self::Paused { .. }
                 | Self::Removing
         )
+    }
+
+    pub fn requires_force_to_delete(self) -> bool {
+        self.is_active() && !matches!(self, Self::Removing)
     }
 
     pub fn blocked_reason(self) -> Option<BlockedReason> {
@@ -75,17 +76,14 @@ impl RunStatus {
         if matches!(to, Self::Dead) {
             return true;
         }
+        if matches!(to, Self::Removing) {
+            return !matches!(self, Self::Removing);
+        }
         if matches!((self, to), (Self::Failed { .. }, Self::Submitted)) {
             return true;
         }
         if self.is_immutable() {
-            return matches!(to, Self::Archived { .. });
-        }
-        if matches!(self, Self::Archived { .. }) {
-            return matches!(
-                to,
-                Self::Succeeded { .. } | Self::Failed { .. } | Self::Dead
-            );
+            return false;
         }
         matches!(
             (self, to),
@@ -156,7 +154,6 @@ impl fmt::Display for RunStatus {
             Self::Succeeded { reason } => write!(f, "succeeded({reason})"),
             Self::Failed { reason } => write!(f, "failed({reason})"),
             Self::Dead => f.write_str("dead"),
-            Self::Archived { prior } => write!(f, "archived({prior})"),
         }
     }
 }
@@ -323,9 +320,7 @@ pub enum RunControlAction {
 mod tests {
     use std::str::FromStr;
 
-    use super::{
-        BlockedReason, FailureReason, InvalidTransition, RunStatus, SuccessReason, TerminalStatus,
-    };
+    use super::{BlockedReason, FailureReason, InvalidTransition, RunStatus, SuccessReason};
 
     #[test]
     fn queued_and_blocked_are_active() {
@@ -392,80 +387,31 @@ mod tests {
     }
 
     #[test]
-    fn archived_display_includes_prior_terminal_status() {
-        let archived = RunStatus::Archived {
-            prior: TerminalStatus::Succeeded {
-                reason: SuccessReason::Completed,
+    fn run_statuses_can_transition_to_removing_for_deletion() {
+        let removing = RunStatus::Removing;
+        for status in [
+            RunStatus::Submitted,
+            RunStatus::Queued,
+            RunStatus::Starting,
+            RunStatus::Running,
+            RunStatus::Blocked {
+                blocked_reason: BlockedReason::HumanInputRequired,
             },
-        };
-        assert_eq!(archived.to_string(), "archived(succeeded(completed))");
-    }
-
-    #[test]
-    fn terminal_statuses_can_transition_to_archived() {
-        let archived = RunStatus::Archived {
-            prior: TerminalStatus::Dead,
-        };
-        assert!(
+            RunStatus::Paused { prior_block: None },
             RunStatus::Succeeded {
                 reason: SuccessReason::Completed,
-            }
-            .can_transition_to(archived)
-        );
-        assert!(
+            },
             RunStatus::Failed {
                 reason: FailureReason::Cancelled,
-            }
-            .can_transition_to(archived)
-        );
-        assert!(RunStatus::Dead.can_transition_to(archived));
-    }
-
-    #[test]
-    fn archived_can_transition_back_to_terminal() {
-        let archived = RunStatus::Archived {
-            prior: TerminalStatus::Succeeded {
-                reason: SuccessReason::Completed,
             },
-        };
-        assert!(archived.can_transition_to(RunStatus::Succeeded {
-            reason: SuccessReason::Completed,
-        }));
-        assert!(archived.can_transition_to(RunStatus::Failed {
-            reason: FailureReason::Cancelled,
-        }));
-        assert!(archived.can_transition_to(RunStatus::Dead));
-    }
-
-    #[test]
-    fn running_cannot_transition_to_archived() {
-        let archived = RunStatus::Archived {
-            prior: TerminalStatus::Succeeded {
-                reason: SuccessReason::Completed,
-            },
-        };
-        assert!(!RunStatus::Running.can_transition_to(archived));
-        assert!(!RunStatus::Queued.can_transition_to(archived));
-        assert!(!RunStatus::Submitted.can_transition_to(archived));
-        assert!(!RunStatus::Paused { prior_block: None }.can_transition_to(archived));
-    }
-
-    #[test]
-    fn archived_to_archived_is_rejected() {
-        let archived = RunStatus::Archived {
-            prior: TerminalStatus::Dead,
-        };
-        assert!(!archived.can_transition_to(archived));
-    }
-
-    #[test]
-    fn archived_is_terminal_but_not_immutable() {
-        let archived = RunStatus::Archived {
-            prior: TerminalStatus::Dead,
-        };
-        assert!(archived.is_terminal());
-        assert!(!archived.is_immutable());
-        assert!(!archived.is_active());
+            RunStatus::Dead,
+        ] {
+            assert!(
+                status.can_transition_to(removing),
+                "{status} should transition to removing"
+            );
+        }
+        assert!(!removing.can_transition_to(removing));
     }
 
     #[test]
@@ -486,10 +432,10 @@ mod tests {
 
     #[test]
     fn invalid_transition_carries_from_and_to() {
-        let from = RunStatus::Running;
-        let to = RunStatus::Archived {
-            prior: TerminalStatus::Dead,
+        let from = RunStatus::Succeeded {
+            reason: SuccessReason::Completed,
         };
+        let to = RunStatus::Running;
         let err = from.transition_to(to).expect_err("should reject");
         assert_eq!(err, InvalidTransition { from, to });
     }

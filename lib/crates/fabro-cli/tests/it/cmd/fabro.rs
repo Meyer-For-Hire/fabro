@@ -16,11 +16,13 @@ fn help() {
       create      Create a workflow run (allocate run dir, persist spec)
       start       Start a created workflow run on the server
       attach      Attach to a running or finished workflow run
-      logs        View the event log of a workflow run
+      events      View the event log of a workflow run
+      logs        View the raw worker tracing log of a workflow run
       resume      Resume an interrupted workflow run
       rewind      Rewind a workflow run to an earlier checkpoint
       fork        Fork a workflow run from an earlier checkpoint into a new run
       wait        Block until a workflow run completes
+      steer       Steer a running agent mid-execution
       preflight   Validate run configuration without executing
       validate    Validate a workflow
       graph       Render a workflow graph as SVG
@@ -92,7 +94,8 @@ fn no_args_prints_curated_landing() {
 
     Inspect runs
 
-      fabro logs           View the event log of a workflow run
+      fabro events         View the event log of a workflow run
+      fabro logs           View the raw worker tracing log of a workflow run
       fabro sandbox ssh    SSH into a run's sandbox
 
     If you need help along the way:

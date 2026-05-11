@@ -6,24 +6,33 @@ import * as RedirectHome from "./routes/redirect-home";
 import * as Setup from "./routes/setup";
 import * as AuthLogin from "./routes/auth-login";
 import * as Start from "./routes/start";
-import * as Workflows from "./routes/workflows";
-import * as WorkflowDetail from "./routes/workflow-detail";
-import * as WorkflowDefinition from "./routes/workflow-definition";
-import * as WorkflowDiagram from "./routes/workflow-diagram";
-import * as WorkflowRuns from "./routes/workflow-runs";
+import * as Automations from "./routes/automations";
+import * as AutomationDetail from "./routes/automation-detail";
+import * as AutomationDefinition from "./routes/automation-definition";
+import * as AutomationDiagram from "./routes/automation-diagram";
+import * as AutomationRuns from "./routes/automation-runs";
 import * as Runs from "./routes/runs";
 import * as RunDetail from "./routes/run-detail";
 import * as RunOverview from "./routes/run-overview";
 import * as RunStages from "./routes/run-stages";
 import * as RunSettings from "./routes/run-settings";
-import * as RunGraph from "./routes/run-graph";
+import * as RunSource from "./routes/run-source";
 import * as RunLogs from "./routes/run-logs";
+import * as RunEvents from "./routes/run-events";
+import * as RunArtifacts from "./routes/run-artifacts";
 import * as RunFiles from "./routes/run-files";
+import * as RunSandbox from "./routes/run-sandbox";
+import * as RunTerminal from "./routes/run-terminal";
 import * as RunBilling from "./routes/run-billing";
 import * as Insights from "./routes/insights";
 import * as InsightsEditor from "./routes/insights-editor";
 import * as InsightsNew from "./routes/insights-new";
 import * as Settings from "./routes/settings";
+import * as SettingsOverview from "./routes/settings-overview";
+import * as SettingsLiveEvents from "./routes/settings-live-events";
+import * as Profile from "./routes/profile";
+import * as ProfileOverview from "./routes/profile-overview";
+import * as ProfileSessions from "./routes/profile-sessions";
 import AppShellModule from "./layouts/app-shell";
 
 type RouteModule = {
@@ -71,18 +80,19 @@ export const routes: RouteObject[] = [
       indexRoute(RedirectHome),
       route("setup", Setup),
       route("login", AuthLogin),
+      route("runs/:id/terminal", RunTerminal),
       {
         Component: withRouteModule({
           default: AppShellModule,
         }),
         children: [
           route("start", Start),
-          route("workflows", Workflows),
-          route("workflows/:name", WorkflowDetail, {
+          route("automations", Automations),
+          route("automations/:name", AutomationDetail, {
             children: [
-              indexRoute(WorkflowDefinition),
-              route("diagram", WorkflowDiagram),
-              route("runs", WorkflowRuns),
+              indexRoute(AutomationDefinition),
+              route("diagram", AutomationDiagram),
+              route("runs", AutomationRuns),
             ],
           }),
           route("runs", Runs),
@@ -92,9 +102,12 @@ export const routes: RouteObject[] = [
               route("stages", RunStages),
               route("stages/:stageId", RunStages),
               route("settings", RunSettings),
-              route("graph", RunGraph),
+              route("source", RunSource),
               route("logs", RunLogs),
+              route("events", RunEvents),
+              route("artifacts", RunArtifacts),
               route("files", RunFiles),
+              route("sandbox", RunSandbox),
               route("billing", RunBilling),
             ],
           }),
@@ -104,7 +117,18 @@ export const routes: RouteObject[] = [
               route("new", InsightsNew),
             ],
           }),
-          route("settings", Settings),
+          route("settings", Settings, {
+            children: [
+              indexRoute(SettingsOverview),
+              route("live-events", SettingsLiveEvents),
+            ],
+          }),
+          route("profile", Profile, {
+            children: [
+              indexRoute(ProfileOverview),
+              route("sessions", ProfileSessions),
+            ],
+          }),
         ],
       },
     ],

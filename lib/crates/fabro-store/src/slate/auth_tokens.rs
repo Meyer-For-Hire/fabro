@@ -3,6 +3,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use fabro_types::IdpIdentity;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -78,6 +79,33 @@ impl RefreshTokenStore {
         self.repo.get(token_hash).await
     }
 
+    pub async fn active_cli_sessions(
+        &self,
+        identity: &IdpIdentity,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<RefreshToken>> {
+        let mut active_by_chain = std::collections::HashMap::<Uuid, RefreshToken>::new();
+        let mut tokens = self.repo.scan_stream();
+
+        while let Some(result) = tokens.next().await {
+            let (_, token) = result?;
+            if token.identity != *identity || token.used || token.expires_at <= now {
+                continue;
+            }
+
+            active_by_chain
+                .entry(token.chain_id)
+                .and_modify(|current| {
+                    if token.last_used_at > current.last_used_at {
+                        *current = token.clone();
+                    }
+                })
+                .or_insert(token);
+        }
+
+        Ok(active_by_chain.into_values().collect())
+    }
+
     pub async fn consume_and_rotate(
         &self,
         presented_hash: [u8; 32],
@@ -111,6 +139,42 @@ impl RefreshTokenStore {
 
     pub async fn delete_chain(&self, chain_id: Uuid) -> Result<u64> {
         self.repo.gc(|token| token.chain_id == chain_id).await
+    }
+
+    pub async fn delete_active_chain_for_identity(
+        &self,
+        identity: &IdpIdentity,
+        chain_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> Result<u64> {
+        let mut token_hashes = Vec::new();
+        let mut has_active_token = false;
+        let mut tokens = self.repo.scan_stream();
+
+        while let Some(result) = tokens.next().await {
+            let (_, token) = result?;
+            if token.identity != *identity || token.chain_id != chain_id {
+                continue;
+            }
+            if !token.used && token.expires_at > now {
+                has_active_token = true;
+            }
+            token_hashes.push(token.token_hash);
+        }
+
+        if !has_active_token {
+            return Ok(0);
+        }
+
+        let deleted = u64::try_from(token_hashes.len()).unwrap_or(u64::MAX);
+        transaction(&self.db, |tx| {
+            for token_hash in &token_hashes {
+                tx.delete::<RefreshToken>(token_hash)?;
+            }
+            Ok(())
+        })
+        .await?;
+        Ok(deleted)
     }
 
     pub async fn gc_expired(&self, cutoff: DateTime<Utc>) -> Result<u64> {
@@ -173,6 +237,10 @@ mod tests {
             used,
             user_agent: "fabro-test".to_string(),
         }
+    }
+
+    fn alternate_identity() -> fabro_types::IdpIdentity {
+        fabro_types::IdpIdentity::new("https://github.com", "67890").unwrap()
     }
 
     #[tokio::test]
@@ -331,6 +399,139 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn delete_active_chain_for_identity_requires_active_owned_token() {
+        let store = store().await;
+        let identity = fabro_types::IdpIdentity::new("https://github.com", "12345").unwrap();
+        let chain_id = Uuid::new_v4();
+        let other_chain_id = Uuid::new_v4();
+        let active = refresh_token([1_u8; 32], chain_id, false);
+        let used = refresh_token([2_u8; 32], chain_id, true);
+        let mut other_identity = refresh_token([3_u8; 32], chain_id, false);
+        other_identity.identity = alternate_identity();
+        let other_chain = refresh_token([4_u8; 32], other_chain_id, false);
+
+        for token in [
+            active.clone(),
+            used.clone(),
+            other_identity.clone(),
+            other_chain.clone(),
+        ] {
+            store.insert_refresh_token(token).await.unwrap();
+        }
+
+        assert_eq!(
+            store
+                .delete_active_chain_for_identity(&identity, chain_id, chrono::Utc::now())
+                .await
+                .unwrap(),
+            2
+        );
+        assert!(
+            store
+                .find_refresh_token(&active.token_hash)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .find_refresh_token(&used.token_hash)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .find_refresh_token(&other_identity.token_hash)
+                .await
+                .unwrap(),
+            Some(other_identity)
+        );
+        assert_eq!(
+            store
+                .find_refresh_token(&other_chain.token_hash)
+                .await
+                .unwrap(),
+            Some(other_chain)
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_active_chain_for_identity_returns_zero_without_active_token() {
+        let store = store().await;
+        let identity = fabro_types::IdpIdentity::new("https://github.com", "12345").unwrap();
+        let chain_id = Uuid::new_v4();
+        let used = refresh_token([1_u8; 32], chain_id, true);
+        store.insert_refresh_token(used.clone()).await.unwrap();
+
+        assert_eq!(
+            store
+                .delete_active_chain_for_identity(&identity, chain_id, chrono::Utc::now())
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store.find_refresh_token(&used.token_hash).await.unwrap(),
+            Some(used)
+        );
+    }
+
+    #[tokio::test]
+    async fn active_cli_sessions_return_newest_active_token_per_chain_for_identity() {
+        let store = store().await;
+        let identity = fabro_types::IdpIdentity::new("https://github.com", "12345").unwrap();
+        let now = chrono::Utc::now();
+        let duplicate_chain_id = Uuid::new_v4();
+        let other_chain_id = Uuid::new_v4();
+
+        let mut old_duplicate = refresh_token([1_u8; 32], duplicate_chain_id, false);
+        old_duplicate.last_used_at = now - ChronoDuration::minutes(10);
+        old_duplicate.issued_at = now - ChronoDuration::minutes(20);
+        let mut newest_duplicate = refresh_token([2_u8; 32], duplicate_chain_id, false);
+        newest_duplicate.last_used_at = now - ChronoDuration::minutes(1);
+        newest_duplicate.issued_at = now - ChronoDuration::minutes(15);
+        let mut other_active = refresh_token([3_u8; 32], other_chain_id, false);
+        other_active.last_used_at = now - ChronoDuration::minutes(3);
+
+        store.insert_refresh_token(old_duplicate).await.unwrap();
+        store
+            .insert_refresh_token(newest_duplicate.clone())
+            .await
+            .unwrap();
+        store
+            .insert_refresh_token(other_active.clone())
+            .await
+            .unwrap();
+
+        let sessions = store.active_cli_sessions(&identity, now).await.unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions.contains(&newest_duplicate));
+        assert!(sessions.contains(&other_active));
+    }
+
+    #[tokio::test]
+    async fn active_cli_sessions_exclude_expired_used_and_other_identity_tokens() {
+        let store = store().await;
+        let identity = fabro_types::IdpIdentity::new("https://github.com", "12345").unwrap();
+        let now = chrono::Utc::now();
+
+        let active = refresh_token([1_u8; 32], Uuid::new_v4(), false);
+        let mut expired = refresh_token([2_u8; 32], Uuid::new_v4(), false);
+        expired.expires_at = now - ChronoDuration::seconds(1);
+        let used = refresh_token([3_u8; 32], Uuid::new_v4(), true);
+        let mut other_identity = refresh_token([4_u8; 32], Uuid::new_v4(), false);
+        other_identity.identity = alternate_identity();
+
+        for token in [active.clone(), expired, used, other_identity] {
+            store.insert_refresh_token(token).await.unwrap();
+        }
+
+        let sessions = store.active_cli_sessions(&identity, now).await.unwrap();
+        assert_eq!(sessions, vec![active]);
     }
 
     #[tokio::test]

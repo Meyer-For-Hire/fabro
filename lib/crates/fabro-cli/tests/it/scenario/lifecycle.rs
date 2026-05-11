@@ -29,7 +29,6 @@ fn local_run_lifecycle() {
     cmd(&[
         "run",
         "--auto-approve",
-        "--no-retro",
         "--sandbox",
         "local",
         fixture("command_pipeline.fabro").to_str().unwrap(),
@@ -67,13 +66,13 @@ fn local_run_lifecycle() {
         items[0]["conclusion"].is_object(),
         "inspect should include conclusion"
     );
-    // 4. logs <run_id> — non-empty, first line is valid JSONL with event field
-    let logs_out = cmd(&["logs", &run_id]).success();
-    let logs_stdout = String::from_utf8(logs_out.get_output().stdout.clone()).unwrap();
-    assert!(!logs_stdout.is_empty(), "logs should not be empty");
-    let first_line = logs_stdout.lines().next().unwrap();
+    // 4. events <run_id> — non-empty, first line is valid JSONL with event field
+    let events_out = cmd(&["events", &run_id]).success();
+    let events_stdout = String::from_utf8(events_out.get_output().stdout.clone()).unwrap();
+    assert!(!events_stdout.is_empty(), "events should not be empty");
+    let first_line = events_stdout.lines().next().unwrap();
     let log_entry: Value =
-        serde_json::from_str(first_line).expect("first log line should be valid JSON");
+        serde_json::from_str(first_line).expect("first event line should be valid JSON");
     assert!(
         log_entry["event"].is_string(),
         "first log line should have an event field"
@@ -147,7 +146,10 @@ fn dry_run_create_start_attach_works_with_default_run_lookup() {
     fabro_json_snapshot!(
         context,
         serde_json::json!({
-            "status": state.status.map(|status| match status {
+            "status": if state.archived_at.is_some() {
+                "archived"
+            } else {
+                match state.status {
                 fabro_types::RunStatus::Submitted => "submitted",
                 fabro_types::RunStatus::Queued => "queued",
                 fabro_types::RunStatus::Starting => "starting",
@@ -158,8 +160,8 @@ fn dry_run_create_start_attach_works_with_default_run_lookup() {
                 fabro_types::RunStatus::Succeeded { .. } => "succeeded",
                 fabro_types::RunStatus::Failed { .. } => "failed",
                 fabro_types::RunStatus::Dead => "dead",
-                fabro_types::RunStatus::Archived { .. } => "archived",
-            }),
+                }
+            },
             "has_conclusion": state.conclusion.is_some(),
         }),
         @r#"
@@ -333,9 +335,7 @@ digraph FooWorkflow {
         .assert()
         .success();
 
-    let run_spec = run_state(&context.find_run_dir(&run_id))
-        .spec
-        .expect("run spec should exist");
+    let run_spec = run_state(&context.find_run_dir(&run_id)).spec;
     fabro_json_snapshot!(
         context,
         serde_json::json!({

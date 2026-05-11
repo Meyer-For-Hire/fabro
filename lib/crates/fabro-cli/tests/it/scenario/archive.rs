@@ -51,9 +51,8 @@ fn archive_lifecycle_end_to_end() {
     let with_archived = ps_runs(&context, true);
     assert_eq!(with_archived.len(), 1);
     assert_eq!(with_archived[0]["run_id"], run.run_id);
-    assert_eq!(with_archived[0]["status"]["kind"], "archived");
-    assert_eq!(with_archived[0]["status"]["prior"]["kind"], "succeeded");
-    assert_eq!(with_archived[0]["status"]["prior"]["reason"], "completed");
+    assert_eq!(with_archived[0]["status"]["kind"], "succeeded");
+    assert_eq!(with_archived[0]["status"]["reason"], "completed");
 
     let unarchive = context
         .command()

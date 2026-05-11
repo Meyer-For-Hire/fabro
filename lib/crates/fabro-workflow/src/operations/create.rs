@@ -42,9 +42,9 @@ pub struct CreateRunInput {
     pub workflow_bundle: Option<WorkflowBundle>,
     pub submitted_manifest_bytes: Option<Vec<u8>>,
     pub run_id: Option<RunId>,
+    pub title: Option<String>,
     pub git: Option<GitContext>,
     pub fork_source_ref: Option<ForkSourceRef>,
-    pub in_place: bool,
     pub provenance: Option<RunProvenance>,
     pub configured_providers: Vec<Provider>,
     /// Public URL where this run can be viewed in the web UI, when the server
@@ -70,7 +70,6 @@ struct PersistCreateOptions {
     source_directory:     Option<String>,
     git:                  Option<GitContext>,
     fork_source_ref:      Option<ForkSourceRef>,
-    in_place:             bool,
     provenance:           Option<RunProvenance>,
     configured_providers: Vec<Provider>,
 }
@@ -102,9 +101,9 @@ pub async fn create(
         workflow_bundle,
         submitted_manifest_bytes,
         run_id,
+        title,
         git,
         fork_source_ref,
-        in_place,
         provenance,
         configured_providers,
         web_url,
@@ -141,7 +140,6 @@ pub async fn create(
                 source_directory,
                 git,
                 fork_source_ref,
-                in_place,
                 provenance,
                 configured_providers,
             },
@@ -164,6 +162,7 @@ pub async fn create(
         workflow_config,
         submitted_manifest_bytes.as_deref(),
         accepted_definition.as_ref(),
+        title,
         web_url,
     )
     .await?;
@@ -183,6 +182,7 @@ async fn persist_created_run(
     workflow_config: Option<String>,
     submitted_manifest_bytes: Option<&[u8]>,
     accepted_definition: Option<&RunDefinition>,
+    explicit_title: Option<String>,
     web_url: Option<String>,
 ) -> Result<(), Error> {
     let record = persisted.run_spec();
@@ -207,10 +207,12 @@ async fn persist_created_run(
         None => None,
     };
 
+    let title = explicit_title.unwrap_or_else(|| fabro_types::infer_run_title(record.graph.goal()));
     let stored = to_run_event_at(
         &record.run_id,
         &Event::RunCreated {
             run_id: record.run_id,
+            title: Some(title),
             settings: normalize_json_value(
                 serde_json::to_value(&record.settings)
                     .map_err(|err| Error::engine(err.to_string()))?,
@@ -234,7 +236,6 @@ async fn persist_created_run(
             manifest_blob,
             git: record.git.clone(),
             fork_source_ref: record.fork_source_ref.clone(),
-            in_place: record.in_place,
             web_url,
         },
         record.run_id.created_at(),
@@ -304,13 +305,8 @@ pub(super) fn preprocess_and_validate(
     goal_override: Option<&str>,
 ) -> Result<Validated, Error> {
     let inputs = run_inputs(settings);
-    let source = render_template(
-        dot_source,
-        &TemplateContext::new()
-            .with_goal("{{ goal }}")
-            .with_inputs(inputs.clone()),
-    )
-    .map_err(|error| Error::Parse(format!("template expansion failed: {error}")))?;
+    let source = render_template(dot_source, &TemplateContext::for_input_scan(inputs.clone()))
+        .map_err(|error| Error::Parse(format!("template expansion failed: {error}")))?;
 
     let mut parsed = pipeline::parse(&source)?;
     apply_goal_override(&mut parsed.graph, goal_override);
@@ -352,7 +348,6 @@ fn persist_validated(
         source_directory,
         git,
         fork_source_ref,
-        in_place,
         provenance,
         configured_providers,
     } = options;
@@ -371,6 +366,7 @@ fn persist_validated(
         run_id,
         settings,
         graph: validated.graph().clone(),
+        graph_source: Some(validated.source().to_string()),
         workflow_slug,
         source_directory,
         labels,
@@ -379,7 +375,6 @@ fn persist_validated(
         definition_blob: None,
         git,
         fork_source_ref,
-        in_place,
     };
 
     pipeline::persist(validated, PersistOptions { run_dir, run_spec })
@@ -718,9 +713,9 @@ mod tests {
                 workflow_bundle: None,
                 submitted_manifest_bytes: None,
                 run_id: None,
+                title: None,
                 git: None,
                 fork_source_ref: None,
-                in_place: false,
                 provenance: None,
                 configured_providers: Vec::new(),
                 web_url: None,
@@ -762,9 +757,9 @@ mod tests {
                 workflow_bundle: None,
                 submitted_manifest_bytes: None,
                 run_id: None,
+                title: None,
                 git: None,
                 fork_source_ref: None,
-                in_place: false,
                 provenance: None,
                 configured_providers: Vec::new(),
                 web_url: None,
@@ -822,6 +817,7 @@ mod tests {
                 workflow_bundle: None,
                 submitted_manifest_bytes: None,
                 run_id: Some(fixtures::RUN_1),
+                title: None,
                 git: Some(fabro_types::GitContext {
                     origin_url:   String::new(),
                     branch:       "main".to_string(),
@@ -830,7 +826,6 @@ mod tests {
                     push_outcome: fabro_types::PreRunPushOutcome::NotAttempted,
                 }),
                 fork_source_ref: None,
-                in_place: false,
                 provenance: None,
                 configured_providers: Vec::new(),
                 web_url: None,
@@ -893,7 +888,7 @@ mod tests {
         );
         let run_store = store.open_run(&fixtures::RUN_1).await.unwrap();
         assert_eq!(
-            run_store.state().await.unwrap().status.unwrap(),
+            run_store.state().await.unwrap().status,
             crate::run_status::RunStatus::Submitted
         );
         assert_eq!(
@@ -937,9 +932,9 @@ mod tests {
                 workflow_bundle: None,
                 submitted_manifest_bytes: None,
                 run_id: Some(fixtures::RUN_2),
+                title: None,
                 git: None,
                 fork_source_ref: None,
-                in_place: false,
                 provenance: None,
                 configured_providers: Vec::new(),
                 web_url: None,
@@ -974,6 +969,7 @@ mod tests {
                 workflow_bundle: None,
                 submitted_manifest_bytes: None,
                 run_id: Some(fixtures::RUN_2),
+                title: None,
                 git: Some(fabro_types::GitContext {
                     origin_url:   "https://github.com/acme/widgets".to_string(),
                     branch:       String::new(),
@@ -982,7 +978,6 @@ mod tests {
                     push_outcome: fabro_types::PreRunPushOutcome::NotAttempted,
                 }),
                 fork_source_ref: None,
-                in_place: false,
                 provenance: None,
                 configured_providers: Vec::new(),
                 web_url: None,
@@ -1045,9 +1040,9 @@ mod tests {
                 workflow_bundle: None,
                 submitted_manifest_bytes: None,
                 run_id: Some(fixtures::RUN_3),
+                title: None,
                 git: None,
                 fork_source_ref: None,
-                in_place: false,
                 provenance: None,
                 configured_providers: Vec::new(),
                 web_url: None,
@@ -1089,9 +1084,9 @@ mod tests {
                 workflow_bundle: None,
                 submitted_manifest_bytes: None,
                 run_id: Some(fixtures::RUN_64),
+                title: None,
                 git: None,
                 fork_source_ref: None,
-                in_place: false,
                 provenance: Some(fabro_types::RunProvenance {
                     server:  Some(fabro_types::RunServerProvenance {
                         version: "0.9.0".to_string(),
@@ -1117,7 +1112,7 @@ mod tests {
 
         let run_store = store.open_run_reader(&created.run_id).await.unwrap();
         let state = run_store.state().await.unwrap();
-        let run = state.spec.expect("run should be projected");
+        let run = state.spec;
         let provenance = run.provenance.expect("provenance should be projected");
 
         assert_eq!(provenance.server.unwrap().version, "0.9.0");

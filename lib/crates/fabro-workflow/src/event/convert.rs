@@ -4,24 +4,12 @@ use ::fabro_types::{
 };
 use chrono::Utc;
 use fabro_agent::{AgentEvent, SandboxEvent};
-use fabro_llm::types::TokenCounts as LlmTokenCounts;
 use uuid::Uuid;
 
 use super::Event;
 use super::stored_fields::stored_event_fields;
+use crate::outcome::billed_model_usage_from_llm;
 use crate::stage_scope::StageScope;
-
-fn billed_token_counts_from_llm(usage: &LlmTokenCounts) -> BilledTokenCounts {
-    BilledTokenCounts {
-        input_tokens:       usage.input_tokens,
-        output_tokens:      usage.output_tokens,
-        total_tokens:       usage.total_tokens(),
-        reasoning_tokens:   usage.reasoning_tokens,
-        cache_read_tokens:  usage.cache_read_tokens,
-        cache_write_tokens: usage.cache_write_tokens,
-        total_usd_micros:   None,
-    }
-}
 
 fn stage_status_from_string(status: &str) -> StageOutcome {
     status.parse().unwrap_or_else(|_| {
@@ -38,6 +26,7 @@ fn stage_status_from_string(status: &str) -> StageOutcome {
 fn event_body_from_event(event: &Event) -> EventBody {
     match event {
         Event::RunCreated {
+            title,
             settings,
             graph,
             workflow_source,
@@ -51,10 +40,10 @@ fn event_body_from_event(event: &Event) -> EventBody {
             manifest_blob,
             git,
             fork_source_ref,
-            in_place,
             web_url,
             ..
         } => EventBody::RunCreated(fabro_types::RunCreatedProps {
+            title:            title.clone(),
             settings:         serde_json::from_value(settings.clone())
                 .expect("run.created settings"),
             graph:            serde_json::from_value(graph.clone()).expect("run.created graph"),
@@ -69,7 +58,6 @@ fn event_body_from_event(event: &Event) -> EventBody {
             manifest_blob:    *manifest_blob,
             git:              git.clone(),
             fork_source_ref:  fork_source_ref.clone(),
-            in_place:         *in_place,
             web_url:          web_url.clone(),
         }),
         Event::WorkflowRunStarted {
@@ -99,6 +87,12 @@ fn event_body_from_event(event: &Event) -> EventBody {
         }
         Event::RunRunning => {
             EventBody::RunRunning(fabro_types::RunStatusTransitionProps::default())
+        }
+        Event::RunInterrupt { .. } => {
+            EventBody::RunInterrupt(fabro_types::RunInterruptProps::default())
+        }
+        Event::RunSteer { text, .. } => {
+            EventBody::RunSteer(fabro_types::RunSteerProps { text: text.clone() })
         }
         Event::RunBlocked { blocked_reason } => {
             EventBody::RunBlocked(fabro_types::RunBlockedProps {
@@ -145,6 +139,11 @@ fn event_body_from_event(event: &Event) -> EventBody {
         Event::RunUnarchived { .. } => {
             EventBody::RunUnarchived(fabro_types::RunUnarchivedProps::default())
         }
+        Event::RunTitleUpdated { title, .. } => {
+            EventBody::RunTitleUpdated(fabro_types::RunTitleUpdatedProps {
+                title: title.clone(),
+            })
+        }
         Event::WorkflowRunCompleted {
             duration_ms,
             artifact_count,
@@ -153,6 +152,7 @@ fn event_body_from_event(event: &Event) -> EventBody {
             total_usd_micros,
             final_git_commit_sha,
             final_patch,
+            diff_summary,
             billing,
         } => EventBody::RunCompleted(fabro_types::RunCompletedProps {
             duration_ms:          *duration_ms,
@@ -162,6 +162,7 @@ fn event_body_from_event(event: &Event) -> EventBody {
             total_usd_micros:     *total_usd_micros,
             final_git_commit_sha: final_git_commit_sha.clone(),
             final_patch:          final_patch.clone(),
+            diff_summary:         *diff_summary,
             billing:              billing.clone(),
         }),
         Event::WorkflowRunFailed {
@@ -170,6 +171,7 @@ fn event_body_from_event(event: &Event) -> EventBody {
             reason,
             git_commit_sha,
             final_patch,
+            diff_summary,
         } => EventBody::RunFailed(fabro_types::RunFailedProps {
             error:          error.to_string(),
             causes:         error.causes(),
@@ -177,6 +179,7 @@ fn event_body_from_event(event: &Event) -> EventBody {
             reason:         *reason,
             git_commit_sha: git_commit_sha.clone(),
             final_patch:    final_patch.clone(),
+            diff_summary:   *diff_summary,
         }),
         Event::RunNotice {
             level,
@@ -290,12 +293,14 @@ fn event_body_from_event(event: &Event) -> EventBody {
             failure,
             will_retry,
             duration_ms,
+            billing,
             ..
         } => EventBody::StageFailed(fabro_types::StageFailedProps {
             index:       *index,
             failure:     Some(failure.clone()),
             will_retry:  *will_retry,
             duration_ms: *duration_ms,
+            billing:     billing.clone(),
         }),
         Event::StageRetrying {
             index,
@@ -420,6 +425,7 @@ fn event_body_from_event(event: &Event) -> EventBody {
             restart_failure_signatures,
             node_visits,
             diff,
+            diff_summary,
             ..
         } => EventBody::CheckpointCompleted(fabro_types::CheckpointCompletedProps {
             status: status.clone(),
@@ -434,6 +440,7 @@ fn event_body_from_event(event: &Event) -> EventBody {
             restart_failure_signatures: restart_failure_signatures.clone(),
             node_visits: node_visits.clone(),
             diff: diff.clone(),
+            diff_summary: *diff_summary,
         }),
         Event::CheckpointFailed {
             error,
@@ -529,16 +536,6 @@ fn event_body_from_event(event: &Event) -> EventBody {
             billing:  billing.clone(),
         }),
         Event::Agent { visit, event, .. } => match event {
-            AgentEvent::SessionStarted { provider, model } => {
-                EventBody::AgentSessionStarted(fabro_types::AgentSessionStartedProps {
-                    provider: provider.clone(),
-                    model:    model.clone(),
-                    visit:    *visit,
-                })
-            }
-            AgentEvent::SessionEnded => {
-                EventBody::AgentSessionEnded(fabro_types::AgentSessionEndedProps { visit: *visit })
-            }
             AgentEvent::ProcessingEnd => {
                 EventBody::AgentProcessingEnd(fabro_types::AgentProcessingEndProps {
                     visit: *visit,
@@ -553,13 +550,23 @@ fn event_body_from_event(event: &Event) -> EventBody {
                 model,
                 usage,
                 tool_call_count,
-            } => EventBody::AgentMessage(fabro_types::AgentMessageProps {
-                text:            text.clone(),
-                model:           model.clone(),
-                billing:         billed_token_counts_from_llm(usage),
-                tool_call_count: *tool_call_count,
-                visit:           *visit,
-            }),
+            } => {
+                let requested_speed = model.speed.map(<&'static str>::from);
+                let billed = billed_model_usage_from_llm(
+                    &model.model_id,
+                    model.provider,
+                    requested_speed,
+                    usage,
+                );
+                let billing = BilledTokenCounts::from_billed_usage(std::slice::from_ref(&billed));
+                EventBody::AgentMessage(fabro_types::AgentMessageProps {
+                    text: text.clone(),
+                    model: model.clone(),
+                    billing,
+                    tool_call_count: *tool_call_count,
+                    visit: *visit,
+                })
+            }
             AgentEvent::ToolCallStarted {
                 tool_name,
                 tool_call_id,
@@ -605,7 +612,7 @@ fn event_body_from_event(event: &Event) -> EventBody {
                     visit:     *visit,
                 })
             }
-            AgentEvent::SteeringInjected { text } => {
+            AgentEvent::SteeringInjected { text, .. } => {
                 EventBody::AgentSteeringInjected(fabro_types::AgentSteeringInjectedProps {
                     text:  text.clone(),
                     visit: *visit,
@@ -704,9 +711,11 @@ fn event_body_from_event(event: &Event) -> EventBody {
             | AgentEvent::TextDelta { .. }
             | AgentEvent::ReasoningDelta { .. }
             | AgentEvent::ToolCallOutputDelta { .. }
-            | AgentEvent::SkillExpanded { .. } => {
-                panic!("streaming-noise agent event should not be converted to RunEvent")
-            }
+            | AgentEvent::SkillExpanded { .. }
+            | AgentEvent::SessionStarted { .. }
+            | AgentEvent::SessionEnded => panic!(
+                "agent event should not be converted through the stage-scoped Event::Agent wrapper"
+            ),
         },
         Event::SubgraphStarted { start_node, .. } => {
             EventBody::SubgraphStarted(fabro_types::SubgraphStartedProps {
@@ -776,6 +785,69 @@ fn event_body_from_event(event: &Event) -> EventBody {
                 error:    error.clone(),
                 causes:   causes.clone(),
             }),
+            SandboxEvent::StartStarted { provider } => {
+                EventBody::SandboxStartStarted(fabro_types::SandboxStartStartedProps {
+                    provider: provider.clone(),
+                })
+            }
+            SandboxEvent::StartCompleted {
+                provider,
+                duration_ms,
+            } => EventBody::SandboxStartCompleted(fabro_types::SandboxStartCompletedProps {
+                provider:    provider.clone(),
+                duration_ms: *duration_ms,
+            }),
+            SandboxEvent::StartFailed {
+                provider,
+                error,
+                causes,
+            } => EventBody::SandboxStartFailed(fabro_types::SandboxStartFailedProps {
+                provider: provider.clone(),
+                error:    error.clone(),
+                causes:   causes.clone(),
+            }),
+            SandboxEvent::StopStarted { provider } => {
+                EventBody::SandboxStopStarted(fabro_types::SandboxStopStartedProps {
+                    provider: provider.clone(),
+                })
+            }
+            SandboxEvent::StopCompleted {
+                provider,
+                duration_ms,
+            } => EventBody::SandboxStopCompleted(fabro_types::SandboxStopCompletedProps {
+                provider:    provider.clone(),
+                duration_ms: *duration_ms,
+            }),
+            SandboxEvent::StopFailed {
+                provider,
+                error,
+                causes,
+            } => EventBody::SandboxStopFailed(fabro_types::SandboxStopFailedProps {
+                provider: provider.clone(),
+                error:    error.clone(),
+                causes:   causes.clone(),
+            }),
+            SandboxEvent::DeleteStarted { provider } => {
+                EventBody::SandboxDeleteStarted(fabro_types::SandboxDeleteStartedProps {
+                    provider: provider.clone(),
+                })
+            }
+            SandboxEvent::DeleteCompleted {
+                provider,
+                duration_ms,
+            } => EventBody::SandboxDeleteCompleted(fabro_types::SandboxDeleteCompletedProps {
+                provider:    provider.clone(),
+                duration_ms: *duration_ms,
+            }),
+            SandboxEvent::DeleteFailed {
+                provider,
+                error,
+                causes,
+            } => EventBody::SandboxDeleteFailed(fabro_types::SandboxDeleteFailedProps {
+                provider: provider.clone(),
+                error:    error.clone(),
+                causes:   causes.clone(),
+            }),
             SandboxEvent::SnapshotPulling { name } => {
                 EventBody::SnapshotPulling(fabro_types::SnapshotNameProps { name: name.clone() })
             }
@@ -820,14 +892,14 @@ fn event_body_from_event(event: &Event) -> EventBody {
         Event::SandboxInitialized {
             working_directory,
             provider,
-            identifier,
+            id,
             repo_cloned,
             clone_origin_url,
             clone_branch,
         } => EventBody::SandboxInitialized(fabro_types::SandboxInitializedProps {
             working_directory: working_directory.clone(),
-            provider:          provider.clone(),
-            identifier:        identifier.clone(),
+            provider:          *provider,
+            id:                id.clone(),
             repo_cloned:       *repo_cloned,
             clone_origin_url:  clone_origin_url.clone(),
             clone_branch:      clone_branch.clone(),
@@ -959,26 +1031,20 @@ fn event_body_from_event(event: &Event) -> EventBody {
             timeout_ms: *timeout_ms,
         }),
         Event::CommandCompleted {
-            stdout,
-            stderr,
+            output,
             exit_code,
             duration_ms,
             termination,
-            stdout_bytes,
-            stderr_bytes,
-            streams_separated,
+            output_bytes,
             live_streaming,
             ..
         } => EventBody::CommandCompleted(fabro_types::CommandCompletedProps {
-            stdout:            stdout.clone(),
-            stderr:            stderr.clone(),
-            exit_code:         *exit_code,
-            duration_ms:       *duration_ms,
-            termination:       *termination,
-            stdout_bytes:      *stdout_bytes,
-            stderr_bytes:      *stderr_bytes,
-            streams_separated: *streams_separated,
-            live_streaming:    *live_streaming,
+            output:         output.clone(),
+            exit_code:      *exit_code,
+            duration_ms:    *duration_ms,
+            termination:    *termination,
+            output_bytes:   *output_bytes,
+            live_streaming: *live_streaming,
         }),
         Event::AgentCliStarted {
             visit,
@@ -1004,6 +1070,68 @@ fn event_body_from_event(event: &Event) -> EventBody {
             stdout:      stdout.clone(),
             stderr:      stderr.clone(),
             exit_code:   *exit_code,
+            duration_ms: *duration_ms,
+        }),
+        Event::AgentSessionStarted {
+            provider, model, ..
+        } => EventBody::AgentSessionStarted(fabro_types::AgentSessionStartedProps {
+            provider: provider.clone(),
+            model:    model.clone(),
+        }),
+        Event::AgentSessionActivated {
+            thread_id,
+            provider,
+            model,
+            capabilities,
+            visit,
+            ..
+        } => EventBody::AgentSessionActivated(fabro_types::AgentSessionActivatedProps {
+            thread_id:    thread_id.clone(),
+            provider:     provider.clone(),
+            model:        model.clone(),
+            capabilities: capabilities.clone(),
+            visit:        *visit,
+        }),
+        Event::AgentSessionDeactivated { visit, .. } => {
+            EventBody::AgentSessionDeactivated(fabro_types::AgentSessionDeactivatedProps {
+                visit: *visit,
+            })
+        }
+        Event::AgentSessionEnded { .. } => {
+            EventBody::AgentSessionEnded(fabro_types::AgentSessionEndedProps {})
+        }
+        Event::AgentInterruptInjected { visit, .. } => {
+            EventBody::AgentInterruptInjected(fabro_types::AgentInterruptInjectedProps {
+                visit: *visit,
+            })
+        }
+        Event::AgentSteerBuffered { .. } => {
+            EventBody::AgentSteerBuffered(fabro_types::AgentSteerBufferedProps::default())
+        }
+        Event::AgentSteerDropped { reason, count, .. } => {
+            EventBody::AgentSteerDropped(fabro_types::AgentSteerDroppedProps {
+                reason: *reason,
+                count:  *count,
+            })
+        }
+        Event::AgentCliCancelled {
+            stdout,
+            stderr,
+            duration_ms,
+            ..
+        } => EventBody::AgentCliCancelled(fabro_types::AgentCliCancelledProps {
+            stdout:      stdout.clone(),
+            stderr:      stderr.clone(),
+            duration_ms: *duration_ms,
+        }),
+        Event::AgentCliTimedOut {
+            stdout,
+            stderr,
+            duration_ms,
+            ..
+        } => EventBody::AgentCliTimedOut(fabro_types::AgentCliTimedOutProps {
+            stdout:      stdout.clone(),
+            stderr:      stderr.clone(),
             duration_ms: *duration_ms,
         }),
         Event::PullRequestCreated {
@@ -1101,33 +1229,6 @@ fn event_body_from_event(event: &Event) -> EventBody {
                 exec_output_tail: exec_output_tail.clone(),
             })
         }
-        Event::RetroStarted {
-            prompt,
-            provider,
-            model,
-        } => EventBody::RetroStarted(fabro_types::RetroStartedProps {
-            prompt:   prompt.clone(),
-            provider: provider.clone(),
-            model:    model.clone(),
-        }),
-        Event::RetroCompleted {
-            duration_ms,
-            response,
-            retro,
-        } => EventBody::RetroCompleted(fabro_types::RetroCompletedProps {
-            duration_ms: *duration_ms,
-            response:    response.clone(),
-            retro:       retro.clone(),
-        }),
-        Event::RetroFailed {
-            error,
-            duration_ms,
-            exec_output_tail,
-        } => EventBody::RetroFailed(fabro_types::RetroFailedProps {
-            error:            error.clone(),
-            duration_ms:      *duration_ms,
-            exec_output_tail: exec_output_tail.clone(),
-        }),
     }
 }
 
@@ -1167,18 +1268,19 @@ mod tests {
     use std::collections::BTreeMap;
 
     use ::fabro_types::{
-        EventBody, FailureReason, ParallelBranchId, Principal, RunNoticeLevel, RunProvenance,
-        StageId, SystemActorKind, fixtures, run_event as fabro_types,
+        EventBody, FailureReason, ParallelBranchId, Principal, RunNoticeCode, RunNoticeLevel,
+        RunProvenance, StageId, SystemActorKind, fixtures, run_event as fabro_types,
     };
     use chrono::Utc;
     use fabro_agent::{AgentEvent, SandboxEvent};
     use fabro_llm::types::TokenCounts as LlmTokenCounts;
+    use fabro_model::{ModelRef, Provider};
 
     use super::*;
     use crate::error::Error;
     use crate::event::test_support::user_principal;
     use crate::event::{Event, StageScope};
-    use crate::outcome::FailureDetail;
+    use crate::outcome::{BilledModelUsage, FailureDetail};
 
     #[derive(Debug)]
     struct EventTestCause;
@@ -1198,6 +1300,28 @@ mod tests {
             stdout_truncated: false,
             stderr_truncated: true,
         }
+    }
+
+    fn test_usage(model_id: &str, input_tokens: i64, output_tokens: i64) -> BilledModelUsage {
+        serde_json::from_value(serde_json::json!({
+            "input": {
+                "usage": {
+                    "model": {
+                        "provider": "openai",
+                        "model_id": model_id
+                    },
+                    "tokens": {
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens
+                    }
+                },
+                "facts": {
+                    "provider": "open_ai"
+                }
+            },
+            "total_usd_micros": input_tokens + output_tokens
+        }))
+        .unwrap()
     }
 
     #[test]
@@ -1279,6 +1403,7 @@ mod tests {
 
     #[test]
     fn run_event_stage_failure_keeps_failure_detail() {
+        let usage = test_usage("gpt-5.2", 321, 54);
         let stored = to_run_event(&fixtures::RUN_3, &Event::StageFailed {
             node_id:     "code".to_string(),
             name:        "Code".to_string(),
@@ -1289,6 +1414,7 @@ mod tests {
             ),
             will_retry:  true,
             duration_ms: 5000,
+            billing:     Some(usage.clone()),
             actor:       None,
         });
 
@@ -1297,6 +1423,7 @@ mod tests {
         assert_eq!(properties["failure"]["message"], "lint failed");
         assert_eq!(properties["failure"]["failure_class"], "deterministic");
         assert_eq!(properties["will_retry"], true);
+        assert_eq!(properties["billing"], serde_json::to_value(&usage).unwrap());
     }
 
     #[test]
@@ -1345,6 +1472,25 @@ mod tests {
     }
 
     #[test]
+    fn run_event_sandbox_stop_and_delete_use_distinct_event_names() {
+        let stopped = to_run_event(&fixtures::RUN_5, &Event::Sandbox {
+            event: SandboxEvent::StopCompleted {
+                provider:    "docker".to_string(),
+                duration_ms: 10,
+            },
+        });
+        let deleted = to_run_event(&fixtures::RUN_5, &Event::Sandbox {
+            event: SandboxEvent::DeleteCompleted {
+                provider:    "docker".to_string(),
+                duration_ms: 20,
+            },
+        });
+
+        assert_eq!(stopped.event_name(), "sandbox.stop.completed");
+        assert_eq!(deleted.event_name(), "sandbox.delete.completed");
+    }
+
+    #[test]
     fn run_event_sandbox_failure_serializes_causes() {
         let stored = to_run_event(&fixtures::RUN_5, &Event::Sandbox {
             event: SandboxEvent::InitializeFailed {
@@ -1376,6 +1522,7 @@ mod tests {
             reason:         FailureReason::WorkflowError,
             git_commit_sha: Some("abc123".to_string()),
             final_patch:    None,
+            diff_summary:   None,
         });
 
         assert_eq!(stored.event_name(), "run.failed");
@@ -1393,6 +1540,7 @@ mod tests {
             reason:         FailureReason::WorkflowError,
             git_commit_sha: None,
             final_patch:    None,
+            diff_summary:   None,
         });
 
         let properties = stored.properties().unwrap();
@@ -1498,6 +1646,30 @@ mod tests {
             stored.parallel_branch_id,
             Some(ParallelBranchId::new(StageId::new("fanout", 2), 0))
         );
+    }
+
+    #[test]
+    fn agent_interrupt_injected_populates_stage_session_and_actor() {
+        let actor = Principal::System {
+            system_kind: SystemActorKind::Engine,
+        };
+        let stored = to_run_event(&fixtures::RUN_1, &Event::AgentInterruptInjected {
+            node_id:    "code".to_string(),
+            visit:      3,
+            session_id: "ses_1".to_string(),
+            actor:      Some(actor.clone()),
+        });
+
+        assert_eq!(stored.event_name(), "agent.interrupt.injected");
+        assert_eq!(stored.node_id.as_deref(), Some("code"));
+        assert_eq!(stored.node_label.as_deref(), Some("code"));
+        assert_eq!(stored.stage_id, Some(StageId::new("code", 3)));
+        assert_eq!(stored.session_id.as_deref(), Some("ses_1"));
+        assert_eq!(stored.actor, Some(actor));
+        match stored.body {
+            EventBody::AgentInterruptInjected(props) => assert_eq!(props.visit, 3),
+            other => panic!("unexpected body: {other:?}"),
+        }
     }
 
     #[test]
@@ -1616,7 +1788,7 @@ mod tests {
     fn run_notice_maps_exec_output_tail_to_props() {
         let stored = to_run_event(&fixtures::RUN_1, &Event::RunNotice {
             level:            RunNoticeLevel::Warn,
-            code:             "git_diff_failed".to_string(),
+            code:             RunNoticeCode::GitDiffFailed.to_string(),
             message:          "git diff failed".to_string(),
             exec_output_tail: Some(exec_tail()),
         });
@@ -1664,24 +1836,6 @@ mod tests {
                 assert_eq!(tail.stderr.as_deref(), Some("last stderr line"));
             }
             other => panic!("expected GitPush body, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn retro_failed_maps_exec_output_tail_to_props() {
-        let stored = to_run_event(&fixtures::RUN_1, &Event::RetroFailed {
-            error:            "state load failed".to_string(),
-            duration_ms:      12,
-            exec_output_tail: Some(exec_tail()),
-        });
-
-        match stored.body {
-            EventBody::RetroFailed(props) => {
-                assert_eq!(props.duration_ms, 12);
-                let tail = props.exec_output_tail.expect("exec output tail");
-                assert_eq!(tail.stdout.as_deref(), Some("last stdout line"));
-            }
-            other => panic!("expected RetroFailed body, got {other:?}"),
         }
     }
 
@@ -1794,7 +1948,11 @@ mod tests {
             visit:             1,
             event:             AgentEvent::AssistantMessage {
                 text:            "ok".to_string(),
-                model:           "claude-sonnet".to_string(),
+                model:           ModelRef {
+                    provider: Provider::Anthropic,
+                    model_id: "claude-sonnet".to_string(),
+                    speed:    None,
+                },
                 usage:           LlmTokenCounts::default(),
                 tool_call_count: 0,
             },
@@ -1807,6 +1965,48 @@ mod tests {
             parent_session_id: None,
             model:             Some("claude-sonnet".to_string()),
         });
+    }
+
+    #[test]
+    fn agent_cli_cancelled_maps_to_event_body_with_node_id() {
+        let stored = to_run_event(&fixtures::RUN_1, &Event::AgentCliCancelled {
+            node_id:     "code".to_string(),
+            stdout:      "out".to_string(),
+            stderr:      "err".to_string(),
+            duration_ms: 42,
+        });
+
+        assert_eq!(stored.event_name(), "agent.cli.cancelled");
+        assert_eq!(stored.node_id.as_deref(), Some("code"));
+        match &stored.body {
+            EventBody::AgentCliCancelled(props) => {
+                assert_eq!(props.stdout, "out");
+                assert_eq!(props.stderr, "err");
+                assert_eq!(props.duration_ms, 42);
+            }
+            other => panic!("expected AgentCliCancelled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_cli_timed_out_maps_to_event_body_with_node_id() {
+        let stored = to_run_event(&fixtures::RUN_1, &Event::AgentCliTimedOut {
+            node_id:     "code".to_string(),
+            stdout:      "out".to_string(),
+            stderr:      "err".to_string(),
+            duration_ms: 99,
+        });
+
+        assert_eq!(stored.event_name(), "agent.cli.timed_out");
+        assert_eq!(stored.node_id.as_deref(), Some("code"));
+        match &stored.body {
+            EventBody::AgentCliTimedOut(props) => {
+                assert_eq!(props.stdout, "out");
+                assert_eq!(props.stderr, "err");
+                assert_eq!(props.duration_ms, 99);
+            }
+            other => panic!("expected AgentCliTimedOut, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1838,6 +2038,7 @@ mod tests {
 
         let stored = to_run_event(&fixtures::RUN_1, &Event::RunCreated {
             run_id:           fixtures::RUN_1,
+            title:            None,
             settings:         serde_json::to_value(WorkflowSettings::default()).unwrap(),
             graph:            serde_json::to_value(Graph::new("test")).unwrap(),
             workflow_source:  None,
@@ -1851,7 +2052,6 @@ mod tests {
             manifest_blob:    None,
             git:              None,
             fork_source_ref:  None,
-            in_place:         false,
             web_url:          None,
         });
         let actor = stored.actor.as_ref().expect("actor set");

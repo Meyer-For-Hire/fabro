@@ -4,8 +4,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use fabro_agent::subagent::{SessionFactory, SubAgentManager};
 use fabro_agent::{
-    AgentEvent, AgentProfile, AnthropicProfile, GeminiProfile, OpenAiProfile, Sandbox, Session,
-    SessionOptions, Turn,
+    AgentEvent, AgentProfile, AnthropicProfile, CompletionCoordinator, GeminiProfile,
+    OpenAiProfile, Sandbox, Session, SessionControlHandle, SessionOptions, StaticEnvProvider,
+    ToolEnvProvider, Turn,
 };
 use fabro_auth::{CredentialSource, EnvCredentialSource};
 use fabro_graphviz::graph::Node;
@@ -13,14 +14,141 @@ use fabro_llm::client::Client;
 use fabro_llm::types::{Message, Request, TokenCounts};
 use fabro_mcp::config::McpServerSettings;
 use fabro_model::{FallbackTarget, Provider};
+use fabro_types::{SessionCapability, StageId};
 use tokio::sync::Mutex as TokioMutex;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use super::super::agent::{CodergenBackend, CodergenResult};
+use super::activation_lease::{ActivationLease, ActivationLeaseOptions};
 use crate::context::keys::Fidelity;
 use crate::context::{Context, WorkflowContext};
 use crate::error::Error;
 use crate::event::{Emitter, Event, StageScope};
 use crate::outcome::billed_model_usage_from_llm;
+use crate::steering_hub::SteeringHub;
+
+/// Spawn a task that, when the run-level token cancels, sets the agent
+/// `Session`'s interrupt reason to `Cancelled` and cancels the session token.
+///
+/// Factored out of `SessionCancelBridgeGuard::replace` so it can be unit-tested
+/// without constructing a real `Session`.
+fn spawn_bridge_task(
+    run_token: CancellationToken,
+    interrupt_reason: Arc<Mutex<Option<fabro_agent::InterruptReason>>>,
+    session_token: CancellationToken,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        run_token.cancelled().await;
+        {
+            let mut guard = interrupt_reason
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if guard.is_none() {
+                *guard = Some(fabro_agent::InterruptReason::Cancelled);
+            }
+        }
+        session_token.cancel();
+    })
+}
+
+/// Per-invocation guard that maps a run-level `CancellationToken` to an agent
+/// `Session`'s interrupt reason and cancel token.
+///
+/// Dropping the guard aborts the spawned bridge task so a still-cached session
+/// (after success) is not left wired to a stale run token.
+struct SessionCancelBridgeGuard {
+    handle: Option<JoinHandle<()>>,
+}
+
+impl SessionCancelBridgeGuard {
+    fn new() -> Self {
+        Self { handle: None }
+    }
+
+    fn replace(&mut self, run_token: CancellationToken, session: &Session) {
+        self.abort();
+        self.handle = Some(spawn_bridge_task(
+            run_token,
+            session.interrupt_reason_handle(),
+            session.cancel_token(),
+        ));
+    }
+
+    fn abort(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
+impl Drop for SessionCancelBridgeGuard {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
+/// Classification of an `fabro_agent::Error` for the API backend's `run` path.
+enum AgentApiErrorDisposition {
+    /// Session was interrupted via cancellation; surface as `Error::Cancelled`.
+    Cancelled,
+    /// Underlying LLM error eligible for provider failover.
+    FailoverEligible(fabro_llm::Error),
+    /// Terminal error; abort the invocation with this workflow `Error`.
+    Terminal(Error),
+}
+
+fn classify_agent_error(err: fabro_agent::Error, allow_failover: bool) -> AgentApiErrorDisposition {
+    match err {
+        fabro_agent::Error::Interrupted(fabro_agent::InterruptReason::Cancelled) => {
+            AgentApiErrorDisposition::Cancelled
+        }
+        fabro_agent::Error::Interrupted(fabro_agent::InterruptReason::WallClockTimeout) => {
+            AgentApiErrorDisposition::Terminal(Error::Precondition(
+                "Agent session hit its wall-clock timeout".to_string(),
+            ))
+        }
+        fabro_agent::Error::Llm(err) if allow_failover && err.failover_eligible() => {
+            AgentApiErrorDisposition::FailoverEligible(err)
+        }
+        fabro_agent::Error::Llm(err) => AgentApiErrorDisposition::Terminal(Error::Llm(err)),
+        other @ (fabro_agent::Error::SessionClosed
+        | fabro_agent::Error::InvalidState(_)
+        | fabro_agent::Error::ToolExecution(_)) => AgentApiErrorDisposition::Terminal(
+            Error::Precondition(format!("Agent session failed: {other}")),
+        ),
+    }
+}
+
+fn begin_session_lifecycle(
+    session: &Session,
+    emitter: &Arc<Emitter>,
+    parent_session_id: Option<String>,
+) {
+    emitter.emit(&Event::AgentSessionStarted {
+        session_id: session.id().to_string(),
+        parent_session_id,
+        provider: Some(session.provider().to_string()),
+        model: Some(session.model().to_string()),
+    });
+}
+
+fn discard_session(
+    session: &mut Session,
+    lease: &mut Option<Arc<ActivationLease>>,
+    emitter: &Arc<Emitter>,
+) {
+    if let Some(lease) = lease.take() {
+        lease.release();
+    }
+    let session_id = session.id().to_string();
+    if session.close() {
+        emitter.emit(&Event::AgentSessionEnded {
+            session_id,
+            parent_session_id: None,
+        });
+    }
+}
 
 fn build_profile(model: &str, provider: Provider) -> Box<dyn AgentProfile> {
     match provider {
@@ -94,6 +222,10 @@ fn spawn_event_forwarder(
             // Forward non-streaming agent events to pipeline
             if !event.event.is_streaming_noise()
                 && !matches!(&event.event, AgentEvent::ProcessingEnd)
+                && !matches!(
+                    &event.event,
+                    AgentEvent::SessionStarted { .. } | AgentEvent::SessionEnded
+                )
             {
                 emitter.emit_scoped(
                     &Event::Agent {
@@ -119,9 +251,10 @@ pub struct AgentApiBackend {
     provider:       Provider,
     fallback_chain: Vec<FallbackTarget>,
     sessions:       Mutex<HashMap<String, Session>>,
-    env:            HashMap<String, String>,
+    tool_env:       Option<Arc<dyn ToolEnvProvider>>,
     mcp_servers:    Vec<McpServerSettings>,
     source:         Arc<dyn CredentialSource>,
+    steering_hub:   Arc<SteeringHub>,
 }
 
 impl AgentApiBackend {
@@ -131,15 +264,17 @@ impl AgentApiBackend {
         provider: Provider,
         fallback_chain: Vec<FallbackTarget>,
         source: Arc<dyn CredentialSource>,
+        steering_hub: Arc<SteeringHub>,
     ) -> Self {
         Self {
             model,
             provider,
             fallback_chain,
             sessions: Mutex::new(HashMap::new()),
-            env: HashMap::new(),
+            tool_env: None,
             mcp_servers: Vec::new(),
             source,
+            steering_hub,
         }
     }
 
@@ -148,18 +283,26 @@ impl AgentApiBackend {
         model: String,
         provider: Provider,
         fallback_chain: Vec<FallbackTarget>,
+        steering_hub: Arc<SteeringHub>,
     ) -> Self {
         Self::new(
             model,
             provider,
             fallback_chain,
             Arc::new(EnvCredentialSource::new()),
+            steering_hub,
         )
     }
 
     #[must_use]
     pub fn with_env(mut self, env: HashMap<String, String>) -> Self {
-        self.env = env;
+        self.tool_env = Some(Arc::new(StaticEnvProvider(env)));
+        self
+    }
+
+    #[must_use]
+    pub fn with_tool_env_provider(mut self, provider: Arc<dyn ToolEnvProvider>) -> Self {
+        self.tool_env = Some(provider);
         self
     }
 
@@ -186,7 +329,7 @@ impl AgentApiBackend {
             node,
             sandbox,
             self.source.as_ref(),
-            &self.env,
+            self.tool_env.as_ref(),
             tool_hooks,
             self.mcp_servers.clone(),
         )
@@ -199,7 +342,7 @@ impl AgentApiBackend {
         node: &Node,
         sandbox: &Arc<dyn Sandbox>,
         source: &dyn CredentialSource,
-        env: &HashMap<String, String>,
+        tool_env: Option<&Arc<dyn ToolEnvProvider>>,
         tool_hooks: Option<Arc<dyn fabro_agent::ToolHookCallback>>,
         mcp_servers: Vec<McpServerSettings>,
     ) -> Result<Session, Error> {
@@ -227,7 +370,7 @@ impl AgentApiBackend {
         let factory_client = client.clone();
         let factory_model = model.to_string();
         let factory_env = Arc::clone(sandbox);
-        let factory_tool_env = env.clone();
+        let factory_tool_env = tool_env.cloned();
         let factory: SessionFactory = Arc::new(move || {
             let child_profile: Arc<dyn AgentProfile> = match provider {
                 Provider::OpenAi => Arc::new(OpenAiProfile::new(&factory_model)),
@@ -248,8 +391,8 @@ impl AgentApiBackend {
                 SessionOptions::default(),
                 None,
             );
-            if !factory_tool_env.is_empty() {
-                session.set_tool_env(factory_tool_env.clone());
+            if let Some(provider) = &factory_tool_env {
+                session.set_tool_env_provider(Arc::clone(provider));
             }
             session
         });
@@ -264,8 +407,8 @@ impl AgentApiBackend {
             config,
             Some(manager_for_callback.clone()),
         );
-        if !env.is_empty() {
-            session.set_tool_env(env.clone());
+        if let Some(provider) = tool_env {
+            session.set_tool_env_provider(Arc::clone(provider));
         }
 
         // Wire subagent event callback to parent session's emitter
@@ -276,15 +419,70 @@ impl AgentApiBackend {
 
         Ok(session)
     }
+
+    /// Activate `session` with the steering hub under `stage_id` and wire up
+    /// the completion coordinator.
+    fn attach_session_to_hub(
+        &self,
+        session: &mut Session,
+        stage_id: &StageId,
+        thread_id: Option<&str>,
+        emitter: &Arc<Emitter>,
+    ) -> Result<Arc<ActivationLease>, Error> {
+        let handle = session.control_handle();
+        let lease = ActivationLease::activate(
+            ActivationLeaseOptions {
+                stage_id:     stage_id.clone(),
+                session_id:   session.id().to_string(),
+                thread_id:    thread_id.map(str::to_string),
+                provider:     Some(session.provider().to_string()),
+                model:        Some(session.model().to_string()),
+                capabilities: vec![SessionCapability::Steer],
+                hub:          Arc::clone(&self.steering_hub),
+                emitter:      Arc::clone(emitter),
+            },
+            &handle,
+        )?;
+        session.set_completion_coordinator(Arc::new(SteeringCompletionCoordinator {
+            handle,
+            lease: Mutex::new(Some(Arc::clone(&lease))),
+        }));
+        Ok(lease)
+    }
+
+    fn shutdown_cached_sessions(&self, emitter: &Arc<Emitter>) {
+        let sessions: Vec<Session> = self
+            .sessions
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, s)| s)
+            .collect();
+        for mut session in sessions {
+            let session_id = session.id().to_string();
+            if session.close() {
+                emitter.emit(&Event::AgentSessionEnded {
+                    session_id,
+                    parent_session_id: None,
+                });
+            }
+        }
+    }
 }
 
 #[async_trait]
 impl CodergenBackend for AgentApiBackend {
+    async fn shutdown(&self, emitter: &Arc<Emitter>) {
+        self.shutdown_cached_sessions(emitter);
+    }
+
     async fn one_shot(
         &self,
         node: &Node,
         prompt: &str,
         system_prompt: Option<&str>,
+        emitter: &Arc<Emitter>,
+        stage_scope: &StageScope,
     ) -> Result<CodergenResult, Error> {
         let client = Client::from_source(self.source.as_ref())
             .await
@@ -358,14 +556,16 @@ impl CodergenBackend for AgentApiBackend {
                 let mut found = None;
 
                 for target in fallback_chain {
-                    tracing::warn!(
-                        stage = node.id.as_str(),
-                        from_provider = from_provider.as_str(),
-                        from_model = from_model.as_str(),
-                        to_provider = target.provider.as_str(),
-                        to_model = target.model.as_str(),
-                        error = error_msg.as_str(),
-                        "LLM provider failover (prompt)"
+                    emitter.emit_scoped(
+                        &Event::Failover {
+                            stage:         node.id.clone(),
+                            from_provider: from_provider.clone(),
+                            from_model:    from_model.clone(),
+                            to_provider:   target.provider.clone(),
+                            to_model:      target.model.clone(),
+                            error:         error_msg.clone(),
+                        },
+                        stage_scope,
                     );
 
                     let max_tokens = node.max_tokens().or_else(|| {
@@ -426,6 +626,7 @@ impl CodergenBackend for AgentApiBackend {
         emitter: &Arc<Emitter>,
         sandbox: &Arc<dyn Sandbox>,
         tool_hooks: Option<Arc<dyn fabro_agent::ToolHookCallback>>,
+        cancel_token: CancellationToken,
     ) -> Result<CodergenResult, Error> {
         let actual_model = node.model().unwrap_or(&self.model).to_string();
         let _actual_provider = node
@@ -440,25 +641,36 @@ impl CodergenBackend for AgentApiBackend {
             None
         };
 
-        // Take a cached session if reusing, otherwise create a new one.
+        let mut bridge = SessionCancelBridgeGuard::new();
+
+        // Take a cached session if reusing, otherwise create a new one. Cancel
+        // checks bracket `Client::from_source(...)` so cancellation arriving
+        // during credential refresh is not lost.
+        if cancel_token.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
         let (mut session, is_reused) = if let Some(ref key) = reuse_key {
             let existing = self.sessions.lock().unwrap().remove(key);
             if let Some(s) = existing {
                 (s, true)
             } else {
-                (
-                    self.create_session(node, sandbox, tool_hooks.clone())
-                        .await?,
-                    false,
-                )
+                let created = self.create_session(node, sandbox, tool_hooks.clone()).await;
+                if cancel_token.is_cancelled() {
+                    return Err(Error::Cancelled);
+                }
+                (created?, false)
             }
         } else {
-            (
-                self.create_session(node, sandbox, tool_hooks.clone())
-                    .await?,
-                false,
-            )
+            let created = self.create_session(node, sandbox, tool_hooks.clone()).await;
+            if cancel_token.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            (created?, false)
         };
+        if cancel_token.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        bridge.replace(cancel_token.clone(), &session);
 
         tracing::info!(
             node = %node.id,
@@ -485,102 +697,209 @@ impl CodergenBackend for AgentApiBackend {
         );
 
         // Record turn count before processing so we only aggregate new usage.
-        let turns_before = session.history().turns().len();
+        let mut turns_before = session.history().turns().len();
 
-        if !is_reused {
-            session.initialize().await;
-        }
+        // Activate with the steering hub after initialization so HTTP
+        // `POST /runs/{id}/steer` calls reach this session. The activation
+        // lease is shared with the natural-completion coordinator and is
+        // released on every exit path.
+        let stage_id = stage_scope.stage_id();
+        let mut lease: Option<Arc<ActivationLease>> = None;
 
-        let result = session.process_input(prompt).await;
-
-        // On failover-eligible error, try fallback providers.
-        let result = match result {
-            Ok(()) => Ok(()),
-            Err(fabro_agent::Error::Llm(ref sdk_err))
-                if sdk_err.failover_eligible() && !self.fallback_chain.is_empty() =>
-            {
-                let error_msg = sdk_err.to_string();
-                let from_provider = self.provider.to_string();
-                let from_model = self.model.clone();
-
-                let mut last_err = Error::Llm(sdk_err.clone());
-                let mut succeeded = false;
-
-                for target in &self.fallback_chain {
-                    emitter.emit_scoped(
-                        &Event::Failover {
-                            stage:         node.id.clone(),
-                            from_provider: from_provider.clone(),
-                            from_model:    from_model.clone(),
-                            to_provider:   target.provider.clone(),
-                            to_model:      target.model.clone(),
-                            error:         error_msg.clone(),
-                        },
-                        &stage_scope,
-                    );
-
-                    let target_provider: Provider = match target.provider.parse() {
-                        Ok(p) => p,
-                        Err(_) => continue,
-                    };
-
-                    let new_session = match Self::create_session_for(
-                        &target.model,
-                        target_provider,
-                        node,
-                        sandbox,
-                        self.source.as_ref(),
-                        &self.env,
-                        tool_hooks.clone(),
-                        self.mcp_servers.clone(),
-                    )
-                    .await
-                    {
-                        Ok(s) => s,
-                        Err(e) => {
-                            last_err = e;
-                            continue;
-                        }
-                    };
-                    session = new_session;
-
-                    // Re-subscribe to forward events + track files from the new session
-                    spawn_event_forwarder(
-                        &session,
-                        node.id.clone(),
-                        stage_scope.clone(),
-                        Arc::clone(emitter),
-                        Arc::clone(&file_tracking),
-                    );
-
-                    session.initialize().await;
-                    match session.process_input(prompt).await {
-                        Ok(()) => {
-                            succeeded = true;
-                            break;
-                        }
-                        Err(fabro_agent::Error::Llm(err)) if err.failover_eligible() => {
-                            last_err = Error::Llm(err);
-                        }
-                        Err(fabro_agent::Error::Llm(err)) => return Err(Error::Llm(err)),
-                        Err(fabro_agent::Error::Interrupted(_)) => {
-                            return Err(Error::Cancelled);
-                        }
-                        Err(other) => {
-                            return Err(Error::handler(format!("Agent session failed: {other}")));
-                        }
+        let allow_failover_primary = !self.fallback_chain.is_empty();
+        let init_result = if is_reused {
+            Ok(())
+        } else {
+            begin_session_lifecycle(&session, emitter, None);
+            match session.initialize().await {
+                Ok(()) => Ok(()),
+                Err(err) => match classify_agent_error(err, allow_failover_primary) {
+                    AgentApiErrorDisposition::Cancelled => {
+                        bridge.abort();
+                        discard_session(&mut session, &mut lease, emitter);
+                        return Err(Error::Cancelled);
                     }
-                }
-
-                if succeeded { Ok(()) } else { Err(last_err) }
+                    AgentApiErrorDisposition::Terminal(err) => {
+                        bridge.abort();
+                        discard_session(&mut session, &mut lease, emitter);
+                        return Err(err);
+                    }
+                    AgentApiErrorDisposition::FailoverEligible(sdk_err) => {
+                        Err(fabro_agent::Error::Llm(sdk_err))
+                    }
+                },
             }
-            Err(fabro_agent::Error::Llm(sdk_err)) => Err(Error::Llm(sdk_err)),
-            Err(fabro_agent::Error::Interrupted(_)) => Err(Error::Cancelled),
-            Err(other) => Err(Error::handler(format!("Agent session failed: {other}"))),
         };
 
-        // On error, drop the session (don't cache failed state).
-        result?;
+        // If initialize failed with a failover-eligible error, treat as a
+        // process_input failover trigger; otherwise run process_input.
+        let result = match init_result {
+            Ok(()) => {
+                match self.attach_session_to_hub(&mut session, &stage_id, thread_id, emitter) {
+                    Ok(active_lease) => lease = Some(active_lease),
+                    Err(err) => {
+                        bridge.abort();
+                        discard_session(&mut session, &mut lease, emitter);
+                        return Err(err);
+                    }
+                }
+                session.process_input(prompt).await
+            }
+            Err(err) => Err(err),
+        };
+
+        // On failover-eligible error, try fallback providers.
+        let result: Result<(), Error> = match result {
+            Ok(()) => Ok(()),
+            Err(err) => match classify_agent_error(err, allow_failover_primary) {
+                AgentApiErrorDisposition::Cancelled => {
+                    bridge.abort();
+                    discard_session(&mut session, &mut lease, emitter);
+                    return Err(Error::Cancelled);
+                }
+                AgentApiErrorDisposition::Terminal(err) => {
+                    bridge.abort();
+                    discard_session(&mut session, &mut lease, emitter);
+                    return Err(err);
+                }
+                AgentApiErrorDisposition::FailoverEligible(sdk_err) => {
+                    let error_msg = sdk_err.to_string();
+                    let from_provider = self.provider.to_string();
+                    let from_model = self.model.clone();
+
+                    let mut last_err = Error::Llm(sdk_err);
+                    let mut succeeded = false;
+
+                    bridge.abort();
+                    discard_session(&mut session, &mut lease, emitter);
+
+                    for (index, target) in self.fallback_chain.iter().enumerate() {
+                        emitter.emit_scoped(
+                            &Event::Failover {
+                                stage:         node.id.clone(),
+                                from_provider: from_provider.clone(),
+                                from_model:    from_model.clone(),
+                                to_provider:   target.provider.clone(),
+                                to_model:      target.model.clone(),
+                                error:         error_msg.clone(),
+                            },
+                            &stage_scope,
+                        );
+
+                        let target_provider: Provider = match target.provider.parse() {
+                            Ok(p) => p,
+                            Err(_) => continue,
+                        };
+
+                        if cancel_token.is_cancelled() {
+                            return Err(Error::Cancelled);
+                        }
+                        let new_session_result = Self::create_session_for(
+                            &target.model,
+                            target_provider,
+                            node,
+                            sandbox,
+                            self.source.as_ref(),
+                            self.tool_env.as_ref(),
+                            tool_hooks.clone(),
+                            self.mcp_servers.clone(),
+                        )
+                        .await;
+                        if cancel_token.is_cancelled() {
+                            return Err(Error::Cancelled);
+                        }
+                        let new_session = match new_session_result {
+                            Ok(s) => s,
+                            Err(e) => {
+                                last_err = e;
+                                continue;
+                            }
+                        };
+                        session = new_session;
+                        bridge.replace(cancel_token.clone(), &session);
+                        turns_before = session.history().turns().len();
+
+                        // Re-subscribe to forward events + track files from the new session
+                        spawn_event_forwarder(
+                            &session,
+                            node.id.clone(),
+                            stage_scope.clone(),
+                            Arc::clone(emitter),
+                            Arc::clone(&file_tracking),
+                        );
+
+                        let allow_failover_next = index + 1 < self.fallback_chain.len();
+                        begin_session_lifecycle(&session, emitter, None);
+                        if let Err(err) = session.initialize().await {
+                            match classify_agent_error(err, allow_failover_next) {
+                                AgentApiErrorDisposition::Cancelled => {
+                                    bridge.abort();
+                                    discard_session(&mut session, &mut lease, emitter);
+                                    return Err(Error::Cancelled);
+                                }
+                                AgentApiErrorDisposition::Terminal(err) => {
+                                    bridge.abort();
+                                    discard_session(&mut session, &mut lease, emitter);
+                                    return Err(err);
+                                }
+                                AgentApiErrorDisposition::FailoverEligible(sdk_err) => {
+                                    last_err = Error::Llm(sdk_err);
+                                    bridge.abort();
+                                    discard_session(&mut session, &mut lease, emitter);
+                                    continue;
+                                }
+                            }
+                        }
+                        match self.attach_session_to_hub(
+                            &mut session,
+                            &stage_id,
+                            thread_id,
+                            emitter,
+                        ) {
+                            Ok(active_lease) => lease = Some(active_lease),
+                            Err(err) => {
+                                bridge.abort();
+                                discard_session(&mut session, &mut lease, emitter);
+                                return Err(err);
+                            }
+                        }
+                        match session.process_input(prompt).await {
+                            Ok(()) => {
+                                succeeded = true;
+                                break;
+                            }
+                            Err(err) => match classify_agent_error(err, allow_failover_next) {
+                                AgentApiErrorDisposition::Cancelled => {
+                                    bridge.abort();
+                                    discard_session(&mut session, &mut lease, emitter);
+                                    return Err(Error::Cancelled);
+                                }
+                                AgentApiErrorDisposition::Terminal(err) => {
+                                    bridge.abort();
+                                    discard_session(&mut session, &mut lease, emitter);
+                                    return Err(err);
+                                }
+                                AgentApiErrorDisposition::FailoverEligible(sdk_err) => {
+                                    last_err = Error::Llm(sdk_err);
+                                    bridge.abort();
+                                    discard_session(&mut session, &mut lease, emitter);
+                                }
+                            },
+                        }
+                    }
+
+                    if succeeded { Ok(()) } else { Err(last_err) }
+                }
+            },
+        };
+
+        // On error, discard the session (don't cache failed state). The
+        // bridge's `Drop` will abort the spawned task on early return.
+        if let Err(err) = result {
+            bridge.abort();
+            discard_session(&mut session, &mut lease, emitter);
+            return Err(err);
+        }
 
         // Aggregate token usage only from new turns (prevents double-counting on
         // reuse).
@@ -622,9 +941,23 @@ impl CodergenBackend for AgentApiBackend {
             (v, s.last.clone())
         };
 
-        // Cache session back for reuse on success.
+        if let Some(lease) = lease.take() {
+            lease.release();
+        }
+
+        // Cache session back for reuse on success. Detach the bridge first so
+        // the cached session is not left wired to this run's cancel token.
         if let Some(key) = reuse_key {
+            bridge.abort();
             self.sessions.lock().unwrap().insert(key, session);
+        } else {
+            let session_id = session.id().to_string();
+            if session.close() {
+                emitter.emit(&Event::AgentSessionEnded {
+                    session_id,
+                    parent_session_id: None,
+                });
+            }
         }
 
         Ok(CodergenResult::Text {
@@ -636,14 +969,103 @@ impl CodergenBackend for AgentApiBackend {
     }
 }
 
+/// Coordinator that lets the agent loop ask the workflow layer whether to
+/// keep iterating after a no-tool natural completion. Implements the
+/// "close-the-door" pattern: detach only if the queue is empty, otherwise
+/// report `true` so the loop drains.
+struct SteeringCompletionCoordinator {
+    handle: SessionControlHandle,
+    lease:  Mutex<Option<Arc<ActivationLease>>>,
+}
+
+impl CompletionCoordinator for SteeringCompletionCoordinator {
+    fn on_natural_completion(&self) -> bool {
+        let mut lease = self.lease.lock().expect("activation lease lock poisoned");
+        let Some(active_lease) = lease.as_ref() else {
+            return false;
+        };
+        if active_lease.release_if_no_pending_control_work(&self.handle) {
+            lease.take();
+            false
+        } else {
+            true
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use fabro_agent::subagent::SessionFactory;
+    use fabro_agent::{AgentProfile, ToolRegistry};
     use fabro_auth::{AuthCredential, AuthDetails, VaultCredentialSource};
+    use fabro_llm::provider::{ProviderAdapter, StreamEventStream};
+    use fabro_llm::{Error as LlmError, ProviderErrorDetail, ProviderErrorKind};
     use fabro_vault::{SecretType, Vault};
+    use futures::stream;
     use tokio::sync::RwLock as AsyncRwLock;
 
     use super::*;
+
+    struct ShutdownTestProfile {
+        registry: ToolRegistry,
+    }
+
+    impl ShutdownTestProfile {
+        fn new() -> Self {
+            Self {
+                registry: ToolRegistry::new(),
+            }
+        }
+    }
+
+    impl AgentProfile for ShutdownTestProfile {
+        fn provider(&self) -> Provider {
+            Provider::OpenAi
+        }
+
+        fn model(&self) -> &str {
+            "gpt-5.4"
+        }
+
+        fn tool_registry(&self) -> &ToolRegistry {
+            &self.registry
+        }
+
+        fn tool_registry_mut(&mut self) -> &mut ToolRegistry {
+            &mut self.registry
+        }
+
+        fn build_system_prompt(
+            &self,
+            _env: &dyn fabro_agent::Sandbox,
+            _env_context: &fabro_agent::EnvContext,
+            _memory: &[String],
+            _user_instructions: Option<&str>,
+            _skills: &[fabro_agent::Skill],
+        ) -> String {
+            "test".to_string()
+        }
+    }
+
+    struct ShutdownTestProvider;
+
+    #[async_trait]
+    impl ProviderAdapter for ShutdownTestProvider {
+        fn name(&self) -> &str {
+            "openai"
+        }
+
+        async fn complete(
+            &self,
+            _request: &Request,
+        ) -> Result<fabro_llm::types::Response, LlmError> {
+            unreachable!("shutdown test never calls LLM completion")
+        }
+
+        async fn stream(&self, _request: &Request) -> Result<StreamEventStream, LlmError> {
+            Ok(Box::pin(stream::empty()))
+        }
+    }
 
     #[test]
     fn agent_backend_stores_config() {
@@ -651,6 +1073,7 @@ mod tests {
             "claude-opus-4-6".to_string(),
             Provider::OpenAi,
             Vec::new(),
+            SteeringHub::for_tests(),
         );
         assert_eq!(backend.model, "claude-opus-4-6");
         assert_eq!(backend.provider, Provider::OpenAi);
@@ -662,6 +1085,7 @@ mod tests {
             "claude-opus-4-6".to_string(),
             Provider::Anthropic,
             Vec::new(),
+            SteeringHub::for_tests(),
         );
         assert!(backend.sessions.lock().unwrap().is_empty());
     }
@@ -814,10 +1238,295 @@ mod tests {
                 Arc::new(AsyncRwLock::new(vault)),
                 |_| None,
             )),
+            SteeringHub::for_tests(),
         );
 
         let client = Client::from_source(backend.source.as_ref()).await.unwrap();
 
         assert_eq!(client.provider_names(), vec!["anthropic"]);
+    }
+
+    #[tokio::test]
+    async fn api_backend_shutdown_closes_cached_sessions_once() {
+        let backend = AgentApiBackend::new_from_env(
+            "gpt-5.4".to_string(),
+            Provider::OpenAi,
+            Vec::new(),
+            SteeringHub::for_tests(),
+        );
+        let emitter = Arc::new(Emitter::new(fabro_types::RunId::new()));
+        let event_names = Arc::new(Mutex::new(Vec::new()));
+        let event_names_for_listener = Arc::clone(&event_names);
+        emitter.on_event(move |event| {
+            event_names_for_listener
+                .lock()
+                .unwrap()
+                .push(event.event_name().to_string());
+        });
+
+        let mut providers = HashMap::new();
+        providers.insert(
+            "openai".to_string(),
+            Arc::new(ShutdownTestProvider) as Arc<dyn ProviderAdapter>,
+        );
+        let client = Client::new(providers, Some("openai".to_string()), Vec::new());
+        let session = Session::new(
+            client,
+            Arc::new(ShutdownTestProfile::new()),
+            Arc::new(fabro_agent::LocalSandbox::new(
+                tempfile::tempdir().unwrap().path().to_path_buf(),
+            )),
+            SessionOptions::default(),
+            None,
+        );
+        begin_session_lifecycle(&session, &emitter, None);
+        backend
+            .sessions
+            .lock()
+            .unwrap()
+            .insert("thread-1".to_string(), session);
+
+        backend.shutdown(&emitter).await;
+        backend.shutdown(&emitter).await;
+
+        assert_eq!(event_names.lock().unwrap().as_slice(), [
+            "agent.session.started",
+            "agent.session.ended"
+        ]);
+        assert!(backend.sessions.lock().unwrap().is_empty());
+    }
+
+    // --- Bridge guard tests ---
+
+    fn failover_eligible_llm_error() -> LlmError {
+        LlmError::Network {
+            message: "boom".into(),
+            source:  None,
+        }
+    }
+
+    fn non_failover_llm_error() -> LlmError {
+        LlmError::Provider {
+            kind:   ProviderErrorKind::Authentication,
+            detail: Box::new(ProviderErrorDetail {
+                message:     "bad key".into(),
+                provider:    "openai".into(),
+                status_code: Some(401),
+                error_code:  None,
+                retry_after: None,
+                raw:         None,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_bridge_task_sets_cancelled_and_cancels_session_token() {
+        let run_token = CancellationToken::new();
+        let interrupt_reason = Arc::new(Mutex::new(None));
+        let session_token = CancellationToken::new();
+
+        let handle = spawn_bridge_task(
+            run_token.clone(),
+            Arc::clone(&interrupt_reason),
+            session_token.clone(),
+        );
+
+        assert!(!session_token.is_cancelled());
+        assert!(interrupt_reason.lock().unwrap().is_none());
+
+        run_token.cancel();
+        handle.await.unwrap();
+
+        assert!(session_token.is_cancelled());
+        assert_eq!(
+            *interrupt_reason.lock().unwrap(),
+            Some(fabro_agent::InterruptReason::Cancelled)
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_bridge_task_preserves_existing_interrupt_reason() {
+        let run_token = CancellationToken::new();
+        let interrupt_reason = Arc::new(Mutex::new(Some(
+            fabro_agent::InterruptReason::WallClockTimeout,
+        )));
+        let session_token = CancellationToken::new();
+
+        let handle = spawn_bridge_task(
+            run_token.clone(),
+            Arc::clone(&interrupt_reason),
+            session_token.clone(),
+        );
+        run_token.cancel();
+        handle.await.unwrap();
+
+        // Existing reason wins; the bridge does not overwrite a wall-clock
+        // timeout already recorded by the session.
+        assert_eq!(
+            *interrupt_reason.lock().unwrap(),
+            Some(fabro_agent::InterruptReason::WallClockTimeout)
+        );
+        assert!(session_token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn bridge_guard_drop_aborts_pending_task() {
+        let run_token = CancellationToken::new();
+        let interrupt_reason = Arc::new(Mutex::new(None));
+        let session_token = CancellationToken::new();
+
+        {
+            let mut guard = SessionCancelBridgeGuard::new();
+            guard.handle = Some(spawn_bridge_task(
+                run_token.clone(),
+                Arc::clone(&interrupt_reason),
+                session_token.clone(),
+            ));
+            // guard dropped here
+        }
+
+        // Trigger the run token after the guard has been dropped. The aborted
+        // task must not write to interrupt_reason or cancel session_token.
+        run_token.cancel();
+        // Yield enough times for any errant task to run.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(interrupt_reason.lock().unwrap().is_none());
+        assert!(!session_token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn bridge_guard_replace_aborts_prior_task() {
+        // First (prior) bridge wiring.
+        let prior_run_token = CancellationToken::new();
+        let prior_interrupt_reason = Arc::new(Mutex::new(None));
+        let prior_session_token = CancellationToken::new();
+
+        // Second (replacement) bridge wiring.
+        let new_run_token = CancellationToken::new();
+        let new_interrupt_reason = Arc::new(Mutex::new(None));
+        let new_session_token = CancellationToken::new();
+
+        let mut guard = SessionCancelBridgeGuard::new();
+        guard.handle = Some(spawn_bridge_task(
+            prior_run_token.clone(),
+            Arc::clone(&prior_interrupt_reason),
+            prior_session_token.clone(),
+        ));
+
+        // Replace with a new task pointing at different handles.
+        guard.handle = {
+            // Manually mirror `replace` semantics: abort then install.
+            if let Some(h) = guard.handle.take() {
+                h.abort();
+            }
+            Some(spawn_bridge_task(
+                new_run_token.clone(),
+                Arc::clone(&new_interrupt_reason),
+                new_session_token.clone(),
+            ))
+        };
+
+        // Cancelling the prior run token must not affect anything because the
+        // prior task was aborted by `replace`.
+        prior_run_token.cancel();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(prior_interrupt_reason.lock().unwrap().is_none());
+        assert!(!prior_session_token.is_cancelled());
+
+        // The replacement task must still be alive and react to its own token.
+        new_run_token.cancel();
+        guard.handle.take().unwrap().await.unwrap();
+        assert_eq!(
+            *new_interrupt_reason.lock().unwrap(),
+            Some(fabro_agent::InterruptReason::Cancelled)
+        );
+        assert!(new_session_token.is_cancelled());
+    }
+
+    // --- classify_agent_error tests ---
+
+    #[test]
+    fn classify_interrupted_cancelled_is_cancelled() {
+        let err = fabro_agent::Error::Interrupted(fabro_agent::InterruptReason::Cancelled);
+        assert!(matches!(
+            classify_agent_error(err, true),
+            AgentApiErrorDisposition::Cancelled
+        ));
+    }
+
+    #[test]
+    fn classify_interrupted_wall_clock_is_terminal_precondition() {
+        let err = fabro_agent::Error::Interrupted(fabro_agent::InterruptReason::WallClockTimeout);
+        match classify_agent_error(err, true) {
+            AgentApiErrorDisposition::Terminal(Error::Precondition(msg)) => {
+                assert!(msg.contains("wall-clock"));
+            }
+            _ => panic!("expected Terminal(Error::Precondition) for WallClockTimeout"),
+        }
+    }
+
+    #[test]
+    fn classify_failover_eligible_llm_returns_failover_when_allowed() {
+        let err = fabro_agent::Error::Llm(failover_eligible_llm_error());
+        assert!(matches!(
+            classify_agent_error(err, true),
+            AgentApiErrorDisposition::FailoverEligible(_)
+        ));
+    }
+
+    #[test]
+    fn classify_failover_eligible_llm_returns_terminal_when_not_allowed() {
+        let err = fabro_agent::Error::Llm(failover_eligible_llm_error());
+        match classify_agent_error(err, false) {
+            AgentApiErrorDisposition::Terminal(Error::Llm(_)) => {}
+            _ => panic!("expected Terminal(Error::Llm) when failover disallowed"),
+        }
+    }
+
+    #[test]
+    fn classify_non_failover_eligible_llm_is_terminal_llm() {
+        let err = fabro_agent::Error::Llm(non_failover_llm_error());
+        match classify_agent_error(err, true) {
+            AgentApiErrorDisposition::Terminal(Error::Llm(_)) => {}
+            _ => panic!("expected Terminal(Error::Llm) for non-failover-eligible LLM error"),
+        }
+    }
+
+    #[test]
+    fn classify_session_closed_is_terminal_precondition() {
+        let err = fabro_agent::Error::SessionClosed;
+        match classify_agent_error(err, true) {
+            AgentApiErrorDisposition::Terminal(Error::Precondition(message)) => {
+                assert!(message.contains("Agent session failed"));
+            }
+            _ => panic!("expected Terminal(Error::Precondition) for SessionClosed"),
+        }
+    }
+
+    #[test]
+    fn classify_invalid_state_is_terminal_precondition() {
+        let err = fabro_agent::Error::InvalidState("oops".into());
+        match classify_agent_error(err, true) {
+            AgentApiErrorDisposition::Terminal(Error::Precondition(message)) => {
+                assert!(message.contains("Agent session failed"));
+            }
+            _ => panic!("expected Terminal(Error::Precondition) for InvalidState"),
+        }
+    }
+
+    #[test]
+    fn classify_tool_execution_is_terminal_precondition() {
+        let err = fabro_agent::Error::ToolExecution("tool blew up".into());
+        match classify_agent_error(err, true) {
+            AgentApiErrorDisposition::Terminal(Error::Precondition(message)) => {
+                assert!(message.contains("Agent session failed"));
+            }
+            _ => panic!("expected Terminal(Error::Precondition) for ToolExecution"),
+        }
     }
 }

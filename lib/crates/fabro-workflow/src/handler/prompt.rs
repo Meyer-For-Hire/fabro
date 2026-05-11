@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use fabro_graphviz::graph::{Graph, Node};
@@ -10,7 +11,7 @@ use super::agent::{
 use super::{EngineServices, Handler};
 use crate::context::{Context, WorkflowContext, keys};
 use crate::error::Error;
-use crate::event::{Event, StageScope};
+use crate::event::{Emitter, Event, StageScope};
 use crate::outcome::Outcome;
 
 /// Handler for single-shot LLM calls (no tools, no agent loop).
@@ -27,6 +28,12 @@ impl PromptHandler {
 
 #[async_trait]
 impl Handler for PromptHandler {
+    async fn shutdown(&self, emitter: &Arc<Emitter>) {
+        if let Some(backend) = self.backend.as_ref() {
+            backend.shutdown(emitter).await;
+        }
+    }
+
     async fn simulate(
         &self,
         node: &Node,
@@ -66,13 +73,21 @@ impl Handler for PromptHandler {
                 .provider()
                 .and_then(|s| s.parse::<Provider>().ok())
                 .unwrap_or(services.run.provider);
-            let docs = fabro_agent::discover_memory(
+            let docs = match fabro_agent::discover_memory(
                 &*services.run.sandbox,
                 working_dir,
                 working_dir,
                 provider,
+                &services.run.cancel_token(),
             )
-            .await;
+            .await
+            {
+                Ok(docs) => docs,
+                Err(fabro_agent::Error::Interrupted(fabro_agent::InterruptReason::Cancelled)) => {
+                    return Err(Error::Cancelled);
+                }
+                Err(_) => Vec::new(),
+            };
 
             if docs.is_empty() {
                 None
@@ -105,7 +120,13 @@ impl Handler for PromptHandler {
         let (response_text, stage_usage, backend_files_touched) =
             if let Some(backend) = &self.backend {
                 let result = backend
-                    .one_shot(node, &prompt, system_prompt.as_deref())
+                    .one_shot(
+                        node,
+                        &prompt,
+                        system_prompt.as_deref(),
+                        &services.run.emitter,
+                        &stage_scope,
+                    )
                     .await;
                 match result {
                     Ok(CodergenResult::Full(outcome)) => return Ok(outcome),
@@ -115,6 +136,7 @@ impl Handler for PromptHandler {
                         files_touched,
                         ..
                     }) => (text, usage, files_touched),
+                    Err(Error::Cancelled) => return Err(Error::Cancelled),
                     Err(e) if e.is_retryable() => {
                         return Err(e);
                     }
@@ -185,8 +207,10 @@ mod tests {
     use fabro_types::fixtures;
     use object_store::memory::InMemory;
     use tempfile::TempDir;
+    use tokio_util::sync::CancellationToken;
 
     use super::*;
+    use crate::event::Emitter;
 
     fn make_services() -> EngineServices {
         EngineServices::test_default()
@@ -208,14 +232,43 @@ mod tests {
     ) {
         let store = test_store();
         let run_store = store.create_run(&fixtures::RUN_1).await.unwrap();
+        seed_created(&run_store).await;
         let mut services = EngineServices::test_default();
         services.run = services
             .run
-            .with_emitter(Arc::new(crate::event::Emitter::new(fixtures::RUN_1)))
+            .with_emitter(Arc::new(Emitter::new(fixtures::RUN_1)))
             .with_run_store(run_store.clone().into());
         let logger = crate::event::StoreProgressLogger::new(run_store.clone());
         logger.register(services.run.emitter.as_ref());
         (services, run_store, logger)
+    }
+
+    async fn seed_created(run_store: &RunDatabase) {
+        crate::event::append_event(
+            run_store,
+            &fixtures::RUN_1,
+            &crate::event::Event::RunCreated {
+                run_id:           fixtures::RUN_1,
+                title:            None,
+                settings:         serde_json::to_value(fabro_types::WorkflowSettings::default())
+                    .unwrap(),
+                graph:            serde_json::to_value(fabro_types::Graph::new("test")).unwrap(),
+                workflow_source:  None,
+                workflow_config:  None,
+                labels:           std::collections::BTreeMap::default(),
+                run_dir:          "/tmp".to_string(),
+                source_directory: None,
+                workflow_slug:    None,
+                db_prefix:        None,
+                provenance:       None,
+                manifest_blob:    None,
+                git:              None,
+                fork_source_ref:  None,
+                web_url:          None,
+            },
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -267,9 +320,10 @@ mod tests {
                 _prompt: &str,
                 _context: &Context,
                 _thread_id: Option<&str>,
-                _emitter: &Arc<crate::event::Emitter>,
+                _emitter: &Arc<Emitter>,
                 _sandbox: &Arc<dyn Sandbox>,
                 _tool_hooks: Option<Arc<dyn fabro_agent::ToolHookCallback>>,
+                _cancel_token: CancellationToken,
             ) -> Result<CodergenResult, Error> {
                 panic!("run() should not be called for prompt handler");
             }
@@ -279,6 +333,8 @@ mod tests {
                 _node: &Node,
                 _prompt: &str,
                 _system_prompt: Option<&str>,
+                _emitter: &Arc<Emitter>,
+                _stage_scope: &StageScope,
             ) -> Result<CodergenResult, Error> {
                 Ok(CodergenResult::Text {
                     text:              "one-shot response".to_string(),
@@ -327,9 +383,10 @@ mod tests {
                 _prompt: &str,
                 _context: &Context,
                 _thread_id: Option<&str>,
-                _emitter: &Arc<crate::event::Emitter>,
+                _emitter: &Arc<Emitter>,
                 _sandbox: &Arc<dyn Sandbox>,
                 _tool_hooks: Option<Arc<dyn fabro_agent::ToolHookCallback>>,
+                _cancel_token: CancellationToken,
             ) -> Result<CodergenResult, Error> {
                 panic!("run() should not be called for prompt handler");
             }
@@ -339,6 +396,8 @@ mod tests {
                 _node: &Node,
                 _prompt: &str,
                 _system_prompt: Option<&str>,
+                _emitter: &Arc<Emitter>,
+                _stage_scope: &StageScope,
             ) -> Result<CodergenResult, Error> {
                 Ok(CodergenResult::Text {
                     text:              "one-shot response".to_string(),
@@ -384,9 +443,10 @@ mod tests {
             _prompt: &str,
             _context: &Context,
             _thread_id: Option<&str>,
-            _emitter: &Arc<crate::event::Emitter>,
+            _emitter: &Arc<Emitter>,
             _sandbox: &Arc<dyn fabro_agent::Sandbox>,
             _tool_hooks: Option<Arc<dyn fabro_agent::ToolHookCallback>>,
+            _cancel_token: CancellationToken,
         ) -> Result<CodergenResult, Error> {
             panic!("run() should not be called for prompt handler");
         }
@@ -396,6 +456,8 @@ mod tests {
             _node: &Node,
             prompt: &str,
             system_prompt: Option<&str>,
+            _emitter: &Arc<Emitter>,
+            _stage_scope: &StageScope,
         ) -> Result<CodergenResult, Error> {
             *self.captured_prompt.lock().unwrap() = Some(prompt.to_string());
             *self.captured_system_prompt.lock().unwrap() = Some(system_prompt.map(String::from));

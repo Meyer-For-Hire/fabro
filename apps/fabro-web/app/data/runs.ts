@@ -1,8 +1,9 @@
 import { formatElapsedSecs, formatDurationSecs } from "../lib/format";
-import type {
-  RunListItem,
-  RunStatus as ApiRunStatus,
-  RunSummary,
+import {
+  BoardColumn,
+  type BoardColumn as ApiBoardColumn,
+  type Run,
+  type RunStatus as ApiRunStatus,
 } from "@qltysh/fabro-api-client";
 
 export type CiStatus = "passing" | "failing" | "pending";
@@ -24,6 +25,7 @@ export interface RunItem {
   lifecycleStatus?: RunStatus | null;
   lifecycleStatusLabel?: string;
   number?: number;
+  pullRequestUrl?: string;
   additions?: number;
   deletions?: number;
   checks?: CheckRun[];
@@ -35,16 +37,30 @@ export interface RunItem {
   sandboxId?: string;
   sandboxWorkingDirectory?: string;
   sourceDirectory?: string;
+  createdAt?: string;
+  lastEventAt?: string;
 }
 
-export type ColumnStatus = "initializing" | "running" | "blocked" | "succeeded" | "failed";
+export type ColumnStatus = ApiBoardColumn;
+
+export const columnStatuses = [
+  BoardColumn.QUEUED,
+  BoardColumn.INITIALIZING,
+  BoardColumn.RUNNING,
+  BoardColumn.BLOCKED,
+  BoardColumn.SUCCEEDED,
+  BoardColumn.FAILED,
+  BoardColumn.ARCHIVED,
+] as const satisfies readonly ColumnStatus[];
 
 export const columnStatusDisplay: Record<ColumnStatus, { label: string; dot: string; text: string }> = {
+  queued:       { label: "Queued",       dot: "bg-fg-muted",  text: "text-fg-muted" },
   initializing: { label: "Initializing", dot: "bg-amber",     text: "text-amber" },
   running:      { label: "Running",      dot: "bg-teal-500",  text: "text-teal-500" },
   blocked:      { label: "Blocked",      dot: "bg-amber",     text: "text-amber" },
   succeeded:    { label: "Succeeded",    dot: "bg-teal-300",  text: "text-teal-300" },
   failed:       { label: "Failed",       dot: "bg-coral",     text: "text-coral" },
+  archived:     { label: "Archived",     dot: "bg-fg-muted",  text: "text-fg-muted" },
 };
 
 export interface RunWithStatus extends RunItem {
@@ -56,63 +72,51 @@ function displayRunTitle(title: string | null | undefined): string {
   return title?.trim() ? title : "Untitled run";
 }
 
+function displayRepoName(name: string): string {
+  const slash = name.lastIndexOf("/");
+  return slash >= 0 ? name.slice(slash + 1) : name;
+}
+
 function runStatusKind(status: ApiRunStatus | null | undefined): RunStatus | null {
   return status?.kind ?? null;
 }
 
-export function mapRunListItem(item: RunListItem): RunItem {
-  const lifecycleStatus = runStatusKind(item.status);
+export function mapRunListItem(item: Run): RunItem {
+  const lifecycleStatus = item.lifecycle.archived ? "archived" : runStatusKind(item.lifecycle.status);
+  const runtime = item.sandbox?.runtime;
   return {
-    id: item.run_id,
-    repo: item.repository.name,
+    id: item.id,
+    repo: displayRepoName(item.repository?.name ?? "unknown"),
     title: displayRunTitle(item.title),
-    workflow: item.workflow_slug ?? item.workflow_name ?? "unknown",
-    column: item.column,
+    workflow: item.workflow.slug ?? item.workflow.name ?? "unknown",
+    column: columnForRun(item) ?? undefined,
     lifecycleStatus,
-    lifecycleStatusLabel: lifecycleStatusLabel(item.status),
+    lifecycleStatusLabel: lifecycleStatusLabel(item.lifecycle.status, item.lifecycle.archived),
     number: item.pull_request?.number,
-    additions: item.pull_request?.additions,
-    deletions: item.pull_request?.deletions,
-    checks: item.pull_request?.checks?.map((c) => ({
-      name: c.name,
-      status: c.status,
-      duration: c.duration_secs != null ? formatDurationSecs(c.duration_secs) : undefined,
-    })),
-    elapsed: item.elapsed_secs != null ? formatElapsedSecs(item.elapsed_secs) : undefined,
-    resources: item.sandbox?.resources ? `${item.sandbox.resources.cpu} CPU / ${item.sandbox.resources.memory} GB` : undefined,
-    comments: item.pull_request?.comments,
-    question: item.question?.text,
-    sandboxId: item.sandbox?.id ?? undefined,
-    sandboxWorkingDirectory: item.sandbox?.working_directory ?? undefined,
+    pullRequestUrl: item.pull_request?.html_url,
+    elapsed: item.timestamps.elapsed_secs != null ? formatElapsedSecs(item.timestamps.elapsed_secs) : undefined,
+    resources: undefined,
+    question: item.current_question?.text,
+    sandboxId: runtime?.id ?? undefined,
+    sandboxWorkingDirectory: runtime?.working_directory ?? undefined,
     sourceDirectory: item.source_directory ?? undefined,
+    createdAt: item.timestamps.created_at,
+    lastEventAt: item.timestamps.last_event_at ?? undefined,
   };
 }
 
-export type { RunSummary };
+export type { Run };
+export type RunSummary = Run;
 
-export function mapRunSummaryToRunItem(summary: RunSummary): RunItem {
-  const lifecycleStatus = runStatusKind(summary.status);
-  return {
-    id: summary.run_id,
-    repo: summary.repository.name,
-    title: displayRunTitle(summary.title),
-    workflow: summary.workflow_slug ?? summary.workflow_name ?? "unknown",
-    lifecycleStatus,
-    lifecycleStatusLabel: lifecycleStatusLabel(summary.status),
-    sourceDirectory: summary.source_directory ?? undefined,
-    elapsed:
-      summary.elapsed_secs != null
-        ? formatElapsedSecs(summary.elapsed_secs)
-        : summary.duration_ms != null
-        ? formatElapsedSecs(summary.duration_ms / 1000)
-        : undefined,
-  };
+export function mapRunSummaryToRunItem(summary: Run): RunItem {
+  return mapRunListItem(summary);
 }
 
 export function columnForStatus(status: ApiRunStatus | null | undefined): ColumnStatus | null {
   switch (status?.kind) {
     case "submitted":
     case "queued":
+      return "queued";
     case "starting":
       return "initializing";
     case "running":
@@ -129,6 +133,11 @@ export function columnForStatus(status: ApiRunStatus | null | undefined): Column
     default:
       return null;
   }
+}
+
+export function columnForRun(run: Run): ColumnStatus | null {
+  if (run.lifecycle.archived) return "archived";
+  return columnForStatus(run.lifecycle.status);
 }
 
 export function deriveCiStatus(checks: CheckRun[]): CiStatus {
@@ -170,8 +179,8 @@ export function isRunStatus(s: string): s is RunStatus {
   return knownRunStatuses.has(s);
 }
 
-function lifecycleStatusLabel(status: ApiRunStatus | null | undefined): string | undefined {
-  const kind = runStatusKind(status);
+function lifecycleStatusLabel(status: ApiRunStatus | null | undefined, archived = false): string | undefined {
+  const kind = archived ? "archived" : runStatusKind(status);
   if (!kind) return undefined;
   return runStatusDisplay[kind].label;
 }

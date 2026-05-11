@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -8,14 +8,13 @@ use fabro_auth::{
     CredentialResolver, CredentialSource, EnvCredentialSource, VaultCredentialSource,
     auth_issue_message,
 };
-use fabro_config::RunScratch;
 use fabro_graphviz::graph;
 use fabro_hooks::{HookContext, HookDecision, HookEvent, HookRunner};
-use fabro_sandbox::config::WorktreeMode;
 use fabro_sandbox::{
-    GitSetupIntent, ReadBeforeWriteSandbox, SandboxEventCallback, SandboxSpec, WorktreeOptions,
-    WorktreeSandbox,
+    GitSetupIntent, ReadBeforeWriteSandbox, SandboxEventCallback, SandboxSpec,
+    reconnect_for_run_with_callback,
 };
+use fabro_static::EnvVars;
 use fabro_vault::Vault;
 use futures::future::try_join_all;
 use shlex::try_quote;
@@ -27,70 +26,17 @@ use tokio::time::timeout as tokio_timeout;
 use super::types::{InitOptions, Initialized, LlmSpec, Persisted, SandboxEnvSpec};
 use crate::devcontainer_bridge::{devcontainer_to_snapshot_config, run_devcontainer_lifecycle};
 use crate::error::Error;
-use crate::event::{Emitter, Event, RunNoticeLevel};
-use crate::git::RUN_BRANCH_PREFIX;
+use crate::event::{Event, RunNoticeCode, RunNoticeLevel};
+use crate::github_token_source::{AppIatMinter, GitHubTokenSource};
 use crate::handler::llm::{AgentApiBackend, AgentCliBackend, BackendRouter};
-use crate::handler::{HandlerRegistry, default_registry, sandbox_cancel_token};
-use crate::run_metadata::{
-    RunMetadataRuntime, build_metadata_writer, metadata_branch_name, mint_token,
-};
+use crate::handler::{HandlerRegistry, default_registry};
+use crate::run_metadata::{RunMetadataRuntime, build_metadata_writer, metadata_branch_name};
 use crate::run_options::{GitCheckpointOptions, RunOptions};
-use crate::sandbox_git::GIT_REMOTE;
 use crate::sandbox_git_runtime::SandboxGitRuntime;
-use crate::services::{EngineServices, RunServices};
+use crate::services::{EngineServices, RunServices, WorkflowToolEnvProvider};
+use crate::steering_hub::SteeringHub;
 
-struct WorktreePlan {
-    branch_name:          String,
-    base_sha:             Option<String>,
-    worktree_path:        PathBuf,
-    skip_branch_creation: bool,
-}
-
-async fn resolve_worktree_base_sha(
-    sandbox: &dyn Sandbox,
-    plan: &WorktreePlan,
-) -> Result<Option<String>, Error> {
-    if let Some(base_sha) = plan.base_sha.as_ref() {
-        return Ok(Some(base_sha.clone()));
-    }
-
-    let result = sandbox
-        .exec_command(
-            &format!("{GIT_REMOTE} rev-parse HEAD"),
-            10_000,
-            None,
-            None,
-            None,
-        )
-        .await
-        .map_err(|err| Error::engine_with_source("git rev-parse HEAD failed", &err))?;
-    if !result.is_success() {
-        let output = result.stderr.trim();
-        let output = if output.is_empty() {
-            result.stdout.trim()
-        } else {
-            output
-        };
-        if is_not_git_repository(output) {
-            return Ok(None);
-        }
-        return Err(Error::engine(format!(
-            "git rev-parse HEAD failed (exit {}): {}",
-            result.display_exit_code(),
-            output
-        )));
-    }
-
-    let base_sha = result.stdout.trim();
-    if base_sha.is_empty() {
-        return Err(Error::engine("git rev-parse HEAD returned no commit sha"));
-    }
-    Ok(Some(base_sha.to_string()))
-}
-
-fn is_not_git_repository(output: &str) -> bool {
-    output.contains("not a git repository") || output.contains("ambiguous argument 'HEAD'")
-}
+type BuiltSandboxEnv = (HashMap<String, String>, Option<Arc<GitHubTokenSource>>);
 
 async fn run_hooks(
     hook_runner: Option<&HookRunner>,
@@ -102,102 +48,6 @@ async fn run_hooks(
         return HookDecision::Proceed;
     };
     runner.run(hook_context, sandbox, work_dir).await
-}
-
-fn resolve_worktree_plan(options: &mut InitOptions) -> Option<WorktreePlan> {
-    let Some(worktree_mode) = options.worktree_mode else {
-        options.run_options.display_base_sha = None;
-        return None;
-    };
-
-    let is_local = matches!(options.sandbox, SandboxSpec::Local { .. });
-
-    if options.checkpoint.is_some() && is_local {
-        if let Some(fork_source) = options.run_options.fork_source_ref.as_ref() {
-            let base_sha = fork_source.checkpoint_sha.clone();
-            options.run_options.display_base_sha = Some(base_sha.clone());
-            return Some(WorktreePlan {
-                branch_name:          format!("{RUN_BRANCH_PREFIX}{}", options.run_id),
-                base_sha:             Some(base_sha),
-                worktree_path:        RunScratch::new(&options.run_options.run_dir).worktree_dir(),
-                skip_branch_creation: false,
-            });
-        }
-
-        if let Some(git) = options.run_options.git.as_ref() {
-            if let (Some(run_branch), Some(base_sha)) = (&git.run_branch, &git.base_sha) {
-                options.run_options.display_base_sha = Some(base_sha.clone());
-                return Some(WorktreePlan {
-                    branch_name:          run_branch.clone(),
-                    base_sha:             Some(base_sha.clone()),
-                    worktree_path:        RunScratch::new(&options.run_options.run_dir)
-                        .worktree_dir(),
-                    skip_branch_creation: true,
-                });
-            }
-        }
-    }
-
-    let local_dirty = options
-        .run_options
-        .pre_run_git
-        .as_ref()
-        .map(|git| git.dirty);
-
-    if matches!(local_dirty, Some(fabro_types::DirtyStatus::Dirty)) {
-        let env_name = if !is_local {
-            Some("remote sandbox")
-        } else if worktree_mode == WorktreeMode::Never {
-            None
-        } else {
-            Some("worktree")
-        };
-        if let Some(env_name) = env_name {
-            options.emitter.notice(
-                RunNoticeLevel::Warn,
-                "dirty_worktree",
-                format!("Uncommitted changes will not be included in the {env_name}."),
-            );
-        }
-    }
-
-    if !is_local {
-        options.run_options.display_base_sha = options
-            .run_options
-            .pre_run_git
-            .as_ref()
-            .and_then(|git| git.sha.clone());
-        return None;
-    }
-
-    if worktree_mode == WorktreeMode::Never {
-        options.run_options.display_base_sha = None;
-        return None;
-    }
-
-    let (branch_name, base_sha) =
-        if let Some(fork_source) = options.run_options.fork_source_ref.as_ref() {
-            (
-                format!("{RUN_BRANCH_PREFIX}{}", options.run_id),
-                Some(fork_source.checkpoint_sha.clone()),
-            )
-        } else {
-            (
-                format!("{RUN_BRANCH_PREFIX}{}", options.run_id),
-                options
-                    .run_options
-                    .pre_run_git
-                    .as_ref()
-                    .and_then(|git| git.sha.clone()),
-            )
-        };
-    options.run_options.display_base_sha.clone_from(&base_sha);
-    Some(WorktreePlan {
-        branch_name,
-        base_sha,
-        worktree_path: RunScratch::new(&options.run_options.run_dir).worktree_dir(),
-        skip_branch_creation: false,
-    })
 }
 
 fn git_setup_intent(run_options: &RunOptions) -> GitSetupIntent {
@@ -214,48 +64,62 @@ fn git_setup_intent(run_options: &RunOptions) -> GitSetupIntent {
     }
 }
 
-async fn mint_github_token(
-    creds: &fabro_github::GitHubCredentials,
-    origin_url: &str,
-    permissions: &HashMap<String, String>,
-) -> Result<String, Error> {
-    mint_token(creds, origin_url, permissions)
-        .await
-        .map_err(|err| Error::engine_with_anyhow("Failed to mint GitHub token", &err))
-}
-
-async fn build_sandbox_env(
+fn build_sandbox_env(
     spec: &SandboxEnvSpec,
     github_app: Option<&fabro_github::GitHubCredentials>,
-    emitter: &Emitter,
-) -> Result<HashMap<String, String>, Error> {
+) -> Result<BuiltSandboxEnv, Error> {
     let mut env = spec.devcontainer_env.clone();
     env.extend(spec.toml_env.clone());
 
-    if let Some(permissions) = spec.github_permissions.as_ref() {
-        if !permissions.is_empty() {
-            if let (Some(creds), Some(origin_url)) = (github_app, spec.origin_url.as_deref()) {
-                match mint_github_token(creds, origin_url, permissions).await {
-                    Ok(token) => {
-                        env.insert("GITHUB_TOKEN".to_string(), token);
-                    }
-                    Err(e) => emitter.notice(
-                        RunNoticeLevel::Warn,
-                        "github_token_failed",
-                        format!("Failed to mint GitHub token: {e}"),
-                    ),
-                }
-            }
-        }
-    }
+    let Some(permissions) = spec.github_permissions.as_ref().filter(|p| !p.is_empty()) else {
+        return Ok((env, None));
+    };
+    let Some(creds) = github_app else {
+        return Ok((env, None));
+    };
 
-    Ok(env)
+    let source = match creds {
+        fabro_github::GitHubCredentials::Pat(token) => {
+            Some(Arc::new(GitHubTokenSource::pat(token.clone())))
+        }
+        fabro_github::GitHubCredentials::Installation(token) => {
+            Some(Arc::new(GitHubTokenSource::static_iat(token.clone())))
+        }
+        fabro_github::GitHubCredentials::App(app) => {
+            let Some(origin_url) = spec.origin_url.as_deref() else {
+                return Ok((env, None));
+            };
+            let https_url = fabro_github::ssh_url_to_https(origin_url);
+            let (owner, repo) = fabro_github::parse_github_owner_repo(&https_url)
+                .map_err(|err| Error::engine_with_anyhow("Failed to parse GitHub origin", &err))?;
+            let permissions = serde_json::to_value(permissions).map_err(|err| {
+                Error::engine_with_source("Failed to serialize GitHub permissions", &err)
+            })?;
+            let http = fabro_http::http_client()
+                .map_err(|err| Error::engine_with_source("Failed to build HTTP client", &err))?;
+            let install_url = app.installation_url(&owner);
+            let minter = AppIatMinter::new(
+                app.clone(),
+                http,
+                owner,
+                repo,
+                fabro_github::github_api_base_url(),
+                install_url,
+                permissions,
+            );
+            Some(Arc::new(GitHubTokenSource::mintable(Arc::new(minter))))
+        }
+    };
+
+    Ok((env, source))
 }
 
 async fn build_registry(
     spec: &LlmSpec,
     interviewer: Arc<dyn fabro_interview::Interviewer>,
-    sandbox_env: &HashMap<String, String>,
+    steering_hub: Arc<SteeringHub>,
+    tool_env_provider: Arc<WorkflowToolEnvProvider>,
+    github_token_refresh_managed: bool,
     graph: &graph::Graph,
     llm_source: Arc<dyn CredentialSource>,
     cli_resolver: Option<CredentialResolver>,
@@ -293,20 +157,23 @@ async fn build_registry(
             Ok((build_no_backend(), false))
         }
         Ok(_result) => {
-            let env = sandbox_env.clone();
             let model = spec.model.clone();
             let provider = spec.provider;
             let fallback_chain = spec.fallback_chain.clone();
             let mcp_servers = spec.mcp_servers.clone();
             let llm_source_for_api = Arc::clone(&llm_source);
+            let steering_hub_for_api = Arc::clone(&steering_hub);
+            let tool_env_provider_for_backend = Arc::clone(&tool_env_provider);
             let registry = Arc::new(default_registry(interviewer, move || {
+                let tool_env_provider = Arc::clone(&tool_env_provider_for_backend);
                 let api = AgentApiBackend::new(
                     model.clone(),
                     provider,
                     fallback_chain.clone(),
                     Arc::clone(&llm_source_for_api),
+                    Arc::clone(&steering_hub_for_api),
                 )
-                .with_env(env.clone())
+                .with_tool_env_provider(tool_env_provider.clone())
                 .with_mcp_servers(mcp_servers.clone());
                 let cli = cli_resolver
                     .clone()
@@ -314,7 +181,7 @@ async fn build_registry(
                         || AgentCliBackend::new_from_env(model.clone(), provider),
                         |resolver| AgentCliBackend::new(model.clone(), provider, resolver),
                     )
-                    .with_env(env.clone());
+                    .with_tool_env_provider(tool_env_provider, github_token_refresh_managed);
                 Some(Box::new(BackendRouter::new(Box::new(api), cli)))
             }));
             Ok((registry, false))
@@ -460,7 +327,29 @@ pub async fn initialize(
 
     resolve_devcontainer(&mut options).await?;
 
-    let worktree_plan = resolve_worktree_plan(&mut options);
+    let attach_existing = options.checkpoint.is_some();
+    options.run_options.display_base_sha = options
+        .run_options
+        .pre_run_git
+        .as_ref()
+        .and_then(|git| git.sha.clone());
+    if !attach_existing
+        && !matches!(options.sandbox, SandboxSpec::Local { .. })
+        && matches!(
+            options
+                .run_options
+                .pre_run_git
+                .as_ref()
+                .map(|git| git.dirty),
+            Some(fabro_types::DirtyStatus::Dirty)
+        )
+    {
+        options.emitter.notice(
+            RunNoticeLevel::Warn,
+            RunNoticeCode::DirtyWorktree,
+            "Uncommitted changes will not be included in the remote sandbox.",
+        );
+    }
 
     let sandbox_event_callback: SandboxEventCallback = {
         let emitter = Arc::clone(&options.emitter);
@@ -468,44 +357,34 @@ pub async fn initialize(
             emitter.emit(&Event::Sandbox { event });
         })
     };
-    let mut worktree_created = false;
-    let sandbox: Arc<dyn Sandbox> = if let Some(plan) = worktree_plan.as_ref() {
-        let inner = options
-            .sandbox
-            .build(Some(Arc::clone(&sandbox_event_callback)))
+    let mut sandbox_initialized = true;
+    let sandbox: Arc<dyn Sandbox> = if attach_existing {
+        let run_state = options
+            .run_store
+            .state()
             .await
-            .map_err(|e| Error::engine_with_anyhow("Failed to build sandbox", &e))?;
-        if let Some(base_sha) = resolve_worktree_base_sha(&*inner, plan).await? {
-            sandbox_git
-                .ensure_git_available(&*inner)
+            .map_err(|err| Error::engine(err.to_string()))?;
+        let record = run_state.sandbox.ok_or_else(|| {
+            Error::Precondition("cannot resume run: run sandbox is missing".to_string())
+        })?;
+        let daytona_api_key = match &options.vault {
+            Some(vault) => vault
+                .read()
                 .await
-                .map_err(|err| Error::engine_with_source("sandbox git unavailable", &err))?;
-            options.run_options.display_base_sha = Some(base_sha.clone());
-            options.run_options.git = Some(GitCheckpointOptions {
-                base_sha:    Some(base_sha.clone()),
-                run_branch:  Some(plan.branch_name.clone()),
-                meta_branch: Some(metadata_branch_name(&options.run_id.to_string())),
-            });
-            let mut worktree = WorktreeSandbox::new(inner, WorktreeOptions {
-                branch_name: plan.branch_name.clone(),
-                base_sha,
-                worktree_path: plan.worktree_path.to_string_lossy().into_owned(),
-                skip_branch_creation: plan.skip_branch_creation,
-                setup_intent: Some(git_setup_intent(&options.run_options)),
-            });
-            worktree.set_event_callback(Arc::clone(&options.emitter).worktree_callback());
-            match worktree.initialize().await {
-                Ok(()) => {
-                    worktree_created = true;
-                    Arc::new(ReadBeforeWriteSandbox::new(Arc::new(worktree)))
-                }
-                Err(e) => {
-                    return Err(Error::engine_with_source("Git worktree setup failed", &e));
-                }
-            }
-        } else {
-            Arc::new(ReadBeforeWriteSandbox::new(inner))
-        }
+                .get(EnvVars::DAYTONA_API_KEY)
+                .map(str::to_string),
+            None => None,
+        };
+        let sandbox = reconnect_for_run_with_callback(
+            &record,
+            daytona_api_key,
+            Some(options.run_id),
+            Some(Arc::clone(&sandbox_event_callback)),
+        )
+        .await
+        .map_err(|err| Error::engine_with_anyhow("Failed to reconnect sandbox for resume", &err))?;
+        sandbox_initialized = false;
+        Arc::new(ReadBeforeWriteSandbox::new(Arc::from(sandbox)))
     } else {
         Arc::new(ReadBeforeWriteSandbox::new(
             options
@@ -515,21 +394,27 @@ pub async fn initialize(
                 .map_err(|e| Error::engine_with_anyhow("Failed to build sandbox", &e))?,
         ))
     };
-    if worktree_plan.is_some() && !worktree_created {
-        options.run_options.git = None;
-    }
-    let cleanup_guard = scopeguard::guard(Arc::clone(&sandbox), |sandbox| {
-        if let Ok(handle) = Handle::try_current() {
-            handle.spawn(async move {
-                let _ = sandbox.cleanup().await;
-            });
-        }
+    let cleanup_guard = (!attach_existing).then(|| {
+        scopeguard::guard(Arc::clone(&sandbox), |sandbox| {
+            if let Ok(handle) = Handle::try_current() {
+                handle.spawn(async move {
+                    let _ = sandbox.delete().await;
+                });
+            }
+        })
     });
 
-    sandbox
-        .initialize()
-        .await
-        .map_err(|e| Error::engine_with_source("Failed to initialize sandbox", &e))?;
+    if attach_existing {
+        sandbox
+            .start()
+            .await
+            .map_err(|e| Error::engine_with_source("Failed to start sandbox", &e))?;
+    } else {
+        sandbox
+            .initialize()
+            .await
+            .map_err(|e| Error::engine_with_source("Failed to initialize sandbox", &e))?;
+    }
 
     let hook_ctx = HookContext::new(
         HookEvent::SandboxReady,
@@ -548,22 +433,35 @@ pub async fn initialize(
         return Err(Error::engine(msg));
     }
 
-    let sandbox_record = options.sandbox.to_sandbox_record(&*sandbox);
-    options.emitter.emit(&Event::SandboxInitialized {
-        working_directory: sandbox_record.working_directory.clone(),
-        provider:          sandbox_record.provider.clone(),
-        identifier:        sandbox_record.identifier.clone(),
-        repo_cloned:       sandbox_record.repo_cloned,
-        clone_origin_url:  sandbox_record.clone_origin_url.clone(),
-        clone_branch:      sandbox_record.clone_branch.clone(),
-    });
+    if sandbox_initialized {
+        let run_sandbox = options
+            .sandbox
+            .to_run_sandbox(&*sandbox, options.run_options.run_id);
+        let runtime = run_sandbox
+            .runtime
+            .as_ref()
+            .ok_or_else(|| Error::engine("initialized sandbox missing runtime metadata"))?;
+        options.emitter.emit(&Event::SandboxInitialized {
+            working_directory: runtime.working_directory.clone(),
+            provider:          run_sandbox.provider,
+            id:                runtime.id.clone(),
+            repo_cloned:       runtime.repo_cloned,
+            clone_origin_url:  runtime.clone_origin_url.clone(),
+            clone_branch:      runtime.clone_branch.clone(),
+        });
+    }
 
-    let env = build_sandbox_env(
+    let (base_env, github_token) = build_sandbox_env(
         &options.sandbox_env,
         options.run_options.github_app.as_ref(),
-        &options.emitter,
-    )
-    .await?;
+    )?;
+    let tool_env_provider = Arc::new(WorkflowToolEnvProvider {
+        base_env:     base_env.clone(),
+        github_token: github_token.clone(),
+    });
+    let github_token_refresh_managed = github_token
+        .as_deref()
+        .is_some_and(GitHubTokenSource::is_refreshable);
     let (registry, effective_dry_run) = if let Some(registry) = options.registry_override.clone() {
         // A caller-supplied registry owns execution behavior for its handlers.
         (registry, options.dry_run)
@@ -571,7 +469,9 @@ pub async fn initialize(
         build_registry(
             &options.llm,
             Arc::clone(&options.interviewer),
-            &env,
+            Arc::clone(&options.steering_hub),
+            Arc::clone(&tool_env_provider),
+            github_token_refresh_managed,
             &graph,
             Arc::clone(&llm_source),
             cli_resolver,
@@ -593,7 +493,8 @@ pub async fn initialize(
         .is_some();
     if !has_run_branch {
         let intent = git_setup_intent(&options.run_options);
-        if sandbox.origin_url().is_some() {
+        let sandbox_has_origin = sandbox.origin_url().is_some();
+        if sandbox_has_origin {
             sandbox_git
                 .ensure_git_available(&*sandbox)
                 .await
@@ -619,7 +520,16 @@ pub async fn initialize(
                     options.run_options.base_branch = info.base_branch;
                 }
             }
-            Ok(None) => {}
+            Ok(None) => {
+                if sandbox_has_origin {
+                    options.emitter.notice(
+                        RunNoticeLevel::Warn,
+                        RunNoticeCode::SandboxGitUnavailable,
+                        "Sandbox could not set up Git despite a configured origin; running \
+                         without checkpointing or PR support.",
+                    );
+                }
+            }
             Err(e) => {
                 return Err(Error::engine_with_source("Sandbox git setup failed", &e));
             }
@@ -637,23 +547,21 @@ pub async fn initialize(
                 index,
             });
             let cmd_start = Instant::now();
-            let cancel_token = sandbox_cancel_token(options.run_options.cancel_token.clone());
+            let cancel_token = options.run_options.cancel_token.child_token();
             let result = sandbox
                 .exec_command(
                     command,
                     options.lifecycle.setup_command_timeout_ms,
                     None,
                     None,
-                    cancel_token.clone(),
+                    Some(cancel_token.clone()),
                 )
                 .await
                 .map_err(|e| Error::engine_with_source("Setup command failed", &e))?;
-            if let Some(token) = &cancel_token {
-                if token.is_cancelled() {
-                    return Err(Error::Cancelled);
-                }
-                token.cancel();
+            if options.run_options.cancel_token.is_cancelled() {
+                return Err(Error::Cancelled);
             }
+            cancel_token.cancel();
             let duration_ms = crate::millis_u64(cmd_start.elapsed());
             if !result.is_success() {
                 let exit_code = result.display_exit_code();
@@ -702,7 +610,7 @@ pub async fn initialize(
             if metadata_runtime.mark_metadata_degraded() {
                 options.emitter.notice(
                     RunNoticeLevel::Warn,
-                    "checkpoint_metadata_write_failed",
+                    RunNoticeCode::CheckpointMetadataWriteFailed,
                     message,
                 );
             }
@@ -726,14 +634,17 @@ pub async fn initialize(
         run: Arc::clone(&run_services),
         registry,
         git_state: std::sync::RwLock::new(None),
-        env,
+        base_env,
+        github_token,
         inputs: options.run_options.settings.run.inputs.clone(),
         dry_run: options.dry_run,
         workflow_path: options.workflow_path.clone(),
         workflow_bundle: options.workflow_bundle.clone(),
     });
 
-    scopeguard::ScopeGuard::into_inner(cleanup_guard);
+    if let Some(cleanup_guard) = cleanup_guard {
+        scopeguard::ScopeGuard::into_inner(cleanup_guard);
+    }
 
     Ok(Initialized {
         graph,
@@ -753,14 +664,12 @@ pub async fn initialize(
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
     use fabro_auth::{AuthCredential, AuthDetails};
     use fabro_graphviz::graph::{AttrValue, Edge, Graph, Node};
     use fabro_interview::AutoApproveInterviewer;
     use fabro_sandbox::SandboxSpec;
-    use fabro_sandbox::config::WorktreeMode;
     use fabro_store::Database;
     use fabro_types::{EventBody, RunEvent, RunId, WorkflowSettings, fixtures};
     use fabro_vault::{SecretType, Vault};
@@ -846,7 +755,7 @@ mod tests {
         RunOptions {
             settings:         WorkflowSettings::default(),
             run_dir:          run_dir.to_path_buf(),
-            cancel_token:     None,
+            cancel_token:     tokio_util::sync::CancellationToken::new(),
             run_id:           test_run_id(),
             labels:           HashMap::new(),
             workflow_slug:    None,
@@ -869,6 +778,7 @@ mod tests {
                 run_id: test_run_id(),
                 settings: WorkflowSettings::default(),
                 graph,
+                graph_source: None,
                 workflow_slug: Some("test".to_string()),
                 source_directory: Some(std::env::current_dir().unwrap().display().to_string()),
                 git: Some(fabro_types::GitContext {
@@ -883,7 +793,6 @@ mod tests {
                 manifest_blob: None,
                 definition_blob: None,
                 fork_source_ref: None,
-                in_place: false,
             },
         )
     }
@@ -904,69 +813,14 @@ mod tests {
         });
 
         let result = initialize(persisted, InitOptions {
-            run_id: test_run_id(),
-            run_store: {
+            run_id:            test_run_id(),
+            run_store:         {
                 let store = memory_store();
                 let inner = store.create_run(&test_run_id()).await.unwrap();
                 inner.into()
             },
-            dry_run: false,
-            emitter,
-            sandbox: SandboxSpec::Local {
-                working_directory: std::env::current_dir().unwrap(),
-            },
-            llm: LlmSpec {
-                model:          "test-model".to_string(),
-                provider:       fabro_llm::Provider::Anthropic,
-                fallback_chain: Vec::new(),
-                mcp_servers:    Vec::new(),
-                dry_run:        true,
-            },
-            interviewer: Arc::new(AutoApproveInterviewer::engine()),
-            lifecycle: crate::run_options::LifecycleOptions {
-                setup_commands:           vec![command.to_string()],
-                setup_command_timeout_ms: 1_000,
-                devcontainer_phases:      vec![],
-            },
-            run_options: test_settings(&run_dir),
-            workflow_path: None,
-            workflow_bundle: None,
-            hooks: fabro_hooks::HookSettings { hooks: vec![] },
-            sandbox_env: SandboxEnvSpec {
-                devcontainer_env:   HashMap::new(),
-                toml_env:           HashMap::new(),
-                github_permissions: None,
-                origin_url:         None,
-            },
-            vault: None,
-            devcontainer: None,
-            git: None,
-            worktree_mode: None,
-            run_control: None,
-            registry_override: None,
-            artifact_sink: None,
-            checkpoint: None,
-            seed_context: None,
-        })
-        .await;
-        let events = seen.lock().unwrap().clone();
-        (result, events)
-    }
-
-    #[tokio::test]
-    async fn resolve_worktree_plan_uses_local_worktree_without_pre_run_git_context() {
-        let temp = tempfile::tempdir().unwrap();
-        let run_dir = temp.path().join("run");
-        std::fs::create_dir_all(&run_dir).unwrap();
-        let store = memory_store();
-        let mut options = InitOptions {
-            run_id:            test_run_id(),
-            run_store:         {
-                let inner = store.create_run(&test_run_id()).await.unwrap();
-                inner.into()
-            },
             dry_run:           false,
-            emitter:           Arc::new(crate::event::Emitter::new(test_run_id())),
+            emitter:           emitter.clone(),
             sandbox:           SandboxSpec::Local {
                 working_directory: std::env::current_dir().unwrap(),
             },
@@ -978,8 +832,9 @@ mod tests {
                 dry_run:        true,
             },
             interviewer:       Arc::new(AutoApproveInterviewer::engine()),
+            steering_hub:      Arc::new(crate::steering_hub::SteeringHub::new(emitter.clone())),
             lifecycle:         crate::run_options::LifecycleOptions {
-                setup_commands:           vec![],
+                setup_commands:           vec![command.to_string()],
                 setup_command_timeout_ms: 1_000,
                 devcontainer_phases:      vec![],
             },
@@ -996,19 +851,15 @@ mod tests {
             vault:             None,
             devcontainer:      None,
             git:               None,
-            worktree_mode:     Some(WorktreeMode::Always),
             run_control:       None,
             registry_override: None,
             artifact_sink:     None,
             checkpoint:        None,
             seed_context:      None,
-        };
-
-        let plan = resolve_worktree_plan(&mut options);
-
-        assert!(plan.is_some());
-        assert!(options.run_options.display_base_sha.is_none());
-        assert!(options.run_options.git.is_none());
+        })
+        .await;
+        let events = seen.lock().unwrap().clone();
+        (result, events)
     }
 
     #[tokio::test]
@@ -1021,49 +872,49 @@ mod tests {
         let emitter = Arc::new(crate::event::Emitter::new(test_run_id()));
 
         let initialized = initialize(persisted, InitOptions {
-            run_id: test_run_id(),
-            run_store: {
+            run_id:            test_run_id(),
+            run_store:         {
                 let store = memory_store();
                 let inner = store.create_run(&test_run_id()).await.unwrap();
                 inner.into()
             },
-            dry_run: false,
-            emitter,
-            sandbox: SandboxSpec::Local {
+            dry_run:           false,
+            emitter:           emitter.clone(),
+            sandbox:           SandboxSpec::Local {
                 working_directory: std::env::current_dir().unwrap(),
             },
-            llm: LlmSpec {
+            llm:               LlmSpec {
                 model:          "test-model".to_string(),
                 provider:       fabro_llm::Provider::Anthropic,
                 fallback_chain: Vec::new(),
                 mcp_servers:    Vec::new(),
                 dry_run:        true,
             },
-            interviewer: Arc::new(AutoApproveInterviewer::engine()),
-            lifecycle: crate::run_options::LifecycleOptions {
+            interviewer:       Arc::new(AutoApproveInterviewer::engine()),
+            steering_hub:      Arc::new(crate::steering_hub::SteeringHub::new(emitter.clone())),
+            lifecycle:         crate::run_options::LifecycleOptions {
                 setup_commands:           vec![],
                 setup_command_timeout_ms: 1_000,
                 devcontainer_phases:      vec![],
             },
-            run_options: test_settings(&run_dir),
-            workflow_path: None,
-            workflow_bundle: None,
-            hooks: fabro_hooks::HookSettings { hooks: vec![] },
-            sandbox_env: SandboxEnvSpec {
+            run_options:       test_settings(&run_dir),
+            workflow_path:     None,
+            workflow_bundle:   None,
+            hooks:             fabro_hooks::HookSettings { hooks: vec![] },
+            sandbox_env:       SandboxEnvSpec {
                 devcontainer_env:   HashMap::new(),
                 toml_env:           HashMap::from([("TEST_KEY".to_string(), "value".to_string())]),
                 github_permissions: None,
                 origin_url:         None,
             },
-            vault: None,
-            devcontainer: None,
-            git: None,
-            worktree_mode: None,
-            run_control: None,
+            vault:             None,
+            devcontainer:      None,
+            git:               None,
+            run_control:       None,
             registry_override: None,
-            artifact_sink: None,
-            checkpoint: None,
-            seed_context: None,
+            artifact_sink:     None,
+            checkpoint:        None,
+            seed_context:      None,
         })
         .await
         .unwrap();
@@ -1072,7 +923,11 @@ mod tests {
         assert_eq!(initialized.source, source);
         assert!(initialized.engine.run.hook_runner.is_none());
         assert_eq!(
-            initialized.engine.env.get("TEST_KEY").map(String::as_str),
+            initialized
+                .engine
+                .base_env
+                .get("TEST_KEY")
+                .map(String::as_str),
             Some("value")
         );
         assert!(initialized.engine.dry_run);
@@ -1115,6 +970,11 @@ mod tests {
         let (graph, _) = llm_graph();
         let vault = Arc::new(AsyncRwLock::new(vault));
 
+        let test_emitter = Arc::new(crate::event::Emitter::new(test_run_id()));
+        let tool_env_provider = Arc::new(WorkflowToolEnvProvider {
+            base_env:     HashMap::new(),
+            github_token: None,
+        });
         let (_registry, effective_dry_run) = build_registry(
             &LlmSpec {
                 model:          "claude-opus-4-6".to_string(),
@@ -1124,7 +984,9 @@ mod tests {
                 dry_run:        false,
             },
             Arc::new(AutoApproveInterviewer::engine()),
-            &HashMap::new(),
+            Arc::new(crate::steering_hub::SteeringHub::new(test_emitter)),
+            tool_env_provider,
+            false,
             &graph,
             Arc::new(VaultCredentialSource::new(Arc::clone(&vault))),
             Some(CredentialResolver::new(vault)),
@@ -1154,45 +1016,45 @@ mod tests {
         store_logger.register(&emitter);
 
         let initialized = initialize(persisted, InitOptions {
-            run_id: test_run_id(),
-            run_store: run_store.into(),
-            dry_run: false,
-            emitter,
-            sandbox: SandboxSpec::Local {
+            run_id:            test_run_id(),
+            run_store:         run_store.into(),
+            dry_run:           false,
+            emitter:           emitter.clone(),
+            sandbox:           SandboxSpec::Local {
                 working_directory: std::env::current_dir().unwrap(),
             },
-            llm: LlmSpec {
+            llm:               LlmSpec {
                 model:          "test-model".to_string(),
                 provider:       fabro_llm::Provider::Anthropic,
                 fallback_chain: Vec::new(),
                 mcp_servers:    Vec::new(),
                 dry_run:        true,
             },
-            interviewer: Arc::new(AutoApproveInterviewer::engine()),
-            lifecycle: crate::run_options::LifecycleOptions {
+            interviewer:       Arc::new(AutoApproveInterviewer::engine()),
+            steering_hub:      Arc::new(crate::steering_hub::SteeringHub::new(emitter.clone())),
+            lifecycle:         crate::run_options::LifecycleOptions {
                 setup_commands:           vec!["true".to_string()],
                 setup_command_timeout_ms: 1_000,
                 devcontainer_phases:      vec![],
             },
-            run_options: test_settings(&run_dir),
-            workflow_path: None,
-            workflow_bundle: None,
-            hooks: fabro_hooks::HookSettings { hooks: vec![] },
-            sandbox_env: SandboxEnvSpec {
+            run_options:       test_settings(&run_dir),
+            workflow_path:     None,
+            workflow_bundle:   None,
+            hooks:             fabro_hooks::HookSettings { hooks: vec![] },
+            sandbox_env:       SandboxEnvSpec {
                 devcontainer_env:   HashMap::new(),
                 toml_env:           HashMap::new(),
                 github_permissions: None,
                 origin_url:         None,
             },
-            vault: None,
-            devcontainer: None,
-            git: None,
-            worktree_mode: None,
-            run_control: None,
+            vault:             None,
+            devcontainer:      None,
+            git:               None,
+            run_control:       None,
             registry_override: None,
-            artifact_sink: None,
-            checkpoint: None,
-            seed_context: None,
+            artifact_sink:     None,
+            checkpoint:        None,
+            seed_context:      None,
         })
         .await
         .unwrap();
@@ -1257,10 +1119,12 @@ mod tests {
         std::fs::create_dir_all(&run_dir).unwrap();
         let (graph, source) = simple_graph();
         let persisted = test_persisted(graph, source, &run_dir);
-        let cancel_token = Arc::new(AtomicBool::new(true));
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        cancel_token.cancel();
         let mut run_options = test_settings(&run_dir);
-        run_options.cancel_token = Some(cancel_token);
+        run_options.cancel_token = cancel_token;
 
+        let emitter = Arc::new(crate::event::Emitter::new(test_run_id()));
         let result = initialize(persisted, InitOptions {
             run_id: test_run_id(),
             run_store: {
@@ -1269,7 +1133,7 @@ mod tests {
                 inner.into()
             },
             dry_run: false,
-            emitter: Arc::new(crate::event::Emitter::new(test_run_id())),
+            emitter: emitter.clone(),
             sandbox: SandboxSpec::Local {
                 working_directory: std::env::current_dir().unwrap(),
             },
@@ -1281,6 +1145,7 @@ mod tests {
                 dry_run:        true,
             },
             interviewer: Arc::new(AutoApproveInterviewer::engine()),
+            steering_hub: Arc::new(crate::steering_hub::SteeringHub::new(emitter.clone())),
             lifecycle: crate::run_options::LifecycleOptions {
                 setup_commands:           vec!["sleep 5".to_string()],
                 setup_command_timeout_ms: 5_000,
@@ -1299,7 +1164,6 @@ mod tests {
             vault: None,
             devcontainer: None,
             git: None,
-            worktree_mode: None,
             run_control: None,
             registry_override: None,
             artifact_sink: None,
@@ -1318,10 +1182,12 @@ mod tests {
         std::fs::create_dir_all(&run_dir).unwrap();
         let (graph, source) = simple_graph();
         let persisted = test_persisted(graph, source, &run_dir);
-        let cancel_token = Arc::new(AtomicBool::new(true));
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        cancel_token.cancel();
         let mut run_options = test_settings(&run_dir);
-        run_options.cancel_token = Some(cancel_token);
+        run_options.cancel_token = cancel_token;
 
+        let emitter = Arc::new(crate::event::Emitter::new(test_run_id()));
         let result = initialize(persisted, InitOptions {
             run_id: test_run_id(),
             run_store: {
@@ -1330,7 +1196,7 @@ mod tests {
                 inner.into()
             },
             dry_run: false,
-            emitter: Arc::new(crate::event::Emitter::new(test_run_id())),
+            emitter: emitter.clone(),
             sandbox: SandboxSpec::Local {
                 working_directory: std::env::current_dir().unwrap(),
             },
@@ -1342,6 +1208,7 @@ mod tests {
                 dry_run:        true,
             },
             interviewer: Arc::new(AutoApproveInterviewer::engine()),
+            steering_hub: Arc::new(crate::steering_hub::SteeringHub::new(emitter.clone())),
             lifecycle: crate::run_options::LifecycleOptions {
                 setup_commands:           vec![],
                 setup_command_timeout_ms: 5_000,
@@ -1362,7 +1229,6 @@ mod tests {
             vault: None,
             devcontainer: None,
             git: None,
-            worktree_mode: None,
             run_control: None,
             registry_override: None,
             artifact_sink: None,

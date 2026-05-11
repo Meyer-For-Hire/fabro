@@ -125,7 +125,8 @@ fn pr_view_uses_server_pull_request_endpoint_and_renders_merged_state() {
             .header("Content-Type", "application/json")
             .body(
                 serde_json::json!({
-                    "record": {
+                    "pull_request": {
+                        "provider": "github",
                         "html_url": "https://github.com/fabro-sh/fabro/pull/123",
                         "number": 123,
                         "owner": "fabro-sh",
@@ -145,18 +146,15 @@ fn pr_view_uses_server_pull_request_endpoint_and_renders_merged_state() {
                     "additions": 10,
                     "deletions": 3,
                     "changed_files": 2,
-                    "html_url": "https://github.com/fabro-sh/fabro/pull/123",
-                    "user": {
+                    "comments": 0,
+                    "checks": [],
+                    "author": {
                         "login": "testuser"
                     },
-                    "head": {
-                        "ref": "fabro/run/demo"
-                    },
-                    "base": {
-                        "ref": "main"
-                    },
-                    "created_at": "2026-04-05T12:00:00Z",
-                    "updated_at": "2026-04-06T12:30:00Z"
+                    "timestamps": {
+                        "created_at": "2026-04-05T12:00:00Z",
+                        "updated_at": "2026-04-06T12:30:00Z"
+                    }
                 })
                 .to_string(),
             );
@@ -181,8 +179,6 @@ fn pr_view_uses_server_pull_request_endpoint_and_renders_merged_state() {
     Branch:  fabro/run/demo -> main
     Author:  testuser
     Changes: +10 -3 (2 files)
-
-    Detailed description
     ----- stderr -----
     ");
 

@@ -89,8 +89,8 @@ async fn wait_for_run_state(
 ) -> serde_json::Value {
     for _ in 0..POLL_ATTEMPTS {
         let body = run_json(app, run_id).await;
-        if body["status"]["kind"].as_str() == Some(expected_status)
-            && body["status"]["reason"].as_str() == Some(expected_reason)
+        if body["lifecycle"]["status"]["kind"].as_str() == Some(expected_status)
+            && body["lifecycle"]["status"]["reason"].as_str() == Some(expected_reason)
         {
             return body;
         }
@@ -169,7 +169,11 @@ async fn full_http_lifecycle_approve_and_complete() {
         )))
         .header("content-type", "application/json")
         .body(Body::from(
-            serde_json::to_string(&serde_json::json!({"selected_option_key": "A"})).unwrap(),
+            serde_json::to_string(&serde_json::json!({
+                "kind": "selected",
+                "option_key": "A",
+            }))
+            .unwrap(),
         ))
         .unwrap();
     let response = app.clone().oneshot(req).await.unwrap();
@@ -256,14 +260,14 @@ async fn full_http_lifecycle_cancel() {
         format!("POST /api/v1/runs/{run_id}/cancel"),
     )
     .await;
-    assert_eq!(body["status"]["kind"], "running");
+    assert_eq!(body["lifecycle"]["status"]["kind"], "blocked");
     // `pending_control` is computed from the store projection after the cancel
     // event is appended AND the worker is signaled. The worker is sitting at a
     // human gate; once notified it can emit a clearing event before this
     // handler re-reads the projection, so the response can legitimately
     // observe either the still-pending "cancel" or a null where the worker
     // already consumed it. Durable convergence is asserted below.
-    let pending_control = &body["pending_control"];
+    let pending_control = &body["lifecycle"]["pending_control"];
     assert!(
         pending_control == "cancel" || pending_control.is_null(),
         "expected pending_control to be \"cancel\" or null, got {pending_control}"
@@ -271,7 +275,7 @@ async fn full_http_lifecycle_cancel() {
 
     // Verify the durable store view converges to cancelled failure.
     let body = wait_for_run_state(&app, &run_id, "failed", "cancelled").await;
-    assert_eq!(body["status"]["reason"], "cancelled");
+    assert_eq!(body["lifecycle"]["status"]["reason"], "cancelled");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

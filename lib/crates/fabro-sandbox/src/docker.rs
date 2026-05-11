@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::Cursor;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bollard::Docker;
@@ -17,6 +17,7 @@ use bollard::image::CreateImageOptions;
 use bollard::models::HostConfig;
 use fabro_github::GitHubCredentials;
 use fabro_types::{CommandOutputStream, CommandTermination, RunId};
+use fabro_util::time::elapsed_ms;
 use futures::StreamExt;
 use tokio::sync::OnceCell;
 use tokio::{fs, time};
@@ -24,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::clone_source::{self, CloneDecision, EmptyWorkspaceReason};
 use crate::redact::redact_auth_url;
-use crate::sandbox::resolve_path;
+use crate::sandbox::{optional_timeout, resolve_path};
 use crate::{
     CommandOutputCallback, DirEntry, ExecResult, ExecStreamingResult, GrepOptions, Sandbox,
     SandboxEvent, SandboxEventCallback, format_lines_numbered, shell_quote,
@@ -44,6 +45,15 @@ const EXEC_TERM_GRACE_SECONDS: &str = "0.2";
 const MANAGED_LABEL: &str = "sh.fabro.managed";
 const RUN_ID_LABEL: &str = "sh.fabro.run_id";
 static EXEC_CONTROL_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+pub fn docker_access_command(container_id: &str) -> String {
+    let shell = format!("cd {} && exec sh -l", shell_quote(WORKING_DIRECTORY));
+    format!(
+        "docker exec -it {} sh -lc {}",
+        shell_quote(container_id),
+        shell_quote(&shell)
+    )
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DockerSandboxOptions {
@@ -130,11 +140,12 @@ impl DockerSandbox {
         repo_cloned: bool,
         clone_origin_url: Option<String>,
         clone_branch: Option<String>,
+        run_id: Option<RunId>,
     ) -> crate::Result<Self> {
         let sandbox = Self::new(
             DockerSandboxOptions::default(),
             None,
-            None,
+            run_id,
             clone_origin_url.clone(),
             clone_branch,
         )?;
@@ -170,6 +181,14 @@ impl DockerSandbox {
         self.container_id.get().map(String::as_str).ok_or_else(|| {
             crate::Error::message("Container not initialized — call initialize() first")
         })
+    }
+
+    pub(crate) fn container_identifier(&self) -> crate::Result<&str> {
+        self.container_id()
+    }
+
+    pub(crate) fn docker_client(&self) -> Docker {
+        self.docker.clone()
     }
 
     fn resolve_container_path(path: &str) -> String {
@@ -362,7 +381,7 @@ impl DockerSandbox {
     async fn docker_exec_shell_streaming(
         &self,
         command: &str,
-        timeout_ms: u64,
+        timeout_ms: Option<u64>,
         working_dir: Option<&str>,
         env_vars: Option<&HashMap<String, String>>,
         cancel_token: Option<CancellationToken>,
@@ -380,7 +399,8 @@ impl DockerSandbox {
             controlled_command,
         ];
 
-        let timeout_duration = Duration::from_millis(timeout_ms);
+        let timeout_future = optional_timeout(timeout_ms);
+        tokio::pin!(timeout_future);
         let token = cancel_token.unwrap_or_default();
 
         let container_id = self.container_id()?.to_string();
@@ -399,7 +419,7 @@ impl DockerSandbox {
                 joined
                     .map_err(|e| crate::Error::context("Docker exec stream task failed", e))??
             }
-            () = time::sleep(timeout_duration) => {
+            () = &mut timeout_future => {
                 termination = CommandTermination::TimedOut;
                 self.request_docker_exec_stop(&stop_file).await?;
                 output_task
@@ -690,8 +710,26 @@ impl DockerSandbox {
             .map_err(|e| crate::Error::context("Failed to upload file to container", e))
     }
 
-    fn cleanup_error(&self, error: crate::Error) -> crate::Result<()> {
-        self.emit(SandboxEvent::CleanupFailed {
+    fn start_error(&self, error: crate::Error) -> crate::Result<()> {
+        self.emit(SandboxEvent::StartFailed {
+            provider: "docker".into(),
+            error:    error.to_string(),
+            causes:   error.causes(),
+        });
+        Err(error)
+    }
+
+    fn stop_error(&self, error: crate::Error) -> crate::Result<()> {
+        self.emit(SandboxEvent::StopFailed {
+            provider: "docker".into(),
+            error:    error.to_string(),
+            causes:   error.causes(),
+        });
+        Err(error)
+    }
+
+    fn delete_error(&self, error: crate::Error) -> crate::Result<()> {
+        self.emit(SandboxEvent::DeleteFailed {
             provider: "docker".into(),
             error:    error.to_string(),
             causes:   error.causes(),
@@ -853,7 +891,7 @@ fn docker_not_found(error: &DockerError) -> bool {
     })
 }
 
-fn docker_already_stopped(error: &DockerError) -> bool {
+fn docker_not_modified(error: &DockerError) -> bool {
     matches!(error, DockerError::DockerResponseServerError {
         status_code: 304,
         ..
@@ -1109,15 +1147,64 @@ impl Sandbox for DockerSandbox {
         Ok(())
     }
 
-    async fn cleanup(&self) -> crate::Result<()> {
-        self.emit(SandboxEvent::CleanupStarted {
+    async fn start(&self) -> crate::Result<()> {
+        self.emit(SandboxEvent::StartStarted {
+            provider: "docker".into(),
+        });
+        let start = Instant::now();
+        let container_id = self.container_id()?.to_string();
+        let labels = match self.inspect_labels(&container_id).await {
+            Ok(labels) => labels,
+            Err(e) => return self.start_error(e),
+        };
+        if let Err(e) = verify_managed_labels(&container_id, &labels, self.run_id.as_ref()) {
+            return self.start_error(e);
+        }
+
+        if let Err(e) = self
+            .docker
+            .start_container(&container_id, None::<StartContainerOptions<String>>)
+            .await
+        {
+            if !docker_not_modified(&e) {
+                return self.start_error(crate::Error::context(
+                    format!(
+                        "Failed to start Docker container '{container_id}' with labels {labels:?}"
+                    ),
+                    e,
+                ));
+            }
+        }
+
+        let (_, stderr, exit_code) = self
+            .docker_exec(vec!["true".to_string()], None, None)
+            .await
+            .map_err(|e| {
+                crate::Error::context(format!("Docker container '{container_id}' health check"), e)
+            })?;
+        if exit_code != 0 {
+            return self.start_error(crate::Error::message(format!(
+                "Docker container '{container_id}' health check failed: {stderr}"
+            )));
+        }
+
+        let duration_ms = elapsed_ms(start);
+        self.emit(SandboxEvent::StartCompleted {
+            provider: "docker".into(),
+            duration_ms,
+        });
+        Ok(())
+    }
+
+    async fn stop(&self) -> crate::Result<()> {
+        self.emit(SandboxEvent::StopStarted {
             provider: "docker".into(),
         });
         let start = Instant::now();
 
         let Some(container_id) = self.container_id.get().cloned() else {
-            let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-            self.emit(SandboxEvent::CleanupCompleted {
+            let duration_ms = elapsed_ms(start);
+            self.emit(SandboxEvent::StopCompleted {
                 provider: "docker".into(),
                 duration_ms,
             });
@@ -1126,10 +1213,10 @@ impl Sandbox for DockerSandbox {
 
         let labels = match self.inspect_labels(&container_id).await {
             Ok(labels) => labels,
-            Err(e) => return self.cleanup_error(e),
+            Err(e) => return self.stop_error(e),
         };
         if let Err(e) = verify_managed_labels(&container_id, &labels, self.run_id.as_ref()) {
-            return self.cleanup_error(e);
+            return self.stop_error(e);
         }
 
         let stop_opts = StopContainerOptions { t: 1 };
@@ -1138,14 +1225,46 @@ impl Sandbox for DockerSandbox {
             .stop_container(&container_id, Some(stop_opts))
             .await
         {
-            if !docker_not_found(&e) && !docker_already_stopped(&e) {
-                return self.cleanup_error(crate::Error::context(
+            if !docker_not_found(&e) && !docker_not_modified(&e) {
+                return self.stop_error(crate::Error::context(
                     format!(
                         "Failed to stop Docker container '{container_id}' with labels {labels:?}"
                     ),
                     e,
                 ));
             }
+        }
+
+        let duration_ms = elapsed_ms(start);
+        self.emit(SandboxEvent::StopCompleted {
+            provider: "docker".into(),
+            duration_ms,
+        });
+
+        Ok(())
+    }
+
+    async fn delete(&self) -> crate::Result<()> {
+        self.emit(SandboxEvent::DeleteStarted {
+            provider: "docker".into(),
+        });
+        let start = Instant::now();
+
+        let Some(container_id) = self.container_id.get().cloned() else {
+            let duration_ms = elapsed_ms(start);
+            self.emit(SandboxEvent::DeleteCompleted {
+                provider: "docker".into(),
+                duration_ms,
+            });
+            return Ok(());
+        };
+
+        let labels = match self.inspect_labels(&container_id).await {
+            Ok(labels) => labels,
+            Err(e) => return self.delete_error(e),
+        };
+        if let Err(e) = verify_managed_labels(&container_id, &labels, self.run_id.as_ref()) {
+            return self.delete_error(e);
         }
 
         let remove_opts = RemoveContainerOptions {
@@ -1158,7 +1277,7 @@ impl Sandbox for DockerSandbox {
             .await
         {
             if !docker_not_found(&e) {
-                return self.cleanup_error(crate::Error::context(
+                return self.delete_error(crate::Error::context(
                     format!(
                         "Failed to remove Docker container '{container_id}' with labels {labels:?}"
                     ),
@@ -1167,13 +1286,17 @@ impl Sandbox for DockerSandbox {
             }
         }
 
-        let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-        self.emit(SandboxEvent::CleanupCompleted {
+        let duration_ms = elapsed_ms(start);
+        self.emit(SandboxEvent::DeleteCompleted {
             provider: "docker".into(),
             duration_ms,
         });
 
         Ok(())
+    }
+
+    async fn cleanup(&self) -> crate::Result<()> {
+        self.delete().await
     }
 
     async fn exec_command(
@@ -1192,7 +1315,7 @@ impl Sandbox for DockerSandbox {
     async fn exec_command_streaming(
         &self,
         command: &str,
-        timeout_ms: u64,
+        timeout_ms: Option<u64>,
         working_dir: Option<&str>,
         env_vars: Option<&HashMap<String, String>>,
         cancel_token: Option<CancellationToken>,
@@ -1428,6 +1551,10 @@ impl Sandbox for DockerSandbox {
         WORKING_DIRECTORY
     }
 
+    async fn ssh_access_command(&self) -> crate::Result<Option<String>> {
+        Ok(Some(docker_access_command(self.container_id()?)))
+    }
+
     fn platform(&self) -> &str {
         self.cached_platform.get().map_or("linux", String::as_str)
     }
@@ -1539,6 +1666,7 @@ mod tests {
         reason = "unit test reads an in-memory tar entry synchronously"
     )]
     use std::io::Read as _;
+    use std::time::Duration;
 
     use tokio::process::Command;
 
@@ -1597,6 +1725,22 @@ mod tests {
         assert_eq!(
             labels.get(RUN_ID_LABEL).map(String::as_str),
             Some("01HY0000000000000000000000")
+        );
+    }
+
+    #[test]
+    fn docker_access_command_uses_exec_in_workspace() {
+        assert_eq!(
+            docker_access_command("fabro-run-01HY0000000000000000000000"),
+            "docker exec -it fabro-run-01HY0000000000000000000000 sh -lc 'cd /workspace && exec sh -l'"
+        );
+    }
+
+    #[test]
+    fn docker_access_command_quotes_container_identifier() {
+        assert_eq!(
+            docker_access_command("container with spaces"),
+            "docker exec -it 'container with spaces' sh -lc 'cd /workspace && exec sh -l'"
         );
     }
 

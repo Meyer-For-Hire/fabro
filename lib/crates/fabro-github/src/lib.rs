@@ -1,6 +1,7 @@
 use anyhow::{Context as _, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use chrono::{DateTime, Utc};
 use fabro_redact::DisplaySafeUrl;
 use fabro_static::EnvVars;
 use fabro_types::PullRequestGithubDetail;
@@ -136,12 +137,60 @@ impl GitHubAppCredentials {
             format!("https://github.com/organizations/{owner}/settings/apps/{slug}/installations")
         })
     }
+
+    pub async fn mint_installation_token(
+        &self,
+        client: &impl HttpClient,
+        owner: &str,
+        repo: &str,
+        base_url: &str,
+        permissions: serde_json::Value,
+        install_url: Option<&str>,
+    ) -> anyhow::Result<InstallationToken> {
+        let jwt = sign_app_jwt(&self.app_id, &self.private_key_pem)?;
+        let default_install_url = self.installation_url(owner);
+        let install_url = install_url.or(default_install_url.as_deref());
+        mint_installation_token_with_jwt(
+            client,
+            &jwt,
+            owner,
+            repo,
+            base_url,
+            permissions,
+            install_url,
+        )
+        .await
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct InstallationToken {
+    pub token:      String,
+    pub expires_at: DateTime<Utc>,
+}
+
+impl InstallationToken {
+    pub fn near_expiry(&self, threshold: std::time::Duration) -> bool {
+        let threshold = chrono::Duration::from_std(threshold).unwrap_or(chrono::Duration::MAX);
+        self.expires_at <= Utc::now() + threshold
+    }
+
+    pub fn valid_token(&self) -> anyhow::Result<&str> {
+        if self.expires_at <= Utc::now() {
+            bail!(
+                "GitHub installation access token expired at {}",
+                self.expires_at
+            );
+        }
+        Ok(&self.token)
+    }
 }
 
 #[derive(Clone, Debug)]
 pub enum GitHubCredentials {
     App(GitHubAppCredentials),
-    Token(String),
+    Pat(String),
+    Installation(InstallationToken),
 }
 
 impl GitHubCredentials {
@@ -166,22 +215,33 @@ impl GitHubCredentials {
     ) -> anyhow::Result<String> {
         match self {
             Self::App(creds) => {
-                let jwt = sign_app_jwt(&creds.app_id, &creds.private_key_pem)?;
                 let install_url = creds.installation_url(owner);
-                create_installation_access_token_with_permissions_and_install_url(
-                    client,
-                    &jwt,
-                    owner,
-                    repo,
-                    base_url,
-                    permissions,
-                    install_url.as_deref(),
-                )
-                .await
+                creds
+                    .mint_installation_token(
+                        client,
+                        owner,
+                        repo,
+                        base_url,
+                        permissions,
+                        install_url.as_deref(),
+                    )
+                    .await
+                    .map(|token| token.token)
             }
-            Self::Token(token) => Ok(token.clone()),
+            Self::Pat(token) => Ok(token.clone()),
+            Self::Installation(token) => token.valid_token().map(str::to_owned),
         }
     }
+}
+
+pub fn validate_static_github_token(token: &str) -> anyhow::Result<()> {
+    if token.starts_with("ghs_") {
+        bail!(
+            "GitHub installation access token (ghs_*) cannot be configured as a static token \
+             because it expires quickly; use a PAT or GitHub App credentials instead"
+        );
+    }
+    Ok(())
 }
 
 pub async fn gh_auth_token() -> anyhow::Result<String> {
@@ -401,6 +461,20 @@ pub async fn create_installation_access_token_with_permissions_and_install_url(
     permissions: serde_json::Value,
     install_url: Option<&str>,
 ) -> anyhow::Result<String> {
+    mint_installation_token_with_jwt(client, jwt, owner, repo, base_url, permissions, install_url)
+        .await
+        .map(|token| token.token)
+}
+
+async fn mint_installation_token_with_jwt(
+    client: &impl HttpClient,
+    jwt: &str,
+    owner: &str,
+    repo: &str,
+    base_url: &str,
+    permissions: serde_json::Value,
+    install_url: Option<&str>,
+) -> anyhow::Result<InstallationToken> {
     #[derive(Deserialize)]
     struct Installation {
         id: u64,
@@ -408,7 +482,8 @@ pub async fn create_installation_access_token_with_permissions_and_install_url(
 
     #[derive(Deserialize)]
     struct AccessToken {
-        token: String,
+        token:      String,
+        expires_at: DateTime<Utc>,
     }
 
     // Step 1: Find the installation for this repo
@@ -506,7 +581,10 @@ pub async fn create_installation_access_token_with_permissions_and_install_url(
         .json()
         .context("Failed to parse access token response")?;
 
-    Ok(access_token.token)
+    Ok(InstallationToken {
+        token:      access_token.token,
+        expires_at: access_token.expires_at,
+    })
 }
 
 /// Request a scoped Installation Access Token with `contents: write`.
@@ -963,7 +1041,8 @@ pub async fn resolve_clone_credentials(
     repo: &str,
 ) -> anyhow::Result<(Option<String>, Option<String>)> {
     let token = match ctx.creds {
-        GitHubCredentials::Token(token) => token.clone(),
+        GitHubCredentials::Pat(token) => token.clone(),
+        GitHubCredentials::Installation(token) => token.valid_token()?.to_string(),
         GitHubCredentials::App(_) => {
             let client = ctx.http_client()?;
             ctx.creds
@@ -1636,6 +1715,50 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
+    async fn app_credentials_mint_installation_token_preserves_expiry() {
+        let mock = MockHttpClient::new()
+            .on(
+                HttpMethod::Get,
+                "/repos/owner/repo/installation",
+                200,
+                r#"{"id": 123}"#,
+            )
+            .on(
+                HttpMethod::Post,
+                "/app/installations/123/access_tokens",
+                201,
+                r#"{"token": "ghs_xxx", "expires_at": "2026-01-01T12:00:00Z"}"#,
+            )
+            .with_req_body(r#"{"permissions":{"contents":"write"},"repositories":["repo"]}"#);
+
+        let creds = GitHubAppCredentials {
+            app_id:          "test".to_string(),
+            private_key_pem: test_rsa_key().to_string(),
+            slug:            None,
+        };
+
+        let token = creds
+            .mint_installation_token(
+                &mock,
+                "owner",
+                "repo",
+                "",
+                serde_json::json!({ "contents": "write" }),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(token.token, "ghs_xxx");
+        assert_eq!(
+            token.expires_at,
+            "2026-01-01T12:00:00Z"
+                .parse::<chrono::DateTime<chrono::Utc>>()
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn create_iat_success() {
         let mock = MockHttpClient::new()
             .on(
@@ -1649,7 +1772,7 @@ mod tests {
                 HttpMethod::Post,
                 "/app/installations/123/access_tokens",
                 201,
-                r#"{"token": "ghs_xxx"}"#,
+                r#"{"token": "ghs_xxx", "expires_at": "2099-01-01T00:00:00Z"}"#,
             )
             .with_req_header("Authorization", "Bearer test-jwt")
             .with_req_body(r#"{"permissions":{"contents":"write"},"repositories":["repo"]}"#);
@@ -1771,7 +1894,7 @@ mod tests {
                 HttpMethod::Post,
                 "/app/installations/456/access_tokens",
                 201,
-                r#"{"token": "ghs_pr_token"}"#,
+                r#"{"token": "ghs_pr_token", "expires_at": "2099-01-01T00:00:00Z"}"#,
             )
             .with_req_header("Authorization", "Bearer test-jwt")
             .with_req_body(
@@ -1801,7 +1924,7 @@ mod tests {
                 HttpMethod::Post,
                 "/app/installations/1/access_tokens",
                 201,
-                r#"{"token": "ghs_test"}"#,
+                r#"{"token": "ghs_test", "expires_at": "2099-01-01T00:00:00Z"}"#,
             )
             .on(
                 HttpMethod::Get,
@@ -1840,7 +1963,7 @@ mod tests {
                 HttpMethod::Post,
                 "/app/installations/1/access_tokens",
                 201,
-                r#"{"token": "ghs_test"}"#,
+                r#"{"token": "ghs_test", "expires_at": "2099-01-01T00:00:00Z"}"#,
             )
             .on(
                 HttpMethod::Get,
@@ -1879,7 +2002,7 @@ mod tests {
                 HttpMethod::Post,
                 "/app/installations/1/access_tokens",
                 201,
-                r#"{"token": "ghs_test"}"#,
+                r#"{"token": "ghs_test", "expires_at": "2099-01-01T00:00:00Z"}"#,
             )
             .on(
                 HttpMethod::Get,
@@ -1916,7 +2039,7 @@ mod tests {
             )
             .with_req_header("Authorization", "Bearer ghu_test");
 
-        let creds = GitHubCredentials::Token("ghu_test".to_string());
+        let creds = GitHubCredentials::Pat("ghu_test".to_string());
         let result = branch_exists_with_client(
             &mock,
             &GitHubContext::new(&creds, ""),
@@ -2047,7 +2170,7 @@ mod tests {
                 HttpMethod::Post,
                 "/app/installations/1/access_tokens",
                 201,
-                r#"{"token": "ghs_test"}"#,
+                r#"{"token": "ghs_test", "expires_at": "2099-01-01T00:00:00Z"}"#,
             )
             .on(
                 HttpMethod::Get,
@@ -2098,7 +2221,7 @@ mod tests {
                 HttpMethod::Post,
                 "/app/installations/1/access_tokens",
                 201,
-                r#"{"token": "ghs_test"}"#,
+                r#"{"token": "ghs_test", "expires_at": "2099-01-01T00:00:00Z"}"#,
             )
             .on(HttpMethod::Get, "/repos/owner/repo/pulls/999", 404, "");
 
@@ -2141,7 +2264,7 @@ mod tests {
             )
             .with_req_header("Authorization", "Bearer ghu_test");
 
-        let creds = GitHubCredentials::Token("ghu_test".to_string());
+        let creds = GitHubCredentials::Pat("ghu_test".to_string());
         let detail = get_pull_request_with_client(
             &mock,
             &GitHubContext::new(&creds, ""),
@@ -2157,7 +2280,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_clone_credentials_returns_token_for_token_credentials() {
-        let creds = GitHubCredentials::Token("ghu_test".to_string());
+        let creds = GitHubCredentials::Pat("ghu_test".to_string());
 
         let credentials =
             resolve_clone_credentials(&GitHubContext::new(&creds, ""), "owner", "repo")
@@ -2171,6 +2294,34 @@ mod tests {
                 Some("ghu_test".to_string())
             )
         );
+    }
+
+    #[test]
+    fn installation_token_valid_token_rejects_expired_tokens() {
+        let expired = InstallationToken {
+            token:      "ghs_expired".to_string(),
+            expires_at: chrono::Utc::now() - chrono::Duration::seconds(1),
+        };
+        assert!(expired.valid_token().is_err());
+
+        let fresh = InstallationToken {
+            token:      "ghs_fresh".to_string(),
+            expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
+        };
+        assert_eq!(fresh.valid_token().unwrap(), "ghs_fresh");
+        assert!(!fresh.near_expiry(std::time::Duration::from_mins(15)));
+    }
+
+    #[test]
+    fn validate_static_github_token_rejects_installation_tokens() {
+        validate_static_github_token("ghp_personal").unwrap();
+        validate_static_github_token("gho_oauth").unwrap();
+        validate_static_github_token("ghu_user").unwrap();
+
+        let err = validate_static_github_token("ghs_installation")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("installation access token"), "got: {err}");
     }
 
     // -----------------------------------------------------------------------
@@ -2190,7 +2341,7 @@ mod tests {
                 HttpMethod::Post,
                 "/app/installations/1/access_tokens",
                 201,
-                r#"{"token": "ghs_test"}"#,
+                r#"{"token": "ghs_test", "expires_at": "2099-01-01T00:00:00Z"}"#,
             )
             .on(
                 HttpMethod::Put,
@@ -2230,7 +2381,7 @@ mod tests {
                 HttpMethod::Post,
                 "/app/installations/1/access_tokens",
                 201,
-                r#"{"token": "ghs_test"}"#,
+                r#"{"token": "ghs_test", "expires_at": "2099-01-01T00:00:00Z"}"#,
             )
             .on(HttpMethod::Put, "/repos/owner/repo/pulls/42/merge", 405, "");
 
@@ -2266,7 +2417,7 @@ mod tests {
                 HttpMethod::Post,
                 "/app/installations/1/access_tokens",
                 201,
-                r#"{"token": "ghs_test"}"#,
+                r#"{"token": "ghs_test", "expires_at": "2099-01-01T00:00:00Z"}"#,
             )
             .on(HttpMethod::Put, "/repos/owner/repo/pulls/42/merge", 409, "");
 
@@ -2306,7 +2457,7 @@ mod tests {
                 HttpMethod::Post,
                 "/app/installations/1/access_tokens",
                 201,
-                r#"{"token": "ghs_test"}"#,
+                r#"{"token": "ghs_test", "expires_at": "2099-01-01T00:00:00Z"}"#,
             )
             .on(
                 HttpMethod::Patch,
@@ -2339,7 +2490,7 @@ mod tests {
                 HttpMethod::Post,
                 "/app/installations/1/access_tokens",
                 201,
-                r#"{"token": "ghs_test"}"#,
+                r#"{"token": "ghs_test", "expires_at": "2099-01-01T00:00:00Z"}"#,
             )
             .on(HttpMethod::Patch, "/repos/owner/repo/pulls/999", 404, "");
 

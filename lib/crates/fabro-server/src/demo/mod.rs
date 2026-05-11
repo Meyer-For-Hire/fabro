@@ -15,15 +15,21 @@ use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use fabro_api::types::{
-    CreateSecretRequest, DeleteSecretRequest, DiffFile, DiffStats, FileDiff, FileDiffChangeKind,
-    PaginatedRunFileList, RunArtifactListResponse, RunFilesMeta,
+    CreateSecretRequest, DeleteSecretRequest, DiffFile, DiffStats, EventEnvelope, FileDiff,
+    FileDiffChangeKind, PaginatedEventList, PaginatedRunCommitList, PaginatedRunFileList,
+    PaginationMeta, RunArtifactListResponse, RunCommit, RunCommitParent, RunCommitParentSha,
+    RunCommitParentShortSha, RunCommitPerson, RunCommitSha, RunCommitShortSha, RunCommitTreeSha,
+    RunCommitsMeta, RunCommitsMetaBaseSha, RunCommitsMetaHeadSha, RunCommitsMetaSource,
+    RunFilesMeta, RunFilesMetaScope, RunFilesMetaSource, SandboxService,
+    SandboxServiceListResponse,
 };
+use fabro_types::{SandboxServiceDiscoverySource, SandboxServiceListMeta};
 use serde_json::json;
 
 use crate::error::ApiError;
 use crate::principal_middleware::RequiredUser;
 use crate::run_selector::{ResolveRunError, resolve_run_by_selector};
-use crate::server::{AppState, PaginationParams};
+use crate::server::{AppState, EventListParams, PaginationParams, parse_stage_id_path};
 
 fn paginated_response<T: serde::Serialize>(
     items: Vec<T>,
@@ -56,7 +62,7 @@ pub(crate) async fn list_board_runs(
     State(_state): State<Arc<AppState>>,
     Query(pagination): Query<PaginationParams>,
 ) -> Response {
-    let items = runs::board_items();
+    let items = runs::summaries();
     let limit = pagination.limit.clamp(1, 100) as usize;
     let offset = pagination.offset as usize;
     let mut data: Vec<_> = items.into_iter().skip(offset).take(limit + 1).collect();
@@ -93,12 +99,16 @@ pub(crate) async fn resolve_run(
     match resolve_run_by_selector(
         &runs,
         &params.selector,
-        |run| run.run_id.to_string(),
-        |run| run.workflow_slug.clone(),
-        |run| run.workflow_name.clone(),
-        |run| run.created_at,
-        |run| run.created_at.to_rfc3339(),
-        |run| run.repo_origin_url.clone(),
+        |run| run.id.to_string(),
+        |run| run.workflow.slug.clone(),
+        |run| Some(run.workflow.name.clone()),
+        |run| run.timestamps.created_at,
+        |run| run.timestamps.created_at.to_rfc3339(),
+        |run| {
+            run.repository
+                .as_ref()
+                .and_then(|repository| repository.origin_url.clone())
+        },
     ) {
         Ok(run) => (StatusCode::OK, Json(run.clone())).into_response(),
         Err(ResolveRunError::InvalidSelector | ResolveRunError::AmbiguousPrefix { .. }) => {
@@ -133,13 +143,39 @@ pub(crate) async fn get_run_stages(
     paginated_response(runs::stages(), &pagination)
 }
 
-pub(crate) async fn get_stage_turns(
+pub(crate) async fn get_stage_events(
     _auth: RequiredUser,
     State(_state): State<Arc<AppState>>,
-    Path((_id, _stage_id)): Path<(String, String)>,
-    Query(pagination): Query<PaginationParams>,
+    Path((_id, stage_id)): Path<(String, String)>,
+    Query(params): Query<EventListParams>,
 ) -> Response {
-    paginated_response(runs::turns(), &pagination)
+    let stage_id = match parse_stage_id_path(&stage_id) {
+        Ok(stage_id) => stage_id,
+        Err(response) => return response,
+    };
+    let since_seq = params.since_seq();
+    let limit = params.limit();
+    let mut matches: Vec<EventEnvelope> = runs::stage_events()
+        .into_iter()
+        .filter(|envelope| {
+            envelope.seq >= since_seq
+                && (envelope.event.stage_id.as_ref() == Some(&stage_id)
+                    || (envelope.event.stage_id.is_none()
+                        && stage_id.visit() == 1
+                        && envelope.event.node_id.as_deref() == Some(stage_id.node_id())))
+        })
+        .take(limit + 1)
+        .collect();
+    let has_more = matches.len() > limit;
+    matches.truncate(limit);
+    (
+        StatusCode::OK,
+        Json(PaginatedEventList {
+            data: matches,
+            meta: PaginationMeta { has_more },
+        }),
+    )
+        .into_response()
 }
 
 pub(crate) async fn list_run_artifacts_stub(
@@ -164,6 +200,79 @@ pub(crate) async fn list_run_files_stub(
     Path(_id): Path<String>,
 ) -> Response {
     (StatusCode::OK, Json(demo_run_files())).into_response()
+}
+
+pub(crate) async fn list_run_commits_stub(
+    _auth: RequiredUser,
+    State(_state): State<Arc<AppState>>,
+    Path(_id): Path<String>,
+) -> Response {
+    let sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let parent = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let tree = "cccccccccccccccccccccccccccccccccccccccc";
+    let commit = RunCommit {
+        sha:       sha_newtype::<RunCommitSha>(sha),
+        short_sha: short_sha_newtype::<RunCommitShortSha>(sha),
+        parents:   vec![RunCommitParent {
+            sha:       sha_newtype::<RunCommitParentSha>(parent),
+            short_sha: short_sha_newtype::<RunCommitParentShortSha>(parent),
+        }],
+        author:    RunCommitPerson {
+            name:  "Fabro".to_string(),
+            email: "bot@fabro.sh".to_string(),
+            date:  None,
+        },
+        committer: RunCommitPerson {
+            name:  "Fabro".to_string(),
+            email: "bot@fabro.sh".to_string(),
+            date:  None,
+        },
+        subject:   "fabro(demo): implement (succeeded)".to_string(),
+        body:      None,
+        message:   "fabro(demo): implement (succeeded)\n\nFabro-Run: demo\nFabro-Completed: 1\n"
+            .to_string(),
+        trailers:  [
+            ("Fabro-Run".to_string(), "demo".to_string()),
+            ("Fabro-Completed".to_string(), "1".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+        tree_sha:  Some(sha_newtype::<RunCommitTreeSha>(tree)),
+    };
+
+    (
+        StatusCode::OK,
+        Json(PaginatedRunCommitList {
+            data: vec![commit],
+            meta: RunCommitsMeta {
+                source:         RunCommitsMetaSource::Sandbox,
+                base_sha:       sha_newtype::<RunCommitsMetaBaseSha>(parent),
+                head_sha:       sha_newtype::<RunCommitsMetaHeadSha>(sha),
+                limit:          std::num::NonZeroU64::new(100).expect("literal is non-zero"),
+                total_returned: 1,
+                truncated:      false,
+            },
+        }),
+    )
+        .into_response()
+}
+
+fn sha_newtype<T>(sha: &str) -> T
+where
+    T: TryFrom<String>,
+    <T as TryFrom<String>>::Error: std::fmt::Display,
+{
+    T::try_from(sha.to_string()).unwrap_or_else(|err| panic!("invalid demo SHA `{sha}`: {err}"))
+}
+
+fn short_sha_newtype<T>(sha: &str) -> T
+where
+    T: TryFrom<String>,
+    <T as TryFrom<String>>::Error: std::fmt::Display,
+{
+    let short = sha.chars().take(7).collect::<String>();
+    T::try_from(short.clone())
+        .unwrap_or_else(|err| panic!("invalid demo short SHA `{short}`: {err}"))
 }
 
 fn demo_run_files() -> PaginatedRunFileList {
@@ -223,6 +332,8 @@ fn demo_run_files() -> PaginatedRunFileList {
             },
         ],
         meta: RunFilesMeta {
+            source:                  RunFilesMetaSource::Sandbox,
+            scope:                   RunFilesMetaScope::Committed,
             truncated:               false,
             files_omitted_by_budget: None,
             total_changed:           3,
@@ -295,6 +406,36 @@ pub(crate) async fn list_sandbox_files_stub(
         .into_response()
 }
 
+pub(crate) async fn list_sandbox_services_stub(
+    _auth: RequiredUser,
+    State(_state): State<Arc<AppState>>,
+    Path(_id): Path<String>,
+) -> Response {
+    (
+        StatusCode::OK,
+        Json(SandboxServiceListResponse {
+            data: vec![
+                SandboxService {
+                    port:              3000,
+                    addresses:         vec!["0.0.0.0:3000".to_string()],
+                    processes:         vec![r#"users:(("node",pid=42,fd=23))"#.to_string()],
+                    preview_supported: true,
+                },
+                SandboxService {
+                    port:              2500,
+                    addresses:         vec!["127.0.0.1:2500".to_string()],
+                    processes:         vec![r#"users:(("debug",pid=84,fd=19))"#.to_string()],
+                    preview_supported: false,
+                },
+            ],
+            meta: SandboxServiceListMeta {
+                source: SandboxServiceDiscoverySource::Ss,
+            },
+        }),
+    )
+        .into_response()
+}
+
 pub(crate) async fn get_sandbox_file_stub(
     _auth: RequiredUser,
     State(_state): State<Arc<AppState>>,
@@ -318,7 +459,7 @@ pub(crate) async fn get_run_status(
 ) -> Response {
     match runs::summaries()
         .into_iter()
-        .find(|run| run.run_id.to_string() == id)
+        .find(|run| run.id.to_string() == id)
     {
         Some(run) => (StatusCode::OK, Json(run)).into_response(),
         None => ApiError::not_found("Run not found.").into_response(),
@@ -618,6 +759,60 @@ pub(crate) async fn list_query_history(
     paginated_response(insights::history(), &pagination)
 }
 
+// ── Workflows ─────────────────────────────────────────────────────────
+
+pub(crate) async fn list_workflows(
+    _auth: RequiredUser,
+    State(_state): State<Arc<AppState>>,
+    Query(pagination): Query<PaginationParams>,
+) -> Response {
+    let limit = pagination.limit.clamp(1, 100) as usize;
+    let offset = pagination.offset as usize;
+    let mut data: Vec<_> = workflows::list_items()
+        .into_iter()
+        .skip(offset)
+        .take(limit + 1)
+        .collect();
+    let has_more = data.len() > limit;
+    data.truncate(limit);
+    (
+        StatusCode::OK,
+        Json(json!({
+            "data": data,
+            "pagination": { "has_more": has_more }
+        })),
+    )
+        .into_response()
+}
+
+pub(crate) async fn get_workflow(
+    _auth: RequiredUser,
+    State(_state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Response {
+    match workflows::detail(&name) {
+        Some(workflow) => (StatusCode::OK, Json(workflow)).into_response(),
+        None => ApiError::not_found("Workflow not found.").into_response(),
+    }
+}
+
+pub(crate) async fn list_workflow_runs(
+    _auth: RequiredUser,
+    State(_state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Query(pagination): Query<PaginationParams>,
+) -> Response {
+    if workflows::detail(&name).is_none() {
+        return ApiError::not_found("Workflow not found.").into_response();
+    }
+
+    let runs = runs::summaries()
+        .into_iter()
+        .filter(|run| run.workflow.slug.as_deref() == Some(&name))
+        .collect();
+    paginated_response(runs, &pagination)
+}
+
 // ── Settings ───────────────────────────────────────────────────────────
 
 pub(crate) async fn get_server_settings(
@@ -681,7 +876,7 @@ pub(crate) async fn get_system_info(
             "uptime_secs": 42,
             "runs": { "total": 3, "active": 1 },
             "sandbox_provider": "local",
-            "features": { "session_sandboxes": false, "retros": false }
+            "features": { "session_sandboxes": false }
         })),
     )
         .into_response()
@@ -726,6 +921,20 @@ pub(crate) async fn get_system_disk_usage(
             "total_size_bytes": 1280,
             "total_reclaimable_bytes": 1280,
             "runs": runs
+        })),
+    )
+        .into_response()
+}
+
+pub(crate) async fn get_system_repair_runs(
+    _auth: RequiredUser,
+    State(_state): State<Arc<AppState>>,
+) -> Response {
+    (
+        StatusCode::OK,
+        Json(json!({
+            "runs": [],
+            "total_count": 0
         })),
     )
         .into_response()
@@ -780,13 +989,17 @@ mod runs {
 
     use fabro_api::types::*;
     use fabro_types::settings::run::{
-        DaytonaSettings, DaytonaSnapshotSettings, LocalSandboxSettings, RunGoal, RunModelSettings,
-        RunNamespace, RunPrepareSettings, RunSandboxSettings,
+        DaytonaSettings, DaytonaSnapshotSettings, RunGoal, RunModelSettings, RunNamespace,
+        RunPrepareSettings, RunSandboxSettings,
     };
     use fabro_types::settings::{InterpString, ProjectNamespace, WorkflowNamespace};
-    use fabro_types::{RunId, WorkflowSettings};
+    use fabro_types::{
+        RepositoryRef, RunBillingSummary, RunId, RunLifecycle, RunLinks, RunOrigin, RunTimestamps,
+        StageId, WorkflowRef, WorkflowSettings,
+    };
 
     use super::ts;
+    use crate::server::run_stage_from_stage_id;
 
     fn labels(entries: &[(&str, &str)]) -> HashMap<String, String> {
         entries
@@ -795,8 +1008,8 @@ mod runs {
             .collect()
     }
 
-    fn demo_run_ids() -> &'static [RunId; 6] {
-        static IDS: OnceLock<[RunId; 6]> = OnceLock::new();
+    fn demo_run_ids() -> &'static [RunId; 7] {
+        static IDS: OnceLock<[RunId; 7]> = OnceLock::new();
         IDS.get_or_init(|| {
             [
                 RunId::with_timestamp(ts("2026-03-06T14:30:00Z"), 1),
@@ -805,6 +1018,7 @@ mod runs {
                 RunId::with_timestamp(ts("2026-03-04T10:00:00Z"), 4),
                 RunId::with_timestamp(ts("2026-03-03T16:45:00Z"), 5),
                 RunId::with_timestamp(ts("2026-02-28T14:00:00Z"), 6),
+                RunId::with_timestamp(ts("2026-03-06T14:35:00Z"), 7),
             ]
         })
     }
@@ -829,23 +1043,54 @@ mod runs {
     ) -> RunSummary {
         let created_at = ts(created_at);
         let run_id = RunId::with_timestamp(created_at, sequence);
-        RunSummary::new(
-            run_id,
-            Some(workflow_name.into()),
-            Some(workflow_slug.into()),
-            goal.into(),
-            labels(entries),
-            Some(format!("/demo/{repo_name}")),
-            false,
-            Some(format!("https://github.com/demo/{repo_name}.git")),
-            Some(created_at),
-            parse_run_status(status, status_reason)
-                .unwrap_or_else(|| panic!("invalid demo run status: {status}")),
-            pending_control,
-            elapsed_secs.and_then(duration_ms_from_secs),
-            total_usd_micros,
-            None,
-        )
+        let source_directory = Some(format!("/demo/{repo_name}"));
+        let repo_origin_url = Some(format!("https://github.com/demo/{repo_name}.git"));
+        let duration_ms = elapsed_secs.and_then(duration_ms_from_secs);
+        RunSummary {
+            id: run_id,
+            title: fabro_types::infer_run_title(goal),
+            goal: goal.into(),
+            workflow: WorkflowRef {
+                slug: Some(workflow_slug.into()),
+                name: workflow_name.into(),
+            },
+            automation: None,
+            repository: Some(RepositoryRef::from_origin_and_source(
+                repo_origin_url,
+                source_directory.as_deref(),
+            )),
+            created_by: None,
+            origin: RunOrigin::default(),
+            labels: labels(entries),
+            lifecycle: RunLifecycle {
+                status: parse_run_status(status, status_reason)
+                    .unwrap_or_else(|| panic!("invalid demo run status: {status}")),
+                pending_control,
+                queue_position: None,
+                error: None,
+                archived: false,
+                archived_at: None,
+            },
+            sandbox: None,
+            models: Vec::new(),
+            source_directory,
+            timestamps: RunTimestamps {
+                created_at,
+                started_at: Some(created_at),
+                last_event_at: Some(created_at),
+                completed_at: Some(created_at),
+                duration_ms,
+                elapsed_secs,
+            },
+            billing: total_usd_micros.map(|total_usd_micros| RunBillingSummary {
+                total_usd_micros: Some(total_usd_micros),
+            }),
+            diff: None,
+            pull_request: None,
+            current_question: None,
+            superseded_by: None,
+            links: RunLinks { web: None },
+        }
     }
 
     fn parse_run_status(status: &str, status_reason: Option<&str>) -> Option<RunStatus> {
@@ -901,96 +1146,30 @@ mod runs {
         duration.as_millis().try_into().ok()
     }
 
-    fn take_summary(summaries: &mut HashMap<RunId, RunSummary>, run_id: RunId) -> RunSummary {
-        summaries
-            .remove(&run_id)
-            .unwrap_or_else(|| panic!("missing demo summary: {run_id}"))
-    }
-
-    fn board_item(
-        summary: RunSummary,
-        column: BoardColumn,
-        pull_request: Option<RunPullRequest>,
-        sandbox: Option<RunSandbox>,
-        question: Option<RunQuestion>,
-    ) -> RunListItem {
-        RunListItem {
-            column,
-            created_at: summary.created_at,
-            duration_ms: summary.duration_ms.and_then(|ms| i64::try_from(ms).ok()),
-            elapsed_secs: summary.elapsed_secs,
-            goal: summary.goal,
-            source_directory: summary.source_directory,
-            in_place: Some(summary.in_place),
-            repo_origin_url: summary.repo_origin_url,
-            labels: summary.labels,
-            pending_control: summary.pending_control,
-            pull_request,
-            question,
-            repository: summary.repository,
-            run_id: summary.run_id.to_string(),
-            sandbox,
-            start_time: summary.start_time,
-            status: summary.status,
-            title: summary.title,
-            total_usd_micros: summary.total_usd_micros,
-            workflow_name: summary.workflow_name,
-            workflow_slug: summary.workflow_slug,
-        }
-    }
-
-    fn check(name: &str, status: CheckRunStatus, duration_secs: Option<f64>) -> CheckRun {
-        CheckRun {
-            name: name.into(),
-            status,
-            duration_secs,
-        }
-    }
-
-    fn sandbox(id: &str, cpu: i64, memory: i64) -> RunSandbox {
-        RunSandbox {
-            id:                Some(id.to_string()),
-            working_directory: Some("/workspace".to_string()),
-            resources:         Some(SandboxResources { cpu, memory }),
-        }
-    }
-
-    fn pull_request(
-        number: i64,
-        additions: i64,
-        deletions: i64,
-        comments: i64,
-        checks: Vec<CheckRun>,
-    ) -> RunPullRequest {
-        RunPullRequest {
-            number,
-            additions: Some(additions),
-            deletions: Some(deletions),
-            comments: Some(comments),
-            checks,
-        }
-    }
-
     pub(super) fn columns() -> Vec<BoardColumnDefinition> {
         vec![
             BoardColumnDefinition {
-                id:   "initializing".into(),
+                id:   BoardColumn::Queued,
+                name: "Queued".into(),
+            },
+            BoardColumnDefinition {
+                id:   BoardColumn::Initializing,
                 name: "Initializing".into(),
             },
             BoardColumnDefinition {
-                id:   "running".into(),
+                id:   BoardColumn::Running,
                 name: "Running".into(),
             },
             BoardColumnDefinition {
-                id:   "blocked".into(),
+                id:   BoardColumn::Blocked,
                 name: "Blocked".into(),
             },
             BoardColumnDefinition {
-                id:   "succeeded".into(),
+                id:   BoardColumn::Succeeded,
                 name: "Succeeded".into(),
             },
             BoardColumnDefinition {
-                id:   "failed".into(),
+                id:   BoardColumn::Failed,
                 name: "Failed".into(),
             },
         ]
@@ -1082,122 +1261,184 @@ mod runs {
                 Some(720000),
                 &[("release", "preview")],
             ),
-        ]
-    }
-
-    pub(super) fn board_items() -> Vec<RunListItem> {
-        let mut summaries = summaries()
-            .into_iter()
-            .map(|summary| (summary.run_id, summary))
-            .collect::<HashMap<_, _>>();
-
-        vec![
-            board_item(
-                take_summary(&mut summaries, demo_run_id(1)),
-                BoardColumn::Running,
-                None,
-                Some(sandbox("sb-a1b2c3d4", 4, 8)),
-                None,
-            ),
-            board_item(
-                take_summary(&mut summaries, demo_run_id(2)),
-                BoardColumn::Running,
-                None,
-                Some(sandbox("sb-e5f6g7h8", 8, 16)),
-                None,
-            ),
-            board_item(
-                take_summary(&mut summaries, demo_run_id(3)),
-                BoardColumn::Initializing,
-                Some(pull_request(0, 567, 234, 0, vec![])),
-                Some(sandbox("sb-q7r8s9t0", 4, 8)),
-                Some(RunQuestion {
-                    text: "Accept or push for another round?".into(),
-                }),
-            ),
-            board_item(
-                take_summary(&mut summaries, demo_run_id(4)),
-                BoardColumn::Blocked,
-                Some(pull_request(0, 145, 23, 0, vec![])),
-                Some(sandbox("sb-u1v2w3x4", 4, 8)),
-                Some(RunQuestion {
-                    text: "Proceed from investigation to fix?".into(),
-                }),
-            ),
-            board_item(
-                take_summary(&mut summaries, demo_run_id(5)),
-                BoardColumn::Failed,
-                Some(pull_request(889, 234, 67, 4, vec![
-                    check("lint", CheckRunStatus::Success, Some(23.0)),
-                    check("typecheck", CheckRunStatus::Success, Some(72.0)),
-                    check("unit-tests", CheckRunStatus::Success, Some(154.0)),
-                    check("integration-tests", CheckRunStatus::Failure, Some(296.0)),
-                    check("build", CheckRunStatus::Success, Some(105.0)),
-                ])),
+            summary(
+                7,
+                "api-server",
+                "implement",
+                "Implement",
+                "Add audit log retention policy",
+                "queued",
+                "2026-03-06T14:35:00Z",
                 None,
                 None,
-            ),
-            board_item(
-                take_summary(&mut summaries, demo_run_id(6)),
-                BoardColumn::Succeeded,
-                Some(pull_request(1249, 189, 45, 7, vec![
-                    check("lint", CheckRunStatus::Success, Some(21.0)),
-                    check("typecheck", CheckRunStatus::Success, Some(68.0)),
-                    check("unit-tests", CheckRunStatus::Success, Some(192.0)),
-                    check("integration-tests", CheckRunStatus::Success, Some(334.0)),
-                    check("deploy-preview", CheckRunStatus::Success, Some(93.0)),
-                ])),
                 None,
                 None,
+                &[("owner", "platform")],
             ),
         ]
     }
 
     pub(super) fn stages() -> Vec<RunStage> {
         vec![
-            RunStage {
-                id:            "detect-drift".into(),
-                name:          "Detect Drift".into(),
-                status:        StageState::Succeeded,
-                duration_secs: Some(72.0),
-                dot_id:        Some("detect".into()),
-            },
-            RunStage {
-                id:            "propose-changes".into(),
-                name:          "Propose Changes".into(),
-                status:        StageState::Succeeded,
-                duration_secs: Some(154.0),
-                dot_id:        Some("propose".into()),
-            },
-            RunStage {
-                id:            "review-changes".into(),
-                name:          "Review Changes".into(),
-                status:        StageState::Succeeded,
-                duration_secs: Some(45.0),
-                dot_id:        Some("review".into()),
-            },
-            RunStage {
-                id:            "apply-changes".into(),
-                name:          "Apply Changes".into(),
-                status:        StageState::Running,
-                duration_secs: Some(118.0),
-                dot_id:        Some("apply".into()),
-            },
+            run_stage_from_stage_id(
+                &StageId::new("detect-drift", 1),
+                "Detect Drift",
+                StageState::Succeeded,
+                Some(72.0),
+                None,
+                StageHandler::Command,
+            ),
+            run_stage_from_stage_id(
+                &StageId::new("propose-changes", 1),
+                "Propose Changes",
+                StageState::Succeeded,
+                Some(154.0),
+                None,
+                StageHandler::Agent,
+            ),
+            run_stage_from_stage_id(
+                &StageId::new("review-changes", 1),
+                "Review Changes",
+                StageState::Succeeded,
+                Some(45.0),
+                None,
+                StageHandler::Agent,
+            ),
+            run_stage_from_stage_id(
+                &StageId::new("apply-changes", 1),
+                "Apply Changes",
+                StageState::Succeeded,
+                Some(118.0),
+                None,
+                StageHandler::Command,
+            ),
+            run_stage_from_stage_id(
+                &StageId::new("apply-changes", 2),
+                "Apply Changes",
+                StageState::Running,
+                None,
+                None,
+                StageHandler::Command,
+            ),
         ]
     }
 
-    pub(super) fn turns() -> Vec<StageTurn> {
+    pub(super) fn stage_events() -> Vec<fabro_types::EventEnvelope> {
+        use fabro_model::BilledTokenCounts;
+        use fabro_types::run_event::agent::{
+            AgentMessageProps, AgentToolCompletedProps, AgentToolStartedProps,
+        };
+        use fabro_types::run_event::stage::StagePromptProps;
+        use fabro_types::{EventBody, EventEnvelope, RunEvent};
+
+        let run_id = demo_run_id(1);
+        let node_id = "detect-drift";
+        let stage_id = fabro_types::StageId::new(node_id, 1);
+        let ts = ts("2026-03-06T14:30:00Z");
+
+        let make_envelope = |seq: u32, id: &str, body: EventBody| EventEnvelope {
+            seq,
+            event: RunEvent {
+                id: id.into(),
+                ts,
+                run_id,
+                node_id: Some(node_id.into()),
+                node_label: Some("Detect Drift".into()),
+                stage_id: Some(stage_id.clone()),
+                parallel_group_id: None,
+                parallel_branch_id: None,
+                session_id: None,
+                parent_session_id: None,
+                tool_call_id: None,
+                actor: None,
+                body,
+            },
+        };
+
         vec![
-            StageTurn::SystemStageTurn(SystemStageTurn { kind: SystemStageTurnKind::System, content: "You are a drift detection agent. Compare the production and staging environments and identify any configuration or code drift.".into() }),
-            StageTurn::AssistantStageTurn(AssistantStageTurn { kind: AssistantStageTurnKind::Assistant, content: "I'll start by loading the environment configurations for both production and staging to compare them.".into() }),
-            StageTurn::ToolStageTurn(ToolStageTurn {
-                kind: ToolStageTurnKind::Tool, content: None,
-                tools: vec![
-                    ToolUse { id: "toolu_01".into(), tool_name: "read_file".into(), input: r#"{ "path": "environments/production/config.toml" }"#.into(), result: "[redis]\nhost = \"redis-prod.internal\"\nport = 6379".into(), is_error: false, duration_ms: Some(45) },
-                    ToolUse { id: "toolu_02".into(), tool_name: "read_file".into(), input: r#"{ "path": "environments/staging/config.toml" }"#.into(), result: "[redis]\nhost = \"redis-staging.internal\"\nport = 6379".into(), is_error: false, duration_ms: Some(38) },
-                ],
-            }),
-            StageTurn::AssistantStageTurn(AssistantStageTurn { kind: AssistantStageTurnKind::Assistant, content: "I've detected drift in 3 resources between production and staging:\n\n1. **redis.max_connections** — production has 200, staging has 100\n2. **redis.tls** — enabled in production, disabled in staging\n3. **iam.session_duration** — production uses 3600s, staging uses 1800s".into() }),
+            make_envelope(
+                1,
+                "evt-detect-drift-1",
+                EventBody::StagePrompt(StagePromptProps {
+                    visit:    1,
+                    text:     "You are a drift detection agent. Compare the production and staging environments and identify any configuration or code drift.".into(),
+                    mode:     None,
+                    provider: None,
+                    model:    None,
+                }),
+            ),
+            make_envelope(
+                2,
+                "evt-detect-drift-2",
+                EventBody::AgentMessage(AgentMessageProps {
+                    text:            "I'll start by loading the environment configurations for both production and staging to compare them.".into(),
+                    model:           fabro_model::ModelRef {
+                        provider: fabro_model::Provider::Anthropic,
+                        model_id: "claude-opus-4-6".into(),
+                        speed: None,
+                    },
+                    billing:         BilledTokenCounts::default(),
+                    tool_call_count: 0,
+                    visit:           1,
+                }),
+            ),
+            make_envelope(
+                3,
+                "evt-detect-drift-3",
+                EventBody::AgentToolStarted(AgentToolStartedProps {
+                    tool_name:    "read_file".into(),
+                    tool_call_id: "toolu_01".into(),
+                    arguments:    serde_json::json!({ "path": "environments/production/config.toml" }),
+                    visit:        1,
+                }),
+            ),
+            make_envelope(
+                4,
+                "evt-detect-drift-4",
+                EventBody::AgentToolCompleted(AgentToolCompletedProps {
+                    tool_name:    "read_file".into(),
+                    tool_call_id: "toolu_01".into(),
+                    output:       serde_json::json!("[redis]\nhost = \"redis-prod.internal\"\nport = 6379"),
+                    is_error:     false,
+                    visit:        1,
+                }),
+            ),
+            make_envelope(
+                5,
+                "evt-detect-drift-5",
+                EventBody::AgentToolStarted(AgentToolStartedProps {
+                    tool_name:    "read_file".into(),
+                    tool_call_id: "toolu_02".into(),
+                    arguments:    serde_json::json!({ "path": "environments/staging/config.toml" }),
+                    visit:        1,
+                }),
+            ),
+            make_envelope(
+                6,
+                "evt-detect-drift-6",
+                EventBody::AgentToolCompleted(AgentToolCompletedProps {
+                    tool_name:    "read_file".into(),
+                    tool_call_id: "toolu_02".into(),
+                    output:       serde_json::json!("[redis]\nhost = \"redis-staging.internal\"\nport = 6379"),
+                    is_error:     false,
+                    visit:        1,
+                }),
+            ),
+            make_envelope(
+                7,
+                "evt-detect-drift-7",
+                EventBody::AgentMessage(AgentMessageProps {
+                    text:            "I've detected drift in 3 resources between production and staging:\n\n1. **redis.max_connections** — production has 200, staging has 100\n2. **redis.tls** — enabled in production, disabled in staging\n3. **iam.session_duration** — production uses 3600s, staging uses 1800s".into(),
+                    model:           fabro_model::ModelRef {
+                        provider: fabro_model::Provider::Anthropic,
+                        model_id: "claude-opus-4-6".into(),
+                        speed: None,
+                    },
+                    billing:         BilledTokenCounts::default(),
+                    tool_call_count: 0,
+                    visit:           1,
+                }),
+            ),
         ]
     }
 
@@ -1222,6 +1463,8 @@ mod runs {
                         total_usd_micros:   Some(480_000),
                     },
                     runtime_secs: 72.0,
+                    started_at:   None,
+                    state:        Some(StageState::Succeeded),
                 },
                 RunBillingStage {
                     stage:        BillingStageRef {
@@ -1241,6 +1484,8 @@ mod runs {
                         total_usd_micros:   Some(720_000),
                     },
                     runtime_secs: 154.0,
+                    started_at:   None,
+                    state:        Some(StageState::Succeeded),
                 },
                 RunBillingStage {
                     stage:        BillingStageRef {
@@ -1260,6 +1505,8 @@ mod runs {
                         total_usd_micros:   Some(190_000),
                     },
                     runtime_secs: 45.0,
+                    started_at:   None,
+                    state:        Some(StageState::Succeeded),
                 },
                 RunBillingStage {
                     stage:        BillingStageRef {
@@ -1279,6 +1526,8 @@ mod runs {
                         total_usd_micros:   Some(870_000),
                     },
                     runtime_secs: 118.0,
+                    started_at:   None,
+                    state:        Some(StageState::Running),
                 },
             ],
             totals:   RunBillingTotals {
@@ -1386,10 +1635,7 @@ mod runs {
 
     pub(super) fn settings() -> serde_json::Value {
         let settings = WorkflowSettings {
-            project:  ProjectNamespace {
-                directory: "/workspace/api-server".into(),
-                ..ProjectNamespace::default()
-            },
+            project:  ProjectNamespace::default(),
             workflow: WorkflowNamespace {
                 graph: "workflow.fabro".into(),
                 ..WorkflowNamespace::default()
@@ -1409,13 +1655,13 @@ mod runs {
                     timeout_ms: 120_000,
                 },
                 sandbox: RunSandboxSettings {
-                    provider:     "daytona".into(),
-                    preserve:     false,
-                    devcontainer: false,
-                    env:          HashMap::new(),
-                    local:        LocalSandboxSettings::default(),
-                    docker:       None,
-                    daytona:      Some(DaytonaSettings {
+                    provider:         "daytona".into(),
+                    preserve:         false,
+                    stop_on_terminal: true,
+                    devcontainer:     false,
+                    env:              HashMap::new(),
+                    docker:           None,
+                    daytona:          Some(DaytonaSettings {
                         auto_stop_interval: Some(60),
                         labels:             HashMap::from([(
                             "project".to_string(),
@@ -1460,7 +1706,7 @@ mod runs {
                 &[],
             );
 
-            assert_eq!(summary.status, RunStatus::Failed {
+            assert_eq!(summary.lifecycle.status, RunStatus::Failed {
                 reason: FailureReason::Cancelled,
             });
         }
@@ -1482,7 +1728,7 @@ mod runs {
                 &[],
             );
 
-            assert_eq!(summary.status, RunStatus::Failed {
+            assert_eq!(summary.lifecycle.status, RunStatus::Failed {
                 reason: FailureReason::WorkflowError,
             });
         }
@@ -1507,6 +1753,150 @@ mod runs {
 
             assert_eq!(summary.title, format!("{}...", "a".repeat(97)));
         }
+    }
+}
+
+mod workflows {
+    use serde_json::{Value, json};
+
+    use super::runs;
+
+    const FIX_BUILD_GRAPH: &str = r#"digraph fix_build {
+    graph [goal="Diagnose and fix CI build failures", label="Fix Build"]
+    rankdir=LR
+    start [shape=Mdiamond, label="Start"]
+    exit [shape=Msquare, label="Exit"]
+    diagnose [label="Diagnose Failure"]
+    fix [label="Apply Fix"]
+    validate [label="Run Build"]
+    gate [shape=diamond, label="Build passing?"]
+    start -> diagnose -> fix -> validate -> gate
+    gate -> exit [label="Yes"]
+    gate -> diagnose [label="No"]
+}"#;
+
+    const IMPLEMENT_GRAPH: &str = r#"digraph implement {
+    graph [goal="Implement feature from technical blueprint", label="Implement"]
+    rankdir=LR
+    start [shape=Mdiamond, label="Start"]
+    exit [shape=Msquare, label="Exit"]
+    plan [label="Plan Implementation"]
+    implement [label="Implement"]
+    review [label="Review"]
+    validate [label="Validate"]
+    fix [label="Fix Failures"]
+    start -> plan -> implement -> review -> validate
+    validate -> exit [label="Pass"]
+    validate -> fix [label="Fix"]
+    fix -> validate
+}"#;
+
+    const SYNC_DRIFT_GRAPH: &str = r#"digraph sync_drift {
+    graph [goal="Detect and reconcile configuration drift", label="Sync Drift"]
+    rankdir=LR
+    start [shape=Mdiamond, label="Start"]
+    exit [shape=Msquare, label="Exit"]
+    detect [label="Detect Drift"]
+    propose [label="Propose Changes"]
+    review [shape=hexagon, label="Review Changes"]
+    apply [label="Apply Changes"]
+    start -> detect
+    detect -> exit [label="No drift"]
+    detect -> propose [label="Drift found"]
+    propose -> review
+    review -> apply [label="Accept"]
+    review -> propose [label="Revise"]
+    apply -> exit
+}"#;
+
+    const EXPAND_GRAPH: &str = r#"digraph expand {
+    graph [goal="Propose and implement incremental product improvements", label="Expand"]
+    rankdir=LR
+    start [shape=Mdiamond, label="Start"]
+    exit [shape=Msquare, label="Exit"]
+    propose [label="Propose Changes"]
+    approve [shape=hexagon, label="Approve Changes"]
+    execute [label="Execute Changes"]
+    start -> propose -> approve
+    approve -> execute [label="Accept"]
+    approve -> propose [label="Revise"]
+    execute -> exit
+}"#;
+
+    fn definitions() -> Vec<Value> {
+        vec![
+            json!({
+                "name": "Fix Build",
+                "slug": "fix_build",
+                "filename": "fix_build.fabro",
+                "description": "Automatically diagnoses and fixes CI build failures by analyzing error logs and applying targeted code changes.",
+                "last_run": { "ran_at": "2026-03-06T12:00:00Z" },
+                "schedule": null,
+                "settings": runs::settings(),
+                "graph": FIX_BUILD_GRAPH,
+            }),
+            json!({
+                "name": "Implement Feature",
+                "slug": "implement",
+                "filename": "implement.fabro",
+                "description": "Generates production-ready code from a technical blueprint, including tests and a pull request ready for review.",
+                "last_run": { "ran_at": "2026-03-06T14:30:00Z" },
+                "schedule": null,
+                "settings": runs::settings(),
+                "graph": IMPLEMENT_GRAPH,
+            }),
+            json!({
+                "name": "Sync Drift",
+                "slug": "sync_drift",
+                "filename": "sync_drift.fabro",
+                "description": "Detects configuration and code drift between environments, then generates reconciliation patches.",
+                "last_run": { "ran_at": "2026-03-04T15:00:00Z" },
+                "schedule": { "expression": "0 9 * * 1", "next_run": "2026-03-09T09:00:00Z" },
+                "settings": runs::settings(),
+                "graph": SYNC_DRIFT_GRAPH,
+            }),
+            json!({
+                "name": "Expand Product",
+                "slug": "expand",
+                "filename": "expand.fabro",
+                "description": "Evolves the product by analyzing usage patterns and implementing incremental improvements.",
+                "last_run": null,
+                "schedule": null,
+                "settings": runs::settings(),
+                "graph": EXPAND_GRAPH,
+            }),
+        ]
+    }
+
+    pub(super) fn list_items() -> Vec<Value> {
+        definitions()
+            .into_iter()
+            .map(|workflow| {
+                json!({
+                    "name": workflow["name"],
+                    "slug": workflow["slug"],
+                    "filename": workflow["filename"],
+                    "last_run": workflow["last_run"],
+                    "schedule": workflow["schedule"],
+                })
+            })
+            .collect()
+    }
+
+    pub(super) fn detail(name: &str) -> Option<Value> {
+        definitions()
+            .into_iter()
+            .find(|workflow| workflow["slug"].as_str() == Some(name))
+            .map(|workflow| {
+                json!({
+                    "name": workflow["name"],
+                    "slug": workflow["slug"],
+                    "description": workflow["description"],
+                    "filename": workflow["filename"],
+                    "settings": workflow["settings"],
+                    "graph": workflow["graph"],
+                })
+            })
     }
 }
 

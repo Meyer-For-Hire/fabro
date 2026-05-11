@@ -3,7 +3,7 @@ title: "Observability"
 description: "How to monitor, inspect, and analyze workflow runs"
 ---
 
-Fabro captures a structured event for every significant action during a workflow run. These events cover stage execution, agent tool calls, retries, routing, sandbox lifecycle, git checkpoints, retro generation, and more.
+Fabro captures a structured event for every significant action during a workflow run. These events cover stage execution, agent tool calls, retries, routing, sandbox lifecycle, git checkpoints, and more.
 
 ## Event stream
 
@@ -11,7 +11,7 @@ Every workflow run emits a sequence of canonical **run event envelopes** that ar
 
 - Stored durably in the run store
 - Broadcast over SSE to connected API clients
-- Stored for later analysis and retro generation
+- Stored for later analysis
 - Rendered by CLI progress and log tooling
 - Optionally materialized into JSONL by export/debug paths
 
@@ -71,14 +71,14 @@ Because event payload lives in `properties`, most shell queries should look ther
 
 ```bash
 # Count tool calls in a run
-fabro logs 01JKXYZ... | jq -r 'select(.event == "agent.tool.started") | .properties.tool_name' | wc -l
+fabro events 01JKXYZ... | jq -r 'select(.event == "agent.tool.started") | .properties.tool_name' | wc -l
 
 # Find stage failures
-fabro logs 01JKXYZ... | jq 'select(.event == "stage.failed")'
+fabro events 01JKXYZ... | jq 'select(.event == "stage.failed")'
 
 # See which edges were taken
 jq '{from: .properties.from_node, to: .properties.to_node, label: .properties.label}' \
-  <(fabro logs 01JKXYZ...) | head
+  <(fabro events 01JKXYZ...) | head
 ```
 
 If you need files on disk for offline analysis, `fabro dump` exports `events.jsonl` plus run-state projections.
@@ -95,7 +95,6 @@ Common categories include:
 | Routing | `edge.selected`, `loop.restart`, `parallel.started` |
 | Git and checkpoints | `checkpoint.completed`, `git.commit`, `git.push` |
 | Setup and sandbox | `sandbox.initializing`, `sandbox.ready`, `setup.started` |
-| Retro | `retro.started`, `retro.completed`, `retro.failed` |
 
 ## Sub-agent visibility
 
@@ -110,11 +109,11 @@ Lifecycle events such as `agent.sub.spawned` and `agent.sub.completed` are emitt
 
 ### API: Server-Sent Events
 
-When running workflows through the API server, subscribe to the [run events endpoint](/api-reference/runs/stream-run-events). Each SSE payload is a serialized run event envelope in the same shape used by `fabro logs` and `events.jsonl` exports.
+When running workflows through the API server, subscribe to the [run events endpoint](/api-reference/runs/stream-run-events). Each SSE payload is a serialized run event envelope in the same shape used by `fabro events` and `events.jsonl` exports.
 
 ### Web UI
 
-The web frontend consumes the SSE stream automatically and shows stage progress, tool calls, and human interaction as they happen.
+The web frontend consumes the SSE stream automatically and shows stage progress, tool calls, command output, and human interaction as they happen. Use the stage `Thread` and `Debug` views for per-stage activity, or the run-level `Run Events` page when you need the full event stream with search and category filters.
 
 <Frame caption="The Stages tab shows the full agent conversation including tool calls and responses.">
   <img src="/images/web/run-stages.png" alt="Fabro web UI run stages showing agent conversation with tool calls" />
@@ -130,8 +129,9 @@ Post-run analysis surfaces include:
 
 | Surface | Description |
 |---|---|
-| `fabro logs <RUN>` | Full event envelope stream as NDJSON |
+| `fabro events <RUN>` | Full event envelope stream as NDJSON |
+| `fabro logs <RUN>` | Raw per-run worker tracing log, when available |
 | `fabro inspect <RUN>` | Current durable run state, including run/start/checkpoint/conclusion records |
 | `fabro dump --output <DIR> <RUN>` | Exported `events.jsonl` plus reconstructed JSON and node files |
 
-See [retros](/execution/retros), [stages](/api-reference/run-internals/list-run-stages), and [turns](/api-reference/run-internals/list-stage-turns) for higher-level analysis views built on top of this event stream.
+See [stages](/api-reference/run-internals/list-run-stages) and [turns](/api-reference/run-internals/list-stage-turns) for higher-level analysis views built on top of this event stream.

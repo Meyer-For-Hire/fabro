@@ -1,24 +1,26 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use fabro_dump::RunDump;
 use fabro_hooks::{HookContext, HookEvent};
 use fabro_types::run_event::{MetadataSnapshotFailureKind, MetadataSnapshotPhase};
-use fabro_types::{BilledTokenCounts, EventBody, RunProjection};
+use fabro_types::{BilledTokenCounts, DiffSummary, EventBody, RunProjection};
 use fabro_util::error::collect_causes;
 use fabro_util::time::elapsed_ms;
 
-use super::types::{Concluded, FinalizeOptions, Retroed};
+use super::types::{Concluded, Executed, FinalizeOptions};
 use crate::error::Error;
-use crate::event::{Event, RunNoticeLevel};
+use crate::event::{Event, RunNoticeCode, RunNoticeLevel};
 use crate::outcome::{Outcome, OutcomeExt, StageOutcome};
 use crate::records::{Checkpoint, Conclusion, StageSummary};
 use crate::run_metadata::MetadataSnapshot;
 use crate::run_options::RunOptions;
 use crate::run_status::{FailureReason, RunStatus, SuccessReason};
 use crate::runtime_store::RunStoreHandle;
-use crate::sandbox_git::git_diff_with_timeout;
+use crate::sandbox_git::{git_diff_with_timeout, list_diff_numstat, summarize_diff_numstat};
 use crate::services::RunServices;
+use crate::{ProjectionBillingRollup, billing_rollup_from_projection};
 
 pub fn classify_engine_result(
     engine_result: &Result<Outcome, Error>,
@@ -68,22 +70,22 @@ pub(crate) async fn build_conclusion_from_store(
     run_duration_ms: u64,
     final_git_commit_sha: Option<String>,
 ) -> Conclusion {
-    let (state_result, events_result) = tokio::join!(run_store.state(), run_store.list_events());
-    let projection = state_result.ok();
+    let projection = run_store.state().await.ok();
     let projection_order = projection
         .as_ref()
         .map(stage_projection_order)
         .unwrap_or_default();
+    let projection_billing = projection
+        .as_ref()
+        .map(billing_rollup_from_projection)
+        .unwrap_or_default();
     let checkpoint = projection
         .as_ref()
-        .and_then(|state| state.checkpoint.as_ref());
-    let stage_durations = events_result
-        .map(|events| crate::extract_stage_durations_from_events(&events))
-        .unwrap_or_default();
+        .and_then(|state| state.current_checkpoint());
 
     build_conclusion_from_parts(
         checkpoint,
-        &stage_durations,
+        &projection_billing,
         &projection_order,
         status,
         failure_reason,
@@ -94,7 +96,7 @@ pub(crate) async fn build_conclusion_from_store(
 
 fn build_conclusion_from_parts(
     checkpoint: Option<&Checkpoint>,
-    stage_durations: &HashMap<String, u64>,
+    projection_billing: &ProjectionBillingRollup,
     projection_order: &HashMap<String, u32>,
     status: StageOutcome,
     failure_reason: Option<String>,
@@ -105,6 +107,11 @@ fn build_conclusion_from_parts(
     // while the other checkpoint maps are keyed by node_id. Dedupe to one row
     // per node so the stages table matches the deduped billing total.
     let (stages, total_retries) = if let Some(cp) = checkpoint {
+        let billing_by_node = projection_billing
+            .stages
+            .iter()
+            .map(|stage| (stage.node_id.as_str(), stage))
+            .collect::<HashMap<_, _>>();
         let mut stage_rows = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let mut retries_sum: u32 = 0;
@@ -130,7 +137,6 @@ fn build_conclusion_from_parts(
         }
 
         for (original_checkpoint_order, node_id) in stage_order {
-            let outcome = cp.node_outcomes.get(node_id);
             let retries = cp
                 .node_retries
                 .get(node_id)
@@ -138,14 +144,13 @@ fn build_conclusion_from_parts(
                 .unwrap_or(1)
                 .saturating_sub(1);
             retries_sum += retries;
+            let billing = billing_by_node.get(node_id);
 
             let summary = StageSummary {
                 stage_id: node_id.to_string(),
                 stage_label: node_id.to_string(),
-                duration_ms: stage_durations.get(node_id).copied().unwrap_or(0),
-                billing_usd_micros: outcome
-                    .and_then(|o| o.usage.as_ref())
-                    .and_then(|usage| usage.total_usd_micros),
+                duration_ms: billing.map_or(0, |stage| stage.duration_ms),
+                billing_usd_micros: billing.and_then(|stage| stage.billing.total_usd_micros),
                 retries,
             };
             stage_rows.push((
@@ -176,8 +181,9 @@ fn build_conclusion_from_parts(
         failure_reason,
         final_git_commit_sha,
         stages,
-        billing: checkpoint.and_then(billing_from_checkpoint),
+        billing: projection_billing.billing_if_present(),
         total_retries,
+        diff: fabro_types::RunDiff::default(),
     }
 }
 
@@ -235,7 +241,11 @@ pub async fn write_finalize_commit(
                 None,
                 None,
             );
-            emit_metadata_warning(services, "checkpoint_metadata_write_failed", message);
+            emit_metadata_warning(
+                services,
+                RunNoticeCode::CheckpointMetadataWriteFailed,
+                message,
+            );
             return;
         }
     };
@@ -256,7 +266,11 @@ pub async fn write_finalize_commit(
                 None,
                 None,
             );
-            emit_metadata_warning(services, "checkpoint_metadata_write_failed", message);
+            emit_metadata_warning(
+                services,
+                RunNoticeCode::CheckpointMetadataWriteFailed,
+                message,
+            );
             return;
         }
     };
@@ -277,7 +291,11 @@ pub async fn write_finalize_commit(
                     Some(snapshot.entry_count),
                     Some(snapshot.bytes),
                 );
-                emit_metadata_warning(services, "checkpoint_metadata_push_failed", message);
+                emit_metadata_warning(
+                    services,
+                    RunNoticeCode::CheckpointMetadataPushFailed,
+                    message,
+                );
             } else {
                 emit_metadata_snapshot_completed(services, phase, meta_branch, started, &snapshot);
             }
@@ -296,7 +314,11 @@ pub async fn write_finalize_commit(
                 None,
                 None,
             );
-            emit_metadata_warning(services, "checkpoint_metadata_write_failed", message);
+            emit_metadata_warning(
+                services,
+                RunNoticeCode::CheckpointMetadataWriteFailed,
+                message,
+            );
         }
     }
 }
@@ -359,7 +381,7 @@ fn emit_metadata_snapshot_failed(
     });
 }
 
-fn emit_metadata_warning(services: &RunServices, code: &str, message: String) {
+fn emit_metadata_warning(services: &RunServices, code: RunNoticeCode, message: String) {
     if services.metadata_runtime.mark_metadata_degraded() {
         services.emitter.notice(RunNoticeLevel::Warn, code, message);
     }
@@ -371,35 +393,47 @@ async fn compute_final_patch(
     run_options: &RunOptions,
     services: &RunServices,
     status: StageOutcome,
-) -> Option<String> {
-    let base_sha = run_options.git.as_ref().and_then(|g| g.base_sha.clone())?;
+) -> (Option<String>, Option<DiffSummary>) {
+    let Some(base_sha) = run_options.git.as_ref().and_then(|g| g.base_sha.clone()) else {
+        return (None, None);
+    };
     let timeout_ms = match status {
         StageOutcome::Succeeded | StageOutcome::PartiallySucceeded => 30_000,
         _ => 10_000,
     };
-    match git_diff_with_timeout(&*services.sandbox, &base_sha, timeout_ms).await {
+    let to_sha = "HEAD";
+    let (patch_result, numstat_result) = tokio::join!(
+        git_diff_with_timeout(&*services.sandbox, &base_sha, timeout_ms),
+        list_diff_numstat(&*services.sandbox, &base_sha, to_sha),
+    );
+    let final_patch = match patch_result {
         Ok(patch) if !patch.is_empty() => Some(patch),
         Ok(_) => None,
         Err(err) => {
             services.emitter.notice(
                 RunNoticeLevel::Warn,
-                "git_diff_failed",
+                RunNoticeCode::GitDiffFailed,
                 format!("final diff failed: {err}"),
             );
             None
         }
-    }
+    };
+    let diff_summary = match numstat_result {
+        Ok(numstat) => Some(summarize_diff_numstat(&numstat)),
+        Err(err) => {
+            services.emitter.notice(
+                RunNoticeLevel::Warn,
+                RunNoticeCode::GitDiffFailed,
+                format!("final diff stats failed: {err}"),
+            );
+            None
+        }
+    };
+    (final_patch, diff_summary)
 }
 
-/// Iterates `node_outcomes.values()` rather than `completed_nodes` to avoid
-/// over-counting the last visit's usage on looping workflows.
-pub(crate) fn billing_from_checkpoint(cp: &Checkpoint) -> Option<BilledTokenCounts> {
-    let usage: Vec<_> = cp
-        .node_outcomes
-        .values()
-        .filter_map(|o| o.usage.clone())
-        .collect();
-    (!usage.is_empty()).then(|| BilledTokenCounts::from_billed_usage(&usage))
+pub(crate) fn billing_from_projection(projection: &RunProjection) -> Option<BilledTokenCounts> {
+    billing_rollup_from_projection(projection).billing_if_present()
 }
 
 pub(crate) fn build_terminal_event(
@@ -408,6 +442,7 @@ pub(crate) fn build_terminal_event(
     artifact_count: usize,
     final_git_commit_sha: Option<String>,
     final_patch: Option<String>,
+    diff_summary: Option<DiffSummary>,
     billing: Option<BilledTokenCounts>,
 ) -> Event {
     if matches!(outcome, Err(Error::Cancelled)) {
@@ -417,6 +452,7 @@ pub(crate) fn build_terminal_event(
             reason: FailureReason::Cancelled,
             git_commit_sha: final_git_commit_sha,
             final_patch,
+            diff_summary,
         };
     }
 
@@ -442,6 +478,7 @@ pub(crate) fn build_terminal_event(
             total_usd_micros,
             final_git_commit_sha,
             final_patch,
+            diff_summary,
             billing,
         };
     }
@@ -460,14 +497,15 @@ pub(crate) fn build_terminal_event(
         reason: FailureReason::WorkflowError,
         git_commit_sha: final_git_commit_sha,
         final_patch,
+        diff_summary,
     }
 }
 
-async fn cleanup_sandbox(
+async fn stop_sandbox_on_terminal(
     services: &RunServices,
     run_id: &fabro_types::RunId,
     workflow_name: &str,
-    preserve: bool,
+    stop_on_terminal: bool,
 ) -> fabro_sandbox::Result<()> {
     let hook_ctx = HookContext::new(
         HookEvent::SandboxCleanup,
@@ -475,8 +513,8 @@ async fn cleanup_sandbox(
         workflow_name.to_string(),
     );
     let _ = services.run_hooks(&hook_ctx).await;
-    if !preserve {
-        services.sandbox.cleanup().await?;
+    if stop_on_terminal {
+        services.sandbox.stop().await?;
     }
     Ok(())
 }
@@ -490,20 +528,21 @@ async fn cleanup_sandbox(
 /// # Errors
 ///
 /// Returns `Error` if persisting terminal state fails.
-pub async fn finalize(retroed: Retroed, options: &FinalizeOptions) -> Result<Concluded, Error> {
-    let Retroed {
+pub async fn finalize(executed: Executed, options: &FinalizeOptions) -> Result<Concluded, Error> {
+    let Executed {
         graph,
         outcome,
         run_options,
         duration_ms,
-        services,
-        retro: _,
-    } = retroed;
+        final_context: _,
+        engine,
+        model: _,
+    } = executed;
+    let services = Arc::clone(&engine.run);
 
     let (final_status, failure_reason, _run_status) = classify_engine_result(&outcome);
 
     let events = services.run_store.list_events().await.unwrap_or_default();
-    let stage_durations = crate::extract_stage_durations_from_events(&events);
     let artifact_count = events
         .iter()
         .filter(|envelope| matches!(envelope.event.body, EventBody::ArtifactCaptured(_)))
@@ -513,12 +552,16 @@ pub async fn finalize(retroed: Retroed, options: &FinalizeOptions) -> Result<Con
         .as_ref()
         .map(stage_projection_order)
         .unwrap_or_default();
+    let projection_billing = projection
+        .as_ref()
+        .map(billing_rollup_from_projection)
+        .unwrap_or_default();
     let checkpoint = projection
         .as_ref()
-        .and_then(|state| state.checkpoint.as_ref());
+        .and_then(|state| state.current_checkpoint());
     let conclusion = build_conclusion_from_parts(
         checkpoint,
-        &stage_durations,
+        &projection_billing,
         &projection_order,
         final_status,
         failure_reason,
@@ -526,7 +569,7 @@ pub async fn finalize(retroed: Retroed, options: &FinalizeOptions) -> Result<Con
         options.last_git_sha.clone(),
     );
 
-    let (final_patch, ()) = tokio::join!(
+    let ((final_patch, diff_summary), ()) = tokio::join!(
         compute_final_patch(&run_options, &services, final_status),
         write_finalize_commit(&run_options, &services, &conclusion),
     );
@@ -534,7 +577,7 @@ pub async fn finalize(retroed: Retroed, options: &FinalizeOptions) -> Result<Con
     if services.metadata_runtime.metadata_degraded() {
         services.emitter.notice(
             RunNoticeLevel::Warn,
-            "checkpoint_metadata_degraded",
+            RunNoticeCode::CheckpointMetadataDegraded,
             "checkpoint metadata archive writes were degraded for this run".to_string(),
         );
     }
@@ -545,6 +588,7 @@ pub async fn finalize(retroed: Retroed, options: &FinalizeOptions) -> Result<Con
         artifact_count,
         options.last_git_sha.clone(),
         final_patch,
+        diff_summary,
         conclusion.billing.clone(),
     );
     services.emitter.emit(&terminal_event);
@@ -556,24 +600,26 @@ pub async fn finalize(retroed: Retroed, options: &FinalizeOptions) -> Result<Con
         } else {
             format!("sandbox preserved: {info}")
         };
-        services
-            .emitter
-            .notice(RunNoticeLevel::Info, "sandbox_preserved", message);
+        services.emitter.notice(
+            RunNoticeLevel::Info,
+            RunNoticeCode::SandboxPreserved,
+            message,
+        );
     }
-    if let Err(e) = cleanup_sandbox(
+    if let Err(e) = stop_sandbox_on_terminal(
         &services,
         &options.run_id,
         &options.workflow_name,
-        options.preserve_sandbox,
+        options.stop_on_terminal,
     )
     .await
     {
-        tracing::warn!(error = %fabro_sandbox::display_for_log(&e), "Sandbox cleanup failed");
+        tracing::warn!(error = %fabro_sandbox::display_for_log(&e), "Sandbox stop failed");
         let exec_output_tail = fabro_sandbox::default_redacted_output_tail(&e);
         services.emitter.notice_with_tail(
             RunNoticeLevel::Warn,
-            "sandbox_cleanup_failed",
-            format!("sandbox cleanup failed: {}", e.display_with_causes()),
+            RunNoticeCode::SandboxCleanupFailed,
+            format!("sandbox stop failed: {}", e.display_with_causes()),
             exec_output_tail,
         );
     }
@@ -598,20 +644,23 @@ mod tests {
     use async_trait::async_trait;
     use bytes::Bytes;
     use fabro_graphviz::graph::Graph;
+    use fabro_sandbox::test_support::MockSandbox;
     use fabro_store::{Database, EventEnvelope, RunDatabase, RunProjection};
     use fabro_types::run_event::{MetadataSnapshotFailureKind, MetadataSnapshotPhase};
     use fabro_types::{
-        EventBody, RunBlobId, RunEvent, RunId, WorkflowSettings, first_event_seq, fixtures,
+        BilledModelUsage, BilledTokenCounts, EventBody, RunBlobId, RunEvent, RunId, RunSpec,
+        StageCompletion, WorkflowSettings, first_event_seq, fixtures,
     };
     use object_store::memory::InMemory;
 
     use super::*;
+    use crate::context::Context;
     use crate::event::{Emitter, StoreProgressLogger, append_event};
-    use crate::pipeline::types::Retroed;
     use crate::run_metadata::{RunMetadataRuntime, RunMetadataWriterHandle};
     use crate::run_options::{GitCheckpointOptions, RunOptions};
     use crate::runtime_store::{RunStoreBackend, RunStoreHandle};
     use crate::sandbox_git_runtime::SandboxGitRuntime;
+    use crate::services::EngineServices;
 
     fn test_run_id() -> RunId {
         fixtures::RUN_1
@@ -621,7 +670,7 @@ mod tests {
         RunOptions {
             settings:         WorkflowSettings::default(),
             run_dir:          run_dir.to_path_buf(),
-            cancel_token:     None,
+            cancel_token:     tokio_util::sync::CancellationToken::new(),
             run_id:           test_run_id(),
             labels:           HashMap::new(),
             workflow_slug:    None,
@@ -644,6 +693,26 @@ mod tests {
         options
     }
 
+    fn test_executed(
+        graph: Graph,
+        outcome: Result<Outcome, Error>,
+        run_options: RunOptions,
+        duration_ms: u64,
+        services: Arc<RunServices>,
+    ) -> Executed {
+        let mut engine = EngineServices::test_default();
+        engine.run = services;
+        Executed {
+            graph,
+            outcome,
+            run_options,
+            duration_ms,
+            final_context: Context::new(),
+            engine: Arc::new(engine),
+            model: "test-model".to_string(),
+        }
+    }
+
     fn test_store() -> Arc<Database> {
         Arc::new(Database::new(
             Arc::new(InMemory::new()),
@@ -657,6 +726,7 @@ mod tests {
         let run_store = test_store().create_run(&test_run_id()).await.unwrap();
         append_event(&run_store, &test_run_id(), &Event::RunCreated {
             run_id:           test_run_id(),
+            title:            None,
             settings:         serde_json::to_value(WorkflowSettings::default()).unwrap(),
             graph:            serde_json::to_value(fabro_types::Graph::new("metadata")).unwrap(),
             workflow_source:  None,
@@ -670,7 +740,6 @@ mod tests {
             manifest_blob:    None,
             git:              None,
             fork_source_ref:  None,
-            in_place:         false,
             web_url:          None,
         })
         .await
@@ -705,6 +774,39 @@ mod tests {
         assert!(commit.status.success());
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "metadata event tests use synchronous git commands to set up temporary repositories"
+    )]
+    fn git_commit_all(repo: &Path, msg: &str) -> String {
+        let add = std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(add.status.success());
+        let commit = std::process::Command::new("git")
+            .args(["commit", "-m", msg])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(
+            commit.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&commit.stderr)
+        );
+        let rev_parse = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(rev_parse.status.success());
+        String::from_utf8(rev_parse.stdout)
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
     fn record_events(emitter: &Arc<Emitter>) -> Arc<std::sync::Mutex<Vec<RunEvent>>> {
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured = Arc::clone(&events);
@@ -737,9 +839,52 @@ mod tests {
         }
     }
 
+    fn test_projection() -> RunProjection {
+        RunProjection::new(
+            "Test run".to_string(),
+            RunSpec {
+                run_id:           test_run_id(),
+                settings:         WorkflowSettings::default(),
+                graph:            Graph::new("test"),
+                graph_source:     None,
+                workflow_slug:    None,
+                source_directory: None,
+                labels:           HashMap::new(),
+                provenance:       None,
+                manifest_blob:    None,
+                definition_blob:  None,
+                git:              None,
+                fork_source_ref:  None,
+            },
+            chrono::Utc::now(),
+        )
+    }
+
+    fn test_usage(model_id: &str, input_tokens: i64, output_tokens: i64) -> BilledModelUsage {
+        serde_json::from_value(serde_json::json!({
+            "input": {
+                "usage": {
+                    "model": {
+                        "provider": "openai",
+                        "model_id": model_id
+                    },
+                    "tokens": {
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens
+                    }
+                },
+                "facts": {
+                    "provider": "open_ai"
+                }
+            },
+            "total_usd_micros": input_tokens + output_tokens
+        }))
+        .unwrap()
+    }
+
     #[test]
     fn conclusion_stage_order_follows_projection_first_event_order() {
-        let mut projection = RunProjection::default();
+        let mut projection = test_projection();
         projection.stage_entry("zebra", 1, first_event_seq(1));
         projection.stage_entry("apple", 1, first_event_seq(2));
         let projection_order = stage_projection_order(&projection);
@@ -753,7 +898,7 @@ mod tests {
 
         let conclusion = build_conclusion_from_parts(
             Some(&checkpoint),
-            &HashMap::new(),
+            &ProjectionBillingRollup::default(),
             &projection_order,
             StageOutcome::Succeeded,
             None,
@@ -771,7 +916,7 @@ mod tests {
 
     #[test]
     fn conclusion_includes_skipped_stage_from_projection_checkpoint_fallback() {
-        let mut projection = RunProjection::default();
+        let mut projection = test_projection();
         projection.stage_entry("skipped", 1, first_event_seq(4));
         projection.stage_entry("finished", 1, first_event_seq(5));
         let projection_order = stage_projection_order(&projection);
@@ -788,7 +933,7 @@ mod tests {
 
         let conclusion = build_conclusion_from_parts(
             Some(&checkpoint),
-            &HashMap::new(),
+            &ProjectionBillingRollup::default(),
             &projection_order,
             StageOutcome::Succeeded,
             None,
@@ -804,6 +949,69 @@ mod tests {
         assert_eq!(stage_ids, vec!["skipped", "finished"]);
     }
 
+    #[test]
+    fn conclusion_billing_sums_retry_visit_usage_from_projection() {
+        let mut projection = test_projection();
+        let failed_usage = test_usage("gpt-old", 100, 10);
+        let success_usage = test_usage("gpt-new", 200, 20);
+        let failed = projection.stage_entry("verify", 1, first_event_seq(1));
+        failed.duration_ms = Some(1200);
+        failed.usage = BilledTokenCounts::from_billed_usage(std::slice::from_ref(&failed_usage));
+        failed.model = Some(failed_usage.model().clone());
+        failed.completion = Some(StageCompletion {
+            outcome:        StageOutcome::Failed {
+                retry_requested: true,
+            },
+            notes:          None,
+            failure_reason: Some("try again".to_string()),
+            timestamp:      chrono::Utc::now(),
+        });
+        let succeeded = projection.stage_entry("verify", 2, first_event_seq(2));
+        succeeded.duration_ms = Some(800);
+        succeeded.usage =
+            BilledTokenCounts::from_billed_usage(std::slice::from_ref(&success_usage));
+        succeeded.model = Some(success_usage.model().clone());
+        succeeded.completion = Some(StageCompletion {
+            outcome:        StageOutcome::Succeeded,
+            notes:          None,
+            failure_reason: None,
+            timestamp:      chrono::Utc::now(),
+        });
+
+        let projection_order = stage_projection_order(&projection);
+        let projection_billing = billing_rollup_from_projection(&projection);
+        let mut latest_outcome = Outcome::success();
+        latest_outcome.usage = Some(success_usage);
+        latest_outcome.duration_ms = Some(800);
+        let mut checkpoint = checkpoint_with(
+            vec!["verify", "verify"],
+            HashMap::from([("verify".to_string(), latest_outcome)]),
+        );
+        checkpoint.node_retries.insert("verify".to_string(), 2);
+
+        let conclusion = build_conclusion_from_parts(
+            Some(&checkpoint),
+            &projection_billing,
+            &projection_order,
+            StageOutcome::Succeeded,
+            None,
+            10,
+            None,
+        );
+
+        assert_eq!(conclusion.billing.as_ref().unwrap().input_tokens, 300);
+        assert_eq!(conclusion.billing.as_ref().unwrap().output_tokens, 30);
+        assert_eq!(
+            conclusion.billing.as_ref().unwrap().total_usd_micros,
+            Some(330)
+        );
+        assert_eq!(conclusion.stages.len(), 1);
+        assert_eq!(conclusion.stages[0].stage_id, "verify");
+        assert_eq!(conclusion.stages[0].duration_ms, 2000);
+        assert_eq!(conclusion.stages[0].billing_usd_micros, Some(330));
+        assert_eq!(conclusion.stages[0].retries, 1);
+    }
+
     fn test_services(
         run_store: RunStoreHandle,
         emitter: Arc<Emitter>,
@@ -816,7 +1024,7 @@ mod tests {
             emitter,
             sandbox,
             None,
-            None,
+            tokio_util::sync::CancellationToken::new(),
             fabro_model::Provider::Anthropic,
             Arc::new(fabro_auth::EnvCredentialSource::new()),
             Arc::new(SandboxGitRuntime::new()),
@@ -842,27 +1050,27 @@ mod tests {
                 std::env::current_dir().unwrap(),
             )),
             None,
-            None,
+            tokio_util::sync::CancellationToken::new(),
             fabro_model::Provider::Anthropic,
             Arc::new(fabro_auth::EnvCredentialSource::new()),
             Arc::new(SandboxGitRuntime::new()),
             Arc::new(RunMetadataRuntime::new()),
             None,
         );
-        let retroed = Retroed {
-            graph: Graph::new("test"),
-            outcome: Ok(Outcome::success()),
-            run_options: test_run_options(&run_dir),
-            duration_ms: 5,
+        let executed = test_executed(
+            Graph::new("test"),
+            Ok(Outcome::success()),
+            test_run_options(&run_dir),
+            5,
             services,
-            retro: None,
-        };
+        );
 
-        let concluded = finalize(retroed, &FinalizeOptions {
+        let concluded = finalize(executed, &FinalizeOptions {
             run_dir:          run_dir.clone(),
             run_id:           test_run_id(),
             workflow_name:    "test".to_string(),
             preserve_sandbox: true,
+            stop_on_terminal: true,
             last_git_sha:     None,
         })
         .await
@@ -888,6 +1096,7 @@ mod tests {
             stages:               Vec::new(),
             billing:              None,
             total_retries:        0,
+            diff:                 fabro_types::RunDiff::default(),
         };
         let emitter = Arc::new(Emitter::new(test_run_id()));
         let events = record_events(&emitter);
@@ -950,6 +1159,7 @@ mod tests {
             stages:               Vec::new(),
             billing:              None,
             total_retries:        0,
+            diff:                 fabro_types::RunDiff::default(),
         };
 
         write_finalize_commit(&run_options, &services, &conclusion).await;
@@ -1001,6 +1211,7 @@ mod tests {
             stages:               Vec::new(),
             billing:              None,
             total_retries:        0,
+            diff:                 fabro_types::RunDiff::default(),
         };
 
         write_finalize_commit(&run_options, &services, &conclusion).await;
@@ -1027,20 +1238,20 @@ mod tests {
                 "fabro/metadata/run",
             )),
         );
-        let retroed = Retroed {
-            graph: Graph::new("test"),
-            outcome: Ok(Outcome::success()),
-            run_options: test_git_run_options(repo_dir.path(), "fabro/metadata/run"),
-            duration_ms: 5,
+        let executed = test_executed(
+            Graph::new("test"),
+            Ok(Outcome::success()),
+            test_git_run_options(repo_dir.path(), "fabro/metadata/run"),
+            5,
             services,
-            retro: None,
-        };
+        );
 
-        finalize(retroed, &FinalizeOptions {
+        finalize(executed, &FinalizeOptions {
             run_dir:          repo_dir.path().to_path_buf(),
             run_id:           test_run_id(),
             workflow_name:    "test".to_string(),
             preserve_sandbox: false,
+            stop_on_terminal: true,
             last_git_sha:     None,
         })
         .await
@@ -1057,6 +1268,139 @@ mod tests {
             "metadata.snapshot.completed",
             "run.completed",
         ]);
+    }
+
+    #[tokio::test]
+    async fn finalize_stops_sandbox_on_terminal_without_deleting() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let sandbox = Arc::new(MockSandbox::linux());
+        let services = test_services(
+            RunStoreHandle::local(seeded_run_store().await),
+            Arc::new(Emitter::new(test_run_id())),
+            sandbox.clone(),
+            Arc::new(RunMetadataRuntime::new()),
+            None,
+        );
+        let executed = test_executed(
+            Graph::new("test"),
+            Ok(Outcome::success()),
+            test_run_options(repo_dir.path()),
+            5,
+            services,
+        );
+
+        finalize(executed, &FinalizeOptions {
+            run_dir:          repo_dir.path().to_path_buf(),
+            run_id:           test_run_id(),
+            workflow_name:    "test".to_string(),
+            preserve_sandbox: false,
+            stop_on_terminal: true,
+            last_git_sha:     None,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(sandbox.stop_count(), 1);
+        assert_eq!(sandbox.delete_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn finalize_leaves_sandbox_running_when_stop_on_terminal_is_false() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let sandbox = Arc::new(MockSandbox::linux());
+        let services = test_services(
+            RunStoreHandle::local(seeded_run_store().await),
+            Arc::new(Emitter::new(test_run_id())),
+            sandbox.clone(),
+            Arc::new(RunMetadataRuntime::new()),
+            None,
+        );
+        let executed = test_executed(
+            Graph::new("test"),
+            Ok(Outcome::success()),
+            test_run_options(repo_dir.path()),
+            5,
+            services,
+        );
+
+        finalize(executed, &FinalizeOptions {
+            run_dir:          repo_dir.path().to_path_buf(),
+            run_id:           test_run_id(),
+            workflow_name:    "test".to_string(),
+            preserve_sandbox: false,
+            stop_on_terminal: false,
+            last_git_sha:     None,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(sandbox.stop_count(), 0);
+        assert_eq!(sandbox.delete_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn finalize_terminal_event_includes_diff_summary() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo = repo_dir.path();
+        init_git_repo(repo);
+        tokio::fs::write(repo.join("notes.txt"), "one\n")
+            .await
+            .unwrap();
+        let base = git_commit_all(repo, "base");
+        tokio::fs::write(repo.join("notes.txt"), "one\ntwo\nthree\n")
+            .await
+            .unwrap();
+        let head = git_commit_all(repo, "head");
+
+        let run_store = seeded_run_store().await;
+        let emitter = Arc::new(Emitter::new(test_run_id()));
+        let events = record_events(&emitter);
+        let services = test_services(
+            RunStoreHandle::local(run_store),
+            Arc::clone(&emitter),
+            Arc::new(fabro_agent::LocalSandbox::new(repo.to_path_buf())),
+            Arc::new(RunMetadataRuntime::new()),
+            None,
+        );
+        let mut run_options = test_git_run_options(repo, "fabro/metadata/run");
+        run_options.git = Some(GitCheckpointOptions {
+            base_sha:    Some(base),
+            run_branch:  None,
+            meta_branch: None,
+        });
+        let executed = test_executed(
+            Graph::new("test"),
+            Ok(Outcome::success()),
+            run_options,
+            5,
+            services,
+        );
+
+        finalize(executed, &FinalizeOptions {
+            run_dir:          repo.to_path_buf(),
+            run_id:           test_run_id(),
+            workflow_name:    "test".to_string(),
+            preserve_sandbox: true,
+            stop_on_terminal: true,
+            last_git_sha:     Some(head),
+        })
+        .await
+        .unwrap();
+
+        let events = events.lock().unwrap();
+        let run_completed = events
+            .iter()
+            .find(|event| event.event_name() == "run.completed")
+            .expect("run.completed event");
+        let properties = run_completed.properties().unwrap();
+        assert_eq!(
+            properties["diff_summary"],
+            serde_json::json!({
+                "files_changed": 1,
+                "additions": 2,
+                "deletions": 0
+            })
+        );
     }
 
     struct FailingStateStore;

@@ -3,8 +3,7 @@
     reason = "sync CLI run-progress renderer: writes to std::io::stderr directly"
 )]
 
-use fabro_types::RunEvent;
-use fabro_types::run_event::is_metadata_snapshot_compat_notice_code;
+use fabro_types::{RunEvent, RunNoticeCode};
 
 mod event;
 mod info_display;
@@ -421,15 +420,6 @@ impl ProgressUI {
             ProgressEvent::LoopRestart { from_node, to_node } => {
                 self.info.on_loop_restart(renderer, &from_node, &to_node);
             }
-            ProgressEvent::RetroStarted => {
-                self.stage.on_retro_started(renderer);
-            }
-            ProgressEvent::RetroCompleted { duration_ms } => {
-                self.stage.on_retro_completed(renderer, duration_ms);
-            }
-            ProgressEvent::RetroFailed { duration_ms } => {
-                self.stage.on_retro_failed(renderer, duration_ms);
-            }
             ProgressEvent::MetadataSnapshotFailed {
                 phase,
                 failure_kind,
@@ -444,7 +434,10 @@ impl ProgressUI {
                 message,
             } => {
                 if self.saw_metadata_snapshot_failure
-                    && is_metadata_snapshot_compat_notice_code(&code)
+                    && code
+                        .parse::<RunNoticeCode>()
+                        .ok()
+                        .is_some_and(RunNoticeCode::is_metadata_snapshot_compat)
                 {
                     return;
                 }
@@ -478,9 +471,10 @@ mod tests {
     use chrono::{DateTime, Utc};
     use fabro_agent::{AgentEvent, SandboxEvent};
     use fabro_llm::types::TokenCounts;
-    use fabro_model::Provider;
+    use fabro_model::{ModelRef, Provider};
     use fabro_types::{
-        MetadataSnapshotFailureKind, MetadataSnapshotPhase, ParallelBranchId, StageId, fixtures,
+        MetadataSnapshotFailureKind, MetadataSnapshotPhase, ParallelBranchId, SandboxProvider,
+        StageId, fixtures,
     };
     use fabro_workflow::event::{Event, RunNoticeLevel, to_run_event, to_run_event_at};
     use fabro_workflow::outcome::billed_model_usage_from_llm;
@@ -557,7 +551,11 @@ mod tests {
     fn assistant_message(stage: &str, model: &str) -> Event {
         agent_event(stage, AgentEvent::AssistantMessage {
             text:            "done".into(),
-            model:           model.into(),
+            model:           ModelRef {
+                provider: Provider::OpenAi,
+                model_id: model.into(),
+                speed:    None,
+            },
             usage:           TokenCounts::default(),
             tool_call_count: 0,
         })
@@ -712,8 +710,8 @@ mod tests {
             stage_started("code", "Code"),
             Event::SandboxInitialized {
                 working_directory: "/home/daytona/workspace".into(),
-                provider:          "daytona".into(),
-                identifier:        None,
+                provider:          SandboxProvider::Daytona,
+                id:                "daytona:sandbox-id".into(),
                 repo_cloned:       None,
                 clone_origin_url:  None,
                 clone_branch:      None,
@@ -1087,8 +1085,8 @@ mod tests {
         emit(&mut ui, stage_started("code", "Code"));
         emit(&mut ui, Event::SandboxInitialized {
             working_directory: "/home/daytona/workspace".into(),
-            provider:          "daytona".into(),
-            identifier:        None,
+            provider:          SandboxProvider::Daytona,
+            id:                "daytona:sandbox-id".into(),
             repo_cloned:       None,
             clone_origin_url:  None,
             clone_branch:      None,
@@ -1208,7 +1206,7 @@ mod tests {
 
         emit(&mut ui, Event::RunNotice {
             level:            RunNoticeLevel::Warn,
-            code:             "sandbox_cleanup_failed".into(),
+            code:             RunNoticeCode::SandboxCleanupFailed.to_string(),
             message:          "sandbox cleanup failed".into(),
             exec_output_tail: None,
         });
@@ -1279,13 +1277,13 @@ mod tests {
         });
         emit(&mut ui, Event::RunNotice {
             level:            RunNoticeLevel::Warn,
-            code:             "checkpoint_metadata_write_failed".into(),
+            code:             RunNoticeCode::CheckpointMetadataWriteFailed.to_string(),
             message:          "legacy metadata warning".into(),
             exec_output_tail: None,
         });
         emit(&mut ui, Event::RunNotice {
             level:            RunNoticeLevel::Warn,
-            code:             "checkpoint_metadata_degraded".into(),
+            code:             RunNoticeCode::CheckpointMetadataDegraded.to_string(),
             message:          "metadata snapshots are disabled for this run".into(),
             exec_output_tail: None,
         });

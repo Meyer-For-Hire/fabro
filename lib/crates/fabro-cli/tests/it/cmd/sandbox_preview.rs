@@ -2,29 +2,20 @@ use fabro_test::{fabro_snapshot, test_context};
 use httpmock::MockServer;
 use serde_json::{Value, json};
 
-use super::support::setup_local_sandbox_run;
+use super::support::{remote_run_summary_json, setup_local_sandbox_run};
 use crate::support::unique_run_id;
 
 fn remote_run_summary(run_id: &str) -> serde_json::Value {
-    json!({
-        "run_id": run_id,
-        "workflow_name": "Preview Test",
-        "workflow_slug": "preview-test",
-        "goal": "Preview test",
-        "title": "Preview test",
-        "labels": {},
-        "source_directory": "/srv/repo",
-        "repository": { "name": "repo" },
-        "start_time": "2026-04-19T12:00:00Z",
-        "created_at": "2026-04-19T12:00:00Z",
-        "status": {
+    remote_run_summary_json(
+        run_id,
+        "Preview Test",
+        "preview-test",
+        "Preview test",
+        &json!({
             "kind": "running"
-        },
-        "pending_control": null,
-        "duration_ms": null,
-        "elapsed_secs": null,
-        "total_usd_micros": null
-    })
+        }),
+        "2026-04-19T12:00:00Z",
+    )
 }
 
 #[test]

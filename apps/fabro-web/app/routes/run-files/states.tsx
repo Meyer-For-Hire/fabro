@@ -96,7 +96,7 @@ export function FileTreeSidebarSkeleton() {
   return (
     <div
       aria-hidden="true"
-      className="sticky top-4 h-[calc(100vh-6rem)] w-72 shrink-0 self-start rounded-md border border-line bg-panel/40 motion-safe:animate-pulse"
+      className="flex min-h-0 w-72 shrink-0 flex-col self-stretch rounded-md border border-line bg-panel/40 motion-safe:animate-pulse"
     />
   );
 }
@@ -107,17 +107,17 @@ export function LoadingSkeleton({
   reserveSidebar?: boolean;
 } = {}) {
   const diffSkeleton = (
-    <div className="flex min-w-0 flex-1 flex-col gap-3">
+    <div className="flex min-w-0 min-h-0 flex-1 flex-col gap-3">
       <div className="h-32 rounded-md bg-panel/60 motion-safe:animate-pulse" />
       <div className="h-32 rounded-md bg-panel/60 motion-safe:animate-pulse" />
     </div>
   );
 
   return (
-    <div className="flex flex-col gap-3" aria-label="Loading files">
-      <div className="h-8 rounded-md bg-panel/60 motion-safe:animate-pulse" />
+    <div className="flex h-full min-h-0 flex-col gap-3" aria-label="Loading files">
+      <div className="h-8 shrink-0 rounded-md bg-panel/60 motion-safe:animate-pulse" />
       {reserveSidebar ? (
-        <div className="flex gap-4">
+        <div className="flex min-h-0 flex-1 gap-4">
           <FileTreeSidebarSkeleton />
           {diffSkeleton}
         </div>

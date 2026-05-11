@@ -65,7 +65,7 @@ async fn run_bulk(action: Action, identifiers: &[String], ctx: &CommandContext) 
             }
         };
 
-        let run_id = run.run_id;
+        let run_id = run.id;
         let result = match action {
             Action::Archive => client.archive_run(&run_id).await,
             Action::Unarchive => client.unarchive_run(&run_id).await,

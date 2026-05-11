@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
 
 use fabro_auth::CredentialSource;
@@ -13,8 +13,10 @@ use fabro_llm::types::{
 use fabro_llm::{Error as LlmError, retry};
 use fabro_mcp::config::{McpServerSettings, McpTransport};
 use fabro_mcp::connection_manager::McpConnectionManager;
+use fabro_model::{ModelRef, Provider, Speed};
+use fabro_types::Principal;
 use futures::StreamExt;
-use tokio::sync::{Mutex as AsyncMutex, broadcast};
+use tokio::sync::{Mutex as AsyncMutex, Notify, broadcast};
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -38,26 +40,231 @@ use crate::subagent::{SubAgentCallbackEvent, SubAgentEventCallback, SubAgentMana
 use crate::tool_execution::execute_tool_calls;
 use crate::types::{AgentEvent, SessionEvent, SessionState, Turn};
 
+/// One queued steering message: text + the principal that authored it (None
+/// for direct internal callers like loop-detection).
+pub type SteeringItem = (String, Option<Principal>);
+
+#[derive(Default)]
+struct ControlState {
+    queue:             VecDeque<SteeringItem>,
+    waiting_for_steer: bool,
+}
+
+/// Trait that lets the workflow layer keep an agent in `process_input` when a
+/// natural completion (no tool calls) coincides with an unconsumed steering
+/// message. The implementation must coordinate with the steering source so
+/// that, once it returns `false`, no further steers can race into the queue
+/// for this session.
+pub trait CompletionCoordinator: Send + Sync {
+    /// Called inside the agent loop when the assistant finishes a turn with
+    /// no tool calls. Return `true` to continue (the session will iterate
+    /// once more and drain pending steering messages); `false` to break out
+    /// of the loop normally.
+    fn on_natural_completion(&self) -> bool;
+}
+
+/// Cheap clone of the parts of a `Session` that an external coordinator
+/// (e.g. the workflow `SteeringHub`) needs to deliver steering messages and
+/// interrupt the current round without holding the session itself.
+#[derive(Clone)]
+pub struct SessionControlHandle {
+    control:     Arc<Mutex<ControlState>>,
+    round_token: Arc<RwLock<CancellationToken>>,
+    notify:      Arc<Notify>,
+}
+
+impl Default for SessionControlHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SessionControlHandle {
+    /// Build an unattached handle for testing or direct construction by
+    /// callers that want to wire a queue into something other than a live
+    /// `Session`. Both pieces are independent `Arc` values; cloning the
+    /// handle clones the `Arc`s.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            control:     Arc::new(Mutex::new(ControlState::default())),
+            round_token: Arc::new(RwLock::new(CancellationToken::new())),
+            notify:      Arc::new(Notify::new()),
+        }
+    }
+
+    /// Push a steering message onto the queue and wake a session waiting
+    /// after a pure interrupt.
+    pub fn steer(&self, text: String, actor: Option<Principal>) {
+        self.enqueue((text, actor));
+    }
+
+    /// Cancel the current round and, if no steering text is queued, park the
+    /// session at a steerable wait point.
+    pub fn interrupt(&self, _actor: Option<Principal>) {
+        {
+            let mut control = self.control.lock().expect("control state lock poisoned");
+            if control.queue.is_empty() {
+                control.waiting_for_steer = true;
+            }
+        }
+        self.cancel_round();
+        self.notify.notify_waiters();
+    }
+
+    /// Atomically apply interrupt semantics, then enqueue steering text.
+    pub fn interrupt_then_steer(&self, text: String, actor: Option<Principal>) {
+        self.interrupt_then_enqueue((text, actor));
+    }
+
+    /// Direct enqueue used by callers such as the hub flushing buffered
+    /// steers.
+    pub fn enqueue(&self, item: SteeringItem) {
+        {
+            let mut control = self.control.lock().expect("control state lock poisoned");
+            control.waiting_for_steer = false;
+            control.queue.push_back(item);
+        }
+        self.notify.notify_waiters();
+    }
+
+    /// Push `item` while enforcing a FIFO cap: if the queue is at or above
+    /// `cap`, the oldest entry is evicted and returned. Atomic under a
+    /// single lock acquisition.
+    #[must_use]
+    pub fn enqueue_bounded(&self, item: SteeringItem, cap: usize) -> Option<SteeringItem> {
+        let evicted = {
+            let mut control = self.control.lock().expect("control state lock poisoned");
+            let evicted = if control.queue.len() >= cap {
+                control.queue.pop_front()
+            } else {
+                None
+            };
+            control.queue.push_back(item);
+            control.waiting_for_steer = false;
+            evicted
+        };
+        self.notify.notify_waiters();
+        evicted
+    }
+
+    /// Interrupt the current round and push `item` while enforcing a FIFO cap.
+    #[must_use]
+    pub fn interrupt_then_enqueue_bounded(
+        &self,
+        item: SteeringItem,
+        cap: usize,
+    ) -> Option<SteeringItem> {
+        let evicted = {
+            let mut control = self.control.lock().expect("control state lock poisoned");
+            let evicted = if control.queue.len() >= cap {
+                control.queue.pop_front()
+            } else {
+                None
+            };
+            control.waiting_for_steer = true;
+            control.queue.push_back(item);
+            control.waiting_for_steer = false;
+            evicted
+        };
+        self.cancel_round();
+        self.notify.notify_waiters();
+        evicted
+    }
+
+    fn interrupt_then_enqueue(&self, item: SteeringItem) {
+        {
+            let mut control = self.control.lock().expect("control state lock poisoned");
+            control.waiting_for_steer = true;
+            control.queue.push_back(item);
+            control.waiting_for_steer = false;
+        }
+        self.cancel_round();
+        self.notify.notify_waiters();
+    }
+
+    fn cancel_round(&self) {
+        self.round_token
+            .read()
+            .expect("round token lock poisoned")
+            .cancel();
+    }
+
+    /// Whether the steering queue currently has no unconsumed messages.
+    #[must_use]
+    pub fn queue_is_empty(&self) -> bool {
+        self.control
+            .lock()
+            .expect("control state lock poisoned")
+            .queue
+            .is_empty()
+    }
+
+    /// Whether queue work or an interrupt-induced wait is still pending.
+    #[must_use]
+    pub fn has_pending_control_work(&self) -> bool {
+        let control = self.control.lock().expect("control state lock poisoned");
+        !control.queue.is_empty() || control.waiting_for_steer
+    }
+
+    #[must_use]
+    pub fn is_waiting_for_steer(&self) -> bool {
+        self.control
+            .lock()
+            .expect("control state lock poisoned")
+            .waiting_for_steer
+    }
+
+    /// Current queue length. Production callers should generally prefer
+    /// `queue_is_empty` or `enqueue_bounded`'s atomic eviction; this is
+    /// kept for tests and diagnostics.
+    #[must_use]
+    pub fn queue_len(&self) -> usize {
+        self.control
+            .lock()
+            .expect("control state lock poisoned")
+            .queue
+            .len()
+    }
+}
+
+#[async_trait::async_trait]
+pub trait ToolEnvProvider: Send + Sync {
+    async fn resolve(&self) -> anyhow::Result<HashMap<String, String>>;
+}
+
+pub struct StaticEnvProvider(pub HashMap<String, String>);
+
+#[async_trait::async_trait]
+impl ToolEnvProvider for StaticEnvProvider {
+    async fn resolve(&self) -> anyhow::Result<HashMap<String, String>> {
+        Ok(self.0.clone())
+    }
+}
+
 pub struct Session {
-    id:               String,
-    config:           SessionOptions,
-    history:          History,
-    event_emitter:    Emitter,
-    state:            SessionState,
-    llm_client:       Client,
-    provider_profile: Arc<dyn AgentProfile>,
-    sandbox:          Arc<dyn Sandbox>,
-    steering_queue:   Arc<Mutex<VecDeque<String>>>,
-    followup_queue:   Arc<Mutex<VecDeque<String>>>,
-    cancel_token:     CancellationToken,
-    interrupt_reason: Arc<Mutex<Option<InterruptReason>>>,
-    memory:           Vec<String>,
-    env_context:      EnvContext,
-    skills:           Vec<Skill>,
-    system_prompt:    String,
-    file_tracker:     FileTracker,
-    tool_env:         Option<HashMap<String, String>>,
-    subagent_manager: Option<Arc<AsyncMutex<SubAgentManager>>>,
+    id:                     String,
+    config:                 SessionOptions,
+    history:                History,
+    event_emitter:          Emitter,
+    state:                  SessionState,
+    llm_client:             Client,
+    provider_profile:       Arc<dyn AgentProfile>,
+    sandbox:                Arc<dyn Sandbox>,
+    control_state:          Arc<Mutex<ControlState>>,
+    control_notify:         Arc<Notify>,
+    followup_queue:         Arc<Mutex<VecDeque<String>>>,
+    cancel_token:           CancellationToken,
+    round_token:            Arc<RwLock<CancellationToken>>,
+    interrupt_reason:       Arc<Mutex<Option<InterruptReason>>>,
+    memory:                 Vec<String>,
+    env_context:            EnvContext,
+    skills:                 Vec<Skill>,
+    system_prompt:          String,
+    file_tracker:           FileTracker,
+    tool_env_provider:      Option<Arc<dyn ToolEnvProvider>>,
+    subagent_manager:       Option<Arc<AsyncMutex<SubAgentManager>>>,
+    completion_coordinator: Option<Arc<dyn CompletionCoordinator>>,
 }
 
 impl Session {
@@ -78,17 +285,20 @@ impl Session {
             llm_client,
             provider_profile,
             sandbox,
-            steering_queue: Arc::new(Mutex::new(VecDeque::new())),
+            control_state: Arc::new(Mutex::new(ControlState::default())),
+            control_notify: Arc::new(Notify::new()),
             followup_queue: Arc::new(Mutex::new(VecDeque::new())),
             cancel_token: CancellationToken::new(),
+            round_token: Arc::new(RwLock::new(CancellationToken::new())),
             interrupt_reason: Arc::new(Mutex::new(None)),
             memory: Vec::new(),
             env_context: EnvContext::default(),
             skills: Vec::new(),
             system_prompt: String::new(),
             file_tracker: FileTracker::default(),
-            tool_env: None,
+            tool_env_provider: None,
             subagent_manager,
+            completion_coordinator: None,
         }
     }
 
@@ -119,8 +329,12 @@ impl Session {
         ))
     }
 
+    pub fn set_tool_env_provider(&mut self, provider: Arc<dyn ToolEnvProvider>) {
+        self.tool_env_provider = Some(provider);
+    }
+
     pub fn set_tool_env(&mut self, env: HashMap<String, String>) {
-        self.tool_env = Some(env);
+        self.set_tool_env_provider(Arc::new(StaticEnvProvider(env)));
     }
 
     #[must_use]
@@ -128,14 +342,35 @@ impl Session {
         &self.id
     }
 
+    #[must_use]
+    pub fn provider(&self) -> Provider {
+        self.provider_profile.provider()
+    }
+
+    #[must_use]
+    pub fn model(&self) -> &str {
+        self.provider_profile.model()
+    }
+
     /// Initialize session by discovering project docs and capturing environment
     /// context. Call before `process_input`.
-    pub async fn initialize(&mut self) {
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::Interrupted(InterruptReason::Cancelled)` if the
+    /// session's cancel token fires during initialization.
+    pub async fn initialize(&mut self) -> Result<(), Error> {
+        let cancel_token = self.cancel_token.clone();
+
         self.event_emitter
             .emit(self.id.clone(), AgentEvent::SessionStarted {
                 provider: Some(self.provider_profile.provider().to_string()),
                 model:    Some(self.provider_profile.model().to_string()),
             });
+
+        if cancel_token.is_cancelled() {
+            return Err(Error::Interrupted(InterruptReason::Cancelled));
+        }
 
         let doc_root = self
             .config
@@ -147,8 +382,9 @@ impl Session {
             &doc_root,
             self.sandbox.working_directory(),
             self.provider_profile.provider(),
+            &cancel_token,
         )
-        .await;
+        .await?;
 
         // Discover skills
         let skill_dirs = if let Some(dirs) = &self.config.skill_dirs {
@@ -158,7 +394,7 @@ impl Session {
             let skills_str = skills_dir.to_string_lossy().to_string();
             default_skill_dirs(Some(&skills_str), self.config.git_root.as_deref())
         };
-        self.skills = discover_skills(self.sandbox.as_ref(), &skill_dirs).await;
+        self.skills = discover_skills(self.sandbox.as_ref(), &skill_dirs, &cancel_token).await?;
         debug!(skill_count = self.skills.len(), "Skills discovered");
 
         // Register use_skill tool when skills are available
@@ -175,7 +411,7 @@ impl Session {
         if !self.config.mcp_servers.is_empty() {
             // Resolve Sandbox transports: start the server inside the sandbox,
             // then rewrite the config to Http using the sandbox's preview URL.
-            let mcp_servers = self.resolve_sandbox_mcp_servers().await;
+            let mcp_servers = self.resolve_sandbox_mcp_servers(&cancel_token).await?;
 
             let mut manager = McpConnectionManager::new();
             let results = manager.start_servers(&mcp_servers).await;
@@ -209,7 +445,7 @@ impl Session {
         }
 
         // Populate environment context
-        self.env_context = self.build_env_context().await;
+        self.env_context = self.build_env_context(&cancel_token).await?;
         debug!(
             is_git_repo = self.env_context.is_git_repo,
             model = %self.env_context.model,
@@ -224,19 +460,30 @@ impl Session {
             self.config.user_instructions.as_deref(),
             &self.skills,
         );
+
+        Ok(())
     }
 
     /// Resolve `McpTransport::Sandbox` configs by starting the MCP server
     /// inside the sandbox and rewriting the transport to `Http` with the
     /// sandbox's preview URL.
-    async fn resolve_sandbox_mcp_servers(&self) -> Vec<McpServerSettings> {
+    async fn resolve_sandbox_mcp_servers(
+        &self,
+        cancel_token: &CancellationToken,
+    ) -> Result<Vec<McpServerSettings>, Error> {
         let mut resolved = Vec::with_capacity(self.config.mcp_servers.len());
 
         for config in &self.config.mcp_servers {
+            if cancel_token.is_cancelled() {
+                return Err(Error::Interrupted(InterruptReason::Cancelled));
+            }
             match &config.transport {
                 McpTransport::Sandbox { command, port, env } => {
                     let port = *port;
-                    match self.start_sandbox_mcp_server(command, port, env).await {
+                    match self
+                        .start_sandbox_mcp_server(command, port, env, cancel_token)
+                        .await?
+                    {
                         Ok((url, headers)) => {
                             info!(
                                 server = %config.name,
@@ -268,17 +515,24 @@ impl Session {
             }
         }
 
-        resolved
+        Ok(resolved)
     }
 
     /// Start an MCP server inside the sandbox and return (url, headers) for
     /// HTTP connection.
+    ///
+    /// The outer `Result` surfaces fatal cancellation as
+    /// `Error::Interrupted(InterruptReason::Cancelled)` (the running MCP
+    /// process group is terminated before returning). The inner `Result`
+    /// captures non-fatal startup failures that the caller logs and turns
+    /// into an `McpServerFailed` event.
     async fn start_sandbox_mcp_server(
         &self,
         command: &[String],
         port: u16,
         env: &std::collections::HashMap<String, String>,
-    ) -> Result<(String, std::collections::HashMap<String, String>), String> {
+        cancel_token: &CancellationToken,
+    ) -> Result<Result<(String, std::collections::HashMap<String, String>), String>, Error> {
         let sandbox = self.sandbox.as_ref();
 
         let cmd_str = command
@@ -296,27 +550,63 @@ impl Session {
             quoted = fabro_sandbox::shell_quote(&inner)
         );
         let env_ref = if env.is_empty() { None } else { Some(env) };
-        let launch_result = sandbox
-            .exec_command(&launch_script, 30_000, None, env_ref, None)
-            .await
-            .map_err(|e| format!("Failed to launch MCP server: {}", e.display_with_causes()))?;
 
-        let pid = launch_result.stdout.trim();
-        info!(pid, port, "MCP server process launched in sandbox");
+        if cancel_token.is_cancelled() {
+            return Err(Error::Interrupted(InterruptReason::Cancelled));
+        }
+        let launch_result = match sandbox
+            .exec_command(
+                &launch_script,
+                30_000,
+                None,
+                env_ref,
+                Some(cancel_token.child_token()),
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                if cancel_token.is_cancelled() {
+                    return Err(Error::Interrupted(InterruptReason::Cancelled));
+                }
+                return Ok(Err(format!(
+                    "Failed to launch MCP server: {}",
+                    e.display_with_causes()
+                )));
+            }
+        };
+
+        let pid = launch_result.stdout.trim().to_string();
+        info!(pid = %pid, port, "MCP server process launched in sandbox");
 
         // Wait for the server to start listening on the port
         let poll_cmd = format!(
             "for i in $(seq 1 30); do ss -tln | grep -q ':{port} ' && echo ready && exit 0; sleep 1; done; echo timeout"
         );
         let poll_result = sandbox
-            .exec_command(&poll_cmd, 60_000, None, None, None)
-            .await
-            .map_err(|e| {
-                format!(
+            .exec_command(
+                &poll_cmd,
+                60_000,
+                None,
+                None,
+                Some(cancel_token.child_token()),
+            )
+            .await;
+
+        if cancel_token.is_cancelled() {
+            kill_mcp_pid(sandbox, &pid).await;
+            return Err(Error::Interrupted(InterruptReason::Cancelled));
+        }
+
+        let poll_result = match poll_result {
+            Ok(result) => result,
+            Err(e) => {
+                return Ok(Err(format!(
                     "Failed to poll MCP server readiness: {}",
                     e.display_with_causes()
-                )
-            })?;
+                )));
+            }
+        };
 
         if poll_result.stdout.trim() != "ready" {
             // Grab stderr for debugging
@@ -326,51 +616,80 @@ impl Session {
                     10_000,
                     None,
                     None,
-                    None,
+                    Some(cancel_token.child_token()),
                 )
                 .await
                 .map(|r| r.stdout)
                 .unwrap_or_default();
-            return Err(format!(
+            return Ok(Err(format!(
                 "MCP server did not start listening on port {port} within 30s. stderr:\n{stderr}"
-            ));
+            )));
         }
 
         // Get the preview URL for the port, or fall back to localhost for local
         // sandboxes
-        if let Some(url_and_headers) = sandbox
-            .get_preview_url(port)
-            .await
-            .map_err(|e| e.display_with_causes())?
-        {
-            Ok(url_and_headers)
+        let preview = match sandbox.get_preview_url(port).await {
+            Ok(p) => p,
+            Err(e) => return Ok(Err(e.display_with_causes())),
+        };
+
+        if cancel_token.is_cancelled() {
+            kill_mcp_pid(sandbox, &pid).await;
+            return Err(Error::Interrupted(InterruptReason::Cancelled));
+        }
+
+        if let Some(url_and_headers) = preview {
+            Ok(Ok(url_and_headers))
         } else {
             info!(port, "No preview URL available, using localhost");
-            Ok((
+            Ok(Ok((
                 format!("http://localhost:{port}"),
                 std::collections::HashMap::new(),
-            ))
+            )))
         }
     }
 
-    async fn build_env_context(&self) -> EnvContext {
+    async fn build_env_context(
+        &self,
+        cancel_token: &CancellationToken,
+    ) -> Result<EnvContext, Error> {
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         let model_name = self.provider_profile.model().to_string();
+
+        if cancel_token.is_cancelled() {
+            return Err(Error::Interrupted(InterruptReason::Cancelled));
+        }
 
         // Detect git info via sandbox
         let git_branch = self
             .sandbox
-            .exec_command("git rev-parse --abbrev-ref HEAD", 5000, None, None, None)
+            .exec_command(
+                "git rev-parse --abbrev-ref HEAD",
+                5000,
+                None,
+                None,
+                Some(cancel_token.child_token()),
+            )
             .await
             .ok()
             .filter(fabro_sandbox::ExecResult::is_success)
             .map(|r| r.stdout.trim().to_string());
 
+        if cancel_token.is_cancelled() {
+            return Err(Error::Interrupted(InterruptReason::Cancelled));
+        }
+
         let is_git_repo = git_branch.is_some();
 
         let git_status_short = if is_git_repo {
             self.sandbox
-                .exec_command("git status --short", 5000, None, None, None)
+                .exec_command(
+                    "git status --short",
+                    5000,
+                    None,
+                    None,
+                    Some(cancel_token.child_token()),
+                )
                 .await
                 .ok()
                 .filter(fabro_sandbox::ExecResult::is_success)
@@ -379,10 +698,20 @@ impl Session {
         } else {
             None
         };
+
+        if cancel_token.is_cancelled() {
+            return Err(Error::Interrupted(InterruptReason::Cancelled));
+        }
 
         let git_recent_commits = if is_git_repo {
             self.sandbox
-                .exec_command("git log --oneline -10", 5000, None, None, None)
+                .exec_command(
+                    "git log --oneline -10",
+                    5000,
+                    None,
+                    None,
+                    Some(cancel_token.child_token()),
+                )
                 .await
                 .ok()
                 .filter(fabro_sandbox::ExecResult::is_success)
@@ -392,7 +721,11 @@ impl Session {
             None
         };
 
-        EnvContext {
+        if cancel_token.is_cancelled() {
+            return Err(Error::Interrupted(InterruptReason::Cancelled));
+        }
+
+        Ok(EnvContext {
             git_branch,
             is_git_repo,
             current_date: today,
@@ -400,7 +733,7 @@ impl Session {
             knowledge_cutoff: self.provider_profile.knowledge_cutoff().unwrap_or_default(),
             git_status_short,
             git_recent_commits,
-        }
+        })
     }
 
     #[must_use]
@@ -413,11 +746,40 @@ impl Session {
         self.event_emitter.subscribe()
     }
 
+    /// Push a steer onto the queue (no actor — internal callers like
+    /// loop-detection use this).
     pub fn steer(&self, message: String) {
-        self.steering_queue
-            .lock()
-            .expect("steering queue lock poisoned")
-            .push_back(message);
+        self.control_handle().steer(message, None);
+    }
+
+    /// Cancel the current round and wait for later steering before starting
+    /// another LLM round.
+    pub fn control_interrupt(&self, actor: Option<Principal>) {
+        self.control_handle().interrupt(actor);
+    }
+
+    /// Cancel the current round and deliver the message as the next steer.
+    pub fn interrupt_then_steer(&self, message: String, actor: Option<Principal>) {
+        self.control_handle().interrupt_then_steer(message, actor);
+    }
+
+    /// Cheap, cloneable handle that lets external coordinators deliver
+    /// steers and trigger interrupts without owning the `Session` itself.
+    #[must_use]
+    pub fn control_handle(&self) -> SessionControlHandle {
+        SessionControlHandle {
+            control:     self.control_state.clone(),
+            round_token: self.round_token.clone(),
+            notify:      self.control_notify.clone(),
+        }
+    }
+
+    /// Install a coordinator that decides whether `process_input` should
+    /// keep iterating after a no-tool turn. Used by the workflow layer to
+    /// race-safely include any steers that arrived during the final
+    /// response.
+    pub fn set_completion_coordinator(&mut self, coordinator: Arc<dyn CompletionCoordinator>) {
+        self.completion_coordinator = Some(coordinator);
     }
 
     pub fn follow_up(&self, message: String) {
@@ -490,11 +852,6 @@ impl Session {
     #[must_use]
     pub fn followup_queue_handle(&self) -> Arc<Mutex<VecDeque<String>>> {
         self.followup_queue.clone()
-    }
-
-    #[must_use]
-    pub fn steering_queue_handle(&self) -> Arc<Mutex<VecDeque<String>>> {
-        self.steering_queue.clone()
     }
 
     #[must_use]
@@ -574,8 +931,10 @@ impl Session {
         self.state = to;
     }
 
-    pub fn close(&mut self) {
+    pub fn close(&mut self) -> bool {
+        let was_open = self.state != SessionState::Closed;
         self.transition(SessionState::Closed);
+        was_open
     }
 
     pub fn set_reasoning_effort(&mut self, effort: Option<ReasoningEffort>) {
@@ -690,12 +1049,40 @@ impl Session {
                 text: expanded_input.clone(),
             });
 
-        // Drain steering queue before first LLM call
-        self.drain_steering();
-
         let mut round_count: usize = 0;
 
         loop {
+            // Top-of-loop: if the previous round's interrupt token fired,
+            // swap in a fresh one before draining and rebuilding state.
+            // (Terminal cancel via `cancel_token` is handled by the explicit
+            // check below and by `interrupted_error()`.)
+            {
+                let needs_refresh = self
+                    .round_token
+                    .read()
+                    .expect("round token lock poisoned")
+                    .is_cancelled();
+                if needs_refresh {
+                    *self.round_token.write().expect("round token lock poisoned") =
+                        CancellationToken::new();
+                }
+            }
+
+            // Terminal cancellation wins even when a control interrupt has
+            // parked the session waiting for steering.
+            if self.cancel_token.is_cancelled() {
+                self.close();
+                return Err(self.interrupted_error());
+            }
+
+            // Drain pending steering messages at the top of every iteration
+            // so steering pushed mid-round is delivered as the first turn of
+            // the next round. A pure interrupt with no queued steer parks the
+            // session here until a later steer arrives.
+            self.drain_steering();
+            self.wait_for_steer_if_needed().await?;
+            self.drain_steering();
+
             // Check max_tool_rounds_per_input
             if self.config.max_tool_rounds_per_input > 0
                 && round_count >= self.config.max_tool_rounds_per_input
@@ -716,11 +1103,12 @@ impl Session {
                 break;
             }
 
-            // Check cancellation
-            if self.cancel_token.is_cancelled() {
-                self.close();
-                return Err(self.interrupted_error());
-            }
+            // Snapshot the per-round token; it stays stable for this iteration.
+            let round_token = self
+                .round_token
+                .read()
+                .expect("round token lock poisoned")
+                .clone();
 
             // Pre-turn compaction: trim context before building the request
             self.compact_if_needed().await;
@@ -751,21 +1139,54 @@ impl Session {
                 ..Default::default()
             };
             let client = self.llm_client.clone();
-            let mut event_stream = self
-                .open_stream_with_retry(&client, &request, &retry_policy)
-                .await?;
+            let cancel_token_for_select = self.cancel_token.clone();
+            let stream_outcome: Option<Result<StreamEventStream, Error>> = tokio::select! {
+                biased;
+                () = round_token.cancelled() => None,
+                () = cancel_token_for_select.cancelled() => None,
+                stream = self.open_stream_with_retry(&client, &request, &retry_policy) => Some(stream),
+            };
+            let mut event_stream = if let Some(stream) = stream_outcome {
+                stream?
+            } else {
+                if self.cancel_token.is_cancelled() {
+                    self.close();
+                    return Err(self.interrupted_error());
+                }
+                // Round-only cancel before stream opened — re-iterate to
+                // pick up the steer.
+                continue;
+            };
 
             // Consume the stream, retrying up to 3 times if the provider
             // closes the stream without sending a Finish event. If visible
             // output was already emitted, clear it before replaying the turn.
             let mut response = None;
+            // Set true if a steer-interrupt cancelled the round mid-stream so
+            // we can clear partial output and `continue` after the loop.
+            let mut steer_interrupted = false;
+            let mut emitted_anything = false;
 
-            for stream_attempt in 0..=STREAM_CONSUME_RETRIES {
+            'streamattempts: for stream_attempt in 0..=STREAM_CONSUME_RETRIES {
                 let mut accumulator = StreamAccumulator::new();
                 let mut emitted_text = String::new();
                 let mut emitted_reasoning = String::new();
 
-                while let Some(event_result) = event_stream.next().await {
+                loop {
+                    let chunk = tokio::select! {
+                        biased;
+                        () = round_token.cancelled() => None,
+                        () = self.cancel_token.cancelled() => None,
+                        next = event_stream.next() => Some(next),
+                    };
+                    let Some(event_opt) = chunk else {
+                        // One of the cancellation tokens fired.
+                        break;
+                    };
+                    let Some(event_result) = event_opt else {
+                        // Stream ended normally.
+                        break;
+                    };
                     match event_result {
                         Ok(event) => {
                             match &event {
@@ -795,19 +1216,26 @@ impl Session {
                             return Err(self.emit_llm_error(err));
                         }
                     }
-
-                    // Check cancellation between chunks
-                    if self.cancel_token.is_cancelled() {
-                        break;
-                    }
                 }
 
-                // If interrupted during streaming, drop the stream to cancel the HTTP
-                // connection, then close the session before returning.
+                // Track whether anything was rendered this attempt.
+                if !emitted_text.is_empty() || !emitted_reasoning.is_empty() {
+                    emitted_anything = true;
+                }
+
+                // If terminal cancel fired, drop the stream and bail out.
                 if self.cancel_token.is_cancelled() {
                     drop(event_stream);
                     self.close();
                     return Err(self.interrupted_error());
+                }
+
+                // If only the round token fired (steer interrupt), drop the
+                // stream now; we'll clear partial output and continue below.
+                if round_token.is_cancelled() {
+                    drop(event_stream);
+                    steer_interrupted = true;
+                    break 'streamattempts;
                 }
 
                 if let Some(resp) = accumulator.response().cloned() {
@@ -831,10 +1259,35 @@ impl Session {
                             },
                         );
                     }
-                    event_stream = self
-                        .open_stream_with_retry(&client, &request, &retry_policy)
-                        .await?;
+                    let cancel_token_for_select = self.cancel_token.clone();
+                    let retry_outcome: Option<Result<StreamEventStream, Error>> = tokio::select! {
+                        biased;
+                        () = round_token.cancelled() => None,
+                        () = cancel_token_for_select.cancelled() => None,
+                        stream = self.open_stream_with_retry(&client, &request, &retry_policy) => Some(stream),
+                    };
+                    event_stream = if let Some(stream) = retry_outcome {
+                        stream?
+                    } else {
+                        steer_interrupted =
+                            round_token.is_cancelled() && !self.cancel_token.is_cancelled();
+                        break 'streamattempts;
+                    };
                 }
+            }
+
+            // Mid-LLM steer interrupt: drop the unrecorded turn, clear any
+            // partial visible output, and re-iterate. The next turn's
+            // top-of-loop drain delivers the steer as the next user message.
+            if steer_interrupted {
+                if emitted_anything {
+                    self.event_emitter
+                        .emit(self.id.clone(), AgentEvent::AssistantOutputReplace {
+                            text:      String::new(),
+                            reasoning: None,
+                        });
+                }
+                continue;
             }
 
             let Some(response) = response else {
@@ -866,23 +1319,62 @@ impl Session {
             });
 
             // Emit AssistantMessage with enriched data from the response
+            let speed = self
+                .config
+                .speed
+                .as_deref()
+                .and_then(|value| value.parse::<Speed>().ok());
+            let model = ModelRef {
+                provider: self.provider_profile.provider(),
+                model_id: if response.model.is_empty() {
+                    self.provider_profile.model().to_string()
+                } else {
+                    response.model.clone()
+                },
+                speed,
+            };
             self.event_emitter
                 .emit(self.id.clone(), AgentEvent::AssistantMessage {
-                    text:            text.clone(),
-                    model:           response.model.clone(),
-                    usage:           response.usage.clone(),
+                    text: text.clone(),
+                    model,
+                    usage: response.usage.clone(),
                     tool_call_count: tool_calls.len(),
                 });
 
             // Post-response compaction: trim context after appending assistant turn
             self.compact_if_needed().await;
 
-            // If no tool calls, natural completion
+            // If no tool calls, natural completion. Consult the optional
+            // completion coordinator: it can return `true` to force one more
+            // iteration when a steer arrived during the final response.
             if tool_calls.is_empty() {
+                let should_continue = self
+                    .completion_coordinator
+                    .as_ref()
+                    .is_some_and(|c| c.on_natural_completion());
+                if should_continue {
+                    continue;
+                }
                 break;
             }
 
             round_count += 1;
+
+            // Build a composite cancellation token covering both terminal
+            // cancel and round (steer) interrupt. Tools observe it
+            // cooperatively — they synthesize "Cancelled" results rather
+            // than being dropped mid-flight, which preserves the
+            // tool_use ↔ tool_result invariant.
+            let composite_token = CancellationToken::new();
+            let composite_for_cancel = composite_token.clone();
+            let cancel_token_clone = self.cancel_token.clone();
+            let round_token_clone = round_token.clone();
+            let composite_watcher = tokio::spawn(async move {
+                tokio::select! {
+                    () = cancel_token_clone.cancelled() => composite_for_cancel.cancel(),
+                    () = round_token_clone.cancelled() => composite_for_cancel.cancel(),
+                }
+            });
 
             // Execute tool calls (parallel or sequential based on provider)
             self.transition(SessionState::Executing);
@@ -892,36 +1384,39 @@ impl Session {
                 self.provider_profile.tool_registry(),
                 self.sandbox.clone(),
                 self.config.tool_hooks.as_ref(),
-                &self.cancel_token,
+                &composite_token,
                 &self.config,
                 &self.event_emitter,
                 &self.id,
-                self.tool_env.as_ref(),
+                self.tool_env_provider.as_ref(),
             )
             .await;
+            composite_watcher.abort();
 
             // Track file operations from tool calls
             self.file_tracker
                 .record_from_tool_calls(&tool_calls, &results);
 
-            // Check cancellation after tool execution
-            if self.cancel_token.is_cancelled() {
-                self.history.push(Turn::ToolResults {
-                    results,
-                    timestamp: SystemTime::now(),
-                });
-                self.close();
-                return Err(self.interrupted_error());
-            }
-
-            // Record tool results turn
+            // Always append tool_results so the tool_use ↔ tool_result
+            // invariant holds, regardless of which token fired.
             self.history.push(Turn::ToolResults {
                 results,
                 timestamp: SystemTime::now(),
             });
 
-            // Drain steering after tool execution
-            self.drain_steering();
+            // Terminal cancel takes precedence: close and return.
+            if self.cancel_token.is_cancelled() {
+                self.close();
+                return Err(self.interrupted_error());
+            }
+
+            // Round-only cancel (steer interrupt mid-tool): re-iterate;
+            // the next top-of-loop drain delivers the steer.
+            if round_token.is_cancelled() {
+                self.transition(SessionState::Thinking);
+                continue;
+            }
+
             self.transition(SessionState::Thinking);
 
             // Loop detection
@@ -970,20 +1465,48 @@ impl Session {
     }
 
     fn drain_steering(&mut self) {
-        let messages: Vec<String> = self
-            .steering_queue
-            .lock()
-            .expect("steering queue lock poisoned")
-            .drain(..)
-            .collect();
-        for msg in messages {
-            let text = msg.clone();
+        let messages: Vec<SteeringItem> = {
+            let mut control = self
+                .control_state
+                .lock()
+                .expect("control state lock poisoned");
+            control.queue.drain(..).collect()
+        };
+        for (text, actor) in messages {
             self.history.push(Turn::Steering {
-                content:   msg,
+                content:   text.clone(),
                 timestamp: SystemTime::now(),
             });
             self.event_emitter
-                .emit(self.id.clone(), AgentEvent::SteeringInjected { text });
+                .emit(self.id.clone(), AgentEvent::SteeringInjected {
+                    text,
+                    actor,
+                });
+        }
+    }
+
+    async fn wait_for_steer_if_needed(&mut self) -> Result<(), Error> {
+        loop {
+            let notified = self.control_notify.notified();
+            let should_wait = {
+                let control = self
+                    .control_state
+                    .lock()
+                    .expect("control state lock poisoned");
+                control.waiting_for_steer && control.queue.is_empty()
+            };
+            if !should_wait {
+                return Ok(());
+            }
+
+            tokio::select! {
+                biased;
+                () = self.cancel_token.cancelled() => {
+                    self.close();
+                    return Err(self.interrupted_error());
+                }
+                () = notified => {}
+            }
         }
     }
 
@@ -1031,17 +1554,37 @@ const fn is_auth_error(err: &LlmError) -> bool {
     )
 }
 
+/// Best-effort kill of a sandbox MCP server process group. Used when
+/// `start_sandbox_mcp_server` is cancelled after spawning a detached
+/// `setsid` child but before reporting readiness. Errors from the sandbox
+/// are logged and swallowed; the caller is already returning a Cancelled
+/// error.
+async fn kill_mcp_pid(sandbox: &dyn Sandbox, pid: &str) {
+    let pid = pid.trim();
+    if pid.is_empty() {
+        return;
+    }
+    let script =
+        format!("kill -TERM -{pid} 2>/dev/null; sleep 1; kill -KILL -{pid} 2>/dev/null; true");
+    if let Err(err) = sandbox.exec_command(&script, 5_000, None, None, None).await {
+        warn!(pid, error = %err.display_with_causes(), "Failed to kill MCP server process group during cancellation");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
+    use anyhow::Context as _;
     use fabro_llm::error::{ProviderErrorDetail, ProviderErrorKind};
     use fabro_llm::provider::{ProviderAdapter, StreamEventStream};
     use fabro_llm::types::{
         ContentPart, ReasoningEffort, Request, Response, Role, StreamEvent, ToolDefinition,
     };
     use futures::stream;
+    use tokio::time::{sleep, timeout};
 
     use super::*;
     use crate::config::ToolApprovalAdapter;
@@ -1198,6 +1741,72 @@ mod tests {
         }
     }
 
+    struct SequenceToolEnvProvider {
+        values: Mutex<VecDeque<HashMap<String, String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ToolEnvProvider for SequenceToolEnvProvider {
+        async fn resolve(&self) -> anyhow::Result<HashMap<String, String>> {
+            self.values
+                .lock()
+                .unwrap()
+                .pop_front()
+                .context("env script exhausted")
+        }
+    }
+
+    #[tokio::test]
+    async fn session_passes_tool_env_provider_to_each_tool_round() {
+        let seen_tokens = Arc::new(Mutex::new(Vec::new()));
+        let seen_tokens_for_tool = Arc::clone(&seen_tokens);
+        let record_env_tool = RegisteredTool {
+            definition: ToolDefinition {
+                name:        "record_env".into(),
+                description: "Records resolved env".into(),
+                parameters:  serde_json::json!({"type": "object"}),
+            },
+            executor:   Arc::new(move |_args, ctx| {
+                let seen_tokens = Arc::clone(&seen_tokens_for_tool);
+                Box::pin(async move {
+                    let env = ctx
+                        .resolve_tool_env()
+                        .await
+                        .map_err(|err| format!("{err:#}"))?
+                        .unwrap_or_default();
+                    seen_tokens.lock().unwrap().push(
+                        env.get("GITHUB_TOKEN")
+                            .cloned()
+                            .unwrap_or_else(|| "<missing>".to_string()),
+                    );
+                    Ok("recorded".to_string())
+                })
+            }),
+        };
+
+        let mut registry = ToolRegistry::new();
+        registry.register(record_env_tool);
+        let responses = vec![
+            tool_call_response("record_env", "call_1", serde_json::json!({})),
+            tool_call_response("record_env", "call_2", serde_json::json!({})),
+            text_response("Done!"),
+        ];
+        let mut session = make_session_with_tools(responses, registry).await;
+        session.set_tool_env_provider(Arc::new(SequenceToolEnvProvider {
+            values: Mutex::new(VecDeque::from([
+                HashMap::from([("GITHUB_TOKEN".to_string(), "t1".to_string())]),
+                HashMap::from([("GITHUB_TOKEN".to_string(), "t2".to_string())]),
+            ])),
+        }));
+
+        session.process_input("Use tools").await.unwrap();
+
+        assert_eq!(seen_tokens.lock().unwrap().as_slice(), [
+            "t1".to_string(),
+            "t2".to_string()
+        ]);
+    }
+
     #[tokio::test]
     async fn max_tool_rounds_enforced() {
         let mut registry = ToolRegistry::new();
@@ -1267,6 +1876,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn steer_event_carries_text() {
+        let mut session = make_session(vec![text_response("OK")]).await;
+        let mut rx = session.subscribe();
+        session.steer("hi there".to_string());
+        session.process_input("Do something").await.unwrap();
+
+        let mut found_text = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let AgentEvent::SteeringInjected { text, .. } = ev.event {
+                found_text = Some(text);
+                break;
+            }
+        }
+        assert_eq!(found_text.as_deref(), Some("hi there"));
+    }
+
+    #[tokio::test]
+    async fn pure_interrupt_enters_waiting_for_steer_without_queueing_text() {
+        let handle = SessionControlHandle::new();
+
+        handle.interrupt(None);
+        handle.interrupt(None);
+
+        assert!(handle.is_waiting_for_steer());
+        assert_eq!(handle.queue_len(), 0);
+        assert!(handle.has_pending_control_work());
+    }
+
+    #[tokio::test]
+    async fn pure_interrupt_waits_until_later_steer() {
+        let mut session = make_session(vec![text_response("OK")]).await;
+        let handle = session.control_handle();
+        handle.interrupt(None);
+
+        let wake_handle = handle.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(10)).await;
+            wake_handle.steer("resume now".to_string(), None);
+        });
+
+        timeout(Duration::from_secs(1), session.process_input("start"))
+            .await
+            .expect("session should wake when steering arrives")
+            .unwrap();
+
+        let turns = session.history().turns();
+        assert!(matches!(&turns[1], Turn::Steering { content, .. } if content == "resume now"));
+        assert!(!handle.is_waiting_for_steer());
+    }
+
+    #[tokio::test]
+    async fn interrupt_then_steer_injects_steering_text() {
+        let mut session = make_session(vec![text_response("OK")]).await;
+        let mut rx = session.subscribe();
+
+        let handle = session.control_handle();
+        handle.interrupt_then_steer("stop now".to_string(), None);
+        session.process_input("start").await.unwrap();
+
+        let mut found_text = None;
+        while let Ok(ev) = rx.try_recv() {
+            if let AgentEvent::SteeringInjected { text, .. } = ev.event {
+                found_text = Some(text);
+                break;
+            }
+        }
+        assert_eq!(found_text.as_deref(), Some("stop now"));
+    }
+
+    #[tokio::test]
+    async fn append_during_final_response_triggers_extra_round_when_coordinator_returns_true() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct OnceCoordinator {
+            calls:  AtomicUsize,
+            handle: SessionControlHandle,
+        }
+        impl CompletionCoordinator for OnceCoordinator {
+            fn on_natural_completion(&self) -> bool {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    // Simulate a steer that arrived during the first
+                    // completion: enqueue and report "keep going".
+                    self.handle
+                        .steer("after-completion steer".to_string(), None);
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+
+        // First scripted response is a no-tool natural completion; second
+        // also natural completion. The completion coordinator forces the
+        // loop to iterate once more — that iteration must drain the queued
+        // steer and produce a second Assistant turn.
+        let responses = vec![
+            text_response("First reply"),
+            text_response("Second reply, after steer"),
+        ];
+        let mut session = make_session(responses).await;
+        let handle = session.control_handle();
+        session.set_completion_coordinator(Arc::new(OnceCoordinator {
+            calls: AtomicUsize::new(0),
+            handle,
+        }));
+
+        session.process_input("hi").await.unwrap();
+        let turns = session.history().turns();
+        // User + Assistant + Steering + Assistant = 4
+        assert_eq!(turns.len(), 4);
+        assert!(matches!(&turns[0], Turn::User { .. }));
+        assert!(matches!(&turns[1], Turn::Assistant { content, .. } if content == "First reply"));
+        assert!(matches!(&turns[2], Turn::Steering { content, .. }
+                if content == "after-completion steer"));
+        assert!(matches!(&turns[3], Turn::Assistant { content, .. }
+                if content == "Second reply, after steer"));
+    }
+
+    #[tokio::test]
     async fn follow_up_triggers_new_cycle() {
         let responses = vec![
             text_response("First response"),
@@ -1297,7 +2026,7 @@ mod tests {
         let mut session = make_session(vec![text_response("Hello")]).await;
         let mut rx = session.subscribe();
 
-        session.initialize().await;
+        session.initialize().await.unwrap();
         session.process_input("Hi").await.unwrap();
         session.close();
 
@@ -1588,6 +2317,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn close_reports_whether_it_transitioned_to_closed() {
+        let mut session = make_session(vec![]).await;
+        let mut rx = session.subscribe();
+
+        assert!(session.close());
+        assert!(!session.close());
+
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.event, AgentEvent::SessionEnded))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn closed_session_does_not_emit_session_start() {
         let mut session = make_session(vec![]).await;
         session.close();
@@ -1825,7 +2572,7 @@ mod tests {
         let mut session = make_session(responses).await;
         let mut rx = session.subscribe();
 
-        session.initialize().await;
+        session.initialize().await.unwrap();
         session.process_input("one").await.unwrap();
         session.process_input("two").await.unwrap();
         session.close();
@@ -1858,7 +2605,7 @@ mod tests {
             ..Default::default()
         };
         let mut session = Session::new(client, profile, env, config, None);
-        session.initialize().await;
+        session.initialize().await.unwrap();
         session.process_input("test").await.unwrap();
 
         // Verify user instructions are included in the system prompt
@@ -2647,7 +3394,7 @@ mod tests {
         let mut rx = session.subscribe();
 
         // Initialize starts the MCP server and registers tools
-        session.initialize().await;
+        session.initialize().await.unwrap();
 
         // Verify McpServerReady event was emitted
         let mut mcp_ready = false;
@@ -2842,7 +3589,7 @@ mod tests {
     #[tokio::test]
     async fn process_input_emits_processing_end_on_idle_transition() {
         let mut session = make_session(vec![text_response("Hello")]).await;
-        session.initialize().await;
+        session.initialize().await.unwrap();
 
         let mut rx = session.subscribe();
         session.process_input("Hi").await.unwrap();

@@ -49,9 +49,6 @@ impl Handler for CommandHandler {
         outcome
             .context_updates
             .insert(keys::COMMAND_OUTPUT.to_string(), serde_json::json!(""));
-        outcome
-            .context_updates
-            .insert(keys::COMMAND_STDERR.to_string(), serde_json::json!(""));
         Ok(outcome)
     }
 
@@ -91,6 +88,7 @@ impl Handler for CommandHandler {
         } else {
             script.to_string()
         };
+        let command = format!("exec 2>&1\n{command}");
         let stage_scope = StageScope::for_handler(context, &node.id);
         services.run.emitter.emit_scoped(
             &Event::CommandStarted {
@@ -104,21 +102,21 @@ impl Handler for CommandHandler {
         );
 
         let timeout_ms = node.timeout().map_or(600_000, crate::millis_u64);
-        let env_vars = if services.env.is_empty() {
-            None
-        } else {
-            Some(&services.env)
-        };
-        let cancel_token = services.run.sandbox_cancel_token();
+        let env = services
+            .env_for_stage()
+            .await
+            .map_err(|err| Error::handler_with_anyhow("Failed to resolve stage env", &err))?;
+        let env_vars = if env.is_empty() { None } else { Some(&env) };
+        let cancel_token = services.run.cancel_token().child_token();
         let stage_id = stage_scope.stage_id();
         let recorder = CommandLogRecorder::create(run_dir, &stage_id).await?;
         let output_callback: CommandOutputCallback = {
             let recorder = recorder.clone();
-            std::sync::Arc::new(move |stream, bytes| {
+            std::sync::Arc::new(move |_stream, bytes| {
                 let recorder = recorder.clone();
                 Box::pin(async move {
                     recorder
-                        .append(stream, &bytes)
+                        .append(&bytes)
                         .await
                         .map_err(|err| fabro_sandbox::Error::message(err.to_string()))
                 })
@@ -130,16 +128,14 @@ impl Handler for CommandHandler {
             .sandbox
             .exec_command_streaming(
                 &command,
-                timeout_ms,
+                Some(timeout_ms),
                 None,
                 env_vars,
-                cancel_token.clone(),
+                Some(cancel_token.clone()),
                 output_callback,
             )
             .await;
-        if let Some(token) = cancel_token {
-            token.cancel();
-        }
+        cancel_token.cancel();
         let streaming = match result {
             Ok(streaming) => streaming,
             Err(err) => {
@@ -152,29 +148,26 @@ impl Handler for CommandHandler {
 
         services.run.emitter.emit_scoped(
             &Event::CommandCompleted {
-                node_id:           node.id.clone(),
-                stdout:            finalized.stdout_ref.clone(),
-                stderr:            finalized.stderr_ref.clone(),
-                exit_code:         result.exit_code,
-                duration_ms:       result.duration_ms,
-                termination:       result.termination,
-                stdout_bytes:      finalized.stdout_bytes,
-                stderr_bytes:      finalized.stderr_bytes,
-                streams_separated: streaming.streams_separated,
-                live_streaming:    streaming.live_streaming,
+                node_id:        node.id.clone(),
+                output:         finalized.output_ref.clone(),
+                exit_code:      result.exit_code,
+                duration_ms:    result.duration_ms,
+                termination:    result.termination,
+                output_bytes:   finalized.output_bytes,
+                live_streaming: streaming.live_streaming,
             },
             &stage_scope,
         );
 
         if result.termination == CommandTermination::TimedOut {
             let mut reason = format!("Script timed out after {timeout_ms}ms: {script}");
-            append_output_tails(&mut reason, &finalized.stdout_text, &finalized.stderr_text);
+            append_output_tail(&mut reason, &finalized.output_text);
             return Err(Error::handler(reason));
         }
 
         if result.termination == CommandTermination::Cancelled {
             let mut reason = format!("Script cancelled: {script}");
-            append_output_tails(&mut reason, &finalized.stdout_text, &finalized.stderr_text);
+            append_output_tail(&mut reason, &finalized.output_text);
             return Err(Error::handler(reason));
         }
 
@@ -182,11 +175,7 @@ impl Handler for CommandHandler {
             let mut outcome = Outcome::success();
             outcome.context_updates.insert(
                 keys::COMMAND_OUTPUT.to_string(),
-                serde_json::json!(finalized.stdout_ref),
-            );
-            outcome.context_updates.insert(
-                keys::COMMAND_STDERR.to_string(),
-                serde_json::json!(finalized.stderr_ref),
+                serde_json::json!(finalized.output_ref),
             );
             outcome.notes = Some(format!("Script completed: {script}"));
             Ok(outcome)
@@ -195,31 +184,22 @@ impl Handler for CommandHandler {
                 "Script failed with exit code: {}",
                 result.exit_code.unwrap_or(-1)
             );
-            append_output_tails(&mut reason, &finalized.stdout_text, &finalized.stderr_text);
+            append_output_tail(&mut reason, &finalized.output_text);
             let mut outcome = Outcome::fail_classify(reason);
             outcome.context_updates.insert(
                 keys::COMMAND_OUTPUT.to_string(),
-                serde_json::json!(finalized.stdout_ref),
-            );
-            outcome.context_updates.insert(
-                keys::COMMAND_STDERR.to_string(),
-                serde_json::json!(finalized.stderr_ref),
+                serde_json::json!(finalized.output_ref),
             );
             Ok(outcome)
         }
     }
 }
 
-fn append_output_tails(reason: &mut String, stdout: &str, stderr: &str) {
-    let stdout_tail = tail_bytes(stdout, 4096);
-    let stderr_tail = tail_bytes(stderr, 4096);
-    if !stdout_tail.trim().is_empty() {
-        reason.push_str("\n\n## stdout\n");
-        reason.push_str(&stdout_tail);
-    }
-    if !stderr_tail.trim().is_empty() {
-        reason.push_str("\n\n## stderr\n");
-        reason.push_str(&stderr_tail);
+fn append_output_tail(reason: &mut String, output: &str) {
+    let output_tail = tail_bytes(output, 4096);
+    if !output_tail.trim().is_empty() {
+        reason.push_str("\n\n## output\n");
+        reason.push_str(&output_tail);
     }
 }
 
@@ -237,13 +217,12 @@ fn tail_bytes(text: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
     use bytes::Bytes;
     use fabro_graphviz::graph::AttrValue;
     use fabro_store::{Database, RunDatabase, StageId};
-    use fabro_types::{CommandOutputStream, fixtures};
+    use fabro_types::{Graph, RunProjection, RunSpec, WorkflowSettings, fixtures};
     use object_store::memory::InMemory;
     use tokio::sync::Mutex;
 
@@ -260,7 +239,24 @@ mod tests {
     #[async_trait::async_trait]
     impl RunStoreBackend for MemoryRunStoreBackend {
         async fn load_state(&self) -> anyhow::Result<fabro_store::RunProjection> {
-            Ok(fabro_store::RunProjection::default())
+            Ok(RunProjection::new(
+                "Test run".to_string(),
+                RunSpec {
+                    run_id:           fixtures::RUN_1,
+                    settings:         WorkflowSettings::default(),
+                    graph:            Graph::new("test"),
+                    graph_source:     None,
+                    workflow_slug:    None,
+                    source_directory: None,
+                    labels:           std::collections::HashMap::default(),
+                    provenance:       None,
+                    manifest_blob:    None,
+                    definition_blob:  None,
+                    git:              None,
+                    fork_source_ref:  None,
+                },
+                chrono::Utc::now(),
+            ))
         }
 
         async fn list_events(&self) -> anyhow::Result<Vec<fabro_store::EventEnvelope>> {
@@ -326,6 +322,7 @@ mod tests {
     ) {
         let store = test_store();
         let run_store = store.create_run(&fixtures::RUN_1).await.unwrap();
+        seed_created(&run_store).await;
         let mut services = EngineServices::test_default();
         services.run = services
             .run
@@ -334,6 +331,33 @@ mod tests {
         let logger = crate::event::StoreProgressLogger::new(run_store.clone());
         logger.register(services.run.emitter.as_ref());
         (services, run_store, logger)
+    }
+
+    async fn seed_created(run_store: &RunDatabase) {
+        crate::event::append_event(
+            run_store,
+            &fixtures::RUN_1,
+            &crate::event::Event::RunCreated {
+                run_id:           fixtures::RUN_1,
+                title:            None,
+                settings:         serde_json::to_value(WorkflowSettings::default()).unwrap(),
+                graph:            serde_json::to_value(Graph::new("test")).unwrap(),
+                workflow_source:  None,
+                workflow_config:  None,
+                labels:           std::collections::BTreeMap::default(),
+                run_dir:          "/tmp".to_string(),
+                source_directory: None,
+                workflow_slug:    None,
+                db_prefix:        None,
+                provenance:       None,
+                manifest_blob:    None,
+                git:              None,
+                fork_source_ref:  None,
+                web_url:          None,
+            },
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -378,10 +402,7 @@ mod tests {
             outcome.context_updates.get(keys::COMMAND_OUTPUT),
             Some(&serde_json::json!(""))
         );
-        assert_eq!(
-            outcome.context_updates.get(keys::COMMAND_STDERR),
-            Some(&serde_json::json!(""))
-        );
+        assert!(!outcome.context_updates.contains_key("command.stderr"));
     }
 
     #[tokio::test]
@@ -438,8 +459,7 @@ mod tests {
                 .await
                 .contains("hello")
         );
-        let command_stderr = outcome.context_updates.get(keys::COMMAND_STDERR).unwrap();
-        assert_eq!(command_text(&services, command_stderr).await, "");
+        assert!(!outcome.context_updates.contains_key("command.stderr"));
     }
 
     #[tokio::test]
@@ -511,7 +531,7 @@ mod tests {
         let snapshot = run_store.state().await.unwrap();
         let node_state = snapshot.stage(&StageId::new("script_node", 1)).unwrap();
         let json = node_state.script_invocation.as_ref().unwrap();
-        assert_eq!(json["command"], "echo hello");
+        assert_eq!(json["command"], "exec 2>&1\necho hello");
         assert_eq!(json["language"], "shell");
         assert_eq!(json["timeout_ms"], serde_json::Value::Null);
     }
@@ -542,13 +562,13 @@ mod tests {
         let snapshot = run_store.state().await.unwrap();
         let node_state = snapshot.stage(&StageId::new("script_node", 1)).unwrap();
         let json = node_state.script_invocation.as_ref().unwrap();
-        assert_eq!(json["command"], "echo hello");
+        assert_eq!(json["command"], "exec 2>&1\necho hello");
         assert_eq!(json["language"], "shell");
         assert_eq!(json["timeout_ms"], 5000);
     }
 
     #[tokio::test]
-    async fn writes_stdout_and_stderr_logs() {
+    async fn writes_output_log() {
         let handler = CommandHandler;
         let mut node = Node::new("script_node");
         node.attrs.insert(
@@ -568,18 +588,14 @@ mod tests {
 
         let snapshot = run_store.state().await.unwrap();
         let node_state = snapshot.stage(&StageId::new("script_node", 1)).unwrap();
-        let stdout = node_state.stdout.as_deref().unwrap();
-        assert_eq!(command_log_text(&services, stdout).await.trim(), "hello");
-        let stderr = node_state.stderr.as_deref().unwrap();
-        assert_eq!(command_log_text(&services, stderr).await, "");
-        assert_eq!(node_state.stdout_bytes, Some(6));
-        assert_eq!(node_state.stderr_bytes, Some(0));
-        assert_eq!(node_state.streams_separated, Some(true));
+        let output = node_state.output.as_deref().unwrap();
+        assert_eq!(command_log_text(&services, output).await.trim(), "hello");
+        assert_eq!(node_state.output_bytes, Some(6));
         assert_eq!(node_state.live_streaming, Some(true));
     }
 
     #[tokio::test]
-    async fn writes_stderr_log_on_failure() {
+    async fn writes_stderr_to_output_log_on_failure() {
         let handler = CommandHandler;
         let mut node = Node::new("script_node");
         node.attrs.insert(
@@ -599,8 +615,8 @@ mod tests {
 
         let snapshot = run_store.state().await.unwrap();
         let node_state = snapshot.stage(&StageId::new("script_node", 1)).unwrap();
-        let stderr = node_state.stderr.as_deref().unwrap();
-        assert_eq!(command_log_text(&services, stderr).await.trim(), "oops");
+        let output = node_state.output.as_deref().unwrap();
+        assert_eq!(command_log_text(&services, output).await.trim(), "oops");
     }
 
     #[tokio::test]
@@ -827,7 +843,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn script_handler_captures_stderr() {
+    async fn script_handler_merges_stderr_into_output() {
         let handler = CommandHandler;
         let mut node = Node::new("script_node");
         node.attrs.insert(
@@ -844,13 +860,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome.status, StageOutcome::Succeeded);
-        let command_stderr = outcome.context_updates.get(keys::COMMAND_STDERR).unwrap();
+        let command_output = outcome.context_updates.get(keys::COMMAND_OUTPUT).unwrap();
         assert!(
-            command_text(&services, command_stderr)
+            command_text(&services, command_output)
                 .await
                 .contains("err"),
-            "command.stderr should contain 'err', got: {:?}",
-            command_stderr
+            "command.output should contain 'err', got: {:?}",
+            command_output
         );
     }
 
@@ -987,6 +1003,21 @@ mod tests {
         services
     }
 
+    struct RefreshingMinter {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::github_token_source::IatMinter for RefreshingMinter {
+        async fn mint(&self) -> anyhow::Result<fabro_github::InstallationToken> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            Ok(fabro_github::InstallationToken {
+                token:      format!("ghs_{call}"),
+                expires_at: chrono::Utc::now() + chrono::Duration::minutes(10),
+            })
+        }
+    }
+
     #[tokio::test]
     async fn executes_script_via_sandbox() {
         let spy = std::sync::Arc::new(SpySandbox::new(fabro_agent::sandbox::ExecResult {
@@ -1022,8 +1053,8 @@ mod tests {
         );
         assert_eq!(
             spy.captured_command().as_deref(),
-            Some("echo hello"),
-            "sandbox should receive the script as the command"
+            Some("exec 2>&1\necho hello"),
+            "sandbox should receive the wrapped script as the command"
         );
     }
 
@@ -1065,7 +1096,7 @@ mod tests {
         assert_eq!(outcome.status, StageOutcome::Succeeded);
         let captured = spy.captured_command().unwrap();
         assert!(
-            captured.starts_with("python3 -c ") && captured.contains("print"),
+            captured.starts_with("exec 2>&1\npython3 -c ") && captured.contains("print"),
             "sandbox command should invoke python3 with the script, got: {captured}"
         );
     }
@@ -1090,7 +1121,7 @@ mod tests {
 
         let mut services = make_spy_services(spy.clone());
         services
-            .env
+            .base_env
             .insert("MY_VAR".to_string(), "my_value".to_string());
 
         handler
@@ -1103,6 +1134,61 @@ mod tests {
             captured_env.get("MY_VAR").map(String::as_str),
             Some("my_value")
         );
+    }
+
+    #[tokio::test]
+    async fn refreshes_github_token_for_each_command_stage_when_near_expiry() {
+        let spy = std::sync::Arc::new(SpySandbox::new(fabro_agent::sandbox::ExecResult {
+            stdout:      String::new(),
+            stderr:      String::new(),
+            exit_code:   Some(0),
+            termination: CommandTermination::Exited,
+            duration_ms: 5,
+        }));
+        let minter = std::sync::Arc::new(RefreshingMinter {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut services = make_spy_services(spy.clone());
+        services.github_token = Some(std::sync::Arc::new(
+            crate::github_token_source::GitHubTokenSource::mintable(minter.clone()),
+        ));
+
+        let handler = CommandHandler;
+        let mut node = Node::new("script_node");
+        node.attrs
+            .insert("script".to_string(), AttrValue::String("true".to_string()));
+        let context = Context::new();
+        let graph = Graph::new("test");
+        let run_dir = tempfile::tempdir().unwrap();
+
+        handler
+            .execute(&node, &context, &graph, run_dir.path(), &services)
+            .await
+            .unwrap();
+        assert_eq!(
+            spy.captured_env_vars
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|env| env.get("GITHUB_TOKEN"))
+                .map(String::as_str),
+            Some("ghs_1")
+        );
+
+        handler
+            .execute(&node, &context, &graph, run_dir.path(), &services)
+            .await
+            .unwrap();
+        assert_eq!(
+            spy.captured_env_vars
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|env| env.get("GITHUB_TOKEN"))
+                .map(String::as_str),
+            Some("ghs_2")
+        );
+        assert_eq!(minter.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -1126,7 +1212,7 @@ mod tests {
         let mut services = make_spy_services(spy.clone());
         services.run = services
             .run
-            .with_cancel_requested(Some(Arc::new(AtomicBool::new(false))));
+            .with_cancel_token(tokio_util::sync::CancellationToken::new());
 
         handler
             .execute(&node, &context, &graph, run_dir.path(), &services)
@@ -1171,11 +1257,11 @@ mod tests {
         assert!(message.contains("timed out"), "got: {message}");
         assert!(
             message.contains("partial stdout"),
-            "timeout error should include stdout tail, got: {message}"
+            "timeout error should include output tail, got: {message}"
         );
         assert!(
             message.contains("partial stderr"),
-            "timeout error should include stderr tail, got: {message}"
+            "timeout error should include merged output tail, got: {message}"
         );
     }
 
@@ -1204,7 +1290,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn script_handler_failure_includes_stdout() {
+    async fn script_handler_failure_includes_output() {
         let handler = CommandHandler;
         let mut node = Node::new("script_node");
         node.attrs.insert(
@@ -1226,11 +1312,11 @@ mod tests {
         let reason = outcome.failure_reason().unwrap();
         assert!(
             reason.contains("build output"),
-            "failure_reason should contain stdout, got: {reason}"
+            "failure_reason should contain output, got: {reason}"
         );
         assert!(
             reason.contains("oops"),
-            "failure_reason should contain stderr, got: {reason}"
+            "failure_reason should contain merged stderr, got: {reason}"
         );
         assert!(
             reason.contains("exit code: 1"),
@@ -1259,12 +1345,8 @@ mod tests {
         assert!(err.to_string().contains("Failed to spawn script"));
         let stage_id = StageId::new("script_node", 1);
         assert!(
-            !command_log_path(run_dir.path(), &stage_id, CommandOutputStream::Stdout).exists(),
-            "spawn failure should remove pre-created stdout scratch log"
-        );
-        assert!(
-            !command_log_path(run_dir.path(), &stage_id, CommandOutputStream::Stderr).exists(),
-            "spawn failure should remove pre-created stderr scratch log"
+            !command_log_path(run_dir.path(), &stage_id).exists(),
+            "spawn failure should remove pre-created output scratch log"
         );
     }
 
@@ -1296,7 +1378,7 @@ mod tests {
             command_text(&services, command_output)
                 .await
                 .contains("build output"),
-            "command.output should contain stdout, got: {command_output:?}"
+            "command.output should contain output, got: {command_output:?}"
         );
     }
 }

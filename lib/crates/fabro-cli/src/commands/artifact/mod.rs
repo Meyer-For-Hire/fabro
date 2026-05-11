@@ -27,7 +27,7 @@ pub(super) async fn resolve_artifacts(
 ) -> Result<(RunId, Client, Vec<ArtifactEntry>)> {
     let ctx = base_ctx.with_target(server)?;
     let client = ctx.server().await?;
-    let run_id = client.resolve_run(run_selector).await?.run_id;
+    let run_id = client.resolve_run(run_selector).await?.id;
     let mut entries = Vec::new();
     for entry in client.list_run_artifacts(&run_id).await? {
         if node.is_some_and(|value| entry.node_slug != value) {

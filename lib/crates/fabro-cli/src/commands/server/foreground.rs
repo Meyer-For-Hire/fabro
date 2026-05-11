@@ -6,6 +6,7 @@ use fabro_config::bind::BindRequest;
 use fabro_config::daemon::ServerDaemon;
 use fabro_server::serve;
 use fabro_server::serve::ServeArgs;
+use fabro_types::settings::LogDestination;
 use fabro_util::terminal::Styles;
 
 /// Run `serve::serve_command` with scopeguards that write/remove the server
@@ -16,6 +17,7 @@ pub(crate) async fn serve_with_daemon_record(
     bind: BindRequest,
     storage_dir: PathBuf,
     styles: &'static Styles,
+    effective_log_destination: Option<LogDestination>,
 ) -> Result<()> {
     serve_args.bind = Some(bind.to_string());
 
@@ -41,6 +43,7 @@ pub(crate) async fn serve_with_daemon_record(
         serve_args,
         styles,
         Some(storage_dir),
+        effective_log_destination,
         move |resolved_bind| {
             ServerDaemon::new(pid, resolved_bind.clone(), log_path.clone()).write(&daemon_dir)
         },

@@ -26,16 +26,18 @@ pub use fabro_api::types::{
     ArtifactEntry, ArtifactListResponse, BillingByModel, BillingStageRef,
     CloseRunPullRequestResponse, CompletionContentPart, CompletionMessage, CompletionMessageRole,
     CompletionResponse, CompletionToolChoiceMode, CompletionUsage, CreateCompletionRequest,
-    CreateRunPullRequestRequest, CreateSecretRequest, DeleteSecretRequest, DiskUsageResponse,
-    DiskUsageRunRow, DiskUsageSummaryRow, ForkRequest, ForkResponse, MergeRunPullRequestRequest,
-    MergeRunPullRequestResponse, ModelReference, PaginatedEventList, PaginatedRunList,
-    PaginationMeta, PreflightResponse, PreviewUrlRequest, PreviewUrlResponse, PruneRunEntry,
-    PruneRunsRequest, PruneRunsResponse, RenderWorkflowGraphDirection, RenderWorkflowGraphRequest,
-    RewindRequest, RewindResponse, RunArtifactEntry, RunArtifactListResponse, RunBilling,
-    RunBillingStage, RunBillingTotals, RunError, RunManifest, RunStage, RunStatusResponse,
-    SandboxFileEntry, SandboxFileListResponse, SshAccessRequest, SshAccessResponse, StageState,
-    StartRunRequest, SubmitAnswerRequest, SystemFeatures, SystemInfoResponse, SystemRunCounts,
-    TimelineEntryResponse, WriteBlobResponse,
+    CreateRunPullRequestRequest, CreateSecretRequest, DeleteRunResponse, DeleteRunSandbox,
+    DeleteSecretRequest, DiskUsageResponse, DiskUsageRunRow, DiskUsageSummaryRow, ForkRequest,
+    ForkResponse, MergeRunPullRequestRequest, MergeRunPullRequestResponse, ModelReference,
+    PaginatedEventList, PaginatedRunList, PaginationMeta, PreflightResponse, PreviewUrlRequest,
+    PreviewUrlResponse, PruneRunEntry, PruneRunsRequest, PruneRunsResponse,
+    RenderWorkflowGraphDirection, RenderWorkflowGraphRequest, RewindRequest, RewindResponse,
+    RunArtifactEntry, RunArtifactListResponse, RunBilling, RunBillingStage, RunBillingTotals,
+    RunError, RunManifest, RunStage, SandboxDetails, SandboxFileEntry, SandboxFileListResponse,
+    SandboxService, SandboxServiceListResponse, SshAccessRequest, SshAccessResponse, StageHandler,
+    StageState, StartRunRequest, SubmitAnswerRequest, SystemFeatures, SystemInfoResponse,
+    SystemRepairRunIssue, SystemRepairRunsResponse, SystemRunCounts, TimelineEntryResponse,
+    VncPreviewResponse, WriteBlobResponse,
 };
 use fabro_auth::{
     CredentialSource, VaultCredentialSource, auth_issue_message, parse_credential_secret,
@@ -54,10 +56,11 @@ use fabro_llm::types::{
     ContentPart, FinishReason, Message as LlmMessage, Request as LlmRequest, Role, ToolChoice,
     ToolDefinition,
 };
-use fabro_model::{BilledModelUsage, BilledTokenCounts, Catalog, ModelTestMode, Provider};
+use fabro_model::{BilledTokenCounts, Catalog, ModelTestMode, Provider};
 use fabro_redact::redact_jsonl_line;
 use fabro_sandbox::daytona::{self, DaytonaSandbox};
-use fabro_sandbox::reconnect::reconnect;
+use fabro_sandbox::details::sandbox_details;
+use fabro_sandbox::reconnect::reconnect_for_run;
 use fabro_sandbox::{Sandbox, SandboxProvider};
 use fabro_slack::client::{PostedMessage as SlackPostedMessage, SlackClient};
 use fabro_slack::config::resolve_credentials as resolve_slack_credentials;
@@ -71,8 +74,6 @@ use fabro_store::{
 };
 #[cfg(test)]
 use fabro_types::BlockedReason;
-#[cfg(test)]
-use fabro_types::CommandOutputStream;
 use fabro_types::settings::run::RunMode;
 use fabro_types::settings::server::{
     GithubIntegrationSettings, GithubIntegrationStrategy, LogDestination,
@@ -80,7 +81,7 @@ use fabro_types::settings::server::{
 use fabro_types::settings::{InterpString, RunNamespace};
 use fabro_types::{
     EventBody, InterviewQuestionRecord, Principal, PullRequestRecord, QuestionType, RunBlobId,
-    RunControlAction, RunEvent, RunId, ServerSettings,
+    RunControlAction, RunEvent, RunId, ServerSettings, SessionCapability,
 };
 use fabro_util::error::{SharedError, collect_causes, render_with_causes};
 use fabro_util::version::FABRO_VERSION;
@@ -111,6 +112,7 @@ use tokio::task::spawn_blocking;
 use tokio::time::{sleep, timeout};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::{BroadcastStream, UnboundedReceiverStream};
+use tokio_util::sync::CancellationToken;
 use tower::{ServiceExt, service_fn};
 use tracing::{Instrument, debug, error, info, warn};
 use ulid::Ulid;
@@ -125,7 +127,7 @@ use crate::ip_allowlist::{IpAllowlistConfig, ip_allowlist_middleware};
 use crate::jwt_auth::{self, AuthMode};
 use crate::principal_middleware::{
     AuthContextSlot, RequestAuth, RequestAuthContext, RequireRunBlob, RequireRunScoped,
-    RequireStageArtifact, RequiredUser, principal_middleware,
+    RequireRunStageScoped, RequireStageArtifact, RequiredUser, principal_middleware,
 };
 use crate::request_id::{self, RequestId};
 use crate::run_files::{FilesInFlight, new_files_in_flight};
@@ -138,6 +140,7 @@ use crate::{
 
 mod handler;
 
+pub(crate) use handler::events::EventListParams;
 #[cfg(test)]
 pub(in crate::server) use handler::events::filtered_global_events;
 pub(crate) use handler::graph::render_graph_bytes;
@@ -194,10 +197,18 @@ struct ManagedRun {
     // Populated when running:
     answer_transport:   Option<RunAnswerTransport>,
     accepted_questions: HashSet<String>,
+    /// Stage IDs of currently steerable API-mode (SDK) agent sessions,
+    /// keyed to the session id that owns the active lease. Used by the
+    /// steerability predicate.
+    active_api_stages:  HashMap<StageId, String>,
+    /// Stage IDs of currently running CLI-mode agent sessions, observed
+    /// from `agent.cli.started/completed` plus `stage.completed`/
+    /// `stage.failed` backstops.
+    active_cli_stages:  HashSet<StageId>,
     event_tx:           Option<broadcast::Sender<RunEvent>>,
     checkpoint:         Option<Checkpoint>,
     cancel_tx:          Option<oneshot::Sender<()>>,
-    cancel_token:       Option<Arc<AtomicBool>>,
+    cancel_token:       Option<CancellationToken>,
     worker_pid:         Option<u32>,
     worker_pgid:        Option<u32>,
     run_dir:            Option<std::path::PathBuf>,
@@ -243,7 +254,8 @@ enum RunAnswerTransport {
         control_tx: mpsc::Sender<WorkerControlEnvelope>,
     },
     InProcess {
-        interviewer: Arc<ControlInterviewer>,
+        interviewer:  Arc<ControlInterviewer>,
+        steering_hub: Arc<fabro_workflow::SteeringHub>,
     },
 }
 
@@ -267,7 +279,7 @@ impl RunAnswerTransport {
                     .map_err(|_| AnswerTransportError::Timeout)?
                     .map_err(|_| AnswerTransportError::Closed)
             }
-            Self::InProcess { interviewer } => interviewer
+            Self::InProcess { interviewer, .. } => interviewer
                 .submit(qid, submission)
                 .await
                 .map_err(|_| AnswerTransportError::Closed),
@@ -283,8 +295,62 @@ impl RunAnswerTransport {
                     .map_err(|_| AnswerTransportError::Timeout)?
                     .map_err(|_| AnswerTransportError::Closed)
             }
-            Self::InProcess { interviewer } => {
+            Self::InProcess { interviewer, .. } => {
                 interviewer.cancel_all().await;
+                Ok(())
+            }
+        }
+    }
+
+    /// Forward a steer to the worker (subprocess) or directly into the
+    /// in-process steering hub.
+    async fn steer(&self, text: String, actor: Principal) -> Result<(), AnswerTransportError> {
+        match self {
+            Self::Subprocess { control_tx } => {
+                let message = WorkerControlEnvelope::steer(text, actor);
+                timeout(WORKER_CONTROL_ENQUEUE_TIMEOUT, control_tx.send(message))
+                    .await
+                    .map_err(|_| AnswerTransportError::Timeout)?
+                    .map_err(|_| AnswerTransportError::Closed)
+            }
+            Self::InProcess { steering_hub, .. } => {
+                steering_hub.deliver_steer(text, Some(actor));
+                Ok(())
+            }
+        }
+    }
+
+    async fn interrupt(&self, actor: Principal) -> Result<(), AnswerTransportError> {
+        match self {
+            Self::Subprocess { control_tx } => {
+                let message = WorkerControlEnvelope::interrupt(actor);
+                timeout(WORKER_CONTROL_ENQUEUE_TIMEOUT, control_tx.send(message))
+                    .await
+                    .map_err(|_| AnswerTransportError::Timeout)?
+                    .map_err(|_| AnswerTransportError::Closed)
+            }
+            Self::InProcess { steering_hub, .. } => {
+                steering_hub.interrupt(Some(&actor));
+                Ok(())
+            }
+        }
+    }
+
+    async fn interrupt_then_steer(
+        &self,
+        text: String,
+        actor: Principal,
+    ) -> Result<(), AnswerTransportError> {
+        match self {
+            Self::Subprocess { control_tx } => {
+                let message = WorkerControlEnvelope::interrupt_then_steer(text, actor);
+                timeout(WORKER_CONTROL_ENQUEUE_TIMEOUT, control_tx.send(message))
+                    .await
+                    .map_err(|_| AnswerTransportError::Timeout)?
+                    .map_err(|_| AnswerTransportError::Closed)
+            }
+            Self::InProcess { steering_hub, .. } => {
+                steering_hub.interrupt_then_steer(&text, Some(&actor));
                 Ok(())
             }
         }
@@ -455,19 +521,20 @@ pub struct AppState {
     pub(crate) files_in_flight: FilesInFlight,
     pull_request_create_locks: PullRequestCreateLocks,
 
-    pub(crate) vault:               Arc<AsyncRwLock<Vault>>,
-    pub(super) server_secrets:      ServerSecrets,
-    pub(crate) llm_source:          Arc<dyn CredentialSource>,
-    manifest_run_defaults:          RwLock<Arc<RunLayer>>,
-    manifest_run_settings:          RwLock<std::result::Result<RunNamespace, SharedError>>,
-    pub(crate) server_settings:     RwLock<Arc<ServerSettings>>,
-    pub(crate) env_lookup:          EnvLookup,
+    pub(crate) vault: Arc<AsyncRwLock<Vault>>,
+    pub(super) server_secrets: ServerSecrets,
+    pub(crate) llm_source: Arc<dyn CredentialSource>,
+    manifest_run_defaults: RwLock<Arc<RunLayer>>,
+    manifest_run_settings: RwLock<std::result::Result<RunNamespace, SharedError>>,
+    pub(crate) server_settings: RwLock<Arc<ServerSettings>>,
+    pub(crate) env_lookup: EnvLookup,
     pub(crate) github_api_base_url: String,
-    http_client:                    Option<fabro_http::HttpClient>,
-    shutting_down:                  AtomicBool,
-    registry_factory_override:      Option<Box<RegistryFactoryOverride>>,
-    slack_service:                  Option<Arc<SlackService>>,
-    slack_started:                  AtomicBool,
+    http_client: Option<fabro_http::HttpClient>,
+    shutdown: CancellationToken,
+    shutting_down: AtomicBool,
+    registry_factory_override: Option<Box<RegistryFactoryOverride>>,
+    slack_service: Option<Arc<SlackService>>,
+    slack_started: AtomicBool,
 }
 
 type PullRequestCreateLocks = Arc<Mutex<HashMap<RunId, Arc<AsyncMutex<()>>>>>;
@@ -527,6 +594,7 @@ pub(crate) struct AppStateConfig {
     pub(crate) env_lookup:                EnvLookup,
     pub(crate) github_api_base_url:       Option<String>,
     pub(crate) http_client:               Option<fabro_http::HttpClient>,
+    pub(crate) shutdown:                  CancellationToken,
 }
 
 #[derive(Clone)]
@@ -536,17 +604,40 @@ pub(crate) struct ResolvedAppStateSettings {
     pub(crate) manifest_run_settings: std::result::Result<RunNamespace, SharedError>,
 }
 
-fn accumulate_model_billing(entry: &mut ModelBillingTotals, usage: &BilledModelUsage) {
-    let tokens = usage.tokens();
-    entry.stages += 1;
-    entry.billing.input_tokens += tokens.input_tokens;
-    entry.billing.output_tokens += tokens.output_tokens;
-    entry.billing.reasoning_tokens += tokens.reasoning_tokens;
-    entry.billing.cache_read_tokens += tokens.cache_read_tokens;
-    entry.billing.cache_write_tokens += tokens.cache_write_tokens;
-    entry.billing.total_tokens += tokens.total_tokens();
-    if let Some(value) = usage.total_usd_micros {
-        *entry.billing.total_usd_micros.get_or_insert(0) += value;
+fn accumulate_billing_rollup(
+    accumulator: &mut BillingAccumulator,
+    rollup: &fabro_workflow::ProjectionBillingRollup,
+) {
+    accumulator.total_runs += 1;
+    accumulator.total_runtime_secs += rollup.runtime_ms as f64 / 1000.0;
+    for model in &rollup.by_model {
+        let entry = accumulator
+            .by_model
+            .entry(model.model.model_id.clone())
+            .or_default();
+        entry.stages += model.stages;
+        entry.billing.add_counts(&model.billing);
+    }
+}
+
+pub(crate) fn run_stage_from_stage_id(
+    stage_id: &StageId,
+    name: impl Into<String>,
+    status: StageState,
+    duration_secs: Option<f64>,
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
+    handler: StageHandler,
+) -> RunStage {
+    RunStage {
+        id: stage_id.to_string(),
+        name: name.into(),
+        handler,
+        status,
+        duration_secs,
+        node_id: stage_id.node_id().to_string(),
+        visit: std::num::NonZeroU32::new(stage_id.visit())
+            .expect("StageId stores a non-zero visit"),
+        started_at,
     }
 }
 
@@ -700,7 +791,11 @@ impl AppState {
                     .filter(|token| !token.is_empty())
                     .map(str::to_string);
                 match token {
-                    Some(token) => Ok(Some(fabro_github::GitHubCredentials::Token(token))),
+                    Some(token) => {
+                        fabro_github::validate_static_github_token(&token)
+                            .map_err(|err| err.to_string())?;
+                        Ok(Some(fabro_github::GitHubCredentials::Pat(token)))
+                    }
                     None => Err(
                         "GITHUB_TOKEN not configured — run fabro install or set GITHUB_TOKEN"
                             .to_string(),
@@ -713,6 +808,10 @@ impl AppState {
     fn begin_shutdown(&self) {
         self.shutting_down.store(true, Ordering::Relaxed);
         self.scheduler_notify.notify_waiters();
+    }
+
+    pub(crate) fn shutdown_token(&self) -> CancellationToken {
+        self.shutdown.clone()
     }
 
     fn is_shutting_down(&self) -> bool {
@@ -856,6 +955,11 @@ pub struct RouterOptions {
     pub static_asset_root:           Option<PathBuf>,
     pub github_endpoints:            Option<Arc<GithubEndpoints>>,
     pub github_webhook_ip_allowlist: Option<Arc<IpAllowlistConfig>>,
+    /// Set when serving with the `--watch-web` dev flag. The static-file
+    /// handler then refuses to fall back to the embedded SPA snapshot and
+    /// returns a 503 "build in progress" page on miss, so developers see
+    /// their edits or a clear signal — never stale embedded bytes.
+    pub watch_web:                   bool,
 }
 
 impl Default for RouterOptions {
@@ -865,6 +969,7 @@ impl Default for RouterOptions {
             static_asset_root:           None,
             github_endpoints:            None,
             github_webhook_ip_allowlist: None,
+            watch_web:                   false,
         }
     }
 }
@@ -883,6 +988,7 @@ pub fn build_router_with_options(
     start_optional_slack_service(&state);
     let web_enabled = options.web_enabled;
     let static_asset_root = options.static_asset_root.clone();
+    let watch_web = options.watch_web;
     let webhook_ip_allowlist = options.github_webhook_ip_allowlist;
     let translation_state = Arc::clone(&state);
     let state_for_canonical_host = Arc::clone(&state);
@@ -961,6 +1067,7 @@ pub fn build_router_with_options(
                             &path,
                             &headers,
                             static_asset_root.as_deref(),
+                            watch_web,
                         )
                         .await,
                     )
@@ -1164,15 +1271,11 @@ async fn github_webhook(
 
 fn system_features(
     server_settings: &ServerSettings,
-    manifest_run_settings: &std::result::Result<RunNamespace, SharedError>,
+    _manifest_run_settings: &std::result::Result<RunNamespace, SharedError>,
 ) -> SystemFeatures {
     let session_sandboxes = server_settings.features.session_sandboxes;
-    let retros = manifest_run_settings
-        .as_ref()
-        .is_ok_and(|settings| settings.execution.retros);
     SystemFeatures {
         session_sandboxes: Some(session_sandboxes),
-        retros:            Some(retros),
     }
 }
 
@@ -1401,6 +1504,7 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         env_lookup,
         github_api_base_url,
         http_client,
+        shutdown,
     } = config;
 
     let vault = Arc::new(AsyncRwLock::new(Vault::load(vault_path)?));
@@ -1462,6 +1566,7 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         env_lookup: Arc::clone(&env_lookup),
         github_api_base_url,
         http_client,
+        shutdown,
         shutting_down: AtomicBool::new(false),
         registry_factory_override,
         slack_service,
@@ -1471,42 +1576,48 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
 
 const MAX_PAGE_OFFSET: u32 = 1_000_000;
 
+enum DeleteRunOutcome {
+    NoContent,
+    Preserved(DeleteRunResponse),
+}
+
 async fn delete_run_internal(
     state: &Arc<AppState>,
     id: RunId,
     force: bool,
-) -> Result<(), Response> {
+) -> Result<DeleteRunOutcome, Response> {
     if !force {
         reject_active_delete_without_force(state.as_ref(), &id).await?;
     }
 
-    let managed_run = if let Ok(mut runs) = state.runs.lock() {
+    let mut managed_run = if let Ok(mut runs) = state.runs.lock() {
         runs.remove(&id)
     } else {
         None
     };
+    let durable_status = if managed_run.is_some() {
+        load_durable_run_status(state.as_ref(), &id).await
+    } else {
+        None
+    };
+    let should_signal_cancel = !durable_status.is_some_and(RunStatus::is_terminal);
 
-    if let Some(mut managed_run) = managed_run {
-        if let Some(token) = &managed_run.cancel_token {
-            token.store(true, Ordering::SeqCst);
-        }
-        if let Some(answer_transport) = managed_run.answer_transport.clone() {
-            let _ = answer_transport.cancel_run().await;
-        }
-        if let Some(cancel_tx) = managed_run.cancel_tx.take() {
-            let _ = cancel_tx.send(());
+    if let Some(managed_run) = managed_run.as_mut() {
+        if should_signal_cancel {
+            if let Some(token) = &managed_run.cancel_token {
+                token.cancel();
+            }
+            if let Some(answer_transport) = managed_run.answer_transport.clone() {
+                let _ = answer_transport.cancel_run().await;
+            }
+            if let Some(cancel_tx) = managed_run.cancel_tx.take() {
+                let _ = cancel_tx.send(());
+            }
         }
         // Terminal runs can still carry a stale worker PID briefly after their
         // completion events land, so avoid paying the full cancellation grace.
-        let delete_grace = if matches!(
-            managed_run.status,
-            RunStatus::Submitted
-                | RunStatus::Queued
-                | RunStatus::Starting
-                | RunStatus::Running
-                | RunStatus::Blocked { .. }
-                | RunStatus::Paused { .. }
-        ) {
+        let delete_grace = if should_signal_cancel && managed_run.status.requires_force_to_delete()
+        {
             WORKER_CANCEL_GRACE
         } else {
             TERMINAL_DELETE_WORKER_GRACE
@@ -1517,6 +1628,11 @@ async fn delete_run_internal(
             delete_grace,
         )
         .await;
+    }
+
+    let delete_outcome = delete_run_sandbox_resource(state, id, force).await?;
+
+    if let Some(mut managed_run) = managed_run {
         if let Some(run_dir) = managed_run.run_dir.take() {
             remove_run_dir(&run_dir).map_err(|err| {
                 ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
@@ -1540,7 +1656,97 @@ async fn delete_run_internal(
         .map_err(|err| {
             ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
         })?;
-    Ok(())
+    Ok(delete_outcome)
+}
+
+async fn load_durable_run_status(state: &AppState, id: &RunId) -> Option<RunStatus> {
+    let run_store = state.store.open_run(id).await.ok()?;
+    let projection = run_store.state().await.ok()?;
+    Some(projection.status)
+}
+
+async fn delete_run_sandbox_resource(
+    state: &Arc<AppState>,
+    id: RunId,
+    force: bool,
+) -> Result<DeleteRunOutcome, Response> {
+    let Ok(run_store) = state.store.open_run(&id).await else {
+        return Ok(DeleteRunOutcome::NoContent);
+    };
+    let projection = match run_store.state().await {
+        Ok(projection) => projection,
+        Err(err) if force => {
+            tracing::warn!(
+                run_id = %id,
+                error = %render_with_causes(&err.to_string(), &collect_causes(&err)),
+                "Skipping sandbox provider delete because run projection cannot be loaded"
+            );
+            return Ok(DeleteRunOutcome::NoContent);
+        }
+        Err(err) => {
+            return Err(
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+            );
+        }
+    };
+    let delete_started = matches!(projection.status, RunStatus::Removing);
+    let can_mark_removing = projection.status.can_transition_to(RunStatus::Removing);
+    if !delete_started && can_mark_removing {
+        workflow_event::append_event(&run_store, &id, &workflow_event::Event::RunRemoving)
+            .await
+            .map_err(|err| {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
+            })?;
+    }
+
+    let preserve = projection.spec().settings.run.sandbox.preserve;
+    let Some(record) = projection.sandbox else {
+        return Ok(DeleteRunOutcome::NoContent);
+    };
+    if preserve {
+        return Ok(DeleteRunOutcome::Preserved(DeleteRunResponse {
+            deleted:           true,
+            sandbox_preserved: true,
+            sandbox:           DeleteRunSandbox {
+                provider: record.provider,
+                id:       record
+                    .runtime
+                    .as_ref()
+                    .map(|runtime| runtime.id.clone())
+                    .unwrap_or_default(),
+            },
+        }));
+    }
+
+    let daytona_api_key = state.vault_or_env(EnvVars::DAYTONA_API_KEY);
+    let sandbox = match reconnect_for_run(&record, daytona_api_key, Some(id)).await {
+        Ok(sandbox) => sandbox,
+        Err(err) if force || delete_started => {
+            tracing::warn!(
+                run_id = %id,
+                error = %render_with_causes(&err.to_string(), &collect_causes(err.as_ref())),
+                "Skipping sandbox provider delete during run deletion"
+            );
+            return Ok(DeleteRunOutcome::NoContent);
+        }
+        Err(err) => {
+            let detail = render_with_causes(&err.to_string(), &collect_causes(err.as_ref()));
+            return Err(ApiError::new(StatusCode::CONFLICT, detail).into_response());
+        }
+    };
+    if let Err(err) = sandbox.delete().await {
+        if force || delete_started {
+            tracing::warn!(
+                run_id = %id,
+                error = %err.display_with_causes(),
+                "Skipping failed sandbox provider delete during run deletion"
+            );
+            return Ok(DeleteRunOutcome::NoContent);
+        }
+        return Err(ApiError::new(StatusCode::CONFLICT, err.display_with_causes()).into_response());
+    }
+
+    Ok(DeleteRunOutcome::NoContent)
 }
 
 async fn reject_active_delete_without_force(
@@ -1553,15 +1759,7 @@ async fn reject_active_delete_without_force(
         .ok()
         .and_then(|runs| runs.get(run_id).map(|managed_run| managed_run.status));
     if let Some(status) = managed_status {
-        if matches!(
-            status,
-            RunStatus::Submitted
-                | RunStatus::Queued
-                | RunStatus::Starting
-                | RunStatus::Running
-                | RunStatus::Blocked { .. }
-                | RunStatus::Paused { .. }
-        ) {
+        if status.requires_force_to_delete() {
             return Err(ApiError::new(
                 StatusCode::CONFLICT,
                 active_run_delete_message(*run_id, status),
@@ -1572,11 +1770,13 @@ async fn reject_active_delete_without_force(
     }
 
     match state.store.runs().find(run_id).await {
-        Ok(Some(summary)) if summary.status.is_active() => Err(ApiError::new(
-            StatusCode::CONFLICT,
-            active_run_delete_message(*run_id, summary.status),
-        )
-        .into_response()),
+        Ok(Some(summary)) if summary.lifecycle.status.requires_force_to_delete() => {
+            Err(ApiError::new(
+                StatusCode::CONFLICT,
+                active_run_delete_message(*run_id, summary.lifecycle.status),
+            )
+            .into_response())
+        }
         Ok(_) => Ok(()),
         Err(err) => {
             Err(ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response())
@@ -1752,6 +1952,8 @@ fn octet_stream_response(bytes: Bytes) -> Response {
 fn clear_live_run_state(run: &mut ManagedRun) {
     run.answer_transport = None;
     run.accepted_questions.clear();
+    run.active_api_stages.clear();
+    run.active_cli_stages.clear();
     run.event_tx = None;
     run.cancel_tx = None;
     run.cancel_token = None;
@@ -1845,24 +2047,25 @@ pub(crate) async fn reconcile_incomplete_runs_on_startup(
     let mut reconciled = 0usize;
 
     for summary in summaries {
-        if !should_reconcile_run_on_startup(summary.status) {
+        if !should_reconcile_run_on_startup(summary.lifecycle.status) {
             continue;
         }
 
-        let run_store = state.store.open_run(&summary.run_id).await?;
+        let run_store = state.store.open_run(&summary.id).await?;
         let (error, reason) = failure_for_incomplete_run(
-            summary.pending_control,
+            summary.lifecycle.pending_control,
             "Fabro server restarted before the run reached a terminal state.".to_string(),
         );
         workflow_event::append_event(
             &run_store,
-            &summary.run_id,
+            &summary.id,
             &workflow_event::Event::WorkflowRunFailed {
                 error,
                 duration_ms: 0,
                 reason,
                 git_commit_sha: None,
                 final_patch: None,
+                diff_summary: None,
             },
         )
         .await?;
@@ -1899,7 +2102,7 @@ async fn persist_shutdown_run_failures(
     for run_id in run_ids {
         let run_store = state.store.open_run(&run_id).await?;
         let run_state = run_store.state().await?;
-        if run_state.status.is_some_and(RunStatus::is_terminal) {
+        if run_state.status.is_terminal() {
             continue;
         }
 
@@ -1916,6 +2119,7 @@ async fn persist_shutdown_run_failures(
                 reason,
                 git_commit_sha: None,
                 final_patch: None,
+                diff_summary: None,
             },
         )
         .await?;
@@ -1981,6 +2185,11 @@ async fn shutdown_active_workers_with_grace(
 
 async fn persist_cancelled_run_status(state: &AppState, run_id: RunId) -> anyhow::Result<()> {
     let run_store = state.store.open_run(&run_id).await?;
+    let run_state = run_store.state().await?;
+    if run_state.status.is_terminal() {
+        return Ok(());
+    }
+
     workflow_event::append_event(
         &run_store,
         &run_id,
@@ -1990,6 +2199,7 @@ async fn persist_cancelled_run_status(state: &AppState, run_id: RunId) -> anyhow
             reason:         FailureReason::Cancelled,
             git_commit_sha: None,
             final_patch:    None,
+            diff_summary:   None,
         },
     )
     .await
@@ -2028,6 +2238,7 @@ async fn fail_run_before_execution(
                     reason,
                     git_commit_sha: None,
                     final_patch: None,
+                    diff_summary: None,
                 },
             )
             .await
@@ -2079,6 +2290,8 @@ fn managed_run(
         enqueued_at: Instant::now(),
         answer_transport: None,
         accepted_questions: HashSet::new(),
+        active_api_stages: HashMap::new(),
+        active_cli_stages: HashSet::new(),
         event_tx: None,
         checkpoint: None,
         cancel_tx: None,
@@ -2106,7 +2319,7 @@ async fn load_pending_control(
         .runs()
         .find(&run_id)
         .await?
-        .and_then(|summary| summary.pending_control))
+        .and_then(|summary| summary.lifecycle.pending_control))
 }
 
 fn fail_managed_run(state: &Arc<AppState>, run_id: RunId, reason: FailureReason, message: String) {
@@ -2174,21 +2387,63 @@ fn update_live_run_from_event(state: &AppState, run_id: RunId, event: &RunEvent)
                 reason: props.reason,
             };
             managed_run.error = None;
+            managed_run.active_api_stages.clear();
+            managed_run.active_cli_stages.clear();
         }
         EventBody::RunFailed(props) => {
             managed_run.status = RunStatus::Failed {
                 reason: props.reason,
             };
             managed_run.error = Some(props.error.clone());
+            managed_run.active_api_stages.clear();
+            managed_run.active_cli_stages.clear();
         }
-        EventBody::RunArchived(_) => {
-            if let Some(prior) = managed_run.status.terminal_status() {
-                managed_run.status = RunStatus::Archived { prior };
+        // Track API-mode steerable sessions. Activated/deactivated are
+        // leased by session id so stale deactivations cannot clear a newer
+        // binding for the same stage.
+        EventBody::AgentSessionActivated(props)
+            if props.capabilities.contains(&SessionCapability::Steer) =>
+        {
+            if let (Some(stage_id), Some(session_id)) =
+                (event.stage_id.as_ref(), event.session_id.as_ref())
+            {
+                managed_run
+                    .active_api_stages
+                    .insert(stage_id.clone(), session_id.clone());
             }
         }
-        EventBody::RunUnarchived(_) => {
-            if let RunStatus::Archived { prior } = managed_run.status {
-                managed_run.status = prior.into();
+        EventBody::AgentSessionDeactivated(_) => {
+            if let (Some(stage_id), Some(session_id)) =
+                (event.stage_id.as_ref(), event.session_id.as_ref())
+            {
+                if managed_run
+                    .active_api_stages
+                    .get(stage_id)
+                    .is_some_and(|current| current == session_id)
+                {
+                    managed_run.active_api_stages.remove(stage_id);
+                }
+            }
+        }
+        // Track CLI-mode agent stages. CLI started/completed are coarser
+        // and sometimes fail to emit `completed` on error paths — the
+        // stage.completed/stage.failed handler below is the backstop.
+        EventBody::AgentCliStarted(_) => {
+            if let Some(stage_id) = event.stage_id.as_ref() {
+                managed_run.active_cli_stages.insert(stage_id.clone());
+            }
+        }
+        EventBody::AgentCliCompleted(_) => {
+            if let Some(stage_id) = &event.stage_id {
+                managed_run.active_cli_stages.remove(stage_id);
+            }
+        }
+        // Stage lifecycle backstop: cover both completion and failure
+        // paths so a failing CLI stage doesn't strand its entry.
+        EventBody::StageCompleted(_) | EventBody::StageFailed(_) => {
+            if let Some(stage_id) = &event.stage_id {
+                managed_run.active_api_stages.remove(stage_id);
+                managed_run.active_cli_stages.remove(stage_id);
             }
         }
         _ => {}
@@ -2232,7 +2487,7 @@ async fn append_worker_exit_failure(
         }
     };
 
-    let terminal = state.status.is_some_and(RunStatus::is_terminal);
+    let terminal = state.status.is_terminal();
     if terminal {
         return;
     }
@@ -2251,6 +2506,7 @@ async fn append_worker_exit_failure(
             reason,
             git_commit_sha: None,
             final_patch: None,
+            diff_summary: None,
         },
     )
     .await
@@ -2379,26 +2635,16 @@ async fn load_pending_interview(
     run_id: RunId,
     qid: &str,
 ) -> Result<LoadedPendingInterview, Response> {
-    let run_store = match state.store.open_run_reader(&run_id).await {
-        Ok(run_store) => run_store,
-        Err(fabro_store::Error::RunNotFound(_)) => {
-            return Err(ApiError::not_found("Run not found.").into_response());
-        }
+    let cached = match state.store.get_cached_run(&run_id).await {
+        Ok(Some(cached)) => cached,
+        Ok(None) => return Err(ApiError::not_found("Run not found.").into_response()),
         Err(err) => {
             return Err(
                 ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
             );
         }
     };
-    let run_state = match run_store.state().await {
-        Ok(run_state) => run_state,
-        Err(err) => {
-            return Err(
-                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
-            );
-        }
-    };
-    let Some(record) = run_state.pending_interviews.get(qid) else {
+    let Some(record) = cached.projection.pending_interviews.get(qid) else {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             "Question no longer exists or was already answered.",
@@ -2525,31 +2771,31 @@ fn answer_from_request(
     req: SubmitAnswerRequest,
     question: &InterviewQuestionRecord,
 ) -> Result<Answer, Response> {
-    if let Some(key) = req.selected_option_key {
-        let option = question
-            .options
-            .iter()
-            .find(|option| option.key == key)
-            .cloned();
-        match option {
-            Some(option) => Ok(Answer::selected(key, option)),
-            None => Err(ApiError::bad_request("Invalid option key.").into_response()),
-        }
-    } else if !req.selected_option_keys.is_empty() {
-        for key in &req.selected_option_keys {
-            let valid = question.options.iter().any(|option| option.key == *key);
-            if !valid {
-                return Err(ApiError::bad_request("Invalid option key.").into_response());
+    match req {
+        SubmitAnswerRequest::YesRequest(_) => Ok(Answer::yes()),
+        SubmitAnswerRequest::NoRequest(_) => Ok(Answer::no()),
+        SubmitAnswerRequest::SelectedRequest(req) => {
+            let key = req.option_key;
+            let option = question
+                .options
+                .iter()
+                .find(|option| option.key == key)
+                .cloned();
+            match option {
+                Some(option) => Ok(Answer::selected(key, option)),
+                None => Err(ApiError::bad_request("Invalid option key.").into_response()),
             }
         }
-        Ok(Answer::multi_selected(req.selected_option_keys))
-    } else if let Some(value) = req.value {
-        Ok(Answer::text(value))
-    } else {
-        Err(ApiError::bad_request(
-            "One of value, selected_option_key, or selected_option_keys is required.",
-        )
-        .into_response())
+        SubmitAnswerRequest::MultiSelectedRequest(req) => {
+            for key in &req.option_keys {
+                let valid = question.options.iter().any(|option| option.key == *key);
+                if !valid {
+                    return Err(ApiError::bad_request("Invalid option key.").into_response());
+                }
+            }
+            Ok(Answer::multi_selected(req.option_keys))
+        }
+        SubmitAnswerRequest::TextRequest(req) => Ok(Answer::text(req.text)),
     }
 }
 
@@ -2581,12 +2827,12 @@ async fn execute_run_in_process(state: Arc<AppState>, run_id: RunId) {
         };
 
         let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
-        let cancel_token = Arc::new(AtomicBool::new(false));
+        let cancel_token = CancellationToken::new();
         let (event_tx, _) = broadcast::channel(256);
 
         managed_run.status = RunStatus::Starting;
         managed_run.cancel_tx = Some(cancel_tx);
-        managed_run.cancel_token = Some(Arc::clone(&cancel_token));
+        managed_run.cancel_token = Some(cancel_token.clone());
         managed_run.event_tx = Some(event_tx);
 
         (
@@ -2614,6 +2860,7 @@ async fn execute_run_in_process(state: Arc<AppState>, run_id: RunId) {
         .as_ref()
         .map(|factory| Arc::new(factory(Arc::clone(&interview_runtime))));
     let emitter = Arc::new(emitter);
+    let steering_hub = Arc::new(fabro_workflow::SteeringHub::new(Arc::clone(&emitter)));
 
     // Transition to Running, populate interviewer
     let cancelled_during_setup = {
@@ -2622,7 +2869,8 @@ async fn execute_run_in_process(state: Arc<AppState>, run_id: RunId) {
             if managed_run.status == RunStatus::Starting {
                 managed_run.status = RunStatus::Running;
                 managed_run.answer_transport = Some(RunAnswerTransport::InProcess {
-                    interviewer: Arc::clone(&interviewer),
+                    interviewer:  Arc::clone(&interviewer),
+                    steering_hub: Arc::clone(&steering_hub),
                 });
                 false
             } else {
@@ -2679,7 +2927,7 @@ async fn execute_run_in_process(state: Arc<AppState>, run_id: RunId) {
     };
     let server_settings = state.server_settings();
     let github_settings = &server_settings.server.integrations.github;
-    if cancel_token.load(Ordering::SeqCst) {
+    if cancel_token.is_cancelled() {
         finish_cancelled_run_before_execution(&state, run_id).await;
         return;
     }
@@ -2693,7 +2941,7 @@ async fn execute_run_in_process(state: Arc<AppState>, run_id: RunId) {
                 .is_some_and(|origin| !origin.trim().is_empty());
         let pull_request_can_use_github_credentials =
             settings.execution.mode != RunMode::DryRun && settings.pull_request.is_some();
-        if !github_settings.permissions.is_empty() {
+        if settings.integrations.github.is_token_requested() {
             state.github_credentials(github_settings)
         } else if clone_can_use_github_credentials || pull_request_can_use_github_credentials {
             match state.github_credentials(github_settings) {
@@ -2714,7 +2962,7 @@ async fn execute_run_in_process(state: Arc<AppState>, run_id: RunId) {
     let github_app = match github_app_result {
         Ok(github_app) => github_app,
         Err(e) => {
-            if cancel_token.load(Ordering::SeqCst) {
+            if cancel_token.is_cancelled() {
                 finish_cancelled_run_before_execution(&state, run_id).await;
                 return;
             }
@@ -2729,21 +2977,19 @@ async fn execute_run_in_process(state: Arc<AppState>, run_id: RunId) {
             return;
         }
     };
-    let github_permissions = github_settings
-        .permissions
-        .iter()
-        .map(|(name, value)| {
-            let resolved = value
-                .resolve(process_env_var)
-                .map_or_else(|_| value.as_source(), |resolved| resolved.value);
-            (name.clone(), resolved)
-        })
-        .collect();
+    let github_permissions = persisted
+        .run_spec()
+        .settings
+        .run
+        .integrations
+        .github
+        .resolve_permissions(process_env_var);
     let services = operations::StartServices {
         run_id,
-        cancel_token: Some(Arc::clone(&cancel_token)),
+        cancel_token: cancel_token.clone(),
         emitter: Arc::clone(&emitter),
         interviewer: Arc::clone(&interview_runtime),
+        steering_hub: Arc::clone(&steering_hub),
         run_store: run_store.clone().into(),
         event_sink: workflow_event::RunEventSink::store(run_store.clone()),
         artifact_sink: Some(ArtifactSink::Store(state.artifact_store.clone())),
@@ -2765,7 +3011,7 @@ async fn execute_run_in_process(state: Arc<AppState>, run_id: RunId) {
     let result = tokio::select! {
         result = execution => ExecutionResult::Completed(Box::new(result)),
         _ = cancel_rx => {
-            cancel_token.store(true, Ordering::SeqCst);
+            cancel_token.cancel();
             ExecutionResult::CancelledBySignal
         }
     };
@@ -2776,9 +3022,9 @@ async fn execute_run_in_process(state: Arc<AppState>, run_id: RunId) {
         }
     }
 
-    // Save final checkpoint
-    let checkpoint = match run_store.state().await {
-        Ok(state) => state.checkpoint,
+    // Save final projection
+    let final_projection = match run_store.state().await {
+        Ok(state) => Some(state),
         Err(err) => {
             tracing::warn!(run_id = %run_id, error = %err, "Failed to load run state from store");
             None
@@ -2786,32 +3032,17 @@ async fn execute_run_in_process(state: Arc<AppState>, run_id: RunId) {
     };
 
     // Accumulate aggregate usage after execution completes.
-    if let Some(ref cp) = checkpoint {
-        let stage_durations = match run_store.list_events().await {
-            Ok(events) => fabro_workflow::extract_stage_durations_from_events(&events),
-            Err(err) => {
-                tracing::warn!(run_id = %run_id, error = %err, "Failed to load run events from store");
-                HashMap::default()
-            }
-        };
-        let mut agg = state
-            .aggregate_billing
-            .lock()
-            .expect("aggregate_billing lock poisoned");
-        agg.total_runs += 1;
-        let mut run_runtime: f64 = 0.0;
-        for (node_id, outcome) in &cp.node_outcomes {
-            if let Some(usage) = &outcome.usage {
-                let entry = agg
-                    .by_model
-                    .entry(usage.model_id().to_string())
-                    .or_default();
-                accumulate_model_billing(entry, usage);
-            }
-            let duration_ms = stage_durations.get(node_id).copied().unwrap_or(0);
-            run_runtime += duration_ms as f64 / 1000.0;
+    if let Some(ref projection) = final_projection {
+        if projection.current_checkpoint().is_some() {
+            let mut agg = state
+                .aggregate_billing
+                .lock()
+                .expect("aggregate_billing lock poisoned");
+            accumulate_billing_rollup(
+                &mut agg,
+                &fabro_workflow::billing_rollup_from_projection(projection),
+            );
         }
-        agg.total_runtime_secs += run_runtime;
     }
 
     let mut runs = state.runs.lock().expect("runs lock poisoned");
@@ -2860,7 +3091,9 @@ async fn execute_run_in_process(state: Arc<AppState>, run_id: RunId) {
                 };
             }
         }
-        managed_run.checkpoint = checkpoint;
+        managed_run.checkpoint = final_projection
+            .as_ref()
+            .and_then(|projection| projection.current_checkpoint().cloned());
         managed_run.run_dir = Some(run_dir);
         clear_live_run_state(managed_run);
     }
@@ -2934,6 +3167,7 @@ async fn execute_run_subprocess(state: Arc<AppState>, run_id: RunId) {
                     reason:         FailureReason::LaunchFailed,
                     git_commit_sha: None,
                     final_patch:    None,
+                    diff_summary:   None,
                 },
             )
             .await;
@@ -2961,6 +3195,7 @@ async fn execute_run_subprocess(state: Arc<AppState>, run_id: RunId) {
                 reason:         FailureReason::LaunchFailed,
                 git_commit_sha: None,
                 final_patch:    None,
+                diff_summary:   None,
             },
         )
         .await;
@@ -2991,6 +3226,7 @@ async fn execute_run_subprocess(state: Arc<AppState>, run_id: RunId) {
                 reason:         FailureReason::LaunchFailed,
                 git_commit_sha: None,
                 final_patch:    None,
+                diff_summary:   None,
             },
         )
         .await;
@@ -3012,6 +3248,7 @@ async fn execute_run_subprocess(state: Arc<AppState>, run_id: RunId) {
                 reason:         FailureReason::LaunchFailed,
                 git_commit_sha: None,
                 final_patch:    None,
+                diff_summary:   None,
             },
         )
         .await;
@@ -3045,6 +3282,7 @@ async fn execute_run_subprocess(state: Arc<AppState>, run_id: RunId) {
                     reason:         FailureReason::Terminated,
                     git_commit_sha: None,
                     final_patch:    None,
+                    diff_summary:   None,
                 },
             )
             .await;
@@ -3103,38 +3341,21 @@ async fn execute_run_subprocess(state: Arc<AppState>, run_id: RunId) {
         }
     };
 
-    if let Some(ref checkpoint) = final_state.checkpoint {
-        let stage_durations = match run_store.list_events().await {
-            Ok(events) => fabro_workflow::extract_stage_durations_from_events(&events),
-            Err(err) => {
-                tracing::warn!(run_id = %run_id, error = %err, "Failed to load run events from store");
-                HashMap::default()
-            }
-        };
+    if final_state.current_checkpoint().is_some() {
         let mut agg = state
             .aggregate_billing
             .lock()
             .expect("aggregate_billing lock poisoned");
-        agg.total_runs += 1;
-        let mut run_runtime: f64 = 0.0;
-        for (node_id, outcome) in &checkpoint.node_outcomes {
-            if let Some(usage) = &outcome.usage {
-                let entry = agg
-                    .by_model
-                    .entry(usage.model_id().to_string())
-                    .or_default();
-                accumulate_model_billing(entry, usage);
-            }
-            let duration_ms = stage_durations.get(node_id).copied().unwrap_or(0);
-            run_runtime += duration_ms as f64 / 1000.0;
-        }
-        agg.total_runtime_secs += run_runtime;
+        accumulate_billing_rollup(
+            &mut agg,
+            &fabro_workflow::billing_rollup_from_projection(&final_state),
+        );
     }
 
     let mut runs = state.runs.lock().expect("runs lock poisoned");
     if let Some(managed_run) = runs.get_mut(&run_id) {
-        if let Some(status) = final_state.status {
-            managed_run.status = status;
+        if final_state.status != managed_run.status {
+            managed_run.status = final_state.status;
         } else if !wait_status.success() {
             managed_run.status = RunStatus::Failed {
                 reason: FailureReason::Terminated,
@@ -3145,7 +3366,7 @@ async fn execute_run_subprocess(state: Arc<AppState>, run_id: RunId) {
             .as_ref()
             .and_then(|conclusion| conclusion.failure_reason.clone())
             .or_else(|| managed_run.error.clone());
-        managed_run.checkpoint = final_state.checkpoint;
+        managed_run.checkpoint = final_state.current_checkpoint().cloned();
         managed_run.run_dir = Some(run_dir);
         clear_live_run_state(managed_run);
     }
@@ -3227,8 +3448,7 @@ async fn append_control_request(
 async fn reject_if_archived(state: &AppState, run_id: &RunId) -> Option<Response> {
     let run_store = state.store.open_run_reader(run_id).await.ok()?;
     let projection = run_store.state().await.ok()?;
-    let status = projection.status?;
-    matches!(status, RunStatus::Archived { .. }).then(|| {
+    projection.archived_at.is_some().then(|| {
         ApiError::new(
             StatusCode::CONFLICT,
             operations::archived_rejection_message(run_id),

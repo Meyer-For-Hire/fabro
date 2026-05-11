@@ -68,31 +68,14 @@ async fn get_checkpoint(
         Ok(id) => id,
         Err(response) => return response,
     };
-    let live_checkpoint = {
-        let runs = state.runs.lock().expect("runs lock poisoned");
-        match runs.get(&id) {
-            Some(managed_run) => managed_run.checkpoint.clone(),
-            None => return ApiError::not_found("Run not found.").into_response(),
-        }
-    };
-    if let Some(cp) = live_checkpoint {
-        return (StatusCode::OK, Json(cp)).into_response();
-    }
-
-    match state.store.open_run_reader(&id).await {
-        Ok(run_store) => match run_store.state().await {
-            Ok(run_state) => match run_state.checkpoint {
-                Some(cp) => (StatusCode::OK, Json(cp)).into_response(),
-                None => (StatusCode::OK, Json(serde_json::json!(null))).into_response(),
-            },
-            Err(err) => {
-                tracing::warn!(run_id = %id, error = %err, "Failed to load checkpoint state from store");
-                (StatusCode::OK, Json(serde_json::json!(null))).into_response()
-            }
+    match state.store.get_cached_run(&id).await {
+        Ok(Some(cached)) => match cached.projection.current_checkpoint() {
+            Some(cp) => (StatusCode::OK, Json(cp.clone())).into_response(),
+            None => (StatusCode::OK, Json(serde_json::json!(null))).into_response(),
         },
+        Ok(None) => ApiError::not_found("Run not found.").into_response(),
         Err(err) => {
-            tracing::warn!(run_id = %id, error = %err, "Failed to open run store reader");
-            ApiError::not_found("Run not found.").into_response()
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
         }
     }
 }
@@ -144,13 +127,7 @@ async fn load_run_spec(state: &AppState, run_id: &RunId) -> Result<fabro_types::
     let run_state = run_store.state().await.map_err(|err| {
         ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
     })?;
-    run_state.spec.ok_or_else(|| {
-        ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "run spec missing from store",
-        )
-        .into_response()
-    })
+    Ok(run_state.spec)
 }
 
 async fn list_run_artifacts(

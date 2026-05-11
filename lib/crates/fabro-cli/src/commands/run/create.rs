@@ -43,6 +43,7 @@ pub(crate) async fn create_run(
         cwd,
         run_overrides: cli_args_config.run,
         cli_overrides: cli_args_config.cli,
+        input_overrides: cli_args_config.input_overrides,
         args: run_manifest_args(args),
         run_id,
         user_settings_path: Some(active_settings_path(None)),
@@ -65,7 +66,10 @@ pub(crate) async fn create_run(
     }
 
     let client = ctx.server().await?;
-    let created_run_id = client.create_run_from_manifest(built.manifest).await?;
+    let created_run_id = client
+        .create_run_from_manifest(built.manifest)
+        .await
+        .context("could not create run")?;
 
     Ok(CreatedRun {
         run_id: created_run_id,

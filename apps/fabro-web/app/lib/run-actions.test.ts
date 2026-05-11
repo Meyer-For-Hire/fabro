@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import type { AxiosAdapter } from "axios";
+import type { Run, RunStatus } from "@qltysh/fabro-api-client";
 
 import {
   archiveRun,
@@ -10,27 +12,75 @@ import {
   mapError,
   unarchiveRun,
 } from "./run-actions";
+import { generatedAxios } from "./api-client";
 
 type StubResponseInit = {
   status: number;
-  body?: string;
+  body?: unknown;
   statusText?: string;
 };
 
-function stubFetchOnce(init: StubResponseInit) {
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = (() =>
-    Promise.resolve(
-      new Response(init.body ?? "", {
-        status: init.status,
-        statusText: init.statusText ?? "",
-        headers: { "Content-Type": "application/json" },
-      }),
-    )) as typeof fetch;
+const originalAdapter = generatedAxios.defaults.adapter;
 
-  return () => {
-    globalThis.fetch = originalFetch;
+function makeRun(status: RunStatus, archived = false): Run {
+  return {
+    id:               "run-1",
+    goal:             "Fix the build",
+    title:            "Fix the build",
+    workflow:         { slug: "fix_build", name: "Fix Build" },
+    automation:       null,
+    repository:       null,
+    created_by:       null,
+    origin:           { kind: "api" },
+    labels:           {},
+    lifecycle:        {
+      status,
+      pending_control: null,
+      queue_position:  null,
+      error:           null,
+      archived,
+      archived_at:     archived ? "2026-04-20T12:05:00Z" : null,
+    },
+    sandbox:          null,
+    models:           [],
+    source_directory: null,
+    timestamps:       {
+      created_at:     "2026-04-20T12:00:00Z",
+      started_at:     null,
+      last_event_at:  null,
+      completed_at:   null,
+    },
+    billing:          null,
+    diff:             null,
+    pull_request:     null,
+    current_question: null,
+    superseded_by:    null,
+    links:            { web: null },
   };
+}
+
+function stubGeneratedAxiosOnce(init: StubResponseInit) {
+  generatedAxios.defaults.adapter = (async (config) => {
+    if (init.status >= 400) {
+      throw {
+        isAxiosError: true,
+        message: init.statusText ?? `HTTP ${init.status}`,
+        response: {
+          status: init.status,
+          statusText: init.statusText ?? "",
+          data: init.body ?? null,
+          headers: {},
+        },
+      };
+    }
+    return {
+      data: init.body,
+      status: init.status,
+      statusText: init.statusText ?? "",
+      headers: {},
+      config,
+    };
+  }) as AxiosAdapter;
 }
 
 async function expectLifecycleError(
@@ -45,68 +95,52 @@ async function expectLifecycleError(
 }
 
 describe("run lifecycle actions", () => {
-  let restoreFetch: (() => void) | undefined;
-
   afterEach(() => {
-    restoreFetch?.();
-    restoreFetch = undefined;
+    generatedAxios.defaults.adapter = originalAdapter;
     delete (globalThis as { window?: unknown }).window;
   });
 
   test("cancelRun parses a 200 response", async () => {
-    restoreFetch = stubFetchOnce({
+    stubGeneratedAxiosOnce({
       status: 200,
-      body: JSON.stringify({
-        id: "run-1",
-        status: { kind: "failed", reason: "cancelled" },
-        created_at: "2026-04-20T12:00:00Z",
-      }),
+      body: makeRun({ kind: "failed", reason: "cancelled" }),
     });
 
     const result = await cancelRun("run-1");
-    expect(result.status.kind).toBe("failed");
-    if (result.status.kind === "failed") {
-      expect(result.status.reason).toBe("cancelled");
+    expect(result.lifecycle.status.kind).toBe("failed");
+    if (result.lifecycle.status.kind === "failed") {
+      expect(result.lifecycle.status.reason).toBe("cancelled");
     }
   });
 
   test("archiveRun parses a 200 response", async () => {
-    restoreFetch = stubFetchOnce({
+    stubGeneratedAxiosOnce({
       status: 200,
-      body: JSON.stringify({
-        id: "run-1",
-        status: {
-          kind: "archived",
-          prior: { kind: "succeeded", reason: "completed" },
-        },
-        created_at: "2026-04-20T12:00:00Z",
-      }),
+      body: makeRun({ kind: "succeeded", reason: "completed" }, true),
     });
 
     const result = await archiveRun("run-1");
-    expect(result.status.kind).toBe("archived");
+    expect(result.lifecycle.status.kind).toBe("succeeded");
+    expect(result.lifecycle.archived).toBe(true);
   });
 
   test("unarchiveRun parses a 200 response", async () => {
-    restoreFetch = stubFetchOnce({
+    stubGeneratedAxiosOnce({
       status: 200,
-      body: JSON.stringify({
-        id: "run-1",
-        status: { kind: "succeeded", reason: "completed" },
-        created_at: "2026-04-20T12:00:00Z",
-      }),
+      body: makeRun({ kind: "succeeded", reason: "completed" }),
     });
 
     const result = await unarchiveRun("run-1");
-    expect(result.status.kind).toBe("succeeded");
+    expect(result.lifecycle.status.kind).toBe("succeeded");
+    expect(result.lifecycle.archived).toBe(false);
   });
 
   test("404 and 409 preserve the parsed error envelope", async () => {
-    restoreFetch = stubFetchOnce({
+    stubGeneratedAxiosOnce({
       status: 404,
-      body: JSON.stringify({
+      body: {
         errors: [{ status: "404", title: "Not Found", detail: "Run not found." }],
-      }),
+      },
     });
     const notFound = await expectLifecycleError(cancelRun("missing-run"));
     expect(notFound).toEqual({
@@ -114,11 +148,11 @@ describe("run lifecycle actions", () => {
       errors: [{ status: "404", title: "Not Found", detail: "Run not found." }],
     });
 
-    restoreFetch = stubFetchOnce({
+    stubGeneratedAxiosOnce({
       status: 409,
-      body: JSON.stringify({
+      body: {
         errors: [{ status: "409", title: "Conflict", detail: "Run is not terminal." }],
-      }),
+      },
     });
     const conflict = await expectLifecycleError(archiveRun("run-1"));
     expect(conflict).toEqual({
@@ -128,7 +162,7 @@ describe("run lifecycle actions", () => {
   });
 
   test("non-JSON error bodies fall back to an empty error list", async () => {
-    restoreFetch = stubFetchOnce({
+    stubGeneratedAxiosOnce({
       status: 409,
       body: "<html>conflict</html>",
       statusText: "Conflict",
@@ -164,19 +198,12 @@ describe("run lifecycle actions", () => {
 
   test("isTerminalCancelledRun distinguishes immediate cancel success from in-flight cancellation", () => {
     expect(
-      isTerminalCancelledRun({
-        id: "run-1",
-        status: { kind: "failed", reason: "cancelled" },
-        created_at: "2026-04-20T12:00:00Z",
-      }),
+      isTerminalCancelledRun(makeRun({ kind: "failed", reason: "cancelled" })),
     ).toBe(true);
     expect(
-      isTerminalCancelledRun({
-        id: "run-1",
-        status: { kind: "running" },
-        pending_control: "cancel",
-        created_at: "2026-04-20T12:00:00Z",
-      }),
+      isTerminalCancelledRun(
+        makeRun({ kind: "running" }, false),
+      ),
     ).toBe(false);
   });
 });

@@ -40,16 +40,17 @@ pub use run::{
     GitAuthorSettings, HookDefinition, HookType, InterviewProviderSettings, McpServerSettings,
     McpTransport, NotificationProviderSettings, NotificationRouteSettings, PullRequestSettings,
     RunAgentSettings, RunCheckpointSettings, RunExecutionSettings, RunGitSettings, RunGoal,
-    RunInterviewsSettings, RunModelControls, RunModelSettings, RunNamespace, RunPrepareSettings,
-    RunSandboxSettings, RunScmSettings, ScmGitHubSettings, TlsMode,
+    RunIntegrationsGithubSettings, RunIntegrationsSettings, RunInterviewsSettings,
+    RunModelControls, RunModelSettings, RunNamespace, RunPrepareSettings, RunSandboxSettings,
+    RunScmSettings, ScmGitHubSettings, TlsMode,
 };
 pub use server::{
-    DiscordIntegrationSettings, GithubIntegrationSettings, IntegrationWebhooksSettings,
-    IpAllowEntry, LogDestination, ObjectStoreSettings, ServerApiSettings, ServerArtifactsSettings,
-    ServerAuthGithubSettings, ServerAuthMethod, ServerAuthSettings, ServerIntegrationsSettings,
+    GithubIntegrationSettings, IntegrationWebhooksSettings, IpAllowEntry, LogDestination,
+    ObjectStoreSettings, ServerApiSettings, ServerArtifactsSettings, ServerAuthGithubSettings,
+    ServerAuthMethod, ServerAuthSettings, ServerIntegrationsSettings,
     ServerIpAllowlistOverrideSettings, ServerIpAllowlistSettings, ServerListenSettings,
     ServerLoggingSettings, ServerNamespace, ServerSchedulerSettings, ServerSlateDbSettings,
-    ServerStorageSettings, ServerWebSettings, SlackIntegrationSettings, TeamsIntegrationSettings,
+    ServerStorageSettings, ServerWebSettings, SlackIntegrationSettings,
 };
 pub use size::{ParseSizeError, Size};
 pub use workflow::WorkflowNamespace;

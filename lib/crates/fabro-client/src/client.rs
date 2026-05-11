@@ -26,7 +26,7 @@ use tokio_util::io::ReaderStream;
 use crate::credential::Credential;
 use crate::error::{
     ApiError, ApiFailure, api_failure_for, classify_api_error, classify_http_response,
-    convert_type, is_not_found_error, map_api_error, raw_response_failure_error,
+    convert_type, is_not_found_error, raw_response_failure_error,
 };
 use crate::session::OAuthSession;
 use crate::target::ServerTarget;
@@ -359,10 +359,13 @@ impl Client {
                     if let Some(failed_token) = state.bearer_token.as_deref() {
                         self.refresh_access_token(failed_token).await?;
                         let state = self.current_state();
-                        return self
+                        let retry_response = self
                             .with_request_timeout(Box::pin(request(state.client.clone())))
-                            .await?
-                            .map_err(map_api_error);
+                            .await?;
+                        return match retry_response {
+                            Ok(response) => Ok(response),
+                            Err(err) => Err(classify_api_error(err).await.error),
+                        };
                     }
                 }
                 Err(mapped.error)
@@ -564,7 +567,7 @@ impl Client {
             )
             .await?;
         let status = response.into_inner();
-        status.id.parse().context("invalid run ID from server")
+        Ok(status.id)
     }
 
     pub async fn list_secrets(&self) -> Result<Vec<types::SecretMetadata>> {
@@ -686,6 +689,13 @@ impl Client {
         Ok(response.into_inner())
     }
 
+    pub async fn get_system_repair_runs(&self) -> Result<types::SystemRepairRunsResponse> {
+        let response = self
+            .send_api(|client| async move { client.get_system_repair_runs().send().await })
+            .await?;
+        Ok(response.into_inner())
+    }
+
     pub async fn prune_runs(
         &self,
         body: types::PruneRunsRequest,
@@ -801,6 +811,35 @@ impl Client {
         self.send_api(
             |client| async move { client.cancel_run().id(run_id.to_string()).send().await },
         )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn interrupt_run(&self, run_id: &RunId) -> Result<()> {
+        self.send_api(|client| async move {
+            client.interrupt_run().id(run_id.to_string()).send().await
+        })
+        .await?;
+        Ok(())
+    }
+
+    pub async fn steer_run(&self, run_id: &RunId, text: String, interrupt: bool) -> Result<()> {
+        let body: types::SteerRunRequest = types::SteerRunRequest::builder()
+            .text(text)
+            .interrupt(interrupt)
+            .try_into()
+            .map_err(|e| anyhow!("failed to build SteerRunRequest: {e}"))?;
+        self.send_api(|client| {
+            let body = body.clone();
+            async move {
+                client
+                    .steer_run()
+                    .id(run_id.to_string())
+                    .body(body)
+                    .send()
+                    .await
+            }
+        })
         .await?;
         Ok(())
     }
@@ -959,7 +998,7 @@ impl Client {
                 Ok(Some(bytes))
             }
             Err(err) => {
-                let err = map_api_error(err);
+                let err = classify_api_error(err).await.error;
                 if is_not_found_error(&err) {
                     Ok(None)
                 } else {
@@ -1120,20 +1159,14 @@ impl Client {
         &self,
         run_id: &RunId,
         qid: &str,
-        value: Option<String>,
-        selected_option_key: Option<String>,
-        selected_option_keys: Vec<String>,
+        body: types::SubmitAnswerRequest,
     ) -> Result<()> {
         self.send_api(|client| async move {
             client
                 .submit_run_answer()
                 .id(run_id.to_string())
                 .qid(qid)
-                .body(types::SubmitAnswerRequest {
-                    value:                value.clone(),
-                    selected_option_key:  selected_option_key.clone(),
-                    selected_option_keys: selected_option_keys.clone(),
-                })
+                .body(body.clone())
                 .send()
                 .await
         })
@@ -1198,7 +1231,7 @@ impl Client {
                 Ok(Some(Bytes::from(bytes)))
             }
             Err(err) => {
-                let err = map_api_error(err);
+                let err = classify_api_error(err).await.error;
                 if is_not_found_error(&err) {
                     Ok(None)
                 } else {

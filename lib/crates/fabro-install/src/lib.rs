@@ -557,6 +557,20 @@ mod tests {
     }
 
     #[test]
+    fn config_toml_omits_server_logging_destination() {
+        let toml_str = format_config_toml();
+        let cfg: toml::Value = toml::from_str(&toml_str).expect("generated config should parse");
+        let destination = cfg
+            .get("server")
+            .and_then(toml::Value::as_table)
+            .and_then(|server| server.get("logging"))
+            .and_then(toml::Value::as_table)
+            .and_then(|logging| logging.get("destination"));
+
+        assert_eq!(destination, None);
+    }
+
+    #[test]
     fn merge_server_settings_preserves_existing_top_level_sections() {
         let mut doc: toml::Value = toml::from_str(
             r#"

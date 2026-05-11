@@ -18,6 +18,7 @@ fn help() {
       prune   Delete old workflow runs
       df      Show disk usage
       events  Stream run events from the server
+      repair  Inspect and repair durable server data
       help    Print this message or the help of the given subcommand(s)
 
     Options:

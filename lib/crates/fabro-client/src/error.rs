@@ -231,10 +231,14 @@ where
 #[cfg(test)]
 mod tests {
     use fabro_util::exit;
+    use httpmock::MockServer;
     use serde_json::json;
     use tokio::net::TcpListener;
 
-    use super::{ApiError, ApiFailure, map_api_error, raw_response_failure_error};
+    use super::{
+        ApiError, ApiFailure, api_failure_for, classify_api_error, map_api_error,
+        raw_response_failure_error,
+    };
 
     fn error_response(
         status: fabro_http::StatusCode,
@@ -293,6 +297,23 @@ mod tests {
     }
 
     #[test]
+    fn map_api_error_uses_structured_detail_and_preserves_code() {
+        let err = map_api_error(error_response(
+            fabro_http::StatusCode::UNPROCESSABLE_ENTITY,
+            "missing field `dirty` at line 1 column 2834",
+            "invalid_manifest",
+        ));
+
+        assert_eq!(
+            err.to_string(),
+            "missing field `dirty` at line 1 column 2834"
+        );
+        let failure = api_failure_for(&err).expect("error should carry API failure metadata");
+        assert_eq!(failure.status, fabro_http::StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(failure.code.as_deref(), Some("invalid_manifest"));
+    }
+
+    #[test]
     fn raw_response_failure_error_marks_401_as_auth_required() {
         let err = raw_response_failure_error(&api_error(
             fabro_http::StatusCode::UNAUTHORIZED,
@@ -310,6 +331,41 @@ mod tests {
             "forbidden",
         ));
         assert_eq!(exit::exit_code_for(&err), 1);
+    }
+
+    #[tokio::test]
+    async fn classify_api_error_preserves_plain_text_unexpected_response_body() {
+        let server = MockServer::start();
+        server.mock(|when, then| {
+            when.method("GET").path("/plain-error");
+            then.status(422)
+                .header("Content-Type", "text/plain")
+                .body("Failed to deserialize request: missing field `dirty` at line 1 column 2834");
+        });
+
+        let response = fabro_http::test_http_client()
+            .unwrap()
+            .get(format!("{}/plain-error", server.base_url()))
+            .send()
+            .await
+            .expect("mock server should return a response");
+        let err = classify_api_error(
+            progenitor_client::Error::<serde_json::Value>::UnexpectedResponse(response),
+        )
+        .await
+        .error;
+
+        let message = err.to_string();
+        assert!(
+            message.contains("request failed with status 422 Unprocessable Entity"),
+            "expected status in message, got: {message}"
+        );
+        assert!(
+            message.contains("missing field `dirty`"),
+            "expected response body in message, got: {message}"
+        );
+        let failure = api_failure_for(&err).expect("error should carry API failure metadata");
+        assert_eq!(failure.status, fabro_http::StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]

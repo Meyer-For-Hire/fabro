@@ -137,8 +137,21 @@ fn build_help_lists_forwarded_cargo_args() {
 fn cargo_dev_alias_points_at_fabro_dev() {
     let config = read_file(&workspace_root(), ".cargo/config.toml");
     assert!(
-        config.contains(r#"dev = "run --package fabro-dev --""#),
+        config.contains(r#"dev = "run --package fabro-dev --features dev --""#),
         "cargo dev alias should invoke fabro-dev:\n{config}"
+    );
+}
+
+#[test]
+fn fabro_dev_does_not_depend_on_fabro_cli() {
+    let manifest = read_file(&workspace_root(), "lib/crates/fabro-dev/Cargo.toml");
+    assert!(
+        !manifest.contains("fabro-cli"),
+        "fabro-dev should shell out to fabro-cli instead of depending on it:\n{manifest}"
+    );
+    assert!(
+        manifest.contains("required-features = [\"dev\"]"),
+        "fabro-dev binary should require the dev feature:\n{manifest}"
     );
 }
 

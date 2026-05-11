@@ -1,6 +1,9 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from "react";
-import { Link } from "react-router";
-import { ChevronDownIcon, ChevronRightIcon, CommandLineIcon, MagnifyingGlassIcon } from "@heroicons/react/24/outline";
+import { Link, useSearchParams } from "react-router";
+import { ArchiveBoxIcon, ChevronDownIcon, CommandLineIcon, MagnifyingGlassIcon } from "@heroicons/react/24/outline";
+import { EllipsisVerticalIcon } from "@heroicons/react/20/solid";
+import { Menu, MenuButton, MenuItem, MenuItems } from "@headlessui/react";
+import { useSWRConfig } from "swr";
 import {
   DndContext,
   closestCenter,
@@ -18,12 +21,17 @@ import {
   arrayMove,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { ciConfig, columnStatusDisplay, deriveCiStatus, mapRunListItem } from "../data/runs";
+import { ciConfig, columnForRun, columnStatusDisplay, columnStatuses, deriveCiStatus, mapRunListItem } from "../data/runs";
 import type { CiStatus, CheckRun, CheckStatus, RunItem, RunWithStatus, ColumnStatus } from "../data/runs";
+import { formatRelativeTime } from "../lib/format";
 import { EmptyState } from "../components/state";
+import { InlineMarkdown } from "../components/inline-markdown";
+import { PullRequestChip } from "../components/pull-request-chip";
+import { useToast } from "../components/toast";
 import { shouldRefreshBoardForEvent, useBoardEvents } from "../lib/board-events";
-import { useDemoMode } from "../lib/demo-mode";
 import { useAuthConfig, useBoardsRuns, useSystemInfo } from "../lib/queries";
+import { queryKeys } from "../lib/query-keys";
+import { archiveRun, canArchive } from "../lib/run-actions";
 import type { PaginatedBoardRunList } from "@qltysh/fabro-api-client";
 
 export { shouldRefreshBoardForEvent };
@@ -33,23 +41,24 @@ export function meta({}: any) {
 }
 
 interface ColumnStyle {
-  iconType: "branch" | "pr";
   actions: string[];
 }
 
 const columnStyles: Record<ColumnStatus, ColumnStyle> = {
-  initializing: { iconType: "branch", actions: [] },
-  running:      { iconType: "branch", actions: ["Watch", "Steer"] },
-  blocked:      { iconType: "branch", actions: ["Answer Question"] },
-  succeeded:    { iconType: "pr",     actions: [] },
-  failed:       { iconType: "branch", actions: [] },
+  queued:       { actions: [] },
+  initializing: { actions: [] },
+  running:      { actions: [] },
+  blocked:      { actions: ["Answer Question"] },
+  succeeded:    { actions: [] },
+  failed:       { actions: [] },
+  archived:     { actions: [] },
 };
 
-const defaultColumnStyle: ColumnStyle = { iconType: "branch", actions: [] };
+const defaultColumnStyle: ColumnStyle = { actions: [] };
 const defaultColumnColors = { dot: "bg-fg-muted", text: "text-fg-muted" };
 
 interface BoardRunsResponse {
-  columns: { id: string; name: string }[];
+  columns: PaginatedBoardRunList["columns"];
   data: PaginatedBoardRunList["data"];
   meta: PaginatedBoardRunList["meta"];
 }
@@ -59,31 +68,24 @@ type Column = {
   name: string;
   dot: string;
   text: string;
-  iconType: "branch" | "pr";
   actions: string[];
   items: RunItem[];
 };
 
-const SKELETON_STATUSES: ColumnStatus[] = [
-  "initializing",
-  "running",
-  "blocked",
-  "succeeded",
-  "failed",
-];
-
-function buildSkeletonColumns(): Column[] {
-  return SKELETON_STATUSES.map((id) => {
-    const colors = columnStatusDisplay[id];
-    return {
-      id,
-      name: colors.label,
-      dot: colors.dot,
-      text: colors.text,
-      ...(columnStyles[id] ?? defaultColumnStyle),
-      items: [],
-    };
-  });
+function buildSkeletonColumns(includeArchived: boolean): Column[] {
+  return columnStatuses
+    .filter((id) => includeArchived || id !== "archived")
+    .map((id) => {
+      const colors = columnStatusDisplay[id];
+      return {
+        id,
+        name: colors.label,
+        dot: colors.dot,
+        text: colors.text,
+        ...(columnStyles[id] ?? defaultColumnStyle),
+        items: [],
+      };
+    });
 }
 
 export function buildBoardColumns(response: BoardRunsResponse): Column[] {
@@ -92,13 +94,14 @@ export function buildBoardColumns(response: BoardRunsResponse): Column[] {
     grouped.set(col.id, []);
   }
   for (const apiRun of response.data) {
-    if (grouped.has(apiRun.column)) {
-      grouped.get(apiRun.column)?.push(mapRunListItem(apiRun));
+    const column = columnForRun(apiRun);
+    if (column != null && grouped.has(column)) {
+      grouped.get(column)?.push(mapRunListItem(apiRun));
     }
   }
 
   return response.columns.map((col) => {
-    const id = col.id as ColumnStatus;
+    const id = col.id;
     const colors = columnStatusDisplay[id] ?? defaultColumnColors;
     return {
       id,
@@ -127,37 +130,6 @@ function listLifecycleStatusLabel(run: Pick<RunWithStatus, "statusLabel" | "life
   return run.lifecycleStatusLabel;
 }
 
-
-function GitBranchIcon({ className }: { className?: string }) {
-  return (
-    <svg
-      viewBox="0 0 16 16"
-      fill="currentColor"
-      className={className}
-      aria-hidden="true"
-    >
-      <path d="M9.5 3.25a2.25 2.25 0 1 1 3 2.122V6A2.5 2.5 0 0 1 10 8.5H6a1 1 0 0 0-1 1v1.128a2.251 2.251 0 1 1-1.5 0V5.372a2.25 2.25 0 1 1 1.5 0v1.836A2.5 2.5 0 0 1 6 7h4a1 1 0 0 0 1-1v-.628A2.25 2.25 0 0 1 9.5 3.25Zm-6 0a.75.75 0 1 0 1.5 0 .75.75 0 0 0-1.5 0Zm8.25-.75a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5ZM4.25 12a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Z" />
-    </svg>
-  );
-}
-
-function GitPullRequestIcon({ className }: { className?: string }) {
-  return (
-    <svg
-      viewBox="0 0 16 16"
-      fill="currentColor"
-      className={className}
-      aria-hidden="true"
-    >
-      <path d="M1.5 3.25a2.25 2.25 0 1 1 3 2.122v5.256a2.251 2.251 0 1 1-1.5 0V5.372A2.25 2.25 0 0 1 1.5 3.25Zm5.677-.177L9.573.677A.25.25 0 0 1 10 .854V2.5h1A2.5 2.5 0 0 1 13.5 5v5.628a2.251 2.251 0 1 1-1.5 0V5a1 1 0 0 0-1-1h-1v1.646a.25.25 0 0 1-.427.177L7.177 3.427a.25.25 0 0 1 0-.354ZM3.75 2.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm0 9.5a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Zm8.25.75a.75.75 0 1 0 1.5 0 .75.75 0 0 0-1.5 0Z" />
-    </svg>
-  );
-}
-
-const iconMap = {
-  branch: GitBranchIcon,
-  pr: GitPullRequestIcon,
-};
 
 function CheckStatusIcon({ status }: { status: CheckStatus }) {
   switch (status) {
@@ -295,52 +267,44 @@ export const handle = {
 
 function PrCard({
   pr,
-  icon: Icon,
   iconColor,
   actions,
 }: {
   pr: RunItem;
-  icon: React.ComponentType<{ className?: string }>;
   iconColor: string;
   actions?: string[];
 }) {
   const lifecycleLabel = boardLifecycleStatusLabel(pr);
 
   return (
-    <Link to={`/runs/${pr.id}`} className="group block rounded-md border border-line bg-panel p-4 transition-all duration-200 hover:border-line-strong hover:shadow-lg hover:shadow-black/20">
+    <div className="group rounded-md border border-line bg-panel p-4 transition-all duration-200 hover:border-line-strong hover:shadow-lg hover:shadow-black/20">
       <div className="mb-2 flex items-center gap-1.5">
-        <Icon className={`size-3.5 shrink-0 ${iconColor}`} />
-        <span className="font-mono text-xs font-medium text-teal-500">
+        <Link to={`/runs/${pr.id}`} className="font-mono text-xs font-medium text-teal-500">
           {pr.repo}
-        </span>
-        {pr.number != null && (
-          <span className="font-mono text-xs text-fg-muted">
-            #{pr.number}
-          </span>
-        )}
+        </Link>
         {lifecycleLabel != null && (
           <span className="rounded-full border border-line px-1.5 py-0.5 font-mono text-[11px] uppercase tracking-wide text-fg-muted">
             {lifecycleLabel}
           </span>
         )}
+        {pr.number != null && (
+          <PullRequestChip
+            number={pr.number}
+            url={pr.pullRequestUrl}
+            className={`ml-auto inline-flex items-center gap-1 font-mono text-xs ${iconColor}`}
+            iconClassName="size-3.5 shrink-0"
+          />
+        )}
       </div>
 
-      <p className="text-sm leading-snug text-fg-2">{pr.title}</p>
+      <Link to={`/runs/${pr.id}`} className="block">
+        <p className="text-sm leading-snug text-fg-2">{pr.title}</p>
+      </Link>
 
-      {(pr.additions != null || pr.resources != null || pr.elapsed != null) && (
+      {(pr.resources != null || pr.comments != null || pr.elapsed != null) && (
         <div className="mt-3 flex items-center gap-3 font-mono text-xs">
           {pr.resources != null && (
             <span className="text-fg-3">{pr.resources}</span>
-          )}
-          {pr.additions != null && pr.deletions != null && (
-            <>
-              <span className="tabular-nums text-mint">
-                +{pr.additions.toLocaleString()}
-              </span>
-              <span className="tabular-nums text-coral">
-                -{pr.deletions.toLocaleString()}
-              </span>
-            </>
           )}
           {pr.comments != null && (
             <span className="inline-flex items-center gap-1 text-fg-muted">
@@ -379,16 +343,6 @@ function PrCard({
                       : "border-line-strong text-fg-3 hover:border-teal-500/40 hover:text-fg"
               }`}
             >
-              {label === "Watch" && (
-                <svg viewBox="0 0 16 16" fill="currentColor" className="size-3" aria-hidden="true">
-                  <path d="M8 2c1.981 0 3.671.992 4.933 2.078 1.27 1.091 2.187 2.345 2.637 3.023a1.62 1.62 0 0 1 0 1.798c-.45.678-1.367 1.932-2.637 3.023C11.67 13.008 9.981 14 8 14c-1.981 0-3.671-.992-4.933-2.078C1.797 10.831.88 9.577.43 8.899a1.62 1.62 0 0 1 0-1.798c.45-.678 1.367-1.932 2.637-3.023C4.33 2.992 6.019 2 8 2ZM1.679 7.932a.12.12 0 0 0 0 .136c.411.622 1.241 1.75 2.366 2.717C5.176 11.758 6.527 12.5 8 12.5c1.473 0 2.825-.742 3.955-1.715 1.124-.967 1.954-2.096 2.366-2.717a.12.12 0 0 0 0-.136c-.412-.621-1.242-1.75-2.366-2.717C10.824 4.242 9.473 3.5 8 3.5c-1.473 0-2.824.742-3.955 1.715-1.124.967-1.954 2.096-2.366 2.717ZM8 10a2 2 0 1 1-.001-3.999A2 2 0 0 1 8 10Z" />
-                </svg>
-              )}
-              {label === "Steer" && (
-                <svg viewBox="0 0 16 16" fill="currentColor" className="size-3" aria-hidden="true">
-                  <path d="M8 0a8 8 0 1 1 0 16A8 8 0 0 1 8 0ZM1.5 8a6.5 6.5 0 1 0 13 0 6.5 6.5 0 0 0-13 0Zm7.25-4.5a.75.75 0 0 0-1.5 0v.582a2.75 2.75 0 0 0-2.168 2.168H4.5a.75.75 0 0 0 0 1.5h.582a2.75 2.75 0 0 0 2.168 2.168v.582a.75.75 0 0 0 1.5 0v-.582a2.75 2.75 0 0 0 2.168-2.168h.582a.75.75 0 0 0 0-1.5h-.582A2.75 2.75 0 0 0 8.75 4.082ZM8 6.75a1.25 1.25 0 1 0 0 2.5 1.25 1.25 0 0 0 0-2.5Z" />
-                </svg>
-              )}
               {label === "Answer Question" && (
                 <svg viewBox="0 0 16 16" fill="currentColor" className="size-3" aria-hidden="true">
                   <path d="M1 2.75C1 1.784 1.784 1 2.75 1h10.5c.966 0 1.75.784 1.75 1.75v7.5A1.75 1.75 0 0 1 13.25 12H9.06l-2.573 2.573A1.458 1.458 0 0 1 4 13.543V12H2.75A1.75 1.75 0 0 1 1 10.25Zm1.75-.25a.25.25 0 0 0-.25.25v7.5c0 .138.112.25.25.25h2a.75.75 0 0 1 .75.75v2.19l2.72-2.72a.749.749 0 0 1 .53-.22h4.5a.25.25 0 0 0 .25-.25v-7.5a.25.25 0 0 0-.25-.25Z" />
@@ -409,18 +363,32 @@ function PrCard({
           ))}
         </div>
       )}
-    </Link>
+
+      {((pr.additions != null && pr.additions !== 0) ||
+        (pr.deletions != null && pr.deletions !== 0)) && (
+        <div className="mt-3 flex items-center gap-3 font-mono text-xs">
+          {pr.additions != null && (
+            <span className="tabular-nums text-mint">
+              +{pr.additions.toLocaleString()}
+            </span>
+          )}
+          {pr.deletions != null && (
+            <span className="tabular-nums text-coral">
+              -{pr.deletions.toLocaleString()}
+            </span>
+          )}
+        </div>
+      )}
+    </div>
   );
 }
 
 function SortablePrCard({
   pr,
-  icon,
   iconColor,
   actions,
 }: {
   pr: RunItem;
-  icon: React.ComponentType<{ className?: string }>;
   iconColor: string;
   actions?: string[];
 }) {
@@ -448,17 +416,91 @@ function SortablePrCard({
         }
       }}
     >
-      <PrCard pr={pr} icon={icon} iconColor={iconColor} actions={actions} />
+      <PrCard pr={pr} iconColor={iconColor} actions={actions} />
     </div>
   );
 }
 
+function archivableItems(items: RunItem[]): RunItem[] {
+  return items.filter((item) => canArchive(item.lifecycleStatus));
+}
+
+function ColumnActionsMenu({ column }: { column: Column }) {
+  const archivable = archivableItems(column.items);
+  const [pending, setPending] = useState(false);
+  const { mutate } = useSWRConfig();
+  const { push } = useToast();
+
+  if (archivable.length === 0) return null;
+
+  async function handleArchiveAll() {
+    if (pending) return;
+    setPending(true);
+    const total = archivable.length;
+    try {
+      const results = await Promise.allSettled(
+        archivable.map((item) => archiveRun(item.id)),
+      );
+      const succeeded = results.filter((r) => r.status === "fulfilled").length;
+      const failed = total - succeeded;
+      const runWord = (n: number) => (n === 1 ? "run" : "runs");
+      if (failed === 0) {
+        push({ message: `Archived ${total} ${runWord(total)}.` });
+      } else if (succeeded === 0) {
+        push({
+          message: `Couldn't archive ${total} ${runWord(total)}. Try again.`,
+          tone: "error",
+        });
+      } else {
+        push({
+          message: `Archived ${succeeded} of ${total} runs. ${failed} failed.`,
+          tone: "error",
+        });
+      }
+    } finally {
+      setPending(false);
+      void mutate(queryKeys.boards.runs());
+    }
+  }
+
+  const label = pending
+    ? `Archiving ${archivable.length}…`
+    : `Archive all`;
+
+  return (
+    <Menu as="div" className="relative ml-auto">
+      <MenuButton
+        type="button"
+        disabled={pending}
+        title={`Actions for ${column.name}`}
+        aria-label={`Actions for ${column.name}`}
+        className="flex size-6 shrink-0 items-center justify-center rounded text-fg-muted transition-colors hover:bg-overlay hover:text-fg-3 disabled:cursor-not-allowed disabled:opacity-60"
+      >
+        <EllipsisVerticalIcon className="size-4" aria-hidden="true" />
+      </MenuButton>
+      <MenuItems
+        transition
+        anchor={{ to: "bottom end", gap: 4 }}
+        className="z-20 w-44 origin-top-right rounded-md bg-panel py-1 outline-1 -outline-offset-1 outline-line-strong transition data-closed:scale-95 data-closed:opacity-0 data-enter:duration-100 data-enter:ease-out data-leave:duration-75 data-leave:ease-in"
+      >
+        <MenuItem>
+          <button
+            type="button"
+            onClick={handleArchiveAll}
+            disabled={pending}
+            className="flex w-full items-center justify-between gap-3 px-3 py-2 text-left text-sm text-fg-3 transition-colors data-focus:bg-overlay data-focus:text-fg data-focus:outline-hidden disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            <span>{label}</span>
+            <span className="font-mono text-xs text-fg-muted">{archivable.length}</span>
+          </button>
+        </MenuItem>
+      </MenuItems>
+    </Menu>
+  );
+}
+
 function BoardColumn({ column }: { column: Column }) {
-  const Icon = iconMap[column.iconType];
-  const demoMode = useDemoMode();
-  const actions = demoMode
-    ? column.actions
-    : column.actions.filter((label) => label !== "Steer");
+  const actions = column.actions;
   return (
     <div className="flex min-w-0 flex-col">
       <div className="mb-3 flex items-center gap-3">
@@ -469,6 +511,7 @@ function BoardColumn({ column }: { column: Column }) {
         <span className="rounded-full bg-overlay px-2 py-0.5 font-mono text-xs text-fg-muted">
           {column.items.length}
         </span>
+        <ColumnActionsMenu column={column} />
       </div>
 
       <SortableContext items={column.items.map((pr) => pr.id)} strategy={verticalListSortingStrategy}>
@@ -477,7 +520,6 @@ function BoardColumn({ column }: { column: Column }) {
             <SortablePrCard
               key={pr.id}
               pr={pr}
-              icon={Icon}
               iconColor={column.text}
               actions={actions}
             />
@@ -490,18 +532,75 @@ function BoardColumn({ column }: { column: Column }) {
 
 type ViewMode = "columns" | "list";
 
+type CreatedFilter = "all" | "today" | "1h" | "1d" | "7d" | "30d";
+
+const createdFilterOptions: { value: CreatedFilter; label: string }[] = [
+  { value: "all", label: "All time" },
+  { value: "today", label: "Today" },
+  { value: "1h", label: "Last hour" },
+  { value: "1d", label: "Last day" },
+  { value: "7d", label: "Last 7 days" },
+  { value: "30d", label: "Last 30 days" },
+];
+
+function parseCreatedFilter(raw: string | null): CreatedFilter {
+  switch (raw) {
+    case "today":
+    case "1h":
+    case "1d":
+    case "7d":
+    case "30d":
+      return raw;
+    default:
+      return "all";
+  }
+}
+
+function parseView(raw: string | null): ViewMode {
+  return raw === "list" ? "list" : "columns";
+}
+
+function createdCutoffMsFor(filter: CreatedFilter): number | null {
+  const now = Date.now();
+  switch (filter) {
+    case "all":
+      return null;
+    case "today": {
+      const d = new Date();
+      d.setHours(0, 0, 0, 0);
+      return d.getTime();
+    }
+    case "1h":
+      return now - 60 * 60 * 1000;
+    case "1d":
+      return now - 24 * 60 * 60 * 1000;
+    case "7d":
+      return now - 7 * 24 * 60 * 60 * 1000;
+    case "30d":
+      return now - 30 * 24 * 60 * 60 * 1000;
+  }
+}
+
 function RunRow({ run }: { run: RunWithStatus }) {
   const lifecycleLabel = listLifecycleStatusLabel(run);
+  const statusDisplay = columnStatusDisplay[run.status];
 
   return (
-    <Link to={`/runs/${run.id}`} className="grid items-center rounded-md border border-line bg-panel/80 px-4 py-3 transition-all duration-200 hover:border-line-strong hover:bg-panel" style={{ gridColumn: "1 / -1", gridTemplateColumns: "subgrid" }}>
+    <div className="grid items-center rounded-md border border-line bg-panel/80 px-4 py-3 transition-all duration-200 hover:border-line-strong hover:bg-panel" style={{ gridColumn: "1 / -1", gridTemplateColumns: "subgrid" }}>
+      <Link to={`/runs/${run.id}`} className="contents">
+      <span className="flex items-center gap-2 pr-2">
+        <span className={`size-1.5 shrink-0 rounded-full ${statusDisplay.dot}`} aria-hidden="true" />
+        <span className={`font-mono text-xs ${statusDisplay.text}`}>{run.statusLabel}</span>
+      </span>
+
       <span className="font-mono text-xs pr-2 text-fg-muted">
         {run.elapsed}
       </span>
 
+      <span className="truncate font-mono text-xs font-medium text-teal-500 pr-2">{run.repo}</span>
+
       <span className="flex items-center gap-2 min-w-0">
-        <span className="font-mono text-xs font-medium text-teal-500">{run.repo}</span>
-        <span className="truncate text-sm text-fg-2">{run.title}</span>
+        <InlineMarkdown content={run.title} className="truncate text-sm text-fg-2" />
         {lifecycleLabel != null && (
           <span className="rounded-full border border-line px-1.5 py-0.5 font-mono text-[11px] uppercase tracking-wide text-fg-muted">
             {lifecycleLabel}
@@ -517,53 +616,28 @@ function RunRow({ run }: { run: RunWithStatus }) {
         )}
       </span>
 
+      <span className="truncate font-mono text-xs text-fg-3 pr-2">{run.workflow}</span>
+
+      <span
+        className="font-mono text-xs text-fg-muted pr-2"
+        title={run.createdAt}
+      >
+        {run.createdAt != null ? formatRelativeTime(run.createdAt) : ""}
+      </span>
+
       <span className="flex items-center justify-end gap-2 pr-4 font-mono text-xs tabular-nums">
         {run.additions != null && <span className="text-mint">+{run.additions.toLocaleString()}</span>}
         {run.deletions != null && <span className="text-coral">-{run.deletions.toLocaleString()}</span>}
       </span>
+      </Link>
 
       <span className="inline-flex items-center justify-end gap-1.5 font-mono text-xs text-fg-muted">
         {run.number != null && (
-          <>
-            <GitPullRequestIcon className="size-3" />
-            #{run.number}
+          <PullRequestChip number={run.number} url={run.pullRequestUrl}>
             {run.checks != null && <span className={`size-1.5 rounded-full ${ciConfig[deriveCiStatus(run.checks)].dot}`} />}
-          </>
+          </PullRequestChip>
         )}
       </span>
-    </Link>
-  );
-}
-
-function SortableRunRow({ run }: { run: RunWithStatus }) {
-  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: run.id });
-  const wasDragging = useRef(false);
-  if (isDragging) wasDragging.current = true;
-  const style = {
-    transform: CSS.Transform.toString(transform),
-    transition,
-    opacity: isDragging ? 0.5 : undefined,
-    position: "relative" as const,
-    zIndex: isDragging ? 10 : undefined,
-    gridColumn: "1 / -1",
-    display: "grid",
-    gridTemplateColumns: "subgrid",
-  };
-  return (
-    <div
-      ref={setNodeRef}
-      style={style}
-      {...attributes}
-      {...listeners}
-      onClickCapture={(e) => {
-        if (wasDragging.current) {
-          e.preventDefault();
-          e.stopPropagation();
-          wasDragging.current = false;
-        }
-      }}
-    >
-      <RunRow run={run} />
     </div>
   );
 }
@@ -687,7 +761,40 @@ function RunsLandingEmpty({
 }
 
 export default function Runs() {
-  const boardRuns = useBoardsRuns();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const query = searchParams.get("search") ?? "";
+  const repoFilter = searchParams.get("repo") ?? "all";
+  const workflowFilter = searchParams.get("workflow") ?? "all";
+  const createdFilter = parseCreatedFilter(searchParams.get("created"));
+  const includeArchived = searchParams.get("archived") === "1";
+  const view = parseView(searchParams.get("view"));
+
+  const updateParam = useCallback(
+    (key: string, value: string | null) => {
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev);
+          if (value == null || value === "") {
+            next.delete(key);
+          } else {
+            next.set(key, value);
+          }
+          return next;
+        },
+        { replace: true },
+      );
+    },
+    [setSearchParams],
+  );
+
+  const setQuery = (value: string) => updateParam("search", value || null);
+  const setRepoFilter = (value: string) => updateParam("repo", value === "all" ? null : value);
+  const setWorkflowFilter = (value: string) => updateParam("workflow", value === "all" ? null : value);
+  const setCreatedFilter = (value: CreatedFilter) => updateParam("created", value === "all" ? null : value);
+  const setIncludeArchived = (value: boolean) => updateParam("archived", value ? "1" : null);
+  const setView = (value: ViewMode) => updateParam("view", value === "columns" ? null : value);
+
+  const boardRuns = useBoardsRuns(includeArchived);
   const authConfig = useAuthConfig();
   const systemInfo = useSystemInfo();
   const isLandingReady =
@@ -695,8 +802,11 @@ export default function Runs() {
     authConfig.data !== undefined &&
     systemInfo.data !== undefined;
   const initialColumns = useMemo(
-    () => boardRuns.data ? buildBoardColumns(boardRuns.data) : buildSkeletonColumns(),
-    [boardRuns.data],
+    () =>
+      boardRuns.data
+        ? buildBoardColumns(boardRuns.data)
+        : buildSkeletonColumns(includeArchived),
+    [boardRuns.data, includeArchived],
   );
   const hasGitHubAuth = authConfig.data?.methods.includes("github") === true;
   const serverUrl = systemInfo.data?.server_url;
@@ -705,10 +815,11 @@ export default function Runs() {
       initialColumns.flatMap((col: Column) => col.items.map((item: RunItem) => String(item.repo))),
     ),
   ].sort();
-  const [query, setQuery] = useState("");
-  const [repoFilter, setRepoFilter] = useState("all");
-  const [view, setView] = useState<ViewMode>("columns");
-  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  const allWorkflows = [
+    ...new Set(
+      initialColumns.flatMap((col: Column) => col.items.map((item: RunItem) => String(item.workflow))),
+    ),
+  ].sort();
   const [columns, setColumns] = useState(initialColumns);
   const lowerQuery = query.toLowerCase();
   useBoardEvents();
@@ -738,11 +849,15 @@ export default function Runs() {
 
   const totalRuns = columns.reduce((sum, col) => sum + col.items.length, 0);
 
+  const createdCutoffMs = createdCutoffMsFor(createdFilter);
   const filteredColumns = columns.map((col) => ({
     ...col,
     items: col.items.filter(
       (item) =>
         (repoFilter === "all" || item.repo === repoFilter) &&
+        (workflowFilter === "all" || item.workflow === workflowFilter) &&
+        (createdCutoffMs == null ||
+          (item.createdAt != null && Date.parse(item.createdAt) >= createdCutoffMs)) &&
         (!query ||
           item.title.toLowerCase().includes(lowerQuery) ||
           item.repo.toLowerCase().includes(lowerQuery) ||
@@ -753,6 +868,9 @@ export default function Runs() {
   const filteredRuns = filteredColumns.reduce(
     (sum, col) => sum + col.items.length,
     0,
+  );
+  const visibleColumns = filteredColumns.filter(
+    (col) => col.id !== "queued" || col.items.length > 0,
   );
 
   return (
@@ -773,6 +891,20 @@ export default function Runs() {
           </div>
           <div className="relative">
             <select
+              name="created"
+              aria-label="Filter by created time"
+              value={createdFilter}
+              onChange={(e) => setCreatedFilter(e.target.value as CreatedFilter)}
+              className="appearance-none rounded-md border border-line bg-panel/80 py-2 pl-3 pr-8 text-sm text-fg-2 outline-none transition-colors focus:border-focus focus:ring-0"
+            >
+              {createdFilterOptions.map((opt) => (
+                <option key={opt.value} value={opt.value}>{opt.label}</option>
+              ))}
+            </select>
+            <ChevronDownIcon className="pointer-events-none absolute right-2 top-1/2 size-4 -translate-y-1/2 text-fg-muted" />
+          </div>
+          <div className="relative">
+            <select
               name="repo"
               aria-label="Filter by repository"
               value={repoFilter}
@@ -786,6 +918,31 @@ export default function Runs() {
             </select>
             <ChevronDownIcon className="pointer-events-none absolute right-2 top-1/2 size-4 -translate-y-1/2 text-fg-muted" />
           </div>
+          <div className="relative">
+            <select
+              name="workflow"
+              aria-label="Filter by workflow"
+              value={workflowFilter}
+              onChange={(e) => setWorkflowFilter(e.target.value)}
+              className="appearance-none rounded-md border border-line bg-panel/80 py-2 pl-3 pr-8 text-sm text-fg-2 outline-none transition-colors focus:border-focus focus:ring-0"
+            >
+              <option value="all">All workflows</option>
+              {allWorkflows.map((workflow: string) => (
+                <option key={workflow} value={workflow}>{workflow}</option>
+              ))}
+            </select>
+            <ChevronDownIcon className="pointer-events-none absolute right-2 top-1/2 size-4 -translate-y-1/2 text-fg-muted" />
+          </div>
+          <button
+            type="button"
+            onClick={() => setIncludeArchived(!includeArchived)}
+            aria-pressed={includeArchived}
+            title={includeArchived ? "Hide archived runs" : "Show archived runs"}
+            className={`inline-flex items-center gap-1.5 rounded-md border border-line bg-panel/80 px-3 py-2 text-xs font-medium transition-colors ${includeArchived ? "text-teal-500" : "text-fg-muted hover:text-fg-3"}`}
+          >
+            <ArchiveBoxIcon className="size-4" aria-hidden="true" />
+            <span>Show archived</span>
+          </button>
           <div role="group" aria-label="Run list view" className="flex rounded-md border border-line bg-panel/80 p-0.5">
             <button
               type="button"
@@ -815,7 +972,7 @@ export default function Runs() {
         {view === "columns" ? (
           <>
             <div className="flex gap-5 overflow-x-auto pb-4">
-              {filteredColumns.map((col) => (
+              {visibleColumns.map((col) => (
                 <div key={col.id} className="w-72 shrink-0">
                   <BoardColumn column={col} />
                 </div>
@@ -837,45 +994,15 @@ export default function Runs() {
           </>
         ) : (
           <>
-            <div className="space-y-4">
-              {filteredColumns.map((col) => {
-                const isCollapsed = collapsed.has(col.id);
-                return (
-                  <div key={col.id}>
-                    <button
-                      type="button"
-                      onClick={() => setCollapsed((prev) => {
-                        const next = new Set(prev);
-                        if (next.has(col.id)) next.delete(col.id);
-                        else next.add(col.id);
-                        return next;
-                      })}
-                      className="mb-3 flex w-full items-center gap-2 text-left"
-                    >
-                      {isCollapsed
-                        ? <ChevronRightIcon className="size-3.5 text-fg-muted" />
-                        : <ChevronDownIcon className="size-3.5 text-fg-muted" />}
-                      <div className={`h-2.5 w-2.5 rounded-full ${col.dot}`} />
-                      <h3 className="text-sm font-semibold tracking-wide text-fg-2">{col.name}</h3>
-                      <span className="rounded-full bg-overlay px-2 py-0.5 font-mono text-xs text-fg-muted">
-                        {col.items.length}
-                      </span>
-                    </button>
-                    {!isCollapsed && (col.items.length > 0 ? (
-                      <SortableContext items={col.items.map((item) => item.id)} strategy={verticalListSortingStrategy}>
-                        <div className="grid gap-2" style={{ gridTemplateColumns: "5rem 1fr 8rem auto" }}>
-                          {col.items.map((item) => (
-                            <SortableRunRow key={item.id} run={{ ...item, status: col.id, statusLabel: col.name }} />
-                          ))}
-                        </div>
-                      </SortableContext>
-                    ) : (
-                      <p className="py-4 text-center text-sm text-fg-muted">No runs</p>
-                    ))}
-                  </div>
-                );
-              })}
-            </div>
+            {filteredRuns > 0 && (
+              <div className="grid gap-2" style={{ gridTemplateColumns: "auto 5rem auto 1fr auto auto 8rem auto" }}>
+                {visibleColumns.flatMap((col) =>
+                  col.items.map((item) => (
+                    <RunRow key={item.id} run={{ ...item, status: col.id, statusLabel: col.name }} />
+                  )),
+                )}
+              </div>
+            )}
             {isLandingReady && totalRuns === 0 ? (
               <RunsLandingEmpty
                 hasGitHubAuth={hasGitHubAuth}

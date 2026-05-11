@@ -14,21 +14,25 @@
     reason = "This integration test stages sandbox fixtures with sync std::fs."
 )]
 
-use fabro_sandbox::SandboxRecord;
 use fabro_sandbox::reconnect::reconnect;
+use fabro_types::{RunSandbox, RunSandboxRuntime, SandboxProvider};
 
 // ---------------------------------------------------------------------------
 // Local sandbox
 // ---------------------------------------------------------------------------
 
-fn local_record(working_directory: &std::path::Path) -> SandboxRecord {
-    SandboxRecord {
-        provider:          "local".to_string(),
-        working_directory: working_directory.to_string_lossy().to_string(),
-        identifier:        None,
-        repo_cloned:       None,
-        clone_origin_url:  None,
-        clone_branch:      None,
+fn local_record(working_directory: &std::path::Path) -> RunSandbox {
+    RunSandbox {
+        provider: SandboxProvider::Local,
+        image:    None,
+        snapshot: None,
+        runtime:  Some(RunSandboxRuntime {
+            id:                "local:test".to_string(),
+            working_directory: working_directory.to_string_lossy().to_string(),
+            repo_cloned:       None,
+            clone_origin_url:  None,
+            clone_branch:      None,
+        }),
     }
 }
 
@@ -124,14 +128,18 @@ async fn local_cp_creates_parent_dirs() {
 // Docker sandbox
 // ---------------------------------------------------------------------------
 
-fn docker_record(container_id: &str) -> SandboxRecord {
-    SandboxRecord {
-        provider:          "docker".to_string(),
-        working_directory: "/workspace".to_string(),
-        identifier:        Some(container_id.to_string()),
-        repo_cloned:       Some(false),
-        clone_origin_url:  None,
-        clone_branch:      None,
+fn docker_record(container_id: &str) -> RunSandbox {
+    RunSandbox {
+        provider: SandboxProvider::Docker,
+        image:    None,
+        snapshot: None,
+        runtime:  Some(RunSandboxRuntime {
+            id:                container_id.to_string(),
+            working_directory: "/workspace".to_string(),
+            repo_cloned:       Some(false),
+            clone_origin_url:  None,
+            clone_branch:      None,
+        }),
     }
 }
 

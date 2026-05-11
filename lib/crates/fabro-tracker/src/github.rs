@@ -78,7 +78,8 @@ impl GitHubTracker {
                 .await
                 .context("creating GitHub App installation token")
             }
-            GitHubCredentials::Token(token) => Ok(token.clone()),
+            GitHubCredentials::Pat(token) => Ok(token.clone()),
+            GitHubCredentials::Installation(token) => token.valid_token().map(str::to_owned),
         }
     }
 
@@ -725,7 +726,8 @@ mod tests {
             .mock_async(|when, then| {
                 when.method("POST")
                     .path("/app/installations/1/access_tokens");
-                then.status(201).body(r#"{"token": "ghs_test"}"#);
+                then.status(201)
+                    .body(r#"{"token": "ghs_test", "expires_at": "2099-01-01T00:00:00Z"}"#);
             })
             .await;
         server
@@ -765,7 +767,8 @@ mod tests {
             .mock_async(|when, then| {
                 when.method("POST")
                     .path("/app/installations/1/access_tokens");
-                then.status(201).body(r#"{"token": "ghs_test"}"#);
+                then.status(201)
+                    .body(r#"{"token": "ghs_test", "expires_at": "2099-01-01T00:00:00Z"}"#);
             })
             .await;
         server
@@ -818,7 +821,8 @@ mod tests {
             .mock_async(|when, then| {
                 when.method("POST")
                     .path("/app/installations/1/access_tokens");
-                then.status(201).body(r#"{"token": "ghs_test"}"#);
+                then.status(201)
+                    .body(r#"{"token": "ghs_test", "expires_at": "2099-01-01T00:00:00Z"}"#);
             })
             .await;
         server
@@ -853,7 +857,8 @@ mod tests {
             .mock_async(|when, then| {
                 when.method("POST")
                     .path("/app/installations/1/access_tokens");
-                then.status(201).body(r#"{"token": "ghs_test"}"#);
+                then.status(201)
+                    .body(r#"{"token": "ghs_test", "expires_at": "2099-01-01T00:00:00Z"}"#);
             })
             .await;
         server
@@ -888,7 +893,8 @@ mod tests {
             .mock_async(|when, then| {
                 when.method("POST")
                     .path("/app/installations/1/access_tokens");
-                then.status(201).body(r#"{"token": "ghs_test"}"#);
+                then.status(201)
+                    .body(r#"{"token": "ghs_test", "expires_at": "2099-01-01T00:00:00Z"}"#);
             })
             .await;
         server
@@ -929,7 +935,8 @@ mod tests {
             .mock_async(|when, then| {
                 when.method("POST")
                     .path("/app/installations/1/access_tokens");
-                then.status(201).body(r#"{"token": "ghs_test"}"#);
+                then.status(201)
+                    .body(r#"{"token": "ghs_test", "expires_at": "2099-01-01T00:00:00Z"}"#);
             })
             .await;
         server
@@ -975,7 +982,8 @@ mod tests {
             .mock_async(|when, then| {
                 when.method("POST")
                     .path("/app/installations/1/access_tokens");
-                then.status(201).body(r#"{"token": "ghs_test"}"#);
+                then.status(201)
+                    .body(r#"{"token": "ghs_test", "expires_at": "2099-01-01T00:00:00Z"}"#);
             })
             .await;
         server
@@ -1026,7 +1034,8 @@ mod tests {
             .mock_async(|when, then| {
                 when.method("POST")
                     .path("/app/installations/1/access_tokens");
-                then.status(201).body(r#"{"token": "ghs_test"}"#);
+                then.status(201)
+                    .body(r#"{"token": "ghs_test", "expires_at": "2099-01-01T00:00:00Z"}"#);
             })
             .await;
         server
@@ -1099,7 +1108,8 @@ mod tests {
             .mock_async(|when, then| {
                 when.method("POST")
                     .path("/app/installations/1/access_tokens");
-                then.status(201).body(r#"{"token": "ghs_test"}"#);
+                then.status(201)
+                    .body(r#"{"token": "ghs_test", "expires_at": "2099-01-01T00:00:00Z"}"#);
             })
             .await;
         server
@@ -1182,7 +1192,8 @@ mod tests {
             .mock_async(|when, then| {
                 when.method("POST")
                     .path("/app/installations/1/access_tokens");
-                then.status(201).body(r#"{"token": "ghs_test"}"#);
+                then.status(201)
+                    .body(r#"{"token": "ghs_test", "expires_at": "2099-01-01T00:00:00Z"}"#);
             })
             .await;
         server

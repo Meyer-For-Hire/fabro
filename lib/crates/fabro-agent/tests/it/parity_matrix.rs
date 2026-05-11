@@ -170,7 +170,7 @@ macro_rules! provider_test {
             async fn [<$prefix _ $scenario>]() {
                 let tmp = tempfile::tempdir().expect("failed to create tempdir");
                 let mut session = make_session($provider, $model, tmp.path(), None).await;
-                session.initialize().await;
+                session.initialize().await.unwrap();
                 [<scenario_ $scenario>](&mut session, tmp.path()).await;
             }
         }
@@ -195,7 +195,7 @@ macro_rules! openai_twin_provider_test {
                     tmp.path(),
                     Some(twin),
                 ).await;
-                session.initialize().await;
+                session.initialize().await.unwrap();
                 [<scenario_ $scenario>](&mut session, tmp.path()).await;
             }
         }
@@ -591,8 +591,8 @@ async fn scenario_steering_mid_task(session: &mut Session, dir: &Path) {
     // Setup: create a file the LLM will read (triggering a tool call)
     std::fs::write(dir.join("task.txt"), "read me first").expect("write task.txt");
 
-    // Grab handles before process_input borrows &mut self
-    let steering_queue = session.steering_queue_handle();
+    // Grab handle before process_input borrows &mut self
+    let control = session.control_handle();
     let mut rx = session.subscribe();
 
     // Spawn a task that waits for the first tool call, then injects steering
@@ -602,12 +602,10 @@ async fn scenario_steering_mid_task(session: &mut Session, dir: &Path) {
                 event.event,
                 fabro_agent::AgentEvent::ToolCallCompleted { .. }
             ) {
-                steering_queue
-                    .lock()
-                    .expect("steering queue lock")
-                    .push_back(
-                        "Stop what you are doing. Create a file called steered.txt containing 'steered' and do nothing else.".to_string(),
-                    );
+                control.steer(
+                    "Stop what you are doing. Create a file called steered.txt containing 'steered' and do nothing else.".to_string(),
+                    None,
+                );
                 break;
             }
         }
@@ -670,7 +668,7 @@ macro_rules! reasoning_effort_tests {
             };
             let mut session =
                 make_session_with_config($provider, $model, tmp.path(), config, None).await;
-            session.initialize().await;
+            session.initialize().await.unwrap();
             session
                 .process_input("Say hello")
                 .await
@@ -749,7 +747,7 @@ macro_rules! loop_detection_tests {
             };
             let mut session =
                 make_session_with_config($provider, $model, tmp.path(), config, None).await;
-            session.initialize().await;
+            session.initialize().await.unwrap();
             session
                 .process_input("Repeatedly read the file /dev/null")
                 .await

@@ -21,7 +21,7 @@ use fabro_config::daemon::ServerDaemon;
 use fabro_config::{Storage, envfile};
 use fabro_store::EventEnvelope;
 use fabro_test::{TestContext, expect_reqwest_status};
-use fabro_types::{CommandOutputStream, RunId, StageId};
+use fabro_types::{RunId, StageId};
 use httpmock::{Mock, MockServer};
 use serde_json::Value;
 use shlex::try_quote;
@@ -120,26 +120,71 @@ pub(crate) fn mock_resolved_run<'a>(
             .query_param("selector", selector);
         then.status(200)
             .header("Content-Type", "application/json")
-            .json_body(serde_json::json!({
-                "run_id": run_id,
-                "workflow_name": "Nightly Build",
-                "workflow_slug": "nightly-build",
-                "goal": "Nightly run",
-                "title": "Nightly run",
-                "labels": {},
-                "source_directory": null,
-                "repository": { "name": "unknown" },
-                "start_time": "2026-04-05T12:00:00Z",
-                "created_at": "2026-04-05T12:00:00Z",
-                "status": {
+            .json_body(remote_run_summary_json(
+                run_id,
+                "Nightly Build",
+                "nightly-build",
+                "Nightly run",
+                &serde_json::json!({
                     "kind": "succeeded",
                     "reason": "completed"
-                },
-                "pending_control": null,
-                "duration_ms": 123,
-                "elapsed_secs": 0,
-                "total_usd_micros": null
-            }));
+                }),
+                "2026-04-05T12:00:00Z",
+            ));
+    })
+}
+
+pub(crate) fn remote_run_summary_json(
+    run_id: &str,
+    workflow_name: &str,
+    workflow_slug: &str,
+    goal: &str,
+    status: &Value,
+    timestamp: &str,
+) -> Value {
+    serde_json::json!({
+        "id": run_id,
+        "title": goal,
+        "goal": goal,
+        "workflow": {
+            "slug": workflow_slug,
+            "name": workflow_name
+        },
+        "repository": {
+            "name": "repo",
+            "origin_url": null,
+            "provider": "unknown"
+        },
+        "origin": {
+            "kind": "api"
+        },
+        "labels": {},
+        "lifecycle": {
+            "status": status,
+            "pending_control": null,
+            "queue_position": null,
+            "error": null,
+            "archived": false,
+            "archived_at": null
+        },
+        "models": [],
+        "source_directory": "/srv/repo",
+        "timestamps": {
+            "created_at": timestamp,
+            "started_at": timestamp,
+            "last_event_at": null,
+            "completed_at": null,
+            "duration_ms": null,
+            "elapsed_secs": null
+        },
+        "billing": null,
+        "diff": null,
+        "pull_request": null,
+        "current_question": null,
+        "superseded_by": null,
+        "links": {
+            "web": null
+        }
     })
 }
 
@@ -200,7 +245,6 @@ fn run_completed_dry_run(context: &TestContext, workflow: &Path) -> RunSetup {
         run_id.as_str(),
         "--dry-run",
         "--auto-approve",
-        "--no-retro",
         "--sandbox",
         "local",
     ]);
@@ -208,7 +252,7 @@ fn run_completed_dry_run(context: &TestContext, workflow: &Path) -> RunSetup {
     let output = cmd.output().expect("command should execute");
     if !output.status.success() {
         panic!(
-            "command failed: fabro run --dry-run --auto-approve --no-retro --sandbox local {}\nstdout:\n{}\nstderr:\n{}",
+            "command failed: fabro run --dry-run --auto-approve --sandbox local {}\nstdout:\n{}\nstderr:\n{}",
             workflow.display(),
             stdout(&output),
             stderr(&output)
@@ -220,7 +264,7 @@ fn run_completed_dry_run(context: &TestContext, workflow: &Path) -> RunSetup {
     };
     wait_for_event_names(&run_setup.run_dir, &[
         "run.completed",
-        "sandbox.cleanup.completed",
+        "sandbox.stop.completed",
     ]);
     run_setup
 }
@@ -264,7 +308,6 @@ pub(crate) fn setup_detached_dry_run(context: &TestContext) -> RunSetup {
         "--detach",
         "--dry-run",
         "--auto-approve",
-        "--no-retro",
         "--sandbox",
         "local",
     ]);
@@ -272,7 +315,7 @@ pub(crate) fn setup_detached_dry_run(context: &TestContext) -> RunSetup {
     let output = cmd.output().expect("command should execute");
     if !output.status.success() {
         panic!(
-            "command failed: fabro run --detach --dry-run --auto-approve --no-retro --sandbox local {}\nstdout:\n{}\nstderr:\n{}",
+            "command failed: fabro run --detach --dry-run --auto-approve --sandbox local {}\nstdout:\n{}\nstderr:\n{}",
             fixture("simple.fabro").display(),
             stdout(&output),
             stderr(&output)
@@ -351,8 +394,6 @@ goal = "Exercise sandbox commands"
 provider = "local"
 preserve = true
 
-[run.sandbox.local]
-worktree_mode = "never"
 "#,
     );
 
@@ -372,7 +413,6 @@ fn run_local_workflow(context: &TestContext, workspace_dir: &Path, workflow: &st
         "--run-id",
         run_id.as_str(),
         "--auto-approve",
-        "--no-retro",
         "--sandbox",
         "local",
         "--provider",
@@ -382,7 +422,7 @@ fn run_local_workflow(context: &TestContext, workspace_dir: &Path, workflow: &st
     let output = cmd.output().expect("command should execute");
     if !output.status.success() {
         panic!(
-            "command failed: fabro run --auto-approve --no-retro --sandbox local --provider openai {workflow}\nstdout:\n{}\nstderr:\n{}",
+            "command failed: fabro run --auto-approve --sandbox local --provider openai {workflow}\nstdout:\n{}\nstderr:\n{}",
             stdout(&output),
             stderr(&output)
         );
@@ -456,22 +496,25 @@ pub(crate) fn write_gated_workflow(path: &Path, name: &str, goal: &str) -> Workf
 pub(crate) fn wait_for_status(run_dir: &Path, expected: &[&str]) -> String {
     let deadline = Instant::now() + command_timeout();
     loop {
-        if let Some(status) = run_state(run_dir).status.map(|status| match status {
-            fabro_types::RunStatus::Submitted => "submitted",
-            fabro_types::RunStatus::Queued => "queued",
-            fabro_types::RunStatus::Starting => "starting",
-            fabro_types::RunStatus::Running => "running",
-            fabro_types::RunStatus::Blocked { .. } => "blocked",
-            fabro_types::RunStatus::Paused { .. } => "paused",
-            fabro_types::RunStatus::Removing => "removing",
-            fabro_types::RunStatus::Succeeded { .. } => "succeeded",
-            fabro_types::RunStatus::Failed { .. } => "failed",
-            fabro_types::RunStatus::Dead => "dead",
-            fabro_types::RunStatus::Archived { .. } => "archived",
-        }) {
-            if expected.contains(&status) {
-                return status.to_string();
+        let state = run_state(run_dir);
+        let status = if state.archived_at.is_some() {
+            "archived"
+        } else {
+            match state.status {
+                fabro_types::RunStatus::Submitted => "submitted",
+                fabro_types::RunStatus::Queued => "queued",
+                fabro_types::RunStatus::Starting => "starting",
+                fabro_types::RunStatus::Running => "running",
+                fabro_types::RunStatus::Blocked { .. } => "blocked",
+                fabro_types::RunStatus::Paused { .. } => "paused",
+                fabro_types::RunStatus::Removing => "removing",
+                fabro_types::RunStatus::Succeeded { .. } => "succeeded",
+                fabro_types::RunStatus::Failed { .. } => "failed",
+                fabro_types::RunStatus::Dead => "dead",
             }
+        };
+        if expected.contains(&status) {
+            return status.to_string();
         }
         assert!(
             Instant::now() < deadline,
@@ -704,15 +747,11 @@ pub(crate) fn run_events(run_dir: &Path) -> Vec<EventEnvelope> {
     crate::support::parse_event_envelopes(&response)
 }
 
-pub(crate) fn command_log_text(
-    run_dir: &Path,
-    stage_id: &StageId,
-    stream: CommandOutputStream,
-) -> String {
+pub(crate) fn command_log_text(run_dir: &Path, stage_id: &StageId) -> String {
     let run_id = infer_run_id(run_dir);
     let response: CommandLogResponseRecord = block_on(get_server_json(
         run_dir,
-        &format!("/api/v1/runs/{run_id}/stages/{stage_id}/logs/{stream}?offset=0&limit=1048576"),
+        &format!("/api/v1/runs/{run_id}/stages/{stage_id}/logs/output?offset=0&limit=1048576"),
     ));
     let bytes = BASE64_STANDARD
         .decode(&response.bytes_base64)
@@ -756,7 +795,6 @@ async fn seed_dry_run(context: &TestContext, state: SeededRunState) -> RunSetup 
         serde_json::json!({
             "dry_run": true,
             "auto_approve": true,
-            "no_retro": true,
             "sandbox": "local",
             "label": test_labels(context),
         }),
@@ -784,7 +822,6 @@ async fn seed_git_backed_changed_run(context: &TestContext) -> SeededGitRunSetup
         serde_json::json!({
             "provider": "openai",
             "sandbox": "local",
-            "no_retro": true,
             "label": test_labels(context),
         }),
         Some(serde_json::json!({
@@ -829,7 +866,6 @@ async fn seed_git_backed_noop_run(context: &TestContext) -> RunSetup {
         serde_json::json!({
             "provider": "openai",
             "sandbox": "local",
-            "no_retro": true,
             "label": test_labels(context),
         }),
         Some(serde_json::json!({
@@ -859,7 +895,6 @@ async fn seed_artifact_run(context: &TestContext) -> RunSetup {
         artifact_workflow_source(),
         serde_json::json!({
             "sandbox": "local",
-            "no_retro": true,
             "label": test_labels(context),
         }),
         None,
@@ -982,7 +1017,7 @@ async fn append_seeded_simple_completion_events(
         serde_json::json!({
             "working_directory": context.temp_dir.display().to_string(),
             "provider": "local",
-            "identifier": null,
+            "id": format!("local:{}", run.run_id),
             "repo_cloned": false,
             "clone_origin_url": null,
             "clone_branch": null,
@@ -1088,7 +1123,7 @@ async fn append_seeded_simple_completion_events(
         base_url,
         &run.run_id,
         None,
-        "sandbox.cleanup.started",
+        "sandbox.stop.started",
         serde_json::json!({
             "provider": "local",
         }),
@@ -1099,7 +1134,7 @@ async fn append_seeded_simple_completion_events(
         base_url,
         &run.run_id,
         None,
-        "sandbox.cleanup.completed",
+        "sandbox.stop.completed",
         serde_json::json!({
             "provider": "local",
             "duration_ms": 1,
@@ -1142,7 +1177,7 @@ async fn append_seeded_git_completion_events(
         serde_json::json!({
             "working_directory": context.temp_dir.display().to_string(),
             "provider": "local",
-            "identifier": null,
+            "id": format!("local:{}", run.run_id),
             "repo_cloned": false,
             "clone_origin_url": null,
             "clone_branch": null,

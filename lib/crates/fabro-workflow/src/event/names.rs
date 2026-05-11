@@ -11,6 +11,8 @@ pub fn event_name(event: &Event) -> &'static str {
         Event::RunQueued => "run.queued",
         Event::RunStarting => "run.starting",
         Event::RunRunning => "run.running",
+        Event::RunInterrupt { .. } => "run.interrupt",
+        Event::RunSteer { .. } => "run.steer",
         Event::RunBlocked { .. } => "run.blocked",
         Event::RunUnblocked => "run.unblocked",
         Event::RunRemoving => "run.removing",
@@ -22,6 +24,7 @@ pub fn event_name(event: &Event) -> &'static str {
         Event::RunSupersededBy { .. } => "run.superseded_by",
         Event::RunArchived { .. } => "run.archived",
         Event::RunUnarchived { .. } => "run.unarchived",
+        Event::RunTitleUpdated { .. } => "run.title.updated",
         Event::WorkflowRunCompleted { .. } => "run.completed",
         Event::WorkflowRunFailed { .. } => "run.failed",
         Event::RunNotice { .. } => "run.notice",
@@ -91,6 +94,15 @@ pub fn event_name(event: &Event) -> &'static str {
             SandboxEvent::CleanupStarted { .. } => "sandbox.cleanup.started",
             SandboxEvent::CleanupCompleted { .. } => "sandbox.cleanup.completed",
             SandboxEvent::CleanupFailed { .. } => "sandbox.cleanup.failed",
+            SandboxEvent::StartStarted { .. } => "sandbox.start.started",
+            SandboxEvent::StartCompleted { .. } => "sandbox.start.completed",
+            SandboxEvent::StartFailed { .. } => "sandbox.start.failed",
+            SandboxEvent::StopStarted { .. } => "sandbox.stop.started",
+            SandboxEvent::StopCompleted { .. } => "sandbox.stop.completed",
+            SandboxEvent::StopFailed { .. } => "sandbox.stop.failed",
+            SandboxEvent::DeleteStarted { .. } => "sandbox.delete.started",
+            SandboxEvent::DeleteCompleted { .. } => "sandbox.delete.completed",
+            SandboxEvent::DeleteFailed { .. } => "sandbox.delete.failed",
             SandboxEvent::SnapshotPulling { .. } => "sandbox.snapshot.pulling",
             SandboxEvent::SnapshotCreating { .. } => "sandbox.snapshot.creating",
             SandboxEvent::SnapshotReady { .. } => "sandbox.snapshot.ready",
@@ -116,6 +128,15 @@ pub fn event_name(event: &Event) -> &'static str {
         Event::CommandCompleted { .. } => "command.completed",
         Event::AgentCliStarted { .. } => "agent.cli.started",
         Event::AgentCliCompleted { .. } => "agent.cli.completed",
+        Event::AgentSessionStarted { .. } => "agent.session.started",
+        Event::AgentSessionActivated { .. } => "agent.session.activated",
+        Event::AgentSessionDeactivated { .. } => "agent.session.deactivated",
+        Event::AgentSessionEnded { .. } => "agent.session.ended",
+        Event::AgentInterruptInjected { .. } => "agent.interrupt.injected",
+        Event::AgentSteerBuffered { .. } => "agent.steer.buffered",
+        Event::AgentSteerDropped { .. } => "agent.steer.dropped",
+        Event::AgentCliCancelled { .. } => "agent.cli.cancelled",
+        Event::AgentCliTimedOut { .. } => "agent.cli.timed_out",
         Event::PullRequestCreated { .. } => "pull_request.created",
         Event::PullRequestFailed { .. } => "pull_request.failed",
         Event::DevcontainerResolved { .. } => "devcontainer.resolved",
@@ -128,9 +149,6 @@ pub fn event_name(event: &Event) -> &'static str {
         }
         Event::DevcontainerLifecycleCompleted { .. } => "devcontainer.lifecycle.completed",
         Event::DevcontainerLifecycleFailed { .. } => "devcontainer.lifecycle.failed",
-        Event::RetroStarted { .. } => "retro.started",
-        Event::RetroCompleted { .. } => "retro.completed",
-        Event::RetroFailed { .. } => "retro.failed",
     }
 }
 
@@ -144,14 +162,6 @@ mod tests {
 
     #[test]
     fn event_name_matches_new_dot_notation() {
-        assert_eq!(
-            event_name(&Event::RetroStarted {
-                prompt:   None,
-                provider: None,
-                model:    None,
-            }),
-            "retro.started"
-        );
         assert_eq!(
             event_name(&Event::ParallelBranchStarted {
                 parallel_group_id:  StageId::new("plan", 1),

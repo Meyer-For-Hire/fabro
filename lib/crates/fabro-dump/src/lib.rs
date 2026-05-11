@@ -62,22 +62,17 @@ impl RunDump {
 
         push_json_entry(&mut entries, "run.json", &SerializableProjection(state))?;
 
-        if let Some(graph_source) = state.graph_source.as_ref() {
+        if let Some(graph_source) = state.spec.graph_source.as_ref() {
             entries.push(RunDumpEntry::text("graph.fabro", graph_source.clone()));
         }
 
-        let mut stages: Vec<_> = state.iter_stages().collect();
+        let stages: Vec<_> = state.iter_stages().collect();
         if stages.len() > MAX_STAGES_IN_DUMP {
             bail!(
                 "run dump supports at most {MAX_STAGES_IN_DUMP} stages with the current path prefix width (got {})",
                 stages.len()
             );
         }
-        stages.sort_by(|(left_id, left), (right_id, right)| {
-            left.first_event_seq
-                .cmp(&right.first_event_seq)
-                .then_with(|| left_id.cmp(right_id))
-        });
 
         let mut stage_ranks = HashMap::new();
         for (index, (stage_id, _)) in stages.iter().enumerate() {
@@ -134,28 +129,12 @@ impl RunDump {
                     parallel_results.clone(),
                 ));
             }
-            if let Some(stdout) = stage.stdout.as_ref() {
+            if let Some(output) = stage.output.as_ref() {
                 entries.push(RunDumpEntry::text_path(
-                    &base.join("stdout.log"),
-                    stdout.clone(),
+                    &base.join("output.log"),
+                    output.clone(),
                 ));
             }
-            if let Some(stderr) = stage.stderr.as_ref() {
-                entries.push(RunDumpEntry::text_path(
-                    &base.join("stderr.log"),
-                    stderr.clone(),
-                ));
-            }
-        }
-
-        if let Some(prompt) = state.retro_prompt.as_ref() {
-            entries.push(RunDumpEntry::text("stages/retro/prompt.md", prompt.clone()));
-        }
-        if let Some(response) = state.retro_response.as_ref() {
-            entries.push(RunDumpEntry::text(
-                "stages/retro/response.md",
-                response.clone(),
-            ));
         }
 
         Ok(Self {
@@ -179,11 +158,11 @@ impl RunDump {
         dump.entries
             .push(RunDumpEntry::bytes("events.jsonl", events_jsonl));
 
-        for (seq, checkpoint) in &state.checkpoints {
+        for record in &state.checkpoints {
             push_json_entry_path(
                 &mut dump.entries,
-                &PathBuf::from("checkpoints").join(format!("{seq:04}.json")),
-                checkpoint,
+                &PathBuf::from("checkpoints").join(format!("{:04}.json", record.seq)),
+                &record.checkpoint,
             )?;
         }
 
@@ -493,8 +472,9 @@ mod tests {
     use fabro_types::graph::Graph;
     use fabro_types::run::RunSpec;
     use fabro_types::{
-        Checkpoint, Conclusion, RunStatus, SandboxRecord, StageCompletion, StageOutcome,
-        StartRecord, SuccessReason, WorkflowSettings, first_event_seq, fixtures,
+        Checkpoint, CheckpointRecord, Conclusion, RunDiff, RunSandbox, RunStatus, SandboxProvider,
+        StageCompletion, StageOutcome, StartRecord, SuccessReason, WorkflowSettings,
+        first_event_seq, fixtures,
     };
     use futures::executor;
 
@@ -505,6 +485,7 @@ mod tests {
             run_id:           fixtures::RUN_1,
             settings:         WorkflowSettings::default(),
             graph:            Graph::new("ship"),
+            graph_source:     Some("digraph Ship {}".to_string()),
             workflow_slug:    Some("demo".to_string()),
             source_directory: Some("/tmp/project".to_string()),
             git:              Some(fabro_types::GitContext {
@@ -519,7 +500,6 @@ mod tests {
             manifest_blob:    None,
             definition_blob:  None,
             fork_source_ref:  None,
-            in_place:         false,
         }
     }
 
@@ -545,11 +525,8 @@ mod tests {
     #[test]
     fn from_projection_uses_stages_layout_and_collapses_top_level_metadata_files() {
         let stage_id = StageId::new("build", 2);
-        let mut projection = RunProjection::default();
-        projection.spec = Some(sample_run_spec());
-        projection.graph_source = Some("digraph Ship {}".to_string());
+        let mut projection = RunProjection::new("Demo".to_string(), sample_run_spec(), Utc::now());
         projection.start = Some(StartRecord {
-            run_id:     fixtures::RUN_1,
             start_time: Utc
                 .with_ymd_and_hms(2026, 4, 20, 12, 0, 0)
                 .single()
@@ -557,10 +534,14 @@ mod tests {
             run_branch: Some("fabro/run/demo".to_string()),
             base_sha:   Some("deadbeef".to_string()),
         });
-        projection.status = Some(RunStatus::Succeeded {
+        projection.status = RunStatus::Succeeded {
             reason: SuccessReason::Completed,
+        };
+        projection.checkpoints.push(CheckpointRecord {
+            seq:        7,
+            checkpoint: sample_checkpoint(),
+            diff:       RunDiff::default(),
         });
-        projection.checkpoint = Some(sample_checkpoint());
         projection.conclusion = Some(Conclusion {
             timestamp:            Utc
                 .with_ymd_and_hms(2026, 4, 20, 12, 5, 0)
@@ -573,17 +554,20 @@ mod tests {
             stages:               Vec::new(),
             billing:              None,
             total_retries:        0,
+            diff:                 RunDiff::default(),
         });
-        projection.sandbox = Some(SandboxRecord {
-            provider:          "local".to_string(),
-            working_directory: "/tmp/project".to_string(),
-            identifier:        Some("sandbox-1".to_string()),
-            repo_cloned:       None,
-            clone_origin_url:  None,
-            clone_branch:      None,
+        projection.sandbox = Some(RunSandbox {
+            provider: SandboxProvider::Local,
+            image:    None,
+            snapshot: None,
+            runtime:  Some(fabro_types::RunSandboxRuntime {
+                id:                "sandbox-1".to_string(),
+                working_directory: "/tmp/project".to_string(),
+                repo_cloned:       None,
+                clone_origin_url:  None,
+                clone_branch:      None,
+            }),
         });
-        projection.retro_prompt = Some("retro prompt".to_string());
-        projection.retro_response = Some("retro response".to_string());
         let stage =
             projection.stage_entry(stage_id.node_id(), stage_id.visit(), first_event_seq(2));
         stage.prompt = Some("plan".to_string());
@@ -602,8 +586,7 @@ mod tests {
         stage.script_invocation = Some(serde_json::json!({ "command": "cargo test" }));
         stage.script_timing = Some(serde_json::json!({ "duration_ms": 10 }));
         stage.parallel_results = Some(serde_json::json!([{ "stage": "fanout@1" }]));
-        stage.stdout = Some("stdout".to_string());
-        stage.stderr = Some("stderr".to_string());
+        stage.output = Some("output".to_string());
 
         let dump = RunDump::from_projection(&projection).unwrap();
         let paths: Vec<&str> = dump
@@ -614,8 +597,6 @@ mod tests {
 
         assert!(paths.contains(&"run.json"));
         assert!(paths.contains(&"graph.fabro"));
-        assert!(paths.contains(&"stages/retro/prompt.md"));
-        assert!(paths.contains(&"stages/retro/response.md"));
         assert!(paths.contains(&"stages/001-build@2/prompt.md"));
         assert!(paths.contains(&"stages/001-build@2/response.md"));
         assert!(paths.contains(&"stages/001-build@2/status.json"));
@@ -624,13 +605,11 @@ mod tests {
         assert!(paths.contains(&"stages/001-build@2/script_invocation.json"));
         assert!(paths.contains(&"stages/001-build@2/script_timing.json"));
         assert!(paths.contains(&"stages/001-build@2/parallel_results.json"));
-        assert!(paths.contains(&"stages/001-build@2/stdout.log"));
-        assert!(paths.contains(&"stages/001-build@2/stderr.log"));
+        assert!(paths.contains(&"stages/001-build@2/output.log"));
         assert!(!paths.contains(&"start.json"));
         assert!(!paths.contains(&"status.json"));
         assert!(!paths.contains(&"checkpoint.json"));
         assert!(!paths.contains(&"sandbox.json"));
-        assert!(!paths.contains(&"retro.json"));
         assert!(!paths.contains(&"conclusion.json"));
 
         let run_json = dump
@@ -644,17 +623,16 @@ mod tests {
         let round_tripped: RunProjection = serde_json::from_value(value.clone()).unwrap();
         let node = round_tripped.stage(&stage_id).expect("node should exist");
 
-        assert!(round_tripped.spec.is_some());
+        assert_eq!(round_tripped.spec.run_id, fixtures::RUN_1);
         assert!(round_tripped.start.is_some());
-        assert!(round_tripped.status.is_some());
-        assert!(round_tripped.checkpoint.is_some());
+        assert!(round_tripped.status.is_terminal());
+        assert!(round_tripped.current_checkpoint().is_some());
         assert!(round_tripped.conclusion.is_some());
         assert!(round_tripped.sandbox.is_some());
         assert_eq!(node.prompt, None);
         assert_eq!(node.response, None);
         assert_eq!(node.diff, None);
-        assert_eq!(node.stdout, None);
-        assert_eq!(node.stderr, None);
+        assert_eq!(node.output, None);
         assert_eq!(
             node.provider_used,
             Some(serde_json::json!({ "provider": "openai" }))
@@ -663,7 +641,7 @@ mod tests {
 
     #[test]
     fn from_projection_prefixes_stage_paths_but_not_artifact_paths() {
-        let mut projection = RunProjection::default();
+        let mut projection = RunProjection::new("Demo".to_string(), sample_run_spec(), Utc::now());
         projection
             .stage_entry("zebra", 1, first_event_seq(1))
             .prompt = Some("first".to_string());
@@ -691,7 +669,7 @@ mod tests {
 
     #[test]
     fn add_artifact_bytes_places_orphans_under_sentinel() {
-        let mut projection = RunProjection::default();
+        let mut projection = RunProjection::new("Demo".to_string(), sample_run_spec(), Utc::now());
         projection
             .stage_entry("known", 1, first_event_seq(1))
             .prompt = Some("present".to_string());

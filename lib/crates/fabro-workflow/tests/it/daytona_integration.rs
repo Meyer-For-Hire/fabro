@@ -41,6 +41,7 @@ use fabro_workflow::records::Checkpoint;
 use fabro_workflow::run_options::{GitCheckpointOptions, RunOptions};
 use fabro_workflow::test_support::{WorkflowRunner, test_store_dir};
 use object_store::local::LocalFileSystem;
+use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
 fn test_run_id(label: &str) -> RunId {
@@ -94,13 +95,13 @@ fn load_run_checkpoint(run_dir: &Path) -> Result<Checkpoint, Box<dyn std::error:
                         .into_iter()
                         .next()
                         .ok_or("test store should contain one run")?
-                        .run_id
+                        .id
                 };
                 let run = runtime.block_on(store.open_run_reader(&run_id))?;
                 let state = runtime.block_on(async {
                     for attempt in 0..20 {
                         let state = run.state().await?;
-                        if state.checkpoint.is_some() || attempt == 19 {
+                        if state.current_checkpoint().is_some() || attempt == 19 {
                             return Ok::<_, fabro_store::Error>(state);
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -132,13 +133,13 @@ fn load_run_checkpoint(run_dir: &Path) -> Result<Checkpoint, Box<dyn std::error:
                 .into_iter()
                 .next()
                 .ok_or("test store should contain one run")?
-                .run_id
+                .id
         };
         let run = runtime.block_on(store.open_run_reader(&run_id))?;
         runtime.block_on(async {
             for attempt in 0..20 {
                 let state = run.state().await?;
-                if state.checkpoint.is_some() || attempt == 19 {
+                if state.current_checkpoint().is_some() || attempt == 19 {
                     return Ok::<_, fabro_store::Error>(state);
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -147,7 +148,8 @@ fn load_run_checkpoint(run_dir: &Path) -> Result<Checkpoint, Box<dyn std::error:
         })?
     };
     state
-        .checkpoint
+        .current_checkpoint()
+        .cloned()
         .ok_or_else(|| "checkpoint should exist in run store".into())
 }
 
@@ -249,7 +251,7 @@ async fn daytona_exec_command_cancelled() {
     let env = create_env_with_github_app(Some(creds)).await;
     env.initialize().await.unwrap();
 
-    let token = tokio_util::sync::CancellationToken::new();
+    let token = CancellationToken::new();
     let token_clone = token.clone();
 
     // Cancel the token shortly after starting
@@ -513,7 +515,7 @@ async fn daytona_pipeline_artifact_offload_and_sync() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("test-run"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -698,7 +700,7 @@ async fn daytona_git_checkpoint_remote_emits_events() {
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("git-cp-test"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -871,7 +873,7 @@ async fn daytona_parallel_git_branching_e2e() {
     let run_options = RunOptions {
         settings: WorkflowSettings::default(),
         run_dir: run_tmp.path().to_path_buf(),
-        cancel_token: None,
+        cancel_token: CancellationToken::new(),
         run_id,
         labels: std::collections::HashMap::new(),
         workflow_slug: None,
@@ -1078,6 +1080,7 @@ async fn run_daytona_cli_test(provider: Provider, model: &str, install_command: 
             &emitter,
             &env,
             None,
+            CancellationToken::new(),
         )
         .await;
 
@@ -1209,7 +1212,7 @@ async fn daytona_git_checkpoint_with_shadow_branch() {
     let run_options = RunOptions {
         settings: WorkflowSettings::default(),
         run_dir: dir.path().to_path_buf(),
-        cancel_token: None,
+        cancel_token: CancellationToken::new(),
         run_id,
         labels: std::collections::HashMap::new(),
         workflow_slug: None,
@@ -1245,7 +1248,8 @@ async fn daytona_git_checkpoint_with_shadow_branch() {
     let projection: fabro_store::RunProjection =
         serde_json::from_slice(run_json.stdout.as_bytes()).expect("run.json should parse");
     let checkpoint = projection
-        .checkpoint
+        .current_checkpoint()
+        .cloned()
         .expect("shadow branch should contain checkpoint data");
     assert!(
         !checkpoint.completed_nodes.is_empty(),
@@ -1366,7 +1370,7 @@ async fn daytona_asset_collection() {
             ..WorkflowSettings::default()
         },
         run_dir:          dir.path().to_path_buf(),
-        cancel_token:     None,
+        cancel_token:     CancellationToken::new(),
         run_id:           test_run_id("artifact-test-daytona"),
         labels:           std::collections::HashMap::new(),
         workflow_slug:    None,
@@ -1634,7 +1638,7 @@ async fn daytona_git_push_run_branch_to_origin() {
     let run_options = RunOptions {
         settings: WorkflowSettings::default(),
         run_dir: dir.path().to_path_buf(),
-        cancel_token: None,
+        cancel_token: CancellationToken::new(),
         run_id,
         labels: std::collections::HashMap::new(),
         workflow_slug: None,
@@ -1834,8 +1838,8 @@ async fn daytona_toolbox_idle_diagnostic() {
 /// uploads a file, downloads it back, and verifies the round-trip.
 #[fabro_macros::e2e_test(live("DAYTONA_API_KEY"), live("GITHUB_APP_PRIVATE_KEY"))]
 async fn daytona_cp_upload_download_round_trip() {
-    use fabro_sandbox::SandboxRecord;
     use fabro_sandbox::reconnect::reconnect;
+    use fabro_types::{RunSandbox, SandboxProvider};
 
     // 1. Create and initialize a real Daytona sandbox
     let env = create_env().await;
@@ -1847,14 +1851,18 @@ async fn daytona_cp_upload_download_round_trip() {
         "sandbox_info() should return the Daytona sandbox name"
     );
 
-    // 2. Build a SandboxRecord (same as `fabro run` would persist)
-    let record = SandboxRecord {
-        provider:          "daytona".to_string(),
-        working_directory: env.working_directory().to_string(),
-        identifier:        Some(sandbox_name.clone()),
-        repo_cloned:       Some(false),
-        clone_origin_url:  None,
-        clone_branch:      None,
+    // 2. Build a RunSandbox (same as `fabro run` would persist)
+    let record = RunSandbox {
+        provider: SandboxProvider::Daytona,
+        image:    None,
+        snapshot: None,
+        runtime:  Some(fabro_types::RunSandboxRuntime {
+            id:                sandbox_name.clone(),
+            working_directory: env.working_directory().to_string(),
+            repo_cloned:       Some(false),
+            clone_origin_url:  None,
+            clone_branch:      None,
+        }),
     };
 
     // 3. Reconnect via the real cp::reconnect path

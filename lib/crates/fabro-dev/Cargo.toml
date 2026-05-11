@@ -6,9 +6,22 @@ publish = false
 license.workspace = true
 description = "Internal development tooling for Fabro"
 
+[lib]
+name = "fabro_dev"
+
 [[bin]]
 name = "fabro-dev"
 path = "src/main.rs"
+required-features = ["dev"]
+
+[[test]]
+name = "it"
+path = "tests/it/main.rs"
+required-features = ["dev"]
+
+[features]
+default = []
+dev = []
 
 [lints]
 workspace = true
@@ -18,7 +31,6 @@ anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
 csv = "1"
-fabro-cli = { path = "../fabro-cli" }
 fabro-config = { path = "../fabro-config" }
 fabro-options-metadata.workspace = true
 quick-xml = "0.36"

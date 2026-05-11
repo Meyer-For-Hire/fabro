@@ -8,7 +8,8 @@ use serde_json::json;
 #[test]
 fn pull_request_detail_reuses_domain_record_type() {
     let detail: PullRequestDetail = serde_json::from_value(json!({
-        "record": {
+        "pull_request": {
+            "provider": "github",
             "html_url": "https://github.com/fabro-sh/fabro/pull/123",
             "number": 123,
             "owner": "fabro-sh",
@@ -17,9 +18,6 @@ fn pull_request_detail_reuses_domain_record_type() {
             "head_branch": "fabro/run/demo",
             "title": "Move PR commands server-side"
         },
-        "number": 123,
-        "title": "Move PR commands server-side",
-        "body": "Generated body",
         "state": "closed",
         "draft": false,
         "merged": true,
@@ -28,22 +26,19 @@ fn pull_request_detail_reuses_domain_record_type() {
         "additions": 234,
         "deletions": 67,
         "changed_files": 5,
-        "html_url": "https://github.com/fabro-sh/fabro/pull/123",
-        "user": {
+        "comments": 3,
+        "checks": [],
+        "author": {
             "login": "octocat"
         },
-        "head": {
-            "ref": "fabro/run/demo"
-        },
-        "base": {
-            "ref": "main"
-        },
-        "created_at": "2026-04-23T15:40:00Z",
-        "updated_at": "2026-04-23T15:45:00Z"
+        "timestamps": {
+            "created_at": "2026-04-23T15:40:00Z",
+            "updated_at": "2026-04-23T15:45:00Z"
+        }
     }))
     .expect("detail should deserialize");
 
-    assert_same_type_as_pull_request_record(&detail.record);
+    assert_same_type_as_pull_request_record(&detail.pull_request);
 }
 
 #[test]
@@ -70,6 +65,7 @@ fn merge_strategy_json_matches_openapi_shape() {
 #[test]
 fn pull_request_record_json_matches_openapi_shape() {
     let fixture = json!({
+        "provider": "github",
         "html_url": "https://github.com/fabro-sh/fabro/pull/123",
         "number": 123,
         "owner": "fabro-sh",
@@ -88,7 +84,8 @@ fn pull_request_record_json_matches_openapi_shape() {
 #[test]
 fn pull_request_detail_json_matches_openapi_shape() {
     let fixture = json!({
-        "record": {
+        "pull_request": {
+            "provider": "github",
             "html_url": "https://github.com/fabro-sh/fabro/pull/123",
             "number": 123,
             "owner": "fabro-sh",
@@ -97,9 +94,6 @@ fn pull_request_detail_json_matches_openapi_shape() {
             "head_branch": "fabro/run/demo",
             "title": "Move PR commands server-side"
         },
-        "number": 123,
-        "title": "Move PR commands server-side",
-        "body": "Generated body",
         "state": "closed",
         "draft": false,
         "merged": true,
@@ -108,18 +102,15 @@ fn pull_request_detail_json_matches_openapi_shape() {
         "additions": 234,
         "deletions": 67,
         "changed_files": 5,
-        "html_url": "https://github.com/fabro-sh/fabro/pull/123",
-        "user": {
+        "comments": 3,
+        "checks": [],
+        "author": {
             "login": "octocat"
         },
-        "head": {
-            "ref": "fabro/run/demo"
-        },
-        "base": {
-            "ref": "main"
-        },
-        "created_at": "2026-04-23T15:40:00Z",
-        "updated_at": "2026-04-23T15:45:00Z"
+        "timestamps": {
+            "created_at": "2026-04-23T15:40:00Z",
+            "updated_at": "2026-04-23T15:45:00Z"
+        }
     });
 
     let detail: PullRequestDetail =

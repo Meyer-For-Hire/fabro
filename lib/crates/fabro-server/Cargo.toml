@@ -31,13 +31,12 @@ fabro-interview = { path = "../fabro-interview" }
 fabro-slack = { path = "../fabro-slack" }
 fabro-workflow = { path = "../fabro-workflow" }
 fabro-validate = { path = "../fabro-validate" }
-fabro-sandbox = { path = "../fabro-sandbox", features = ["daytona"] }
+fabro-sandbox = { path = "../fabro-sandbox", features = ["daytona", "docker"] }
 fabro-github = { path = "../fabro-github" }
 fabro-agent = { path = "../fabro-agent" }
 fabro-llm = { path = "../fabro-llm" }
 fabro-model = { path = "../fabro-model" }
 fabro-proc = { path = "../fabro-proc" }
-fabro-retro = { path = "../fabro-retro" }
 fabro-types = { path = "../fabro-types" }
 fabro-util = { path = "../fabro-util" }
 fabro-api = { path = "../fabro-api" }
@@ -48,7 +47,7 @@ fabro-redact.workspace = true
 fabro-static.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
-axum.workspace = true
+axum = { workspace = true, features = ["ws"] }
 axum-extra.workspace = true
 cookie.workspace = true
 dirs.workspace = true
@@ -56,6 +55,7 @@ globset.workspace = true
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
 tokio-stream = { workspace = true, features = ["sync"] }
+tokio-util.workspace = true
 base64.workspace = true
 jsonwebtoken.workspace = true
 hkdf.workspace = true
@@ -94,6 +94,7 @@ zeroize.workspace = true
 strum.workspace = true
 
 [build-dependencies]
+fabro-build-support = { path = "../build-support" }
 chrono = { workspace = true }
 
 [dev-dependencies]

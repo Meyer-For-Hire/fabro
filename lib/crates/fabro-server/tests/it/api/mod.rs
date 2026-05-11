@@ -1,3 +1,4 @@
+mod auth_sessions;
 mod cli_auth_token;
 mod docs;
 mod install;
@@ -5,6 +6,7 @@ mod install_openai_compatible;
 mod routing;
 mod run_files;
 mod runs;
+mod sandbox_vnc;
 mod settings;
 mod system;
 mod tcp;

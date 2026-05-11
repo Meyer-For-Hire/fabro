@@ -11,8 +11,8 @@ use fabro_vault::{SecretType, Vault};
 use httpmock::MockServer;
 use serde_json::Value;
 
-use super::support::{output_stderr, wait_for_event_names};
-use crate::support::{run_output_filters, unique_run_id};
+use super::support::{output_stderr, remote_run_summary_json, wait_for_event_names};
+use crate::support::{run_output_filters, run_projection_json, unique_run_id};
 
 fn run_status_response(run_id: &str, status: &str) -> serde_json::Value {
     let status = match status {
@@ -20,19 +20,26 @@ fn run_status_response(run_id: &str, status: &str) -> serde_json::Value {
         "queued" => serde_json::json!({ "kind": "queued" }),
         other => panic!("unsupported test status {other:?}"),
     };
-    serde_json::json!({
-        "id": run_id,
-        "status": status,
-        "created_at": "2026-04-05T12:00:00Z"
-    })
+    remote_run_summary_json(
+        run_id,
+        "Test Workflow",
+        "test-workflow",
+        "Test run",
+        &status,
+        "2026-04-05T12:00:00Z",
+    )
 }
 
-fn remote_run_state_response() -> serde_json::Value {
-    serde_json::json!({
-        "spec": null,
-        "graph_source": null,
-        "start": null,
-        "status": null,
+fn remote_run_state_response(run_id: &str) -> serde_json::Value {
+    let mut state = run_projection_json(
+        run_id,
+        &serde_json::json!({
+            "kind": "succeeded",
+            "reason": "completed"
+        }),
+    );
+    state["checkpoints"] = serde_json::json!([{
+        "seq": 1,
         "checkpoint": {
             "timestamp": "2026-04-05T12:00:01Z",
             "current_node": "exit",
@@ -47,24 +54,18 @@ fn remote_run_state_response() -> serde_json::Value {
             "loop_failure_signatures": {},
             "restart_failure_signatures": {},
             "node_visits": {}
-        },
-        "checkpoints": [],
-        "conclusion": {
+        }
+    }]);
+    state["conclusion"] = serde_json::json!({
             "timestamp": "2026-04-05T12:00:01Z",
             "status": "succeeded",
             "duration_ms": 12,
             "stages": [],
             "billing": null,
             "total_retries": 0,
-        },
-        "retro": null,
-        "retro_prompt": null,
-        "retro_response": null,
-        "sandbox": null,
-        "final_patch": null,
-        "pull_request": null,
-        "stages": {}
-    })
+            "diff": {}
+    });
+    state
 }
 
 fn run_completed_event(run_id: &str) -> serde_json::Value {
@@ -141,19 +142,18 @@ fn help() {
           --json                   Output as JSON [env: FABRO_JSON=]
           --server <SERVER>        Fabro server target: http(s) URL or absolute Unix socket path [env: FABRO_SERVER=]
           --debug                  Enable DEBUG-level logging (default is INFO) [env: FABRO_DEBUG=]
+      -I, --input <KEY=VALUE>      Override a workflow input value (repeatable, format: KEY=VALUE)
           --dry-run                Execute with simulated LLM backend
-          --auto-approve           Auto-approve all human gates
           --no-upgrade-check       Disable automatic upgrade check [env: FABRO_NO_UPGRADE_CHECK=true]
-          --goal <GOAL>            Override the workflow goal (available as {{ goal }} in prompts)
+          --auto-approve           Auto-approve all human gates
           --quiet                  Suppress non-essential output [env: FABRO_QUIET=]
+          --goal <GOAL>            Override the workflow goal (available as {{ goal }} in prompts)
           --goal-file <GOAL_FILE>  Read the workflow goal from a file
           --model <MODEL>          Override default LLM model
           --provider <PROVIDER>    Override default LLM provider
       -v, --verbose                Enable verbose output
           --sandbox <SANDBOX>      Sandbox for agent tools [possible values: local, docker, daytona]
-          --in-place               Run directly in the source checkout without git checkpoints
           --label <KEY=VALUE>      Attach a label to this run (repeatable, format: KEY=VALUE)
-          --no-retro               Skip retro generation after the run
           --preserve-sandbox       Keep the sandbox alive after the run finishes (for debugging)
       -d, --detach                 Run the workflow in the background and print the run ID
       -h, --help                   Print help
@@ -256,6 +256,55 @@ fn detach_uses_configured_server_target_without_server_flag() {
 }
 
 #[test]
+fn run_create_failure_shows_action_context_and_response_body() {
+    let context = test_context!();
+    let server = MockServer::start();
+    let create_mock = server.mock(|when, then| {
+        when.method("POST").path("/api/v1/runs");
+        then.status(422)
+            .header("Content-Type", "text/plain")
+            .body("Failed to deserialize request: missing field `dirty` at line 1 column 2834");
+    });
+
+    let workflow = context.install_fixture("simple.fabro");
+    let output = context
+        .run_cmd()
+        .args([
+            "--server",
+            &format!("{}/api/v1", server.base_url()),
+            "--detach",
+            "--dry-run",
+            "--auto-approve",
+            workflow.to_str().unwrap(),
+        ])
+        .output()
+        .expect("command should execute");
+
+    assert!(
+        !output.status.success(),
+        "create failure should fail:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    create_mock.assert();
+
+    let stderr = output_stderr(&output);
+    assert!(stderr.contains("could not create run"), "{stderr}");
+    assert!(stderr.contains("missing field `dirty`"), "{stderr}");
+    assert!(
+        stderr.contains("422 Unprocessable Entity"),
+        "status should remain visible for plain-text API failures:\n{stderr}"
+    );
+    assert!(
+        !stderr.lines().any(|line| {
+            line.trim_end()
+                .ends_with("request failed with status 422 Unprocessable Entity")
+        }),
+        "stderr should not collapse to status-only output:\n{stderr}"
+    );
+}
+
+#[test]
 fn run_uses_vault_credentials_for_worker_execution() {
     let mut context = test_context!();
     context.write_home(
@@ -323,7 +372,6 @@ digraph VaultWorkerLlm {
             "--run-id",
             run_id.as_str(),
             "--auto-approve",
-            "--no-retro",
             "--sandbox",
             "local",
             "--provider",
@@ -362,7 +410,6 @@ fn detach_rejects_storage_dir_flag() {
             "--detach",
             "--dry-run",
             "--auto-approve",
-            "--no-retro",
             workflow.to_str().unwrap(),
         ])
         .output()
@@ -509,7 +556,7 @@ fn remote_foreground_run_consumes_paginated_events_and_prints_server_backed_summ
             .path(format!("/api/v1/runs/{run_id}/state"));
         then.status(200)
             .header("Content-Type", "application/json")
-            .body(remote_run_state_response().to_string());
+            .body(remote_run_state_response(run_id.as_str()).to_string());
     });
     server.mock(|when, then| {
         when.method("GET")
@@ -625,9 +672,6 @@ goal = "Show stored artifacts"
 provider = "local"
 preserve = true
 
-[run.sandbox.local]
-worktree_mode = "never"
-
 [run.artifacts]
 include = ["assets/**"]
 "#,
@@ -641,7 +685,6 @@ include = ["assets/**"]
             "--run-id",
             run_id.as_str(),
             "--auto-approve",
-            "--no-retro",
             "--sandbox",
             "local",
             "--provider",
@@ -781,15 +824,15 @@ fn dry_run_persists_event_history_in_store() {
         .success();
 
     let run_dir = context.find_run_dir(&run_id);
-    wait_for_event_names(&run_dir, &["run.completed", "sandbox.cleanup.completed"]);
+    wait_for_event_names(&run_dir, &["run.completed", "sandbox.stop.completed"]);
     let output = context
         .command()
-        .args(["logs", &run_id])
+        .args(["events", &run_id])
         .output()
-        .expect("logs command should execute");
+        .expect("events command should execute");
     assert!(
         output.status.success(),
-        "logs failed:\nstdout:\n{}\nstderr:\n{}",
+        "events failed:\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -797,7 +840,7 @@ fn dry_run_persists_event_history_in_store() {
         .expect("stdout should be UTF-8")
         .lines()
         .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str(line).expect("logs output should be JSONL"))
+        .map(|line| serde_json::from_str(line).expect("events output should be JSONL"))
         .collect();
     assert!(
         !progress.is_empty(),
@@ -822,17 +865,17 @@ fn dry_run_persists_event_history_in_store() {
     );
     assert_eq!(
         progress.last().and_then(|event| event["event"].as_str()),
-        Some("sandbox.cleanup.completed")
+        Some("sandbox.stop.completed")
     );
 
     let tail_output = context
         .command()
-        .args(["logs", "--tail", "1", &run_id])
+        .args(["events", "--tail", "1", &run_id])
         .output()
-        .expect("tail logs command should execute");
+        .expect("tail events command should execute");
     assert!(
         tail_output.status.success(),
-        "tail logs failed:\nstdout:\n{}\nstderr:\n{}",
+        "tail events failed:\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&tail_output.stdout),
         String::from_utf8_lossy(&tail_output.stderr)
     );
@@ -840,15 +883,15 @@ fn dry_run_persists_event_history_in_store() {
         .expect("stdout should be UTF-8")
         .lines()
         .find(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str(line).expect("tail logs output should be JSON"))
-        .expect("tail logs should include the latest event");
+        .map(|line| serde_json::from_str(line).expect("tail events output should be JSON"))
+        .expect("tail events should include the latest event");
     fabro_json_snapshot!(context, &live_content, @r#"
     {
       "actor": {
         "kind": "worker",
         "run_id": "[ULID]"
       },
-      "event": "sandbox.cleanup.completed",
+      "event": "sandbox.stop.completed",
       "id": "[EVENT_ID]",
       "properties": {
         "duration_ms": "[DURATION_MS]",
@@ -915,7 +958,6 @@ fn json_run_requires_manual_input_for_human_gates_without_auto_approve() {
             "run",
             "--sandbox",
             "local",
-            "--no-retro",
             workflow.to_str().unwrap(),
         ])
         .output()
