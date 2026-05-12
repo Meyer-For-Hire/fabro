@@ -249,3 +249,23 @@ fn stop_reason_to_string(stop_reason: StopReason) -> String {
         .and_then(|value| value.as_str().map(str::to_string))
         .unwrap_or_else(|| format!("{stop_reason:?}"))
 }
+
+#[cfg(test)]
+mod tests {
+    use agent_client_protocol::schema::SessionNotification;
+
+    #[test]
+    fn codex_usage_update_session_notification_deserializes() {
+        let notification = serde_json::json!({
+            "sessionId": "session-1",
+            "update": {
+                "sessionUpdate": "usage_update",
+                "used": 26128,
+                "size": 258400
+            }
+        });
+
+        serde_json::from_value::<SessionNotification>(notification)
+            .expect("Codex ACP usage_update notifications should be ignored, not fatal");
+    }
+}

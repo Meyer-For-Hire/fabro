@@ -9,7 +9,7 @@ version = "0.230.0-nightly.0"
 license = "MIT"
 
 [workspace.dependencies]
-agent-client-protocol = "0.11.1"
+agent-client-protocol = { version = "0.11.1", features = ["unstable_session_usage"] }
 agent-client-protocol-tokio = "0.11.1"
 anyhow = "1"
 axum = { version = "0.8" }
