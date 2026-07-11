@@ -2846,12 +2846,18 @@ dependencies = [
 name = "fabro-mcp-store"
 version = "0.302.0-nightly.1"
 dependencies = [
+ "chrono",
+ "fabro-db",
  "fabro-types",
  "serde",
+ "serde_json",
+ "sqlx",
+ "strum 0.28.0",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "toml 0.8.23",
+ "tracing",
 ]
 
 [[package]]

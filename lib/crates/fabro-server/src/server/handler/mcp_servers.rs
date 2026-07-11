@@ -143,11 +143,18 @@ impl From<McpServerStoreError> for ApiError {
             }
             // Remaining variants are persistence/parse faults that indicate an
             // internal problem rather than a client one.
-            McpServerStoreError::InvalidFilename { .. }
+            McpServerStoreError::Db { .. }
+            | McpServerStoreError::StoredRevision { .. }
+            | McpServerStoreError::StoredTransport { .. }
+            | McpServerStoreError::StoredInteger { .. }
+            | McpServerStoreError::JsonEncode { .. }
+            | McpServerStoreError::JsonDecode { .. }
+            | McpServerStoreError::InvalidFilename { .. }
             | McpServerStoreError::Parse { .. }
             | McpServerStoreError::InvalidUtf8 { .. }
             | McpServerStoreError::Serialize { .. }
-            | McpServerStoreError::Io { .. } => Self::new(
+            | McpServerStoreError::Io { .. }
+            | McpServerStoreError::LegacyBackup { .. } => Self::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "mcp server store operation failed",
             ),

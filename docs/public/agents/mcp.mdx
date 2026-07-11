@@ -119,6 +119,21 @@ MCP servers available to Fabro agents can be configured in two places:
 
 Each server entry specifies a transport type and optional timeouts. The server name is the TOML table key and is used in qualified tool names.
 
+### Server-managed catalog
+
+Fabro servers can also manage a shared MCP catalog through the MCP servers REST API. Workflows reference a catalog definition by id instead of repeating its transport configuration:
+
+```toml
+[run.agent.mcps.sentry]
+id = "sentry"
+```
+
+Server-managed definitions are stored in the server's shared SQLite database. Read APIs return configured env/header names but never their values.
+
+When upgrading an installation that stored definitions as `mcps/*.toml` next to the active `settings.toml`, Fabro validates and imports the directory during startup. Existing SQLite rows win on id conflicts. After a successful transaction, Fabro renames the source directory to a timestamped backup such as `mcps.imported-20260711T120000000000Z.bak`.
+
+Transport env/header values preserve their existing plaintext-at-rest behavior in SQLite. Prefer `{{ secrets.NAME }}` interpolation over literal credentials where possible.
+
 ## Transports
 
 ### Stdio

@@ -21,6 +21,38 @@ pub enum McpServerStoreError {
         #[from]
         source: McpServerValidationError,
     },
+    #[error("mcp server database error")]
+    Db {
+        #[from]
+        source: sqlx::Error,
+    },
+    #[error("stored mcp server {id} has invalid revision")]
+    StoredRevision {
+        id:     McpServerId,
+        #[source]
+        source: fabro_types::McpServerRevisionParseError,
+    },
+    #[error("stored mcp server {id} has invalid transport: {reason}")]
+    StoredTransport { id: McpServerId, reason: String },
+    #[error("stored mcp server {id} has invalid {column} value {value}")]
+    StoredInteger {
+        id:     McpServerId,
+        column: &'static str,
+        value:  i64,
+    },
+    #[error("encoding mcp server {field} as JSON")]
+    JsonEncode {
+        field:  &'static str,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("decoding stored mcp server {id}.{field} JSON")]
+    JsonDecode {
+        id:     McpServerId,
+        field:  &'static str,
+        #[source]
+        source: serde_json::Error,
+    },
     #[error("invalid mcp server filename at {path:?}")]
     InvalidFilename { path: PathBuf, reason: String },
     #[error("failed to parse mcp server TOML at {path:?}")]
@@ -45,6 +77,13 @@ pub enum McpServerStoreError {
         path:   PathBuf,
         #[source]
         source: std::io::Error,
+    },
+    #[error("renaming legacy mcp server directory {source_path:?} to backup {backup_path:?}")]
+    LegacyBackup {
+        source_path: PathBuf,
+        backup_path: PathBuf,
+        #[source]
+        source:      std::io::Error,
     },
 }
 
@@ -77,10 +116,15 @@ impl McpServerStoreError {
             Self::AlreadyExists { .. } => "already_exists",
             Self::StaleRevision { .. } => "stale_revision",
             Self::Validation { .. } => "validation",
+            Self::Db { .. } => "database",
+            Self::StoredRevision { .. }
+            | Self::StoredTransport { .. }
+            | Self::StoredInteger { .. }
+            | Self::JsonDecode { .. } => "stored_data",
+            Self::JsonEncode { .. } | Self::Serialize { .. } => "serialize",
             Self::InvalidFilename { .. } => "invalid_filename",
             Self::Parse { .. } | Self::InvalidUtf8 { .. } => "parse",
-            Self::Serialize { .. } => "serialize",
-            Self::Io { .. } => "io",
+            Self::Io { .. } | Self::LegacyBackup { .. } => "io",
         }
     }
 }

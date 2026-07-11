@@ -117,6 +117,32 @@ fn test_environment_store(
     (temp, store)
 }
 
+fn test_mcp_server_store() -> (tempfile::TempDir, McpServerStore) {
+    let temp = tempfile::tempdir().expect("MCP server store tempdir should be created");
+    let db_path = temp.path().join("fabro.sqlite3");
+    let pool = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("MCP server store setup runtime should build");
+        runtime.block_on(async move {
+            let database = fabro_db::Database::connect(db_path)
+                .await
+                .expect("test MCP server database should connect");
+            database
+                .migrate()
+                .await
+                .expect("test MCP server database should migrate");
+            database.clone_pool()
+        })
+    })
+    .join()
+    .expect("MCP server store setup thread should not panic");
+    let store = load_mcp_server_store_blocking(pool, temp.path().join("mcps"))
+        .expect("test MCP server store should load");
+    (temp, store)
+}
+
 fn server_settings_from_toml(source: &str) -> ServerSettings {
     ServerSettingsBuilder::from_toml(source).expect("server settings should resolve")
 }
@@ -1275,10 +1301,9 @@ id = "missing"
 
 #[test]
 fn system_sandbox_provider_uses_manifest_defaults() {
-    let (temp, environment_store) =
+    let (_environment_temp, environment_store) =
         test_environment_store(Some(EnvironmentProvider::Daytona), true);
-    let mcp_server_store =
-        McpServerStore::load(temp.path().join("mcps")).expect("mcp server store should load");
+    let (_mcp_temp, mcp_server_store) = test_mcp_server_store();
     let source = r#"
 _version = 1
 
@@ -1296,9 +1321,8 @@ id = "default"
 
 #[test]
 fn system_sandbox_provider_defaults_when_manifest_run_settings_do_not_resolve() {
-    let (temp, environment_store) = test_environment_store(None, true);
-    let mcp_server_store =
-        McpServerStore::load(temp.path().join("mcps")).expect("mcp server store should load");
+    let (_environment_temp, environment_store) = test_environment_store(None, true);
+    let (_mcp_temp, mcp_server_store) = test_mcp_server_store();
     let source = r#"
 _version = 1
 
