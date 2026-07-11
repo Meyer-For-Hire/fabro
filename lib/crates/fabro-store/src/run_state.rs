@@ -935,7 +935,7 @@ pub(crate) fn build_summary(state: &RunProjection, run_id: &RunId) -> Run {
         .as_ref()
         .map(|conclusion| conclusion.timing);
     let terminal_total = terminal_total_usd_micros(state);
-    let current_total = terminal_total.or_else(|| projected_total_usd_micros(state));
+    let current_total = projected_billing(state).total_usd_micros;
 
     Run {
         id: *run_id,
@@ -1001,10 +1001,6 @@ fn terminal_total_usd_micros(state: &RunProjection) -> Option<i64> {
         .as_ref()
         .and_then(|conclusion| conclusion.billing.as_ref())
         .and_then(|billing| billing.total_usd_micros)
-}
-
-fn projected_total_usd_micros(state: &RunProjection) -> Option<i64> {
-    projected_billing(state).total_usd_micros
 }
 
 pub(crate) fn projected_billing(state: &RunProjection) -> BilledTokenCounts {

@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use axum::http::HeaderMap;
 use axum_extra::extract::Query as ExtraQuery;
-use chrono::Utc;
 use fabro_automation::{
     Automation, AutomationDraft, AutomationId, AutomationReplace, AutomationStoreError,
 };
@@ -11,8 +10,8 @@ use fabro_types::{AutomationRef, RunId};
 use serde::Serialize;
 
 use super::super::{
-    ApiError, AppState, IntoResponse, Json, MAX_PAGE_OFFSET, PaginationParams, Path, RequiredUser,
-    Response, Router, State, StatusCode, get,
+    ApiError, AppState, IntoResponse, Json, PaginationParams, Path, RequiredUser, Response, Router,
+    State, StatusCode, clamp_page_limit, clamp_page_offset, get,
 };
 use super::{json_with_etag_response, lifecycle, parse_required_if_match, runs};
 use crate::automation_materializer::AutomationRunMaterializeInput;
@@ -84,28 +83,11 @@ async fn list_automation_runs(
     let query = RunSummaryListQuery {
         automation_id: Some(id.to_string()),
         visibility: RunSummaryVisibility::All,
-        limit: pagination.limit.clamp(1, 100),
-        offset: pagination.offset.min(MAX_PAGE_OFFSET),
+        limit: clamp_page_limit(pagination.limit),
+        offset: clamp_page_offset(pagination.offset),
         ..RunSummaryListQuery::default()
     };
-    let page = match state.stores.run_summaries.list(&query, Utc::now()).await {
-        Ok(page) => page,
-        Err(err) => {
-            return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
-                .into_response();
-        }
-    };
-
-    let data = state.decorate_run_summaries(page.data).await;
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "data": data,
-            "meta": { "has_more": page.has_more, "total": page.total }
-        })),
-    )
-        .into_response()
+    runs::run_summary_page_response(&state, &query).await
 }
 
 async fn create_automation_run(

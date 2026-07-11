@@ -53,6 +53,4 @@ CREATE INDEX runs_by_created_at ON runs(created_at_ms DESC, id DESC);
 CREATE INDEX runs_by_updated_at ON runs(last_event_at_ms DESC, id DESC);
 CREATE INDEX runs_by_status ON runs(archived_at_ms, status, last_event_at_ms DESC, id DESC);
 CREATE INDEX runs_by_parent ON runs(parent_id, created_at_ms DESC, id DESC);
-CREATE INDEX runs_by_workflow ON runs(workflow_slug, created_at_ms DESC, id DESC);
-CREATE INDEX runs_by_repository ON runs(repository_name, created_at_ms DESC, id DESC);
 CREATE INDEX runs_by_automation ON runs(automation_id, created_at_ms DESC, id DESC);

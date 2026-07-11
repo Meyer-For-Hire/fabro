@@ -15,6 +15,7 @@
 //! child branches carry their own work timing; run-level active time sums work
 //! across stage visits and can exceed run wall time when work runs in parallel.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Timing breakdown for one stage visit.
@@ -134,6 +135,13 @@ impl RunTiming {
             wall_time_ms,
             ..self
         }
+    }
+
+    /// Milliseconds elapsed from `start` to `now`, clamped at zero.
+    #[must_use]
+    pub fn wall_time_ms_since(start: DateTime<Utc>, now: DateTime<Utc>) -> u64 {
+        u64::try_from(now.signed_duration_since(start).num_milliseconds().max(0))
+            .expect("non-negative milliseconds fit in u64")
     }
 }
 

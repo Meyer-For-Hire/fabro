@@ -349,7 +349,7 @@ async fn runs_schema_creates_indexes_and_rejects_invalid_rows() -> anyhow::Resul
     )
     .fetch_one(database.pool())
     .await?;
-    assert_eq!(index_count, 7);
+    assert_eq!(index_count, 5);
 
     insert_minimal_run(database.pool(), "submitted", 0, r#"{"id":"run"}"#).await?;
     for (status, input_tokens, summary_json) in [

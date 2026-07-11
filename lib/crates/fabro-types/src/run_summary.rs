@@ -101,6 +101,18 @@ pub struct WorkflowRef {
     pub edge_count: i64,
 }
 
+impl WorkflowRef {
+    /// Best available human-facing workflow name: explicit name, then graph
+    /// name, then slug.
+    #[must_use]
+    pub fn display_name(&self) -> Option<&str> {
+        self.name
+            .as_deref()
+            .or(self.graph_name.as_deref())
+            .or(self.slug.as_deref())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AutomationRef {
     pub id:         String,
@@ -233,15 +245,23 @@ pub enum RunSize {
 }
 
 impl RunSize {
+    /// Inclusive upper bounds in USD micros for each bucket below [`Self::Xl`],
+    /// ordered smallest to largest. Shared with the SQLite size sort so both
+    /// stay in step.
+    pub const BUCKET_MAX_USD_MICROS: [(Self, i64); 4] = [
+        (Self::Xs, 20_000_000),
+        (Self::S, 50_000_000),
+        (Self::M, 100_000_000),
+        (Self::L, 200_000_000),
+    ];
+
     #[must_use]
     pub fn from_total_usd_micros(total_usd_micros: Option<i64>) -> Self {
-        match total_usd_micros.unwrap_or(0) {
-            ..=20_000_000 => Self::Xs,
-            20_000_001..=50_000_000 => Self::S,
-            50_000_001..=100_000_000 => Self::M,
-            100_000_001..=200_000_000 => Self::L,
-            _ => Self::Xl,
-        }
+        let total = total_usd_micros.unwrap_or(0);
+        Self::BUCKET_MAX_USD_MICROS
+            .iter()
+            .find(|(_, max)| total <= *max)
+            .map_or(Self::Xl, |(size, _)| *size)
     }
 }
 

@@ -24,20 +24,21 @@ use fabro_store::{
 use fabro_types::settings::ResolveError;
 use fabro_types::{
     AutomationRef, Principal, RunClientProvenance, RunId, RunProvenance, RunServerProvenance,
-    StageContextWindow, StageContextWindowStaleness, StageContextWindowUnavailableReason,
-    StageHandler, StageModelUsage, StageProjection, SystemActorKind, WorkflowSettings,
-    parse_blob_ref,
+    RunStatusKind, StageContextWindow, StageContextWindowStaleness,
+    StageContextWindowUnavailableReason, StageHandler, StageModelUsage, StageProjection,
+    SystemActorKind, WorkflowSettings, parse_blob_ref,
 };
 use fabro_util::version::FABRO_VERSION;
 use fabro_workflow::command_log::{command_log_path, read_json_string_blob, read_log_slice};
 use fabro_workflow::run_status::RunStatus;
 use fabro_workflow::{Error as WorkflowError, operations};
+use strum::VariantArray as _;
 use tokio::fs;
 use tracing::info;
 
 use super::super::{
-    AppState, DeleteRunOutcome, ListResponse, MAX_PAGE_OFFSET, RunExecutionMode, VariableError,
-    answer_from_request, api_question_from_pending_interview, default_page_limit,
+    AppState, DeleteRunOutcome, ListResponse, RunExecutionMode, VariableError, answer_from_request,
+    api_question_from_pending_interview, clamp_page_limit, clamp_page_offset, default_page_limit,
     delete_run_internal, load_pending_interview, managed_run, parse_run_id_path,
     parse_stage_id_path, reject_if_archived, submit_pending_interview_answer, workflow_event,
 };
@@ -88,29 +89,6 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         .merge(manifest_routes())
 }
 
-#[derive(Debug, Clone, Copy, Default, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum RunsSortKey {
-    #[default]
-    CreatedAt,
-    UpdatedAt,
-    Status,
-    Elapsed,
-    Repo,
-    Title,
-    Workflow,
-    Changes,
-    Size,
-}
-
-#[derive(Debug, Clone, Copy, Default, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum RunsSortDirection {
-    Asc,
-    #[default]
-    Desc,
-}
-
 #[derive(serde::Deserialize)]
 struct ListRunsParams {
     #[serde(rename = "page[limit]", default = "default_page_limit")]
@@ -124,9 +102,9 @@ struct ListRunsParams {
     #[serde(default)]
     status:           Vec<BoardColumn>,
     #[serde(default)]
-    sort:             RunsSortKey,
+    sort:             RunSummarySort,
     #[serde(default)]
-    direction:        RunsSortDirection,
+    direction:        RunSummarySortDirection,
 }
 
 impl ListRunsParams {
@@ -134,10 +112,10 @@ impl ListRunsParams {
         RunSummaryListQuery {
             parent_id: self.parent_id,
             visibility: summary_visibility(&self.status, self.include_archived),
-            sort: summary_sort(self.sort),
-            direction: summary_sort_direction(self.direction),
-            limit: self.limit.clamp(1, 100),
-            offset: self.offset.min(MAX_PAGE_OFFSET),
+            sort: self.sort,
+            direction: self.direction,
+            limit: clamp_page_limit(self.limit),
+            offset: clamp_page_offset(self.offset),
             ..RunSummaryListQuery::default()
         }
     }
@@ -151,35 +129,14 @@ fn summary_visibility(selected: &[BoardColumn], include_archived: bool) -> RunSu
     let mut statuses = HashSet::new();
     let mut archived = false;
     for column in selected {
-        match column {
-            BoardColumn::Pending => {
-                statuses.insert(fabro_types::RunStatusKind::Submitted);
-                statuses.insert(fabro_types::RunStatusKind::Pending);
-            }
-            BoardColumn::Runnable => {
-                statuses.insert(fabro_types::RunStatusKind::Runnable);
-            }
-            BoardColumn::Initializing => {
-                statuses.insert(fabro_types::RunStatusKind::Starting);
-            }
-            BoardColumn::Running => {
-                statuses.insert(fabro_types::RunStatusKind::Running);
-                statuses.insert(fabro_types::RunStatusKind::Paused);
-            }
-            BoardColumn::Blocked => {
-                statuses.insert(fabro_types::RunStatusKind::Blocked);
-            }
-            BoardColumn::Succeeded => {
-                statuses.insert(fabro_types::RunStatusKind::Succeeded);
-            }
-            BoardColumn::Failed => {
-                statuses.insert(fabro_types::RunStatusKind::Failed);
-                statuses.insert(fabro_types::RunStatusKind::Dead);
-            }
-            BoardColumn::Archived => archived = true,
-            BoardColumn::Removing => {
-                statuses.insert(fabro_types::RunStatusKind::Removing);
-            }
+        match board_column_rank(*column) {
+            None => archived = true,
+            Some(rank) => statuses.extend(
+                RunStatusKind::VARIANTS
+                    .iter()
+                    .copied()
+                    .filter(|kind| kind.board_rank() == rank),
+            ),
         }
     }
     RunSummaryVisibility::Selected {
@@ -188,24 +145,20 @@ fn summary_visibility(selected: &[BoardColumn], include_archived: bool) -> RunSu
     }
 }
 
-fn summary_sort(sort: RunsSortKey) -> RunSummarySort {
-    match sort {
-        RunsSortKey::CreatedAt => RunSummarySort::CreatedAt,
-        RunsSortKey::UpdatedAt => RunSummarySort::UpdatedAt,
-        RunsSortKey::Status => RunSummarySort::Status,
-        RunsSortKey::Elapsed => RunSummarySort::Elapsed,
-        RunsSortKey::Repo => RunSummarySort::Repository,
-        RunsSortKey::Title => RunSummarySort::Title,
-        RunsSortKey::Workflow => RunSummarySort::Workflow,
-        RunsSortKey::Changes => RunSummarySort::Changes,
-        RunsSortKey::Size => RunSummarySort::Size,
-    }
-}
-
-fn summary_sort_direction(direction: RunsSortDirection) -> RunSummarySortDirection {
-    match direction {
-        RunsSortDirection::Asc => RunSummarySortDirection::Asc,
-        RunsSortDirection::Desc => RunSummarySortDirection::Desc,
+/// Rank of each board column, mirroring the `BoardColumn` enum order.
+/// Statuses map to columns through [`RunStatusKind::board_rank`]; `archived`
+/// has no rank because it selects on the archival overlay, not a status.
+fn board_column_rank(column: BoardColumn) -> Option<u8> {
+    match column {
+        BoardColumn::Pending => Some(0),
+        BoardColumn::Runnable => Some(1),
+        BoardColumn::Initializing => Some(2),
+        BoardColumn::Running => Some(3),
+        BoardColumn::Blocked => Some(4),
+        BoardColumn::Succeeded => Some(5),
+        BoardColumn::Failed => Some(6),
+        BoardColumn::Archived => None,
+        BoardColumn::Removing => Some(8),
     }
 }
 
@@ -361,29 +314,28 @@ async fn list_runs(
     State(state): State<Arc<AppState>>,
     ExtraQuery(params): ExtraQuery<ListRunsParams>,
 ) -> Response {
-    let page = match state
-        .stores
-        .run_summaries
-        .list(&params.summary_query(), Utc::now())
-        .await
-    {
-        Ok(page) => page,
-        Err(err) => {
-            return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
-                .into_response();
+    run_summary_page_response(&state, &params.summary_query()).await
+}
+
+/// List run summaries matching `query`, decorate them, and wrap them in the
+/// paginated list envelope. Shared by the runs and automation-runs lists.
+pub(super) async fn run_summary_page_response(
+    state: &AppState,
+    query: &RunSummaryListQuery,
+) -> Response {
+    match state.stores.run_summaries.list(query, Utc::now()).await {
+        Ok(page) => {
+            let data = state.decorate_run_summaries(page.data).await;
+            (
+                StatusCode::OK,
+                Json(ListResponse::paginated(data, page.has_more, page.total)),
+            )
+                .into_response()
         }
-    };
-
-    let data = state.decorate_run_summaries(page.data).await;
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "data": data,
-            "meta": { "has_more": page.has_more, "total": page.total }
-        })),
-    )
-        .into_response()
+        Err(err) => {
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
+        }
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -425,49 +377,33 @@ async fn resolve_run(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ResolveRunQuery>,
 ) -> Response {
-    let summary_query = RunSummaryListQuery {
-        visibility: RunSummaryVisibility::All,
-        limit: u32::MAX,
-        ..RunSummaryListQuery::default()
-    };
-    let runs = match state
-        .stores
-        .run_summaries
-        .list(&summary_query, Utc::now())
-        .await
-    {
-        Ok(page) => page.data,
+    let identities = match state.stores.run_summaries.list_identities().await {
+        Ok(identities) => identities,
         Err(err) => {
             return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
                 .into_response();
         }
     };
 
-    match resolve_run_by_selector(
-        &runs,
+    let resolved_id = match resolve_run_by_selector(
+        &identities,
         &query.selector,
         |run| run.id.to_string(),
-        |run| run.workflow.slug.clone(),
-        |run| run.workflow.name.clone(),
+        |run| run.workflow_slug.clone(),
+        |run| run.workflow_name.clone(),
         |run| run.id.created_at(),
         |run| run.id.created_at().to_rfc3339(),
-        |run| {
-            run.repository
-                .as_ref()
-                .and_then(|repository| repository.origin_url.clone())
-        },
+        |run| run.repository_origin_url.clone(),
     ) {
-        Ok(run) => {
-            let run = state.decorate_run_summary(run.clone()).await;
-            (StatusCode::OK, Json(run)).into_response()
-        }
+        Ok(identity) => identity.id,
         Err(err @ (ResolveRunError::InvalidSelector | ResolveRunError::AmbiguousPrefix { .. })) => {
-            ApiError::bad_request(err.to_string()).into_response()
+            return ApiError::bad_request(err.to_string()).into_response();
         }
         Err(err @ ResolveRunError::NotFound { .. }) => {
-            ApiError::not_found(err.to_string()).into_response()
+            return ApiError::not_found(err.to_string()).into_response();
         }
-    }
+    };
+    updated_run_response(&state, &resolved_id).await
 }
 
 async fn delete_run(

@@ -1,7 +1,7 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-use strum::{Display, EnumString, IntoStaticStr};
+use strum::{Display, EnumString, IntoStaticStr, VariantArray};
 
 #[derive(
     Debug,
@@ -15,6 +15,7 @@ use strum::{Display, EnumString, IntoStaticStr};
     Display,
     EnumString,
     IntoStaticStr,
+    VariantArray,
 )]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
@@ -30,6 +31,27 @@ pub enum RunStatusKind {
     Succeeded,
     Failed,
     Dead,
+}
+
+impl RunStatusKind {
+    /// Position of this status in the run-board column order. Ranks mirror
+    /// the API `BoardColumn` enum: pending 0, runnable 1, initializing 2,
+    /// running 3, blocked 4, succeeded 5, failed 6, archived 7, removing 8.
+    /// Rank 7 is reserved for archived runs, which is an overlay flag rather
+    /// than a status.
+    #[must_use]
+    pub fn board_rank(self) -> u8 {
+        match self {
+            Self::Submitted | Self::Pending => 0,
+            Self::Runnable => 1,
+            Self::Starting => 2,
+            Self::Running | Self::Paused => 3,
+            Self::Blocked => 4,
+            Self::Succeeded => 5,
+            Self::Failed | Self::Dead => 6,
+            Self::Removing => 8,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

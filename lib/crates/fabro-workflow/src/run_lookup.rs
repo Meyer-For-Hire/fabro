@@ -83,13 +83,7 @@ impl RunInfo {
     pub fn workflow_display_name(&self) -> String {
         self.summary.as_ref().map_or_else(
             || "[no run spec]".to_string(),
-            |_| {
-                self.workflow_name()
-                    .or_else(|| self.workflow_graph_name())
-                    .or_else(|| self.workflow_slug())
-                    .unwrap_or("-")
-                    .to_string()
-            },
+            |summary| summary.workflow.display_name().unwrap_or("-").to_string(),
         )
     }
 

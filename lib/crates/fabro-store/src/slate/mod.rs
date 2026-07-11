@@ -168,7 +168,7 @@ impl Database {
             *run_id,
             db,
             Arc::clone(&self.projection_cache),
-            self.run_summary_store(),
+            Arc::clone(&self.run_summary_store),
         )
         .await?;
         Self::cache_active_run(&mut active_runs, &run_store);
@@ -197,7 +197,7 @@ impl Database {
             *run_id,
             db,
             Arc::clone(&self.projection_cache),
-            self.run_summary_store(),
+            Arc::clone(&self.run_summary_store),
         )
         .await?;
         Self::cache_active_run(&mut active_runs, &run_store);
@@ -221,7 +221,7 @@ impl Database {
             *run_id,
             db,
             Arc::clone(&self.projection_cache),
-            self.run_summary_store(),
+            Arc::clone(&self.run_summary_store),
         )
         .await
     }
@@ -511,7 +511,7 @@ mod tests {
     use object_store::path::Path;
 
     use super::*;
-    use crate::{EventPayload, keys};
+    use crate::{EventPayload, keys, test_util};
 
     fn dt(value: &str) -> DateTime<Utc> {
         value.parse().unwrap()
@@ -560,15 +560,8 @@ mod tests {
     }
 
     async fn make_summary_store() -> (tempfile::TempDir, Arc<RunSummaryStore>) {
-        let directory = tempfile::tempdir().unwrap();
-        let database = fabro_db::Database::connect(directory.path().join("fabro.sqlite3"))
-            .await
-            .unwrap();
-        database.migrate().await.unwrap();
-        (
-            directory,
-            Arc::new(RunSummaryStore::new(database.clone_pool())),
-        )
+        let (directory, store) = test_util::sqlite_summary_store().await;
+        (directory, Arc::new(store))
     }
 
     fn sample_run_spec(label: &str) -> RunSpec {

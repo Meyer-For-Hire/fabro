@@ -1,9 +1,12 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
+use std::sync::LazyLock;
 
 use chrono::{DateTime, Utc};
-use fabro_types::{Run, RunId, RunStatusKind, RunTiming};
+use fabro_types::{Run, RunId, RunSize, RunStatusKind, RunTiming};
 use sqlx::sqlite::{SqliteConnection, SqliteRow};
 use sqlx::{QueryBuilder, Row as _, Sqlite, SqlitePool};
+use strum::VariantArray as _;
 
 use crate::run_state::projected_billing;
 use crate::slate::CachedRunProjection;
@@ -46,13 +49,20 @@ ON CONFLICT(id) DO UPDATE SET
 WHERE excluded.source_last_seq > runs.source_last_seq
 ";
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+const SELECT_RUN_SUMMARIES_SQL: &str = r"
+SELECT runs.id, runs.summary_json,
+       (SELECT COUNT(*) FROM runs AS child WHERE child.parent_id = runs.id) AS children_count
+FROM runs";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RunSummarySort {
     #[default]
     CreatedAt,
     UpdatedAt,
     Status,
     Elapsed,
+    #[serde(rename = "repo")]
     Repository,
     Title,
     Workflow,
@@ -60,7 +70,8 @@ pub enum RunSummarySort {
     Size,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum RunSummarySortDirection {
     Asc,
     #[default]
@@ -144,44 +155,82 @@ impl RunSummaryStore {
     }
 
     pub(crate) async fn reconcile(&self, entries: &[CachedRunProjection]) -> Result<()> {
-        let authoritative_ids = entries
-            .iter()
-            .map(|entry| entry.run_id.to_string())
-            .collect::<HashSet<_>>();
         let mut transaction = self.pool.begin().await?;
+        let stored_seqs: HashMap<String, i64> =
+            sqlx::query_as::<_, (String, i64)>("SELECT id, source_last_seq FROM runs")
+                .fetch_all(&mut *transaction)
+                .await?
+                .into_iter()
+                .collect();
+
+        let mut authoritative_ids = HashSet::new();
         for entry in entries {
-            let record = ProjectedRunSummary::from_entry(entry);
-            upsert_run(&mut transaction, &record).await?;
+            let run_id = entry.run_id.to_string();
+            let up_to_date = stored_seqs
+                .get(&run_id)
+                .is_some_and(|stored_seq| *stored_seq >= i64::from(entry.last_seq));
+            authoritative_ids.insert(run_id);
+            if up_to_date {
+                continue;
+            }
+            upsert_run(&mut transaction, &ProjectedRunSummary::from_entry(entry)).await?;
         }
 
-        let stored_ids = sqlx::query_scalar::<_, String>("SELECT id FROM runs")
-            .fetch_all(&mut *transaction)
-            .await?;
-        for stored_id in stored_ids {
-            if !authoritative_ids.contains(&stored_id) {
-                sqlx::query("DELETE FROM runs WHERE id = ?")
-                    .bind(stored_id)
-                    .execute(&mut *transaction)
-                    .await?;
+        let stale_ids = stored_seqs
+            .keys()
+            .filter(|stored_id| !authoritative_ids.contains(stored_id.as_str()))
+            .collect::<Vec<_>>();
+        for chunk in stale_ids.chunks(500) {
+            let mut delete = QueryBuilder::<Sqlite>::new("DELETE FROM runs WHERE id IN (");
+            let mut separated = delete.separated(", ");
+            for stale_id in chunk {
+                separated.push_bind(stale_id.as_str());
             }
+            delete.push(")");
+            delete.build().execute(&mut *transaction).await?;
         }
         transaction.commit().await?;
         Ok(())
     }
 
     pub async fn get(&self, run_id: &RunId, now: DateTime<Utc>) -> Result<Option<Run>> {
-        let row = sqlx::query(
-            r"
-SELECT runs.id, runs.summary_json,
-       (SELECT COUNT(*) FROM runs AS child WHERE child.parent_id = runs.id) AS children_count
-FROM runs
-WHERE runs.id = ?
-",
-        )
-        .bind(run_id.to_string())
-        .fetch_optional(&self.pool)
-        .await?;
+        let mut query = QueryBuilder::<Sqlite>::new(SELECT_RUN_SUMMARIES_SQL);
+        query
+            .push(" WHERE runs.id = ")
+            .push_bind(run_id.to_string());
+        let row = query.build().fetch_optional(&self.pool).await?;
         row.map(|row| decode_run_row(&row, now)).transpose()
+    }
+
+    /// Identity fields for every stored run, for selector resolution without
+    /// decoding full summaries.
+    pub async fn list_identities(&self) -> Result<Vec<RunSummaryIdentity>> {
+        let rows = sqlx::query(
+            r"
+SELECT id, workflow_slug,
+       json_extract(summary_json, '$.workflow.name') AS workflow_name,
+       json_extract(summary_json, '$.repository.origin_url') AS repository_origin_url
+FROM runs",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                let stored_id: String = row.try_get("id")?;
+                let id = stored_id
+                    .parse::<RunId>()
+                    .map_err(|_| Error::RunSummaryMismatch {
+                        run_id: stored_id,
+                        field:  "id",
+                    })?;
+                Ok(RunSummaryIdentity {
+                    id,
+                    workflow_slug: row.try_get("workflow_slug")?,
+                    workflow_name: row.try_get("workflow_name")?,
+                    repository_origin_url: row.try_get("repository_origin_url")?,
+                })
+            })
+            .collect()
     }
 
     pub async fn list(
@@ -198,12 +247,7 @@ WHERE runs.id = ?
             .fetch_one(&mut *transaction)
             .await?;
 
-        let mut rows_query = QueryBuilder::<Sqlite>::new(
-            r"
-SELECT runs.id, runs.summary_json,
-       (SELECT COUNT(*) FROM runs AS child WHERE child.parent_id = runs.id) AS children_count
-FROM runs",
-        );
+        let mut rows_query = QueryBuilder::<Sqlite>::new(SELECT_RUN_SUMMARIES_SQL);
         push_filters(&mut rows_query, query);
         push_order(&mut rows_query, query.sort, query.direction, now);
         rows_query.push(" LIMIT ").push_bind(i64::from(query.limit));
@@ -217,10 +261,7 @@ FROM runs",
             .iter()
             .map(|row| decode_run_row(row, now))
             .collect::<Result<Vec<_>>>()?;
-        let total = u64::try_from(total).map_err(|_| Error::RunSummaryMismatch {
-            run_id: "<list>".to_string(),
-            field:  "negative total",
-        })?;
+        let total = u64::try_from(total).expect("COUNT(*) is non-negative");
         let consumed = u64::from(query.offset).saturating_add(data.len() as u64);
         Ok(RunSummaryPage {
             data,
@@ -236,6 +277,16 @@ FROM runs",
             .await?;
         Ok(())
     }
+}
+
+/// Identity fields of a stored run summary, cheap to list for selector
+/// resolution.
+#[derive(Debug, Clone)]
+pub struct RunSummaryIdentity {
+    pub id:                    RunId,
+    pub workflow_slug:         Option<String>,
+    pub workflow_name:         Option<String>,
+    pub repository_origin_url: Option<String>,
 }
 
 #[derive(Debug)]
@@ -263,12 +314,7 @@ impl ProjectedRunSummary {
             run.timing = entry.projection.live_run_timing(at);
         }
         let billing = projected_billing(&entry.projection);
-        let workflow_name = run
-            .workflow
-            .name
-            .clone()
-            .or_else(|| run.workflow.graph_name.clone())
-            .or_else(|| run.workflow.slug.clone());
+        let workflow_name = run.workflow.display_name().map(str::to_string);
         let repository_name = run
             .repository
             .as_ref()
@@ -356,12 +402,13 @@ fn push_filters(builder: &mut QueryBuilder<Sqlite>, query: &RunSummaryListQuery)
     match &query.visibility {
         RunSummaryVisibility::All => {}
         RunSummaryVisibility::Default { include_archived } => {
+            let not_removing = format!("status <> '{}'", RunStatusKind::Removing);
             if *include_archived {
-                builder.push(
-                    " AND (archived_at_ms IS NOT NULL OR (archived_at_ms IS NULL AND status <> 'removing'))",
-                );
+                builder.push(format!(
+                    " AND (archived_at_ms IS NOT NULL OR {not_removing})"
+                ));
             } else {
-                builder.push(" AND archived_at_ms IS NULL AND status <> 'removing'");
+                builder.push(format!(" AND archived_at_ms IS NULL AND {not_removing}"));
             }
         }
         RunSummaryVisibility::Selected { statuses, archived } => {
@@ -391,6 +438,32 @@ fn push_filters(builder: &mut QueryBuilder<Sqlite>, query: &RunSummaryListQuery)
     }
 }
 
+/// Status sort rank derived from [`RunStatusKind::board_rank`], so the SQL
+/// order and the board column order share one source. Archived runs rank 7,
+/// matching the `archived` board column.
+static STATUS_RANK_CASE_SQL: LazyLock<String> = LazyLock::new(|| {
+    let mut case = String::from("CASE WHEN archived_at_ms IS NOT NULL THEN 7");
+    for kind in RunStatusKind::VARIANTS {
+        let _ = write!(case, " WHEN status = '{kind}' THEN {}", kind.board_rank());
+    }
+    case.push_str(" ELSE 9 END");
+    case
+});
+
+/// Size sort rank derived from [`RunSize::BUCKET_MAX_USD_MICROS`], so the SQL
+/// order and the displayed size buckets share one source.
+static SIZE_RANK_CASE_SQL: LazyLock<String> = LazyLock::new(|| {
+    let mut case = String::from("CASE");
+    for (rank, (_, max_usd_micros)) in RunSize::BUCKET_MAX_USD_MICROS.iter().enumerate() {
+        let _ = write!(
+            case,
+            " WHEN COALESCE(total_usd_micros, 0) <= {max_usd_micros} THEN {rank}"
+        );
+    }
+    let _ = write!(case, " ELSE {} END", RunSize::BUCKET_MAX_USD_MICROS.len());
+    case
+});
+
 fn push_order(
     builder: &mut QueryBuilder<Sqlite>,
     sort: RunSummarySort,
@@ -401,20 +474,7 @@ fn push_order(
     match sort {
         RunSummarySort::CreatedAt => builder.push("created_at_ms"),
         RunSummarySort::UpdatedAt => builder.push("last_event_at_ms"),
-        RunSummarySort::Status => builder.push(
-            r"CASE
-                WHEN archived_at_ms IS NOT NULL THEN 7
-                WHEN status IN ('submitted', 'pending') THEN 0
-                WHEN status = 'runnable' THEN 1
-                WHEN status = 'starting' THEN 2
-                WHEN status IN ('running', 'paused') THEN 3
-                WHEN status = 'blocked' THEN 4
-                WHEN status = 'succeeded' THEN 5
-                WHEN status IN ('failed', 'dead') THEN 6
-                WHEN status = 'removing' THEN 8
-                ELSE 9
-            END",
-        ),
+        RunSummarySort::Status => builder.push(STATUS_RANK_CASE_SQL.as_str()),
         RunSummarySort::Elapsed => builder
             .push("(COALESCE(completed_at_ms, ")
             .push_bind(now.timestamp_millis())
@@ -423,15 +483,7 @@ fn push_order(
         RunSummarySort::Title => builder.push("TRIM(title) COLLATE NOCASE"),
         RunSummarySort::Workflow => builder.push("COALESCE(workflow_name, '') COLLATE NOCASE"),
         RunSummarySort::Changes => builder.push("(diff_additions + diff_deletions)"),
-        RunSummarySort::Size => builder.push(
-            r"CASE
-                WHEN COALESCE(total_usd_micros, 0) <= 20000000 THEN 0
-                WHEN total_usd_micros <= 50000000 THEN 1
-                WHEN total_usd_micros <= 100000000 THEN 2
-                WHEN total_usd_micros <= 200000000 THEN 3
-                ELSE 4
-            END",
-        ),
+        RunSummarySort::Size => builder.push(SIZE_RANK_CASE_SQL.as_str()),
     };
     match direction {
         RunSummarySortDirection::Asc => builder.push(" ASC"),
@@ -455,23 +507,18 @@ fn decode_run_row(row: &SqliteRow, now: DateTime<Utc>) -> Result<Run> {
         run_id: run.id.to_string(),
         field:  "children_count",
     })?;
-    apply_read_overlays(&mut run, now);
+    overlay_live_wall_time(&mut run, now);
     Ok(run)
 }
 
-fn apply_read_overlays(run: &mut Run, now: DateTime<Utc>) {
+fn overlay_live_wall_time(run: &mut Run, now: DateTime<Utc>) {
     if run.timestamps.completed_at.is_some() {
         return;
     }
     let Some(started_at) = run.timestamps.started_at else {
         return;
     };
-    let wall_time_ms = u64::try_from(
-        now.signed_duration_since(started_at)
-            .num_milliseconds()
-            .max(0),
-    )
-    .expect("non-negative milliseconds fit in u64");
+    let wall_time_ms = RunTiming::wall_time_ms_since(started_at, now);
     run.timing = Some(
         run.timing
             .unwrap_or_else(|| RunTiming::wall_only(wall_time_ms))
@@ -485,10 +532,11 @@ mod tests {
 
     use chrono::{DateTime, Utc};
     use fabro_types::{
-        AutomationRef, BilledTokenCounts, Conclusion, DiffSummary, Graph, RunDiff, RunId,
-        RunProjection, RunSize, RunSpec, RunStatus, RunTiming, StageOutcome, SuccessReason,
-        WorkflowSettings, test_support,
+        AutomationRef, BilledTokenCounts, BlockedReason, Conclusion, DiffSummary, FailureReason,
+        Graph, PendingReason, RunDiff, RunId, RunProjection, RunSize, RunSpec, RunStatus,
+        RunStatusKind, RunTiming, StageOutcome, SuccessReason, WorkflowSettings, test_support,
     };
+    use strum::VariantArray as _;
     use ulid::Ulid;
 
     use super::{
@@ -496,6 +544,7 @@ mod tests {
         RunSummaryVisibility,
     };
     use crate::slate::CachedRunProjection;
+    use crate::test_util;
 
     fn dt(value: &str) -> DateTime<Utc> {
         value.parse().unwrap()
@@ -532,12 +581,49 @@ mod tests {
     }
 
     async fn store() -> (tempfile::TempDir, RunSummaryStore) {
-        let directory = tempfile::tempdir().unwrap();
-        let database = fabro_db::Database::connect(directory.path().join("fabro.sqlite3"))
-            .await
-            .unwrap();
-        database.migrate().await.unwrap();
-        (directory, RunSummaryStore::new(database.clone_pool()))
+        test_util::sqlite_summary_store().await
+    }
+
+    fn sample_status(kind: RunStatusKind) -> RunStatus {
+        match kind {
+            RunStatusKind::Submitted => RunStatus::Submitted,
+            RunStatusKind::Pending => RunStatus::Pending {
+                reason: PendingReason::ApprovalRequired,
+            },
+            RunStatusKind::Runnable => RunStatus::Runnable,
+            RunStatusKind::Starting => RunStatus::Starting,
+            RunStatusKind::Running => RunStatus::Running,
+            RunStatusKind::Blocked => RunStatus::Blocked {
+                blocked_reason: BlockedReason::HumanInputRequired,
+            },
+            RunStatusKind::Paused => RunStatus::Paused { prior_block: None },
+            RunStatusKind::Removing => RunStatus::Removing,
+            RunStatusKind::Succeeded => RunStatus::Succeeded {
+                reason: SuccessReason::Completed,
+            },
+            RunStatusKind::Failed => RunStatus::Failed {
+                reason: FailureReason::WorkflowError,
+            },
+            RunStatusKind::Dead => RunStatus::Dead,
+        }
+    }
+
+    /// The migration's `CHECK (status IN (...))` freezes the status strings;
+    /// prove every `RunStatusKind` variant passes it so an enum change that
+    /// forgets a follow-up migration fails in CI instead of at runtime.
+    #[tokio::test]
+    async fn every_status_kind_upserts_within_schema_check() {
+        let (_directory, store) = store().await;
+        let created_at = dt("2026-07-11T12:00:00Z");
+        for (index, kind) in RunStatusKind::VARIANTS.iter().enumerate() {
+            let id = run_id(
+                created_at.timestamp_millis().cast_unsigned(),
+                u128::try_from(index).unwrap() + 1,
+            );
+            let mut projected = projection(id, "status", created_at);
+            projected.status = sample_status(*kind);
+            store.upsert_projection(&entry(projected, 1)).await.unwrap();
+        }
     }
 
     #[tokio::test]

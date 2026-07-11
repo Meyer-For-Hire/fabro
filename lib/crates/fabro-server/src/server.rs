@@ -204,9 +204,17 @@ pub struct PaginationParams {
     pub offset: u32,
 }
 
+pub(crate) fn clamp_page_limit(limit: u32) -> u32 {
+    limit.clamp(1, 100)
+}
+
+pub(crate) fn clamp_page_offset(offset: u32) -> u32 {
+    offset.min(MAX_PAGE_OFFSET)
+}
+
 pub(crate) fn paginate_items<T>(items: Vec<T>, pagination: &PaginationParams) -> (Vec<T>, bool) {
-    let limit = pagination.limit.clamp(1, 100) as usize;
-    let offset = pagination.offset.min(MAX_PAGE_OFFSET) as usize;
+    let limit = clamp_page_limit(pagination.limit) as usize;
+    let offset = clamp_page_offset(pagination.offset) as usize;
     let mut data: Vec<_> = items.into_iter().skip(offset).take(limit + 1).collect();
     let has_more = data.len() > limit;
     data.truncate(limit);
@@ -219,7 +227,7 @@ pub(crate) struct DfParams {
     pub(crate) verbose: bool,
 }
 
-/// Non-paginated list response wrapper with `has_more: false`.
+/// List response envelope with pagination metadata.
 #[derive(serde::Serialize)]
 pub struct ListResponse<T: serde::Serialize> {
     data: T,
@@ -227,12 +235,23 @@ pub struct ListResponse<T: serde::Serialize> {
 }
 
 impl<T: serde::Serialize> ListResponse<T> {
+    /// Non-paginated response with `has_more: false`.
     pub fn new(data: T) -> Self {
         Self {
             data,
             meta: PaginationMeta {
                 has_more: false,
                 total:    None,
+            },
+        }
+    }
+
+    pub fn paginated(data: T, has_more: bool, total: u64) -> Self {
+        Self {
+            data,
+            meta: PaginationMeta {
+                has_more,
+                total: i64::try_from(total).ok(),
             },
         }
     }

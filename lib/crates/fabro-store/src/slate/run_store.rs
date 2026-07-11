@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use bytes::Bytes;
 use chrono::Utc;
@@ -43,7 +43,9 @@ pub(crate) struct RunDatabaseInner {
     state_lock: Mutex<()>,
     projection_cache: Mutex<EventProjectionCache>,
     shared_projection_cache: Arc<RunProjectionCache>,
-    run_summary_store: Option<Arc<RunSummaryStore>>,
+    // Shared cell rather than a snapshot so a summary store attached after
+    // this writer opened is still picked up by later appends.
+    run_summary_store: Arc<OnceLock<Arc<RunSummaryStore>>>,
     recent_events: Mutex<VecDeque<EventEnvelope>>,
     recent_event_limit: usize,
     event_tx: broadcast::Sender<EventEnvelope>,
@@ -54,7 +56,7 @@ impl RunDatabase {
         run_id: RunId,
         db: Db,
         shared_projection_cache: Arc<RunProjectionCache>,
-        run_summary_store: Option<Arc<RunSummaryStore>>,
+        run_summary_store: Arc<OnceLock<Arc<RunSummaryStore>>>,
     ) -> Result<Self> {
         Self::build(
             run_id,
@@ -70,7 +72,7 @@ impl RunDatabase {
         run_id: RunId,
         db: Db,
         shared_projection_cache: Arc<RunProjectionCache>,
-        run_summary_store: Option<Arc<RunSummaryStore>>,
+        run_summary_store: Arc<OnceLock<Arc<RunSummaryStore>>>,
     ) -> Result<Self> {
         Self::build(run_id, db, true, shared_projection_cache, run_summary_store).await
     }
@@ -80,7 +82,7 @@ impl RunDatabase {
         db: Db,
         read_only: bool,
         shared_projection_cache: Arc<RunProjectionCache>,
-        run_summary_store: Option<Arc<RunSummaryStore>>,
+        run_summary_store: Arc<OnceLock<Arc<RunSummaryStore>>>,
     ) -> Result<Self> {
         let event_seq =
             recover_next_seq(&db, keys::run_events_prefix(&run_id), keys::parse_event_seq).await?;
@@ -271,6 +273,8 @@ impl RunDatabase {
             )
             .await?;
         self.cache_event(&event).await?;
+        // Box::pin keeps append_event_envelope's future small enough for the
+        // clippy::large_futures budget of its many callers.
         Box::pin(self.update_summary_projection_after_append(&event)).await?;
         Ok(event)
     }
@@ -292,31 +296,21 @@ impl RunDatabase {
                             .await;
                         entry
                     }
-                    Ok(None) => {
+                    rebuild => {
                         self.inner
                             .shared_projection_cache
                             .remove(&self.inner.run_id)
                             .await;
+                        if let Err(rebuild_err) = rebuild {
+                            warn!(
+                                run_id = %self.inner.run_id,
+                                error = %rebuild_err,
+                                "Failed to rebuild run projection cache after append"
+                            );
+                        }
                         warn!(
                             run_id = %self.inner.run_id,
-                            error = ?err,
-                            "Failed to update run projection cache after append"
-                        );
-                        return Err(err);
-                    }
-                    Err(rebuild_err) => {
-                        self.inner
-                            .shared_projection_cache
-                            .remove(&self.inner.run_id)
-                            .await;
-                        warn!(
-                            run_id = %self.inner.run_id,
-                            error = %rebuild_err,
-                            "Failed to rebuild run projection cache after append"
-                        );
-                        warn!(
-                            run_id = %self.inner.run_id,
-                            error = ?err,
+                            error = %err,
                             "Failed to update run projection cache after append"
                         );
                         return Err(err);
@@ -324,14 +318,11 @@ impl RunDatabase {
                 }
             }
         };
-        if let Some(store) = &self.inner.run_summary_store {
-            let source_last_seq = cached.last_seq;
-            let store = Arc::clone(store);
-            let upsert = Box::pin(async move { store.upsert_projection(&cached).await });
-            if let Err(err) = upsert.await {
+        if let Some(store) = self.inner.run_summary_store.get() {
+            if let Err(err) = store.upsert_projection(&cached).await {
                 error!(
                     run_id = %self.inner.run_id,
-                    source_last_seq,
+                    source_last_seq = cached.last_seq,
                     error = %err,
                     "Failed to update SQLite run summary after append"
                 );
