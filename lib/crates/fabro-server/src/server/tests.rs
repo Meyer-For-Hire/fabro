@@ -523,20 +523,10 @@ async fn http_log_records_webhook_principal_fields() {
     reason = "Test helper mirrors the public build_router convenience API."
 )]
 fn webhook_test_app(auth_mode: AuthMode) -> Router {
-    let secret = TEST_WEBHOOK_SECRET.to_string();
-    let state = test_app_state_with_env_lookup(
-        default_test_server_settings(),
-        RunLayer::default(),
-        5,
-        |_| None,
-    );
-    state
-        .stores
-        .vault
-        .try_write()
-        .expect("test vault should not be locked")
-        .set(WEBHOOK_SECRET_ENV, &secret, SecretType::Token, None)
-        .unwrap();
+    let state = TestAppStateBuilder::new()
+        .env_lookup(|_| None)
+        .vault_entries([(WEBHOOK_SECRET_ENV, TEST_WEBHOOK_SECRET)])
+        .build();
     build_router_with_options(state, &auth_mode, RouterOptions {
         web_enabled: false,
         ..RouterOptions::default()
@@ -1383,7 +1373,7 @@ async fn create_secret_stores_file_secret_outside_token_lookups() {
     assert_eq!(body["type"], "file");
     assert_eq!(body["description"], "Test certificate");
 
-    let vault = state.stores.vault.read().await;
+    let vault = state.stores.vault.snapshot().await.unwrap();
     assert_eq!(
         vault.get_entry("/tmp/test.pem").unwrap().secret_type,
         SecretType::File
@@ -1427,7 +1417,7 @@ async fn create_secret_rejects_bootstrap_secret_names() {
             body["errors"][0]["detail"],
             format!("{name} is a bootstrap secret; configure it with process env or server.env")
         );
-        assert!(state.stores.vault.read().await.get(name).is_none());
+        assert!(state.stores.vault.get(name).await.unwrap().is_none());
     }
 }
 
@@ -1447,7 +1437,16 @@ async fn create_secret_allows_optional_vault_and_custom_secret_names() {
             .unwrap();
 
         assert_status!(response, StatusCode::OK).await;
-        assert_eq!(state.stores.vault.read().await.get(name), Some(value));
+        assert_eq!(
+            state
+                .stores
+                .vault
+                .get(name)
+                .await
+                .unwrap()
+                .map(|entry| entry.value),
+            Some(value.to_string())
+        );
     }
 }
 
@@ -1540,7 +1539,7 @@ async fn create_secret_stores_valid_oauth_entries() {
 
     let response = app.oneshot(req).await.unwrap();
     assert_status!(response, StatusCode::OK).await;
-    let listed = state.stores.vault.read().await.list();
+    let listed = state.stores.vault.list().await.unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].name, "OPENAI_CODEX");
     assert_eq!(listed[0].secret_type, SecretType::Oauth);
@@ -1548,9 +1547,9 @@ async fn create_secret_stores_valid_oauth_entries() {
         state
             .stores
             .vault
-            .read()
-            .await
             .get("OPENAI_CODEX")
+            .await
+            .unwrap()
             .is_some()
     );
 }
@@ -1578,14 +1577,13 @@ async fn create_secret_rejects_under_scoped_daytona_api_key_and_leaves_vault_unc
     state
         .stores
         .vault
-        .write()
-        .await
         .set(
             EnvVars::DAYTONA_API_KEY,
             "existing",
             SecretType::Token,
             None,
         )
+        .await
         .unwrap();
     let app = crate::test_support::build_test_router(Arc::clone(&state));
 
@@ -1616,10 +1614,11 @@ async fn create_secret_rejects_under_scoped_daytona_api_key_and_leaves_vault_unc
         state
             .stores
             .vault
-            .read()
+            .get(EnvVars::DAYTONA_API_KEY)
             .await
-            .get(EnvVars::DAYTONA_API_KEY),
-        Some("existing")
+            .unwrap()
+            .map(|entry| entry.value),
+        Some("existing".to_string())
     );
     auth.assert_async().await;
     current_key.assert_async().await;
@@ -1660,14 +1659,13 @@ enabled = false
     state
         .stores
         .vault
-        .write()
-        .await
         .set(
             EnvVars::DAYTONA_API_KEY,
             "dtn_test",
             SecretType::Token,
             None,
         )
+        .await
         .unwrap();
 
     let report = crate::diagnostics::run_all(&state).await;
@@ -1710,14 +1708,13 @@ async fn resolve_llm_client_reads_openai_token_from_vault() {
     state
         .stores
         .vault
-        .write()
-        .await
         .set(
             "OPENAI_API_KEY",
             "vault-openai-key",
             SecretType::Token,
             None,
         )
+        .await
         .unwrap();
 
     let llm_result = state.resolve_llm_client().await.unwrap();
@@ -1797,14 +1794,13 @@ async fn llm_source_configured_providers_reads_openai_token_from_vault() {
     state
         .stores
         .vault
-        .write()
-        .await
         .set(
             "OPENAI_API_KEY",
             "vault-openai-key",
             SecretType::Token,
             None,
         )
+        .await
         .unwrap();
 
     let catalog = state.catalog();
@@ -1842,14 +1838,13 @@ async fn resolve_llm_client_uses_vault_key_without_env_lookup_openai_settings() 
     state
         .stores
         .vault
-        .write()
-        .await
         .set(
             "OPENAI_API_KEY",
             "vault-openai-key",
             SecretType::Token,
             None,
         )
+        .await
         .unwrap();
 
     let llm_result = state.resolve_llm_client().await.unwrap();
@@ -1881,17 +1876,17 @@ async fn resolve_llm_client_uses_vault_key_without_env_lookup_openai_settings() 
 #[tokio::test]
 async fn list_secrets_includes_oauth_metadata() {
     let state = test_app_state();
-    {
-        let mut vault = state.stores.vault.write().await;
-        vault
-            .set(
-                "OPENAI_CODEX",
-                &openai_oauth_credential_json(),
-                SecretType::Oauth,
-                Some("saved auth"),
-            )
-            .unwrap();
-    }
+    state
+        .stores
+        .vault
+        .set(
+            "OPENAI_CODEX",
+            &openai_oauth_credential_json(),
+            SecretType::Oauth,
+            Some("saved auth"),
+        )
+        .await
+        .unwrap();
     let app = crate::test_support::build_test_router(Arc::clone(&state));
 
     let response = app
@@ -1998,7 +1993,7 @@ async fn delete_secret_by_name_removes_file_secret() {
 
     let delete_response = app.oneshot(delete_req).await.unwrap();
     assert_status!(delete_response, StatusCode::NO_CONTENT).await;
-    assert!(state.stores.vault.read().await.list().is_empty());
+    assert!(state.stores.vault.list().await.unwrap().is_empty());
 }
 
 #[test]
@@ -2347,26 +2342,16 @@ fn worker_command_opt_in_token_includes_agent_run_tools_scope() {
 fn worker_command_forwards_github_app_private_key_from_vault() {
     let storage_dir = tempfile::tempdir().unwrap();
     let state = worker_command_test_state(storage_dir.path(), &["dev-token"], Some(TEST_DEV_TOKEN));
-    state
-        .stores
-        .vault
-        .try_write()
-        .expect("test vault should not be locked")
-        .set(
-            EnvVars::GITHUB_APP_PRIVATE_KEY,
-            "test-private-key",
-            SecretType::File,
-            None,
-        )
-        .unwrap();
-    let cmd = worker_command(
+    let spec = worker_launch_spec(
         state.as_ref(),
         RunId::new(),
         RunExecutionMode::Start,
         storage_dir.path(),
         false,
+        Some("test-private-key".to_string()),
     )
     .unwrap();
+    let cmd = LocalWorkerRuntime::command_for_spec(&spec);
 
     assert_eq!(
         command_env_value(&cmd, EnvVars::GITHUB_APP_PRIVATE_KEY),
@@ -2602,8 +2587,8 @@ methods = ["dev-token"]
     ));
 }
 
-#[test]
-fn build_app_state_migrates_legacy_vault_file_on_boot() {
+#[tokio::test]
+async fn build_app_state_migrates_legacy_vault_file_on_boot() {
     let vault_path = test_secret_store_path();
     let timestamp = "2026-05-18T12:00:00Z";
     let legacy_api_key = json!({
@@ -2664,11 +2649,7 @@ fn build_app_state_migrates_legacy_vault_file_on_boot() {
     let state = build_test_app_state_with_vault_path(&vault_path)
         .expect("legacy vault should not prevent server boot");
 
-    let vault = state
-        .stores
-        .vault
-        .try_read()
-        .expect("test vault should not be locked");
+    let vault = state.stores.vault.snapshot().await.unwrap();
     let api_key_entry = vault
         .get_entry("ANTHROPIC_API_KEY")
         .expect("legacy provider credential should be migrated to token name");
@@ -2739,7 +2720,14 @@ fn worker_command(
     run_dir: &Path,
     agent_fabro_tools_enabled: bool,
 ) -> anyhow::Result<Command> {
-    let spec = worker_launch_spec(state, run_id, mode, run_dir, agent_fabro_tools_enabled)?;
+    let spec = worker_launch_spec(
+        state,
+        run_id,
+        mode,
+        run_dir,
+        agent_fabro_tools_enabled,
+        None,
+    )?;
     Ok(LocalWorkerRuntime::command_for_spec(&spec))
 }
 
@@ -3319,9 +3307,8 @@ async fn create_run_without_explicit_title_returns_deterministic_then_updates_ge
     state
         .stores
         .vault
-        .write()
-        .await
         .set("OPENAI_API_KEY", "openai-key", SecretType::Token, None)
+        .await
         .unwrap();
     let app = crate::test_support::build_test_router(Arc::clone(&state));
 
@@ -3345,9 +3332,8 @@ async fn create_run_with_explicit_title_skips_generated_title_work() {
     state
         .stores
         .vault
-        .write()
-        .await
         .set("OPENAI_API_KEY", "openai-key", SecretType::Token, None)
+        .await
         .unwrap();
     let app = crate::test_support::build_test_router(Arc::clone(&state));
     let mut manifest = minimal_manifest_json(MINIMAL_DOT);
@@ -3413,9 +3399,8 @@ async fn generated_title_failure_leaves_deterministic_title_unchanged() {
     state
         .stores
         .vault
-        .write()
-        .await
         .set("OPENAI_API_KEY", "openai-key", SecretType::Token, None)
+        .await
         .unwrap();
     let app = crate::test_support::build_test_router(Arc::clone(&state));
 
@@ -3454,9 +3439,8 @@ async fn generated_title_does_not_overwrite_user_title_edit() {
     state
         .stores
         .vault
-        .write()
-        .await
         .set("OPENAI_API_KEY", "openai-key", SecretType::Token, None)
+        .await
         .unwrap();
     let app = crate::test_support::build_test_router(Arc::clone(&state));
 
@@ -6068,6 +6052,12 @@ fn create_github_token_app_state_with_env_lookup_and_llm_catalog_settings(
     let vault_path = test_secret_store_path();
     let server_env_path = vault_path.with_file_name("server.env");
     let active_config_path = vault_path.with_file_name("settings.toml");
+    if let Some(token) = token {
+        Vault::load(vault_path.clone())
+            .expect("test vault should load")
+            .set("GITHUB_TOKEN", token, SecretType::Token, None)
+            .expect("test github token should be writable");
+    }
     let db_pool = test_db_pool_for_vault_path(&vault_path).expect("test db pool should build");
     let config = AppStateConfig {
         resolved_settings: resolved_runtime_settings_for_tests(
@@ -6093,21 +6083,11 @@ fn create_github_token_app_state_with_env_lookup_and_llm_catalog_settings(
         worker_runtime: None,
         automation_materializer_override: None,
     };
-    let state = build_app_state(config).expect("test app state should build");
-    if let Some(token) = token {
-        state
-            .stores
-            .vault
-            .try_write()
-            .expect("test vault should not already be locked")
-            .set("GITHUB_TOKEN", token, SecretType::Token, None)
-            .expect("test github token should be writable");
-    }
-    state
+    build_app_state(config).expect("test app state should build")
 }
 
-#[test]
-fn github_token_strategy_ignores_process_env_token() {
+#[tokio::test]
+async fn github_token_strategy_ignores_process_env_token() {
     let state = create_github_token_app_state_with_env_lookup(None, None, |name| match name {
         EnvVars::GITHUB_TOKEN => Some("ghu_from_env".to_string()),
         _ => None,
@@ -6116,6 +6096,7 @@ fn github_token_strategy_ignores_process_env_token() {
 
     let err = state
         .github_credentials(&settings.server.integrations.github)
+        .await
         .expect_err("server runtime should ignore env-backed GitHub tokens");
 
     assert_eq!(
@@ -6124,8 +6105,8 @@ fn github_token_strategy_ignores_process_env_token() {
     );
 }
 
-#[test]
-fn github_token_strategy_ignores_gh_token_alias() {
+#[tokio::test]
+async fn github_token_strategy_ignores_gh_token_alias() {
     let state = create_github_token_app_state_with_env_lookup(None, None, |name| match name {
         EnvVars::GH_TOKEN => Some("ghu_from_env_alias".to_string()),
         _ => None,
@@ -6133,19 +6114,19 @@ fn github_token_strategy_ignores_gh_token_alias() {
     state
         .stores
         .vault
-        .try_write()
-        .expect("test vault should not already be locked")
         .set(
             EnvVars::GH_TOKEN,
             "ghu_from_vault_alias",
             SecretType::Token,
             None,
         )
+        .await
         .unwrap();
     let settings = state.server_settings();
 
     let err = state
         .github_credentials(&settings.server.integrations.github)
+        .await
         .expect_err("server runtime should ignore GH_TOKEN in env and vault");
 
     assert_eq!(
@@ -6154,13 +6135,14 @@ fn github_token_strategy_ignores_gh_token_alias() {
     );
 }
 
-#[test]
-fn github_token_strategy_reads_github_token_from_vault() {
+#[tokio::test]
+async fn github_token_strategy_reads_github_token_from_vault() {
     let state = create_github_token_app_state(Some("ghu_test"), None);
     let settings = state.server_settings();
 
     let credentials = state
         .github_credentials(&settings.server.integrations.github)
+        .await
         .expect("vault GitHub token should resolve")
         .expect("vault GitHub token should produce credentials");
 
@@ -6521,14 +6503,13 @@ async fn list_models_marks_configured_true_when_provider_has_credential_material
     state
         .stores
         .vault
-        .write()
-        .await
         .set(
             EnvVars::ANTHROPIC_API_KEY,
             "test-key",
             SecretType::Token,
             None,
         )
+        .await
         .unwrap();
     let app = crate::test_support::build_test_router(state);
 
@@ -6716,14 +6697,13 @@ async fn list_providers_marks_configured_per_provider_and_omits_secrets() {
     state
         .stores
         .vault
-        .write()
-        .await
         .set(
             EnvVars::ANTHROPIC_API_KEY,
             "test-key",
             SecretType::Token,
             None,
         )
+        .await
         .unwrap();
     let app = crate::test_support::build_test_router(state);
 
@@ -6872,14 +6852,13 @@ async fn test_providers_successful_probe_returns_probe_model() {
     state
         .stores
         .vault
-        .write()
-        .await
         .set(
             EnvVars::OPENAI_API_KEY,
             "vault-openai-key",
             SecretType::Token,
             None,
         )
+        .await
         .unwrap();
     let app = crate::test_support::build_test_router(state);
 
@@ -6927,14 +6906,13 @@ async fn test_providers_auth_issue_returns_error_without_upstream_call() {
     state
         .stores
         .vault
-        .write()
-        .await
         .set(
             "OPENAI_CODEX",
             &serde_json::to_string(&credential).unwrap(),
             SecretType::Oauth,
             None,
         )
+        .await
         .unwrap();
     let app = crate::test_support::build_test_router(state);
 
@@ -7001,9 +6979,8 @@ reasoning = false
     state
         .stores
         .vault
-        .write()
-        .await
         .set("ACME_API_KEY", "acme-key", SecretType::Token, None)
+        .await
         .unwrap();
     let app = crate::test_support::build_test_router(state);
 
@@ -7117,15 +7094,18 @@ reasoning = false
         .max_concurrent_runs(5)
         .llm_catalog_settings(llm_catalog_settings)
         .build();
-    {
-        let mut vault = state.stores.vault.write().await;
-        vault
-            .set("ALPHA_API_KEY", "alpha-key", SecretType::Token, None)
-            .unwrap();
-        vault
-            .set("ZETA_API_KEY", "zeta-key", SecretType::Token, None)
-            .unwrap();
-    }
+    state
+        .stores
+        .vault
+        .set("ALPHA_API_KEY", "alpha-key", SecretType::Token, None)
+        .await
+        .unwrap();
+    state
+        .stores
+        .vault
+        .set("ZETA_API_KEY", "zeta-key", SecretType::Token, None)
+        .await
+        .unwrap();
     let app = crate::test_support::build_test_router(state);
 
     let req = Request::builder()
@@ -7180,9 +7160,8 @@ async fn test_providers_response_does_not_leak_api_keys() {
     state
         .stores
         .vault
-        .write()
-        .await
         .set(EnvVars::OPENAI_API_KEY, leaked_key, SecretType::Token, None)
+        .await
         .unwrap();
     let app = crate::test_support::build_test_router(state);
 
@@ -8676,9 +8655,8 @@ async fn create_run_pull_request_creates_and_persists_record() {
     state
         .stores
         .vault
-        .write()
-        .await
         .set("OPENAI_API_KEY", "openai-key", SecretType::Token, None)
+        .await
         .unwrap();
     let app = crate::test_support::build_test_router(Arc::clone(&state));
     let run_id = fixtures::RUN_1;

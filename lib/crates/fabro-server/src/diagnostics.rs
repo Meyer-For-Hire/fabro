@@ -96,7 +96,7 @@ pub async fn run_all(state: &AppState) -> DiagnosticsReport {
         check_cloud_sandbox(state),
         check_brave_search(state),
     );
-    let crypto = check_crypto(state);
+    let crypto = check_crypto(state).await;
 
     DiagnosticsReport {
         version:  FABRO_VERSION.to_string(),
@@ -332,7 +332,10 @@ fn short_error_line(rendered: &str) -> String {
 async fn check_github_app(state: &AppState) -> CheckResult {
     let settings = state.server_settings();
     if settings.server.integrations.github.strategy == GithubIntegrationStrategy::Token {
-        let token = match state.github_credentials(&settings.server.integrations.github) {
+        let token = match state
+            .github_credentials(&settings.server.integrations.github)
+            .await
+        {
             Ok(Some(fabro_github::GitHubCredentials::Pat(token))) => token,
             Ok(Some(fabro_github::GitHubCredentials::Installation(token))) => {
                 match token.valid_token() {
@@ -445,14 +448,22 @@ async fn check_github_app(state: &AppState) -> CheckResult {
 
     let app_id = settings.server.integrations.github.app_id.clone();
     let slug = settings.server.integrations.github.slug.clone();
-    let private_key_raw = state.vault_secret(EnvVars::GITHUB_APP_PRIVATE_KEY);
+    let private_key_raw =
+        match diagnostic_secret(state, "GitHub App", EnvVars::GITHUB_APP_PRIVATE_KEY).await {
+            Ok(value) => value,
+            Err(result) => return result,
+        };
     let client_id = settings.server.integrations.github.client_id.is_some();
-    let client_secret = state
-        .vault_secret(EnvVars::GITHUB_APP_CLIENT_SECRET)
-        .is_some();
-    let webhook_secret = state
-        .vault_secret(EnvVars::GITHUB_APP_WEBHOOK_SECRET)
-        .is_some();
+    let client_secret =
+        match diagnostic_secret(state, "GitHub App", EnvVars::GITHUB_APP_CLIENT_SECRET).await {
+            Ok(value) => value.is_some(),
+            Err(result) => return result,
+        };
+    let webhook_secret =
+        match diagnostic_secret(state, "GitHub App", EnvVars::GITHUB_APP_WEBHOOK_SECRET).await {
+            Ok(value) => value.is_some(),
+            Err(result) => return result,
+        };
 
     if app_id.is_none()
         && private_key_raw.is_none()
@@ -622,7 +633,11 @@ fn docker_sandbox_probe_check(probe: Result<(), String>) -> CheckResult {
 }
 
 async fn check_cloud_sandbox(state: &AppState) -> CheckResult {
-    let Some(api_key) = state.vault_secret(EnvVars::DAYTONA_API_KEY) else {
+    let api_key = match diagnostic_secret(state, "Cloud Sandbox", EnvVars::DAYTONA_API_KEY).await {
+        Ok(value) => value,
+        Err(result) => return result,
+    };
+    let Some(api_key) = api_key else {
         return CheckResult {
             name:        "Cloud Sandbox".to_string(),
             status:      CheckStatus::Warning,
@@ -707,7 +722,12 @@ fn check_storage_dir_path(path: &std::path::Path) -> CheckResult {
 }
 
 async fn check_brave_search(state: &AppState) -> CheckResult {
-    let Some(api_key) = state.vault_secret(EnvVars::BRAVE_SEARCH_API_KEY) else {
+    let api_key =
+        match diagnostic_secret(state, "Web Search (Brave)", EnvVars::BRAVE_SEARCH_API_KEY).await {
+            Ok(value) => value,
+            Err(result) => return result,
+        };
+    let Some(api_key) = api_key else {
         return CheckResult {
             name:        "Web Search (Brave)".to_string(),
             status:      CheckStatus::Warning,
@@ -767,7 +787,7 @@ async fn check_brave_search(state: &AppState) -> CheckResult {
     }
 }
 
-fn check_crypto(state: &AppState) -> CheckResult {
+async fn check_crypto(state: &AppState) -> CheckResult {
     let resolved_server_settings = state.server_settings();
 
     let mut details = Vec::new();
@@ -802,10 +822,12 @@ fn check_crypto(state: &AppState) -> CheckResult {
         {
             errors.push("server.integrations.github.client_id is not configured".to_string());
         }
-        if state
-            .vault_secret(EnvVars::GITHUB_APP_CLIENT_SECRET)
-            .is_none()
-        {
+        let client_secret =
+            match diagnostic_secret(state, "Crypto", EnvVars::GITHUB_APP_CLIENT_SECRET).await {
+                Ok(value) => value,
+                Err(result) => return result,
+            };
+        if client_secret.is_none() {
             errors.push("GITHUB_APP_CLIENT_SECRET not configured in vault".to_string());
         }
     }
@@ -830,6 +852,20 @@ fn check_crypto(state: &AppState) -> CheckResult {
             remediation: Some(errors.join("; ")),
         }
     }
+}
+
+async fn diagnostic_secret(
+    state: &AppState,
+    check_name: &str,
+    name: &str,
+) -> Result<Option<String>, CheckResult> {
+    state.vault_secret(name).await.map_err(|err| CheckResult {
+        name:        check_name.to_string(),
+        status:      CheckStatus::Error,
+        summary:     "secret store unavailable".to_string(),
+        details:     vec![CheckDetail::new(err.to_string())],
+        remediation: Some("Check the Fabro database and retry".to_string()),
+    })
 }
 
 #[cfg(test)]
@@ -888,14 +924,13 @@ mod tests {
         state
             .stores
             .vault
-            .write()
-            .await
             .set(
                 "OPENAI_API_KEY",
                 "vault-openai-key",
                 SecretType::Token,
                 None,
             )
+            .await
             .unwrap();
 
         let result = check_llm_providers(&state).await;
@@ -970,14 +1005,13 @@ mod tests {
         state
             .stores
             .vault
-            .write()
-            .await
             .set(
                 "OPENAI_API_KEY",
                 "vault-openai-key",
                 SecretType::Token,
                 None,
             )
+            .await
             .unwrap();
 
         let result = check_llm_providers(&state).await;
@@ -1132,8 +1166,8 @@ enabled = false
         );
     }
 
-    #[test]
-    fn check_crypto_requires_github_client_secret_from_vault() {
+    #[tokio::test]
+    async fn check_crypto_requires_github_client_secret_from_vault() {
         let settings = fabro_config::ServerSettingsBuilder::from_toml(
             r#"
 _version = 1
@@ -1157,7 +1191,7 @@ client_id = "Iv1.test"
             )]))
             .build();
 
-        let result = check_crypto(&state);
+        let result = check_crypto(&state).await;
 
         assert_eq!(result.status, CheckStatus::Error);
         assert!(result.details.iter().any(|detail| {

@@ -7,10 +7,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use fabro_config::RuntimeDirectory;
 use fabro_config::bind::{Bind, BindRequest};
 use fabro_config::daemon::ServerDaemon;
 use fabro_config::user::default_settings_path;
+use fabro_config::{RuntimeDirectory, Storage};
+use fabro_db::Database;
 use fabro_server::jwt_auth::auth_method_name;
 use fabro_server::serve::{DEFAULT_TCP_PORT, ServeArgs, resolve_runtime_server_settings_for_start};
 use fabro_server::{
@@ -20,6 +21,7 @@ use fabro_static::EnvVars;
 use fabro_types::settings::{LogDestination, ServerAuthMethod};
 use fabro_util::printer::Printer;
 use fabro_util::terminal::Styles;
+use fabro_vault::{SecretStore, import_legacy_json_once};
 use tokio::process::Command as TokioCommand;
 use tokio::task::spawn_blocking;
 use tokio::time;
@@ -289,7 +291,22 @@ async fn execute_daemon(
         );
     }
     validate_startup_configuration(&resolved_settings)?;
-    let startup_vault = load_startup_vault(fabro_config::Storage::new(storage_dir).secrets_path())?;
+    let storage = Storage::new(storage_dir);
+    let _legacy_vault = load_startup_vault(storage.secrets_path())?;
+    let database = Database::connect(storage.sqlite_path())
+        .await
+        .context("opening the Fabro database for startup validation")?;
+    database
+        .migrate()
+        .await
+        .context("migrating the Fabro database for startup validation")?;
+    import_legacy_json_once(database.pool(), storage.secrets_path())
+        .await
+        .context("importing legacy secrets into SQLite")?;
+    let startup_vault = SecretStore::new(database.clone_pool())
+        .snapshot()
+        .await
+        .context("loading secrets for startup validation")?;
     validate_startup(
         runtime_directory.env_path().as_path(),
         process_env_snapshot(),

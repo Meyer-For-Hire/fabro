@@ -4,6 +4,7 @@ mod credential_source;
 mod env_source;
 mod refresh;
 mod resolve;
+mod sql_vault_source;
 mod strategy;
 mod vault_ext;
 mod vault_source;
@@ -20,6 +21,7 @@ pub use resolve::{
     ResolvedCredential, auth_issue_message, build_api_key_header,
     configured_providers_from_process_env,
 };
+pub use sql_vault_source::SqlVaultCredentialSource;
 pub use strategy::{
     AuthMethod, AuthStrategy, CODEX_AUTH_URL, CODEX_CLIENT_ID, CODEX_TOKEN_URL, LoginResult,
     codex_oauth_config, strategy_for,

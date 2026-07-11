@@ -19,6 +19,7 @@ workspace = true
 
 [dependencies]
 fabro-auth = { path = "../fabro-auth" }
+fabro-db = { path = "../fabro-db" }
 fabro-config = { path = "../fabro-config" }
 fabro-environment = { path = "../fabro-environment" }
 fabro-llm = { path = "../fabro-llm" }

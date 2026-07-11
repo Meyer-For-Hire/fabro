@@ -38,6 +38,7 @@ impl Database {
             .connect_with(options)
             .await
             .with_context(|| format!("opening SQLite database {}", path.display()))?;
+        set_private_permissions(path).await?;
 
         Ok(Self { pool })
     }

@@ -1,8 +1,20 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use strum::Display;
+use strum::{Display, EnumString, IntoStaticStr};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Display, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    Display,
+    EnumString,
+    IntoStaticStr,
+    Serialize,
+    Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum SecretType {

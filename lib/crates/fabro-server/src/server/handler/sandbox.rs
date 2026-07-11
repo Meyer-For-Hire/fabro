@@ -109,7 +109,10 @@ async fn retrieve_run_sandbox(
         Ok(record) => record,
         Err(response) => return response,
     };
-    let daytona_api_key = state.vault_secret(EnvVars::DAYTONA_API_KEY);
+    let daytona_api_key = match load_daytona_api_key(&state).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
     let daytona_organization_id = state.config_env_lookup(EnvVars::DAYTONA_ORGANIZATION_ID);
     match sandbox_details(&record, daytona_api_key, daytona_organization_id, Some(id)).await {
         Ok(details) => Json::<SandboxDetails>(details).into_response(),
@@ -228,7 +231,19 @@ async fn terminal_websocket(mut socket: WebSocket, state: Arc<AppState>, id: Run
             return;
         }
     };
-    let daytona_api_key = state.vault_secret(EnvVars::DAYTONA_API_KEY);
+    let daytona_api_key = match load_daytona_api_key(&state).await {
+        Ok(value) => value,
+        Err(response) => {
+            let _ = socket
+                .send(terminal_server_text(
+                    "error",
+                    Some("Secret store unavailable."),
+                ))
+                .await;
+            tracing::error!(status = %response.status(), "Loading Daytona API key failed");
+            return;
+        }
+    };
     let daytona_organization_id = state.config_env_lookup(EnvVars::DAYTONA_ORGANIZATION_ID);
     let session = match open_terminal_for_run(
         &record,
@@ -859,7 +874,7 @@ async fn reconnect_run_sandbox_instance(
     run_id: &RunId,
     record: &RunSandboxInstance,
 ) -> Result<Box<dyn Sandbox>, Response> {
-    let daytona_api_key = state.vault_secret(EnvVars::DAYTONA_API_KEY);
+    let daytona_api_key = load_daytona_api_key(state).await?;
     let sandbox = reconnect_for_run(record, daytona_api_key, Some(*run_id))
         .await
         .map_err(|err| {
@@ -899,7 +914,7 @@ async fn reconnect_daytona_sandbox_instance(
         )
         .into_response());
     };
-    let daytona_api_key = state.vault_secret(EnvVars::DAYTONA_API_KEY);
+    let daytona_api_key = load_daytona_api_key(state).await?;
     let sandbox = DaytonaSandbox::reconnect(
         &runtime.id,
         daytona_api_key,
@@ -916,6 +931,20 @@ async fn reconnect_daytona_sandbox_instance(
         ApiError::new(StatusCode::CONFLICT, err.display_with_causes()).into_response()
     })?;
     Ok(sandbox)
+}
+
+async fn load_daytona_api_key(state: &AppState) -> Result<Option<String>, Response> {
+    state
+        .vault_secret(EnvVars::DAYTONA_API_KEY)
+        .await
+        .map_err(|err| {
+            tracing::error!(error = ?err, "Loading Daytona API key failed");
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "secret store operation failed",
+            )
+            .into_response()
+        })
 }
 
 async fn load_run_sandbox_instance(

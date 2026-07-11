@@ -2069,7 +2069,7 @@ async fn run_install_inner(args: &InstallArgs, ctx: &CommandContext) -> Result<(
         "  {} Saved {} workflow-visible secrets to {}",
         s.green.apply_to("✔"),
         vault_secrets.len(),
-        path::contract_tilde(&Storage::new(&storage_dir).secrets_path()).display()
+        path::contract_tilde(&Storage::new(&storage_dir).sqlite_path()).display()
     );
     fabro_util::printerr!(
         printer,
@@ -2169,6 +2169,26 @@ mod tests {
     use httpmock::MockServer;
 
     use super::*;
+
+    fn load_secret_snapshot(storage: &Storage) -> Vault {
+        let database_path = storage.sqlite_path();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let database = fabro_db::Database::connect(database_path).await.unwrap();
+                database.migrate().await.unwrap();
+                fabro_vault::SecretStore::new(database.clone_pool())
+                    .snapshot()
+                    .await
+                    .unwrap()
+            })
+        })
+        .join()
+        .unwrap()
+    }
 
     fn install_args(non_interactive: bool, scripted: InstallNonInteractiveArgs) -> InstallArgs {
         InstallArgs {
@@ -3283,7 +3303,7 @@ client_id = "client-id"
         assert!(!server_env.contains_key(GITHUB_APP_CLIENT_SECRET_KEY));
         assert!(!server_env.contains_key(GITHUB_APP_WEBHOOK_SECRET_KEY));
 
-        let vault = Vault::load(storage.secrets_path()).unwrap();
+        let vault = load_secret_snapshot(&storage);
         assert_eq!(vault.get(GITHUB_TOKEN_SECRET_KEY), Some("token"));
         assert_eq!(
             vault
@@ -3361,7 +3381,7 @@ client_id = "client-id"
         assert!(!server_env.contains_key(GITHUB_APP_CLIENT_SECRET_KEY));
         assert!(!server_env.contains_key(GITHUB_APP_WEBHOOK_SECRET_KEY));
 
-        let vault = Vault::load(storage.secrets_path()).unwrap();
+        let vault = load_secret_snapshot(&storage);
         assert_eq!(vault.get(GITHUB_TOKEN_SECRET_KEY), None);
         assert_eq!(vault.get(GITHUB_APP_PRIVATE_KEY_KEY), Some("private"));
         assert_eq!(vault.get(GITHUB_APP_CLIENT_SECRET_KEY), Some("client"));
@@ -3444,12 +3464,7 @@ client_id = "client-id"
         );
         assert_eq!(server_env.get("KEEP_ME").map(String::as_str), Some("1"));
         assert_eq!(std::fs::read_to_string(&settings_path).unwrap(), "before");
-        assert_eq!(
-            Vault::load(storage.secrets_path())
-                .unwrap()
-                .get("bad-secret-name"),
-            None
-        );
+        assert_eq!(load_secret_snapshot(&storage).get("bad-secret-name"), None);
     }
 
     #[tokio::test]

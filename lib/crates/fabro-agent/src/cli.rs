@@ -9,9 +9,10 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Context as _;
 use clap::{Args, Parser};
-use fabro_auth::{CredentialSource, EnvCredentialSource, VaultCredentialSource};
+use fabro_auth::{CredentialSource, SqlVaultCredentialSource};
 use fabro_config::Storage;
 use fabro_config::user::default_storage_dir;
+use fabro_db::Database;
 use fabro_llm::Error as LlmError;
 use fabro_llm::client::Client;
 use fabro_llm::middleware::{Middleware, NextFn, NextStreamFn};
@@ -23,10 +24,10 @@ use fabro_model::catalog::LlmCatalogSettings;
 use fabro_model::{AgentProfileKind, Catalog, ModelHandle, ProviderId};
 use fabro_static::EnvVars;
 use fabro_util::terminal::Styles;
-use fabro_vault::Vault;
+use fabro_vault::{SecretStore, import_legacy_json_once};
 use tokio::io::{AsyncWriteExt, stdout};
 use tokio::signal;
-use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::config::{ToolApprovalAdapter, ToolApprovalFn, ToolHookCallback, ToolSecrets};
 use crate::error::InterruptReason;
@@ -273,14 +274,21 @@ fn resolve_provider_id(catalog: &Catalog, args: &AgentArgs) -> anyhow::Result<Pr
         .map_or(requested, |provider| provider.id.clone()))
 }
 
-fn standalone_llm_source() -> Arc<dyn CredentialSource> {
+async fn standalone_llm_source() -> anyhow::Result<Arc<dyn CredentialSource>> {
     let storage_dir = default_storage_dir();
-    match Vault::load(Storage::new(storage_dir).secrets_path()) {
-        Ok(vault) => Arc::new(VaultCredentialSource::new(Arc::new(AsyncRwLock::new(
-            vault,
-        )))),
-        Err(_) => Arc::new(EnvCredentialSource::new()),
-    }
+    let storage = Storage::new(storage_dir);
+    let database = Database::connect(storage.sqlite_path())
+        .await
+        .context("opening the Fabro database for secrets")?;
+    database
+        .migrate()
+        .await
+        .context("migrating the Fabro database for secrets")?;
+    import_legacy_json_once(database.pool(), storage.secrets_path())
+        .await
+        .context("importing legacy secrets into SQLite")?;
+    let store = Arc::new(SecretStore::new(database.clone_pool()));
+    Ok(Arc::new(SqlVaultCredentialSource::vault_only(store)))
 }
 
 fn profile_kind_for_provider(
@@ -464,7 +472,7 @@ pub async fn run_with_args(
     args: AgentArgs,
     mcp_servers: Vec<McpServerSettings>,
 ) -> anyhow::Result<()> {
-    let llm_source = standalone_llm_source();
+    let llm_source = standalone_llm_source().await?;
     let catalog =
         Arc::new(Catalog::from_builtin().context("failed to build standalone agent LLM catalog")?);
     run_with_args_and_source_and_catalog(args, llm_source, mcp_servers, catalog).await

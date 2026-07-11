@@ -7,10 +7,14 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use fabro_config::{Storage, envfile};
+use fabro_db::Database;
 use fabro_static::EnvVars;
 use fabro_types::settings::run::EnvironmentProvider;
 use fabro_util::dev_token;
-use fabro_vault::{SecretType as VaultSecretType, Vault};
+use fabro_vault::{
+    SecretStore, SecretStoreWrite, SecretType as VaultSecretType, import_legacy_json_once,
+};
+use tokio::runtime::Builder as TokioRuntimeBuilder;
 
 #[derive(Debug, Clone, Copy)]
 pub struct PendingSettingsWrite<'a> {
@@ -53,12 +57,23 @@ pub const GITHUB_APP_VAULT_KEYS: &[&str] = &[
     EnvVars::GITHUB_APP_WEBHOOK_SECRET,
 ];
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct VaultSecretWrite {
     pub name:        String,
     pub value:       String,
     pub secret_type: VaultSecretType,
     pub description: Option<String>,
+}
+
+impl std::fmt::Debug for VaultSecretWrite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VaultSecretWrite")
+            .field("name", &self.name)
+            .field("value", &"[REDACTED]")
+            .field("secret_type", &self.secret_type)
+            .field("description", &self.description)
+            .finish()
+    }
 }
 
 pub struct InstallPersistencePlan<'a> {
@@ -591,25 +606,34 @@ fn persist_vault_secrets_direct(
         return Ok(());
     }
 
-    let vault_path = Storage::new(storage_dir).secrets_path();
-    let mut vault = Vault::load(vault_path).map_err(anyhow::Error::from)?;
-    for name in removals {
-        match vault.remove(name) {
-            Ok(()) | Err(fabro_vault::Error::NotFound(_)) => {}
-            Err(err) => return Err(err.into()),
-        }
-    }
-    for secret in secrets {
-        vault
-            .set(
-                &secret.name,
-                &secret.value,
-                secret.secret_type,
-                secret.description.as_deref(),
-            )
-            .map_err(anyhow::Error::from)?;
-    }
-    Ok(())
+    let storage_dir = storage_dir.to_path_buf();
+    let writes = secrets
+        .iter()
+        .map(|secret| SecretStoreWrite {
+            name:        secret.name.clone(),
+            value:       secret.value.clone(),
+            secret_type: secret.secret_type,
+            description: secret.description.clone(),
+        })
+        .collect::<Vec<_>>();
+    let removals = removals.to_vec();
+    std::thread::spawn(move || {
+        let runtime = TokioRuntimeBuilder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(async move {
+            let storage = Storage::new(&storage_dir);
+            let database = Database::connect(storage.sqlite_path()).await?;
+            database.migrate().await?;
+            import_legacy_json_once(database.pool(), storage.secrets_path()).await?;
+            SecretStore::new(database.clone_pool())
+                .apply(&removals, &writes)
+                .await?;
+            Ok::<(), anyhow::Error>(())
+        })
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("secret persistence thread panicked"))?
 }
 
 fn direct_persistence_error(err: anyhow::Error, rollback_failures: &[String]) -> anyhow::Error {
@@ -625,8 +649,6 @@ fn direct_persistence_error(err: anyhow::Error, rollback_failures: &[String]) ->
 
 fn rollback_direct_persistence(
     settings_write: Option<&PendingSettingsWrite<'_>>,
-    vault_path: &Path,
-    previous_vault: Option<&str>,
     dev_token_write: Option<&PendingDevTokenWrite>,
 ) -> Vec<String> {
     let mut failures = Vec::new();
@@ -635,9 +657,6 @@ fn rollback_direct_persistence(
         if let Err(err) = restore_optional_file(write.path, write.previous_contents) {
             failures.push(err.to_string());
         }
-    }
-    if let Err(err) = restore_optional_file(vault_path, previous_vault) {
-        failures.push(err.to_string());
     }
     if let Some(write) = dev_token_write {
         if let Err(err) = rollback_dev_token_write(write) {
@@ -673,16 +692,24 @@ impl InstallPersistencePlan<'_> {
                 })?;
         }
 
-        let vault_path = Storage::new(self.storage_dir).secrets_path();
-        let previous_vault = std::fs::read_to_string(&vault_path).ok();
+        if let Some(write) = self.dev_token_write.as_ref() {
+            if let Err(err) = write_pending_dev_token(write) {
+                let rollback_failures =
+                    rollback_direct_persistence(self.settings_write.as_ref(), Some(write));
+                let error = direct_persistence_error(err, &rollback_failures);
+                return Err(PersistInstallOutputsError::new(
+                    error,
+                    true,
+                    removed_env_keys,
+                ));
+            }
+        }
 
         if let Err(err) =
             persist_vault_secrets_direct(self.storage_dir, &self.vault_writes, &self.vault_removals)
         {
             let rollback_failures = rollback_direct_persistence(
                 self.settings_write.as_ref(),
-                &vault_path,
-                previous_vault.as_deref(),
                 self.dev_token_write.as_ref(),
             );
             let error = direct_persistence_error(err, &rollback_failures);
@@ -691,23 +718,6 @@ impl InstallPersistencePlan<'_> {
                 true,
                 removed_env_keys,
             ));
-        }
-
-        if let Some(write) = self.dev_token_write.as_ref() {
-            if let Err(err) = write_pending_dev_token(write) {
-                let rollback_failures = rollback_direct_persistence(
-                    self.settings_write.as_ref(),
-                    &vault_path,
-                    previous_vault.as_deref(),
-                    Some(write),
-                );
-                let error = direct_persistence_error(err, &rollback_failures);
-                return Err(PersistInstallOutputsError::new(
-                    error,
-                    true,
-                    removed_env_keys,
-                ));
-            }
         }
 
         Ok(())
@@ -743,6 +753,28 @@ mod tests {
         generate_dev_token, read_dev_token_file, validate_dev_token_format, write_dev_token,
     };
     use fabro_vault::{SecretType as VaultSecretType, Vault};
+
+    use super::{Database, SecretStore, TokioRuntimeBuilder};
+
+    fn load_secret_snapshot(storage: &Storage) -> Vault {
+        let database_path = storage.sqlite_path();
+        std::thread::spawn(move || {
+            let runtime = TokioRuntimeBuilder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let database = Database::connect(database_path).await.unwrap();
+                database.migrate().await.unwrap();
+                SecretStore::new(database.clone_pool())
+                    .snapshot()
+                    .await
+                    .unwrap()
+            })
+        })
+        .join()
+        .unwrap()
+    }
 
     use super::{
         InstallListenConfig, InstallObjectStoreCredentialMode, InstallObjectStoreSelection,
@@ -1048,7 +1080,7 @@ stale = "remove-me"
             "_version = 1\n[server]\n"
         );
 
-        let restored = Vault::load(vault_path).unwrap();
+        let restored = load_secret_snapshot(&storage);
         assert_eq!(restored.get("EXISTING_SECRET"), Some("keep"));
         assert_eq!(restored.get("bad-secret-name"), None);
 
@@ -1088,7 +1120,7 @@ stale = "remove-me"
         .persist_direct()
         .unwrap();
 
-        let vault = Vault::load(storage.secrets_path()).unwrap();
+        let vault = load_secret_snapshot(&storage);
         assert_eq!(vault.get("REMOVE_ME"), None);
         assert_eq!(vault.get("KEEP_ME"), Some("keep"));
         assert_eq!(vault.get("NEW_SECRET"), Some("new"));
@@ -1135,7 +1167,7 @@ stale = "remove-me"
             std::fs::read_to_string(&settings_path).unwrap(),
             "_version = 1\n[server]\n"
         );
-        let vault = Vault::load(vault_path).unwrap();
+        let vault = load_secret_snapshot(&storage);
         assert_eq!(vault.get("REMOVE_ME"), Some("old"));
         assert_eq!(vault.get("bad-secret-name"), None);
         let server_env = envfile::read_env_file(&storage.runtime_directory().env_path()).unwrap();

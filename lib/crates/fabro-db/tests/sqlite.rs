@@ -11,6 +11,15 @@ async fn connect_creates_parent_directory_and_migrate_is_idempotent() -> anyhow:
     database.health_check().await?;
 
     assert!(db_path.exists());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        assert_eq!(
+            std::fs::metadata(&db_path)?.permissions().mode() & 0o777,
+            0o600
+        );
+    }
     let variable_table_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'variables'",
     )
@@ -24,6 +33,13 @@ async fn connect_creates_parent_directory_and_migrate_is_idempotent() -> anyhow:
     .fetch_one(database.pool())
     .await?;
     assert_eq!(environments_table_count, 1);
+
+    let secrets_table_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'secrets'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(secrets_table_count, 1);
 
     let legacy_import_table_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'legacy_imports'",

@@ -55,6 +55,7 @@ pub fn load_startup_vault(vault_path: impl AsRef<Path>) -> anyhow::Result<Vault>
         .with_context(|| format!("load vault {}", vault_path.display()))
 }
 
+#[cfg(test)]
 pub(crate) fn prepare_startup_vault(
     vault_path: impl AsRef<Path>,
     server_env_path: impl AsRef<Path>,

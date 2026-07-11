@@ -705,13 +705,13 @@ async fn build_agent_session(
     let sandbox_instance = sandbox_record.instance().ok_or_else(|| {
         AskFabroBuildError::SandboxUnavailable(anyhow::anyhow!("run sandbox was not created"))
     })?;
-    let sandbox = reconnect_for_run(
-        sandbox_instance,
-        state.vault_secret(EnvVars::DAYTONA_API_KEY),
-        Some(run_id),
-    )
-    .await
-    .map_err(AskFabroBuildError::SandboxUnavailable)?;
+    let daytona_api_key = state
+        .vault_secret(EnvVars::DAYTONA_API_KEY)
+        .await
+        .map_err(|err| AskFabroBuildError::Agent(anyhow::Error::new(err)))?;
+    let sandbox = reconnect_for_run(sandbox_instance, daytona_api_key, Some(run_id))
+        .await
+        .map_err(AskFabroBuildError::SandboxUnavailable)?;
     let sandbox: Arc<dyn fabro_agent::Sandbox> = Arc::from(sandbox);
     let mut profile = build_profile(
         provider_id,
@@ -752,11 +752,15 @@ async fn build_agent_session(
     let profile: Arc<dyn AgentProfile> =
         Arc::new(AskFabroProfile::new(profile, Arc::clone(&ask_fabro_policy)));
 
+    let brave_search_api_key = state
+        .vault_secret(EnvVars::BRAVE_SEARCH_API_KEY)
+        .await
+        .map_err(|err| AskFabroBuildError::Agent(anyhow::Error::new(err)))?;
     let config = SessionOptions {
         tool_access_policy: Some(ask_fabro_policy),
         tool_exposure_mode: ToolExposureMode::AutoApprovedOnly,
         tool_secrets: ToolSecrets {
-            brave_search_api_key: state.vault_secret(EnvVars::BRAVE_SEARCH_API_KEY),
+            brave_search_api_key,
         },
         ..SessionOptions::default()
     };
