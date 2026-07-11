@@ -8,16 +8,16 @@ use fabro_types::run_event::{
 };
 use fabro_types::settings::run::{EnvironmentProvider, RunEnvironmentSettings};
 use fabro_types::{
-    ActivatedSkill, AskFabro, BilledModelUsage, Checkpoint, CheckpointRecord, CommandTermination,
-    Conclusion, EventBody, FailureCategory, FailureSignature, InterviewQuestionRecord,
-    McpServerProjection, McpServerStatus, Outcome, PendingInterviewRecord, PendingReason,
-    PullRequestLink, RepositoryRef, Run, RunApproval, RunApprovalState, RunBillingSummary,
-    RunControlAction, RunDiff, RunEvent, RunId, RunLifecycle, RunLinks, RunModel, RunOrigin,
-    RunProjection, RunSandbox, RunSandboxFailure, RunSandboxInstance, RunSandboxPlan,
-    RunSandboxRuntime, RunSize, RunSpec, RunStatus, RunTimestamps, SandboxProviderKind,
-    StageCompletion, StageHandler, StageId, StageModelUsage, StageOutcome, StageProjection,
-    StageState, StartRecord, SubAgentProjection, SubAgentStatus, TodoListKind, TodoListProjection,
-    TodoProjection, WorkflowRef, first_event_seq,
+    ActivatedSkill, AskFabro, BilledModelUsage, BilledTokenCounts, Checkpoint, CheckpointRecord,
+    CommandTermination, Conclusion, EventBody, FailureCategory, FailureSignature,
+    InterviewQuestionRecord, McpServerProjection, McpServerStatus, Outcome, PendingInterviewRecord,
+    PendingReason, PullRequestLink, RepositoryRef, Run, RunApproval, RunApprovalState,
+    RunBillingSummary, RunControlAction, RunDiff, RunEvent, RunId, RunLifecycle, RunLinks,
+    RunModel, RunOrigin, RunProjection, RunSandbox, RunSandboxFailure, RunSandboxInstance,
+    RunSandboxPlan, RunSandboxRuntime, RunSize, RunSpec, RunStatus, RunTimestamps,
+    SandboxProviderKind, StageCompletion, StageHandler, StageId, StageModelUsage, StageOutcome,
+    StageProjection, StageState, StartRecord, SubAgentProjection, SubAgentStatus, TodoListKind,
+    TodoListProjection, TodoProjection, WorkflowRef, first_event_seq,
 };
 use fabro_util::error::render_compact_with_causes;
 
@@ -1004,20 +1004,25 @@ fn terminal_total_usd_micros(state: &RunProjection) -> Option<i64> {
 }
 
 fn projected_total_usd_micros(state: &RunProjection) -> Option<i64> {
-    let mut total_usd_micros = 0_i64;
-    let mut has_total = false;
+    projected_billing(state).total_usd_micros
+}
 
-    for (stage_id, stage) in state.iter_stages() {
-        if is_boundary_stage(state, stage_id.node_id()) {
-            continue;
-        }
-        if let Some(value) = stage.usage.total_usd_micros {
-            total_usd_micros = total_usd_micros.saturating_add(value);
-            has_total = true;
-        }
+pub(crate) fn projected_billing(state: &RunProjection) -> BilledTokenCounts {
+    if let Some(billing) = state
+        .conclusion
+        .as_ref()
+        .and_then(|conclusion| conclusion.billing.as_ref())
+    {
+        return billing.clone();
     }
 
-    has_total.then_some(total_usd_micros)
+    let mut billing = BilledTokenCounts::default();
+    for (stage_id, stage) in state.iter_stages() {
+        if !is_boundary_stage(state, stage_id.node_id()) {
+            billing.add_counts(&stage.usage);
+        }
+    }
+    billing
 }
 
 fn is_boundary_stage(projection: &RunProjection, node_id: &str) -> bool {

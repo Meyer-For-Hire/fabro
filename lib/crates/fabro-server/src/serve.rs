@@ -779,10 +779,6 @@ where
         flush_interval,
         cache_path,
     ));
-    store
-        .warm_projection_cache()
-        .await
-        .context("warming run projection cache")?;
     let auth_code_store = store.auth_codes().await?;
     let auth_token_store = store.refresh_tokens().await?;
     let (artifact_object_store, artifact_prefix) = build_artifact_object_store_with_server_secrets(
@@ -815,6 +811,12 @@ where
         #[cfg(any(test, feature = "test-support"))]
         automation_materializer_override: None,
     })?;
+    state
+        .stores
+        .runs
+        .warm_projection_cache()
+        .await
+        .context("warming run projection cache and reconciling run summaries")?;
     let reconciled = reconcile_incomplete_runs_on_startup(&state).await?;
     if reconciled > 0 {
         info!(

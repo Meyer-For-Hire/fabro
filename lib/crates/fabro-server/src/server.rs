@@ -86,7 +86,7 @@ use fabro_slack::{blocks as slack_blocks, connection as slack_connection};
 use fabro_static::EnvVars;
 use fabro_store::{
     ArtifactKey, ArtifactStore, Database, EventEnvelope, EventPayload, NodeArtifact,
-    PendingInterviewRecord, StageArtifactEntry, StageId,
+    PendingInterviewRecord, RunSummaryStore, StageArtifactEntry, StageId,
 };
 #[cfg(test)]
 use fabro_types::BlockedReason;
@@ -1107,12 +1107,13 @@ pub struct AppState {
 }
 
 pub(crate) struct AppStores {
-    pub(crate) runs:         Arc<Database>,
-    pub(crate) automations:  Arc<AutomationStore>,
-    pub(crate) environments: Arc<EnvironmentStore>,
-    pub(crate) mcp_servers:  Arc<McpServerStore>,
-    pub(crate) vault:        Arc<SecretStore>,
-    pub(crate) variables:    Arc<VariableStore>,
+    pub(crate) runs:          Arc<Database>,
+    pub(crate) run_summaries: Arc<RunSummaryStore>,
+    pub(crate) automations:   Arc<AutomationStore>,
+    pub(crate) environments:  Arc<EnvironmentStore>,
+    pub(crate) mcp_servers:   Arc<McpServerStore>,
+    pub(crate) vault:         Arc<SecretStore>,
+    pub(crate) variables:     Arc<VariableStore>,
 }
 
 type PullRequestCreateLocks = Arc<Mutex<HashMap<RunId, Arc<AsyncMutex<()>>>>>;
@@ -2386,6 +2387,8 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         })
         .context("load environments")?,
     );
+    let run_summaries =
+        store.attach_run_summary_store(Arc::new(RunSummaryStore::new(db_pool.clone())));
     let mcp_server_dir = mcp_server_dir_for_active_config(&active_config_path);
     let mcp_server_pool = db_pool.clone();
     let mcp_server_store = Arc::new(
@@ -2491,6 +2494,7 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         aggregate_billing: Mutex::new(BillingAccumulator::default()),
         stores: AppStores {
             runs: store,
+            run_summaries,
             automations: automation_store,
             environments: environment_store,
             mcp_servers: mcp_server_store,

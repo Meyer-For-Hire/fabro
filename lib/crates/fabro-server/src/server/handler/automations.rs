@@ -6,12 +6,13 @@ use chrono::Utc;
 use fabro_automation::{
     Automation, AutomationDraft, AutomationId, AutomationReplace, AutomationStoreError,
 };
+use fabro_store::{RunSummaryListQuery, RunSummaryVisibility};
 use fabro_types::{AutomationRef, RunId};
 use serde::Serialize;
 
 use super::super::{
-    ApiError, AppState, IntoResponse, Json, PaginationParams, Path, RequiredUser, Response, Router,
-    State, StatusCode, get, paginate_items,
+    ApiError, AppState, IntoResponse, Json, MAX_PAGE_OFFSET, PaginationParams, Path, RequiredUser,
+    Response, Router, State, StatusCode, get,
 };
 use super::{json_with_etag_response, lifecycle, parse_required_if_match, runs};
 use crate::automation_materializer::AutomationRunMaterializeInput;
@@ -80,44 +81,28 @@ async fn list_automation_runs(
         Err(err) => return ApiError::from(err).into_response(),
     }
 
-    let entries = match state
-        .stores
-        .runs
-        .list_cached_runs(&fabro_store::ListRunsQuery::default(), Utc::now())
-        .await
-    {
-        Ok(entries) => entries,
+    let query = RunSummaryListQuery {
+        automation_id: Some(id.to_string()),
+        visibility: RunSummaryVisibility::All,
+        limit: pagination.limit.clamp(1, 100),
+        offset: pagination.offset.min(MAX_PAGE_OFFSET),
+        ..RunSummaryListQuery::default()
+    };
+    let page = match state.stores.run_summaries.list(&query, Utc::now()).await {
+        Ok(page) => page,
         Err(err) => {
             return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
                 .into_response();
         }
     };
 
-    let mut runs: Vec<fabro_types::Run> = entries
-        .into_iter()
-        .map(|entry| entry.summary)
-        .filter(|run| {
-            run.automation
-                .as_ref()
-                .is_some_and(|automation| automation.id == id.as_str())
-        })
-        .collect();
-    runs.sort_by(|a, b| {
-        b.timestamps
-            .created_at
-            .cmp(&a.timestamps.created_at)
-            .then_with(|| b.id.cmp(&a.id))
-    });
-
-    let total = runs.len() as u64;
-    let (page, has_more) = paginate_items(runs, &pagination);
-    let data = state.decorate_run_summaries(page).await;
+    let data = state.decorate_run_summaries(page.data).await;
 
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "data": data,
-            "meta": { "has_more": has_more, "total": total }
+            "meta": { "has_more": page.has_more, "total": page.total }
         })),
     )
         .into_response()

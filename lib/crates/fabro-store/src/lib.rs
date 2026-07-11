@@ -7,6 +7,7 @@ mod keys;
 mod record;
 mod run_sessions;
 mod run_state;
+mod run_summary_store;
 mod serializable_projection;
 mod slate;
 mod types;
@@ -25,6 +26,10 @@ pub use run_sessions::{
     project_run_sessions,
 };
 pub use run_state::RunProjectionReducer;
+pub use run_summary_store::{
+    RunSummaryListQuery, RunSummaryPage, RunSummarySort, RunSummarySortDirection, RunSummaryStore,
+    RunSummaryVisibility,
+};
 pub use serializable_projection::SerializableProjection;
 pub use slate::{
     AuthCode, AuthCodeStore, Blob, BlobStore, CachedRunProjection, ConsumeOutcome, Database,

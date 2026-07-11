@@ -9,12 +9,14 @@ use futures::Stream;
 use slatedb::{Db, DbRead};
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::warn;
+use tracing::{error, warn};
 
 use super::blob_store::BlobStore;
 use super::projection_cache::{CachedRunProjection, RunProjectionCache};
 use crate::run_state::{EventProjectionCache, RunProjectionReducer};
-use crate::{Error, EventEnvelope, EventPayload, Result, RunProjection, StageId, keys};
+use crate::{
+    Error, EventEnvelope, EventPayload, Result, RunProjection, RunSummaryStore, StageId, keys,
+};
 
 const DEFAULT_EVENT_TAIL_LIMIT: usize = 1024;
 #[derive(Clone)]
@@ -41,6 +43,7 @@ pub(crate) struct RunDatabaseInner {
     state_lock: Mutex<()>,
     projection_cache: Mutex<EventProjectionCache>,
     shared_projection_cache: Arc<RunProjectionCache>,
+    run_summary_store: Option<Arc<RunSummaryStore>>,
     recent_events: Mutex<VecDeque<EventEnvelope>>,
     recent_event_limit: usize,
     event_tx: broadcast::Sender<EventEnvelope>,
@@ -51,16 +54,25 @@ impl RunDatabase {
         run_id: RunId,
         db: Db,
         shared_projection_cache: Arc<RunProjectionCache>,
+        run_summary_store: Option<Arc<RunSummaryStore>>,
     ) -> Result<Self> {
-        Self::build(run_id, db, false, shared_projection_cache).await
+        Self::build(
+            run_id,
+            db,
+            false,
+            shared_projection_cache,
+            run_summary_store,
+        )
+        .await
     }
 
     pub(crate) async fn open_reader(
         run_id: RunId,
         db: Db,
         shared_projection_cache: Arc<RunProjectionCache>,
+        run_summary_store: Option<Arc<RunSummaryStore>>,
     ) -> Result<Self> {
-        Self::build(run_id, db, true, shared_projection_cache).await
+        Self::build(run_id, db, true, shared_projection_cache, run_summary_store).await
     }
 
     async fn build(
@@ -68,6 +80,7 @@ impl RunDatabase {
         db: Db,
         read_only: bool,
         shared_projection_cache: Arc<RunProjectionCache>,
+        run_summary_store: Option<Arc<RunSummaryStore>>,
     ) -> Result<Self> {
         let event_seq =
             recover_next_seq(&db, keys::run_events_prefix(&run_id), keys::parse_event_seq).await?;
@@ -83,6 +96,7 @@ impl RunDatabase {
                 state_lock: Mutex::new(()),
                 projection_cache: Mutex::new(EventProjectionCache::default()),
                 shared_projection_cache,
+                run_summary_store,
                 recent_events: Mutex::new(VecDeque::with_capacity(DEFAULT_EVENT_TAIL_LIMIT)),
                 recent_event_limit: DEFAULT_EVENT_TAIL_LIMIT,
                 event_tx,
@@ -257,43 +271,74 @@ impl RunDatabase {
             )
             .await?;
         self.cache_event(&event).await?;
-        if let Err(err) = self
+        Box::pin(self.update_summary_projection_after_append(&event)).await?;
+        Ok(event)
+    }
+
+    async fn update_summary_projection_after_append(&self, event: &EventEnvelope) -> Result<()> {
+        let cached = match self
             .inner
             .shared_projection_cache
-            .apply_event(&self.inner.run_id, &event)
+            .apply_event(&self.inner.run_id, event)
             .await
         {
-            match Self::build_cached_projection(&self.inner.db, &self.inner.run_id).await {
-                Ok(Some(entry)) => {
-                    self.inner.shared_projection_cache.replace(entry).await;
-                    return Ok(event);
-                }
-                Ok(None) => {
-                    self.inner
-                        .shared_projection_cache
-                        .remove(&self.inner.run_id)
-                        .await;
-                }
-                Err(rebuild_err) => {
-                    self.inner
-                        .shared_projection_cache
-                        .remove(&self.inner.run_id)
-                        .await;
-                    warn!(
-                        run_id = %self.inner.run_id,
-                        error = %rebuild_err,
-                        "Failed to rebuild run projection cache after append"
-                    );
+            Ok(entry) => entry,
+            Err(err) => {
+                match Self::build_cached_projection(&self.inner.db, &self.inner.run_id).await {
+                    Ok(Some(entry)) => {
+                        self.inner
+                            .shared_projection_cache
+                            .replace(entry.clone())
+                            .await;
+                        entry
+                    }
+                    Ok(None) => {
+                        self.inner
+                            .shared_projection_cache
+                            .remove(&self.inner.run_id)
+                            .await;
+                        warn!(
+                            run_id = %self.inner.run_id,
+                            error = ?err,
+                            "Failed to update run projection cache after append"
+                        );
+                        return Err(err);
+                    }
+                    Err(rebuild_err) => {
+                        self.inner
+                            .shared_projection_cache
+                            .remove(&self.inner.run_id)
+                            .await;
+                        warn!(
+                            run_id = %self.inner.run_id,
+                            error = %rebuild_err,
+                            "Failed to rebuild run projection cache after append"
+                        );
+                        warn!(
+                            run_id = %self.inner.run_id,
+                            error = ?err,
+                            "Failed to update run projection cache after append"
+                        );
+                        return Err(err);
+                    }
                 }
             }
-            warn!(
-                run_id = %self.inner.run_id,
-                error = %err,
-                "Failed to update run projection cache after append"
-            );
-            return Err(err);
+        };
+        if let Some(store) = &self.inner.run_summary_store {
+            let source_last_seq = cached.last_seq;
+            let store = Arc::clone(store);
+            let upsert = Box::pin(async move { store.upsert_projection(&cached).await });
+            if let Err(err) = upsert.await {
+                error!(
+                    run_id = %self.inner.run_id,
+                    source_last_seq,
+                    error = %err,
+                    "Failed to update SQLite run summary after append"
+                );
+                return Err(err);
+            }
         }
-        Ok(event)
+        Ok(())
     }
 
     pub async fn list_events(&self) -> Result<Vec<EventEnvelope>> {

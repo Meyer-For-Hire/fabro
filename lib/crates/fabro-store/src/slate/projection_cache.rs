@@ -184,25 +184,27 @@ impl RunProjectionCache {
         Some(entry.summary)
     }
 
-    pub(crate) async fn apply_event(&self, run_id: &RunId, event: &EventEnvelope) -> Result<()> {
+    pub(crate) async fn apply_event(
+        &self,
+        run_id: &RunId,
+        event: &EventEnvelope,
+    ) -> Result<CachedRunProjection> {
         let mut state = self.state.lock().await;
         let Some(entry) = state.entries.get(run_id).cloned() else {
             if event.seq == 1 {
                 let projection = RunProjection::apply_events(std::slice::from_ref(event))?;
-                state.insert(CachedRunProjection::from_projection(
-                    *run_id, projection, event.seq,
-                ));
-            } else {
-                return Err(Error::InvalidEvent(format!(
-                    "projection cache cannot initialize run {run_id} from event seq {}",
-                    event.seq
-                )));
+                let entry = CachedRunProjection::from_projection(*run_id, projection, event.seq);
+                state.insert(entry.clone());
+                return Ok(entry);
             }
-            return Ok(());
+            return Err(Error::InvalidEvent(format!(
+                "projection cache cannot initialize run {run_id} from event seq {}",
+                event.seq
+            )));
         };
 
         if event.seq <= entry.last_seq {
-            return Ok(());
+            return Ok(entry);
         }
         if event.seq != entry.last_seq.saturating_add(1) {
             return Err(Error::Other(format!(
@@ -213,10 +215,9 @@ impl RunProjectionCache {
 
         let mut projection = (*entry.projection).clone();
         projection.apply_event(event)?;
-        state.insert(CachedRunProjection::from_projection(
-            *run_id, projection, event.seq,
-        ));
-        Ok(())
+        let entry = CachedRunProjection::from_projection(*run_id, projection, event.seq);
+        state.insert(entry.clone());
+        Ok(entry)
     }
 
     pub(crate) async fn remove(&self, run_id: &RunId) {

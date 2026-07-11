@@ -11,13 +11,16 @@ use axum_extra::extract::Query as ExtraQuery;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use fabro_api::types::{
     BoardColumn, RunManifest, SubmitAnswerRequest, UpdateRunParentRequest, UpdateRunRequest,
 };
 use fabro_config::Storage;
 use fabro_interview::AnswerSubmission;
 use fabro_llm::client::Client as LlmClient;
+use fabro_store::{
+    RunSummaryListQuery, RunSummarySort, RunSummarySortDirection, RunSummaryVisibility,
+};
 use fabro_types::settings::ResolveError;
 use fabro_types::{
     AutomationRef, Principal, RunClientProvenance, RunId, RunProvenance, RunServerProvenance,
@@ -33,9 +36,9 @@ use tokio::fs;
 use tracing::info;
 
 use super::super::{
-    AppState, DeleteRunOutcome, ListResponse, PaginationParams, RunExecutionMode, VariableError,
+    AppState, DeleteRunOutcome, ListResponse, MAX_PAGE_OFFSET, RunExecutionMode, VariableError,
     answer_from_request, api_question_from_pending_interview, default_page_limit,
-    delete_run_internal, load_pending_interview, managed_run, paginate_items, parse_run_id_path,
+    delete_run_internal, load_pending_interview, managed_run, parse_run_id_path,
     parse_stage_id_path, reject_if_archived, submit_pending_interview_answer, workflow_event,
 };
 use crate::error::ApiError;
@@ -127,107 +130,83 @@ struct ListRunsParams {
 }
 
 impl ListRunsParams {
-    fn pagination(&self) -> PaginationParams {
-        PaginationParams {
-            limit:  self.limit,
-            offset: self.offset,
-        }
-    }
-
-    fn status_filter(&self) -> Option<HashSet<BoardColumn>> {
-        if self.status.is_empty() {
-            None
-        } else {
-            Some(self.status.iter().copied().collect())
+    fn summary_query(&self) -> RunSummaryListQuery {
+        RunSummaryListQuery {
+            parent_id: self.parent_id,
+            visibility: summary_visibility(&self.status, self.include_archived),
+            sort: summary_sort(self.sort),
+            direction: summary_sort_direction(self.direction),
+            limit: self.limit.clamp(1, 100),
+            offset: self.offset.min(MAX_PAGE_OFFSET),
+            ..RunSummaryListQuery::default()
         }
     }
 }
 
-pub(crate) fn board_column(status: RunStatus, archived: bool) -> BoardColumn {
-    if archived {
-        return BoardColumn::Archived;
+fn summary_visibility(selected: &[BoardColumn], include_archived: bool) -> RunSummaryVisibility {
+    if selected.is_empty() {
+        return RunSummaryVisibility::Default { include_archived };
     }
-    match status {
-        RunStatus::Submitted | RunStatus::Pending { .. } => BoardColumn::Pending,
-        RunStatus::Runnable => BoardColumn::Runnable,
-        RunStatus::Starting => BoardColumn::Initializing,
-        RunStatus::Running | RunStatus::Paused { .. } => BoardColumn::Running,
-        RunStatus::Blocked { .. } => BoardColumn::Blocked,
-        RunStatus::Succeeded { .. } => BoardColumn::Succeeded,
-        RunStatus::Failed { .. } | RunStatus::Dead => BoardColumn::Failed,
-        RunStatus::Removing => BoardColumn::Removing,
+
+    let mut statuses = HashSet::new();
+    let mut archived = false;
+    for column in selected {
+        match column {
+            BoardColumn::Pending => {
+                statuses.insert(fabro_types::RunStatusKind::Submitted);
+                statuses.insert(fabro_types::RunStatusKind::Pending);
+            }
+            BoardColumn::Runnable => {
+                statuses.insert(fabro_types::RunStatusKind::Runnable);
+            }
+            BoardColumn::Initializing => {
+                statuses.insert(fabro_types::RunStatusKind::Starting);
+            }
+            BoardColumn::Running => {
+                statuses.insert(fabro_types::RunStatusKind::Running);
+                statuses.insert(fabro_types::RunStatusKind::Paused);
+            }
+            BoardColumn::Blocked => {
+                statuses.insert(fabro_types::RunStatusKind::Blocked);
+            }
+            BoardColumn::Succeeded => {
+                statuses.insert(fabro_types::RunStatusKind::Succeeded);
+            }
+            BoardColumn::Failed => {
+                statuses.insert(fabro_types::RunStatusKind::Failed);
+                statuses.insert(fabro_types::RunStatusKind::Dead);
+            }
+            BoardColumn::Archived => archived = true,
+            BoardColumn::Removing => {
+                statuses.insert(fabro_types::RunStatusKind::Removing);
+            }
+        }
+    }
+    RunSummaryVisibility::Selected {
+        statuses: statuses.into_iter().collect(),
+        archived,
     }
 }
 
-fn run_elapsed_ms(run: &fabro_types::Run, now: DateTime<Utc>) -> i64 {
-    let start = run
-        .timestamps
-        .started_at
-        .unwrap_or(run.timestamps.created_at);
-    let end = run.timestamps.completed_at.unwrap_or(now);
-    (end - start).num_milliseconds().max(0)
+fn summary_sort(sort: RunsSortKey) -> RunSummarySort {
+    match sort {
+        RunsSortKey::CreatedAt => RunSummarySort::CreatedAt,
+        RunsSortKey::UpdatedAt => RunSummarySort::UpdatedAt,
+        RunsSortKey::Status => RunSummarySort::Status,
+        RunsSortKey::Elapsed => RunSummarySort::Elapsed,
+        RunsSortKey::Repo => RunSummarySort::Repository,
+        RunsSortKey::Title => RunSummarySort::Title,
+        RunsSortKey::Workflow => RunSummarySort::Workflow,
+        RunsSortKey::Changes => RunSummarySort::Changes,
+        RunsSortKey::Size => RunSummarySort::Size,
+    }
 }
 
-fn sort_runs(runs: &mut [fabro_types::Run], key: RunsSortKey, direction: RunsSortDirection) {
-    let now = Utc::now();
-    let asc = matches!(direction, RunsSortDirection::Asc);
-    runs.sort_by(|a, b| {
-        let primary = match key {
-            RunsSortKey::CreatedAt => a.timestamps.created_at.cmp(&b.timestamps.created_at),
-            RunsSortKey::UpdatedAt => {
-                let av = a
-                    .timestamps
-                    .last_event_at
-                    .unwrap_or(a.timestamps.created_at);
-                let bv = b
-                    .timestamps
-                    .last_event_at
-                    .unwrap_or(b.timestamps.created_at);
-                av.cmp(&bv)
-            }
-            RunsSortKey::Status => {
-                let ac = board_column(a.lifecycle.status, a.lifecycle.archived);
-                let bc = board_column(b.lifecycle.status, b.lifecycle.archived);
-                ac.cmp(&bc)
-            }
-            RunsSortKey::Elapsed => run_elapsed_ms(a, now).cmp(&run_elapsed_ms(b, now)),
-            RunsSortKey::Repo => run_repo_key(a).cmp(&run_repo_key(b)),
-            RunsSortKey::Title => run_title_key(a).cmp(&run_title_key(b)),
-            RunsSortKey::Workflow => run_workflow_key(a).cmp(&run_workflow_key(b)),
-            RunsSortKey::Changes => run_changes_total(a).cmp(&run_changes_total(b)),
-            RunsSortKey::Size => a.size.cmp(&b.size),
-        };
-        let primary = if asc { primary } else { primary.reverse() };
-        // Stable tiebreak: newer ULIDs (and thus newer runs) first.
-        primary.then_with(|| b.id.cmp(&a.id))
-    });
-}
-
-fn run_repo_key(run: &fabro_types::Run) -> String {
-    run.repository
-        .as_ref()
-        .map(|repo| repo.name.to_lowercase())
-        .unwrap_or_default()
-}
-
-fn run_title_key(run: &fabro_types::Run) -> String {
-    run.title.trim().to_lowercase()
-}
-
-fn run_workflow_key(run: &fabro_types::Run) -> String {
-    let wf = &run.workflow;
-    wf.name
-        .as_deref()
-        .or(wf.graph_name.as_deref())
-        .or(wf.slug.as_deref())
-        .map(str::to_lowercase)
-        .unwrap_or_default()
-}
-
-fn run_changes_total(run: &fabro_types::Run) -> i64 {
-    run.diff
-        .as_ref()
-        .map_or(0, |diff| diff.additions + diff.deletions)
+fn summary_sort_direction(direction: RunsSortDirection) -> RunSummarySortDirection {
+    match direction {
+        RunsSortDirection::Asc => RunSummarySortDirection::Asc,
+        RunsSortDirection::Desc => RunSummarySortDirection::Desc,
+    }
 }
 
 async fn link_run_parent(
@@ -364,12 +343,7 @@ async fn validate_parent_link(
 }
 
 async fn updated_run_response(state: &AppState, run_id: &RunId) -> Response {
-    match state
-        .stores
-        .runs
-        .get_cached_summary(run_id, Utc::now())
-        .await
-    {
+    match state.stores.run_summaries.get(run_id, Utc::now()).await {
         Ok(Some(summary)) => (
             StatusCode::OK,
             Json(state.decorate_run_summary(summary).await),
@@ -387,53 +361,26 @@ async fn list_runs(
     State(state): State<Arc<AppState>>,
     ExtraQuery(params): ExtraQuery<ListRunsParams>,
 ) -> Response {
-    let entries = match state
+    let page = match state
         .stores
-        .runs
-        .list_cached_runs(
-            &fabro_store::ListRunsQuery {
-                parent_id: params.parent_id,
-                ..fabro_store::ListRunsQuery::default()
-            },
-            Utc::now(),
-        )
+        .run_summaries
+        .list(&params.summary_query(), Utc::now())
         .await
     {
-        Ok(entries) => entries,
+        Ok(page) => page,
         Err(err) => {
             return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
                 .into_response();
         }
     };
 
-    let status_filter = params.status_filter();
-    let include_archived = params.include_archived;
-
-    let filtered: Vec<fabro_types::Run> = entries
-        .into_iter()
-        .map(|entry| entry.summary)
-        .filter(|run| {
-            let column = board_column(run.lifecycle.status, run.lifecycle.archived);
-            match &status_filter {
-                Some(set) => set.contains(&column),
-                None => {
-                    column != BoardColumn::Removing
-                        && (include_archived || column != BoardColumn::Archived)
-                }
-            }
-        })
-        .collect();
-
-    let mut decorated = state.decorate_run_summaries(filtered).await;
-    sort_runs(&mut decorated, params.sort, params.direction);
-    let total = decorated.len() as u64;
-    let (data, has_more) = paginate_items(decorated, &params.pagination());
+    let data = state.decorate_run_summaries(page.data).await;
 
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "data": data,
-            "meta": { "has_more": has_more, "total": total }
+            "meta": { "has_more": page.has_more, "total": page.total }
         })),
     )
         .into_response()
@@ -478,13 +425,18 @@ async fn resolve_run(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ResolveRunQuery>,
 ) -> Response {
+    let summary_query = RunSummaryListQuery {
+        visibility: RunSummaryVisibility::All,
+        limit: u32::MAX,
+        ..RunSummaryListQuery::default()
+    };
     let runs = match state
         .stores
-        .runs
-        .list_runs(&fabro_store::ListRunsQuery::default(), Utc::now())
+        .run_summaries
+        .list(&summary_query, Utc::now())
         .await
     {
-        Ok(runs) => runs,
+        Ok(page) => page.data,
         Err(err) => {
             return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
                 .into_response();
@@ -1031,7 +983,7 @@ async fn get_run_status(
     RequireRunManagementTarget(id, _actor): RequireRunManagementTarget,
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    match state.stores.runs.get_cached_summary(&id, Utc::now()).await {
+    match state.stores.run_summaries.get(&id, Utc::now()).await {
         Ok(Some(run)) => {
             (StatusCode::OK, Json(state.decorate_run_summary(run).await)).into_response()
         }
