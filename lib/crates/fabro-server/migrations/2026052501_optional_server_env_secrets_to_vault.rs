@@ -15,8 +15,6 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use fabro_config::envfile::{self, EnvFileRemoval};
 use fabro_static::{EnvVars, optional_vault_secrets};
-#[cfg(test)]
-use fabro_vault::Vault;
 use fabro_vault::{SecretStore, SecretStoreWrite, SecretType};
 
 pub(crate) const REMOVAL_DEADLINE: &str = "2026-08-18";
@@ -36,94 +34,6 @@ impl OptionalServerEnvSecretsMigrationReport {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn migrate(
-    vault: &mut Vault,
-    server_env_path: &Path,
-    env_entries: &HashMap<String, String>,
-) -> anyhow::Result<OptionalServerEnvSecretsMigrationReport> {
-    let server_env_entries = envfile::read_env_file(server_env_path)
-        .with_context(|| format!("read server env file {}", server_env_path.display()))?;
-    let mut vault_writes = Vec::new();
-    let mut env_removals = Vec::new();
-    let mut warnings = Vec::new();
-    let mut preserved_env_entries = 0;
-
-    for &name in optional_vault_secrets() {
-        let process_value = env_entries.get(name);
-        let file_value = server_env_entries.get(name);
-
-        if let Some(vault_value) = vault.get(name) {
-            if let Some(file_value) = file_value {
-                if file_value == vault_value {
-                    env_removals.push(env_removal(name));
-                } else {
-                    preserved_env_entries += 1;
-                    warnings.push(format!(
-                        "Preserved {name} in server.env because the vault already contains a different value"
-                    ));
-                }
-            }
-            continue;
-        }
-
-        match (process_value, file_value) {
-            (Some(value), Some(file_value)) => {
-                vault_writes.push((name, value.clone(), secret_type_for(name)));
-                if value == file_value {
-                    env_removals.push(env_removal(name));
-                } else {
-                    preserved_env_entries += 1;
-                    warnings.push(format!(
-                        "Preserved {name} in server.env because process env takes precedence and the file value differs"
-                    ));
-                }
-            }
-            (Some(value), None) => {
-                vault_writes.push((name, value.clone(), secret_type_for(name)));
-            }
-            (None, Some(value)) => {
-                vault_writes.push((name, value.clone(), secret_type_for(name)));
-                env_removals.push(env_removal(name));
-            }
-            (None, None) => {}
-        }
-    }
-
-    let mut report = OptionalServerEnvSecretsMigrationReport {
-        migrated_secrets: vault_writes.len(),
-        removed_env_entries: 0,
-        preserved_env_entries,
-        backup_path: None,
-        warnings,
-    };
-    if vault_writes.is_empty() && env_removals.is_empty() {
-        return Ok(report);
-    }
-
-    for (name, value, secret_type) in vault_writes {
-        vault
-            .set(name, &value, secret_type, None)
-            .with_context(|| format!("write migrated secret {name} to vault"))?;
-    }
-
-    if !env_removals.is_empty() {
-        let backup_path = backup_server_env_file(server_env_path)?;
-        let update_report =
-            envfile::update_env_file_with_report(server_env_path, env_removals, Vec::new())
-                .with_context(|| {
-                    format!(
-                        "remove migrated optional secrets from {}",
-                        server_env_path.display()
-                    )
-                })?;
-        report.removed_env_entries = update_report.removed_keys.len();
-        report.backup_path = Some(backup_path);
-    }
-
-    Ok(report)
-}
-
 pub(crate) async fn migrate_to_store(
     store: &SecretStore,
     server_env_path: &Path,
@@ -131,6 +41,7 @@ pub(crate) async fn migrate_to_store(
 ) -> anyhow::Result<OptionalServerEnvSecretsMigrationReport> {
     let server_env_entries = envfile::read_env_file(server_env_path)
         .with_context(|| format!("read server env file {}", server_env_path.display()))?;
+    let stored = store.snapshot().await?;
     let mut writes = Vec::new();
     let mut env_removals = Vec::new();
     let mut warnings = Vec::new();
@@ -139,7 +50,7 @@ pub(crate) async fn migrate_to_store(
     for &name in optional_vault_secrets() {
         let process_value = env_entries.get(name);
         let file_value = server_env_entries.get(name);
-        if let Some(entry) = store.get(name).await? {
+        if let Some(entry) = stored.get_entry(name) {
             if let Some(file_value) = file_value {
                 if file_value == &entry.value {
                     env_removals.push(env_removal(name));

@@ -112,8 +112,12 @@ fn test_environment_store(
     })
     .join()
     .expect("environment store setup thread should not panic");
-    let store = load_environment_store_blocking(pool, local_enabled)
-        .expect("test environment store should load");
+    let store = load_store_blocking("environment store", move || async move {
+        EnvironmentStore::load(pool, local_enabled)
+            .await
+            .map_err(anyhow::Error::new)
+    })
+    .expect("test environment store should load");
     (temp, store)
 }
 
@@ -138,8 +142,13 @@ fn test_mcp_server_store() -> (tempfile::TempDir, McpServerStore) {
     })
     .join()
     .expect("MCP server store setup thread should not panic");
-    let store = load_mcp_server_store_blocking(pool, temp.path().join("mcps"))
-        .expect("test MCP server store should load");
+    let mcps_dir = temp.path().join("mcps");
+    let store = load_store_blocking("MCP server store", move || async move {
+        McpServerStore::open(pool, mcps_dir)
+            .await
+            .map_err(anyhow::Error::new)
+    })
+    .expect("test MCP server store should load");
     (temp, store)
 }
 

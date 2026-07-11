@@ -2328,43 +2328,21 @@ fn mcp_server_dir_for_active_config(active_config_path: &std::path::Path) -> Pat
     reason = "synchronous app-state assembly may run inside an async runtime; a short-lived OS \
               thread avoids nested Tokio runtimes"
 )]
-fn load_environment_store_blocking(
-    pool: DbPool,
-    local_enabled: bool,
-) -> anyhow::Result<EnvironmentStore> {
+fn load_store_blocking<T, F, Fut>(description: &'static str, load: F) -> anyhow::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
     std::thread::spawn(move || {
         let runtime = TokioRuntimeBuilder::new_current_thread()
             .enable_all()
             .build()
-            .context("build environment store runtime")?;
-        runtime
-            .block_on(EnvironmentStore::load(pool, local_enabled))
-            .map_err(anyhow::Error::new)
+            .with_context(|| format!("build {description} runtime"))?;
+        runtime.block_on(load())
     })
     .join()
-    .expect("environment store load thread should not panic")
-}
-
-#[expect(
-    clippy::disallowed_methods,
-    reason = "synchronous app-state assembly may run inside an async runtime; a short-lived OS \
-              thread avoids nested Tokio runtimes"
-)]
-fn load_mcp_server_store_blocking(
-    pool: DbPool,
-    legacy_dir: PathBuf,
-) -> anyhow::Result<McpServerStore> {
-    std::thread::spawn(move || {
-        let runtime = TokioRuntimeBuilder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("build MCP server store runtime")?;
-        runtime
-            .block_on(McpServerStore::open(pool, legacy_dir))
-            .map_err(anyhow::Error::new)
-    })
-    .join()
-    .expect("MCP server store load thread should not panic")
+    .expect("store load thread should not panic")
 }
 
 pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppState>> {
@@ -2404,14 +2382,24 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         .providers
         .local
         .enabled;
+    let environment_pool = db_pool.clone();
     let environment_store = Arc::new(
-        load_environment_store_blocking(db_pool.clone(), local_provider_enabled)
-            .context("load environments")?,
+        load_store_blocking("environment store", move || async move {
+            EnvironmentStore::load(environment_pool, local_provider_enabled)
+                .await
+                .map_err(anyhow::Error::new)
+        })
+        .context("load environments")?,
     );
     let mcp_server_dir = mcp_server_dir_for_active_config(&active_config_path);
+    let mcp_server_pool = db_pool.clone();
     let mcp_server_store = Arc::new(
-        load_mcp_server_store_blocking(db_pool.clone(), mcp_server_dir)
-            .context("load mcp servers")?,
+        load_store_blocking("MCP server store", move || async move {
+            McpServerStore::open(mcp_server_pool, mcp_server_dir)
+                .await
+                .map_err(anyhow::Error::new)
+        })
+        .context("load mcp servers")?,
     );
     let variables = Arc::new(VariableStore::new(db_pool.clone()));
     let secret_store = Arc::new(SecretStore::new(db_pool));

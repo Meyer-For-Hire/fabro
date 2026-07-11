@@ -1,12 +1,10 @@
 use std::collections::{BTreeMap, HashMap};
-use std::ffi::OsString;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
 use std::sync::RwLock;
 
-use chrono::{DateTime, Utc};
-use fabro_db::DbPool;
+use fabro_db::{DbPool, legacy};
 use fabro_types::settings::run::{McpHttpProtocol, McpServerSettings, McpTransport};
 use fabro_types::{
     McpServerDefinition, McpServerDraft, McpServerId, McpServerReplace, McpServerRevision,
@@ -29,6 +27,8 @@ use crate::model;
 /// Reads use a synchronous in-memory catalog because manifest resolution is
 /// synchronous. Mutations are serialized within this process and use
 /// revision-guarded SQL so SQLite remains authoritative for concurrency.
+/// Writes to the same database from other processes are not observed until
+/// this store is reloaded.
 pub struct McpServerStore {
     pool:      DbPool,
     mutations: Mutex<()>,
@@ -444,20 +444,7 @@ async fn update_definition(
     expected: &McpServerRevision,
 ) -> Result<(), McpServerStoreError> {
     let row = McpServerSqlRow::from_definition(definition)?;
-    let result = sqlx::query(UPDATE_DEFINITION_SQL)
-        .bind(row.revision)
-        .bind(row.display_name)
-        .bind(row.description)
-        .bind(row.transport_type)
-        .bind(row.protocol)
-        .bind(row.command_json)
-        .bind(row.url)
-        .bind(row.port)
-        .bind(row.env_json)
-        .bind(row.headers_json)
-        .bind(row.startup_timeout_secs)
-        .bind(row.tool_timeout_secs)
-        .bind(row.id)
+    let result = bind_definition(sqlx::query(UPDATE_DEFINITION_SQL), row)
         .bind(expected.as_str())
         .execute(&mut **transaction)
         .await?;
@@ -467,12 +454,13 @@ async fn update_definition(
     Ok(())
 }
 
+/// Binds the shared placeholder order of [`INSERT_DEFINITION_SQL`] and
+/// [`UPDATE_DEFINITION_SQL`]: the twelve value columns first, then `id`.
 fn bind_definition(
     query: Query<'_, Sqlite, SqliteArguments>,
     row: McpServerSqlRow,
 ) -> Query<'_, Sqlite, SqliteArguments> {
     query
-        .bind(row.id)
         .bind(row.revision)
         .bind(row.display_name)
         .bind(row.description)
@@ -485,6 +473,7 @@ fn bind_definition(
         .bind(row.headers_json)
         .bind(row.startup_timeout_secs)
         .bind(row.tool_timeout_secs)
+        .bind(row.id)
 }
 
 struct McpServerSqlRow {
@@ -590,7 +579,6 @@ fn encode_string_map(
 
 const INSERT_DEFINITION_SQL: &str = r"
 INSERT INTO mcp_servers (
-    id,
     revision,
     display_name,
     description,
@@ -602,7 +590,8 @@ INSERT INTO mcp_servers (
     env_json,
     headers_json,
     startup_timeout_secs,
-    tool_timeout_secs
+    tool_timeout_secs,
+    id
 )
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO NOTHING
@@ -686,7 +675,7 @@ async fn legacy_definition_paths(
             .file_type()
             .await
             .map_err(|source| McpServerStoreError::io(&path, source))?;
-        if file_type.is_file() && is_toml_file(&path) {
+        if file_type.is_file() && legacy::is_toml_file(&path) {
             paths.push((id_from_path(&path)?, path));
         }
     }
@@ -722,31 +711,14 @@ fn id_from_path(path: &Path) -> Result<McpServerId, McpServerStoreError> {
     })
 }
 
-fn is_toml_file(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension == "toml")
-}
-
 async fn rename_imported_legacy_directory(
     source_dir: &Path,
 ) -> Result<PathBuf, McpServerStoreError> {
-    let backup_path = legacy_backup_path(source_dir, Utc::now());
-    fs::rename(source_dir, &backup_path)
+    legacy::rename_to_legacy_backup(source_dir, "mcps")
         .await
-        .map_err(|source| McpServerStoreError::LegacyBackup {
+        .map_err(|err| McpServerStoreError::LegacyBackup {
             source_path: source_dir.to_path_buf(),
-            backup_path: backup_path.clone(),
-            source,
-        })?;
-    Ok(backup_path)
-}
-
-fn legacy_backup_path(source_dir: &Path, imported_at: DateTime<Utc>) -> PathBuf {
-    let timestamp = imported_at.format("%Y%m%dT%H%M%S%fZ");
-    let mut file_name = source_dir
-        .file_name()
-        .map_or_else(|| OsString::from("mcps"), OsString::from);
-    file_name.push(format!(".imported-{timestamp}.bak"));
-    source_dir.with_file_name(file_name)
+            backup_path: err.backup_path,
+            source:      err.source,
+        })
 }

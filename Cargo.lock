@@ -2561,6 +2561,7 @@ name = "fabro-db"
 version = "0.302.0-nightly.1"
 dependencies = [
  "anyhow",
+ "chrono",
  "sqlx",
  "tempfile",
  "tokio",
