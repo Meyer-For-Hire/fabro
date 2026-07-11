@@ -34,7 +34,7 @@ use crate::canonical_origin::resolve_canonical_origin;
 use crate::github_webhooks::{TailscaleFunnelManager, WEBHOOK_ROUTE, WEBHOOK_SECRET_ENV};
 use crate::interp::process_env_var;
 use crate::server::{
-    AppState, AppStateConfig, ResolvedAppStateSettings, RouterOptions, build_app_state,
+    self, AppState, AppStateConfig, ResolvedAppStateSettings, RouterOptions, build_app_state,
     build_router_with_options, reconcile_incomplete_runs_on_startup, shutdown_active_workers,
     spawn_automation_scheduler, spawn_scheduler,
 };
@@ -733,6 +733,15 @@ where
             format!(
                 "importing legacy environments directory {}",
                 legacy_environment_dir.display()
+            )
+        })?;
+    let legacy_automation_dir = server::automation_dir_for_active_config(&active_config_path);
+    fabro_automation::import_legacy_directory_once(database.pool(), &legacy_automation_dir)
+        .await
+        .with_context(|| {
+            format!(
+                "importing legacy automations directory {}",
+                legacy_automation_dir.display()
             )
         })?;
     let db_pool = database.clone_pool();

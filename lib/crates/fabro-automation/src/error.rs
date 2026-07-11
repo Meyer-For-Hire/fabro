@@ -4,7 +4,7 @@ use croner::errors::CronError;
 use toml::de::Error as TomlDeError;
 use toml::ser::Error as TomlSerError;
 
-use crate::{AutomationId, AutomationRevision};
+use crate::{AutomationId, AutomationRevision, AutomationRevisionParseError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AutomationValidationError {
@@ -57,6 +57,31 @@ pub enum AutomationStoreError {
         #[from]
         source: AutomationValidationError,
     },
+    #[error("stored automation {id} failed validation")]
+    StoredValidation {
+        id:     AutomationId,
+        #[source]
+        source: AutomationValidationError,
+    },
+    #[error("stored automation has invalid id {value:?}")]
+    StoredId {
+        value:  String,
+        #[source]
+        source: AutomationValidationError,
+    },
+    #[error("stored automation {id} has an invalid trigger row")]
+    StoredTriggerShape { id: AutomationId },
+    #[error("stored automation {id} has an invalid revision")]
+    InvalidRevision {
+        id:     AutomationId,
+        #[source]
+        source: AutomationRevisionParseError,
+    },
+    #[error("database error")]
+    Db {
+        #[from]
+        source: sqlx::Error,
+    },
     #[error("invalid automation filename at {path:?}")]
     InvalidFilename { path: PathBuf, reason: String },
     #[error("failed to parse automation TOML at {path:?}")]
@@ -81,6 +106,13 @@ pub enum AutomationStoreError {
         path:   PathBuf,
         #[source]
         source: std::io::Error,
+    },
+    #[error("renaming legacy automations directory {source_path:?} to {backup_path:?}")]
+    LegacyBackup {
+        source_path: PathBuf,
+        backup_path: PathBuf,
+        #[source]
+        source:      std::io::Error,
     },
 }
 
@@ -114,10 +146,16 @@ impl AutomationStoreError {
             Self::MissingRevision { .. } => "missing_revision",
             Self::StaleRevision { .. } => "stale_revision",
             Self::Validation { .. } => "validation",
+            Self::StoredValidation { .. } => "stored_validation",
+            Self::StoredId { .. } => "stored_id",
+            Self::StoredTriggerShape { .. } => "stored_trigger_shape",
+            Self::InvalidRevision { .. } => "invalid_revision",
+            Self::Db { .. } => "db",
             Self::InvalidFilename { .. } => "invalid_filename",
             Self::Parse { .. } | Self::InvalidUtf8 { .. } => "parse",
             Self::Serialize { .. } => "serialize",
             Self::Io { .. } => "io",
+            Self::LegacyBackup { .. } => "legacy_backup",
         }
     }
 }

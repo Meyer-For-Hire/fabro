@@ -180,7 +180,18 @@ pub(crate) fn spawn_automation_scheduler(state: Arc<AppState>) {
                 break;
             }
 
-            let automations = state.automation_store().list().await;
+            let automations = match state.automation_store().list().await {
+                Ok(automations) => automations,
+                Err(err) => {
+                    error!(error = ?err, "Failed to load automations for scheduler");
+                    tokio::select! {
+                        () = shutdown.cancelled() => break,
+                        () = state.automation_scheduler_notified() => {},
+                        () = sleep(AUTOMATION_SCHEDULER_MAX_SLEEP) => {},
+                    }
+                    continue;
+                }
+            };
             let now = Utc::now();
             for due in planner.tick(&automations, now) {
                 let state = Arc::clone(&state);
@@ -304,7 +315,11 @@ fn run_due_schedules_once<'a>(
     now: DateTime<Utc>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
     Box::pin(async move {
-        let automations = state.automation_store().list().await;
+        let automations = state
+            .automation_store()
+            .list()
+            .await
+            .expect("test automations should load");
         for trigger in planner.tick(&automations, now) {
             Box::pin(fire_scheduled_automation_run(
                 Arc::clone(&state),

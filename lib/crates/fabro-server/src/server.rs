@@ -2309,7 +2309,7 @@ fn build_sandbox_provider_registry(
     SandboxProviderRegistry::new(providers)
 }
 
-fn automation_dir_for_active_config(active_config_path: &std::path::Path) -> PathBuf {
+pub(crate) fn automation_dir_for_active_config(active_config_path: &std::path::Path) -> PathBuf {
     active_config_path
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
@@ -2369,12 +2369,7 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         automation_materializer_override,
     } = config;
 
-    let automation_dir = automation_dir_for_active_config(&active_config_path);
-    let automation_store = Arc::new(
-        AutomationStore::load(automation_dir)
-            .map_err(anyhow::Error::new)
-            .context("load automations")?,
-    );
+    let automation_store = Arc::new(AutomationStore::new(db_pool.clone()));
     let local_provider_enabled = resolved_settings
         .server_settings
         .server

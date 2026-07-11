@@ -13,15 +13,19 @@ doctest = false
 workspace = true
 
 [dependencies]
+chrono.workspace = true
 croner.workspace = true
+fabro-db = { path = "../fabro-db" }
 hex.workspace = true
 serde.workspace = true
 sha2.workspace = true
+sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+anyhow.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "test-util"] }

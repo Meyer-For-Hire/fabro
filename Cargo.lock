@@ -2350,10 +2350,14 @@ dependencies = [
 name = "fabro-automation"
 version = "0.302.0-nightly.1"
 dependencies = [
+ "anyhow",
+ "chrono",
  "croner",
+ "fabro-db",
  "hex",
  "serde",
  "sha2 0.10.9",
+ "sqlx",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -3047,6 +3051,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2 0.10.9",
+ "sqlx",
  "strum 0.28.0",
  "sysinfo",
  "tempfile",

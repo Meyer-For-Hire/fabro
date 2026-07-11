@@ -56,6 +56,16 @@ async fn connect_creates_parent_directory_and_migrate_is_idempotent() -> anyhow:
     .await?;
     assert_eq!(mcp_servers_table_count, 1);
 
+    for table in ["automations", "automation_triggers"] {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+        )
+        .bind(table)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(count, 1, "{table} table should exist");
+    }
+
     let legacy_import_table_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'legacy_imports'",
     )
@@ -217,6 +227,105 @@ async fn insert_mcp_server(
     .bind(headers_json)
     .bind(10_i64)
     .bind(60_i64)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn automations_schema_enforces_aggregate_constraints() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let database = fabro_db::Database::connect(dir.path().join("fabro.sqlite3")).await?;
+    database.migrate().await?;
+
+    insert_minimal_automation(database.pool(), "valid", 1).await?;
+    sqlx::query(
+        "INSERT INTO automation_triggers (automation_id, id, enabled, expression) \
+         VALUES (?, ?, ?, ?)",
+    )
+    .bind("valid")
+    .bind("nightly")
+    .bind(true)
+    .bind("0 3 * * *")
+    .execute(database.pool())
+    .await?;
+
+    assert!(
+        insert_minimal_automation(database.pool(), "Bad", 1)
+            .await
+            .is_err()
+    );
+    assert!(
+        insert_minimal_automation(database.pool(), "bad-bool", 2_i64)
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO automation_triggers (automation_id, id, enabled, expression) \
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind("valid")
+        .bind("Bad!")
+        .bind(true)
+        .bind("0 4 * * *")
+        .execute(database.pool())
+        .await
+        .is_err()
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO automation_triggers (automation_id, id, enabled, expression) \
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind("missing")
+        .bind("nightly")
+        .bind(true)
+        .bind("0 4 * * *")
+        .execute(database.pool())
+        .await
+        .is_err()
+    );
+
+    sqlx::query("DELETE FROM automations WHERE id = ?")
+        .bind("valid")
+        .execute(database.pool())
+        .await?;
+    let trigger_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM automation_triggers WHERE automation_id = ?")
+            .bind("valid")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(trigger_count, 0);
+
+    Ok(())
+}
+
+async fn insert_minimal_automation(
+    pool: &fabro_db::DbPool,
+    id: &str,
+    api_enabled: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r"
+        INSERT INTO automations (
+            id,
+            revision,
+            name,
+            api_enabled,
+            target_repository,
+            target_ref,
+            target_workflow
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ",
+    )
+    .bind(id)
+    .bind("a".repeat(64))
+    .bind("Automation")
+    .bind(api_enabled)
+    .bind("fabro-sh/fabro")
+    .bind("main")
+    .bind("release")
     .execute(pool)
     .await?;
     Ok(())

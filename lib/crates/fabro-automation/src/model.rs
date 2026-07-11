@@ -21,6 +21,8 @@ static SCHEDULE_CRON_PARSER: LazyLock<CronParser> = LazyLock::new(|| {
         .build()
 });
 
+pub(crate) const MANUAL_TRIGGER_ID: &str = "manual";
+
 /// Parse an automation schedule trigger expression with the canonical
 /// configuration (no seconds, no year). Returned `Cron` instances can be cached
 /// and used to find next occurrences.
@@ -61,12 +63,21 @@ impl Automation {
         id: AutomationId,
         draft: AutomationReplace,
     ) -> Result<(Self, Vec<u8>), AutomationStoreError> {
-        validate_fields(&draft)?;
+        let draft = normalize_replace(draft)?;
         let persisted = PersistedAutomation::from(draft.clone());
         let bytes = canonical_bytes(&persisted)?;
         let revision = AutomationRevision::from_bytes(&bytes);
         let automation = Self::from_validated_replace(id, revision, draft);
         Ok((automation, bytes))
+    }
+
+    pub(crate) fn from_stored(
+        id: AutomationId,
+        revision: AutomationRevision,
+        value: AutomationReplace,
+    ) -> Result<Self, AutomationValidationError> {
+        let value = normalize_replace(value)?;
+        Ok(Self::from_validated_replace(id, revision, value))
     }
 
     pub(crate) fn to_persisted(&self) -> PersistedAutomation {
@@ -102,13 +113,23 @@ impl Automation {
             })
     }
 
+    pub(crate) fn schedule_triggers(&self) -> impl Iterator<Item = &ScheduleTrigger> {
+        self.triggers.iter().filter_map(|trigger| match trigger {
+            AutomationTrigger::Schedule(trigger) => Some(trigger),
+            AutomationTrigger::Api(_) => None,
+        })
+    }
+
+    pub(crate) fn api_enabled(&self) -> bool {
+        self.enabled_api_trigger().is_some()
+    }
+
     fn from_persisted(
         id: AutomationId,
         revision: AutomationRevision,
         persisted: PersistedAutomation,
     ) -> Result<Self, AutomationValidationError> {
-        let replace = AutomationReplace::from(persisted);
-        validate_fields(&replace)?;
+        let replace = normalize_replace(AutomationReplace::from(persisted))?;
         Ok(Self::from_validated_replace(id, revision, replace))
     }
 
@@ -289,6 +310,39 @@ fn validate_fields(value: &AutomationReplace) -> Result<(), AutomationValidation
     validate_git_ref_selector(&value.target.ref_selector)?;
     validate_workflow_selector(&value.target.workflow)?;
     validate_triggers(&value.triggers)
+}
+
+fn normalize_replace(
+    mut value: AutomationReplace,
+) -> Result<AutomationReplace, AutomationValidationError> {
+    validate_fields(&value)?;
+
+    let api_enabled = value
+        .triggers
+        .iter()
+        .any(|trigger| matches!(trigger, AutomationTrigger::Api(trigger) if trigger.enabled));
+    let mut schedules = value
+        .triggers
+        .into_iter()
+        .filter_map(|trigger| match trigger {
+            AutomationTrigger::Schedule(trigger) => Some(trigger),
+            AutomationTrigger::Api(_) => None,
+        })
+        .collect::<Vec<_>>();
+    schedules.sort_by(|left, right| left.id.cmp(&right.id));
+
+    let mut triggers = Vec::with_capacity(schedules.len() + usize::from(api_enabled));
+    if api_enabled {
+        triggers.push(AutomationTrigger::Api(ApiTrigger {
+            id:      AutomationTriggerId::new(MANUAL_TRIGGER_ID)
+                .expect("manual automation trigger id is valid"),
+            enabled: true,
+        }));
+    }
+    triggers.extend(schedules.into_iter().map(AutomationTrigger::Schedule));
+    value.triggers = triggers;
+    validate_fields(&value)?;
+    Ok(value)
 }
 
 pub fn parse_github_repository_slug(
