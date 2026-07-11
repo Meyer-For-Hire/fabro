@@ -1713,7 +1713,7 @@ async fn post_install_finish(
         vault_writes: vault_secrets,
         vault_removals,
     };
-    if let Err(err) = persistence_plan.persist_direct() {
+    if let Err(err) = persistence_plan.persist_direct().await {
         error!(error = %err, "install persistence failed");
         let status = StatusCode::INTERNAL_SERVER_ERROR;
         let detail = err.to_string();

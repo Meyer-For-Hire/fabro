@@ -20,6 +20,25 @@ async fn test_database() -> (tempfile::TempDir, Database) {
     (dir, database)
 }
 
+fn oauth_credential(access_token: &str) -> String {
+    serde_json::json!({
+        "tokens": {
+            "access_token": access_token,
+            "refresh_token": "refresh",
+            "expires_at": "2026-07-11T13:00:00Z"
+        },
+        "config": {
+            "auth_url": "https://auth.example.com",
+            "token_url": "https://auth.example.com/token",
+            "client_id": "client",
+            "scopes": ["openid"],
+            "redirect_uri": null,
+            "use_pkce": true
+        }
+    })
+    .to_string()
+}
+
 #[tokio::test]
 async fn crud_preserves_metadata_and_description() {
     let (_dir, database) = test_database().await;
@@ -80,7 +99,12 @@ async fn replace_if_revision_rejects_stale_writer() {
     let (_dir, database) = test_database().await;
     let store = SecretStore::new(database.clone_pool());
     store
-        .set("OPENAI_CODEX", "{}", SecretType::Oauth, None)
+        .set(
+            "OPENAI_CODEX",
+            &oauth_credential("initial"),
+            SecretType::Oauth,
+            None,
+        )
         .await
         .unwrap();
 
@@ -88,7 +112,7 @@ async fn replace_if_revision_rejects_stale_writer() {
         .replace_if_revision(
             "OPENAI_CODEX",
             1,
-            r#"{"token":"winner"}"#,
+            &oauth_credential("winner"),
             SecretType::Oauth,
         )
         .await
@@ -96,7 +120,12 @@ async fn replace_if_revision_rejects_stale_writer() {
     assert_eq!(updated.revision, 2);
 
     let err = store
-        .replace_if_revision("OPENAI_CODEX", 1, r#"{"token":"loser"}"#, SecretType::Oauth)
+        .replace_if_revision(
+            "OPENAI_CODEX",
+            1,
+            &oauth_credential("loser"),
+            SecretType::Oauth,
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, SecretStoreError::StaleRevision {
@@ -196,6 +225,38 @@ async fn github_private_key_file_secret_satisfies_schema() {
         .set("/run/secrets/key.pem", "pem", SecretType::File, None)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn corrupted_stored_row_returns_typed_error() {
+    let (_dir, database) = test_database().await;
+    let mut connection = database.pool().acquire().await.unwrap();
+    sqlx::query("PRAGMA ignore_check_constraints = ON")
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO secrets (name, secret_type, value, revision, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind("VALID_NAME")
+    .bind("token")
+    .bind("value")
+    .bind(0_i64)
+    .bind("2026-07-11T12:00:00Z")
+    .bind("2026-07-11T12:00:00Z")
+    .execute(&mut *connection)
+    .await
+    .unwrap();
+
+    let err = SecretStore::new(database.clone_pool())
+        .get("VALID_NAME")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SecretStoreError::StoredRevision {
+        revision: 0,
+        ..
+    }));
 }
 
 #[test]

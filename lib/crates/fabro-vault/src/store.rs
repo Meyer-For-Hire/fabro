@@ -5,7 +5,7 @@ use std::str::FromStr as _;
 
 use chrono::{DateTime, Utc};
 use fabro_db::DbPool;
-use fabro_types::{SecretMetadata, SecretType};
+use fabro_types::{OAuthCredential, SecretMetadata, SecretType};
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row as _, Sqlite, Transaction};
 use tokio::fs;
@@ -40,6 +40,19 @@ pub enum SecretStoreError {
 
     #[error("stored secret {name} has invalid type {value:?}")]
     StoredType { name: String, value: String },
+
+    #[error("stored secret has invalid name {name:?}")]
+    StoredName { name: String },
+
+    #[error("stored secret {name} has invalid revision {revision}")]
+    StoredRevision { name: String, revision: i64 },
+
+    #[error("stored secret {name} is not a valid OAuth credential")]
+    StoredOauth {
+        name:   String,
+        #[source]
+        source: serde_json::Error,
+    },
 
     #[error("parsing secret timestamp for {name}.{column}")]
     Timestamp {
@@ -111,6 +124,30 @@ pub struct SecretStore {
     pool: DbPool,
 }
 
+#[derive(Clone)]
+pub struct SecretSnapshot(Vault);
+
+impl SecretSnapshot {
+    #[must_use]
+    pub fn into_vault(self) -> Vault {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for SecretSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::ops::Deref for SecretSnapshot {
+    type Target = Vault;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 impl std::fmt::Debug for SecretStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SecretStore").finish_non_exhaustive()
@@ -139,15 +176,12 @@ impl SecretStore {
 
     pub async fn list(&self) -> Result<Vec<SecretMetadata>, SecretStoreError> {
         let rows = sqlx::query(
-            "SELECT name, secret_type, value, description, revision, created_at, updated_at \
+            "SELECT name, secret_type, description, created_at, updated_at \
              FROM secrets ORDER BY name",
         )
         .fetch_all(&self.pool)
         .await?;
-        rows.iter()
-            .map(entry_from_row)
-            .map(|entry| entry.map(|(name, entry)| metadata(name, &entry)))
-            .collect()
+        rows.iter().map(metadata_from_row).collect()
     }
 
     pub async fn set(
@@ -157,40 +191,20 @@ impl SecretStore {
         secret_type: SecretType,
         description: Option<&str>,
     ) -> Result<SecretMetadata, SecretStoreError> {
-        Vault::validate_name(name, secret_type)
-            .map_err(|_| SecretStoreError::InvalidName(name.to_string()))?;
-        if secret_type == SecretType::Oauth {
-            validate_oauth_json(value).map_err(|source| SecretStoreError::InvalidOauth {
-                name: name.to_string(),
-                source,
-            })?;
-        }
-
+        validate_write(name, value, secret_type)?;
         let now = Utc::now().to_rfc3339();
-        let row = sqlx::query(
-            r"
-            INSERT INTO secrets (
-                name, secret_type, value, description, revision, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, 1, ?, ?)
-            ON CONFLICT(name) DO UPDATE SET
-                secret_type = excluded.secret_type,
-                value = excluded.value,
-                description = COALESCE(excluded.description, secrets.description),
-                revision = secrets.revision + 1,
-                updated_at = excluded.updated_at
-            RETURNING name, secret_type, value, description, revision, created_at, updated_at
-            ",
+        let mut transaction = self.pool.begin().await?;
+        let metadata = upsert_secret(
+            &mut transaction,
+            name,
+            value,
+            secret_type,
+            description,
+            &now,
         )
-        .bind(name)
-        .bind(secret_type_string(secret_type))
-        .bind(value)
-        .bind(description)
-        .bind(&now)
-        .bind(&now)
-        .fetch_one(&self.pool)
         .await?;
-        let (name, entry) = entry_from_row(&row)?;
-        Ok(metadata(name, &entry))
+        transaction.commit().await?;
+        Ok(metadata)
     }
 
     pub async fn remove(&self, name: &str) -> Result<(), SecretStoreError> {
@@ -210,16 +224,7 @@ impl SecretStore {
         writes: &[SecretStoreWrite],
     ) -> Result<(), SecretStoreError> {
         for write in writes {
-            Vault::validate_name(&write.name, write.secret_type)
-                .map_err(|_| SecretStoreError::InvalidName(write.name.clone()))?;
-            if write.secret_type == SecretType::Oauth {
-                validate_oauth_json(&write.value).map_err(|source| {
-                    SecretStoreError::InvalidOauth {
-                        name: write.name.clone(),
-                        source,
-                    }
-                })?;
-            }
+            validate_write(&write.name, &write.value, write.secret_type)?;
         }
 
         let mut transaction = self.pool.begin().await?;
@@ -229,28 +234,16 @@ impl SecretStore {
                 .execute(&mut *transaction)
                 .await?;
         }
+        let now = Utc::now().to_rfc3339();
         for write in writes {
-            let now = Utc::now().to_rfc3339();
-            sqlx::query(
-                r"
-                INSERT INTO secrets (
-                    name, secret_type, value, description, revision, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 1, ?, ?)
-                ON CONFLICT(name) DO UPDATE SET
-                    secret_type = excluded.secret_type,
-                    value = excluded.value,
-                    description = COALESCE(excluded.description, secrets.description),
-                    revision = secrets.revision + 1,
-                    updated_at = excluded.updated_at
-                ",
+            upsert_secret(
+                &mut transaction,
+                &write.name,
+                &write.value,
+                write.secret_type,
+                write.description.as_deref(),
+                &now,
             )
-            .bind(&write.name)
-            .bind(secret_type_string(write.secret_type))
-            .bind(&write.value)
-            .bind(&write.description)
-            .bind(&now)
-            .bind(&now)
-            .execute(&mut *transaction)
             .await?;
         }
         transaction.commit().await?;
@@ -264,14 +257,7 @@ impl SecretStore {
         value: &str,
         secret_type: SecretType,
     ) -> Result<SecretEntry, SecretStoreError> {
-        Vault::validate_name(name, secret_type)
-            .map_err(|_| SecretStoreError::InvalidName(name.to_string()))?;
-        if secret_type == SecretType::Oauth {
-            validate_oauth_json(value).map_err(|source| SecretStoreError::InvalidOauth {
-                name: name.to_string(),
-                source,
-            })?;
-        }
+        validate_write(name, value, secret_type)?;
         let now = Utc::now().to_rfc3339();
         let row = sqlx::query(
             r"
@@ -305,7 +291,7 @@ impl SecretStore {
         }
     }
 
-    pub async fn snapshot(&self) -> Result<Vault, SecretStoreError> {
+    pub async fn snapshot(&self) -> Result<SecretSnapshot, SecretStoreError> {
         let rows = sqlx::query(
             "SELECT name, secret_type, value, description, revision, created_at, updated_at \
              FROM secrets",
@@ -316,8 +302,41 @@ impl SecretStore {
             .iter()
             .map(entry_from_row)
             .collect::<Result<HashMap<_, _>, _>>()?;
-        Ok(Vault::from_entries(entries))
+        Ok(SecretSnapshot(Vault::from_entries(entries)))
     }
+}
+
+async fn upsert_secret(
+    transaction: &mut Transaction<'_, Sqlite>,
+    name: &str,
+    value: &str,
+    secret_type: SecretType,
+    description: Option<&str>,
+    now: &str,
+) -> Result<SecretMetadata, SecretStoreError> {
+    let row = sqlx::query(
+        r"
+        INSERT INTO secrets (
+            name, secret_type, value, description, revision, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, 1, ?, ?)
+        ON CONFLICT(name) DO UPDATE SET
+            secret_type = excluded.secret_type,
+            value = excluded.value,
+            description = COALESCE(excluded.description, secrets.description),
+            revision = secrets.revision + 1,
+            updated_at = excluded.updated_at
+        RETURNING name, secret_type, description, created_at, updated_at
+        ",
+    )
+    .bind(name)
+    .bind(secret_type_string(secret_type))
+    .bind(value)
+    .bind(description)
+    .bind(now)
+    .bind(now)
+    .fetch_one(&mut **transaction)
+    .await?;
+    metadata_from_row(&row)
 }
 
 pub async fn import_legacy_json_once(
@@ -412,38 +431,70 @@ async fn insert_legacy_entry(
 }
 
 fn entry_from_row(row: &SqliteRow) -> Result<(String, SecretEntry), SecretStoreError> {
-    let name = row.get::<String, _>("name");
-    let type_value = row.get::<String, _>("secret_type");
+    let name = row.try_get::<String, _>("name")?;
+    let type_value = row.try_get::<String, _>("secret_type")?;
     let secret_type =
         SecretType::from_str(&type_value).map_err(|_| SecretStoreError::StoredType {
             name:  name.clone(),
             value: type_value,
         })?;
-    let created_at = parse_timestamp(&name, "created_at", &row.get::<String, _>("created_at"))?;
-    let updated_at = parse_timestamp(&name, "updated_at", &row.get::<String, _>("updated_at"))?;
+    validate_stored_name(&name, secret_type)?;
+    let created_at = parse_timestamp(
+        &name,
+        "created_at",
+        &row.try_get::<String, _>("created_at")?,
+    )?;
+    let updated_at = parse_timestamp(
+        &name,
+        "updated_at",
+        &row.try_get::<String, _>("updated_at")?,
+    )?;
+    let value = row.try_get::<String, _>("value")?;
+    if secret_type == SecretType::Oauth {
+        validate_oauth_json(&value).map_err(|source| SecretStoreError::StoredOauth {
+            name: name.clone(),
+            source,
+        })?;
+    }
+    let revision = row.try_get::<i64, _>("revision")?;
+    if revision <= 0 {
+        return Err(SecretStoreError::StoredRevision { name, revision });
+    }
     let entry = SecretEntry {
-        value: row.get("value"),
+        value,
         secret_type,
-        description: row.get("description"),
+        description: row.try_get("description")?,
         created_at,
         updated_at,
-        revision: row.get("revision"),
+        revision,
     };
-    Vault::validate_name(&name, secret_type).map_err(|_| SecretStoreError::StoredType {
-        name:  name.clone(),
-        value: secret_type_string(secret_type).to_string(),
-    })?;
     Ok((name, entry))
 }
 
-fn metadata(name: String, entry: &SecretEntry) -> SecretMetadata {
-    SecretMetadata {
-        name,
-        secret_type: entry.secret_type,
-        description: entry.description.clone(),
-        created_at: entry.created_at,
-        updated_at: entry.updated_at,
-    }
+fn metadata_from_row(row: &SqliteRow) -> Result<SecretMetadata, SecretStoreError> {
+    let name = row.try_get::<String, _>("name")?;
+    let type_value = row.try_get::<String, _>("secret_type")?;
+    let secret_type =
+        SecretType::from_str(&type_value).map_err(|_| SecretStoreError::StoredType {
+            name:  name.clone(),
+            value: type_value,
+        })?;
+    validate_stored_name(&name, secret_type)?;
+    Ok(SecretMetadata {
+        name: name.clone(),
+        secret_type,
+        description: row.try_get("description")?,
+        created_at: parse_timestamp(
+            &name,
+            "created_at",
+            &row.try_get::<String, _>("created_at")?,
+        )?,
+        updated_at: parse_timestamp(
+            &name,
+            "updated_at",
+            &row.try_get::<String, _>("updated_at")?,
+        )?,
+    })
 }
 
 fn secret_type_string(secret_type: SecretType) -> &'static str {
@@ -465,7 +516,29 @@ fn parse_timestamp(
 }
 
 fn validate_oauth_json(value: &str) -> Result<(), serde_json::Error> {
-    serde_json::from_str::<serde_json::Value>(value).map(|_| ())
+    serde_json::from_str::<OAuthCredential>(value).map(|_| ())
+}
+
+fn validate_write(
+    name: &str,
+    value: &str,
+    secret_type: SecretType,
+) -> Result<(), SecretStoreError> {
+    Vault::validate_name(name, secret_type)
+        .map_err(|_| SecretStoreError::InvalidName(name.to_string()))?;
+    if secret_type == SecretType::Oauth {
+        validate_oauth_json(value).map_err(|source| SecretStoreError::InvalidOauth {
+            name: name.to_string(),
+            source,
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_stored_name(name: &str, secret_type: SecretType) -> Result<(), SecretStoreError> {
+    Vault::validate_name(name, secret_type).map_err(|_| SecretStoreError::StoredName {
+        name: name.to_string(),
+    })
 }
 
 async fn rename_imported_legacy_file(source_path: &Path) -> Result<PathBuf, SecretStoreError> {

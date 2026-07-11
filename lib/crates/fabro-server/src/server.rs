@@ -1144,8 +1144,7 @@ impl AppState {
         let credentials = self
             .github_credentials(&settings.server.integrations.github)
             .await
-            .ok()
-            .flatten();
+            .map_err(|err| RunMaterializeError::Credentials(err.to_string()))?;
         ProductionAutomationRunMaterializer::new(
             credentials,
             self.github_api_base_url.clone(),
@@ -1530,7 +1529,7 @@ impl AppState {
     pub(crate) async fn github_credentials(
         &self,
         settings: &GithubIntegrationSettings,
-    ) -> Result<Option<fabro_github::GitHubCredentials>, String> {
+    ) -> anyhow::Result<Option<fabro_github::GitHubCredentials>> {
         match settings.strategy {
             GithubIntegrationStrategy::App => {
                 let Some(app_id) = settings.app_id.clone() else {
@@ -1539,11 +1538,12 @@ impl AppState {
                 let raw = self
                     .vault_secret(EnvVars::GITHUB_APP_PRIVATE_KEY)
                     .await
-                    .map_err(|err| err.to_string())?;
+                    .map_err(anyhow::Error::new)?;
                 let Some(raw) = raw else {
                     return Ok(None);
                 };
-                let private_key_pem = decode_secret_pem(EnvVars::GITHUB_APP_PRIVATE_KEY, &raw)?;
+                let private_key_pem = decode_secret_pem(EnvVars::GITHUB_APP_PRIVATE_KEY, &raw)
+                    .map_err(anyhow::Error::msg)?;
                 Ok(Some(fabro_github::GitHubCredentials::App(
                     fabro_github::GitHubAppCredentials {
                         app_id,
@@ -1556,7 +1556,7 @@ impl AppState {
                 let token = self
                     .vault_secret(EnvVars::GITHUB_TOKEN)
                     .await
-                    .map_err(|err| err.to_string())?
+                    .map_err(anyhow::Error::new)?
                     .as_deref()
                     .map(str::trim)
                     .filter(|token| !token.is_empty())
@@ -1564,12 +1564,11 @@ impl AppState {
                 match token {
                     Some(token) => {
                         fabro_github::validate_static_github_token(&token)
-                            .map_err(|err| err.to_string())?;
+                            .map_err(anyhow::Error::msg)?;
                         Ok(Some(fabro_github::GitHubCredentials::Pat(token)))
                     }
-                    None => Err(
+                    None => anyhow::bail!(
                         "GITHUB_TOKEN not configured -- run fabro install or run fabro secret set GITHUB_TOKEN"
-                            .to_string(),
                     ),
                 }
             }
@@ -4071,7 +4070,7 @@ async fn execute_run_in_process(state: Arc<AppState>, run_id: RunId) {
         run_control: None,
         github_app,
         github_permissions,
-        vault: Some(Arc::new(AsyncRwLock::new(vault))),
+        vault: Some(Arc::new(AsyncRwLock::new(vault.into_vault()))),
         catalog: state.catalog(),
         on_node: None,
         registry_override,

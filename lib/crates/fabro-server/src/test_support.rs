@@ -295,6 +295,7 @@ fn test_secret_snapshot(pool: DbPool) -> anyhow::Result<Vault> {
             .build()?;
         runtime
             .block_on(fabro_vault::SecretStore::new(pool).snapshot())
+            .map(fabro_vault::SecretSnapshot::into_vault)
             .map_err(anyhow::Error::new)
     })
     .join()

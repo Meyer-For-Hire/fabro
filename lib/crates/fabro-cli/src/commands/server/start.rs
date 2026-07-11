@@ -15,7 +15,7 @@ use fabro_db::Database;
 use fabro_server::jwt_auth::auth_method_name;
 use fabro_server::serve::{DEFAULT_TCP_PORT, ServeArgs, resolve_runtime_server_settings_for_start};
 use fabro_server::{
-    load_startup_vault, process_env_snapshot, validate_startup, validate_startup_configuration,
+    migrate_startup_vault, process_env_snapshot, validate_startup, validate_startup_configuration,
 };
 use fabro_static::EnvVars;
 use fabro_types::settings::{LogDestination, ServerAuthMethod};
@@ -292,7 +292,7 @@ async fn execute_daemon(
     }
     validate_startup_configuration(&resolved_settings)?;
     let storage = Storage::new(storage_dir);
-    let _legacy_vault = load_startup_vault(storage.secrets_path())?;
+    migrate_startup_vault(storage.secrets_path());
     let database = Database::connect(storage.sqlite_path())
         .await
         .context("opening the Fabro database for startup validation")?;

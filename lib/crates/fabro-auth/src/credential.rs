@@ -1,45 +1,10 @@
 use chrono::{DateTime, Duration, Utc};
 use fabro_redact::redact_string;
-use serde::{Deserialize, Serialize};
-
-/// JSON shape stored in the vault when `secret_type == Oauth`.
-///
-/// Provider context comes from the catalog and auth strategy at resolve time.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct OAuthCredential {
-    pub tokens:     OAuthTokens,
-    pub config:     OAuthConfig,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub account_id: Option<String>,
-}
-
-impl OAuthCredential {
-    #[must_use]
-    pub fn needs_refresh(&self) -> bool {
-        self.tokens.expires_at <= Utc::now() + Duration::minutes(5)
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct OAuthTokens {
-    pub access_token:  String,
-    pub refresh_token: Option<String>,
-    pub expires_at:    DateTime<Utc>,
-}
+pub use fabro_types::{OAuthConfig, OAuthCredential, OAuthTokens};
 
 pub(crate) fn expires_at_from_now(expires_in: Option<u64>) -> DateTime<Utc> {
     let seconds = i64::try_from(expires_in.unwrap_or(3600)).unwrap_or(i64::MAX);
     Utc::now() + Duration::seconds(seconds)
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct OAuthConfig {
-    pub auth_url:     String,
-    pub token_url:    String,
-    pub client_id:    String,
-    pub scopes:       Vec<String>,
-    pub redirect_uri: Option<String>,
-    pub use_pkce:     bool,
 }
 
 #[derive(Clone, PartialEq, Eq)]

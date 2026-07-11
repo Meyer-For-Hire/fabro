@@ -15,10 +15,18 @@ async fn connect_creates_parent_directory_and_migrate_is_idempotent() -> anyhow:
     {
         use std::os::unix::fs::PermissionsExt as _;
 
-        assert_eq!(
-            std::fs::metadata(&db_path)?.permissions().mode() & 0o777,
-            0o600
-        );
+        for path in [
+            db_path.clone(),
+            db_path.with_extension("sqlite3-wal"),
+            db_path.with_extension("sqlite3-shm"),
+        ] {
+            assert_eq!(
+                std::fs::metadata(&path)?.permissions().mode() & 0o777,
+                0o600,
+                "{} should be private",
+                path.display()
+            );
+        }
     }
     let variable_table_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'variables'",

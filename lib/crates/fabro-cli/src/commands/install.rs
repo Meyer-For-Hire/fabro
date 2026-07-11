@@ -1353,7 +1353,7 @@ struct PendingGitHubInstallWrite<'a> {
     vault_remove:      Vec<&'static str>,
 }
 
-fn persist_github_install_changes(
+async fn persist_github_install_changes(
     storage_dir: &Path,
     writes: &PendingGitHubInstallWrite<'_>,
 ) -> Result<()> {
@@ -1373,7 +1373,8 @@ fn persist_github_install_changes(
             .map(|key| (*key).to_string())
             .collect(),
     }
-    .persist_direct())
+    .persist_direct()
+    .await)
     {
         Ok(()) => Ok(()),
         Err(err) => {
@@ -1422,7 +1423,8 @@ async fn persist_cli_install_outputs_with(
         vault_writes: Vec::new(),
         vault_removals: Vec::new(),
     }
-    .persist_direct()?;
+    .persist_direct()
+    .await?;
 
     let persist_result = persist_vault_secrets_with(
         storage_dir,
@@ -1698,7 +1700,8 @@ async fn run_install_github_inner(
         server_env_remove,
         vault_set,
         vault_remove,
-    })?;
+    })
+    .await?;
 
     if let Some(restart_outcome) =
         maybe_restart_server_after_github_install(&storage_dir, &config_path, server_was_running)
@@ -2170,24 +2173,16 @@ mod tests {
 
     use super::*;
 
-    fn load_secret_snapshot(storage: &Storage) -> Vault {
-        let database_path = storage.sqlite_path();
-        std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            runtime.block_on(async move {
-                let database = fabro_db::Database::connect(database_path).await.unwrap();
-                database.migrate().await.unwrap();
-                fabro_vault::SecretStore::new(database.clone_pool())
-                    .snapshot()
-                    .await
-                    .unwrap()
-            })
-        })
-        .join()
-        .unwrap()
+    async fn load_secret_snapshot(storage: &Storage) -> Vault {
+        let database = fabro_db::Database::connect(storage.sqlite_path())
+            .await
+            .unwrap();
+        database.migrate().await.unwrap();
+        fabro_vault::SecretStore::new(database.clone_pool())
+            .snapshot()
+            .await
+            .unwrap()
+            .into_vault()
     }
 
     fn install_args(non_interactive: bool, scripted: InstallNonInteractiveArgs) -> InstallArgs {
@@ -3247,8 +3242,8 @@ client_id = "client-id"
         );
     }
 
-    #[test]
-    fn persist_github_install_changes_replaces_app_env_keys_with_token_secret() {
+    #[tokio::test]
+    async fn persist_github_install_changes_replaces_app_env_keys_with_token_secret() {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new(dir.path());
         let server_env_path = storage.runtime_directory().env_path();
@@ -3295,6 +3290,7 @@ client_id = "client-id"
             }],
             vault_remove:      Vec::new(),
         })
+        .await
         .unwrap();
 
         let server_env = envfile::read_env_file(&server_env_path).unwrap();
@@ -3303,7 +3299,7 @@ client_id = "client-id"
         assert!(!server_env.contains_key(GITHUB_APP_CLIENT_SECRET_KEY));
         assert!(!server_env.contains_key(GITHUB_APP_WEBHOOK_SECRET_KEY));
 
-        let vault = load_secret_snapshot(&storage);
+        let vault = load_secret_snapshot(&storage).await;
         assert_eq!(vault.get(GITHUB_TOKEN_SECRET_KEY), Some("token"));
         assert_eq!(
             vault
@@ -3314,8 +3310,8 @@ client_id = "client-id"
         assert_eq!(std::fs::read_to_string(&settings_path).unwrap(), "after");
     }
 
-    #[test]
-    fn persist_github_install_changes_replaces_token_secret_with_app_vault_keys() {
+    #[tokio::test]
+    async fn persist_github_install_changes_replaces_token_secret_with_app_vault_keys() {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new(dir.path());
         let server_env_path = storage.runtime_directory().env_path();
@@ -3373,6 +3369,7 @@ client_id = "client-id"
             ],
             vault_remove:      vec![GITHUB_TOKEN_SECRET_KEY],
         })
+        .await
         .unwrap();
 
         let server_env = envfile::read_env_file(&server_env_path).unwrap();
@@ -3381,7 +3378,7 @@ client_id = "client-id"
         assert!(!server_env.contains_key(GITHUB_APP_CLIENT_SECRET_KEY));
         assert!(!server_env.contains_key(GITHUB_APP_WEBHOOK_SECRET_KEY));
 
-        let vault = load_secret_snapshot(&storage);
+        let vault = load_secret_snapshot(&storage).await;
         assert_eq!(vault.get(GITHUB_TOKEN_SECRET_KEY), None);
         assert_eq!(vault.get(GITHUB_APP_PRIVATE_KEY_KEY), Some("private"));
         assert_eq!(vault.get(GITHUB_APP_CLIENT_SECRET_KEY), Some("client"));
@@ -3407,8 +3404,8 @@ client_id = "client-id"
         assert_eq!(std::fs::read_to_string(&settings_path).unwrap(), "after");
     }
 
-    #[test]
-    fn persist_github_install_changes_restores_server_env_on_vault_failure() {
+    #[tokio::test]
+    async fn persist_github_install_changes_restores_server_env_on_vault_failure() {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new(dir.path());
         let server_env_path = storage.runtime_directory().env_path();
@@ -3446,7 +3443,8 @@ client_id = "client-id"
                 description: None,
             }],
             vault_remove:      Vec::new(),
-        });
+        })
+        .await;
 
         assert!(result.is_err());
         let server_env = envfile::read_env_file(&server_env_path).unwrap();
@@ -3464,7 +3462,10 @@ client_id = "client-id"
         );
         assert_eq!(server_env.get("KEEP_ME").map(String::as_str), Some("1"));
         assert_eq!(std::fs::read_to_string(&settings_path).unwrap(), "before");
-        assert_eq!(load_secret_snapshot(&storage).get("bad-secret-name"), None);
+        assert_eq!(
+            load_secret_snapshot(&storage).await.get("bad-secret-name"),
+            None
+        );
     }
 
     #[tokio::test]

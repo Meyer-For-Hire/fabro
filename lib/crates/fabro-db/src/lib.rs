@@ -6,6 +6,8 @@ use anyhow::Context as _;
 use sqlx::migrate::{Migrate as _, Migrator};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use tokio::fs;
+#[cfg(unix)]
+use tokio::task::spawn_blocking;
 use tracing::info;
 
 pub type DbPool = sqlx::SqlitePool;
@@ -26,6 +28,8 @@ impl Database {
             })?;
         }
 
+        prepare_private_database_file(path).await?;
+
         let options = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
@@ -38,7 +42,6 @@ impl Database {
             .connect_with(options)
             .await
             .with_context(|| format!("opening SQLite database {}", path.display()))?;
-        set_private_permissions(path).await?;
 
         Ok(Self { pool })
     }
@@ -202,5 +205,40 @@ async fn set_private_permissions(path: &Path) -> anyhow::Result<()> {
 
 #[cfg(not(unix))]
 async fn set_private_permissions(_path: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "SQLite file permissions must be established synchronously before opening the pool"
+)]
+async fn prepare_private_database_file(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+    let path = path.to_path_buf();
+    spawn_blocking(move || {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("creating private SQLite database {}", path.display()))?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("setting private SQLite permissions on {}", path.display()))
+    })
+    .await
+    .context("joining SQLite permission setup task")?
+}
+
+#[cfg(not(unix))]
+async fn prepare_private_database_file(path: &Path) -> anyhow::Result<()> {
+    fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(path)
+        .await
+        .with_context(|| format!("creating SQLite database {}", path.display()))?;
     Ok(())
 }

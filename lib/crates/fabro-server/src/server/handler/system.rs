@@ -8,6 +8,7 @@ use fabro_slack::config::{
 };
 use fabro_static::EnvVars;
 use fabro_types::settings::server::GithubIntegrationSettings;
+use fabro_vault::Vault;
 
 use super::super::{
     AggregateBilling, AggregateBillingTotals, ApiError, AppState, BilledTokenCounts,
@@ -101,26 +102,22 @@ async fn get_system_integrations(
     State(state): State<Arc<AppState>>,
 ) -> Response {
     let settings = state.server_settings();
-    let github =
-        match github_integration_status(state.as_ref(), &settings.server.integrations.github).await
-        {
-            Ok(status) => status,
-            Err(err) => return secret_store_failure(&err),
-        };
-    let slack = match slack_integration_status(state.as_ref()).await {
-        Ok(status) => status,
+    let vault = match state.stores.vault.snapshot().await {
+        Ok(vault) => vault,
         Err(err) => return secret_store_failure(&err),
     };
+    let github = github_integration_status(&settings.server.integrations.github, &vault);
+    let slack = slack_integration_status(state.as_ref(), &vault);
     let response = SystemIntegrationsResponse {
         data: vec![github, slack],
     };
     (StatusCode::OK, Json(response)).into_response()
 }
 
-async fn github_integration_status(
-    state: &AppState,
+fn github_integration_status(
     settings: &GithubIntegrationSettings,
-) -> Result<SystemIntegrationStatus, fabro_vault::SecretStoreError> {
+    vault: &Vault,
+) -> SystemIntegrationStatus {
     let mut metadata = BTreeMap::new();
     metadata.insert(
         "strategy".to_string(),
@@ -138,20 +135,20 @@ async fn github_integration_status(
     }
 
     if !settings.enabled {
-        return Ok(integration_status(
+        return integration_status(
             IntegrationProvider::Github,
             false,
             false,
             IntegrationStatus::Disabled,
             Vec::new(),
             metadata,
-        ));
+        );
     }
 
     let mut missing = Vec::new();
     match settings.strategy {
         GithubIntegrationStrategy::Token => {
-            if missing_vault_secret(state, EnvVars::GITHUB_TOKEN).await? {
+            if missing_vault_secret(vault, EnvVars::GITHUB_TOKEN) {
                 missing.push(EnvVars::GITHUB_TOKEN.to_string());
             }
         }
@@ -162,10 +159,10 @@ async fn github_integration_status(
             if settings.client_id.is_none() {
                 missing.push("server.integrations.github.client_id".to_string());
             }
-            if missing_vault_secret(state, EnvVars::GITHUB_APP_CLIENT_SECRET).await? {
+            if missing_vault_secret(vault, EnvVars::GITHUB_APP_CLIENT_SECRET) {
                 missing.push(EnvVars::GITHUB_APP_CLIENT_SECRET.to_string());
             }
-            if missing_vault_secret(state, EnvVars::GITHUB_APP_PRIVATE_KEY).await? {
+            if missing_vault_secret(vault, EnvVars::GITHUB_APP_PRIVATE_KEY) {
                 missing.push(EnvVars::GITHUB_APP_PRIVATE_KEY.to_string());
             }
         }
@@ -173,7 +170,7 @@ async fn github_integration_status(
     missing.sort();
 
     let configured = missing.is_empty();
-    Ok(integration_status(
+    integration_status(
         IntegrationProvider::Github,
         true,
         configured,
@@ -184,12 +181,10 @@ async fn github_integration_status(
         },
         missing,
         metadata,
-    ))
+    )
 }
 
-async fn slack_integration_status(
-    state: &AppState,
-) -> Result<SystemIntegrationStatus, fabro_vault::SecretStoreError> {
+fn slack_integration_status(state: &AppState, vault: &Vault) -> SystemIntegrationStatus {
     let settings = &state.server_settings().server.integrations.slack;
     let mut metadata = BTreeMap::new();
     if let Some(default_channel) = settings.default_channel.as_ref() {
@@ -197,17 +192,16 @@ async fn slack_integration_status(
     }
 
     if !settings.enabled {
-        return Ok(integration_status(
+        return integration_status(
             IntegrationProvider::Slack,
             false,
             false,
             IntegrationStatus::Disabled,
             Vec::new(),
             metadata,
-        ));
+        );
     }
 
-    let vault = state.stores.vault.snapshot().await?;
     let mut missing = match resolve_slack_credentials_status_with_lookup(|name| {
         vault.get(name).map(str::to_string)
     }) {
@@ -218,14 +212,14 @@ async fn slack_integration_status(
     };
     missing.sort();
     if !missing.is_empty() {
-        return Ok(integration_status(
+        return integration_status(
             IntegrationProvider::Slack,
             true,
             false,
             IntegrationStatus::MissingCredentials,
             missing,
             metadata,
-        ));
+        );
     }
 
     let connection = state
@@ -243,7 +237,7 @@ async fn slack_integration_status(
             },
         );
 
-    Ok(SystemIntegrationStatus {
+    SystemIntegrationStatus {
         provider: IntegrationProvider::Slack,
         enabled: true,
         configured: true,
@@ -251,7 +245,7 @@ async fn slack_integration_status(
         missing_credentials: Vec::new(),
         connection,
         metadata,
-    })
+    }
 }
 
 fn integration_status(
@@ -273,16 +267,8 @@ fn integration_status(
     }
 }
 
-async fn missing_vault_secret(
-    state: &AppState,
-    name: &str,
-) -> Result<bool, fabro_vault::SecretStoreError> {
-    Ok(state
-        .vault_secret(name)
-        .await?
-        .as_deref()
-        .map(str::trim)
-        .is_none_or(str::is_empty))
+fn missing_vault_secret(vault: &Vault, name: &str) -> bool {
+    vault.get(name).map(str::trim).is_none_or(str::is_empty)
 }
 
 fn secret_store_failure(err: &fabro_vault::SecretStoreError) -> Response {
@@ -504,7 +490,12 @@ async fn get_github_repo(
                     .into_response();
                 }
                 Err(err) => {
-                    return ApiError::new(StatusCode::SERVICE_UNAVAILABLE, err).into_response();
+                    tracing::error!(error = ?err, "Loading GitHub credentials failed");
+                    return ApiError::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "GitHub credentials are unavailable",
+                    )
+                    .into_response();
                 }
             };
 
@@ -597,7 +588,12 @@ async fn get_github_repo(
                     .into_response();
                 }
                 Err(err) => {
-                    return ApiError::new(StatusCode::SERVICE_UNAVAILABLE, err).into_response();
+                    tracing::error!(error = ?err, "Loading GitHub credentials failed");
+                    return ApiError::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "GitHub credentials are unavailable",
+                    )
+                    .into_response();
                 }
             };
             let client = match state.http_client() {

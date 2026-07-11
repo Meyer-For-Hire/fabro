@@ -516,10 +516,17 @@ async fn build_preflight_report(
     let needs_github_credentials =
         sandbox_provider.is_clone_based() || resolved_run.integrations.github.is_token_requested();
     let github_app = if needs_github_credentials {
-        state
-            .github_credentials(github_integration)
-            .await
-            .unwrap_or_default()
+        match state.github_credentials(github_integration).await {
+            Ok(credentials) => credentials,
+            Err(err)
+                if err
+                    .downcast_ref::<fabro_vault::SecretStoreError>()
+                    .is_some() =>
+            {
+                return Err(err);
+            }
+            Err(_) => None,
+        }
     } else {
         None
     };

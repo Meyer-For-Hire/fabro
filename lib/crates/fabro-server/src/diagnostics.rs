@@ -367,12 +367,13 @@ async fn check_github_app(state: &AppState) -> CheckResult {
                 };
             }
             Err(err) => {
+                let rendered = format!("{err:#}");
                 return CheckResult {
                     name:        "GitHub Token".to_string(),
                     status:      CheckStatus::Error,
                     summary:     "missing token".to_string(),
-                    details:     vec![CheckDetail::new(err.clone())],
-                    remediation: Some(err),
+                    details:     vec![CheckDetail::new(rendered.clone())],
+                    remediation: Some(rendered),
                 };
             }
         };

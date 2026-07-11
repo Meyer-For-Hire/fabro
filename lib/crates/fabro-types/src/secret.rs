@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString, IntoStaticStr};
 
@@ -25,6 +25,39 @@ pub enum SecretType {
     Oauth,
     /// Path-shaped secret materialized to the filesystem.
     File,
+}
+
+/// JSON shape stored when [`SecretType::Oauth`] is used.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OAuthCredential {
+    pub tokens:     OAuthTokens,
+    pub config:     OAuthConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+}
+
+impl OAuthCredential {
+    #[must_use]
+    pub fn needs_refresh(&self) -> bool {
+        self.tokens.expires_at <= Utc::now() + Duration::minutes(5)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OAuthTokens {
+    pub access_token:  String,
+    pub refresh_token: Option<String>,
+    pub expires_at:    DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OAuthConfig {
+    pub auth_url:     String,
+    pub token_url:    String,
+    pub client_id:    String,
+    pub scopes:       Vec<String>,
+    pub redirect_uri: Option<String>,
+    pub use_pkce:     bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use fabro_model::{Catalog, ProviderId};
 use fabro_types::SecretType;
-use fabro_vault::{SecretStore, SecretStoreError, Vault};
+use fabro_vault::{SecretSnapshot, SecretStore, SecretStoreError, Vault};
 use tokio::sync::RwLock;
 use tracing::error;
 
@@ -33,11 +33,12 @@ impl SqlVaultCredentialSource {
         }
     }
 
-    fn source_for_snapshot(&self, snapshot: Vault) -> VaultCredentialSource {
+    fn source_for_snapshot(&self, snapshot: SecretSnapshot) -> VaultCredentialSource {
         let env_lookup = Arc::clone(&self.env_lookup);
-        VaultCredentialSource::with_env_lookup(Arc::new(RwLock::new(snapshot)), move |name| {
-            env_lookup(name)
-        })
+        VaultCredentialSource::with_env_lookup(
+            Arc::new(RwLock::new(snapshot.into_vault())),
+            move |name| env_lookup(name),
+        )
     }
 
     async fn persist_oauth_refreshes(

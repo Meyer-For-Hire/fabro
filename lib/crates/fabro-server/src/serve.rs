@@ -39,7 +39,7 @@ use crate::server::{
     spawn_automation_scheduler, spawn_scheduler,
 };
 use crate::server_secrets::{ServerSecrets, process_env_snapshot};
-use crate::startup::{load_startup_vault, resolve_startup, validate_startup_configuration};
+use crate::startup::{migrate_startup_vault, resolve_startup, validate_startup_configuration};
 use crate::{migrations, static_files};
 
 pub const DEFAULT_TCP_PORT: u16 = 32276;
@@ -666,7 +666,7 @@ where
     let resolved_server_settings = resolved_app_settings.server_settings.server.clone();
     validate_startup_configuration(&resolved_server_settings)?;
     let env_entries = process_env_snapshot();
-    let _legacy_vault = load_startup_vault(&vault_path)?;
+    migrate_startup_vault(&vault_path);
     let bind_request = resolve_bind_request_from_server_settings(
         &resolved_app_settings.server_settings,
         args.bind.as_deref(),
@@ -792,7 +792,7 @@ where
         artifact_store,
         vault_path,
         db_pool,
-        preloaded_vault: Some(startup_vault),
+        preloaded_vault: Some(startup_vault.into_vault()),
         server_secrets,
         env_lookup,
         github_api_base_url: None,

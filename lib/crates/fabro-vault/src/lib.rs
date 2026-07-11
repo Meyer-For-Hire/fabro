@@ -14,7 +14,8 @@ use fabro_static::EnvVars;
 pub use fabro_types::SecretType;
 use fabro_types::{SecretMetadata, is_env_style_name};
 pub use store::{
-    ImportReport, SecretStore, SecretStoreError, SecretStoreWrite, import_legacy_json_once,
+    ImportReport, SecretSnapshot, SecretStore, SecretStoreError, SecretStoreWrite,
+    import_legacy_json_once,
 };
 
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

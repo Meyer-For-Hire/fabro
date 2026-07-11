@@ -6100,7 +6100,7 @@ async fn github_token_strategy_ignores_process_env_token() {
         .expect_err("server runtime should ignore env-backed GitHub tokens");
 
     assert_eq!(
-        err,
+        err.to_string(),
         "GITHUB_TOKEN not configured -- run fabro install or run fabro secret set GITHUB_TOKEN"
     );
 }
@@ -6130,7 +6130,7 @@ async fn github_token_strategy_ignores_gh_token_alias() {
         .expect_err("server runtime should ignore GH_TOKEN in env and vault");
 
     assert_eq!(
-        err,
+        err.to_string(),
         "GITHUB_TOKEN not configured -- run fabro install or run fabro secret set GITHUB_TOKEN"
     );
 }

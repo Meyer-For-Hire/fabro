@@ -41,6 +41,8 @@ pub(crate) enum RunMaterializeError {
     WorkflowNotFound(String),
     #[error("failed to build run manifest: {0}")]
     Manifest(String),
+    #[error("failed to load GitHub credentials: {0}")]
+    Credentials(String),
 }
 
 impl From<GitCheckoutError> for RunMaterializeError {

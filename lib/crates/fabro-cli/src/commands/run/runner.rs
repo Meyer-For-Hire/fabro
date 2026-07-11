@@ -292,7 +292,8 @@ async fn load_worker_vault(storage_dir: Option<&Path>) -> Result<Option<Arc<Asyn
     let vault = SecretStore::new(database.clone_pool())
         .snapshot()
         .await
-        .context("loading worker secrets snapshot")?;
+        .context("loading worker secrets snapshot")?
+        .into_vault();
     Ok(Some(Arc::new(AsyncRwLock::new(vault))))
 }
 
