@@ -72,9 +72,9 @@ async fn list_automation_runs(
         Ok(id) => id,
         Err(err) => return err.into_response(),
     };
-    match state.automation_store().get(&id).await {
-        Ok(Some(_)) => {}
-        Ok(None) => {
+    match state.automation_store().exists(&id).await {
+        Ok(true) => {}
+        Ok(false) => {
             return ApiError::not_found(format!("automation not found: {id}")).into_response();
         }
         Err(err) => return ApiError::from(err).into_response(),

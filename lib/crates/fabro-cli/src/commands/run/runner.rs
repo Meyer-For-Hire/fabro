@@ -278,17 +278,14 @@ async fn load_worker_vault(storage_dir: Option<&Path>) -> Result<Option<Arc<Asyn
     };
 
     let storage = Storage::new(storage_dir);
-    let vault = SecretStore::open(storage.sqlite_path(), storage.secrets_path())
+    let vault = SecretStore::open_snapshot(storage.sqlite_path(), storage.secrets_path())
         .await
         .with_context(|| {
             format!(
-                "failed to open worker secret store from {}",
+                "failed to load worker secrets from {}",
                 storage.root().display()
             )
         })?
-        .snapshot()
-        .await
-        .context("loading worker secrets snapshot")?
         .into_vault();
     Ok(Some(Arc::new(AsyncRwLock::new(vault))))
 }

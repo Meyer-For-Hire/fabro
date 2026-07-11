@@ -292,10 +292,7 @@ async fn execute_daemon(
     validate_startup_configuration(&resolved_settings)?;
     let storage = Storage::new(storage_dir);
     migrate_startup_vault(storage.secrets_path());
-    let startup_vault = SecretStore::open(storage.sqlite_path(), storage.secrets_path())
-        .await
-        .context("opening the Fabro secret store for startup validation")?
-        .snapshot()
+    let startup_vault = SecretStore::open_snapshot(storage.sqlite_path(), storage.secrets_path())
         .await
         .context("loading secrets for startup validation")?;
     validate_startup(

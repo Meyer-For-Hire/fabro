@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use fabro_db::{DbPool, legacy};
+use fabro_db::DbPool;
 use fabro_types::{Variable, is_env_style_name};
 use sqlx::Row as _;
 use sqlx::sqlite::SqliteRow;
@@ -312,13 +312,15 @@ fn parse_legacy_entries(
 }
 
 async fn rename_imported_legacy_file(source_path: &Path) -> Result<PathBuf, Error> {
-    legacy::rename_to_legacy_backup(source_path, "variables.json")
+    let backup_path = fabro_db::legacy_backup_path(source_path, "variables.json", Utc::now());
+    fs::rename(source_path, &backup_path)
         .await
-        .map_err(|err| Error::LegacyBackup {
+        .map_err(|source| Error::LegacyBackup {
             source_path: source_path.to_path_buf(),
-            backup_path: err.backup_path,
-            source:      err.source,
-        })
+            backup_path: backup_path.clone(),
+            source,
+        })?;
+    Ok(backup_path)
 }
 
 fn row_count(count: usize) -> Result<i64, Error> {
@@ -342,7 +344,7 @@ fn variable_from_row(row: &SqliteRow) -> Result<Variable, Error> {
 }
 
 fn parse_timestamp(name: &str, column: &'static str, value: &str) -> Result<DateTime<Utc>, Error> {
-    fabro_db::parse_rfc3339_utc(value).map_err(|source| Error::Timestamp {
+    fabro_db::parse_rfc3339(value).map_err(|source| Error::Timestamp {
         name: name.to_string(),
         column,
         source,

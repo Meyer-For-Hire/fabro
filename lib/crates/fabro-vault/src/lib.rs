@@ -10,12 +10,12 @@ use std::path::{Component, Path, PathBuf};
 use std::{fmt, io};
 
 use chrono::{DateTime, Utc};
+pub use fabro_db::ImportReport;
 use fabro_static::EnvVars;
 pub use fabro_types::SecretType;
 use fabro_types::{SecretMetadata, is_env_style_name};
 pub use store::{
-    ImportReport, SecretSnapshot, SecretStore, SecretStoreError, SecretStoreWrite,
-    import_legacy_json_once,
+    SecretSnapshot, SecretStore, SecretStoreError, SecretStoreWrite, import_legacy_json_once,
 };
 
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

@@ -2,26 +2,16 @@
 //! automation store. Remove this compatibility migration after 2026-10-11,
 //! once supported upgrades no longer span a file-backed Fabro release.
 
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Utc};
-use fabro_db::DbPool;
+use chrono::Utc;
+use fabro_db::{DbPool, ImportReport};
 use tokio::fs;
 use tracing::info;
 
 use crate::{Automation, AutomationId, AutomationStoreError, store};
 
 pub(crate) const REMOVAL_DEADLINE: &str = "2026-10-11";
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ImportReport {
-    pub source_path:    PathBuf,
-    pub backup_path:    PathBuf,
-    pub imported_rows:  usize,
-    pub skipped_rows:   usize,
-    pub automation_ids: Vec<String>,
-}
 
 pub async fn import_legacy_directory_once(
     pool: &DbPool,
@@ -57,14 +47,14 @@ pub async fn import_legacy_directory_once(
         backup_path,
         imported_rows: imported_ids.len(),
         skipped_rows,
-        automation_ids: imported_ids,
+        names: imported_ids,
     };
     info!(
         source_path = %report.source_path.display(),
         backup_path = %report.backup_path.display(),
         imported_rows = report.imported_rows,
         skipped_rows = report.skipped_rows,
-        automation_ids = ?report.automation_ids,
+        automation_ids = ?report.names,
         removal_deadline = REMOVAL_DEADLINE,
         "Imported legacy automations directory into SQLite"
     );
@@ -121,7 +111,7 @@ fn is_toml_file(path: &Path) -> bool {
 async fn rename_imported_legacy_directory(
     source_dir: &Path,
 ) -> Result<PathBuf, AutomationStoreError> {
-    let backup_path = legacy_backup_path(source_dir, Utc::now());
+    let backup_path = fabro_db::legacy_backup_path(source_dir, "automations", Utc::now());
     fs::rename(source_dir, &backup_path)
         .await
         .map_err(|source| AutomationStoreError::LegacyBackup {
@@ -130,13 +120,4 @@ async fn rename_imported_legacy_directory(
             source,
         })?;
     Ok(backup_path)
-}
-
-fn legacy_backup_path(source_dir: &Path, imported_at: DateTime<Utc>) -> PathBuf {
-    let timestamp = imported_at.format("%Y%m%dT%H%M%S%fZ");
-    let mut file_name = source_dir
-        .file_name()
-        .map_or_else(|| OsString::from("automations"), OsString::from);
-    file_name.push(format!(".imported-{timestamp}.bak"));
-    source_dir.with_file_name(file_name)
 }

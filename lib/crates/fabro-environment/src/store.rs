@@ -3,11 +3,12 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
+use chrono::Utc;
 use fabro_config::{
     EnvironmentDockerfileLayer, EnvironmentImageLayer, EnvironmentLayer, EnvironmentLifecycleLayer,
     EnvironmentNetworkLayer, EnvironmentResourcesLayer, MergeMap, StickyMap,
 };
-use fabro_db::{DbPool, legacy};
+use fabro_db::DbPool;
 use fabro_types::settings::run::{DockerfileSource, EnvironmentProvider, EnvironmentSettings};
 use fabro_types::settings::{Duration, InterpString, Size};
 use serde::de::DeserializeOwned;
@@ -704,7 +705,7 @@ async fn legacy_environment_paths(
             .file_type()
             .await
             .map_err(|source| EnvironmentStoreError::io(&path, source))?;
-        if file_type.is_file() && legacy::is_toml_file(&path) {
+        if file_type.is_file() && is_toml_file(&path) {
             paths.push(LegacyEnvironmentPath {
                 id: id_from_path(&path)?,
                 path,
@@ -754,9 +755,11 @@ async fn existing_environment_ids(
 async fn rename_imported_legacy_directory(
     source_dir: &Path,
 ) -> Result<PathBuf, EnvironmentStoreError> {
-    legacy::rename_to_legacy_backup(source_dir, "environments")
+    let backup_path = fabro_db::legacy_backup_path(source_dir, "environments", Utc::now());
+    fs::rename(source_dir, &backup_path)
         .await
-        .map_err(|err| EnvironmentStoreError::io(&err.backup_path, err.source))
+        .map_err(|source| EnvironmentStoreError::io(&backup_path, source))?;
+    Ok(backup_path)
 }
 
 fn id_from_path(path: &Path) -> Result<EnvironmentId, EnvironmentStoreError> {
@@ -771,6 +774,12 @@ fn id_from_path(path: &Path) -> Result<EnvironmentId, EnvironmentStoreError> {
         path:   path.to_path_buf(),
         reason: source.to_string(),
     })
+}
+
+fn is_toml_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension == "toml")
 }
 
 fn encode_json<T: serde::Serialize>(

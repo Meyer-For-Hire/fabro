@@ -266,7 +266,7 @@ async fn legacy_import_is_transactional_and_sql_wins() {
 
     assert_eq!(report.imported_rows, 1);
     assert_eq!(report.skipped_rows, 1);
-    assert_eq!(report.automation_ids, vec!["imported"]);
+    assert_eq!(report.names, vec!["imported"]);
     assert!(!source_dir.exists());
     assert!(report.backup_path.exists());
     assert_eq!(

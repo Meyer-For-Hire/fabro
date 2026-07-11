@@ -208,6 +208,18 @@ pub struct ApiTrigger {
     pub enabled: bool,
 }
 
+impl ApiTrigger {
+    /// The canonical enabled API trigger. Automations store API enablement as a
+    /// flag and re-materialize it as this trigger with the fixed `manual` id.
+    pub(crate) fn manual() -> Self {
+        Self {
+            id:      AutomationTriggerId::new(MANUAL_TRIGGER_ID)
+                .expect("manual automation trigger id is valid"),
+            enabled: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScheduleTrigger {
@@ -331,17 +343,24 @@ fn normalize_replace(
         .collect::<Vec<_>>();
     schedules.sort_by(|left, right| left.id.cmp(&right.id));
 
+    // Canonicalization renames the enabled API trigger to `manual`, which can
+    // collide with a schedule trigger id even when the input ids were unique.
+    if api_enabled
+        && schedules
+            .iter()
+            .any(|schedule| schedule.id.as_str() == MANUAL_TRIGGER_ID)
+    {
+        return Err(AutomationValidationError::DuplicateTriggerId {
+            id: MANUAL_TRIGGER_ID.to_string(),
+        });
+    }
+
     let mut triggers = Vec::with_capacity(schedules.len() + usize::from(api_enabled));
     if api_enabled {
-        triggers.push(AutomationTrigger::Api(ApiTrigger {
-            id:      AutomationTriggerId::new(MANUAL_TRIGGER_ID)
-                .expect("manual automation trigger id is valid"),
-            enabled: true,
-        }));
+        triggers.push(AutomationTrigger::Api(ApiTrigger::manual()));
     }
     triggers.extend(schedules.into_iter().map(AutomationTrigger::Schedule));
     value.triggers = triggers;
-    validate_fields(&value)?;
     Ok(value)
 }
 

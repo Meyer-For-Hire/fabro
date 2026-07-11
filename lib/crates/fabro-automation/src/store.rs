@@ -4,12 +4,36 @@ use fabro_db::DbPool;
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row as _, Sqlite, Transaction};
 
-use crate::model::MANUAL_TRIGGER_ID;
 use crate::{
     ApiTrigger, Automation, AutomationDraft, AutomationId, AutomationReplace, AutomationRevision,
     AutomationStoreError, AutomationTarget, AutomationTrigger, AutomationTriggerId,
     ScheduleTrigger,
 };
+
+/// Shared projection for loading automations with their schedule triggers.
+/// A macro rather than a `const` because sqlx requires `&'static str` SQL.
+macro_rules! select_automations_sql {
+    ($suffix:expr) => {
+        concat!(
+            "SELECT
+                a.id,
+                a.revision,
+                a.name,
+                a.description,
+                a.api_enabled,
+                a.target_repository,
+                a.target_ref,
+                a.target_workflow,
+                t.id AS trigger_id,
+                t.enabled AS trigger_enabled,
+                t.expression AS trigger_expression
+            FROM automations AS a
+            LEFT JOIN automation_triggers AS t ON t.automation_id = a.id
+            ",
+            $suffix
+        )
+    };
+}
 
 #[derive(Clone)]
 pub struct AutomationStore {
@@ -29,55 +53,26 @@ impl AutomationStore {
     }
 
     pub async fn list(&self) -> Result<Vec<Automation>, AutomationStoreError> {
-        let rows = sqlx::query(
-            r"
-            SELECT
-                a.id,
-                a.revision,
-                a.name,
-                a.description,
-                a.api_enabled,
-                a.target_repository,
-                a.target_ref,
-                a.target_workflow,
-                t.id AS trigger_id,
-                t.enabled AS trigger_enabled,
-                t.expression AS trigger_expression
-            FROM automations AS a
-            LEFT JOIN automation_triggers AS t ON t.automation_id = a.id
-            ORDER BY a.id, t.id
-            ",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = sqlx::query(select_automations_sql!("ORDER BY a.id, t.id"))
+            .fetch_all(&self.pool)
+            .await?;
         automations_from_rows(&rows)
     }
 
     pub async fn get(&self, id: &AutomationId) -> Result<Option<Automation>, AutomationStoreError> {
-        let rows = sqlx::query(
-            r"
-            SELECT
-                a.id,
-                a.revision,
-                a.name,
-                a.description,
-                a.api_enabled,
-                a.target_repository,
-                a.target_ref,
-                a.target_workflow,
-                t.id AS trigger_id,
-                t.enabled AS trigger_enabled,
-                t.expression AS trigger_expression
-            FROM automations AS a
-            LEFT JOIN automation_triggers AS t ON t.automation_id = a.id
-            WHERE a.id = ?
-            ORDER BY t.id
-            ",
-        )
-        .bind(id.as_str())
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = sqlx::query(select_automations_sql!("WHERE a.id = ? ORDER BY t.id"))
+            .bind(id.as_str())
+            .fetch_all(&self.pool)
+            .await?;
         Ok(automations_from_rows(&rows)?.into_iter().next())
+    }
+
+    pub async fn exists(&self, id: &AutomationId) -> Result<bool, AutomationStoreError> {
+        let row = sqlx::query("SELECT 1 FROM automations WHERE id = ?")
+            .bind(id.as_str())
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.is_some())
     }
 
     pub async fn create(&self, draft: AutomationDraft) -> Result<Automation, AutomationStoreError> {
@@ -221,20 +216,15 @@ impl StoredAutomation {
     }
 
     fn finish(self) -> Result<Automation, AutomationStoreError> {
-        let mut triggers =
-            Vec::with_capacity(self.schedule_triggers.len() + usize::from(self.api_enabled));
+        // `from_stored` canonicalizes trigger order and the manual API trigger.
+        let mut triggers = self
+            .schedule_triggers
+            .into_iter()
+            .map(AutomationTrigger::Schedule)
+            .collect::<Vec<_>>();
         if self.api_enabled {
-            triggers.push(AutomationTrigger::Api(ApiTrigger {
-                id:      AutomationTriggerId::new(MANUAL_TRIGGER_ID)
-                    .expect("manual automation trigger id is valid"),
-                enabled: true,
-            }));
+            triggers.push(AutomationTrigger::Api(ApiTrigger::manual()));
         }
-        triggers.extend(
-            self.schedule_triggers
-                .into_iter()
-                .map(AutomationTrigger::Schedule),
-        );
         let id = self.id;
         Automation::from_stored(id.clone(), self.revision, AutomationReplace {
             name: self.name,

@@ -37,10 +37,7 @@ fn spa_fixture_root() -> PathBuf {
 
 async fn load_secret_snapshot(storage_dir: &std::path::Path) -> Vault {
     let storage = Storage::new(storage_dir);
-    fabro_vault::SecretStore::open(storage.sqlite_path(), storage.secrets_path())
-        .await
-        .expect("test secret store should open")
-        .snapshot()
+    fabro_vault::SecretStore::open_snapshot(storage.sqlite_path(), storage.secrets_path())
         .await
         .expect("test secret snapshot should load")
         .into_vault()
