@@ -18,6 +18,16 @@ pub struct SqlVaultCredentialSource {
 
 impl SqlVaultCredentialSource {
     #[must_use]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "SqlVaultCredentialSource::new owns the process-env fallback used after vault \
+                  lookup."
+    )]
+    pub fn new(store: Arc<SecretStore>) -> Self {
+        Self::with_env_lookup(store, |name| std::env::var(name).ok())
+    }
+
+    #[must_use]
     pub fn vault_only(store: Arc<SecretStore>) -> Self {
         Self::with_env_lookup(store, |_| None)
     }
@@ -87,6 +97,15 @@ impl CredentialSource for SqlVaultCredentialSource {
     async fn resolve(&self, catalog: &Catalog) -> anyhow::Result<ResolvedCredentials> {
         for _ in 0..2 {
             let before = self.store.snapshot().await?;
+            let has_oauth = before
+                .entries()
+                .values()
+                .any(|entry| entry.secret_type == SecretType::Oauth);
+            if !has_oauth {
+                // Only OAuth resolution can write back (token refresh); with no
+                // OAuth secrets, skip the snapshot clones and CAS machinery.
+                return self.source_for_snapshot(before).resolve(catalog).await;
+            }
             let source = self.source_for_snapshot(before.clone());
             let resolved = source.resolve(catalog).await?;
             let after = source.snapshot().await;

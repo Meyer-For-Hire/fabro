@@ -13,6 +13,7 @@ doctest = false
 workspace = true
 
 [dependencies]
+anyhow.workspace = true
 chrono.workspace = true
 fabro-db = { path = "../fabro-db" }
 fabro-static = { path = "../fabro-static" }

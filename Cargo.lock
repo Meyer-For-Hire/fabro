@@ -2267,7 +2267,6 @@ dependencies = [
  "dirs",
  "fabro-auth",
  "fabro-config",
- "fabro-db",
  "fabro-http",
  "fabro-llm",
  "fabro-macros",
@@ -2410,7 +2409,6 @@ dependencies = [
  "fabro-checkpoint",
  "fabro-client",
  "fabro-config",
- "fabro-db",
  "fabro-dump",
  "fabro-environment",
  "fabro-github",
@@ -3300,6 +3298,7 @@ dependencies = [
 name = "fabro-vault"
 version = "0.302.0-nightly.1"
 dependencies = [
+ "anyhow",
  "chrono",
  "fabro-db",
  "fabro-static",

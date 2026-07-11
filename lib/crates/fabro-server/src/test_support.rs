@@ -264,8 +264,7 @@ impl TestAppStateBuilder {
             store,
             artifact_store,
             db_pool,
-            vault_path,
-            preloaded_vault: Some(preloaded_vault),
+            preloaded_vault,
             server_secrets: load_test_server_secrets(server_env_path, self.server_secret_env),
             env_lookup: self.env_lookup,
             github_api_base_url: None,
@@ -288,7 +287,7 @@ impl TestAppStateBuilder {
     clippy::disallowed_methods,
     reason = "sync test builders may run inside Tokio; a dedicated thread avoids a nested runtime"
 )]
-fn test_secret_snapshot(pool: DbPool) -> anyhow::Result<Vault> {
+pub(crate) fn test_secret_snapshot(pool: DbPool) -> anyhow::Result<Vault> {
     std::thread::spawn(move || {
         let runtime = TokioRuntimeBuilder::new_current_thread()
             .enable_all()

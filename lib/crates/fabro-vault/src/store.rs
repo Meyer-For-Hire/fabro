@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
 
 use chrono::{DateTime, Utc};
-use fabro_db::DbPool;
+use fabro_db::{Database, DbPool};
 use fabro_types::{OAuthCredential, SecretMetadata, SecretType};
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row as _, Sqlite, Transaction};
@@ -86,17 +86,14 @@ pub enum SecretStoreError {
         #[source]
         source:      std::io::Error,
     },
-
-    #[error("secret row count {count} exceeds SQLite integer range")]
-    RowCountOverflow { count: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportReport {
     pub source_path:   PathBuf,
     pub backup_path:   PathBuf,
-    pub imported_rows: i64,
-    pub skipped_rows:  i64,
+    pub imported_rows: usize,
+    pub skipped_rows:  usize,
     pub secret_names:  Vec<String>,
 }
 
@@ -158,6 +155,18 @@ impl SecretStore {
     #[must_use]
     pub fn new(pool: DbPool) -> Self {
         Self { pool }
+    }
+
+    /// Opens the Fabro database at `sqlite_path`, runs migrations, imports any
+    /// legacy secrets JSON at `legacy_secrets_path`, and returns the store.
+    pub async fn open(
+        sqlite_path: impl AsRef<Path>,
+        legacy_secrets_path: impl AsRef<Path>,
+    ) -> anyhow::Result<Self> {
+        let database = Database::connect(sqlite_path).await?;
+        database.migrate().await?;
+        import_legacy_json_once(database.pool(), legacy_secrets_path).await?;
+        Ok(Self::new(database.clone_pool()))
     }
 
     pub async fn get(&self, name: &str) -> Result<Option<SecretEntry>, SecretStoreError> {
@@ -270,7 +279,7 @@ impl SecretStore {
             RETURNING name, secret_type, value, description, revision, created_at, updated_at
             ",
         )
-        .bind(secret_type_string(secret_type))
+        .bind(secret_type.as_str())
         .bind(value)
         .bind(now)
         .bind(name)
@@ -329,7 +338,7 @@ async fn upsert_secret(
         ",
     )
     .bind(name)
-    .bind(secret_type_string(secret_type))
+    .bind(secret_type.as_str())
     .bind(value)
     .bind(description)
     .bind(now)
@@ -391,8 +400,8 @@ pub async fn import_legacy_json_once(
     let report = ImportReport {
         source_path: source_path.to_path_buf(),
         backup_path,
-        imported_rows: row_count(imported_names.len())?,
-        skipped_rows: row_count(skipped_rows)?,
+        imported_rows: imported_names.len(),
+        skipped_rows,
         secret_names: imported_names,
     };
     info!(
@@ -420,7 +429,7 @@ async fn insert_legacy_entry(
         ",
     )
     .bind(name)
-    .bind(secret_type_string(entry.secret_type))
+    .bind(entry.secret_type.as_str())
     .bind(&entry.value)
     .bind(entry.description.as_deref())
     .bind(entry.created_at.to_rfc3339())
@@ -431,26 +440,10 @@ async fn insert_legacy_entry(
 }
 
 fn entry_from_row(row: &SqliteRow) -> Result<(String, SecretEntry), SecretStoreError> {
-    let name = row.try_get::<String, _>("name")?;
-    let type_value = row.try_get::<String, _>("secret_type")?;
-    let secret_type =
-        SecretType::from_str(&type_value).map_err(|_| SecretStoreError::StoredType {
-            name:  name.clone(),
-            value: type_value,
-        })?;
-    validate_stored_name(&name, secret_type)?;
-    let created_at = parse_timestamp(
-        &name,
-        "created_at",
-        &row.try_get::<String, _>("created_at")?,
-    )?;
-    let updated_at = parse_timestamp(
-        &name,
-        "updated_at",
-        &row.try_get::<String, _>("updated_at")?,
-    )?;
+    let metadata = metadata_from_row(row)?;
+    let name = metadata.name;
     let value = row.try_get::<String, _>("value")?;
-    if secret_type == SecretType::Oauth {
+    if metadata.secret_type == SecretType::Oauth {
         validate_oauth_json(&value).map_err(|source| SecretStoreError::StoredOauth {
             name: name.clone(),
             source,
@@ -462,10 +455,10 @@ fn entry_from_row(row: &SqliteRow) -> Result<(String, SecretEntry), SecretStoreE
     }
     let entry = SecretEntry {
         value,
-        secret_type,
-        description: row.try_get("description")?,
-        created_at,
-        updated_at,
+        secret_type: metadata.secret_type,
+        description: metadata.description,
+        created_at: metadata.created_at,
+        updated_at: metadata.updated_at,
         revision,
     };
     Ok((name, entry))
@@ -495,10 +488,6 @@ fn metadata_from_row(row: &SqliteRow) -> Result<SecretMetadata, SecretStoreError
             &row.try_get::<String, _>("updated_at")?,
         )?,
     })
-}
-
-fn secret_type_string(secret_type: SecretType) -> &'static str {
-    secret_type.into()
 }
 
 fn parse_timestamp(
@@ -560,8 +549,4 @@ fn legacy_backup_path(source_path: &Path, imported_at: DateTime<Utc>) -> PathBuf
         .map_or_else(|| OsString::from("secrets.json"), OsString::from);
     file_name.push(format!(".imported-{timestamp}.bak"));
     source_path.with_file_name(file_name)
-}
-
-fn row_count(count: usize) -> Result<i64, SecretStoreError> {
-    i64::try_from(count).map_err(|_| SecretStoreError::RowCountOverflow { count })
 }

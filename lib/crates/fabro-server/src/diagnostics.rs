@@ -89,14 +89,14 @@ fn validate_session_secret(value: &str) -> Result<(), String> {
 }
 
 pub async fn run_all(state: &AppState) -> DiagnosticsReport {
-    let (llm, github, docker_sandbox, cloud_sandbox, brave) = tokio::join!(
+    let (llm, github, docker_sandbox, cloud_sandbox, brave, crypto) = tokio::join!(
         check_llm_providers(state),
         check_github_app(state),
         check_docker_sandbox(state),
         check_cloud_sandbox(state),
         check_brave_search(state),
+        check_crypto(state),
     );
-    let crypto = check_crypto(state).await;
 
     DiagnosticsReport {
         version:  FABRO_VERSION.to_string(),

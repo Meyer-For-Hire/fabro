@@ -27,6 +27,13 @@ pub enum SecretType {
     File,
 }
 
+impl SecretType {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        self.into()
+    }
+}
+
 /// JSON shape stored when [`SecretType::Oauth`] is used.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OAuthCredential {

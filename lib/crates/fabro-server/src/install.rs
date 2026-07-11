@@ -19,7 +19,7 @@ use fabro_config::envfile::{EnvFileRemoval, EnvFileUpdate};
 use fabro_install::{
     GITHUB_APP_VAULT_KEYS, GITHUB_INSTALL_SECRET_KEYS, InstallListenConfig, InstallPersistencePlan,
     InstallSandboxSelection, OBJECT_STORE_ACCESS_KEY_ID_ENV, OBJECT_STORE_SECRET_ACCESS_KEY_ENV,
-    PendingSettingsWrite, VaultSecretWrite, merge_server_settings,
+    PendingSettingsWrite, SecretStoreWrite, merge_server_settings,
     prepare_dev_token_write_for_install, seed_default_environment_in_storage,
     write_github_app_settings, write_object_store_settings, write_sandbox_settings,
     write_token_settings,
@@ -1573,7 +1573,7 @@ async fn post_install_finish(
     }
     let mut vault_secrets = Vec::new();
     if let InstallSandboxProviderState::Daytona { api_key } = &sandbox.provider {
-        vault_secrets.push(VaultSecretWrite {
+        vault_secrets.push(SecretStoreWrite {
             name:        EnvVars::DAYTONA_API_KEY.to_string(),
             value:       api_key.expose_secret().to_string(),
             secret_type: VaultSecretType::Token,
@@ -1585,7 +1585,7 @@ async fn post_install_finish(
             Ok(name) => name,
             Err(err) => return install_error_response(StatusCode::UNPROCESSABLE_ENTITY, err),
         };
-        vault_secrets.push(VaultSecretWrite {
+        vault_secrets.push(SecretStoreWrite {
             name,
             value: provider.api_key,
             secret_type: VaultSecretType::Token,
@@ -1612,7 +1612,7 @@ async fn post_install_finish(
             if let Err(err) = write_token_settings(&mut settings_doc) {
                 return install_error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
             }
-            vault_secrets.push(VaultSecretWrite {
+            vault_secrets.push(SecretStoreWrite {
                 name:        EnvVars::GITHUB_TOKEN.to_string(),
                 value:       github.token,
                 secret_type: VaultSecretType::Token,
@@ -1649,20 +1649,20 @@ async fn post_install_finish(
             ) {
                 return install_error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
             }
-            vault_secrets.push(VaultSecretWrite {
+            vault_secrets.push(SecretStoreWrite {
                 name:        EnvVars::GITHUB_APP_PRIVATE_KEY.to_string(),
                 value:       BASE64_STANDARD.encode(github.pem.as_bytes()),
                 secret_type: VaultSecretType::File,
                 description: None,
             });
-            vault_secrets.push(VaultSecretWrite {
+            vault_secrets.push(SecretStoreWrite {
                 name:        EnvVars::GITHUB_APP_CLIENT_SECRET.to_string(),
                 value:       github.client_secret,
                 secret_type: VaultSecretType::Token,
                 description: None,
             });
             if let Some(secret) = github.webhook_secret {
-                vault_secrets.push(VaultSecretWrite {
+                vault_secrets.push(SecretStoreWrite {
                     name:        EnvVars::GITHUB_APP_WEBHOOK_SECRET.to_string(),
                     value:       secret,
                     secret_type: VaultSecretType::Token,
@@ -2502,10 +2502,9 @@ mod tests {
         assert!(!server_env.contains_key(EnvVars::GITHUB_APP_CLIENT_SECRET));
         assert!(!server_env.contains_key(EnvVars::GITHUB_APP_WEBHOOK_SECRET));
 
-        let database = fabro_db::Database::connect(storage.sqlite_path())
+        let vault = fabro_vault::SecretStore::open(storage.sqlite_path(), storage.secrets_path())
             .await
-            .unwrap();
-        let vault = fabro_vault::SecretStore::new(database.clone_pool())
+            .unwrap()
             .snapshot()
             .await
             .unwrap();

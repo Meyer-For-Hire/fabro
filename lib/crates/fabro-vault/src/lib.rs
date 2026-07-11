@@ -110,6 +110,8 @@ impl Vault {
         })
     }
 
+    /// Builds a detached in-memory vault with no backing file: mutations
+    /// update memory only and are never persisted to disk.
     #[must_use]
     pub fn from_entries(entries: HashMap<String, SecretEntry>) -> Self {
         Self {

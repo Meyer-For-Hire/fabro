@@ -12,7 +12,6 @@ use clap::{Args, Parser};
 use fabro_auth::{CredentialSource, SqlVaultCredentialSource};
 use fabro_config::Storage;
 use fabro_config::user::default_storage_dir;
-use fabro_db::Database;
 use fabro_llm::Error as LlmError;
 use fabro_llm::client::Client;
 use fabro_llm::middleware::{Middleware, NextFn, NextStreamFn};
@@ -24,7 +23,7 @@ use fabro_model::catalog::LlmCatalogSettings;
 use fabro_model::{AgentProfileKind, Catalog, ModelHandle, ProviderId};
 use fabro_static::EnvVars;
 use fabro_util::terminal::Styles;
-use fabro_vault::{SecretStore, import_legacy_json_once};
+use fabro_vault::SecretStore;
 use tokio::io::{AsyncWriteExt, stdout};
 use tokio::signal;
 use tokio::sync::Mutex as AsyncMutex;
@@ -275,20 +274,11 @@ fn resolve_provider_id(catalog: &Catalog, args: &AgentArgs) -> anyhow::Result<Pr
 }
 
 async fn standalone_llm_source() -> anyhow::Result<Arc<dyn CredentialSource>> {
-    let storage_dir = default_storage_dir();
-    let storage = Storage::new(storage_dir);
-    let database = Database::connect(storage.sqlite_path())
+    let storage = Storage::new(default_storage_dir());
+    let store = SecretStore::open(storage.sqlite_path(), storage.secrets_path())
         .await
-        .context("opening the Fabro database for secrets")?;
-    database
-        .migrate()
-        .await
-        .context("migrating the Fabro database for secrets")?;
-    import_legacy_json_once(database.pool(), storage.secrets_path())
-        .await
-        .context("importing legacy secrets into SQLite")?;
-    let store = Arc::new(SecretStore::new(database.clone_pool()));
-    Ok(Arc::new(SqlVaultCredentialSource::vault_only(store)))
+        .context("opening the Fabro secret store")?;
+    Ok(Arc::new(SqlVaultCredentialSource::new(Arc::new(store))))
 }
 
 fn profile_kind_for_provider(

@@ -163,7 +163,6 @@ use crate::request_id::{self, RequestId};
 use crate::run_files::{FilesInFlight, new_files_in_flight};
 use crate::server_secrets::{LlmClientResult, ServerSecrets};
 use crate::spawn_env::apply_render_graph_env;
-use crate::startup::load_startup_vault;
 use crate::worker_control::{LocalWorkerControlBus, WorkerControlBus, WorkerControlBusError};
 use crate::worker_runtime::{
     LocalWorkerRuntime, WorkerExit, WorkerLaunchSpec, WorkerRef, WorkerRuntime,
@@ -1251,9 +1250,8 @@ pub(crate) struct AppStateConfig {
     pub(crate) max_concurrent_runs: usize,
     pub(crate) store: Arc<Database>,
     pub(crate) artifact_store: ArtifactStore,
-    pub(crate) vault_path: PathBuf,
     pub(crate) db_pool: DbPool,
-    pub(crate) preloaded_vault: Option<Vault>,
+    pub(crate) preloaded_vault: Vault,
     pub(crate) server_secrets: ServerSecrets,
     pub(crate) env_lookup: EnvLookup,
     pub(crate) github_api_base_url: Option<String>,
@@ -2354,7 +2352,6 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         max_concurrent_runs,
         store,
         artifact_store,
-        vault_path,
         db_pool,
         preloaded_vault,
         server_secrets,
@@ -2397,10 +2394,7 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
     );
     let variables = Arc::new(VariableStore::new(db_pool.clone()));
     let secret_store = Arc::new(SecretStore::new(db_pool));
-    let vault = match preloaded_vault {
-        Some(vault) => vault,
-        None => load_startup_vault(&vault_path)?,
-    };
+    let vault = preloaded_vault;
     // Read vault secrets needed for synchronous setup before we wrap the vault in
     // an async lock for the rest of AppState.
     let daytona_api_key = vault.get(EnvVars::DAYTONA_API_KEY).map(str::to_string);
@@ -2533,6 +2527,8 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         registry_factory_override,
         slack_service,
         slack_started: AtomicBool::new(false),
+        // Startup snapshot for the sync router build; rotating the webhook
+        // secret requires a server restart.
         github_webhook_secret: vault.get(WEBHOOK_SECRET_ENV).map(str::to_string),
     }))
 }

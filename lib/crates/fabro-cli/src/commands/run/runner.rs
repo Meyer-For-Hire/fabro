@@ -9,7 +9,6 @@ use fabro_api::types::RunManifest;
 use fabro_client::ServerTarget;
 use fabro_config::user::active_settings_path;
 use fabro_config::{ServerSettingsBuilder, Storage, load_llm_catalog_settings};
-use fabro_db::Database;
 use fabro_interview::{
     AnswerSubmission, ControlInterviewer, WORKER_CONTROL_INVALID_CURSOR_REASON,
     WORKER_CONTROL_PONG_TIMEOUT_REASON, WORKER_CONTROL_WS_LIVENESS_TIMEOUT,
@@ -25,7 +24,7 @@ use fabro_types::{
     ArtifactUpload, EventBody, FailureReason, Principal, RunBlobId, RunEvent, RunId,
     WorkflowSettings,
 };
-use fabro_vault::{SecretStore, Vault, import_legacy_json_once};
+use fabro_vault::{SecretStore, Vault};
 use fabro_workflow::artifact_upload::{ArtifactSink, StageArtifactUploader};
 use fabro_workflow::event::{Emitter, RunEventSink};
 use fabro_workflow::operations::{self, StartServices};
@@ -279,17 +278,14 @@ async fn load_worker_vault(storage_dir: Option<&Path>) -> Result<Option<Arc<Asyn
     };
 
     let storage = Storage::new(storage_dir);
-    let database = Database::connect(storage.sqlite_path())
+    let vault = SecretStore::open(storage.sqlite_path(), storage.secrets_path())
         .await
-        .with_context(|| format!("failed to open database from {}", storage.root().display()))?;
-    database
-        .migrate()
-        .await
-        .context("migrating worker database")?;
-    import_legacy_json_once(database.pool(), storage.secrets_path())
-        .await
-        .context("importing legacy worker secrets into SQLite")?;
-    let vault = SecretStore::new(database.clone_pool())
+        .with_context(|| {
+            format!(
+                "failed to open worker secret store from {}",
+                storage.root().display()
+            )
+        })?
         .snapshot()
         .await
         .context("loading worker secrets snapshot")?

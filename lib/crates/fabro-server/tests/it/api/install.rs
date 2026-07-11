@@ -35,6 +35,17 @@ fn spa_fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/spa")
 }
 
+async fn load_secret_snapshot(storage_dir: &std::path::Path) -> Vault {
+    let storage = Storage::new(storage_dir);
+    fabro_vault::SecretStore::open(storage.sqlite_path(), storage.secrets_path())
+        .await
+        .expect("test secret store should open")
+        .snapshot()
+        .await
+        .expect("test secret snapshot should load")
+        .into_vault()
+}
+
 fn assert_sandbox_provider_policy(
     settings: &str,
     local_enabled: bool,
@@ -994,7 +1005,7 @@ async fn token_install_finish_persists_settings_env_and_vault() {
         Some(finish_dev_token)
     );
 
-    let vault = Vault::load(storage.secrets_path()).unwrap();
+    let vault = load_secret_snapshot(temp_dir.path()).await;
     assert!(vault.get("ANTHROPIC_API_KEY").is_some());
     assert_eq!(vault.get("GITHUB_TOKEN"), Some("ghp_test_token"));
 }
@@ -1080,7 +1091,7 @@ async fn browser_install_finish_with_skipped_llm_persists_no_llm_credentials() {
     assert!(server_env.contains("SESSION_SECRET="));
     assert!(server_env.contains("FABRO_DEV_TOKEN="));
 
-    let vault = Vault::load(fabro_config::Storage::new(temp_dir.path()).secrets_path()).unwrap();
+    let vault = load_secret_snapshot(temp_dir.path()).await;
     assert!(
         vault.get("OPENAI_API_KEY").is_none() && vault.get("OPENAI_CODEX").is_none(),
         "skipped LLM install should not write any OpenAI vault entries"
@@ -2551,7 +2562,7 @@ async fn sandbox_daytona_resave_without_api_key_preserves_saved_key() {
     )
     .await;
 
-    let vault = Vault::load(Storage::new(temp_dir.path()).secrets_path()).unwrap();
+    let vault = load_secret_snapshot(temp_dir.path()).await;
     assert_eq!(vault.get("DAYTONA_API_KEY"), Some(api_key));
 }
 
@@ -2604,7 +2615,7 @@ async fn sandbox_switching_from_daytona_to_docker_drops_saved_key() {
     assert_no_legacy_environment_dir(&temp_dir);
     let default_environment = seeded_default_environment(&temp_dir).await;
     assert_eq!(default_environment.settings.provider.to_string(), "docker");
-    let vault = Vault::load(Storage::new(temp_dir.path()).secrets_path()).unwrap();
+    let vault = load_secret_snapshot(temp_dir.path()).await;
     assert_eq!(vault.get("DAYTONA_API_KEY"), None);
 }
 
@@ -2730,7 +2741,7 @@ async fn daytona_install_finish_writes_settings_and_vault_secret() {
             if content.contains("buildpack-deps:noble")
     ));
 
-    let vault = Vault::load(Storage::new(temp_dir.path()).secrets_path()).unwrap();
+    let vault = load_secret_snapshot(temp_dir.path()).await;
     assert_eq!(vault.get("DAYTONA_API_KEY"), Some(api_key));
 }
 

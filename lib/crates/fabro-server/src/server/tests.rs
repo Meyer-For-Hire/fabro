@@ -2052,8 +2052,7 @@ fn slack_app_state_with_settings_and_secret_sources(
         store,
         artifact_store,
         db_pool: test_db_pool_for_vault_path(&vault_path).expect("test db pool should build"),
-        vault_path,
-        preloaded_vault: Some(vault),
+        preloaded_vault: vault,
         server_secrets: load_test_server_secrets(server_env_path, server_secret_env),
         env_lookup: default_env_lookup(),
         github_api_base_url: None,
@@ -2211,8 +2210,7 @@ fn slack_service_respects_disabled_server_config_even_with_vault_tokens() {
         store,
         artifact_store,
         db_pool: test_db_pool_for_vault_path(&vault_path).expect("test db pool should build"),
-        vault_path,
-        preloaded_vault: Some(vault),
+        preloaded_vault: vault,
         server_secrets: load_test_server_secrets(
             tempfile::tempdir().unwrap().path().join("server.env"),
             HashMap::new(),
@@ -2555,6 +2553,9 @@ methods = ["dev-token"]
     let (store, artifact_store) = test_store_bundle();
     let vault_path = test_secret_store_path();
     let server_env_path = vault_path.with_file_name("server.env");
+    let db_pool = test_db_pool_for_vault_path(&vault_path).expect("test db pool should build");
+    let preloaded_vault = crate::test_support::test_secret_snapshot(db_pool.clone())
+        .expect("test secret snapshot should build");
     let Err(err) = build_app_state(AppStateConfig {
         resolved_settings: resolved_runtime_settings_for_tests(
             server_settings,
@@ -2565,9 +2566,8 @@ methods = ["dev-token"]
         max_concurrent_runs: 5,
         store,
         artifact_store,
-        db_pool: test_db_pool_for_vault_path(&vault_path).expect("test db pool should build"),
-        vault_path,
-        preloaded_vault: None,
+        db_pool,
+        preloaded_vault,
         server_secrets: ServerSecrets::load(server_env_path, HashMap::new()).unwrap(),
         env_lookup: default_env_lookup(),
         github_api_base_url: None,
@@ -2679,6 +2679,8 @@ async fn build_app_state_migrates_legacy_vault_file_on_boot() {
 
 fn build_test_app_state_with_vault_path(vault_path: &Path) -> anyhow::Result<Arc<AppState>> {
     let (store, artifact_store) = test_store_bundle();
+    let db_pool = test_db_pool_for_vault_path(vault_path)?;
+    let preloaded_vault = crate::test_support::test_secret_snapshot(db_pool.clone())?;
     build_app_state(AppStateConfig {
         resolved_settings: resolved_runtime_settings_for_tests(
             default_test_server_settings(),
@@ -2689,9 +2691,8 @@ fn build_test_app_state_with_vault_path(vault_path: &Path) -> anyhow::Result<Arc
         max_concurrent_runs: 5,
         store,
         artifact_store,
-        db_pool: test_db_pool_for_vault_path(vault_path)?,
-        vault_path: vault_path.to_path_buf(),
-        preloaded_vault: None,
+        db_pool,
+        preloaded_vault,
         server_secrets: load_test_server_secrets(
             vault_path.with_file_name("server.env"),
             HashMap::new(),
@@ -6059,6 +6060,8 @@ fn create_github_token_app_state_with_env_lookup_and_llm_catalog_settings(
             .expect("test github token should be writable");
     }
     let db_pool = test_db_pool_for_vault_path(&vault_path).expect("test db pool should build");
+    let preloaded_vault = crate::test_support::test_secret_snapshot(db_pool.clone())
+        .expect("test secret snapshot should build");
     let config = AppStateConfig {
         resolved_settings: resolved_runtime_settings_for_tests(
             github_token_settings(),
@@ -6070,8 +6073,7 @@ fn create_github_token_app_state_with_env_lookup_and_llm_catalog_settings(
         store,
         artifact_store,
         db_pool,
-        vault_path,
-        preloaded_vault: None,
+        preloaded_vault,
         server_secrets: load_test_server_secrets(server_env_path, HashMap::new()),
         env_lookup: Arc::new(env_lookup),
         github_api_base_url,

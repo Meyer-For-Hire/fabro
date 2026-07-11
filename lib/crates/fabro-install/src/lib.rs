@@ -10,8 +10,8 @@ use fabro_config::{Storage, envfile};
 use fabro_static::EnvVars;
 use fabro_types::settings::run::EnvironmentProvider;
 use fabro_util::dev_token;
-pub use fabro_vault::SecretStoreWrite as VaultSecretWrite;
-use fabro_vault::{SecretStore, import_legacy_json_once};
+use fabro_vault::SecretStore;
+pub use fabro_vault::SecretStoreWrite;
 
 #[derive(Debug, Clone, Copy)]
 pub struct PendingSettingsWrite<'a> {
@@ -60,7 +60,7 @@ pub struct InstallPersistencePlan<'a> {
     pub server_env_writes:   Vec<envfile::EnvFileUpdate>,
     pub server_env_removals: Vec<envfile::EnvFileRemoval>,
     pub dev_token_write:     Option<PendingDevTokenWrite>,
-    pub vault_writes:        Vec<VaultSecretWrite>,
+    pub vault_writes:        Vec<SecretStoreWrite>,
     pub vault_removals:      Vec<String>,
 }
 
@@ -577,7 +577,7 @@ fn persist_server_env_secrets(
 
 async fn persist_vault_secrets_direct(
     storage_dir: &Path,
-    secrets: &[VaultSecretWrite],
+    secrets: &[SecretStoreWrite],
     removals: &[String],
 ) -> Result<()> {
     if secrets.is_empty() && removals.is_empty() {
@@ -585,9 +585,8 @@ async fn persist_vault_secrets_direct(
     }
 
     let storage = Storage::new(storage_dir);
-    let database = open_migrated_database(storage_dir).await?;
-    import_legacy_json_once(database.pool(), storage.secrets_path()).await?;
-    SecretStore::new(database.clone_pool())
+    SecretStore::open(storage.sqlite_path(), storage.secrets_path())
+        .await?
         .apply(removals, secrets)
         .await?;
     Ok(())
@@ -690,28 +689,13 @@ impl InstallPersistencePlan<'_> {
 
         Ok(())
     }
-
-    pub async fn persist_with_secret_store(
-        &self,
-        store: &SecretStore,
-    ) -> std::result::Result<(), PersistInstallOutputsError> {
-        let removed_env_keys = self.persist_files()?;
-        if let Err(err) = store
-            .apply(&self.vault_removals, &self.vault_writes)
-            .await
-            .map_err(anyhow::Error::new)
-        {
-            return Err(self.secret_persistence_error(err, removed_env_keys));
-        }
-        Ok(())
-    }
 }
 
 pub async fn persist_install_outputs_direct(
     storage_dir: &Path,
     server_env_writes: &[envfile::EnvFileUpdate],
     server_env_removals: &[envfile::EnvFileRemoval],
-    vault_secrets: &[VaultSecretWrite],
+    vault_secrets: &[SecretStoreWrite],
     settings_write: Option<&PendingSettingsWrite<'_>>,
 ) -> std::result::Result<(), PersistInstallOutputsError> {
     InstallPersistencePlan {
@@ -739,11 +723,9 @@ mod tests {
     use fabro_vault::{SecretType as VaultSecretType, Vault};
 
     async fn load_secret_snapshot(storage: &Storage) -> Vault {
-        let database = fabro_db::Database::connect(storage.sqlite_path())
+        SecretStore::open(storage.sqlite_path(), storage.secrets_path())
             .await
-            .unwrap();
-        database.migrate().await.unwrap();
-        SecretStore::new(database.clone_pool())
+            .unwrap()
             .snapshot()
             .await
             .unwrap()
@@ -754,7 +736,7 @@ mod tests {
         InstallListenConfig, InstallObjectStoreCredentialMode, InstallObjectStoreSelection,
         InstallPersistencePlan, InstallSandboxSelection, OBJECT_STORE_ACCESS_KEY_ID_ENV,
         OBJECT_STORE_MANAGED_COMMENT, OBJECT_STORE_SECRET_ACCESS_KEY_ENV, PendingSettingsWrite,
-        SecretStore, VaultSecretWrite, default_web_url, merge_server_settings,
+        SecretStore, SecretStoreWrite, default_web_url, merge_server_settings,
         persist_install_outputs_direct, prepare_dev_token_write_for_install, set_cli_target_http,
         set_server_listen, write_github_app_settings, write_object_store_settings,
         write_sandbox_settings,
@@ -1036,7 +1018,7 @@ stale = "remove-me"
                 comment: None,
             }],
             &[],
-            &[VaultSecretWrite {
+            &[SecretStoreWrite {
                 name:        "bad-secret-name".to_string(),
                 value:       "boom".to_string(),
                 secret_type: VaultSecretType::Token,
@@ -1085,7 +1067,7 @@ stale = "remove-me"
             server_env_writes:   Vec::new(),
             server_env_removals: Vec::new(),
             dev_token_write:     None,
-            vault_writes:        vec![VaultSecretWrite {
+            vault_writes:        vec![SecretStoreWrite {
                 name:        "NEW_SECRET".to_string(),
                 value:       "new".to_string(),
                 secret_type: VaultSecretType::Token,
@@ -1129,7 +1111,7 @@ stale = "remove-me"
             }],
             server_env_removals: Vec::new(),
             dev_token_write:     None,
-            vault_writes:        vec![VaultSecretWrite {
+            vault_writes:        vec![SecretStoreWrite {
                 name:        "bad-secret-name".to_string(),
                 value:       "boom".to_string(),
                 secret_type: VaultSecretType::Token,
@@ -1252,7 +1234,7 @@ stale = "remove-me"
             server_env_writes:   Vec::new(),
             server_env_removals: Vec::new(),
             dev_token_write:     prepared.write,
-            vault_writes:        vec![VaultSecretWrite {
+            vault_writes:        vec![SecretStoreWrite {
                 name:        "bad-secret-name".to_string(),
                 value:       "boom".to_string(),
                 secret_type: VaultSecretType::Token,
