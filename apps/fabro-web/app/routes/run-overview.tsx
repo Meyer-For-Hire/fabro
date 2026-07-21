@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router";
 import { ApiError } from "../lib/api-client";
 import { useRun, useRunGraph, useRunGraphSource, useRunStages } from "../lib/queries";
@@ -67,7 +67,10 @@ export default function RunOverview() {
   const innerRef = useRef<HTMLDivElement>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
   const navigate = useNavigate();
-  const [view, setView] = useRememberedGraphView(id);
+  const [viewTB, setViewTB] = useRememberedGraphView(id ? `${id}-TB` : undefined);
+  const [viewLR, setViewLR] = useRememberedGraphView(id ? `${id}-LR` : undefined);
+  const view = activeDirection === "LR" ? viewLR : viewTB;
+  const setView = activeDirection === "LR" ? setViewLR : setViewTB;
   const dragState = useRef<{ startX: number; startY: number; startPanX: number; startPanY: number } | null>(null);
   const [hoveredNode, setHoveredNode] = useState<RunGraphNodeHover | null>(null);
 
@@ -101,7 +104,7 @@ export default function RunOverview() {
         y: drag.startPanY + e.clientY - drag.startY,
       },
     }));
-  }, []);
+  }, [setView]);
 
   const onPointerUp = useCallback(() => {
     dragState.current = null;
@@ -116,11 +119,11 @@ export default function RunOverview() {
     if (e.ctrlKey || e.metaKey) {
       const r = el.getBoundingClientRect();
       const cursor = { x: e.clientX - (r.left + r.width / 2), y: e.clientY - (r.top + r.height / 2) };
-      setView((v) => zoomAtPoint(v, wheelZoomFactor(e.deltaY), cursor));
+      setView((v) => zoomAtPoint(v, wheelZoomFactor(e.deltaY), cursor, activeDirection));
     } else {
       setView((v) => ({ ...v, pan: { x: v.pan.x - e.deltaX, y: v.pan.y - e.deltaY } }));
     }
-  }, []);
+  }, [activeDirection, setView]);
   // The container only exists once the graph has loaded, so gate the listener on
   // graphSvg. The effect then re-runs and binds once the container is on the page.
   useElementEvent(containerRef, "wheel", onWheel, WHEEL_LISTENER_OPTS, Boolean(graphSvg));
@@ -137,8 +140,8 @@ export default function RunOverview() {
     const containerH = container.clientHeight - padPx;
 
     const fitPct = Math.min(containerW / svgW, containerH / svgH) * 100;
-    setView({ zoom: clampZoom(fitPct), pan: { x: 0, y: 0 } });
-  }, []);
+    setView({ zoom: clampZoom(fitPct, activeDirection), pan: { x: 0, y: 0 } });
+  }, [activeDirection, setView]);
 
   return (
     <div className="flex min-h-0 flex-1 gap-6">
@@ -159,7 +162,7 @@ export default function RunOverview() {
               setDirection={setDirection}
               fitToWindow={fitToWindow}
               zoom={view.zoom}
-              onZoomBy={(factor) => setView((v) => zoomAtPoint(v, factor))}
+              onZoomBy={(factor) => setView((v) => zoomAtPoint(v, factor, undefined, activeDirection))}
             />
 
             <div
