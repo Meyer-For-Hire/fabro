@@ -2502,12 +2502,10 @@ mod tests {
         assert!(!server_env.contains_key(EnvVars::GITHUB_APP_CLIENT_SECRET));
         assert!(!server_env.contains_key(EnvVars::GITHUB_APP_WEBHOOK_SECRET));
 
-        let vault = fabro_vault::SecretStore::open(storage.sqlite_path(), storage.secrets_path())
-            .await
-            .unwrap()
-            .snapshot()
-            .await
-            .unwrap();
+        let vault =
+            fabro_vault::SecretStore::open_snapshot(storage.sqlite_path(), storage.secrets_path())
+                .await
+                .unwrap();
         assert_eq!(vault.get(EnvVars::GITHUB_TOKEN), None);
         assert_eq!(
             vault.get(EnvVars::GITHUB_APP_CLIENT_SECRET),

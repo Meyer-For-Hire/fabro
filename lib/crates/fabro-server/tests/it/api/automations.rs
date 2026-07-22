@@ -2,11 +2,13 @@ use std::path::{Path, PathBuf};
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
+use fabro_config::Storage;
 use fabro_server::server::build_router;
 use fabro_server::test_support::{
     TestAppStateBuilder, TestAutomationRunMaterializer, build_test_router, test_auth_mode,
 };
 use serde_json::{Value, json};
+use sqlx::Row as _;
 use tower::ServiceExt;
 
 use crate::helpers::{
@@ -62,17 +64,20 @@ fn replacement_body(name: &str) -> Value {
 fn automation_app() -> (axum::Router, tempfile::TempDir, PathBuf) {
     let temp_dir = tempfile::tempdir().expect("automation test tempdir should be created");
     let active_config_path = temp_dir.path().join("settings.toml");
-    let automation_dir = temp_dir.path().join("automations");
+    let vault_path = temp_dir.path().join("secrets.json");
+    let sqlite_path = Storage::new(temp_dir.path()).sqlite_path();
     let state = TestAppStateBuilder::new()
         .active_config_path(active_config_path)
+        .vault_path(vault_path)
         .build();
-    (build_test_router(state), temp_dir, automation_dir)
+    (build_test_router(state), temp_dir, sqlite_path)
 }
 
 fn automation_app_with_fake_materializer() -> (axum::Router, tempfile::TempDir, PathBuf) {
     let temp_dir = tempfile::tempdir().expect("automation test tempdir should be created");
     let active_config_path = temp_dir.path().join("settings.toml");
-    let automation_dir = temp_dir.path().join("automations");
+    let vault_path = temp_dir.path().join("secrets.json");
+    let sqlite_path = Storage::new(temp_dir.path()).sqlite_path();
     let materialized_manifest: fabro_api::types::RunManifest =
         serde_json::from_value(minimal_manifest_json(MINIMAL_DOT))
             .expect("minimal run manifest fixture should deserialize");
@@ -80,12 +85,13 @@ fn automation_app_with_fake_materializer() -> (axum::Router, tempfile::TempDir, 
         serde_json::to_vec(&materialized_manifest).expect("minimal run manifest should serialize");
     let state = TestAppStateBuilder::new()
         .active_config_path(active_config_path)
+        .vault_path(vault_path)
         .automation_materializer(TestAutomationRunMaterializer::succeed(
             materialized_manifest,
             submitted_manifest_bytes,
         ))
         .build();
-    (build_test_router(state), temp_dir, automation_dir)
+    (build_test_router(state), temp_dir, sqlite_path)
 }
 
 fn json_request(method: Method, path: &str, body: &Value) -> Request<Body> {
@@ -197,35 +203,36 @@ fn assert_schedule_trigger(body: &Value, expression: &str, enabled: bool) {
     );
 }
 
-async fn persisted_automation_toml(automation_dir: &Path, id: &str) -> toml::Value {
-    let persisted = tokio::fs::read_to_string(automation_dir.join(format!("{id}.toml")))
+async fn persisted_automation(sqlite_path: &Path, id: &str) -> Option<Value> {
+    let database = fabro_db::Database::connect(sqlite_path)
         .await
-        .expect("persisted automation TOML should be readable");
-    toml::from_str(&persisted).expect("persisted automation TOML should parse")
-}
-
-fn assert_persisted_schedule_trigger(body: &toml::Value, expression: &str, enabled: bool) {
-    let triggers = body
-        .get("triggers")
-        .and_then(toml::Value::as_array)
-        .expect("persisted automation TOML should include triggers");
-    let trigger = triggers
-        .iter()
-        .find(|trigger| trigger.get("id").and_then(toml::Value::as_str) == Some("nightly"))
-        .expect("persisted automation TOML should include nightly trigger");
-
-    assert_eq!(
-        trigger.get("type").and_then(toml::Value::as_str),
-        Some("schedule")
-    );
-    assert_eq!(
-        trigger.get("expression").and_then(toml::Value::as_str),
-        Some(expression)
-    );
-    assert_eq!(
-        trigger.get("enabled").and_then(toml::Value::as_bool),
-        Some(enabled)
-    );
+        .expect("automation test database should open");
+    let parent = sqlx::query("SELECT api_enabled FROM automations WHERE id = ?")
+        .bind(id)
+        .fetch_optional(database.pool())
+        .await
+        .expect("persisted automation should query")?;
+    let triggers = sqlx::query(
+        "SELECT id, enabled, expression FROM automation_triggers \
+         WHERE automation_id = ? ORDER BY id",
+    )
+    .bind(id)
+    .fetch_all(database.pool())
+    .await
+    .expect("persisted automation triggers should query")
+    .into_iter()
+    .map(|row| {
+        json!({
+            "id": row.get::<String, _>("id"),
+            "enabled": row.get::<bool, _>("enabled"),
+            "expression": row.get::<String, _>("expression")
+        })
+    })
+    .collect::<Vec<_>>();
+    Some(json!({
+        "api_enabled": parent.get::<bool, _>("api_enabled"),
+        "triggers": triggers
+    }))
 }
 
 #[tokio::test]
@@ -250,19 +257,60 @@ async fn empty_automation_list_returns_total_zero() {
 }
 
 #[tokio::test]
-async fn create_automation_persists_sibling_toml_file() {
-    let (app, _temp_dir, automation_dir) = automation_app();
+async fn create_automation_persists_sql_aggregate() {
+    let (app, _temp_dir, sqlite_path) = automation_app();
 
     let body = create_automation(&app, "nightly", "Nightly").await;
 
     assert_eq!(body["id"], "nightly");
     assert_eq!(body["name"], "Nightly");
-    assert!(automation_dir.join("nightly.toml").exists());
+    assert_eq!(
+        persisted_automation(&sqlite_path, "nightly").await,
+        Some(json!({
+            "api_enabled": true,
+            "triggers": [{
+                "id": "nightly",
+                "enabled": true,
+                "expression": "0 3 * * *"
+            }]
+        }))
+    );
 }
 
 #[tokio::test]
-async fn schedule_trigger_round_trips_through_create_list_get_and_toml() {
-    let (app, _temp_dir, automation_dir) = automation_app();
+async fn automation_persists_across_app_rebuild() {
+    let temp_dir = tempfile::tempdir().expect("automation test tempdir should be created");
+    let active_config_path = temp_dir.path().join("settings.toml");
+    let vault_path = temp_dir.path().join("secrets.json");
+    let state = TestAppStateBuilder::new()
+        .active_config_path(active_config_path.clone())
+        .vault_path(vault_path.clone())
+        .build();
+    let app = build_test_router(state);
+    let created = create_automation(&app, "nightly", "Nightly").await;
+    drop(app);
+
+    let state = TestAppStateBuilder::new()
+        .active_config_path(active_config_path)
+        .vault_path(vault_path)
+        .build();
+    let response = build_test_router(state)
+        .oneshot(empty_request(Method::GET, "/automations/nightly"))
+        .await
+        .expect("get persisted automation should respond");
+    let retrieved = response_json(
+        response,
+        StatusCode::OK,
+        "GET /api/v1/automations/nightly after app rebuild",
+    )
+    .await;
+
+    assert_eq!(retrieved, created);
+}
+
+#[tokio::test]
+async fn schedule_trigger_round_trips_through_create_list_get_and_sql() {
+    let (app, _temp_dir, sqlite_path) = automation_app();
 
     let created = create_automation(&app, "nightly", "Nightly").await;
     assert_schedule_trigger(&created, "0 3 * * *", true);
@@ -283,11 +331,43 @@ async fn schedule_trigger_round_trips_through_create_list_get_and_toml() {
     let list = response_json(response, StatusCode::OK, "GET /api/v1/automations").await;
     assert_schedule_trigger(&list["data"][0], "0 3 * * *", true);
 
-    let persisted = persisted_automation_toml(&automation_dir, "nightly").await;
-    assert_persisted_schedule_trigger(&persisted, "0 3 * * *", true);
-    assert!(persisted.get("id").is_none());
-    assert!(persisted.get("revision").is_none());
-    assert!(persisted.get("enabled").is_none());
+    assert_eq!(
+        persisted_automation(&sqlite_path, "nightly")
+            .await
+            .expect("automation should be persisted")["triggers"][0],
+        json!({
+            "id": "nightly",
+            "enabled": true,
+            "expression": "0 3 * * *"
+        })
+    );
+}
+
+#[tokio::test]
+async fn invalid_stored_automation_returns_internal_server_error() {
+    let (app, _temp_dir, sqlite_path) = automation_app();
+    create_automation(&app, "nightly", "Nightly").await;
+    let database = fabro_db::Database::connect(sqlite_path)
+        .await
+        .expect("automation test database should open");
+    sqlx::query(
+        "UPDATE automation_triggers SET expression = 'not cron' WHERE automation_id = 'nightly'",
+    )
+    .execute(database.pool())
+    .await
+    .expect("stored schedule should be corrupted for the test");
+
+    let response = app
+        .oneshot(empty_request(Method::GET, "/automations/nightly"))
+        .await
+        .expect("get invalid stored automation should respond");
+
+    response_status(
+        response,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "GET /api/v1/automations/nightly with invalid stored schedule",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -386,7 +466,7 @@ async fn replace_automation_accepts_unquoted_if_match_and_returns_new_etag() {
 
 #[tokio::test]
 async fn replace_automation_round_trips_schedule_trigger() {
-    let (app, _temp_dir, automation_dir) = automation_app();
+    let (app, _temp_dir, sqlite_path) = automation_app();
     let created = create_automation(&app, "nightly", "Nightly").await;
     let revision = revision_from(&created);
     let mut replacement = replacement_body("Rescheduled");
@@ -416,8 +496,16 @@ async fn replace_automation_round_trips_schedule_trigger() {
     let body = response_json(response, StatusCode::OK, "PUT /api/v1/automations/nightly").await;
 
     assert_schedule_trigger(&body, "30 4 * * *", false);
-    let persisted = persisted_automation_toml(&automation_dir, "nightly").await;
-    assert_persisted_schedule_trigger(&persisted, "30 4 * * *", false);
+    assert_eq!(
+        persisted_automation(&sqlite_path, "nightly")
+            .await
+            .expect("automation should be persisted")["triggers"][0],
+        json!({
+            "id": "nightly",
+            "enabled": false,
+            "expression": "30 4 * * *"
+        })
+    );
 }
 
 #[tokio::test]
@@ -495,8 +583,8 @@ async fn replace_and_delete_automation_require_if_match() {
 }
 
 #[tokio::test]
-async fn delete_automation_removes_file_and_resource() {
-    let (app, _temp_dir, automation_dir) = automation_app();
+async fn delete_automation_removes_sql_aggregate() {
+    let (app, _temp_dir, sqlite_path) = automation_app();
     let created = create_automation(&app, "nightly", "Nightly").await;
     let revision = revision_from(&created);
 
@@ -517,7 +605,11 @@ async fn delete_automation_removes_file_and_resource() {
     )
     .await;
 
-    assert!(!automation_dir.join("nightly.toml").exists());
+    assert!(
+        persisted_automation(&sqlite_path, "nightly")
+            .await
+            .is_none()
+    );
     let response = app
         .oneshot(empty_request(Method::GET, "/automations/nightly"))
         .await
@@ -668,6 +760,69 @@ async fn automation_store_malformed_persisted_toml_fails_startup() {
         .try_build();
 
     assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn legacy_automation_is_imported_and_directory_is_backed_up() {
+    let temp_dir = tempfile::tempdir().expect("automation test tempdir should be created");
+    let automation_dir = temp_dir.path().join("automations");
+    tokio::fs::create_dir_all(&automation_dir)
+        .await
+        .expect("automation dir should be created");
+    tokio::fs::write(
+        automation_dir.join("nightly.toml"),
+        r#"name = "Legacy nightly"
+
+[target]
+repository = "fabro-sh/fabro"
+ref = "main"
+workflow = "release"
+
+[[triggers]]
+type = "api"
+id = "manual"
+enabled = true
+"#,
+    )
+    .await
+    .expect("legacy automation fixture should be written");
+    let state = TestAppStateBuilder::new()
+        .active_config_path(temp_dir.path().join("settings.toml"))
+        .vault_path(temp_dir.path().join("secrets.json"))
+        .build();
+
+    let response = build_test_router(state)
+        .oneshot(empty_request(Method::GET, "/automations/nightly"))
+        .await
+        .expect("get imported automation should respond");
+    let body = response_json(
+        response,
+        StatusCode::OK,
+        "GET /api/v1/automations/nightly after legacy import",
+    )
+    .await;
+
+    assert_eq!(body["name"], "Legacy nightly");
+    assert!(!automation_dir.exists());
+    let mut entries = tokio::fs::read_dir(temp_dir.path())
+        .await
+        .expect("storage directory should be readable");
+    let mut backup_exists = false;
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .expect("storage directory entry should be readable")
+    {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("automations.imported-")
+        {
+            backup_exists = true;
+            break;
+        }
+    }
+    assert!(backup_exists);
 }
 
 #[tokio::test]

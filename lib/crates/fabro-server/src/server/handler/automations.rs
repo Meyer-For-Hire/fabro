@@ -46,17 +46,20 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         )
 }
 
-async fn list_automations(_auth: RequiredUser, State(state): State<Arc<AppState>>) -> Response {
-    let data = state.automation_store().list().await;
+async fn list_automations(
+    _auth: RequiredUser,
+    State(state): State<Arc<AppState>>,
+) -> Result<Response, ApiError> {
+    let data = state.automation_store().list().await?;
     let total = data.len();
-    (
+    Ok((
         StatusCode::OK,
         Json(AutomationListResponse {
             data,
             meta: AutomationListMeta { total },
         }),
     )
-        .into_response()
+        .into_response())
 }
 
 async fn list_automation_runs(
@@ -69,8 +72,12 @@ async fn list_automation_runs(
         Ok(id) => id,
         Err(err) => return err.into_response(),
     };
-    if state.automation_store().get(&id).await.is_none() {
-        return ApiError::not_found(format!("automation not found: {id}")).into_response();
+    match state.automation_store().exists(&id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return ApiError::not_found(format!("automation not found: {id}")).into_response();
+        }
+        Err(err) => return ApiError::from(err).into_response(),
     }
 
     let entries = match state
@@ -126,8 +133,12 @@ async fn create_automation_run(
         Ok(id) => id,
         Err(err) => return err.into_response(),
     };
-    let Some(automation) = state.automation_store().get(&id).await else {
-        return ApiError::not_found(format!("automation not found: {id}")).into_response();
+    let automation = match state.automation_store().get(&id).await {
+        Ok(Some(automation)) => automation,
+        Ok(None) => {
+            return ApiError::not_found(format!("automation not found: {id}")).into_response();
+        }
+        Err(err) => return ApiError::from(err).into_response(),
     };
     let Some(api_trigger) = automation.enabled_api_trigger() else {
         return ApiError::with_code(
@@ -210,7 +221,7 @@ async fn get_automation(
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
     let id = parse_path_id(id)?;
-    match state.automation_store().get(&id).await {
+    match state.automation_store().get(&id).await? {
         Some(automation) => Ok(automation_with_etag_response(StatusCode::OK, automation)),
         None => Err(ApiError::not_found(format!("automation not found: {id}"))),
     }
@@ -273,18 +284,13 @@ impl From<AutomationStoreError> for ApiError {
             AutomationStoreError::Validation { source } => {
                 Self::new(StatusCode::UNPROCESSABLE_ENTITY, source.to_string())
             }
-            // The handlers parse `If-Match` before reaching the store, so a
-            // missing-revision error from the store would indicate an internal
-            // bug rather than a client problem.
-            AutomationStoreError::MissingRevision { .. }
-            | AutomationStoreError::InvalidFilename { .. }
-            | AutomationStoreError::Parse { .. }
-            | AutomationStoreError::InvalidUtf8 { .. }
-            | AutomationStoreError::Serialize { .. }
-            | AutomationStoreError::Io { .. } => Self::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "automation store operation failed",
-            ),
+            err => {
+                tracing::error!(error = ?err, "Automation store operation failed");
+                Self::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "automation store operation failed",
+                )
+            }
         }
     }
 }

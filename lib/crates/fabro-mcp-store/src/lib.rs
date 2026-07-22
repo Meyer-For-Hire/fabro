@@ -10,4 +10,5 @@ mod model;
 mod store;
 
 pub use error::McpServerStoreError;
-pub use store::{ImportReport, McpServerStore, import_legacy_directory_once};
+pub use fabro_db::ImportReport;
+pub use store::{McpServerStore, import_legacy_directory_once};

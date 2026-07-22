@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
 use std::sync::RwLock;
 
-use fabro_db::{DbPool, legacy};
+use chrono::Utc;
+use fabro_db::{DbPool, ImportReport};
 use fabro_types::settings::run::{McpHttpProtocol, McpServerSettings, McpTransport};
 use fabro_types::{
     McpServerDefinition, McpServerDraft, McpServerId, McpServerReplace, McpServerRevision,
@@ -33,15 +34,6 @@ pub struct McpServerStore {
     pool:      DbPool,
     mutations: Mutex<()>,
     defs:      RwLock<HashMap<McpServerId, McpServerDefinition>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ImportReport {
-    pub source_path:    PathBuf,
-    pub backup_path:    PathBuf,
-    pub imported_rows:  usize,
-    pub skipped_rows:   usize,
-    pub mcp_server_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Display, EnumString, IntoStaticStr)]
@@ -642,14 +634,14 @@ pub async fn import_legacy_directory_once(
         backup_path,
         imported_rows: imported_ids.len(),
         skipped_rows,
-        mcp_server_ids: imported_ids,
+        names: imported_ids,
     };
     info!(
         source_path = %report.source_path.display(),
         backup_path = %report.backup_path.display(),
         imported_rows = report.imported_rows,
         skipped_rows = report.skipped_rows,
-        mcp_server_ids = ?report.mcp_server_ids,
+        mcp_server_ids = ?report.names,
         "Imported legacy MCP server directory into SQLite"
     );
     Ok(Some(report))
@@ -675,7 +667,7 @@ async fn legacy_definition_paths(
             .file_type()
             .await
             .map_err(|source| McpServerStoreError::io(&path, source))?;
-        if file_type.is_file() && legacy::is_toml_file(&path) {
+        if file_type.is_file() && is_toml_file(&path) {
             paths.push((id_from_path(&path)?, path));
         }
     }
@@ -711,14 +703,22 @@ fn id_from_path(path: &Path) -> Result<McpServerId, McpServerStoreError> {
     })
 }
 
+fn is_toml_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension == "toml")
+}
+
 async fn rename_imported_legacy_directory(
     source_dir: &Path,
 ) -> Result<PathBuf, McpServerStoreError> {
-    legacy::rename_to_legacy_backup(source_dir, "mcps")
+    let backup_path = fabro_db::legacy_backup_path(source_dir, "mcps", Utc::now());
+    fs::rename(source_dir, &backup_path)
         .await
-        .map_err(|err| McpServerStoreError::LegacyBackup {
+        .map_err(|source| McpServerStoreError::LegacyBackup {
             source_path: source_dir.to_path_buf(),
-            backup_path: err.backup_path,
-            source:      err.source,
-        })
+            backup_path: backup_path.clone(),
+            source,
+        })?;
+    Ok(backup_path)
 }

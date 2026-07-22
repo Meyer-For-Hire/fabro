@@ -252,6 +252,10 @@ impl TestAppStateBuilder {
             &vault_path,
             self.default_environment_provider,
         )?;
+        import_test_legacy_automations(
+            db_pool.clone(),
+            server::automation_dir_for_active_config(&active_config_path),
+        )?;
         let preloaded_vault = test_secret_snapshot(db_pool.clone())?;
         build_app_state(AppStateConfig {
             resolved_settings: resolved_runtime_settings_for_tests(
@@ -579,6 +583,26 @@ fn test_db_pool(
     })
     .join()
     .expect("test database setup thread should not panic")
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "sync test builders may run inside async tests; a short-lived OS thread avoids nested Tokio runtimes"
+)]
+fn import_test_legacy_automations(pool: DbPool, source_dir: PathBuf) -> anyhow::Result<()> {
+    std::thread::spawn(move || {
+        let runtime = TokioRuntimeBuilder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime
+            .block_on(fabro_automation::import_legacy_directory_once(
+                &pool, source_dir,
+            ))
+            .map(|_| ())
+            .map_err(anyhow::Error::new)
+    })
+    .join()
+    .expect("test automation import thread should not panic")
 }
 
 pub fn test_app_state_with_store_and_runtime_settings(

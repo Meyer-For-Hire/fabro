@@ -113,6 +113,7 @@ tower = "0.5"
 http-body-util = "0.1"
 httpmock = "0.8"
 serde_yaml = "0.9"
+sqlx.workspace = true
 tracing-subscriber.workspace = true
 tokio-util.workspace = true
 tokio-tungstenite.workspace = true

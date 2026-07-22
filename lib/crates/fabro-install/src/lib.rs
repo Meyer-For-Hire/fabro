@@ -723,10 +723,7 @@ mod tests {
     use fabro_vault::{SecretType as VaultSecretType, Vault};
 
     async fn load_secret_snapshot(storage: &Storage) -> Vault {
-        SecretStore::open(storage.sqlite_path(), storage.secrets_path())
-            .await
-            .unwrap()
-            .snapshot()
+        SecretStore::open_snapshot(storage.sqlite_path(), storage.secrets_path())
             .await
             .unwrap()
             .into_vault()

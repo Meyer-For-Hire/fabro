@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
 
 use chrono::{DateTime, Utc};
-use fabro_db::{Database, DbPool, legacy};
+use fabro_db::{Database, DbPool, ImportReport};
 use fabro_types::{OAuthCredential, SecretMetadata, SecretType};
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row as _, Sqlite, Transaction};
@@ -87,15 +87,6 @@ pub enum SecretStoreError {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ImportReport {
-    pub source_path:   PathBuf,
-    pub backup_path:   PathBuf,
-    pub imported_rows: usize,
-    pub skipped_rows:  usize,
-    pub secret_names:  Vec<String>,
-}
-
 #[derive(Clone, PartialEq, Eq)]
 pub struct SecretStoreWrite {
     pub name:        String,
@@ -124,6 +115,10 @@ pub struct SecretStore {
 pub struct SecretSnapshot(Vault);
 
 impl SecretSnapshot {
+    /// Converts the snapshot into a path-less in-memory [`Vault`]. Mutations to
+    /// the returned vault are never persisted; callers that need durable writes
+    /// must go through [`SecretStore`] (see `SqlVaultCredentialSource`'s
+    /// before/after diffing for the OAuth refresh write-back).
     #[must_use]
     pub fn into_vault(self) -> Vault {
         self.0
@@ -168,6 +163,19 @@ impl SecretStore {
         Ok(Self::new(database.clone_pool()))
     }
 
+    /// Like [`SecretStore::open`], but returns a point-in-time snapshot of the
+    /// store instead of the store itself.
+    pub async fn open_snapshot(
+        sqlite_path: impl AsRef<Path>,
+        legacy_secrets_path: impl AsRef<Path>,
+    ) -> anyhow::Result<SecretSnapshot> {
+        let snapshot = Self::open(sqlite_path, legacy_secrets_path)
+            .await?
+            .snapshot()
+            .await?;
+        Ok(snapshot)
+    }
+
     pub async fn get(&self, name: &str) -> Result<Option<SecretEntry>, SecretStoreError> {
         let row = sqlx::query(
             "SELECT name, secret_type, value, description, revision, created_at, updated_at \
@@ -176,7 +184,10 @@ impl SecretStore {
         .bind(name)
         .fetch_optional(&self.pool)
         .await?;
-        row.as_ref().map(entry_from_row).transpose()
+        row.as_ref()
+            .map(entry_from_row)
+            .transpose()
+            .map(|entry| entry.map(|(_, entry)| entry))
     }
 
     pub async fn list(&self) -> Result<Vec<SecretMetadata>, SecretStoreError> {
@@ -284,7 +295,7 @@ impl SecretStore {
         .await?;
 
         if let Some(row) = row {
-            return entry_from_row(&row);
+            return entry_from_row(&row).map(|(_, entry)| entry);
         }
         match self.get(name).await? {
             Some(entry) => Err(SecretStoreError::StaleRevision {
@@ -305,8 +316,8 @@ impl SecretStore {
         .await?;
         let entries = rows
             .iter()
-            .map(|row| Ok((row.try_get::<String, _>("name")?, entry_from_row(row)?)))
-            .collect::<Result<HashMap<_, _>, SecretStoreError>>()?;
+            .map(entry_from_row)
+            .collect::<Result<HashMap<_, _>, _>>()?;
         Ok(SecretSnapshot(Vault::from_entries(entries)))
     }
 }
@@ -402,14 +413,14 @@ pub async fn import_legacy_json_once(
         backup_path,
         imported_rows: imported_names.len(),
         skipped_rows,
-        secret_names: imported_names,
+        names: imported_names,
     };
     info!(
         source_path = %report.source_path.display(),
         backup_path = %report.backup_path.display(),
         imported_rows = report.imported_rows,
         skipped_rows = report.skipped_rows,
-        secret_names = ?report.secret_names,
+        secret_names = ?report.names,
         removal_deadline = IMPORT_REMOVAL_DEADLINE,
         "Imported legacy secrets JSON into SQLite"
     );
@@ -440,7 +451,7 @@ async fn insert_legacy_entry(
     Ok(result.rows_affected() == 1)
 }
 
-fn entry_from_row(row: &SqliteRow) -> Result<SecretEntry, SecretStoreError> {
+fn entry_from_row(row: &SqliteRow) -> Result<(String, SecretEntry), SecretStoreError> {
     let metadata = metadata_from_row(row)?;
     let name = metadata.name;
     let value = row.try_get::<String, _>("value")?;
@@ -454,14 +465,15 @@ fn entry_from_row(row: &SqliteRow) -> Result<SecretEntry, SecretStoreError> {
     if revision <= 0 {
         return Err(SecretStoreError::StoredRevision { name, revision });
     }
-    Ok(SecretEntry {
+    let entry = SecretEntry {
         value,
         secret_type: metadata.secret_type,
         description: metadata.description,
         created_at: metadata.created_at,
         updated_at: metadata.updated_at,
         revision,
-    })
+    };
+    Ok((name, entry))
 }
 
 fn metadata_from_row(row: &SqliteRow) -> Result<SecretMetadata, SecretStoreError> {
@@ -495,7 +507,7 @@ fn parse_timestamp(
     column: &'static str,
     value: &str,
 ) -> Result<DateTime<Utc>, SecretStoreError> {
-    fabro_db::parse_rfc3339_utc(value).map_err(|source| SecretStoreError::Timestamp {
+    fabro_db::parse_rfc3339(value).map_err(|source| SecretStoreError::Timestamp {
         name: name.to_string(),
         column,
         source,
@@ -529,11 +541,13 @@ fn validate_stored_name(name: &str, secret_type: SecretType) -> Result<(), Secre
 }
 
 async fn rename_imported_legacy_file(source_path: &Path) -> Result<PathBuf, SecretStoreError> {
-    legacy::rename_to_legacy_backup(source_path, "secrets.json")
+    let backup_path = fabro_db::legacy_backup_path(source_path, "secrets.json", Utc::now());
+    fs::rename(source_path, &backup_path)
         .await
-        .map_err(|err| SecretStoreError::LegacyBackup {
+        .map_err(|source| SecretStoreError::LegacyBackup {
             source_path: source_path.to_path_buf(),
-            backup_path: err.backup_path,
-            source:      err.source,
-        })
+            backup_path: backup_path.clone(),
+            source,
+        })?;
+    Ok(backup_path)
 }

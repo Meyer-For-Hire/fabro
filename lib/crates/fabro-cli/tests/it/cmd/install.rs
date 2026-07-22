@@ -14,10 +14,7 @@ use fabro_vault::{SecretType, Vault};
 const INSTALL_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 async fn load_secret_snapshot(storage: &Storage) -> Vault {
-    fabro_vault::SecretStore::open(storage.sqlite_path(), storage.secrets_path())
-        .await
-        .expect("test secret store should open")
-        .snapshot()
+    fabro_vault::SecretStore::open_snapshot(storage.sqlite_path(), storage.secrets_path())
         .await
         .expect("test secret snapshot should load")
         .into_vault()

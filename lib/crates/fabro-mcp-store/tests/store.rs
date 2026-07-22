@@ -233,7 +233,7 @@ async fn imports_legacy_directory_once_without_overwriting_sql() {
 
     assert_eq!(report.imported_rows, 1);
     assert_eq!(report.skipped_rows, 1);
-    assert_eq!(report.mcp_server_ids, vec!["new"]);
+    assert_eq!(report.names, vec!["new"]);
     assert!(!source.exists());
     assert!(report.backup_path.join("notes.txt").exists());
     let reloaded = McpServerStore::load(database.clone_pool()).await.unwrap();
