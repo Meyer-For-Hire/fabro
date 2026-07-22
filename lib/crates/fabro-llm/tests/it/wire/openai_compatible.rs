@@ -2,11 +2,15 @@
 //! `OpenAiCompatibleAdapter` (kimi, zai, minimax, venice, inception, ollama,
 //! litellm — all config-only routes over this adapter).
 
+use std::sync::Arc;
+
 use fabro_llm::provider::ProviderAdapter;
 use fabro_llm::providers::OpenAiCompatibleAdapter;
 use fabro_llm::types::{
-    Message, Request, ResponseFormat, ResponseFormatType, ToolChoice, ToolDefinition,
+    Message, ReasoningEffort, Request, ResponseFormat, ResponseFormatType, ToolChoice,
+    ToolDefinition,
 };
+use fabro_model::Catalog;
 use httpmock::prelude::*;
 
 use crate::support::{
@@ -229,6 +233,27 @@ async fn encode_response_format_json_schema() {
 async fn encode_sampling_params() {
     let capture = encode_capture(&corpus_sampling_params(MODEL)).await;
     fabro_test::fabro_json_snapshot!(capture.body);
+}
+
+#[tokio::test]
+async fn encode_kimi_k3_uses_catalog_reasoning_and_sampling_controls() {
+    let catalog = Arc::new(Catalog::from_builtin().expect("built-in catalog should build"));
+    let request = Request {
+        model: "kimi-k3".to_string(),
+        reasoning_effort: Some(ReasoningEffort::High),
+        temperature: Some(0.7),
+        top_p: Some(0.9),
+        ..base_request(MODEL)
+    };
+    let capture = encode_capture_with(&request, move |adapter| {
+        adapter.with_name("kimi").with_catalog(catalog)
+    })
+    .await;
+
+    assert_eq!(capture.body["model"], "kimi-k3");
+    assert_eq!(capture.body["reasoning_effort"], "high");
+    assert!(capture.body.get("temperature").is_none());
+    assert!(capture.body.get("top_p").is_none());
 }
 
 /// The provider_options namespace key is the runtime adapter NAME, not a

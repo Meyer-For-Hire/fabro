@@ -10,7 +10,9 @@ use fabro_llm::provider::ProviderAdapter;
 use fabro_llm::providers::{
     AnthropicAdapter, BedrockAdapter, GeminiAdapter, OpenAiAdapter, OpenAiCompatibleAdapter,
 };
-use fabro_llm::types::{CostSource, FinishReason, Message, Request};
+use fabro_llm::types::{
+    CostSource, FinishReason, Message, ReasoningEffort, Request, ToolChoice, ToolDefinition,
+};
 use fabro_model::Catalog;
 use fabro_static::EnvVars;
 
@@ -123,6 +125,74 @@ async fn openai_gpt_5_5_pro_complete() {
     assert!(response.usage.input_tokens > 0);
     assert!(response.usage.output_tokens > 0);
     assert_eq!(response.provider, "openai");
+}
+
+#[fabro_macros::e2e_test(live("KIMI_API_KEY"))]
+async fn kimi_k3_reasoning_tool_round_trip() {
+    let api_key = std::env::var(EnvVars::KIMI_API_KEY).expect("KIMI_API_KEY must be set");
+    let adapter = OpenAiCompatibleAdapter::new(api_key, "https://api.moonshot.ai/v1")
+        .with_name("kimi")
+        .with_catalog(Arc::new(Catalog::from_builtin().unwrap()));
+    let tool = ToolDefinition::function(
+        "multiply",
+        "Multiply two integers",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "a": {"type": "integer"},
+                "b": {"type": "integer"}
+            },
+            "required": ["a", "b"]
+        }),
+    );
+    let request = Request {
+        model: "kimi-k3".to_string(),
+        messages: vec![Message::user(
+            "Use the multiply tool to calculate 19 times 23. Do not calculate it yourself.",
+        )],
+        tools: Some(vec![tool]),
+        tool_choice: Some(ToolChoice::Required),
+        temperature: Some(0.0),
+        max_tokens: Some(4096),
+        reasoning_effort: Some(ReasoningEffort::Low),
+        ..make_request("kimi-k3")
+    };
+
+    let tool_response = adapter.complete(&request).await.unwrap();
+    assert_eq!(tool_response.finish_reason, FinishReason::ToolCalls);
+    assert!(
+        tool_response.reasoning().is_some(),
+        "K3 should return reasoning content before its tool call"
+    );
+    let tool_call = tool_response
+        .tool_calls()
+        .into_iter()
+        .next()
+        .expect("K3 should call the required tool");
+    assert_eq!(tool_call.name, "multiply");
+
+    let mut messages = request.messages.clone();
+    messages.push(tool_response.message);
+    messages.push(Message::tool_result(
+        tool_call.id,
+        serde_json::json!({"product": 437}),
+        false,
+    ));
+    let final_request = Request {
+        model: "kimi-k3".to_string(),
+        messages,
+        temperature: Some(0.0),
+        max_tokens: Some(2048),
+        reasoning_effort: Some(ReasoningEffort::Low),
+        ..make_request("kimi-k3")
+    };
+
+    let final_response = adapter.complete(&final_request).await.unwrap();
+    assert_eq!(final_response.finish_reason, FinishReason::Stop);
+    assert!(
+        final_response.text().contains("437"),
+        "K3 should incorporate the replayed tool result"
+    );
 }
 
 #[fabro_macros::e2e_test(twin)]

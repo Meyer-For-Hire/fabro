@@ -1,27 +1,29 @@
 //! Serde types mirroring the OpenAI Chat Completions wire shapes.
 
-use crate::types::TokenCounts;
+use crate::types::{ReasoningEffort, TokenCounts};
 
 #[derive(serde::Serialize)]
 pub(super) struct ApiRequest {
-    pub model:           String,
-    pub messages:        Vec<ChatMessage>,
+    pub model:            String,
+    pub messages:         Vec<ChatMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature:     Option<f64>,
+    pub temperature:      Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_tokens:      Option<i64>,
+    pub max_tokens:       Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub top_p:           Option<f64>,
+    pub top_p:            Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub stop:            Option<Vec<String>>,
+    pub reasoning_effort: Option<ReasoningEffort>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools:           Option<Vec<serde_json::Value>>,
+    pub stop:             Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_choice:     Option<serde_json::Value>,
+    pub tools:            Option<Vec<serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub response_format: Option<serde_json::Value>,
+    pub tool_choice:      Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub stream:          Option<bool>,
+    pub response_format:  Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream:           Option<bool>,
 }
 
 #[derive(serde::Serialize)]
