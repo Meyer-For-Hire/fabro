@@ -5,7 +5,10 @@
 
 use std::sync::Arc;
 
+use fabro_auth::ApiCredential;
+use fabro_llm::client::Client;
 use fabro_llm::error::ProviderErrorKind;
+use fabro_llm::model_test::{ModelTestStatus, run_model_test};
 use fabro_llm::provider::ProviderAdapter;
 use fabro_llm::providers::{
     AnthropicAdapter, BedrockAdapter, GeminiAdapter, OpenAiAdapter, OpenAiCompatibleAdapter,
@@ -13,7 +16,8 @@ use fabro_llm::providers::{
 use fabro_llm::types::{
     CostSource, FinishReason, Message, ReasoningEffort, Request, ToolChoice, ToolDefinition,
 };
-use fabro_model::Catalog;
+use fabro_model::catalog::{LlmCatalogSettings, ProviderCatalogSettings};
+use fabro_model::{Catalog, ModelTestMode, ProviderId};
 use fabro_static::EnvVars;
 
 fn make_request(model: &str) -> Request {
@@ -330,6 +334,42 @@ async fn openrouter_complete() {
         "OpenRouter responses should carry an authoritative usage.cost",
     );
     assert_eq!(response.cost_source, Some(CostSource::Authoritative));
+}
+
+#[fabro_macros::e2e_test(live("OPENROUTER_API_KEY"))]
+async fn openrouter_kimi_k3_deep_tool_round_trip() {
+    let api_key =
+        std::env::var(EnvVars::OPENROUTER_API_KEY).expect("OPENROUTER_API_KEY must be set");
+    let provider = ProviderId::new("openrouter");
+    let mut settings = LlmCatalogSettings::default();
+    settings
+        .providers
+        .insert(provider.to_string(), ProviderCatalogSettings {
+            enabled: Some(true),
+            ..ProviderCatalogSettings::default()
+        });
+    let catalog = Arc::new(
+        Catalog::from_builtin_with_overrides(&settings)
+            .expect("enabled OpenRouter catalog should build"),
+    );
+    let credential = ApiCredential::from_api_key(provider, api_key, &catalog)
+        .expect("OpenRouter credential should resolve from the catalog");
+    let client = Arc::new(
+        Client::from_credentials(vec![credential], Arc::clone(&catalog))
+            .await
+            .expect("OpenRouter client should build from the catalog"),
+    );
+    let model = catalog
+        .get("moonshotai/kimi-k3")
+        .expect("OpenRouter Kimi K3 should be present");
+
+    let outcome = run_model_test(model, ModelTestMode::Deep, client).await;
+    assert_eq!(
+        outcome.status,
+        ModelTestStatus::Ok,
+        "OpenRouter Kimi K3 deep test failed: {:?}",
+        outcome.error_message
+    );
 }
 
 async fn run_multi_turn_cache_test(
