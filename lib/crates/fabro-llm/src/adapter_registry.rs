@@ -311,6 +311,8 @@ mod tests {
             ("gpt-5.6-terra",                      "gpt-5.6-terra",                       T::OpenAi,            C::OpenAiResponses,   B::OpenAi,    P::OpenAi),
             ("kimi-k2.5",                          "kimi-k2.5",                           T::OpenAiCompatible,  C::OpenAiCompatible,  B::OpenAi,    P::OpenAi),
             ("kimi-k3",                            "kimi-k3",                             T::OpenAiCompatible,  C::OpenAiCompatible,  B::OpenAi,    P::OpenAi),
+            ("laguna-s-2.1",                       "poolside/laguna-s-2.1",                T::OpenAiCompatible,  C::OpenAiCompatible,  B::OpenAi,    P::OpenAi),
+            ("laguna-xs-2.1",                      "poolside/laguna-xs-2.1",               T::OpenAiCompatible,  C::OpenAiCompatible,  B::OpenAi,    P::OpenAi),
             ("mercury-2",                          "mercury-2",                           T::OpenAiCompatible,  C::OpenAiCompatible,  B::OpenAi,    P::OpenAi),
             ("minimax-m2.5",                       "minimax-m2.5",                        T::OpenAiCompatible,  C::OpenAiCompatible,  B::OpenAi,    P::OpenAi),
             ("venice-uncensored-1-2",              "venice-uncensored-1-2",               T::OpenAiCompatible,  C::OpenAiCompatible,  B::OpenAi,    P::OpenAi),

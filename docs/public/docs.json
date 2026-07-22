@@ -96,6 +96,7 @@
               "integrations/daytona",
               "integrations/litellm",
               "integrations/bedrock",
+              "integrations/poolside",
               "integrations/openrouter",
               "integrations/slack",
               "integrations/brave-search"

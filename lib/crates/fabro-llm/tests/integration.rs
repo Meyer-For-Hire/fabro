@@ -313,6 +313,31 @@ async fn bedrock_openai_frontier_complete() {
     assert_eq!(response.provider, "bedrock-openai");
 }
 
+#[fabro_macros::e2e_test(live("POOLSIDE_API_KEY"))]
+async fn poolside_laguna_xs_deep_tool_round_trip() {
+    let api_key = std::env::var(EnvVars::POOLSIDE_API_KEY).expect("POOLSIDE_API_KEY must be set");
+    let provider = ProviderId::new("poolside");
+    let catalog = Arc::new(Catalog::from_builtin().expect("built-in catalog should be valid"));
+    let credential = ApiCredential::from_api_key(provider, api_key, &catalog)
+        .expect("Poolside credential should resolve from the catalog");
+    let client = Arc::new(
+        Client::from_credentials(vec![credential], Arc::clone(&catalog))
+            .await
+            .expect("Poolside client should build from the catalog"),
+    );
+    let model = catalog
+        .get("laguna-xs-2.1")
+        .expect("direct Poolside Laguna XS should be present");
+
+    let outcome = run_model_test(model, ModelTestMode::Deep, client).await;
+    assert_eq!(
+        outcome.status,
+        ModelTestStatus::Ok,
+        "direct Poolside Laguna XS deep test failed: {:?}",
+        outcome.error_message
+    );
+}
+
 #[fabro_macros::e2e_test(live("OPENROUTER_API_KEY"))]
 async fn openrouter_complete() {
     let api_key =
@@ -320,6 +345,29 @@ async fn openrouter_complete() {
     let adapter = OpenAiCompatibleAdapter::new(api_key, "https://openrouter.ai/api/v1")
         .with_name("openrouter");
     let request = make_request("deepseek/deepseek-v4-flash");
+    let response = adapter.complete(&request).await.unwrap();
+
+    assert!(
+        !response.text().is_empty(),
+        "response text should not be empty"
+    );
+    assert!(response.usage.input_tokens > 0);
+    assert!(response.usage.output_tokens > 0);
+    assert_eq!(response.provider, "openrouter");
+    assert!(
+        response.cost_usd.is_some(),
+        "OpenRouter responses should carry an authoritative usage.cost",
+    );
+    assert_eq!(response.cost_source, Some(CostSource::Authoritative));
+}
+
+#[fabro_macros::e2e_test(live("OPENROUTER_API_KEY"))]
+async fn openrouter_poolside_laguna_complete() {
+    let api_key =
+        std::env::var(EnvVars::OPENROUTER_API_KEY).expect("OPENROUTER_API_KEY must be set");
+    let adapter = OpenAiCompatibleAdapter::new(api_key, "https://openrouter.ai/api/v1")
+        .with_name("openrouter");
+    let request = make_request("poolside/laguna-xs-2.1");
     let response = adapter.complete(&request).await.unwrap();
 
     assert!(

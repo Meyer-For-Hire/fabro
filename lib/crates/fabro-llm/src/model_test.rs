@@ -142,7 +142,7 @@ fn build_deep_test_params(info: &Model, client: Arc<Client>) -> Option<GenerateP
         .max_tool_rounds(5)
         .max_tokens(1024);
 
-    if info.features.reasoning {
+    if info.supports_reasoning_effort() {
         params = params.reasoning_effort(ReasoningEffort::High);
     }
 
@@ -238,6 +238,40 @@ mod tests {
             outcome.error_message.as_deref(),
             Some("model does not support tools")
         );
+    }
+
+    #[test]
+    fn deep_test_omits_effort_for_reasoning_without_effort_controls() {
+        let info = test_model_with(ModelFeatures {
+            tools:            true,
+            vision:           false,
+            reasoning:        true,
+            reasoning_effort: ReasoningEffortFeature::None,
+            prompt_cache:     true,
+            sampling_params:  true,
+        });
+
+        let params = build_deep_test_params(&info, empty_test_client())
+            .expect("tool-capable model should produce deep-test params");
+
+        assert_eq!(params.reasoning_effort, None);
+    }
+
+    #[test]
+    fn deep_test_uses_high_effort_when_supported() {
+        let info = test_model_with(ModelFeatures {
+            tools:            true,
+            vision:           false,
+            reasoning:        true,
+            reasoning_effort: ReasoningEffortFeature::Levels,
+            prompt_cache:     true,
+            sampling_params:  true,
+        });
+
+        let params = build_deep_test_params(&info, empty_test_client())
+            .expect("tool-capable model should produce deep-test params");
+
+        assert_eq!(params.reasoning_effort, Some(ReasoningEffort::High));
     }
 
     #[test]

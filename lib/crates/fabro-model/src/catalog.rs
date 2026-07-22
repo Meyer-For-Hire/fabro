@@ -2006,6 +2006,85 @@ enabled = true
     }
 
     #[test]
+    fn builtin_poolside_provider_routes_current_laguna_models() {
+        let poolside = ProviderId::new("poolside");
+        let catalog = Catalog::builtin();
+        let provider = catalog
+            .provider(&poolside)
+            .expect("Poolside provider should be active");
+
+        assert_eq!(provider.adapter, AdapterKind::OpenAiCompatible);
+        assert_eq!(provider.codec, CodecKind::OpenAiCompatible);
+        assert_eq!(provider.billing_policy, BillingPolicy::OpenAi);
+        assert_eq!(
+            provider.base_url.as_deref(),
+            Some("https://inference.poolside.ai/v1")
+        );
+        assert_eq!(provider.priority, 65);
+        assert_eq!(provider.auth.as_ref().unwrap().credentials, vec![
+            CredentialRef::Env("POOLSIDE_API_KEY".to_string()),
+            CredentialRef::Vault("POOLSIDE_API_KEY".to_string()),
+        ]);
+
+        assert_eq!(
+            catalog
+                .default_for_provider(&poolside)
+                .map(|model| model.id.as_str()),
+            Some("laguna-s-2.1")
+        );
+        assert_eq!(
+            catalog
+                .small_default_for_provider(&poolside)
+                .map(|model| model.id.as_str()),
+            Some("laguna-xs-2.1")
+        );
+        assert_eq!(
+            catalog
+                .probe_for_provider(&poolside)
+                .map(|model| model.id.as_str()),
+            Some("laguna-xs-2.1")
+        );
+
+        let s = catalog.get("laguna").expect("Laguna alias should resolve");
+        assert_eq!(s.id, "laguna-s-2.1");
+        assert_eq!(s.limits.context_window, 1_048_576);
+        assert_eq!(s.limits.max_output, Some(131_072));
+        assert!(s.features.tools);
+        assert!(s.features.reasoning);
+        assert!(s.features.prompt_cache);
+        assert!(s.features.sampling_params);
+        assert!(!s.features.vision);
+        assert!(!s.supports_reasoning_effort());
+        assert_eq!(s.costs.input_cost_per_mtok, Some(0.10));
+        assert_eq!(s.costs.output_cost_per_mtok, Some(0.20));
+        assert_eq!(s.costs.cache_input_cost_per_mtok, Some(0.01));
+        assert_eq!(
+            catalog.model_settings(&s.id).unwrap().api_id,
+            "poolside/laguna-s-2.1"
+        );
+
+        let xs = catalog
+            .get("laguna-xs")
+            .expect("Laguna XS alias should resolve");
+        assert_eq!(xs.id, "laguna-xs-2.1");
+        assert_eq!(xs.limits.context_window, 262_144);
+        assert_eq!(xs.limits.max_output, Some(32_768));
+        assert!(xs.features.tools);
+        assert!(xs.features.reasoning);
+        assert!(xs.features.prompt_cache);
+        assert!(xs.features.sampling_params);
+        assert!(!xs.features.vision);
+        assert!(!xs.supports_reasoning_effort());
+        assert_eq!(xs.costs.input_cost_per_mtok, Some(0.10));
+        assert_eq!(xs.costs.output_cost_per_mtok, Some(0.20));
+        assert_eq!(xs.costs.cache_input_cost_per_mtok, Some(0.05));
+        assert_eq!(
+            catalog.model_settings(&xs.id).unwrap().api_id,
+            "poolside/laguna-xs-2.1"
+        );
+    }
+
+    #[test]
     fn builtin_openrouter_provider_is_opt_in() {
         let openrouter = ProviderId::new("openrouter");
         let builtin = Catalog::builtin();
@@ -2119,6 +2198,58 @@ enabled = true
             ReasoningEffort::High,
             ReasoningEffort::Max,
         ]);
+    }
+
+    #[test]
+    fn builtin_openrouter_includes_poolside_laguna_when_enabled() {
+        let catalog = Catalog::from_builtin_with_overrides(&minimal_settings(
+            r"
+[providers.openrouter]
+enabled = true
+",
+        ))
+        .expect("enabled OpenRouter override should build from the built-in provider settings");
+
+        let expected = [
+            (
+                "poolside/laguna-s-2.1",
+                1_048_576,
+                131_072,
+                0.10,
+                0.20,
+                0.01,
+            ),
+            ("poolside/laguna-xs-2.1", 262_144, 32_768, 0.06, 0.12, 0.03),
+        ];
+
+        for (id, context, max_output, input, output, cache_read) in expected {
+            let model = catalog
+                .get(id)
+                .unwrap_or_else(|| panic!("OpenRouter model '{id}' should be present"));
+            assert_eq!(model.provider, ProviderId::new("openrouter"), "{id}");
+            assert_eq!(model.family, "laguna-2", "{id}");
+            assert_eq!(model.limits.context_window, context, "{id}");
+            assert_eq!(model.limits.max_output, Some(max_output), "{id}");
+            assert!(model.features.tools, "{id}");
+            assert!(model.features.reasoning, "{id}");
+            assert!(model.features.prompt_cache, "{id}");
+            assert!(model.features.sampling_params, "{id}");
+            assert!(!model.features.vision, "{id}");
+            assert!(!model.supports_reasoning_effort(), "{id}");
+            assert_eq!(model.costs.input_cost_per_mtok, Some(input), "{id}");
+            assert_eq!(model.costs.output_cost_per_mtok, Some(output), "{id}");
+            assert_eq!(
+                model.costs.cache_input_cost_per_mtok,
+                Some(cache_read),
+                "{id}"
+            );
+
+            let settings = catalog
+                .model_settings(id)
+                .unwrap_or_else(|| panic!("OpenRouter settings for '{id}' should be present"));
+            assert_eq!(settings.api_id, id, "{id}");
+            assert!(settings.controls.reasoning_effort.is_empty(), "{id}");
+        }
     }
 
     #[test]

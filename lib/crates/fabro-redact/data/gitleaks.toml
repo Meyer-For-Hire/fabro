@@ -2568,6 +2568,13 @@ entropy = 3
 keywords = ["sk-or-v1-"]
 
 [[rules]]
+id = "poolside-api-key"
+description = "Found a Poolside API Key, posing a risk of unauthorized model access and billing."
+regex = '''\b(sky_[A-Za-z0-9]{8}\.[A-Za-z0-9]{32})(?:['|\"|\n|\r|\s|\x60|;]|$)'''
+entropy = 3
+keywords = ["sky_"]
+
+[[rules]]
 id = "openshift-user-token"
 description = "Found an OpenShift user token, potentially compromising an OpenShift/Kubernetes cluster."
 regex = '''\b(sha256~[\w-]{43})(?:[^\w-]|\z)'''
