@@ -16,6 +16,7 @@ workspace = true
 anyhow.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
