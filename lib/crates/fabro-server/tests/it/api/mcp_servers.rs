@@ -2,8 +2,12 @@ use std::path::{Path, PathBuf};
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
+use fabro_db::Database;
+use fabro_mcp_store::McpServerStore;
 use fabro_server::server::build_router;
 use fabro_server::test_support::{TestAppStateBuilder, build_test_router, test_auth_mode};
+use fabro_types::settings::McpTransport;
+use fabro_types::{McpServerDefinition, McpServerId};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
@@ -47,11 +51,13 @@ fn replacement_body(display_name: &str) -> Value {
 fn mcp_server_app() -> (axum::Router, tempfile::TempDir, PathBuf) {
     let temp_dir = tempfile::tempdir().expect("mcp server test tempdir should be created");
     let active_config_path = temp_dir.path().join("settings.toml");
-    let mcp_dir = temp_dir.path().join("mcps");
+    let vault_path = temp_dir.path().join("secrets.json");
+    let db_path = temp_dir.path().join("db").join("fabro.sqlite3");
     let state = TestAppStateBuilder::new()
         .active_config_path(active_config_path)
+        .vault_path(vault_path)
         .build();
-    (build_test_router(state), temp_dir, mcp_dir)
+    (build_test_router(state), temp_dir, db_path)
 }
 
 fn json_request(method: Method, path: &str, body: &Value) -> Request<Body> {
@@ -114,11 +120,14 @@ fn revision_from(body: &Value) -> &str {
         .expect("mcp server response should include a revision")
 }
 
-async fn persisted_mcp_server_toml(mcp_dir: &Path, id: &str) -> toml::Value {
-    let persisted = tokio::fs::read_to_string(mcp_dir.join(format!("{id}.toml")))
+async fn persisted_mcp_server(db_path: &Path, id: &str) -> Option<McpServerDefinition> {
+    let database = Database::connect(db_path)
         .await
-        .expect("persisted mcp server TOML should be readable");
-    toml::from_str(&persisted).expect("persisted mcp server TOML should parse")
+        .expect("persisted MCP server database should connect");
+    let store = McpServerStore::load(database.clone_pool())
+        .await
+        .expect("persisted MCP server store should load");
+    store.get(&McpServerId::new(id).expect("fixture MCP server id should be valid"))
 }
 
 #[tokio::test]
@@ -141,8 +150,8 @@ async fn empty_mcp_server_list_returns_total_zero() {
 }
 
 #[tokio::test]
-async fn create_mcp_server_returns_etag_and_persists_sibling_toml_file() {
-    let (app, _temp_dir, mcp_dir) = mcp_server_app();
+async fn create_mcp_server_returns_etag_and_persists_sqlite_row() {
+    let (app, _temp_dir, db_path) = mcp_server_app();
 
     let response = app
         .clone()
@@ -167,7 +176,7 @@ async fn create_mcp_server_returns_etag_and_persists_sibling_toml_file() {
     assert_eq!(body["id"], "sentry");
     assert_eq!(body["display_name"], "Sentry");
     assert_eq!(etag, format!("\"{}\"", revision_from(&body)));
-    assert!(mcp_dir.join("sentry.toml").exists());
+    assert!(db_path.exists());
 
     // The response is the value-omitting view: header *names* are returned, but
     // the stored header value is not.
@@ -177,27 +186,20 @@ async fn create_mcp_server_returns_etag_and_persists_sibling_toml_file() {
         "response must not echo transport header values"
     );
 
-    let persisted = persisted_mcp_server_toml(&mcp_dir, "sentry").await;
-    assert_eq!(
-        persisted.get("display_name").and_then(toml::Value::as_str),
-        Some("Sentry")
-    );
-    assert!(persisted.get("id").is_none());
-    assert!(persisted.get("revision").is_none());
-    // The value the view omits is still persisted on disk for the runtime to use.
-    assert_eq!(
-        persisted
-            .get("transport")
-            .and_then(|transport| transport.get("headers"))
-            .and_then(|headers| headers.get("X-Org"))
-            .and_then(toml::Value::as_str),
-        Some("fabro")
-    );
+    let persisted = persisted_mcp_server(&db_path, "sentry")
+        .await
+        .expect("MCP server should be persisted");
+    assert_eq!(persisted.display_name, "Sentry");
+    assert_eq!(persisted.revision.as_str(), revision_from(&body));
+    let McpTransport::Http { headers, .. } = persisted.transport else {
+        panic!("persisted MCP server should use HTTP transport")
+    };
+    assert_eq!(headers.get("X-Org").map(String::as_str), Some("fabro"));
 }
 
 #[tokio::test]
-async fn mcp_server_round_trips_through_create_get_and_toml() {
-    let (app, _temp_dir, mcp_dir) = mcp_server_app();
+async fn mcp_server_round_trips_through_create_get_and_sqlite() {
+    let (app, _temp_dir, db_path) = mcp_server_app();
 
     let created = create_mcp_server(&app, "sentry", "Sentry").await;
     assert_eq!(created["transport"]["type"], "http");
@@ -211,14 +213,10 @@ async fn mcp_server_round_trips_through_create_get_and_toml() {
     let retrieved = response_json(response, StatusCode::OK, "GET /api/v1/mcp-servers/sentry").await;
     assert_eq!(retrieved, created);
 
-    let persisted = persisted_mcp_server_toml(&mcp_dir, "sentry").await;
-    assert_eq!(
-        persisted
-            .get("transport")
-            .and_then(|transport| transport.get("type"))
-            .and_then(toml::Value::as_str),
-        Some("http")
-    );
+    let persisted = persisted_mcp_server(&db_path, "sentry")
+        .await
+        .expect("MCP server should be persisted");
+    assert!(matches!(persisted.transport, McpTransport::Http { .. }));
 }
 
 #[tokio::test]
@@ -432,8 +430,8 @@ async fn replace_and_delete_mcp_server_require_if_match() {
 }
 
 #[tokio::test]
-async fn delete_mcp_server_removes_file_and_resource() {
-    let (app, _temp_dir, mcp_dir) = mcp_server_app();
+async fn delete_mcp_server_removes_sqlite_row_and_resource() {
+    let (app, _temp_dir, db_path) = mcp_server_app();
     let created = create_mcp_server(&app, "sentry", "Sentry").await;
     let revision = revision_from(&created);
 
@@ -454,7 +452,7 @@ async fn delete_mcp_server_removes_file_and_resource() {
     )
     .await;
 
-    assert!(!mcp_dir.join("sentry.toml").exists());
+    assert!(persisted_mcp_server(&db_path, "sentry").await.is_none());
     let response = app
         .oneshot(empty_request(Method::GET, "/mcp-servers/sentry"))
         .await
@@ -593,7 +591,7 @@ id = "sentry"
 }
 
 #[tokio::test]
-async fn mcp_server_store_malformed_persisted_toml_fails_startup() {
+async fn malformed_legacy_mcp_server_toml_fails_startup() {
     let temp_dir = tempfile::tempdir().expect("mcp server test tempdir should be created");
     let mcp_dir = temp_dir.path().join("mcps");
     tokio::fs::create_dir_all(&mcp_dir)
@@ -608,6 +606,84 @@ async fn mcp_server_store_malformed_persisted_toml_fails_startup() {
         .try_build();
 
     assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn legacy_mcp_server_toml_imports_at_startup_and_renames_directory() {
+    let temp_dir = tempfile::tempdir().expect("mcp server test tempdir should be created");
+    let active_config_path = temp_dir.path().join("settings.toml");
+    let vault_path = temp_dir.path().join("secrets.json");
+    let db_path = temp_dir.path().join("db").join("fabro.sqlite3");
+    let mcp_dir = temp_dir.path().join("mcps");
+    tokio::fs::create_dir_all(&mcp_dir)
+        .await
+        .expect("legacy MCP server directory should be created");
+    tokio::fs::write(
+        mcp_dir.join("sentry.toml"),
+        r#"
+display_name = "Sentry"
+startup_timeout_secs = 10
+tool_timeout_secs = 60
+
+[transport]
+type = "http"
+url = "https://example.com/mcp"
+
+[transport.headers]
+Authorization = "secret-value"
+"#,
+    )
+    .await
+    .expect("legacy MCP server fixture should be written");
+
+    let state = TestAppStateBuilder::new()
+        .active_config_path(active_config_path)
+        .vault_path(vault_path)
+        .build();
+    let app = build_test_router(state);
+
+    let response = app
+        .oneshot(empty_request(Method::GET, "/mcp-servers/sentry"))
+        .await
+        .expect("imported MCP server should respond");
+    let body = response_json(
+        response,
+        StatusCode::OK,
+        "GET imported /api/v1/mcp-servers/sentry",
+    )
+    .await;
+    assert_eq!(body["display_name"], "Sentry");
+    assert_eq!(body["transport"]["header_keys"], json!(["Authorization"]));
+    assert!(!mcp_dir.exists());
+    let mut entries = tokio::fs::read_dir(temp_dir.path())
+        .await
+        .expect("test directory should be readable");
+    let mut backup_found = false;
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .expect("test directory entry should be readable")
+    {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("mcps.imported-")
+        {
+            backup_found = true;
+            break;
+        }
+    }
+    assert!(backup_found);
+    let persisted = persisted_mcp_server(&db_path, "sentry")
+        .await
+        .expect("imported MCP server should be in SQLite");
+    let McpTransport::Http { headers, .. } = persisted.transport else {
+        panic!("imported MCP server should use HTTP transport")
+    };
+    assert_eq!(
+        headers.get("Authorization").map(String::as_str),
+        Some("secret-value")
+    );
 }
 
 #[tokio::test]

@@ -1,15 +1,13 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
 use fabro_config::{
     EnvironmentDockerfileLayer, EnvironmentImageLayer, EnvironmentLayer, EnvironmentLifecycleLayer,
     EnvironmentNetworkLayer, EnvironmentResourcesLayer, MergeMap, StickyMap,
 };
-use fabro_db::DbPool;
+use fabro_db::{DbPool, legacy};
 use fabro_types::settings::run::{DockerfileSource, EnvironmentProvider, EnvironmentSettings};
 use fabro_types::settings::{Duration, InterpString, Size};
 use serde::de::DeserializeOwned;
@@ -706,7 +704,7 @@ async fn legacy_environment_paths(
             .file_type()
             .await
             .map_err(|source| EnvironmentStoreError::io(&path, source))?;
-        if file_type.is_file() && is_toml_file(&path) {
+        if file_type.is_file() && legacy::is_toml_file(&path) {
             paths.push(LegacyEnvironmentPath {
                 id: id_from_path(&path)?,
                 path,
@@ -756,20 +754,9 @@ async fn existing_environment_ids(
 async fn rename_imported_legacy_directory(
     source_dir: &Path,
 ) -> Result<PathBuf, EnvironmentStoreError> {
-    let backup_path = legacy_backup_path(source_dir, Utc::now());
-    fs::rename(source_dir, &backup_path)
+    legacy::rename_to_legacy_backup(source_dir, "environments")
         .await
-        .map_err(|source| EnvironmentStoreError::io(&backup_path, source))?;
-    Ok(backup_path)
-}
-
-fn legacy_backup_path(source_dir: &Path, imported_at: DateTime<Utc>) -> PathBuf {
-    let timestamp = imported_at.format("%Y%m%dT%H%M%S%fZ");
-    let mut file_name = source_dir
-        .file_name()
-        .map_or_else(|| OsString::from("environments"), OsString::from);
-    file_name.push(format!(".imported-{timestamp}.bak"));
-    source_dir.with_file_name(file_name)
+        .map_err(|err| EnvironmentStoreError::io(&err.backup_path, err.source))
 }
 
 fn id_from_path(path: &Path) -> Result<EnvironmentId, EnvironmentStoreError> {
@@ -784,12 +771,6 @@ fn id_from_path(path: &Path) -> Result<EnvironmentId, EnvironmentStoreError> {
         path:   path.to_path_buf(),
         reason: source.to_string(),
     })
-}
-
-fn is_toml_file(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension == "toml")
 }
 
 fn encode_json<T: serde::Serialize>(

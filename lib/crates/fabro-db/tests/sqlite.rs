@@ -49,6 +49,13 @@ async fn connect_creates_parent_directory_and_migrate_is_idempotent() -> anyhow:
     .await?;
     assert_eq!(secrets_table_count, 1);
 
+    let mcp_servers_table_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'mcp_servers'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(mcp_servers_table_count, 1);
+
     let legacy_import_table_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'legacy_imports'",
     )
@@ -62,6 +69,156 @@ async fn connect_creates_parent_directory_and_migrate_is_idempotent() -> anyhow:
         .get(0);
     assert_eq!(foreign_keys, 1);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_servers_schema_rejects_invalid_transport_rows() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let database = fabro_db::Database::connect(dir.path().join("fabro.sqlite3")).await?;
+    database.migrate().await?;
+
+    insert_mcp_server(
+        database.pool(),
+        "stdio",
+        "stdio",
+        None,
+        Some(r#"["server"]"#),
+        None,
+        None,
+        Some("{}"),
+        None,
+    )
+    .await?;
+    insert_mcp_server(
+        database.pool(),
+        "http",
+        "http",
+        Some("streamable_http"),
+        None,
+        Some("https://example.com/mcp"),
+        None,
+        None,
+        Some("{}"),
+    )
+    .await?;
+    insert_mcp_server(
+        database.pool(),
+        "sandbox",
+        "sandbox",
+        Some("sse"),
+        Some(r#"["server"]"#),
+        None,
+        Some(3000),
+        Some("{}"),
+        None,
+    )
+    .await?;
+
+    for result in [
+        insert_mcp_server(
+            database.pool(),
+            "bad-id_",
+            "stdio",
+            None,
+            Some(r#"["server"]"#),
+            None,
+            None,
+            Some("{}"),
+            None,
+        )
+        .await,
+        insert_mcp_server(
+            database.pool(),
+            "empty-command",
+            "stdio",
+            None,
+            Some("[]"),
+            None,
+            None,
+            Some("{}"),
+            None,
+        )
+        .await,
+        insert_mcp_server(
+            database.pool(),
+            "http-with-env",
+            "http",
+            Some("streamable_http"),
+            None,
+            Some("https://example.com/mcp"),
+            None,
+            Some("{}"),
+            Some("{}"),
+        )
+        .await,
+        insert_mcp_server(
+            database.pool(),
+            "sandbox-port",
+            "sandbox",
+            Some("streamable_http"),
+            Some(r#"["server"]"#),
+            None,
+            Some(65_536),
+            Some("{}"),
+            None,
+        )
+        .await,
+    ] {
+        assert!(result.is_err(), "invalid MCP server row should be rejected");
+    }
+
+    Ok(())
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "schema test helper mirrors the mutually exclusive transport columns"
+)]
+async fn insert_mcp_server(
+    pool: &fabro_db::DbPool,
+    id: &str,
+    transport_type: &str,
+    protocol: Option<&str>,
+    command_json: Option<&str>,
+    url: Option<&str>,
+    port: Option<i64>,
+    env_json: Option<&str>,
+    headers_json: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r"
+        INSERT INTO mcp_servers (
+            id,
+            revision,
+            display_name,
+            transport_type,
+            protocol,
+            command_json,
+            url,
+            port,
+            env_json,
+            headers_json,
+            startup_timeout_secs,
+            tool_timeout_secs
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ",
+    )
+    .bind(id)
+    .bind("a".repeat(64))
+    .bind("MCP Server")
+    .bind(transport_type)
+    .bind(protocol)
+    .bind(command_json)
+    .bind(url)
+    .bind(port)
+    .bind(env_json)
+    .bind(headers_json)
+    .bind(10_i64)
+    .bind(60_i64)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

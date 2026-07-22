@@ -3,8 +3,8 @@
 //! These types describe MCP server definitions that are stored once on a Fabro
 //! server and later referenced by name from workflow configs. They are
 //! persistence-independent: the durable storage lives in the `fabro-mcp-store`
-//! crate, which derives `id` (filename stem) and `revision` (content hash) and
-//! never persists them inside the TOML body.
+//! crate, which persists `id` and a content-hash `revision` alongside the
+//! normalized definition fields.
 //!
 //! Transport is the existing [`McpTransport`](crate::settings::McpTransport)
 //! reused verbatim, so a stored definition uses the same `stdio`/`http`/
@@ -28,11 +28,9 @@ use crate::settings::run::McpHttpProtocol;
 
 /// A server-managed MCP server definition.
 ///
-/// `id` and `revision` are derived (filename stem + content hash of the
-/// persisted TOML bytes) and are not stored in the persisted TOML body. This is
-/// the internal/persistence model and carries full transport values; it is not
-/// serialized to clients. Read APIs return [`McpServerView`] instead, which
-/// omits env/header values.
+/// This is the internal/persistence model and carries full transport values; it
+/// is not serialized to clients. Read APIs return [`McpServerView`] instead,
+/// which omits env/header values.
 #[derive(Debug, Clone, PartialEq)]
 pub struct McpServerDefinition {
     pub id:                   McpServerId,
@@ -44,8 +42,8 @@ pub struct McpServerDefinition {
     pub tool_timeout_secs:    u64,
 }
 
-/// Fields supplied when creating a new definition. Carries an `id` (the create
-/// call assigns the filename) but no `revision` (the store derives it).
+/// Fields supplied when creating a new definition. Carries an `id` but no
+/// `revision` (the store derives it).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpServerDraft {
@@ -236,6 +234,7 @@ fn sorted_keys_ref(map: &HashMap<String, String>) -> Vec<String> {
 pub enum McpServerValidationError {
     InvalidMcpServerId { value: String },
     EmptyName,
+    TimeoutOutOfRange { field: &'static str, value: u64 },
     InvalidTransport { reason: String },
 }
 
@@ -249,6 +248,12 @@ impl fmt::Display for McpServerValidationError {
                 )
             }
             Self::EmptyName => f.write_str("mcp server display name must not be empty"),
+            Self::TimeoutOutOfRange { field, value } => {
+                write!(
+                    f,
+                    "mcp server {field} value {value} exceeds the signed 64-bit range"
+                )
+            }
             Self::InvalidTransport { reason } => {
                 write!(f, "mcp server transport is invalid: {reason}")
             }
@@ -258,8 +263,7 @@ impl fmt::Display for McpServerValidationError {
 
 impl std::error::Error for McpServerValidationError {}
 
-/// An MCP server id: lowercase, matches `^[a-z0-9][a-z0-9-]{0,62}$`, and equals
-/// the persisted file's stem.
+/// An MCP server id: lowercase and matches `^[a-z0-9][a-z0-9-]{0,62}$`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct McpServerId(String);
 
@@ -312,8 +316,9 @@ impl<'de> Deserialize<'de> for McpServerId {
     }
 }
 
-/// A revision: the lowercase SHA-256 hex of a definition's canonical persisted
-/// TOML bytes. Used as an ETag for optimistic concurrency.
+/// A revision: lowercase SHA-256 hex of a definition's canonical bytes. Used as
+/// an ETag for optimistic concurrency. Legacy imports preserve the hash of the
+/// original TOML bytes.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct McpServerRevision(String);
 
@@ -406,7 +411,15 @@ pub fn validate_mcp_server_fields(
     if replace.display_name.trim().is_empty() {
         return Err(McpServerValidationError::EmptyName);
     }
+    validate_timeout("startup_timeout_secs", replace.startup_timeout_secs)?;
+    validate_timeout("tool_timeout_secs", replace.tool_timeout_secs)?;
     validate_transport(&replace.transport)
+}
+
+fn validate_timeout(field: &'static str, value: u64) -> Result<(), McpServerValidationError> {
+    i64::try_from(value)
+        .map(|_| ())
+        .map_err(|_| McpServerValidationError::TimeoutOutOfRange { field, value })
 }
 
 fn validate_transport(transport: &McpTransport) -> Result<(), McpServerValidationError> {
@@ -512,6 +525,19 @@ mod tests {
             startup_timeout_secs: 10,
             tool_timeout_secs:    60,
         };
+        assert!(validate_mcp_server_fields(&replace).is_err());
+    }
+
+    #[test]
+    fn validation_rejects_timeout_outside_sqlite_integer_range() {
+        let replace = McpServerReplace {
+            display_name:         "Sentry".to_string(),
+            description:          None,
+            transport:            http_transport(),
+            startup_timeout_secs: u64::MAX,
+            tool_timeout_secs:    60,
+        };
+
         assert!(validate_mcp_server_fields(&replace).is_err());
     }
 

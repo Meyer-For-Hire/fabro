@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context as _;
+use chrono::{DateTime, Utc};
 use sqlx::migrate::{Migrate as _, Migrator};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use tokio::fs;
@@ -10,7 +11,14 @@ use tokio::fs;
 use tokio::task::spawn_blocking;
 use tracing::info;
 
+pub mod legacy;
+
 pub type DbPool = sqlx::SqlitePool;
+
+/// Parse an RFC 3339 TEXT column value into a UTC timestamp.
+pub fn parse_rfc3339_utc(value: &str) -> Result<DateTime<Utc>, chrono::ParseError> {
+    DateTime::parse_from_rfc3339(value).map(|timestamp| timestamp.with_timezone(&Utc))
+}
 
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 

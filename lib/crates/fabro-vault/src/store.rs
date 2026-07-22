@@ -1,10 +1,9 @@
 use std::collections::HashMap;
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
 
 use chrono::{DateTime, Utc};
-use fabro_db::{Database, DbPool};
+use fabro_db::{Database, DbPool, legacy};
 use fabro_types::{OAuthCredential, SecretMetadata, SecretType};
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row as _, Sqlite, Transaction};
@@ -177,10 +176,7 @@ impl SecretStore {
         .bind(name)
         .fetch_optional(&self.pool)
         .await?;
-        row.as_ref()
-            .map(entry_from_row)
-            .transpose()
-            .map(|entry| entry.map(|(_, entry)| entry))
+        row.as_ref().map(entry_from_row).transpose()
     }
 
     pub async fn list(&self) -> Result<Vec<SecretMetadata>, SecretStoreError> {
@@ -288,7 +284,7 @@ impl SecretStore {
         .await?;
 
         if let Some(row) = row {
-            return entry_from_row(&row).map(|(_, entry)| entry);
+            return entry_from_row(&row);
         }
         match self.get(name).await? {
             Some(entry) => Err(SecretStoreError::StaleRevision {
@@ -309,8 +305,8 @@ impl SecretStore {
         .await?;
         let entries = rows
             .iter()
-            .map(entry_from_row)
-            .collect::<Result<HashMap<_, _>, _>>()?;
+            .map(|row| Ok((row.try_get::<String, _>("name")?, entry_from_row(row)?)))
+            .collect::<Result<HashMap<_, _>, SecretStoreError>>()?;
         Ok(SecretSnapshot(Vault::from_entries(entries)))
     }
 }
@@ -444,7 +440,7 @@ async fn insert_legacy_entry(
     Ok(result.rows_affected() == 1)
 }
 
-fn entry_from_row(row: &SqliteRow) -> Result<(String, SecretEntry), SecretStoreError> {
+fn entry_from_row(row: &SqliteRow) -> Result<SecretEntry, SecretStoreError> {
     let metadata = metadata_from_row(row)?;
     let name = metadata.name;
     let value = row.try_get::<String, _>("value")?;
@@ -458,15 +454,14 @@ fn entry_from_row(row: &SqliteRow) -> Result<(String, SecretEntry), SecretStoreE
     if revision <= 0 {
         return Err(SecretStoreError::StoredRevision { name, revision });
     }
-    let entry = SecretEntry {
+    Ok(SecretEntry {
         value,
         secret_type: metadata.secret_type,
         description: metadata.description,
         created_at: metadata.created_at,
         updated_at: metadata.updated_at,
         revision,
-    };
-    Ok((name, entry))
+    })
 }
 
 fn metadata_from_row(row: &SqliteRow) -> Result<SecretMetadata, SecretStoreError> {
@@ -500,13 +495,11 @@ fn parse_timestamp(
     column: &'static str,
     value: &str,
 ) -> Result<DateTime<Utc>, SecretStoreError> {
-    DateTime::parse_from_rfc3339(value)
-        .map(|timestamp| timestamp.with_timezone(&Utc))
-        .map_err(|source| SecretStoreError::Timestamp {
-            name: name.to_string(),
-            column,
-            source,
-        })
+    fabro_db::parse_rfc3339_utc(value).map_err(|source| SecretStoreError::Timestamp {
+        name: name.to_string(),
+        column,
+        source,
+    })
 }
 
 fn validate_oauth_json(value: &str) -> Result<(), serde_json::Error> {
@@ -536,22 +529,11 @@ fn validate_stored_name(name: &str, secret_type: SecretType) -> Result<(), Secre
 }
 
 async fn rename_imported_legacy_file(source_path: &Path) -> Result<PathBuf, SecretStoreError> {
-    let backup_path = legacy_backup_path(source_path, Utc::now());
-    fs::rename(source_path, &backup_path)
+    legacy::rename_to_legacy_backup(source_path, "secrets.json")
         .await
-        .map_err(|source| SecretStoreError::LegacyBackup {
+        .map_err(|err| SecretStoreError::LegacyBackup {
             source_path: source_path.to_path_buf(),
-            backup_path: backup_path.clone(),
-            source,
-        })?;
-    Ok(backup_path)
-}
-
-fn legacy_backup_path(source_path: &Path, imported_at: DateTime<Utc>) -> PathBuf {
-    let timestamp = imported_at.format("%Y%m%dT%H%M%S%fZ");
-    let mut file_name = source_path
-        .file_name()
-        .map_or_else(|| OsString::from("secrets.json"), OsString::from);
-    file_name.push(format!(".imported-{timestamp}.bak"));
-    source_path.with_file_name(file_name)
+            backup_path: err.backup_path,
+            source:      err.source,
+        })
 }

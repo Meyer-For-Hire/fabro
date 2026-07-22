@@ -2180,12 +2180,32 @@ pub enum McpTransport {
     },
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    strum::Display,
+    strum::EnumString,
+    strum::IntoStaticStr,
+    Serialize,
+    Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum McpHttpProtocol {
     #[default]
     StreamableHttp,
     Sse,
+}
+
+impl McpHttpProtocol {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        self.into()
+    }
 }
 
 #[expect(
