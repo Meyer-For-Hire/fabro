@@ -3,20 +3,22 @@
 use super::translate;
 use super::wire::ApiRequest;
 use crate::codec::{CodecCtx, EncodedRequest, merge_named_provider_options};
+use crate::error::Error;
 
 /// Build the Chat Completions request for `ctx.request`. `stream` toggles the
 /// `stream` body field. The body is assembled as a `serde_json::Value` so
 /// `provider_options.<provider_name>` fields can be merged in before sending.
 ///
-/// Infallible for this dialect — the `Codec::encode` `Result` is wrapped by the
-/// trait impl.
-pub(super) fn encode(ctx: &CodecCtx<'_>, stream: bool) -> EncodedRequest {
+/// Returns an error when the request contains a custom tool definition, which
+/// the Chat Completions tool envelope cannot represent.
+pub(super) fn encode(ctx: &CodecCtx<'_>, stream: bool) -> Result<EncodedRequest, Error> {
     let request = ctx.request;
     let chat_messages = translate::translate_messages(&request.messages);
     let tools = request
         .tools
         .as_ref()
-        .map(|t| translate::translate_tools(t));
+        .map(|t| translate::translate_tools(t))
+        .transpose()?;
     let tool_choice = request
         .tool_choice
         .as_ref()
@@ -46,11 +48,11 @@ pub(super) fn encode(ctx: &CodecCtx<'_>, stream: bool) -> EncodedRequest {
         ctx.provider_name,
     );
 
-    EncodedRequest {
+    Ok(EncodedRequest {
         body,
         endpoint: "/chat/completions".to_string(),
         headers: Vec::new(),
-    }
+    })
 }
 
 /// Merge `provider_options.<provider_name>` fields into the serialized API
@@ -71,7 +73,7 @@ mod tests {
     use super::super::wire::ApiRequest;
     use super::*;
     use crate::codec::CodecParams;
-    use crate::types::{Message, Request};
+    use crate::types::{Message, Request, ToolDefinition};
 
     fn minimal_request() -> Request {
         Request {
@@ -104,7 +106,7 @@ mod tests {
             model: None,
             params: &params,
         };
-        encode(&ctx, stream).body
+        encode(&ctx, stream).unwrap().body
     }
 
     #[test]
@@ -152,8 +154,36 @@ mod tests {
             model:         None,
             params:        &params,
         };
-        let body = encode(&ctx, false).body;
+        let body = encode(&ctx, false).unwrap().body;
         assert_eq!(body["model"], "acme/model-large");
+    }
+
+    #[test]
+    fn encode_rejects_custom_tool_definitions() {
+        let mut request = minimal_request();
+        request.tools = Some(vec![ToolDefinition::custom(
+            "apply_patch",
+            "Apply a patch",
+            serde_json::json!({"type": "grammar"}),
+        )]);
+        let params = CodecParams::default();
+        let deployment_id = request.model.clone();
+        let ctx = CodecCtx {
+            request:       &request,
+            provider_name: "kimi",
+            deployment_id: &deployment_id,
+            model:         None,
+            params:        &params,
+        };
+
+        let Err(error) = encode(&ctx, false) else {
+            panic!("custom tool definition should be rejected");
+        };
+        assert!(matches!(
+            error,
+            Error::Configuration { message, source: None }
+                if message.contains("custom tool definition 'apply_patch'")
+        ));
     }
 
     #[test]

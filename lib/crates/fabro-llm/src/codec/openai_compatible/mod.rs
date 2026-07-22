@@ -21,7 +21,7 @@ pub(crate) struct OpenAiCompatible;
 
 impl Codec for OpenAiCompatible {
     fn encode(&self, ctx: &CodecCtx<'_>, stream: bool) -> Result<EncodedRequest, Error> {
-        Ok(request::encode(ctx, stream))
+        request::encode(ctx, stream)
     }
 
     fn decode_response(
