@@ -3510,6 +3510,7 @@ root = "{}"
         assert!(ids.contains(&ProviderId::new("minimax")));
         assert!(ids.contains(&ProviderId::new("inception")));
         assert!(ids.contains(&ProviderId::new("venice")));
+        assert!(ids.contains(&ProviderId::new("poolside")));
         assert!(!ids.contains(&ProviderId::new("ollama")));
         assert!(!ids.contains(&ProviderId::new("litellm")));
     }

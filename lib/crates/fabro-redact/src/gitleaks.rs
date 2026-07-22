@@ -273,6 +273,14 @@ mod tests {
     }
 
     #[test]
+    fn detects_poolside_api_key() {
+        let input = format!("sky_Ab12Cd34.{}", "Ef56Gh78".repeat(4));
+        let regions = find_gitleaks_regions(&input);
+        assert_eq!(regions.len(), 1, "expected 1 region, got {regions:?}");
+        assert_eq!(&input[regions[0].start..regions[0].end], input);
+    }
+
+    #[test]
     fn detects_private_key_block() {
         let input =
             "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA\n-----END RSA PRIVATE KEY-----";

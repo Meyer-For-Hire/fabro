@@ -304,6 +304,52 @@ input_cost_per_mtok = 3.0
 output_cost_per_mtok = 15.0
 cache_input_cost_per_mtok = 0.3
 
+[models."poolside/laguna-s-2.1"]
+provider = "openrouter"
+api_id = "poolside/laguna-s-2.1"
+display_name = "Laguna S 2.1 (via OpenRouter)"
+family = "laguna-2"
+
+[models."poolside/laguna-s-2.1".limits]
+context_window = 1048576
+max_output = 131072
+
+[models."poolside/laguna-s-2.1".features]
+tools = true
+vision = false
+reasoning = true
+prompt_cache = true
+sampling_params = true
+
+[models."poolside/laguna-s-2.1".costs]
+input_cost_per_mtok = 0.10
+output_cost_per_mtok = 0.20
+cache_input_cost_per_mtok = 0.01
+
+[models."poolside/laguna-xs-2.1"]
+provider = "openrouter"
+api_id = "poolside/laguna-xs-2.1"
+display_name = "Laguna XS 2.1 (via OpenRouter)"
+family = "laguna-2"
+
+[models."poolside/laguna-xs-2.1".limits]
+context_window = 262144
+max_output = 32768
+
+[models."poolside/laguna-xs-2.1".features]
+tools = true
+vision = false
+reasoning = true
+prompt_cache = true
+sampling_params = true
+
+# Current promotional rate. OpenRouter's authoritative in-band usage.cost
+# supersedes this estimate on completed responses.
+[models."poolside/laguna-xs-2.1".costs]
+input_cost_per_mtok = 0.06
+output_cost_per_mtok = 0.12
+cache_input_cost_per_mtok = 0.03
+
 [models."qwen/qwen3-coder"]
 provider = "openrouter"
 api_id = "qwen/qwen3-coder"
