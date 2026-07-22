@@ -348,6 +348,10 @@ async fn upsert_secret(
     metadata_from_row(&row)
 }
 
+/// Removal deadline for this temporary legacy-import migration, per
+/// docs/internal/migrations-strategy.md.
+const IMPORT_REMOVAL_DEADLINE: &str = "2026-10-11";
+
 pub async fn import_legacy_json_once(
     pool: &DbPool,
     source_path: impl AsRef<Path>,
@@ -410,6 +414,7 @@ pub async fn import_legacy_json_once(
         imported_rows = report.imported_rows,
         skipped_rows = report.skipped_rows,
         secret_names = ?report.secret_names,
+        removal_deadline = IMPORT_REMOVAL_DEADLINE,
         "Imported legacy secrets JSON into SQLite"
     );
     Ok(Some(report))
