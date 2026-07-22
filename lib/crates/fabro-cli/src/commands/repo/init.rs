@@ -117,11 +117,12 @@ draft = true
         );
     }
 
-    // Create workflow.toml
+    // Leave the environment unspecified so the target server can supply its
+    // default.
     let toml_path = workflow_dir.join("workflow.toml");
     std::fs::write(
         &toml_path,
-        "_version = 1\n\n[workflow]\ngraph = \"workflow.fabro\"\n\n[run.environment]\nid = \"local\"\n\n[environments.local]\nprovider = \"local\"\n",
+        "_version = 1\n\n[workflow]\ngraph = \"workflow.fabro\"\n",
     )
     .with_context(|| format!("failed to write {}", toml_path.display()))?;
     created.push(".fabro/workflows/hello/workflow.toml".to_string());
