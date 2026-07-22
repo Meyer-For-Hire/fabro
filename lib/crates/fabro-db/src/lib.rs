@@ -1,10 +1,9 @@
 use std::collections::HashSet;
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context as _;
-use sqlx::migrate::Migrator;
+use sqlx::migrate::{Migrate as _, Migrator};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use tokio::fs;
 use tracing::info;
@@ -16,7 +15,6 @@ static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 #[derive(Clone)]
 pub struct Database {
     pool: DbPool,
-    path: PathBuf,
 }
 
 impl Database {
@@ -41,10 +39,7 @@ impl Database {
             .await
             .with_context(|| format!("opening SQLite database {}", path.display()))?;
 
-        Ok(Self {
-            pool,
-            path: path.to_path_buf(),
-        })
+        Ok(Self { pool })
     }
 
     pub async fn migrate(&self) -> anyhow::Result<()> {
@@ -76,46 +71,61 @@ impl Database {
     /// schema change.
     async fn snapshot_before_new_migrations(&self) -> anyhow::Result<()> {
         let applied = applied_migration_versions(&self.pool).await?;
-        if applied.is_empty() {
-            return Ok(());
-        }
-        if !MIGRATOR
+        let has_pending = MIGRATOR
             .iter()
-            .any(|migration| !applied.contains(&migration.version))
-        {
+            .any(|migration| !applied.contains(&migration.version));
+        if applied.is_empty() || !has_pending {
             return Ok(());
         }
 
-        let snapshot_path = pre_migration_snapshot_path(&self.path);
-        match fs::remove_file(&snapshot_path).await {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!(
-                        "removing stale pre-migration snapshot {}",
-                        snapshot_path.display()
-                    )
-                });
-            }
-        }
+        let connect_options = self.pool.connect_options();
+        let database_path = connect_options.get_filename();
+        let snapshot_path = pre_migration_snapshot_path(database_path);
 
         // VACUUM INTO produces a consistent single-file copy from the live
-        // pool, so the snapshot needs no -wal/-shm siblings to restore.
-        let snapshot_target = snapshot_path
+        // pool, so the snapshot needs no -wal/-shm siblings to restore. It
+        // writes to a staging file that is renamed into place afterwards, so
+        // a failure mid-copy never leaves a partial file at the snapshot
+        // path.
+        let staging_path = append_to_path(&snapshot_path, ".tmp");
+        remove_file_if_exists(&staging_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "removing stale snapshot staging file {}",
+                    staging_path.display()
+                )
+            })?;
+        let staging_target = staging_path
             .to_str()
-            .context("database path is not valid UTF-8")?;
+            .context("snapshot staging path is not valid UTF-8")?;
         sqlx::query("VACUUM INTO ?")
-            .bind(snapshot_target)
+            .bind(staging_target)
             .execute(&self.pool)
             .await
             .with_context(|| {
-                format!("writing pre-migration snapshot {}", snapshot_path.display())
+                format!("writing pre-migration snapshot {}", staging_path.display())
             })?;
-        set_private_permissions(&snapshot_path).await?;
+        set_private_permissions(&staging_path).await?;
+        remove_file_if_exists(&snapshot_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "removing stale pre-migration snapshot {}",
+                    snapshot_path.display()
+                )
+            })?;
+        fs::rename(&staging_path, &snapshot_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "publishing pre-migration snapshot {}",
+                    snapshot_path.display()
+                )
+            })?;
 
         info!(
-            database = %self.path.display(),
+            database = %database_path.display(),
             snapshot = %snapshot_path.display(),
             "Snapshotted SQLite database before applying new migrations"
         );
@@ -140,31 +150,44 @@ impl Database {
 }
 
 /// Rollback artifact written by [`Database::migrate`] before applying new
-/// migrations: the database file name with `.pre-migration.bak` appended,
-/// next to the database.
+/// migrations: the database path with `.pre-migration.bak` appended.
 pub fn pre_migration_snapshot_path(database_path: &Path) -> PathBuf {
-    let mut file_name = database_path
-        .file_name()
-        .map_or_else(|| OsString::from("fabro.sqlite3"), OsString::from);
-    file_name.push(".pre-migration.bak");
-    database_path.with_file_name(file_name)
+    append_to_path(database_path, ".pre-migration.bak")
+}
+
+fn append_to_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut path = path.as_os_str().to_os_string();
+    path.push(suffix);
+    PathBuf::from(path)
 }
 
 async fn applied_migration_versions(pool: &DbPool) -> anyhow::Result<HashSet<i64>> {
-    let table_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
-    )
-    .fetch_one(pool)
-    .await
-    .context("checking for the sqlx migrations table")?;
-    if table_count == 0 {
-        return Ok(HashSet::new());
-    }
-    let versions: Vec<i64> = sqlx::query_scalar("SELECT version FROM _sqlx_migrations")
-        .fetch_all(pool)
+    let mut conn = pool
+        .acquire()
+        .await
+        .context("acquiring a SQLite connection")?;
+    // Migrator::run performs this same ensure + list as its first step, so
+    // asking the Migrate trait (rather than querying sqlx's bookkeeping
+    // table by hand) cannot drift from what it will actually apply.
+    conn.ensure_migrations_table(&MIGRATOR.table_name)
+        .await
+        .context("ensuring the sqlx migrations table exists")?;
+    let applied = conn
+        .list_applied_migrations(&MIGRATOR.table_name)
         .await
         .context("listing applied migration versions")?;
-    Ok(versions.into_iter().collect())
+    Ok(applied
+        .into_iter()
+        .map(|migration| migration.version)
+        .collect())
+}
+
+async fn remove_file_if_exists(path: &Path) -> std::io::Result<()> {
+    match fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 #[cfg(unix)]

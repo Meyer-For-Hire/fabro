@@ -171,15 +171,9 @@ async fn migrate_snapshots_database_before_applying_new_migrations() -> anyhow::
         snapshot_path.exists(),
         "pending migration must snapshot first"
     );
-    let snapshot =
-        sqlx::SqlitePool::connect(&format!("sqlite://{}?mode=ro", snapshot_path.display())).await?;
-    let snapshot_environments: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'environments'",
-    )
-    .fetch_one(&snapshot)
-    .await?;
-    assert_eq!(
-        snapshot_environments, 0,
+    let snapshot = connect_read_only(&snapshot_path).await?;
+    assert!(
+        !table_exists(&snapshot, "environments").await?,
         "snapshot must hold the pre-migration schema"
     );
     let snapshot_marker: i64 =
@@ -189,12 +183,10 @@ async fn migrate_snapshots_database_before_applying_new_migrations() -> anyhow::
     assert_eq!(snapshot_marker, 1, "snapshot must preserve row data");
     snapshot.close().await;
 
-    let migrated_environments: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'environments'",
-    )
-    .fetch_one(database.pool())
-    .await?;
-    assert_eq!(migrated_environments, 1, "migration must still apply");
+    assert!(
+        table_exists(database.pool(), "environments").await?,
+        "migration must still apply"
+    );
 
     #[cfg(unix)]
     {
@@ -206,17 +198,24 @@ async fn migrate_snapshots_database_before_applying_new_migrations() -> anyhow::
     // With nothing pending, migrate must not rewrite the snapshot: it still
     // holds the state from before the most recent schema change.
     database.migrate().await?;
-    let snapshot =
-        sqlx::SqlitePool::connect(&format!("sqlite://{}?mode=ro", snapshot_path.display())).await?;
-    let snapshot_environments: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'environments'",
-    )
-    .fetch_one(&snapshot)
-    .await?;
-    assert_eq!(
-        snapshot_environments, 0,
+    let snapshot = connect_read_only(&snapshot_path).await?;
+    assert!(
+        !table_exists(&snapshot, "environments").await?,
         "no-pending migrate must leave the snapshot untouched"
     );
     snapshot.close().await;
     Ok(())
+}
+
+async fn connect_read_only(path: &std::path::Path) -> anyhow::Result<sqlx::SqlitePool> {
+    Ok(sqlx::SqlitePool::connect(&format!("sqlite://{}?mode=ro", path.display())).await?)
+}
+
+async fn table_exists(pool: &sqlx::SqlitePool, table: &str) -> anyhow::Result<bool> {
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?")
+            .bind(table)
+            .fetch_one(pool)
+            .await?;
+    Ok(count == 1)
 }
