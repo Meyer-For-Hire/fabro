@@ -2121,6 +2121,71 @@ enabled = true
     }
 
     #[test]
+    fn builtin_openrouter_includes_kimi_k3_when_enabled() {
+        let catalog = Catalog::from_builtin_with_overrides(&minimal_settings(
+            r"
+[providers.openrouter]
+enabled = true
+",
+        ))
+        .expect("enabled OpenRouter override should build from the built-in provider settings");
+
+        let model = catalog
+            .get("moonshotai/kimi-k3")
+            .expect("OpenRouter Kimi K3 should be present");
+        insta::assert_debug_snapshot!(model, @r#"
+        Model {
+            id: "moonshotai/kimi-k3",
+            provider: openrouter,
+            family: "kimi-k3",
+            display_name: "Kimi K3 (via OpenRouter)",
+            limits: ModelLimits {
+                context_window: 1048576,
+                max_output: Some(
+                    131072,
+                ),
+            },
+            training: None,
+            knowledge_cutoff: None,
+            features: ModelFeatures {
+                tools: true,
+                vision: true,
+                reasoning: true,
+                reasoning_effort: AlwaysAdaptive,
+                prompt_cache: true,
+                sampling_params: false,
+            },
+            costs: ModelCosts {
+                input_cost_per_mtok: Some(
+                    3.0,
+                ),
+                output_cost_per_mtok: Some(
+                    15.0,
+                ),
+                cache_input_cost_per_mtok: Some(
+                    0.3,
+                ),
+            },
+            estimated_output_tps: None,
+            aliases: [],
+            default: false,
+            small_default: false,
+            configured: false,
+        }
+        "#);
+
+        let settings = catalog
+            .model_settings("moonshotai/kimi-k3")
+            .expect("OpenRouter Kimi K3 settings should be present");
+        assert_eq!(settings.api_id, "moonshotai/kimi-k3");
+        assert_eq!(settings.controls.reasoning_effort, vec![
+            ReasoningEffort::Low,
+            ReasoningEffort::High,
+            ReasoningEffort::Max,
+        ]);
+    }
+
+    #[test]
     fn builtin_ollama_provider_is_opt_in() {
         let ollama = ProviderId::new("ollama");
         let builtin = Catalog::builtin();

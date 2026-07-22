@@ -278,6 +278,32 @@ reasoning = false
 input_cost_per_mtok = 0.73
 output_cost_per_mtok = 3.49
 
+[models."moonshotai/kimi-k3"]
+provider = "openrouter"
+api_id = "moonshotai/kimi-k3"
+display_name = "Kimi K3 (via OpenRouter)"
+family = "kimi-k3"
+
+[models."moonshotai/kimi-k3".limits]
+context_window = 1048576
+max_output = 131072
+
+[models."moonshotai/kimi-k3".features]
+tools = true
+vision = true
+reasoning = true
+reasoning_effort = "always_adaptive"
+prompt_cache = true
+sampling_params = false
+
+[models."moonshotai/kimi-k3".controls]
+reasoning_effort = ["low", "high", "max"]
+
+[models."moonshotai/kimi-k3".costs]
+input_cost_per_mtok = 3.0
+output_cost_per_mtok = 15.0
+cache_input_cost_per_mtok = 0.3
+
 [models."qwen/qwen3-coder"]
 provider = "openrouter"
 api_id = "qwen/qwen3-coder"
