@@ -123,3 +123,99 @@ async fn variables_schema_enforces_env_style_names() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn fresh_database_migrate_takes_no_snapshot() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("fabro.sqlite3");
+
+    let database = fabro_db::Database::connect(&db_path).await?;
+    database.migrate().await?;
+
+    assert!(
+        !fabro_db::pre_migration_snapshot_path(&db_path).exists(),
+        "a fresh database has no pre-migration state worth snapshotting"
+    );
+    Ok(())
+}
+
+// Simulates a binary upgrade: a database whose `_sqlx_migrations` table is
+// missing an entry for a bundled migration is exactly what an older binary
+// leaves behind for a newer one. The environments migration is pure CREATE
+// TABLE, so dropping the table and deleting its version row makes it pending
+// again without violating checksums.
+#[tokio::test]
+async fn migrate_snapshots_database_before_applying_new_migrations() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("fabro.sqlite3");
+    let snapshot_path = fabro_db::pre_migration_snapshot_path(&db_path);
+
+    let database = fabro_db::Database::connect(&db_path).await?;
+    database.migrate().await?;
+    sqlx::query(
+        "INSERT INTO variables (name, value, created_at, updated_at) \
+         VALUES ('SNAPSHOT_MARKER', 'kept', '2026-07-22T00:00:00Z', '2026-07-22T00:00:00Z')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query("DROP TABLE environments")
+        .execute(database.pool())
+        .await?;
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 2026063002")
+        .execute(database.pool())
+        .await?;
+
+    database.migrate().await?;
+
+    assert!(
+        snapshot_path.exists(),
+        "pending migration must snapshot first"
+    );
+    let snapshot = connect_read_only(&snapshot_path).await?;
+    assert!(
+        !table_exists(&snapshot, "environments").await?,
+        "snapshot must hold the pre-migration schema"
+    );
+    let snapshot_marker: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM variables WHERE name = 'SNAPSHOT_MARKER'")
+            .fetch_one(&snapshot)
+            .await?;
+    assert_eq!(snapshot_marker, 1, "snapshot must preserve row data");
+    snapshot.close().await;
+
+    assert!(
+        table_exists(database.pool(), "environments").await?,
+        "migration must still apply"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&snapshot_path)?.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "snapshot must be private");
+    }
+
+    // With nothing pending, migrate must not rewrite the snapshot: it still
+    // holds the state from before the most recent schema change.
+    database.migrate().await?;
+    let snapshot = connect_read_only(&snapshot_path).await?;
+    assert!(
+        !table_exists(&snapshot, "environments").await?,
+        "no-pending migrate must leave the snapshot untouched"
+    );
+    snapshot.close().await;
+    Ok(())
+}
+
+async fn connect_read_only(path: &std::path::Path) -> anyhow::Result<sqlx::SqlitePool> {
+    Ok(sqlx::SqlitePool::connect(&format!("sqlite://{}?mode=ro", path.display())).await?)
+}
+
+async fn table_exists(pool: &sqlx::SqlitePool, table: &str) -> anyhow::Result<bool> {
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?")
+            .bind(table)
+            .fetch_one(pool)
+            .await?;
+    Ok(count == 1)
+}
