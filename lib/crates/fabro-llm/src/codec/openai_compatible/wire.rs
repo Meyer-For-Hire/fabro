@@ -246,6 +246,22 @@ mod tests {
             Some("provider reasoning")
         );
 
+        let openrouter_response: ApiResponse = serde_json::from_value(serde_json::json!({
+            "id": "response-2",
+            "model": "reasoning-model",
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "reasoning": "OpenRouter reasoning"
+                },
+                "finish_reason": "stop"
+            }]
+        }))
+        .unwrap();
+        assert_eq!(
+            openrouter_response.choices[0].message.reasoning(),
+            Some("OpenRouter reasoning")
+        );
         let openrouter_chunk: StreamChunk = serde_json::from_value(serde_json::json!({
             "id": "response-2",
             "model": "reasoning-model",
