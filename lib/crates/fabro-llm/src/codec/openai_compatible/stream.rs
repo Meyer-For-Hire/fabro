@@ -87,7 +87,7 @@ impl StreamState {
         let delta = choice.delta.as_ref()?;
 
         // Accumulate reasoning/thinking content (Kimi, etc.).
-        if let Some(reasoning) = &delta.reasoning_content {
+        if let Some(reasoning) = delta.reasoning() {
             if !reasoning.is_empty() {
                 self.accumulated_reasoning.push_str(reasoning);
             }

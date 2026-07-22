@@ -75,7 +75,17 @@ pub(super) struct ApiChoice {
 pub(super) struct ApiChoiceMessage {
     pub content:           Option<String>,
     pub reasoning_content: Option<String>,
+    /// OpenRouter's normalized spelling for reasoning text.
+    pub reasoning:         Option<String>,
     pub tool_calls:        Option<Vec<ApiToolCall>>,
+}
+
+impl ApiChoiceMessage {
+    pub(super) fn reasoning(&self) -> Option<&str> {
+        self.reasoning_content
+            .as_deref()
+            .or(self.reasoning.as_deref())
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -178,7 +188,17 @@ pub(super) struct StreamDelta {
     pub content:           Option<String>,
     /// Reasoning/thinking content (used by Kimi and other reasoning models).
     pub reasoning_content: Option<String>,
+    /// OpenRouter's normalized spelling for reasoning text.
+    pub reasoning:         Option<String>,
     pub tool_calls:        Option<Vec<StreamToolCall>>,
+}
+
+impl StreamDelta {
+    pub(super) fn reasoning(&self) -> Option<&str> {
+        self.reasoning_content
+            .as_deref()
+            .or(self.reasoning.as_deref())
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -201,4 +221,47 @@ pub(super) struct AccumulatedToolCall {
     pub name:      String,
     pub arguments: String,
     pub started:   bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ApiResponse, StreamChunk};
+
+    #[test]
+    fn reasoning_accepts_provider_and_openrouter_spellings() {
+        let provider_response: ApiResponse = serde_json::from_value(serde_json::json!({
+            "id": "response-1",
+            "model": "reasoning-model",
+            "choices": [{
+                "message": {
+                    "content": null,
+                    "reasoning_content": "provider reasoning"
+                },
+                "finish_reason": "stop"
+            }]
+        }))
+        .unwrap();
+        assert_eq!(
+            provider_response.choices[0].message.reasoning(),
+            Some("provider reasoning")
+        );
+
+        let openrouter_chunk: StreamChunk = serde_json::from_value(serde_json::json!({
+            "id": "response-2",
+            "model": "reasoning-model",
+            "choices": [{
+                "delta": {"reasoning": "OpenRouter reasoning"},
+                "finish_reason": null
+            }]
+        }))
+        .unwrap();
+        assert_eq!(
+            openrouter_chunk.choices.unwrap()[0]
+                .delta
+                .as_ref()
+                .unwrap()
+                .reasoning(),
+            Some("OpenRouter reasoning")
+        );
+    }
 }

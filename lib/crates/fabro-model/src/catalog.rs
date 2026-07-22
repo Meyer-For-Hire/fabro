@@ -2057,6 +2057,70 @@ enabled = true
     }
 
     #[test]
+    fn builtin_openrouter_includes_glm_5_2_when_enabled() {
+        let catalog = Catalog::from_builtin_with_overrides(&minimal_settings(
+            r"
+[providers.openrouter]
+enabled = true
+",
+        ))
+        .expect("enabled OpenRouter override should build from the built-in provider settings");
+
+        let model = catalog
+            .get("z-ai/glm-5.2")
+            .expect("OpenRouter GLM 5.2 should be present");
+        insta::assert_debug_snapshot!(model, @r#"
+        Model {
+            id: "z-ai/glm-5.2",
+            provider: openrouter,
+            family: "glm-5",
+            display_name: "GLM 5.2 (via OpenRouter)",
+            limits: ModelLimits {
+                context_window: 1048576,
+                max_output: Some(
+                    131072,
+                ),
+            },
+            training: None,
+            knowledge_cutoff: None,
+            features: ModelFeatures {
+                tools: true,
+                vision: false,
+                reasoning: true,
+                reasoning_effort: Levels,
+                prompt_cache: true,
+                sampling_params: true,
+            },
+            costs: ModelCosts {
+                input_cost_per_mtok: Some(
+                    0.784,
+                ),
+                output_cost_per_mtok: Some(
+                    2.464,
+                ),
+                cache_input_cost_per_mtok: Some(
+                    0.1456,
+                ),
+            },
+            estimated_output_tps: None,
+            aliases: [],
+            default: false,
+            small_default: false,
+            configured: false,
+        }
+        "#);
+
+        let settings = catalog
+            .model_settings("z-ai/glm-5.2")
+            .expect("OpenRouter GLM 5.2 settings should be present");
+        assert_eq!(settings.api_id, "z-ai/glm-5.2");
+        assert_eq!(settings.controls.reasoning_effort, vec![
+            ReasoningEffort::High,
+            ReasoningEffort::XHigh
+        ]);
+    }
+
+    #[test]
     fn builtin_ollama_provider_is_opt_in() {
         let ollama = ProviderId::new("ollama");
         let builtin = Catalog::builtin();
@@ -4352,6 +4416,67 @@ sampling_params = false
     fn glm_4_7_in_catalog() {
         let m = Catalog::builtin().get("glm-4.7").unwrap();
         assert_eq!(m.provider, ProviderId::new("zai"));
+        assert_eq!(Catalog::builtin().get("glm4").unwrap().id, "glm-4.7");
+    }
+
+    #[test]
+    fn glm_5_2_in_catalog() {
+        let catalog = Catalog::builtin();
+        let model = catalog.get("glm-5.2").expect("GLM 5.2 should be present");
+        insta::assert_debug_snapshot!(model, @r#"
+        Model {
+            id: "glm-5.2",
+            provider: zai,
+            family: "glm-5",
+            display_name: "GLM 5.2",
+            limits: ModelLimits {
+                context_window: 1048576,
+                max_output: Some(
+                    131072,
+                ),
+            },
+            training: None,
+            knowledge_cutoff: None,
+            features: ModelFeatures {
+                tools: true,
+                vision: false,
+                reasoning: true,
+                reasoning_effort: Levels,
+                prompt_cache: true,
+                sampling_params: true,
+            },
+            costs: ModelCosts {
+                input_cost_per_mtok: Some(
+                    1.4,
+                ),
+                output_cost_per_mtok: Some(
+                    4.4,
+                ),
+                cache_input_cost_per_mtok: Some(
+                    0.26,
+                ),
+            },
+            estimated_output_tps: None,
+            aliases: [
+                "glm",
+                "glm5",
+            ],
+            default: true,
+            small_default: false,
+            configured: false,
+        }
+        "#);
+
+        let settings = catalog
+            .model_settings("glm-5.2")
+            .expect("GLM 5.2 settings should be present");
+        assert_eq!(settings.api_id, "glm-5.2");
+        assert_eq!(settings.controls.reasoning_effort, vec![
+            ReasoningEffort::High,
+            ReasoningEffort::Max
+        ]);
+        assert_eq!(catalog.get("glm").unwrap().id, "glm-5.2");
+        assert_eq!(catalog.get("glm5").unwrap().id, "glm-5.2");
     }
 
     #[test]
