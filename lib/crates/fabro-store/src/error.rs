@@ -8,6 +8,8 @@ pub enum Error {
     ObjectStore(#[from] object_store::Error),
     #[error("Serialization error: {0}")]
     Serde(#[from] serde_json::Error),
+    #[error("SQLite error: {0}")]
+    Sqlite(#[from] sqlx::Error),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("Invalid event payload: {0}")]
@@ -26,6 +28,11 @@ pub enum Error {
     InvalidKeySegment { segment: String },
     #[error("failed to parse key: {0}")]
     KeyParse(String),
+    #[error("stored run summary {run_id} has inconsistent field {field}")]
+    RunSummaryMismatch {
+        run_id: String,
+        field:  &'static str,
+    },
     #[error("invalid status transition: {0}")]
     InvalidTransition(#[from] fabro_types::InvalidTransition),
     #[error("{0}")]

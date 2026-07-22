@@ -616,12 +616,7 @@ impl RunProjection {
     #[must_use]
     pub fn live_run_timing(&self, now: DateTime<Utc>) -> Option<RunTiming> {
         let start = self.start.as_ref()?;
-        let wall_time_ms = u64::try_from(
-            now.signed_duration_since(start.start_time)
-                .num_milliseconds()
-                .max(0),
-        )
-        .expect("non-negative milliseconds fit in u64");
+        let wall_time_ms = RunTiming::wall_time_ms_since(start.start_time, now);
         let active = self
             .stages
             .values()

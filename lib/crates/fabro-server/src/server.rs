@@ -86,7 +86,7 @@ use fabro_slack::{blocks as slack_blocks, connection as slack_connection};
 use fabro_static::EnvVars;
 use fabro_store::{
     ArtifactKey, ArtifactStore, Database, EventEnvelope, EventPayload, NodeArtifact,
-    PendingInterviewRecord, StageArtifactEntry, StageId,
+    PendingInterviewRecord, RunSummaryStore, StageArtifactEntry, StageId,
 };
 #[cfg(test)]
 use fabro_types::BlockedReason;
@@ -204,9 +204,17 @@ pub struct PaginationParams {
     pub offset: u32,
 }
 
+pub(crate) fn clamp_page_limit(limit: u32) -> u32 {
+    limit.clamp(1, 100)
+}
+
+pub(crate) fn clamp_page_offset(offset: u32) -> u32 {
+    offset.min(MAX_PAGE_OFFSET)
+}
+
 pub(crate) fn paginate_items<T>(items: Vec<T>, pagination: &PaginationParams) -> (Vec<T>, bool) {
-    let limit = pagination.limit.clamp(1, 100) as usize;
-    let offset = pagination.offset.min(MAX_PAGE_OFFSET) as usize;
+    let limit = clamp_page_limit(pagination.limit) as usize;
+    let offset = clamp_page_offset(pagination.offset) as usize;
     let mut data: Vec<_> = items.into_iter().skip(offset).take(limit + 1).collect();
     let has_more = data.len() > limit;
     data.truncate(limit);
@@ -219,7 +227,7 @@ pub(crate) struct DfParams {
     pub(crate) verbose: bool,
 }
 
-/// Non-paginated list response wrapper with `has_more: false`.
+/// List response envelope with pagination metadata.
 #[derive(serde::Serialize)]
 pub struct ListResponse<T: serde::Serialize> {
     data: T,
@@ -227,12 +235,23 @@ pub struct ListResponse<T: serde::Serialize> {
 }
 
 impl<T: serde::Serialize> ListResponse<T> {
+    /// Non-paginated response with `has_more: false`.
     pub fn new(data: T) -> Self {
         Self {
             data,
             meta: PaginationMeta {
                 has_more: false,
                 total:    None,
+            },
+        }
+    }
+
+    pub fn paginated(data: T, has_more: bool, total: u64) -> Self {
+        Self {
+            data,
+            meta: PaginationMeta {
+                has_more,
+                total: i64::try_from(total).ok(),
             },
         }
     }
@@ -1107,12 +1126,13 @@ pub struct AppState {
 }
 
 pub(crate) struct AppStores {
-    pub(crate) runs:         Arc<Database>,
-    pub(crate) automations:  Arc<AutomationStore>,
-    pub(crate) environments: Arc<EnvironmentStore>,
-    pub(crate) mcp_servers:  Arc<McpServerStore>,
-    pub(crate) vault:        Arc<SecretStore>,
-    pub(crate) variables:    Arc<VariableStore>,
+    pub(crate) runs:          Arc<Database>,
+    pub(crate) run_summaries: Arc<RunSummaryStore>,
+    pub(crate) automations:   Arc<AutomationStore>,
+    pub(crate) environments:  Arc<EnvironmentStore>,
+    pub(crate) mcp_servers:   Arc<McpServerStore>,
+    pub(crate) vault:         Arc<SecretStore>,
+    pub(crate) variables:     Arc<VariableStore>,
 }
 
 type PullRequestCreateLocks = Arc<Mutex<HashMap<RunId, Arc<AsyncMutex<()>>>>>;
@@ -2386,6 +2406,8 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         })
         .context("load environments")?,
     );
+    let run_summaries =
+        store.attach_run_summary_store(Arc::new(RunSummaryStore::new(db_pool.clone())));
     let mcp_server_dir = mcp_server_dir_for_active_config(&active_config_path);
     let mcp_server_pool = db_pool.clone();
     let mcp_server_store = Arc::new(
@@ -2491,6 +2513,7 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         aggregate_billing: Mutex::new(BillingAccumulator::default()),
         stores: AppStores {
             runs: store,
+            run_summaries,
             automations: automation_store,
             environments: environment_store,
             mcp_servers: mcp_server_store,

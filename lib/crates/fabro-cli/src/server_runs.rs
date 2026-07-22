@@ -38,11 +38,7 @@ impl ServerRunInfo {
     }
 
     pub(crate) fn workflow_display_name(&self) -> String {
-        self.workflow_name()
-            .or_else(|| self.workflow_graph_name())
-            .or_else(|| self.workflow_slug())
-            .unwrap_or("-")
-            .to_string()
+        self.run.workflow.display_name().unwrap_or("-").to_string()
     }
 
     pub(crate) fn workflow_matches(&self, pattern: &str) -> bool {

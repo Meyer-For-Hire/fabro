@@ -66,6 +66,13 @@ async fn connect_creates_parent_directory_and_migrate_is_idempotent() -> anyhow:
         assert_eq!(count, 1, "{table} table should exist");
     }
 
+    let runs_table_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'runs'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(runs_table_count, 1);
+
     let legacy_import_table_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'legacy_imports'",
     )
@@ -326,6 +333,58 @@ async fn insert_minimal_automation(
     .bind("fabro-sh/fabro")
     .bind("main")
     .bind("release")
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn runs_schema_creates_indexes_and_rejects_invalid_rows() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let database = fabro_db::Database::connect(dir.path().join("fabro.sqlite3")).await?;
+    database.migrate().await?;
+
+    let index_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name LIKE 'runs_by_%'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(index_count, 5);
+
+    insert_minimal_run(database.pool(), "submitted", 0, r#"{"id":"run"}"#).await?;
+    for (status, input_tokens, summary_json) in [
+        ("unknown", 0, r#"{"id":"run-2"}"#),
+        ("submitted", -1, r#"{"id":"run-3"}"#),
+        ("submitted", 0, "not-json"),
+    ] {
+        assert!(
+            insert_minimal_run(database.pool(), status, input_tokens, summary_json)
+                .await
+                .is_err()
+        );
+    }
+
+    Ok(())
+}
+
+async fn insert_minimal_run(
+    pool: &fabro_db::DbPool,
+    status: &str,
+    input_tokens: i64,
+    summary_json: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r"
+INSERT INTO runs (
+    id, source_last_seq, created_at_ms, last_event_at_ms, status, title,
+    input_tokens, summary_json
+) VALUES (?, 1, 0, 0, ?, 'title', ?, ?)
+",
+    )
+    .bind(format!("run-{status}-{input_tokens}"))
+    .bind(status)
+    .bind(input_tokens)
+    .bind(summary_json)
     .execute(pool)
     .await?;
     Ok(())

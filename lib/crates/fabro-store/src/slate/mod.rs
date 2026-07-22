@@ -7,7 +7,7 @@ mod run_store;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 pub use auth_codes::{AuthCode, AuthCodeStore};
@@ -25,7 +25,7 @@ use slatedb::config::{CompressionCodec, Settings};
 use tokio::sync::{Mutex, OnceCell};
 use tracing::warn;
 
-use crate::{Error, ListRunsQuery, Result, RunProjection, keys};
+use crate::{Error, ListRunsQuery, Result, RunProjection, RunSummaryStore, keys};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnreadableRun {
@@ -53,6 +53,7 @@ pub struct Database {
     refresh_tokens: Arc<OnceCell<Arc<RefreshTokenStore>>>,
     projection_cache: Arc<RunProjectionCache>,
     projection_cache_warmed: Arc<OnceCell<()>>,
+    run_summary_store: Arc<OnceLock<Arc<RunSummaryStore>>>,
 }
 
 impl std::fmt::Debug for Database {
@@ -85,7 +86,16 @@ impl Database {
             refresh_tokens: Arc::new(OnceCell::new()),
             projection_cache: Arc::new(RunProjectionCache::default()),
             projection_cache_warmed: Arc::new(OnceCell::new()),
+            run_summary_store: Arc::new(OnceLock::new()),
         }
+    }
+
+    pub fn attach_run_summary_store(&self, store: Arc<RunSummaryStore>) -> Arc<RunSummaryStore> {
+        Arc::clone(self.run_summary_store.get_or_init(|| store))
+    }
+
+    fn run_summary_store(&self) -> Option<Arc<RunSummaryStore>> {
+        self.run_summary_store.get().cloned()
     }
 
     fn shared_db_prefix(&self) -> String {
@@ -154,8 +164,13 @@ impl Database {
         }
 
         self.catalog_index().await?.add(run_id).await?;
-        let run_store =
-            RunDatabase::open_writer(*run_id, db, Arc::clone(&self.projection_cache)).await?;
+        let run_store = RunDatabase::open_writer(
+            *run_id,
+            db,
+            Arc::clone(&self.projection_cache),
+            Arc::clone(&self.run_summary_store),
+        )
+        .await?;
         Self::cache_active_run(&mut active_runs, &run_store);
         Ok(run_store)
     }
@@ -178,8 +193,13 @@ impl Database {
         if !RunDatabase::has_any_events(&db, run_id).await? {
             return Err(Error::RunNotFound(run_id.to_string()));
         }
-        let run_store =
-            RunDatabase::open_writer(*run_id, db, Arc::clone(&self.projection_cache)).await?;
+        let run_store = RunDatabase::open_writer(
+            *run_id,
+            db,
+            Arc::clone(&self.projection_cache),
+            Arc::clone(&self.run_summary_store),
+        )
+        .await?;
         Self::cache_active_run(&mut active_runs, &run_store);
         Ok(run_store)
     }
@@ -197,7 +217,13 @@ impl Database {
         if !RunDatabase::has_any_events(&db, run_id).await? {
             return Err(Error::RunNotFound(run_id.to_string()));
         }
-        RunDatabase::open_reader(*run_id, db, Arc::clone(&self.projection_cache)).await
+        RunDatabase::open_reader(
+            *run_id,
+            db,
+            Arc::clone(&self.projection_cache),
+            Arc::clone(&self.run_summary_store),
+        )
+        .await
     }
 
     pub async fn list_runs(&self, query: &ListRunsQuery, now: DateTime<Utc>) -> Result<Vec<Run>> {
@@ -244,6 +270,9 @@ impl Database {
                             );
                         }
                     }
+                }
+                if let Some(store) = self.run_summary_store() {
+                    store.reconcile(&entries).await?;
                 }
                 self.projection_cache.replace_all(entries).await;
                 Ok::<_, Error>(())
@@ -356,6 +385,9 @@ impl Database {
         self.delete_session_indexes_for_run(run_id).await?;
         self.catalog_index().await?.remove(run_id).await?;
         self.remove_cached_run(run_id).await;
+        if let Some(store) = self.run_summary_store() {
+            store.delete(run_id).await?;
+        }
         Ok(())
     }
 
@@ -479,7 +511,7 @@ mod tests {
     use object_store::path::Path;
 
     use super::*;
-    use crate::{EventPayload, keys};
+    use crate::{EventPayload, keys, test_util};
 
     fn dt(value: &str) -> DateTime<Utc> {
         value.parse().unwrap()
@@ -525,6 +557,11 @@ mod tests {
             None,
         );
         (object_store, store)
+    }
+
+    async fn make_summary_store() -> (tempfile::TempDir, Arc<RunSummaryStore>) {
+        let (directory, store) = test_util::sqlite_summary_store().await;
+        (directory, Arc::new(store))
     }
 
     fn sample_run_spec(label: &str) -> RunSpec {
@@ -1325,6 +1362,8 @@ mod tests {
     #[tokio::test]
     async fn append_event_refreshes_projection_cache_and_delete_removes_it() {
         let (_object_store, store) = make_store();
+        let (_directory, summaries) = make_summary_store().await;
+        store.attach_run_summary_store(Arc::clone(&summaries));
         let run = store.create_run(&test_run_id("run-1")).await.unwrap();
         append_created(&run, "run-1", dt("2026-03-27T12:00:00Z")).await;
         store.warm_projection_cache().await.unwrap();
@@ -1436,7 +1475,7 @@ mod tests {
             Some("abc123")
         );
 
-        let summaries = store
+        let cached_summaries = store
             .list_runs(&ListRunsQuery::default(), Utc::now())
             .await
             .unwrap();
@@ -1444,7 +1483,7 @@ mod tests {
             .list_runs_with_projection(&ListRunsQuery::default(), Utc::now())
             .await
             .unwrap();
-        assert_eq!(summaries, vec![cached.summary.clone()]);
+        assert_eq!(cached_summaries, vec![cached.summary.clone()]);
         assert_eq!(projected[0].0, cached.summary);
         assert_eq!(
             projected[0]
@@ -1460,6 +1499,18 @@ mod tests {
                 .git_commit_sha
                 .as_deref()
         );
+        let comparison_time = dt("2026-03-27T12:00:10Z");
+        let cache_summary = store
+            .get_cached_summary(&test_run_id("run-1"), comparison_time)
+            .await
+            .unwrap()
+            .unwrap();
+        let sql_summary = summaries
+            .get(&test_run_id("run-1"), comparison_time)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sql_summary, cache_summary);
 
         store.delete_run(&test_run_id("run-1")).await.unwrap();
         assert!(
@@ -1476,6 +1527,34 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        assert!(
+            summaries
+                .get(&test_run_id("run-1"), Utc::now())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn projection_cache_warmup_backfills_sqlite_run_summaries() {
+        let (object_store, store) = make_store();
+        let run = store.create_run(&test_run_id("run-1")).await.unwrap();
+        append_completed(&run, "run-1", dt("2026-03-27T12:00:00Z")).await;
+
+        let reopened = Database::new(object_store, "runs", Duration::from_millis(1), None);
+        let (_directory, summaries) = make_summary_store().await;
+        reopened.attach_run_summary_store(Arc::clone(&summaries));
+        reopened.warm_projection_cache().await.unwrap();
+
+        let summary = summaries
+            .get(&test_run_id("run-1"), Utc::now())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(summary.lifecycle.status, RunStatus::Succeeded {
+            reason: SuccessReason::Completed,
+        });
     }
 
     #[tokio::test]

@@ -7,8 +7,11 @@ mod keys;
 mod record;
 mod run_sessions;
 mod run_state;
+mod run_summary_store;
 mod serializable_projection;
 mod slate;
+#[cfg(test)]
+mod test_util;
 mod types;
 
 pub use artifact_store::{
@@ -25,6 +28,10 @@ pub use run_sessions::{
     project_run_sessions,
 };
 pub use run_state::RunProjectionReducer;
+pub use run_summary_store::{
+    RunSummaryIdentity, RunSummaryListQuery, RunSummaryPage, RunSummarySort,
+    RunSummarySortDirection, RunSummaryStore, RunSummaryVisibility,
+};
 pub use serializable_projection::SerializableProjection;
 pub use slate::{
     AuthCode, AuthCodeStore, Blob, BlobStore, CachedRunProjection, ConsumeOutcome, Database,
