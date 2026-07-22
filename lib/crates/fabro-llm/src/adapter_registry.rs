@@ -301,6 +301,7 @@ mod tests {
             ("gemini-3.1-pro-preview-customtools", "gemini-3.1-pro-preview-customtools",  T::Gemini,            C::GeminiGenerate,    B::Gemini,    P::Gemini),
             ("gemini-3.5-flash",                   "gemini-3.5-flash",                    T::Gemini,            C::GeminiGenerate,    B::Gemini,    P::Gemini),
             ("glm-4.7",                            "glm-4.7",                             T::OpenAiCompatible,  C::OpenAiCompatible,  B::OpenAi,    P::OpenAi),
+            ("glm-5.2",                            "glm-5.2",                             T::OpenAiCompatible,  C::OpenAiCompatible,  B::OpenAi,    P::OpenAi),
             ("gpt-5.4",                            "gpt-5.4",                             T::OpenAi,            C::OpenAiResponses,   B::OpenAi,    P::OpenAi),
             ("gpt-5.4-mini",                       "gpt-5.4-mini",                        T::OpenAi,            C::OpenAiResponses,   B::OpenAi,    P::OpenAi),
             ("gpt-5.4-pro",                        "gpt-5.4-pro",                         T::OpenAi,            C::OpenAiResponses,   B::OpenAi,    P::OpenAi),

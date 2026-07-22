@@ -25,10 +25,10 @@ pub(super) fn decode_response(
     })?;
 
     let mut content_parts = Vec::new();
-    if let Some(reasoning) = &choice.message.reasoning_content {
+    if let Some(reasoning) = choice.message.reasoning() {
         if !reasoning.is_empty() {
             content_parts.push(ContentPart::Thinking(ThinkingData {
-                text:      reasoning.clone(),
+                text:      reasoning.to_string(),
                 signature: None,
                 redacted:  false,
             }));
