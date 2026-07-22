@@ -39,6 +39,7 @@ permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
 
 jobs:
   fmt:
@@ -74,8 +75,16 @@ jobs:
           cache-on-failure: true
       - name: Verify legacy auth identity removal
         run: |
-          ! rg -n 'AuthMode::Disabled|RunAuthMethod|RunSubjectProvenance|\bActorRef\b|\bActorKind\b|AuthenticatedSubject|AuthenticatedService|AuthorizeRunScoped|AuthorizeRunBlob|AuthorizeStageArtifact|AuthorizeCommandLog|auth_method\s*==\s*"disabled"' \
-            lib/crates apps lib/packages docs/public/api-reference/fabro-api.yaml
+          if git grep -nE 'AuthMode::Disabled|RunAuthMethod|RunSubjectProvenance|\bActorRef\b|\bActorKind\b|AuthenticatedSubject|AuthenticatedService|AuthorizeRunScoped|AuthorizeRunBlob|AuthorizeStageArtifact|AuthorizeCommandLog|auth_method\s*==\s*"disabled"' \
+            -- lib/crates apps lib/packages docs/public/api-reference/fabro-api.yaml; then
+            echo "::error::Legacy auth identities remain in the repository"
+            exit 1
+          else
+            status=$?
+            if [ "$status" -ne 1 ]; then
+              exit "$status"
+            fi
+          fi
       - run: cargo +nightly-2026-04-14 clippy --locked --workspace --all-targets -- -D warnings
 
   generated-docs:
