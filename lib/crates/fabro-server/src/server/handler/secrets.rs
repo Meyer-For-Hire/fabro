@@ -5,7 +5,7 @@ use fabro_static::EnvVars;
 
 use super::super::{
     ApiError, AppState, CreateSecretRequest, DeleteSecretRequest, IntoResponse, Json, RequiredUser,
-    Response, Router, SecretType, State, StatusCode, VaultError, get, spawn_blocking,
+    Response, Router, SecretStoreError, SecretType, State, StatusCode, get,
 };
 
 pub(super) fn routes() -> Router<Arc<AppState>> {
@@ -18,8 +18,10 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
 }
 
 async fn list_secrets(_auth: RequiredUser, State(state): State<Arc<AppState>>) -> Response {
-    let data = state.stores.vault.read().await.list();
-    (StatusCode::OK, Json(serde_json::json!({ "data": data }))).into_response()
+    match state.stores.vault.list().await {
+        Ok(data) => (StatusCode::OK, Json(serde_json::json!({ "data": data }))).into_response(),
+        Err(err) => secret_store_error(&err),
+    }
 }
 
 async fn create_secret(
@@ -59,34 +61,20 @@ async fn create_secret(
             }
         }
     }
-    let state_for_write = Arc::clone(&state);
-    let result = spawn_blocking(move || {
-        let mut vault = state_for_write.stores.vault.blocking_write();
-        vault.set(&name, &value, secret_type, description.as_deref())
-    })
-    .await;
-
-    match result {
-        Ok(Ok(meta)) => (StatusCode::OK, Json(meta)).into_response(),
-        Ok(Err(VaultError::InvalidName(_))) => {
+    match state
+        .stores
+        .vault
+        .set(&name, &value, secret_type, description.as_deref())
+        .await
+    {
+        Ok(meta) => (StatusCode::OK, Json(meta)).into_response(),
+        Err(SecretStoreError::InvalidName(_)) => {
             ApiError::bad_request("invalid secret name").into_response()
         }
-        Ok(Err(VaultError::Io(err))) => {
-            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
+        Err(SecretStoreError::InvalidOauth { .. }) => {
+            ApiError::bad_request("invalid oauth credential JSON").into_response()
         }
-        Ok(Err(VaultError::Serde(err))) => {
-            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
-        }
-        Ok(Err(VaultError::NotFound(_))) => ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "secret unexpectedly missing",
-        )
-        .into_response(),
-        Err(err) => ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("secret write task failed: {err}"),
-        )
-        .into_response(),
+        Err(err) => secret_store_error(&err),
     }
 }
 
@@ -96,32 +84,21 @@ async fn delete_secret_by_name(
     Json(body): Json<DeleteSecretRequest>,
 ) -> Response {
     let name = body.name;
-    let state_for_write = Arc::clone(&state);
-    let result = spawn_blocking(move || {
-        let mut vault = state_for_write.stores.vault.blocking_write();
-        vault.remove(&name)
-    })
-    .await;
-
-    match result {
-        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
-        Ok(Err(VaultError::InvalidName(_))) => {
-            ApiError::bad_request("invalid secret name").into_response()
-        }
-        Ok(Err(VaultError::NotFound(name))) => {
+    match state.stores.vault.remove(&name).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(SecretStoreError::NotFound(name)) => {
             ApiError::new(StatusCode::NOT_FOUND, format!("secret not found: {name}"))
                 .into_response()
         }
-        Ok(Err(VaultError::Io(err))) => {
-            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
-        }
-        Ok(Err(VaultError::Serde(err))) => {
-            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
-        }
-        Err(err) => ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("secret delete task failed: {err}"),
-        )
-        .into_response(),
+        Err(err) => secret_store_error(&err),
     }
+}
+
+fn secret_store_error(err: &SecretStoreError) -> Response {
+    tracing::error!(error = ?err, "Secret store operation failed");
+    ApiError::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "secret store operation failed",
+    )
+    .into_response()
 }

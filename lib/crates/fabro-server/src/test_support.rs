@@ -30,7 +30,6 @@ use tokio::runtime::Builder as TokioRuntimeBuilder;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
-use crate::auth;
 use crate::automation_materializer::AutomationRunMaterializer;
 pub use crate::automation_materializer::TestAutomationRunMaterializer;
 use crate::interp::process_env_var;
@@ -44,6 +43,7 @@ use crate::server::{
 use crate::server_secrets::ServerSecrets;
 #[cfg(test)]
 use crate::worker_runtime::WorkerRuntime;
+use crate::{auth, migrations};
 
 pub const TEST_DEV_TOKEN: &str =
     "fabro_dev_abababababababababababababababababababababababababababababababab";
@@ -252,6 +252,7 @@ impl TestAppStateBuilder {
             &vault_path,
             self.default_environment_provider,
         )?;
+        let preloaded_vault = test_secret_snapshot(db_pool.clone())?;
         build_app_state(AppStateConfig {
             resolved_settings: resolved_runtime_settings_for_tests(
                 self.server_settings,
@@ -263,8 +264,7 @@ impl TestAppStateBuilder {
             store,
             artifact_store,
             db_pool,
-            vault_path,
-            preloaded_vault: None,
+            preloaded_vault,
             server_secrets: load_test_server_secrets(server_env_path, self.server_secret_env),
             env_lookup: self.env_lookup,
             github_api_base_url: None,
@@ -281,6 +281,24 @@ impl TestAppStateBuilder {
             automation_materializer_override: self.automation_materializer,
         })
     }
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "sync test builders may run inside Tokio; a dedicated thread avoids a nested runtime"
+)]
+pub(crate) fn test_secret_snapshot(pool: DbPool) -> anyhow::Result<Vault> {
+    std::thread::spawn(move || {
+        let runtime = TokioRuntimeBuilder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime
+            .block_on(fabro_vault::SecretStore::new(pool).snapshot())
+            .map(fabro_vault::SecretSnapshot::into_vault)
+            .map_err(anyhow::Error::new)
+    })
+    .join()
+    .expect("test secret snapshot thread should not panic")
 }
 
 pub fn llm_catalog_settings_with_provider_base_url(
@@ -512,6 +530,7 @@ pub(crate) fn test_db_pool_for_vault_path_with_default_environment(
 ) -> anyhow::Result<DbPool> {
     test_db_pool(
         sqlite_path_for_vault_path(vault_path),
+        vault_path.to_path_buf(),
         default_environment_provider,
     )
 }
@@ -540,15 +559,18 @@ pub async fn test_environment_from_storage_dir(
 )]
 fn test_db_pool(
     path: PathBuf,
+    vault_path: PathBuf,
     default_environment_provider: Option<EnvironmentProvider>,
 ) -> anyhow::Result<DbPool> {
     std::thread::spawn(move || {
+        migrations::migrate_legacy_vault_file(&vault_path)?;
         let runtime = TokioRuntimeBuilder::new_current_thread()
             .enable_all()
             .build()?;
         runtime.block_on(async move {
             let database = fabro_db::Database::connect(&path).await?;
             database.migrate().await?;
+            fabro_vault::import_legacy_json_once(database.pool(), vault_path).await?;
             if let Some(provider) = default_environment_provider {
                 fabro_environment::seed_default_environment(database.pool(), provider).await?;
             }

@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context as _, Result, bail};
-use fabro_auth::{CredentialSource, EnvCredentialSource, VaultCredentialSource};
+use fabro_auth::{CredentialSource, SqlVaultCredentialSource};
 use fabro_config::{CliLayer, Storage, load_llm_catalog_settings};
 use fabro_model::Catalog;
 use fabro_types::UserSettings;
@@ -10,8 +10,8 @@ use fabro_types::settings::RunNamespace;
 use fabro_types::settings::cli::{OutputFormat, OutputVerbosity};
 use fabro_util::error::SharedError;
 use fabro_util::printer::Printer;
-use fabro_vault::Vault;
-use tokio::sync::{OnceCell, RwLock as AsyncRwLock};
+use fabro_vault::SecretStore;
+use tokio::sync::OnceCell;
 
 use crate::args::{
     ServerConnectionArgs, ServerTargetArgs, printer_from_verbosity, require_no_json_override,
@@ -169,13 +169,12 @@ impl CommandContext {
         let source = self
             .llm_source
             .get_or_try_init(|| async move {
+                let storage = Storage::new(&storage_dir);
+                let store = SecretStore::open(storage.sqlite_path(), storage.secrets_path())
+                    .await
+                    .context("opening the Fabro secret store")?;
                 let source: Arc<dyn CredentialSource> =
-                    match Vault::load(Storage::new(&storage_dir).secrets_path()) {
-                        Ok(vault) => Arc::new(VaultCredentialSource::new(Arc::new(
-                            AsyncRwLock::new(vault),
-                        ))),
-                        Err(_) => Arc::new(EnvCredentialSource::new()),
-                    };
+                    Arc::new(SqlVaultCredentialSource::new(Arc::new(store)));
                 Ok::<Arc<dyn CredentialSource>, anyhow::Error>(source)
             })
             .await?;

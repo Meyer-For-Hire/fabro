@@ -15,7 +15,9 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use fabro_config::envfile::{self, EnvFileRemoval};
 use fabro_static::{EnvVars, optional_vault_secrets};
-use fabro_vault::{SecretType, Vault};
+#[cfg(test)]
+use fabro_vault::Vault;
+use fabro_vault::{SecretStore, SecretStoreWrite, SecretType};
 
 pub(crate) const REMOVAL_DEADLINE: &str = "2026-08-18";
 
@@ -34,6 +36,7 @@ impl OptionalServerEnvSecretsMigrationReport {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn migrate(
     vault: &mut Vault,
     server_env_path: &Path,
@@ -118,6 +121,92 @@ pub(crate) fn migrate(
         report.backup_path = Some(backup_path);
     }
 
+    Ok(report)
+}
+
+pub(crate) async fn migrate_to_store(
+    store: &SecretStore,
+    server_env_path: &Path,
+    env_entries: &HashMap<String, String>,
+) -> anyhow::Result<OptionalServerEnvSecretsMigrationReport> {
+    let server_env_entries = envfile::read_env_file(server_env_path)
+        .with_context(|| format!("read server env file {}", server_env_path.display()))?;
+    let mut writes = Vec::new();
+    let mut env_removals = Vec::new();
+    let mut warnings = Vec::new();
+    let mut preserved_env_entries = 0;
+
+    for &name in optional_vault_secrets() {
+        let process_value = env_entries.get(name);
+        let file_value = server_env_entries.get(name);
+        if let Some(entry) = store.get(name).await? {
+            if let Some(file_value) = file_value {
+                if file_value == &entry.value {
+                    env_removals.push(env_removal(name));
+                } else {
+                    preserved_env_entries += 1;
+                    warnings.push(format!(
+                        "Preserved {name} in server.env because the secret store already contains a different value"
+                    ));
+                }
+            }
+            continue;
+        }
+
+        let value = match (process_value, file_value) {
+            (Some(value), Some(file_value)) => {
+                if value == file_value {
+                    env_removals.push(env_removal(name));
+                } else {
+                    preserved_env_entries += 1;
+                    warnings.push(format!(
+                        "Preserved {name} in server.env because process env takes precedence and the file value differs"
+                    ));
+                }
+                Some(value)
+            }
+            (Some(value), None) => Some(value),
+            (None, Some(value)) => {
+                env_removals.push(env_removal(name));
+                Some(value)
+            }
+            (None, None) => None,
+        };
+        if let Some(value) = value {
+            writes.push(SecretStoreWrite {
+                name:        name.to_string(),
+                value:       value.clone(),
+                secret_type: secret_type_for(name),
+                description: None,
+            });
+        }
+    }
+
+    let mut report = OptionalServerEnvSecretsMigrationReport {
+        migrated_secrets: writes.len(),
+        removed_env_entries: 0,
+        preserved_env_entries,
+        backup_path: None,
+        warnings,
+    };
+    if writes.is_empty() && env_removals.is_empty() {
+        return Ok(report);
+    }
+
+    store.apply(&[], &writes).await?;
+    if !env_removals.is_empty() {
+        let backup_path = backup_server_env_file(server_env_path)?;
+        let update_report =
+            envfile::update_env_file_with_report(server_env_path, env_removals, Vec::new())
+                .with_context(|| {
+                    format!(
+                        "remove migrated optional secrets from {}",
+                        server_env_path.display()
+                    )
+                })?;
+        report.removed_env_entries = update_report.removed_keys.len();
+        report.backup_path = Some(backup_path);
+    }
     Ok(report)
 }
 

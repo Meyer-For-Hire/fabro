@@ -35,6 +35,10 @@ impl VaultCredentialSource {
     pub fn vault_only(vault: Arc<AsyncRwLock<Vault>>) -> Self {
         Self::with_env_lookup(vault, |_| None)
     }
+
+    pub(crate) async fn snapshot(&self) -> Vault {
+        self.vault.read().await.clone()
+    }
 }
 
 impl std::fmt::Debug for VaultCredentialSource {

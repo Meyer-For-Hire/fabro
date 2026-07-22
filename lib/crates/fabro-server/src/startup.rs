@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+#[cfg(test)]
 use anyhow::Context as _;
 use fabro_static::EnvVars;
 use fabro_types::settings::ServerNamespace;
@@ -26,7 +27,7 @@ pub(crate) fn resolve_startup(
     Ok((auth_mode, server_secrets))
 }
 
-pub fn load_startup_vault(vault_path: impl AsRef<Path>) -> anyhow::Result<Vault> {
+pub fn migrate_startup_vault(vault_path: impl AsRef<Path>) {
     let vault_path = vault_path.as_ref();
     match migrations::migrate_legacy_vault_file(vault_path) {
         Ok(report) if report.changed() => {
@@ -51,10 +52,17 @@ pub fn load_startup_vault(vault_path: impl AsRef<Path>) -> anyhow::Result<Vault>
             );
         }
     }
+}
+
+#[cfg(test)]
+fn load_startup_vault(vault_path: impl AsRef<Path>) -> anyhow::Result<Vault> {
+    let vault_path = vault_path.as_ref();
+    migrate_startup_vault(vault_path);
     Vault::load(vault_path.to_path_buf())
         .with_context(|| format!("load vault {}", vault_path.display()))
 }
 
+#[cfg(test)]
 pub(crate) fn prepare_startup_vault(
     vault_path: impl AsRef<Path>,
     server_env_path: impl AsRef<Path>,

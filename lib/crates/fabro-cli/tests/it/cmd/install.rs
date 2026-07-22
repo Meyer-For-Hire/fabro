@@ -13,6 +13,16 @@ use fabro_vault::{SecretType, Vault};
 
 const INSTALL_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
+async fn load_secret_snapshot(storage: &Storage) -> Vault {
+    fabro_vault::SecretStore::open(storage.sqlite_path(), storage.secrets_path())
+        .await
+        .expect("test secret store should open")
+        .snapshot()
+        .await
+        .expect("test secret snapshot should load")
+        .into_vault()
+}
+
 #[test]
 fn help() {
     let context = test_context!();
@@ -611,8 +621,8 @@ fn github_non_interactive_requires_strategy() {
     assert!(stderr.contains("install github --non-interactive requires --strategy"));
 }
 
-#[test]
-fn github_non_interactive_token_reconfigures_existing_app_install() {
+#[tokio::test]
+async fn github_non_interactive_token_reconfigures_existing_app_install() {
     let mut context = test_context!();
     let storage_dir = context.home_dir.join("install-storage");
     context.manage_storage_dir(&storage_dir);
@@ -758,7 +768,7 @@ mode = "keep-me"
     assert!(!server_env.contains_key("GITHUB_APP_WEBHOOK_SECRET"));
     assert_eq!(server_env.get("KEEP_ME").map(String::as_str), Some("1"));
 
-    let vault = Vault::load(Storage::new(&storage_dir).secrets_path()).unwrap();
+    let vault = load_secret_snapshot(&Storage::new(&storage_dir)).await;
     assert_eq!(vault.get("GITHUB_TOKEN"), Some("token-from-gh"));
     assert_eq!(vault.get("GITHUB_APP_PRIVATE_KEY"), None);
     assert_eq!(vault.get("GITHUB_APP_CLIENT_SECRET"), None);

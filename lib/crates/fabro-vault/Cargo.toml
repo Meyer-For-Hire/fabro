@@ -13,11 +13,17 @@ doctest = false
 workspace = true
 
 [dependencies]
+anyhow.workspace = true
 chrono.workspace = true
+fabro-db = { path = "../fabro-db" }
 fabro-static = { path = "../fabro-static" }
 fabro-types = { path = "../fabro-types" }
 serde.workspace = true
 serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
 ulid.workspace = true
 
 [dev-dependencies]

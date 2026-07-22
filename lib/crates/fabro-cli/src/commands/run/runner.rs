@@ -24,7 +24,7 @@ use fabro_types::{
     ArtifactUpload, EventBody, FailureReason, Principal, RunBlobId, RunEvent, RunId,
     WorkflowSettings,
 };
-use fabro_vault::Vault;
+use fabro_vault::{SecretStore, Vault};
 use fabro_workflow::artifact_upload::{ArtifactSink, StageArtifactUploader};
 use fabro_workflow::event::{Emitter, RunEventSink};
 use fabro_workflow::operations::{self, StartServices};
@@ -137,7 +137,7 @@ pub(crate) async fn execute(
     if let Some(control_manager) = &mut control_manager {
         control_manager.wait_for_first_connection().await?;
     }
-    let vault = load_worker_vault(storage_dir.as_deref())?;
+    let vault = load_worker_vault(storage_dir.as_deref()).await?;
     let github_app = {
         let vault_guard = match &vault {
             Some(arc) => Some(arc.read().await),
@@ -272,18 +272,24 @@ impl fabro_tool::RunManifestBuilder for WorkerRunManifestBuilder {
     }
 }
 
-fn load_worker_vault(storage_dir: Option<&Path>) -> Result<Option<Arc<AsyncRwLock<Vault>>>> {
+async fn load_worker_vault(storage_dir: Option<&Path>) -> Result<Option<Arc<AsyncRwLock<Vault>>>> {
     let Some(storage_dir) = storage_dir else {
         return Ok(None);
     };
 
     let storage = Storage::new(storage_dir);
-    let vault = Vault::load(storage.secrets_path()).with_context(|| {
-        format!(
-            "failed to load worker vault from {}",
-            storage.root().display()
-        )
-    })?;
+    let vault = SecretStore::open(storage.sqlite_path(), storage.secrets_path())
+        .await
+        .with_context(|| {
+            format!(
+                "failed to open worker secret store from {}",
+                storage.root().display()
+            )
+        })?
+        .snapshot()
+        .await
+        .context("loading worker secrets snapshot")?
+        .into_vault();
     Ok(Some(Arc::new(AsyncRwLock::new(vault))))
 }
 
@@ -1744,7 +1750,7 @@ mod tests {
             .set("ANTHROPIC_API_KEY", "vault-key", SecretType::Token, None)
             .unwrap();
 
-        let loaded = load_worker_vault(Some(temp.path())).unwrap().unwrap();
+        let loaded = load_worker_vault(Some(temp.path())).await.unwrap().unwrap();
         let guard = loaded.read().await;
         let credential = guard.get("ANTHROPIC_API_KEY").unwrap();
 

@@ -1217,7 +1217,10 @@ async fn reconnect_run_sandbox(
         .and_then(fabro_types::RunSandbox::instance)
         .cloned()
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Run sandbox was not created."))?;
-    let daytona_api_key = state.vault_secret(EnvVars::DAYTONA_API_KEY);
+    let daytona_api_key = state
+        .vault_secret(EnvVars::DAYTONA_API_KEY)
+        .await
+        .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
     let sandbox = reconnect_for_run(&record, daytona_api_key, Some(*run_id))
         .await
         .map_err(|err| ApiError::new(StatusCode::CONFLICT, err.to_string()))?;

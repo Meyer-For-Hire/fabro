@@ -577,7 +577,17 @@ async fn callback_github(
         );
     };
     let client_id = client_id.clone();
-    let Some(client_secret) = state.vault_secret(EnvVars::GITHUB_APP_CLIENT_SECRET) else {
+    let client_secret = match state.vault_secret(EnvVars::GITHUB_APP_CLIENT_SECRET).await {
+        Ok(value) => value,
+        Err(err) => {
+            error!(error = ?err, "OAuth callback failed: secret store unavailable");
+            return json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error": "secret store operation failed"}),
+            );
+        }
+    };
+    let Some(client_secret) = client_secret else {
         error!("OAuth callback failed: GITHUB_APP_CLIENT_SECRET not configured");
         return json_response(
             StatusCode::CONFLICT,
@@ -1659,14 +1669,13 @@ client_id = "github-client-id"
         state
             .stores
             .vault
-            .write()
-            .await
             .set(
                 EnvVars::GITHUB_APP_CLIENT_SECRET,
                 "vault-client-secret",
                 SecretType::Token,
                 None,
             )
+            .await
             .unwrap();
         let app =
             server::build_router_with_options(state, &github_auth_mode(), server::RouterOptions {

@@ -145,7 +145,7 @@ pub use sandbox_services::{
     SandboxService, SandboxServiceDiscoverySource, SandboxServiceListMeta,
     SandboxServiceListResponse,
 };
-pub use secret::{SecretMetadata, SecretType};
+pub use secret::{OAuthConfig, OAuthCredential, OAuthTokens, SecretMetadata, SecretType};
 pub use session::{
     PermissionLevel, SessionDetail, SessionId, SessionMessage, SessionRecord, SessionStatus,
     SessionSummary, SessionTurn, TurnId,

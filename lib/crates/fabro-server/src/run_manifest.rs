@@ -516,14 +516,22 @@ async fn build_preflight_report(
     let needs_github_credentials =
         sandbox_provider.is_clone_based() || resolved_run.integrations.github.is_token_requested();
     let github_app = if needs_github_credentials {
-        state
-            .github_credentials(github_integration)
-            .unwrap_or_default()
+        match state.github_credentials(github_integration).await {
+            Ok(credentials) => credentials,
+            Err(err)
+                if err
+                    .downcast_ref::<fabro_vault::SecretStoreError>()
+                    .is_some() =>
+            {
+                return Err(err);
+            }
+            Err(_) => None,
+        }
     } else {
         None
     };
 
-    let daytona_api_key = state.vault_secret(EnvVars::DAYTONA_API_KEY);
+    let daytona_api_key = state.vault_secret(EnvVars::DAYTONA_API_KEY).await?;
     let sandbox_ok = run_sandbox_check(
         &mut checks,
         sandbox_provider,
@@ -2326,14 +2334,13 @@ id = "daytona"
         state
             .stores
             .vault
-            .write()
-            .await
             .set(
                 "OPENAI_API_KEY",
                 "test-openai-key",
                 fabro_vault::SecretType::Token,
                 None,
             )
+            .await
             .unwrap();
 
         let mut manifest = minimal_manifest();

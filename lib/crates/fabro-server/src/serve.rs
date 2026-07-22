@@ -39,8 +39,8 @@ use crate::server::{
     spawn_automation_scheduler, spawn_scheduler,
 };
 use crate::server_secrets::{ServerSecrets, process_env_snapshot};
-use crate::startup::{prepare_startup_vault, resolve_startup, validate_startup_configuration};
-use crate::static_files;
+use crate::startup::{migrate_startup_vault, resolve_startup, validate_startup_configuration};
+use crate::{migrations, static_files};
 
 pub const DEFAULT_TCP_PORT: u16 = 32276;
 type EnvLookup = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
@@ -256,7 +256,7 @@ enum WebhookPreconditions {
     Skip(String),
 }
 
-fn resolve_webhook_preconditions(
+async fn resolve_webhook_preconditions(
     github: &GithubIntegrationSettings,
     state: &Arc<AppState>,
     webhook_secret_present: bool,
@@ -272,7 +272,7 @@ fn resolve_webhook_preconditions(
             "server.integrations.github.app_id is not set".to_string(),
         );
     };
-    let github_app = match state.github_credentials(github) {
+    let github_app = match state.github_credentials(github).await {
         Ok(creds) => creds,
         Err(err) => {
             return WebhookPreconditions::Skip(format!("GitHub credentials are invalid: {err}"));
@@ -312,7 +312,7 @@ async fn start_webhook_strategy(
     };
 
     let (app_id, private_key_pem) =
-        match resolve_webhook_preconditions(github, state, webhook_secret_present) {
+        match resolve_webhook_preconditions(github, state, webhook_secret_present).await {
             WebhookPreconditions::Ready {
                 app_id,
                 private_key_pem,
@@ -666,14 +666,7 @@ where
     let resolved_server_settings = resolved_app_settings.server_settings.server.clone();
     validate_startup_configuration(&resolved_server_settings)?;
     let env_entries = process_env_snapshot();
-    let startup_vault = prepare_startup_vault(&vault_path, &server_env_path, &env_entries)?;
-    let (auth_mode, server_secrets) = resolve_startup(
-        &server_env_path,
-        env_entries,
-        &resolved_server_settings,
-        &startup_vault,
-    )?;
-    let webhook_secret_present = startup_vault.get(WEBHOOK_SECRET_ENV).is_some();
+    migrate_startup_vault(&vault_path);
     let bind_request = resolve_bind_request_from_server_settings(
         &resolved_app_settings.server_settings,
         args.bind.as_deref(),
@@ -683,6 +676,45 @@ where
         .with_context(|| format!("creating data directory {}", data_dir.display()))?;
     let database = fabro_db::Database::connect(&sqlite_path).await?;
     database.migrate().await?;
+    fabro_vault::import_legacy_json_once(database.pool(), &vault_path)
+        .await
+        .with_context(|| format!("importing legacy secrets file {}", vault_path.display()))?;
+    let secret_store = fabro_vault::SecretStore::new(database.clone_pool());
+    let optional_report = migrations::migrate_optional_server_env_secrets_to_store(
+        &secret_store,
+        &server_env_path,
+        &env_entries,
+    )
+    .await
+    .context("migrate optional server env secrets into SQLite")?;
+    for warning in &optional_report.warnings {
+        warn!(
+            warning = %warning,
+            removal_deadline = migrations::OPTIONAL_SERVER_ENV_SECRETS_REMOVAL_DEADLINE,
+            "Optional server env secrets migration warning"
+        );
+    }
+    if optional_report.changed() {
+        warn!(
+            migrated_secrets = optional_report.migrated_secrets,
+            removed_env_entries = optional_report.removed_env_entries,
+            preserved_env_entries = optional_report.preserved_env_entries,
+            backup_path = ?optional_report.backup_path,
+            removal_deadline = migrations::OPTIONAL_SERVER_ENV_SECRETS_REMOVAL_DEADLINE,
+            "Migrated optional server env secrets into SQLite"
+        );
+    }
+    let startup_vault = secret_store
+        .snapshot()
+        .await
+        .context("loading startup secret snapshot")?;
+    let (auth_mode, server_secrets) = resolve_startup(
+        &server_env_path,
+        env_entries,
+        &resolved_server_settings,
+        &startup_vault,
+    )?;
+    let webhook_secret_present = startup_vault.get(WEBHOOK_SECRET_ENV).is_some();
     fabro_variable::import_legacy_json_once(database.pool(), &variables_path)
         .await
         .with_context(|| {
@@ -758,9 +790,8 @@ where
         max_concurrent_runs,
         store,
         artifact_store,
-        vault_path,
         db_pool,
-        preloaded_vault: Some(startup_vault),
+        preloaded_vault: startup_vault.into_vault(),
         server_secrets,
         env_lookup,
         github_api_base_url: None,

@@ -3,6 +3,8 @@
     reason = "fabro-vault: sync secret-file storage; not used on a Tokio hot path"
 )]
 
+mod store;
+
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::{fmt, io};
@@ -11,8 +13,12 @@ use chrono::{DateTime, Utc};
 use fabro_static::EnvVars;
 pub use fabro_types::SecretType;
 use fabro_types::{SecretMetadata, is_env_style_name};
+pub use store::{
+    ImportReport, SecretSnapshot, SecretStore, SecretStoreError, SecretStoreWrite,
+    import_legacy_json_once,
+};
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SecretEntry {
     pub value:       String,
     #[serde(rename = "type", default)]
@@ -21,6 +27,25 @@ pub struct SecretEntry {
     pub description: Option<String>,
     pub created_at:  DateTime<Utc>,
     pub updated_at:  DateTime<Utc>,
+    #[serde(skip, default = "default_revision")]
+    pub revision:    i64,
+}
+
+const fn default_revision() -> i64 {
+    1
+}
+
+impl fmt::Debug for SecretEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SecretEntry")
+            .field("value", &"[REDACTED]")
+            .field("secret_type", &self.secret_type)
+            .field("description", &self.description)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .field("revision", &self.revision)
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -56,10 +81,19 @@ impl From<serde_json::Error> for Error {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone)]
 pub struct Vault {
-    path:    PathBuf,
+    path:    Option<PathBuf>,
     entries: HashMap<String, SecretEntry>,
+}
+
+impl fmt::Debug for Vault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Vault")
+            .field("path", &self.path)
+            .field("entry_count", &self.entries.len())
+            .finish()
+    }
 }
 
 impl Vault {
@@ -70,7 +104,25 @@ impl Vault {
             Err(err) => return Err(io_context("read vault", &path, &err).into()),
         };
 
-        Ok(Self { path, entries })
+        Ok(Self {
+            path: Some(path),
+            entries,
+        })
+    }
+
+    /// Builds a detached in-memory vault with no backing file: mutations
+    /// update memory only and are never persisted to disk.
+    #[must_use]
+    pub fn from_entries(entries: HashMap<String, SecretEntry>) -> Self {
+        Self {
+            path: None,
+            entries,
+        }
+    }
+
+    #[must_use]
+    pub fn entries(&self) -> &HashMap<String, SecretEntry> {
+        &self.entries
     }
 
     pub fn set(
@@ -83,14 +135,15 @@ impl Vault {
         Self::validate_name(name, secret_type)?;
 
         let now = Utc::now();
-        let (created_at, description) = self.entries.get(name).map_or_else(
-            || (now, description.map(str::to_string)),
+        let (created_at, description, revision) = self.entries.get(name).map_or_else(
+            || (now, description.map(str::to_string), 1),
             |entry| {
                 (
                     entry.created_at,
                     description
                         .map(str::to_string)
                         .or_else(|| entry.description.clone()),
+                    entry.revision.saturating_add(1),
                 )
             },
         );
@@ -100,6 +153,7 @@ impl Vault {
             description: description.clone(),
             created_at,
             updated_at: now,
+            revision,
         };
         self.entries.insert(name.to_string(), entry);
         self.write_atomic()?;
@@ -196,15 +250,16 @@ impl Vault {
     }
 
     fn write_atomic(&self) -> Result<(), Error> {
-        let parent = self
-            .path
+        let Some(path) = self.path.as_ref() else {
+            return Ok(());
+        };
+        let parent = path
             .parent()
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
         std::fs::create_dir_all(&parent)
             .map_err(|err| io_context("create vault directory", &parent, &err))?;
 
-        let file_name = self
-            .path
+        let file_name = path
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("secrets.json");
@@ -213,9 +268,9 @@ impl Vault {
         std::fs::write(&tmp_path, json)
             .map_err(|err| io_context("write vault temp file", &tmp_path, &err))?;
         set_private_permissions(&tmp_path)?;
-        std::fs::rename(&tmp_path, &self.path).map_err(|err| {
+        std::fs::rename(&tmp_path, path).map_err(|err| {
             io_context(
-                &format!("rename vault temp file to {}", self.path.display()),
+                &format!("rename vault temp file to {}", path.display()),
                 &tmp_path,
                 &err,
             )

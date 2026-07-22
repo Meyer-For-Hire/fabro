@@ -49,7 +49,7 @@ pub use fabro_api::types::{
     TimelineEntryResponse, UpdateVariableRequest, VariableListResponse, VncPreviewResponse,
     WriteBlobResponse,
 };
-use fabro_auth::{CredentialSource, VaultCredentialSource, auth_issue_message};
+use fabro_auth::{CredentialSource, SqlVaultCredentialSource, auth_issue_message};
 use fabro_automation::AutomationStore;
 use fabro_config::daemon::ServerDaemon;
 use fabro_config::{RunLayer, Storage, WorkflowSettingsBuilder};
@@ -106,7 +106,7 @@ use fabro_util::error::{
 };
 use fabro_util::version::FABRO_VERSION;
 use fabro_variable::{Error as VariableError, VariableStore};
-use fabro_vault::{Error as VaultError, SecretType, Vault};
+use fabro_vault::{SecretStore, SecretStoreError, SecretType, Vault};
 use fabro_workflow::artifact_upload::ArtifactSink;
 #[cfg(test)]
 use fabro_workflow::command_log::command_log_path;
@@ -163,7 +163,6 @@ use crate::request_id::{self, RequestId};
 use crate::run_files::{FilesInFlight, new_files_in_flight};
 use crate::server_secrets::{LlmClientResult, ServerSecrets};
 use crate::spawn_env::apply_render_graph_env;
-use crate::startup::load_startup_vault;
 use crate::worker_control::{LocalWorkerControlBus, WorkerControlBus, WorkerControlBusError};
 use crate::worker_runtime::{
     LocalWorkerRuntime, WorkerExit, WorkerLaunchSpec, WorkerRef, WorkerRuntime,
@@ -1104,6 +1103,7 @@ pub struct AppState {
     registry_factory_override: Option<Box<RegistryFactoryOverride>>,
     slack_service: Option<Arc<SlackService>>,
     slack_started: AtomicBool,
+    github_webhook_secret: Option<String>,
 }
 
 pub(crate) struct AppStores {
@@ -1111,7 +1111,7 @@ pub(crate) struct AppStores {
     pub(crate) automations:  Arc<AutomationStore>,
     pub(crate) environments: Arc<EnvironmentStore>,
     pub(crate) mcp_servers:  Arc<McpServerStore>,
-    pub(crate) vault:        Arc<AsyncRwLock<Vault>>,
+    pub(crate) vault:        Arc<SecretStore>,
     pub(crate) variables:    Arc<VariableStore>,
 }
 
@@ -1142,8 +1142,8 @@ impl AppState {
         let settings = self.server_settings();
         let credentials = self
             .github_credentials(&settings.server.integrations.github)
-            .ok()
-            .flatten();
+            .await
+            .map_err(|err| RunMaterializeError::Credentials(err.to_string()))?;
         ProductionAutomationRunMaterializer::new(
             credentials,
             self.github_api_base_url.clone(),
@@ -1250,9 +1250,8 @@ pub(crate) struct AppStateConfig {
     pub(crate) max_concurrent_runs: usize,
     pub(crate) store: Arc<Database>,
     pub(crate) artifact_store: ArtifactStore,
-    pub(crate) vault_path: PathBuf,
     pub(crate) db_pool: DbPool,
-    pub(crate) preloaded_vault: Option<Vault>,
+    pub(crate) preloaded_vault: Vault,
     pub(crate) server_secrets: ServerSecrets,
     pub(crate) env_lookup: EnvLookup,
     pub(crate) github_api_base_url: Option<String>,
@@ -1440,12 +1439,15 @@ impl AppState {
         AskFabroReadiness { default_model }
     }
 
-    pub(crate) fn vault_secret(&self, name: &str) -> Option<String> {
+    pub(crate) async fn vault_secret(
+        &self,
+        name: &str,
+    ) -> Result<Option<String>, SecretStoreError> {
         self.stores
             .vault
-            .try_read()
-            .ok()
-            .and_then(|vault| vault.get(name).map(str::to_string))
+            .get(name)
+            .await
+            .map(|entry| entry.map(|entry| entry.value))
     }
 
     pub(crate) fn config_env_lookup(&self, name: &str) -> Option<String> {
@@ -1522,20 +1524,24 @@ impl AppState {
             .and_then(|value| auth::derive_cookie_key(value.as_bytes()).ok())
     }
 
-    pub(crate) fn github_credentials(
+    pub(crate) async fn github_credentials(
         &self,
         settings: &GithubIntegrationSettings,
-    ) -> Result<Option<fabro_github::GitHubCredentials>, String> {
+    ) -> anyhow::Result<Option<fabro_github::GitHubCredentials>> {
         match settings.strategy {
             GithubIntegrationStrategy::App => {
                 let Some(app_id) = settings.app_id.clone() else {
                     return Ok(None);
                 };
-                let raw = self.vault_secret(EnvVars::GITHUB_APP_PRIVATE_KEY);
+                let raw = self
+                    .vault_secret(EnvVars::GITHUB_APP_PRIVATE_KEY)
+                    .await
+                    .map_err(anyhow::Error::new)?;
                 let Some(raw) = raw else {
                     return Ok(None);
                 };
-                let private_key_pem = decode_secret_pem(EnvVars::GITHUB_APP_PRIVATE_KEY, &raw)?;
+                let private_key_pem = decode_secret_pem(EnvVars::GITHUB_APP_PRIVATE_KEY, &raw)
+                    .map_err(anyhow::Error::msg)?;
                 Ok(Some(fabro_github::GitHubCredentials::App(
                     fabro_github::GitHubAppCredentials {
                         app_id,
@@ -1547,6 +1553,8 @@ impl AppState {
             GithubIntegrationStrategy::Token => {
                 let token = self
                     .vault_secret(EnvVars::GITHUB_TOKEN)
+                    .await
+                    .map_err(anyhow::Error::new)?
                     .as_deref()
                     .map(str::trim)
                     .filter(|token| !token.is_empty())
@@ -1554,12 +1562,11 @@ impl AppState {
                 match token {
                     Some(token) => {
                         fabro_github::validate_static_github_token(&token)
-                            .map_err(|err| err.to_string())?;
+                            .map_err(anyhow::Error::msg)?;
                         Ok(Some(fabro_github::GitHubCredentials::Pat(token)))
                     }
-                    None => Err(
+                    None => anyhow::bail!(
                         "GITHUB_TOKEN not configured -- run fabro install or run fabro secret set GITHUB_TOKEN"
-                            .to_string(),
                     ),
                 }
             }
@@ -1758,7 +1765,7 @@ pub fn build_router_with_options(
     let state_for_canonical_host = Arc::clone(&state);
     let github_endpoints =
         github_endpoints.unwrap_or_else(|| Arc::new(GithubEndpoints::production_defaults()));
-    let webhook_secret = state.vault_secret(WEBHOOK_SECRET_ENV);
+    let webhook_secret = state.github_webhook_secret.clone();
     let principal_layer = middleware::from_fn_with_state(Arc::clone(&state), principal_middleware);
     let api_common = if web_enabled {
         Router::new()
@@ -2345,7 +2352,6 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         max_concurrent_runs,
         store,
         artifact_store,
-        vault_path,
         db_pool,
         preloaded_vault,
         server_secrets,
@@ -2386,17 +2392,15 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
             .map_err(anyhow::Error::new)
             .context("load mcp servers")?,
     );
-    let variables = Arc::new(VariableStore::new(db_pool));
-    let vault = match preloaded_vault {
-        Some(vault) => vault,
-        None => load_startup_vault(&vault_path)?,
-    };
+    let variables = Arc::new(VariableStore::new(db_pool.clone()));
+    let secret_store = Arc::new(SecretStore::new(db_pool));
+    let vault = preloaded_vault;
     // Read vault secrets needed for synchronous setup before we wrap the vault in
     // an async lock for the rest of AppState.
     let daytona_api_key = vault.get(EnvVars::DAYTONA_API_KEY).map(str::to_string);
-    let vault = Arc::new(AsyncRwLock::new(vault));
-    let llm_source: Arc<dyn CredentialSource> =
-        Arc::new(VaultCredentialSource::vault_only(Arc::clone(&vault)));
+    let llm_source: Arc<dyn CredentialSource> = Arc::new(SqlVaultCredentialSource::vault_only(
+        Arc::clone(&secret_store),
+    ));
     let (global_event_tx, _) = broadcast::channel(4096);
     let current_server_settings = Arc::new(resolved_settings.server_settings);
     let current_effective_web_url =
@@ -2423,11 +2427,8 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         let slack_settings = &current_server_settings.server.integrations.slack;
         if slack_settings.enabled {
             let default_channel = slack_settings.default_channel.clone();
-            let vault_guard = vault.try_read().ok();
             match resolve_slack_credentials_status_with_lookup(|name| {
-                vault_guard
-                    .as_ref()
-                    .and_then(|vault| vault.get(name).map(str::to_string))
+                vault.get(name).map(str::to_string)
             }) {
                 SlackCredentialResolution::Configured(credentials) => {
                     info!(
@@ -2489,7 +2490,7 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
             automations: automation_store,
             environments: environment_store,
             mcp_servers: mcp_server_store,
-            vault,
+            vault: secret_store,
             variables,
         },
         session_runtimes: SessionRuntimeManager::new(),
@@ -2526,6 +2527,9 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         registry_factory_override,
         slack_service,
         slack_started: AtomicBool::new(false),
+        // Startup snapshot for the sync router build; rotating the webhook
+        // secret requires a server restart.
+        github_webhook_secret: vault.get(WEBHOOK_SECRET_ENV).map(str::to_string),
     }))
 }
 
@@ -2695,7 +2699,10 @@ async fn delete_run_sandbox_resource(
         }));
     }
 
-    let daytona_api_key = state.vault_secret(EnvVars::DAYTONA_API_KEY);
+    let daytona_api_key = state
+        .vault_secret(EnvVars::DAYTONA_API_KEY)
+        .await
+        .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
     let sandbox = match reconnect_for_run(&record, daytona_api_key, Some(id)).await {
         Ok(sandbox) => sandbox,
         Err(err) if force || delete_started => {
@@ -3585,6 +3592,7 @@ fn worker_launch_spec(
     mode: RunExecutionMode,
     run_dir: &std::path::Path,
     agent_fabro_tools_enabled: bool,
+    github_app_private_key: Option<String>,
 ) -> anyhow::Result<WorkerLaunchSpec> {
     let current_exe = std::env::current_exe().context("reading current executable path")?;
     let executable =
@@ -3622,7 +3630,7 @@ fn worker_launch_spec(
         log_destination,
         fabro_log,
         active_config_path: state.active_config_path().to_path_buf(),
-        github_app_private_key: state.vault_secret(EnvVars::GITHUB_APP_PRIVATE_KEY),
+        github_app_private_key,
     })
 }
 
@@ -3990,9 +3998,9 @@ async fn execute_run_in_process(state: Arc<AppState>, run_id: RunId) {
         let pull_request_can_use_github_credentials =
             settings.execution.mode != RunMode::DryRun && settings.pull_request.is_some();
         if settings.integrations.github.is_token_requested() {
-            state.github_credentials(github_settings)
+            state.github_credentials(github_settings).await
         } else if clone_can_use_github_credentials || pull_request_can_use_github_credentials {
-            match state.github_credentials(github_settings) {
+            match state.github_credentials(github_settings).await {
                 Ok(github_app) => Ok(github_app),
                 Err(err) => {
                     tracing::warn!(
@@ -4032,6 +4040,20 @@ async fn execute_run_in_process(state: Arc<AppState>, run_id: RunId) {
         .integrations
         .github
         .resolve_permissions(process_env_var);
+    let vault = match state.stores.vault.snapshot().await {
+        Ok(vault) => vault,
+        Err(err) => {
+            tracing::error!(run_id = %run_id, error = ?err, "Loading run secrets failed");
+            fail_run_before_execution(
+                &state,
+                run_id,
+                FailureReason::WorkflowError,
+                "Loading run secrets failed".to_string(),
+            )
+            .await;
+            return;
+        }
+    };
     let services = operations::StartServices {
         run_id,
         cancel_token: cancel_token.clone(),
@@ -4044,7 +4066,7 @@ async fn execute_run_in_process(state: Arc<AppState>, run_id: RunId) {
         run_control: None,
         github_app,
         github_permissions,
-        vault: Some(Arc::clone(&state.stores.vault)),
+        vault: Some(Arc::new(AsyncRwLock::new(vault.into_vault()))),
         catalog: state.catalog(),
         on_node: None,
         registry_override,
@@ -4214,6 +4236,20 @@ async fn execute_run_subprocess(state: Arc<AppState>, run_id: RunId) {
         return;
     }
 
+    let github_app_private_key = match state.vault_secret(EnvVars::GITHUB_APP_PRIVATE_KEY).await {
+        Ok(value) => value,
+        Err(err) => {
+            fail_run_before_execution(
+                &state,
+                run_id,
+                FailureReason::WorkflowError,
+                "Loading worker secrets failed".to_string(),
+            )
+            .await;
+            tracing::error!(run_id = %run_id, error = ?err, "Loading worker secrets failed");
+            return;
+        }
+    };
     let state_for_build = Arc::clone(&state);
     let run_dir_for_build = run_dir.clone();
     let start_result = spawn_blocking(move || {
@@ -4223,6 +4259,7 @@ async fn execute_run_subprocess(state: Arc<AppState>, run_id: RunId) {
             execution_mode,
             &run_dir_for_build,
             agent_fabro_tools_enabled,
+            github_app_private_key,
         )
     })
     .await

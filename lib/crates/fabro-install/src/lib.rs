@@ -10,7 +10,8 @@ use fabro_config::{Storage, envfile};
 use fabro_static::EnvVars;
 use fabro_types::settings::run::EnvironmentProvider;
 use fabro_util::dev_token;
-use fabro_vault::{SecretType as VaultSecretType, Vault};
+use fabro_vault::SecretStore;
+pub use fabro_vault::SecretStoreWrite;
 
 #[derive(Debug, Clone, Copy)]
 pub struct PendingSettingsWrite<'a> {
@@ -53,21 +54,13 @@ pub const GITHUB_APP_VAULT_KEYS: &[&str] = &[
     EnvVars::GITHUB_APP_WEBHOOK_SECRET,
 ];
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VaultSecretWrite {
-    pub name:        String,
-    pub value:       String,
-    pub secret_type: VaultSecretType,
-    pub description: Option<String>,
-}
-
 pub struct InstallPersistencePlan<'a> {
     pub storage_dir:         &'a Path,
     pub settings_write:      Option<PendingSettingsWrite<'a>>,
     pub server_env_writes:   Vec<envfile::EnvFileUpdate>,
     pub server_env_removals: Vec<envfile::EnvFileRemoval>,
     pub dev_token_write:     Option<PendingDevTokenWrite>,
-    pub vault_writes:        Vec<VaultSecretWrite>,
+    pub vault_writes:        Vec<SecretStoreWrite>,
     pub vault_removals:      Vec<String>,
 }
 
@@ -582,33 +575,20 @@ fn persist_server_env_secrets(
     .with_context(|| format!("updating server env file {}", env_path.display()))
 }
 
-fn persist_vault_secrets_direct(
+async fn persist_vault_secrets_direct(
     storage_dir: &Path,
-    secrets: &[VaultSecretWrite],
+    secrets: &[SecretStoreWrite],
     removals: &[String],
 ) -> Result<()> {
     if secrets.is_empty() && removals.is_empty() {
         return Ok(());
     }
 
-    let vault_path = Storage::new(storage_dir).secrets_path();
-    let mut vault = Vault::load(vault_path).map_err(anyhow::Error::from)?;
-    for name in removals {
-        match vault.remove(name) {
-            Ok(()) | Err(fabro_vault::Error::NotFound(_)) => {}
-            Err(err) => return Err(err.into()),
-        }
-    }
-    for secret in secrets {
-        vault
-            .set(
-                &secret.name,
-                &secret.value,
-                secret.secret_type,
-                secret.description.as_deref(),
-            )
-            .map_err(anyhow::Error::from)?;
-    }
+    let storage = Storage::new(storage_dir);
+    SecretStore::open(storage.sqlite_path(), storage.secrets_path())
+        .await?
+        .apply(removals, secrets)
+        .await?;
     Ok(())
 }
 
@@ -625,8 +605,6 @@ fn direct_persistence_error(err: anyhow::Error, rollback_failures: &[String]) ->
 
 fn rollback_direct_persistence(
     settings_write: Option<&PendingSettingsWrite<'_>>,
-    vault_path: &Path,
-    previous_vault: Option<&str>,
     dev_token_write: Option<&PendingDevTokenWrite>,
 ) -> Vec<String> {
     let mut failures = Vec::new();
@@ -635,9 +613,6 @@ fn rollback_direct_persistence(
         if let Err(err) = restore_optional_file(write.path, write.previous_contents) {
             failures.push(err.to_string());
         }
-    }
-    if let Err(err) = restore_optional_file(vault_path, previous_vault) {
-        failures.push(err.to_string());
     }
     if let Some(write) = dev_token_write {
         if let Err(err) = rollback_dev_token_write(write) {
@@ -649,7 +624,7 @@ fn rollback_direct_persistence(
 }
 
 impl InstallPersistencePlan<'_> {
-    pub fn persist_direct(&self) -> std::result::Result<(), PersistInstallOutputsError> {
+    fn persist_files(&self) -> std::result::Result<Vec<String>, PersistInstallOutputsError> {
         let server_env_report = persist_server_env_secrets(
             self.storage_dir,
             &self.server_env_writes,
@@ -673,34 +648,10 @@ impl InstallPersistencePlan<'_> {
                 })?;
         }
 
-        let vault_path = Storage::new(self.storage_dir).secrets_path();
-        let previous_vault = std::fs::read_to_string(&vault_path).ok();
-
-        if let Err(err) =
-            persist_vault_secrets_direct(self.storage_dir, &self.vault_writes, &self.vault_removals)
-        {
-            let rollback_failures = rollback_direct_persistence(
-                self.settings_write.as_ref(),
-                &vault_path,
-                previous_vault.as_deref(),
-                self.dev_token_write.as_ref(),
-            );
-            let error = direct_persistence_error(err, &rollback_failures);
-            return Err(PersistInstallOutputsError::new(
-                error,
-                true,
-                removed_env_keys,
-            ));
-        }
-
         if let Some(write) = self.dev_token_write.as_ref() {
             if let Err(err) = write_pending_dev_token(write) {
-                let rollback_failures = rollback_direct_persistence(
-                    self.settings_write.as_ref(),
-                    &vault_path,
-                    previous_vault.as_deref(),
-                    Some(write),
-                );
+                let rollback_failures =
+                    rollback_direct_persistence(self.settings_write.as_ref(), Some(write));
                 let error = direct_persistence_error(err, &rollback_failures);
                 return Err(PersistInstallOutputsError::new(
                     error,
@@ -710,15 +661,41 @@ impl InstallPersistencePlan<'_> {
             }
         }
 
+        Ok(removed_env_keys)
+    }
+
+    fn secret_persistence_error(
+        &self,
+        err: anyhow::Error,
+        removed_env_keys: Vec<String>,
+    ) -> PersistInstallOutputsError {
+        let rollback_failures = rollback_direct_persistence(
+            self.settings_write.as_ref(),
+            self.dev_token_write.as_ref(),
+        );
+        let error = direct_persistence_error(err, &rollback_failures);
+        PersistInstallOutputsError::new(error, true, removed_env_keys)
+    }
+
+    pub async fn persist_direct(&self) -> std::result::Result<(), PersistInstallOutputsError> {
+        let removed_env_keys = self.persist_files()?;
+
+        if let Err(err) =
+            persist_vault_secrets_direct(self.storage_dir, &self.vault_writes, &self.vault_removals)
+                .await
+        {
+            return Err(self.secret_persistence_error(err, removed_env_keys));
+        }
+
         Ok(())
     }
 }
 
-pub fn persist_install_outputs_direct(
+pub async fn persist_install_outputs_direct(
     storage_dir: &Path,
     server_env_writes: &[envfile::EnvFileUpdate],
     server_env_removals: &[envfile::EnvFileRemoval],
-    vault_secrets: &[VaultSecretWrite],
+    vault_secrets: &[SecretStoreWrite],
     settings_write: Option<&PendingSettingsWrite<'_>>,
 ) -> std::result::Result<(), PersistInstallOutputsError> {
     InstallPersistencePlan {
@@ -731,6 +708,7 @@ pub fn persist_install_outputs_direct(
         vault_removals: Vec::new(),
     }
     .persist_direct()
+    .await
 }
 
 #[cfg(test)]
@@ -744,13 +722,24 @@ mod tests {
     };
     use fabro_vault::{SecretType as VaultSecretType, Vault};
 
+    async fn load_secret_snapshot(storage: &Storage) -> Vault {
+        SecretStore::open(storage.sqlite_path(), storage.secrets_path())
+            .await
+            .unwrap()
+            .snapshot()
+            .await
+            .unwrap()
+            .into_vault()
+    }
+
     use super::{
         InstallListenConfig, InstallObjectStoreCredentialMode, InstallObjectStoreSelection,
         InstallPersistencePlan, InstallSandboxSelection, OBJECT_STORE_ACCESS_KEY_ID_ENV,
         OBJECT_STORE_MANAGED_COMMENT, OBJECT_STORE_SECRET_ACCESS_KEY_ENV, PendingSettingsWrite,
-        VaultSecretWrite, default_web_url, merge_server_settings, persist_install_outputs_direct,
-        prepare_dev_token_write_for_install, set_cli_target_http, set_server_listen,
-        write_github_app_settings, write_object_store_settings, write_sandbox_settings,
+        SecretStore, SecretStoreWrite, default_web_url, merge_server_settings,
+        persist_install_outputs_direct, prepare_dev_token_write_for_install, set_cli_target_http,
+        set_server_listen, write_github_app_settings, write_object_store_settings,
+        write_sandbox_settings,
     };
 
     fn format_config_toml() -> String {
@@ -1009,8 +998,8 @@ stale = "remove-me"
         );
     }
 
-    #[test]
-    fn persist_install_outputs_direct_restores_settings_and_vault_on_secret_failure() {
+    #[tokio::test]
+    async fn persist_install_outputs_direct_restores_settings_and_vault_on_secret_failure() {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new(dir.path());
         let settings_path = dir.path().join("settings.toml");
@@ -1029,7 +1018,7 @@ stale = "remove-me"
                 comment: None,
             }],
             &[],
-            &[VaultSecretWrite {
+            &[SecretStoreWrite {
                 name:        "bad-secret-name".to_string(),
                 value:       "boom".to_string(),
                 secret_type: VaultSecretType::Token,
@@ -1040,7 +1029,8 @@ stale = "remove-me"
                 contents:          "_version = 1\n[server]\nfoo = \"bar\"\n",
                 previous_contents: Some("_version = 1\n[server]\n"),
             }),
-        );
+        )
+        .await;
 
         assert!(result.is_err());
         assert_eq!(
@@ -1048,7 +1038,7 @@ stale = "remove-me"
             "_version = 1\n[server]\n"
         );
 
-        let restored = Vault::load(vault_path).unwrap();
+        let restored = load_secret_snapshot(&storage).await;
         assert_eq!(restored.get("EXISTING_SECRET"), Some("keep"));
         assert_eq!(restored.get("bad-secret-name"), None);
 
@@ -1059,8 +1049,8 @@ stale = "remove-me"
         );
     }
 
-    #[test]
-    fn install_persistence_plan_direct_writes_and_removes_vault_secrets() {
+    #[tokio::test]
+    async fn install_persistence_plan_direct_writes_and_removes_vault_secrets() {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new(dir.path());
         let mut vault = Vault::load(storage.secrets_path()).unwrap();
@@ -1077,7 +1067,7 @@ stale = "remove-me"
             server_env_writes:   Vec::new(),
             server_env_removals: Vec::new(),
             dev_token_write:     None,
-            vault_writes:        vec![VaultSecretWrite {
+            vault_writes:        vec![SecretStoreWrite {
                 name:        "NEW_SECRET".to_string(),
                 value:       "new".to_string(),
                 secret_type: VaultSecretType::Token,
@@ -1086,16 +1076,17 @@ stale = "remove-me"
             vault_removals:      vec!["REMOVE_ME".to_string()],
         }
         .persist_direct()
+        .await
         .unwrap();
 
-        let vault = Vault::load(storage.secrets_path()).unwrap();
+        let vault = load_secret_snapshot(&storage).await;
         assert_eq!(vault.get("REMOVE_ME"), None);
         assert_eq!(vault.get("KEEP_ME"), Some("keep"));
         assert_eq!(vault.get("NEW_SECRET"), Some("new"));
     }
 
-    #[test]
-    fn install_persistence_plan_direct_restores_settings_and_vault_on_secret_failure() {
+    #[tokio::test]
+    async fn install_persistence_plan_direct_restores_settings_and_vault_on_secret_failure() {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new(dir.path());
         let settings_path = dir.path().join("settings.toml");
@@ -1120,7 +1111,7 @@ stale = "remove-me"
             }],
             server_env_removals: Vec::new(),
             dev_token_write:     None,
-            vault_writes:        vec![VaultSecretWrite {
+            vault_writes:        vec![SecretStoreWrite {
                 name:        "bad-secret-name".to_string(),
                 value:       "boom".to_string(),
                 secret_type: VaultSecretType::Token,
@@ -1128,14 +1119,15 @@ stale = "remove-me"
             }],
             vault_removals:      vec!["REMOVE_ME".to_string()],
         }
-        .persist_direct();
+        .persist_direct()
+        .await;
 
         assert!(result.is_err());
         assert_eq!(
             std::fs::read_to_string(&settings_path).unwrap(),
             "_version = 1\n[server]\n"
         );
-        let vault = Vault::load(vault_path).unwrap();
+        let vault = load_secret_snapshot(&storage).await;
         assert_eq!(vault.get("REMOVE_ME"), Some("old"));
         assert_eq!(vault.get("bad-secret-name"), None);
         let server_env = envfile::read_env_file(&storage.runtime_directory().env_path()).unwrap();
@@ -1197,8 +1189,8 @@ stale = "remove-me"
         assert!(err.to_string().contains("invalid dev token format"));
     }
 
-    #[test]
-    fn install_persistence_plan_direct_writes_staged_dev_token_on_success() {
+    #[tokio::test]
+    async fn install_persistence_plan_direct_writes_staged_dev_token_on_success() {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new(dir.path());
         let path = storage.runtime_directory().dev_token_path();
@@ -1215,6 +1207,7 @@ stale = "remove-me"
             vault_removals:      Vec::new(),
         }
         .persist_direct()
+        .await
         .unwrap();
 
         assert_eq!(read_dev_token_file(&path).as_deref(), Some(token.as_str()));
@@ -1228,8 +1221,8 @@ stale = "remove-me"
         }
     }
 
-    #[test]
-    fn install_persistence_plan_direct_does_not_leave_staged_dev_token_on_vault_failure() {
+    #[tokio::test]
+    async fn install_persistence_plan_direct_does_not_leave_staged_dev_token_on_vault_failure() {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new(dir.path());
         let path = storage.runtime_directory().dev_token_path();
@@ -1241,7 +1234,7 @@ stale = "remove-me"
             server_env_writes:   Vec::new(),
             server_env_removals: Vec::new(),
             dev_token_write:     prepared.write,
-            vault_writes:        vec![VaultSecretWrite {
+            vault_writes:        vec![SecretStoreWrite {
                 name:        "bad-secret-name".to_string(),
                 value:       "boom".to_string(),
                 secret_type: VaultSecretType::Token,
@@ -1249,7 +1242,8 @@ stale = "remove-me"
             }],
             vault_removals:      Vec::new(),
         }
-        .persist_direct();
+        .persist_direct()
+        .await;
 
         assert!(result.is_err());
         assert!(
@@ -1506,8 +1500,8 @@ stale = "remove-me"
             .and_then(toml::Value::as_bool)
     }
 
-    #[test]
-    fn persist_install_outputs_direct_only_removes_marked_object_store_keys() {
+    #[tokio::test]
+    async fn persist_install_outputs_direct_only_removes_marked_object_store_keys() {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new(dir.path());
         let env_path = storage.runtime_directory().env_path();
@@ -1530,6 +1524,7 @@ stale = "remove-me"
             &[],
             None,
         )
+        .await
         .expect("env-only persistence should succeed");
 
         let server_env = envfile::read_env_file(&env_path).unwrap();
@@ -1549,8 +1544,8 @@ stale = "remove-me"
     }
 
     #[cfg(unix)]
-    #[test]
-    fn persist_install_outputs_direct_writes_private_server_env_permissions() {
+    #[tokio::test]
+    async fn persist_install_outputs_direct_writes_private_server_env_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1568,6 +1563,7 @@ stale = "remove-me"
             &[],
             None,
         )
+        .await
         .expect("initial env write should succeed");
         let create_mode = std::fs::metadata(&env_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(create_mode, 0o600);
@@ -1583,6 +1579,7 @@ stale = "remove-me"
             &[],
             None,
         )
+        .await
         .expect("rewrite env write should succeed");
         let update_mode = std::fs::metadata(&env_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(update_mode, 0o600);
