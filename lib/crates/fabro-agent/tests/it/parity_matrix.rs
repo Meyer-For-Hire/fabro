@@ -17,6 +17,7 @@ use fabro_auth::EnvCredentialSource;
 use fabro_llm::client::Client;
 use fabro_llm::provider::ProviderAdapter;
 use fabro_llm::providers::{OpenAiAdapter, OpenAiCompatibleAdapter};
+use fabro_model::catalog::{LlmCatalogSettings, ProviderCatalogSettings};
 use fabro_model::{Catalog, ModelHandle, ProviderId};
 use fabro_test::{TwinScenario, TwinScenarios, TwinToolCall, twin_openai};
 use tokio::sync::Mutex as AsyncMutex;
@@ -184,7 +185,20 @@ fn make_openai_compatible_twin_session(
     twin: &OpenAiTwinOptions,
 ) -> Session {
     let client = make_openai_compatible_twin_client(&provider, twin);
-    let catalog = Arc::new(Catalog::from_builtin().expect("default catalog should build"));
+    // LiteLLM is opt-in in the built-in catalog. Enable the provider in this
+    // twin fixture so the profile can resolve the same OpenAI-compatible
+    // codec that the manually registered adapter uses.
+    let mut settings = LlmCatalogSettings::default();
+    settings
+        .providers
+        .insert(provider.to_string(), ProviderCatalogSettings {
+            enabled: Some(true),
+            ..ProviderCatalogSettings::default()
+        });
+    let catalog = Arc::new(
+        Catalog::from_builtin_with_overrides(&settings)
+            .expect("OpenAI-compatible twin catalog should build"),
+    );
     let profile: Arc<dyn AgentProfile> = Arc::new(
         OpenAiProfile::new(model)
             .with_provider_id(provider)

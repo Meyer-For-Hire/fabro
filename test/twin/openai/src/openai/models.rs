@@ -531,6 +531,7 @@ pub fn normalize_whitespace(input: &str) -> String {
 pub struct ChatCompletionsRequest {
     pub model:           String,
     pub messages:        Vec<ChatMessage>,
+    pub max_tokens:      Option<i64>,
     #[serde(default)]
     pub stream:          bool,
     pub tools:           Option<Vec<Value>>,
