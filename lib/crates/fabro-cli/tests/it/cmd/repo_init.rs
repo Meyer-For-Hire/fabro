@@ -96,12 +96,6 @@ fn repo_init_creates_project_toml_and_hello_workflow() {
 
     [workflow]
     graph = "workflow.fabro"
-
-    [run.environment]
-    id = "local"
-
-    [environments.local]
-    provider = "local"
     "###
     );
 }
