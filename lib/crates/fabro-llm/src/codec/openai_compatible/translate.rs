@@ -1,6 +1,7 @@
 //! Pure mapping between canonical types and the Chat Completions wire shapes.
 
 use super::wire::{ChatFunction, ChatMessage, ChatToolCall};
+use crate::error::Error;
 use crate::types::{
     ContentPart, CostSource, FinishReason, Message, Request, ResponseFormat, ResponseFormatType,
     Role, ToolChoice, ToolDefinition,
@@ -146,18 +147,28 @@ pub(super) fn translate_messages(messages: &[Message]) -> Vec<ChatMessage> {
         .collect()
 }
 
-pub(super) fn translate_tools(tools: &[ToolDefinition]) -> Vec<serde_json::Value> {
+pub(super) fn translate_tools(tools: &[ToolDefinition]) -> Result<Vec<serde_json::Value>, Error> {
     tools
         .iter()
         .map(|t| {
-            serde_json::json!({
+            if t.is_custom() {
+                return Err(Error::Configuration {
+                    message: format!(
+                        "openai_compatible codec does not support custom tool definition '{}'",
+                        t.name
+                    ),
+                    source:  None,
+                });
+            }
+
+            Ok(serde_json::json!({
                 "type": "function",
                 "function": {
                     "name": t.name,
                     "description": t.description,
                     "parameters": t.parameters,
                 }
-            })
+            }))
         })
         .collect()
 }

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use fabro_model::{AgentProfileKind, Catalog, ProviderId};
+use fabro_model::{AgentProfileKind, Catalog, CodecKind, ProviderId};
 
 use super::EnvContext;
 use crate::agent_profile::AgentProfile;
@@ -12,10 +12,27 @@ use crate::skills::Skill;
 use crate::todo_runtime::TodoRuntime;
 use crate::todo_tools::make_update_plan_tool;
 use crate::tool_registry::ToolRegistry;
-use crate::tools::{WebFetchSummarizer, register_core_tools};
+use crate::tools::{self, WebFetchSummarizer, register_core_tools};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FileEditToolKind {
+    ApplyPatch,
+    EditFile,
+}
+
+impl FileEditToolKind {
+    fn for_codec(codec: CodecKind) -> Self {
+        if codec == CodecKind::OpenAiResponses {
+            Self::ApplyPatch
+        } else {
+            Self::EditFile
+        }
+    }
+}
 
 pub struct OpenAiProfile {
-    base: BaseProfile,
+    base:           BaseProfile,
+    file_edit_tool: FileEditToolKind,
 }
 
 impl OpenAiProfile {
@@ -39,13 +56,14 @@ impl OpenAiProfile {
         registry.register(make_update_plan_tool(todo_runtime));
 
         Self {
-            base: BaseProfile {
+            base:           BaseProfile {
                 profile_kind: AgentProfileKind::OpenAi,
                 provider_id: ProviderId::openai(),
                 model: model.into(),
                 catalog: None,
                 registry,
             },
+            file_edit_tool: FileEditToolKind::ApplyPatch,
         }
     }
 
@@ -53,13 +71,41 @@ impl OpenAiProfile {
     #[must_use]
     pub fn with_provider_id(mut self, provider_id: ProviderId) -> Self {
         self.base.provider_id = provider_id;
+        self.configure_file_edit_tool();
         self
     }
 
     #[must_use]
     pub fn with_catalog(mut self, catalog: Arc<Catalog>) -> Self {
         self.base.catalog = Some(catalog);
+        self.configure_file_edit_tool();
         self
+    }
+
+    fn configure_file_edit_tool(&mut self) {
+        let Some(codec) = self.base.catalog.as_ref().and_then(|catalog| {
+            catalog.effective_codec(&self.base.provider_id, Some(&self.base.model))
+        }) else {
+            return;
+        };
+        let desired = FileEditToolKind::for_codec(codec);
+        if desired == self.file_edit_tool {
+            return;
+        }
+
+        match desired {
+            FileEditToolKind::ApplyPatch => {
+                self.base.registry.unregister("edit_file");
+                self.base
+                    .registry
+                    .register(apply_patch::make_apply_patch_tool());
+            }
+            FileEditToolKind::EditFile => {
+                self.base.registry.unregister("apply_patch");
+                self.base.registry.register(tools::make_edit_file_tool());
+            }
+        }
+        self.file_edit_tool = desired;
     }
 
     fn provider_display_name(&self) -> String {
@@ -108,13 +154,47 @@ impl AgentProfile for OpenAiProfile {
         skills: &[Skill],
     ) -> String {
         let provider_name = self.provider_display_name();
+        let (file_edit_tool_name, file_edit_failure_guidance, file_edit_tool_guidance) =
+            match self.file_edit_tool {
+                FileEditToolKind::ApplyPatch => (
+                    "apply_patch",
+                    "- When apply_patch fails, use the error text to construct a corrected patch. \
+Re-read the target file if you need fresh context.",
+                    "## apply_patch
+Use the `apply_patch` tool for all file modifications. This is a freeform tool: pass the raw \
+patch text directly, never wrap it in JSON. The format uses `*** Begin Patch` / \
+`*** End Patch` delimiters with `*** Add File:`, `*** Delete File:`, `*** Update File:` \
+operations. Use `-` for removals, `+` for additions, and space-prefix for unchanged context \
+lines. Show 3 lines of context around each change. NEVER use `applypatch` or `apply-patch`, \
+only `apply_patch`.
+
+Example:
+```
+*** Begin Patch
+*** Update File: src/main.py
+@@ def hello():
+-    print(\"old\")
++    print(\"new\")
+*** End Patch
+```",
+                ),
+                FileEditToolKind::EditFile => (
+                    "edit_file",
+                    "- When edit_file fails, use the error text to construct a corrected exact \
+replacement. Re-read the target file if you need fresh context.",
+                    "## edit_file
+Use `edit_file` to modify an existing file by replacing an exact string. Read the file first. \
+The `old_string` must match exactly and be unique unless `replace_all` is true; include enough \
+surrounding context to make the match unique and preserve the existing indentation.",
+                ),
+            };
         let core_prompt = format!("\
 You are a coding agent powered by {provider_name}, running in a terminal-based agentic coding assistant. \
 You are expected to be precise, safe, and helpful.
 
 You can receive user prompts and context such as files in the workspace, communicate with the \
 user by streaming thinking and responses, and emit function calls to run terminal commands and \
-apply patches.
+edit files.
 
 # Personality
 
@@ -146,8 +226,7 @@ If completing the task requires writing or modifying files:
 and focused on the task.
 - Use `git log` and `git blame` to search the history of the codebase if additional context is needed.
 - NEVER add copyright or license headers unless specifically requested.
-- When apply_patch fails, use the error text to construct a corrected patch. Re-read the target \
-file if you need fresh context.
+{file_edit_failure_guidance}
 - Do not `git commit` your changes or create new git branches unless explicitly requested.
 
 # Validating Your Work
@@ -163,26 +242,10 @@ Use the provided tools to interact with the codebase and environment.
 ## read_file
 Read files to understand code before modifying. Use offset/limit for large files.
 
-## apply_patch
-Use the `apply_patch` tool for all file modifications. This is a freeform tool: pass the raw \
-patch text directly, never wrap it in JSON. The format uses `*** Begin Patch` / \
-`*** End Patch` delimiters with `*** Add File:`, `*** Delete File:`, `*** Update File:` \
-operations. Use `-` for removals, `+` for additions, and space-prefix for unchanged context \
-lines. Show 3 lines of context around each change. NEVER use `applypatch` or `apply-patch`, \
-only `apply_patch`.
-
-Example:
-```
-*** Begin Patch
-*** Update File: src/main.py
-@@ def hello():
--    print(\"old\")
-+    print(\"new\")
-*** End Patch
-```
+{file_edit_tool_guidance}
 
 ## write_file
-Use for creating new files. For modifications, prefer apply_patch.
+Use for creating new files. For modifications, prefer {file_edit_tool_name}.
 
 ## shell
 Execute shell commands. Default timeout is 10 seconds. Use timeout_ms parameter for \
@@ -348,6 +411,44 @@ mod tests {
         let prompt = profile.build_system_prompt(&env, &EnvContext::default(), &[], None, &[]);
         assert!(prompt.contains("powered by Kimi"));
         assert!(!prompt.contains("powered by OpenAI"));
+    }
+
+    #[test]
+    fn openai_compatible_profile_uses_json_schema_edit_tool() {
+        let profile = OpenAiProfile::new("kimi-k2.5")
+            .with_provider_id(ProviderId::new("kimi"))
+            .with_catalog(test_catalog());
+
+        let names = profile.tool_registry().names();
+        assert!(names.contains(&"edit_file".to_string()));
+        assert!(!names.contains(&"apply_patch".to_string()));
+
+        let edit_file = profile.tool_registry().get("edit_file").unwrap();
+        assert!(!edit_file.definition.is_custom());
+        assert_eq!(edit_file.definition.parameters["type"], "object");
+        for definition in profile.tool_registry().definitions() {
+            assert_eq!(
+                definition.parameters["type"], "object",
+                "tool '{}' must use an object parameter schema",
+                definition.name
+            );
+        }
+
+        let env = MockSandbox::linux();
+        let prompt = profile.build_system_prompt(&env, &EnvContext::default(), &[], None, &[]);
+        assert!(prompt.contains("## edit_file"));
+        assert!(!prompt.contains("## apply_patch"));
+        assert!(!prompt.contains("freeform tool"));
+    }
+
+    #[test]
+    fn file_edit_tool_selection_is_builder_order_independent() {
+        let profile = OpenAiProfile::new("kimi-k2.5")
+            .with_catalog(test_catalog())
+            .with_provider_id(ProviderId::new("kimi"));
+
+        assert!(profile.tool_registry().get("edit_file").is_some());
+        assert!(profile.tool_registry().get("apply_patch").is_none());
     }
 
     #[test]

@@ -30,6 +30,7 @@ Supported `/v1/responses` fields:
 Supported `/v1/chat/completions` fields:
 
 - bearer auth
+- `max_tokens`
 - `stream`
 - `tools`
 - `tool_choice`

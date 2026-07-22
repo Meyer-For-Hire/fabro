@@ -17,6 +17,7 @@ use fabro_auth::EnvCredentialSource;
 use fabro_llm::client::Client;
 use fabro_llm::provider::ProviderAdapter;
 use fabro_llm::providers::{OpenAiAdapter, OpenAiCompatibleAdapter};
+use fabro_model::catalog::{LlmCatalogSettings, ProviderCatalogSettings};
 use fabro_model::{Catalog, ModelHandle, ProviderId};
 use fabro_test::{TwinScenario, TwinScenarios, TwinToolCall, twin_openai};
 use tokio::sync::Mutex as AsyncMutex;
@@ -56,11 +57,16 @@ fn build_summarizer(provider: &Provider, client: &Client) -> WebFetchSummarizer 
 
 fn build_profile(provider: &Provider, model: &str, client: &Client) -> Box<dyn AgentProfile> {
     let summarizer = Some(build_summarizer(provider, client));
+    let catalog = Arc::new(Catalog::from_builtin().expect("default catalog should build"));
     match provider.as_str() {
         ProviderId::ANTHROPIC => Box::new(AnthropicProfile::with_summarizer(model, summarizer)),
-        ProviderId::OPENAI => Box::new(OpenAiProfile::with_summarizer(model, summarizer)),
+        ProviderId::OPENAI => Box::new(
+            OpenAiProfile::with_summarizer(model, summarizer).with_catalog(Arc::clone(&catalog)),
+        ),
         "kimi" | "zai" | "minimax" | "inception" => Box::new(
-            OpenAiProfile::with_summarizer(model, summarizer).with_provider_id(provider.clone()),
+            OpenAiProfile::with_summarizer(model, summarizer)
+                .with_provider_id(provider.clone())
+                .with_catalog(Arc::clone(&catalog)),
         ),
         ProviderId::GEMINI => Box::new(GeminiProfile::with_summarizer(model, summarizer)),
         other => panic!("unexpected provider {other}"),
@@ -85,6 +91,7 @@ async fn make_session(
     let factory_cwd = cwd.to_path_buf();
     let factory_provider = provider.clone();
     let factory: SessionFactory = Arc::new(move || {
+        let catalog = Arc::new(Catalog::from_builtin().expect("default catalog should build"));
         let sub_profile: Arc<dyn AgentProfile> = {
             let summarizer = Some(build_summarizer(&factory_provider, &factory_client));
             match factory_provider.as_str() {
@@ -92,12 +99,14 @@ async fn make_session(
                     &factory_model,
                     summarizer,
                 )),
-                ProviderId::OPENAI => {
-                    Arc::new(OpenAiProfile::with_summarizer(&factory_model, summarizer))
-                }
+                ProviderId::OPENAI => Arc::new(
+                    OpenAiProfile::with_summarizer(&factory_model, summarizer)
+                        .with_catalog(Arc::clone(&catalog)),
+                ),
                 "kimi" | "zai" | "minimax" | "inception" => Arc::new(
                     OpenAiProfile::with_summarizer(&factory_model, summarizer)
-                        .with_provider_id(factory_provider.clone()),
+                        .with_provider_id(factory_provider.clone())
+                        .with_catalog(Arc::clone(&catalog)),
                 ),
                 ProviderId::GEMINI => {
                     Arc::new(GeminiProfile::with_summarizer(&factory_model, summarizer))
@@ -176,8 +185,25 @@ fn make_openai_compatible_twin_session(
     twin: &OpenAiTwinOptions,
 ) -> Session {
     let client = make_openai_compatible_twin_client(&provider, twin);
-    let profile: Arc<dyn AgentProfile> =
-        Arc::new(OpenAiProfile::new(model).with_provider_id(provider));
+    // LiteLLM is opt-in in the built-in catalog. Enable the provider in this
+    // twin fixture so the profile can resolve the same OpenAI-compatible
+    // codec that the manually registered adapter uses.
+    let mut settings = LlmCatalogSettings::default();
+    settings
+        .providers
+        .insert(provider.to_string(), ProviderCatalogSettings {
+            enabled: Some(true),
+            ..ProviderCatalogSettings::default()
+        });
+    let catalog = Arc::new(
+        Catalog::from_builtin_with_overrides(&settings)
+            .expect("OpenAI-compatible twin catalog should build"),
+    );
+    let profile: Arc<dyn AgentProfile> = Arc::new(
+        OpenAiProfile::new(model)
+            .with_provider_id(provider)
+            .with_catalog(catalog),
+    );
     let env = Arc::new(LocalSandbox::new(cwd.to_path_buf()));
     Session::new(client, profile, env, config, None)
 }
@@ -271,27 +297,25 @@ macro_rules! provider_tests {
 }
 
 #[fabro_macros::e2e_test(twin)]
-async fn openai_compatible_twin_preserves_raw_apply_patch_arguments() {
+async fn openai_compatible_twin_uses_json_edit_file_tool() {
     let tmp = tempfile::tempdir().expect("failed to create tempdir");
     let file_path = tmp.path().join("data.txt");
     std::fs::write(&file_path, "old\n").expect("failed to write data.txt");
 
     let (base_url, api_key) = fabro_test::e2e_openai!();
     let twin = OpenAiTwinOptions { base_url, api_key };
-    let patch = "\
-*** Begin Patch
-*** Update File: data.txt
-@@
--old
-+new
-*** End Patch
-";
-
     TwinScenarios::new(twin.api_key.clone())
         .scenario(
             TwinScenario::chat_completions("gpt-5.4-mini")
                 .input_contains("Replace old with new")
-                .tool_call(TwinToolCall::apply_patch_raw_arguments(patch)),
+                .tool_call(TwinToolCall::new(
+                    "edit_file",
+                    serde_json::json!({
+                        "file_path": "data.txt",
+                        "old_string": "old",
+                        "new_string": "new"
+                    }),
+                )),
         )
         .load(twin_openai().await)
         .await;
@@ -311,7 +335,7 @@ async fn openai_compatible_twin_preserves_raw_apply_patch_arguments() {
     let mut rx = session.subscribe();
 
     session
-        .process_input("Replace old with new in data.txt using apply_patch")
+        .process_input("Replace old with new in data.txt using edit_file")
         .await
         .expect("process_input failed");
 

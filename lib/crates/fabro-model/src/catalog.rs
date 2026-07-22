@@ -2266,9 +2266,7 @@ enabled = true
             "claude-haiku-4-5",
             &fallbacks,
         );
-        assert_eq!(chain.len(), 1);
-        assert_eq!(chain[0].provider, "kimi");
-        assert_eq!(chain[0].model, "kimi-k2.5");
+        assert!(chain.is_empty());
     }
 
     #[test]
@@ -4246,7 +4244,7 @@ sampling_params = false
             limits: ModelLimits {
                 context_window: 262144,
                 max_output: Some(
-                    16000,
+                    32768,
                 ),
             },
             training: Some(
@@ -4258,10 +4256,10 @@ sampling_params = false
             features: ModelFeatures {
                 tools: true,
                 vision: true,
-                reasoning: false,
+                reasoning: true,
                 reasoning_effort: None,
-                prompt_cache: false,
-                sampling_params: true,
+                prompt_cache: true,
+                sampling_params: false,
             },
             costs: ModelCosts {
                 input_cost_per_mtok: Some(
@@ -4270,11 +4268,59 @@ sampling_params = false
                 output_cost_per_mtok: Some(
                     3.0,
                 ),
-                cache_input_cost_per_mtok: None,
+                cache_input_cost_per_mtok: Some(
+                    0.1,
+                ),
             },
             estimated_output_tps: Some(
                 50.0,
             ),
+            aliases: [],
+            default: false,
+            small_default: false,
+            configured: false,
+        }
+        "#);
+    }
+
+    #[test]
+    fn kimi_k3_in_catalog() {
+        let catalog = Catalog::builtin();
+        let m = catalog.get("kimi-k3").unwrap();
+        insta::assert_debug_snapshot!(m, @r#"
+        Model {
+            id: "kimi-k3",
+            provider: kimi,
+            family: "kimi-k3",
+            display_name: "Kimi K3",
+            limits: ModelLimits {
+                context_window: 1048576,
+                max_output: Some(
+                    131072,
+                ),
+            },
+            training: None,
+            knowledge_cutoff: None,
+            features: ModelFeatures {
+                tools: true,
+                vision: true,
+                reasoning: true,
+                reasoning_effort: AlwaysAdaptive,
+                prompt_cache: true,
+                sampling_params: false,
+            },
+            costs: ModelCosts {
+                input_cost_per_mtok: Some(
+                    3.0,
+                ),
+                output_cost_per_mtok: Some(
+                    15.0,
+                ),
+                cache_input_cost_per_mtok: Some(
+                    0.3,
+                ),
+            },
+            estimated_output_tps: None,
             aliases: [
                 "kimi",
             ],
@@ -4283,11 +4329,23 @@ sampling_params = false
             configured: false,
         }
         "#);
+        assert_eq!(
+            catalog
+                .model_settings("kimi-k3")
+                .unwrap()
+                .controls
+                .reasoning_effort,
+            vec![
+                ReasoningEffort::Low,
+                ReasoningEffort::High,
+                ReasoningEffort::Max,
+            ]
+        );
     }
 
     #[test]
     fn kimi_alias() {
-        assert_eq!(Catalog::builtin().get("kimi").unwrap().id, "kimi-k2.5");
+        assert_eq!(Catalog::builtin().get("kimi").unwrap().id, "kimi-k3");
     }
 
     #[test]
@@ -4485,10 +4543,11 @@ context_window = 1050000
     #[test]
     fn closest_model_haiku_to_kimi() {
         let haiku = Catalog::builtin().get("claude-haiku-4-5").unwrap();
-        let result = Catalog::builtin()
-            .closest(&ProviderId::new("kimi"), haiku)
-            .unwrap();
-        assert_eq!(result.id, "kimi-k2.5");
+        assert!(
+            Catalog::builtin()
+                .closest(&ProviderId::new("kimi"), haiku)
+                .is_none()
+        );
     }
 
     #[test]

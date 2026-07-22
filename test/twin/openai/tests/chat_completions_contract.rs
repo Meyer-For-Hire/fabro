@@ -69,6 +69,7 @@ async fn chat_completions_accepts_supported_openai_compatible_fields() {
                 },
                 { "role": "user", "content": "structured chat" }
             ],
+            "max_tokens": 128,
             "stream": false,
             "tools": [{ "type": "function", "function": { "name": "lookup" } }],
             "tool_choice": "auto",

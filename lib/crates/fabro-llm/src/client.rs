@@ -1183,6 +1183,26 @@ output_cost_per_mtok = 2.0
     }
 
     #[tokio::test]
+    async fn complete_accepts_supported_kimi_k3_reasoning_effort() {
+        let catalog = Arc::new(Catalog::from_builtin().unwrap());
+        let mut client = Client::new(HashMap::new(), None, vec![]);
+        client.catalog = Some(Arc::clone(&catalog));
+        client
+            .register_provider(Arc::new(MockProvider::new("kimi", "accepted")))
+            .await
+            .unwrap();
+
+        let mut request = test_request();
+        request.model = "kimi-k3".to_string();
+        request.provider = Some("kimi".to_string());
+        request.reasoning_effort = Some(ReasoningEffort::High);
+
+        let response = client.complete(&request).await.unwrap();
+
+        assert_eq!(response.text(), "accepted");
+    }
+
+    #[tokio::test]
     async fn complete_rejects_unsupported_speed_before_dispatch() {
         let catalog = Arc::new(Catalog::from_builtin().unwrap());
         let mut client = Client::new(HashMap::new(), None, vec![]);

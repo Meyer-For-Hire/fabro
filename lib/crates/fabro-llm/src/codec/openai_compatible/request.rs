@@ -3,20 +3,22 @@
 use super::translate;
 use super::wire::ApiRequest;
 use crate::codec::{CodecCtx, EncodedRequest, merge_named_provider_options};
+use crate::error::Error;
 
 /// Build the Chat Completions request for `ctx.request`. `stream` toggles the
 /// `stream` body field. The body is assembled as a `serde_json::Value` so
 /// `provider_options.<provider_name>` fields can be merged in before sending.
 ///
-/// Infallible for this dialect — the `Codec::encode` `Result` is wrapped by the
-/// trait impl.
-pub(super) fn encode(ctx: &CodecCtx<'_>, stream: bool) -> EncodedRequest {
+/// Returns an error when the request contains a custom tool definition, which
+/// the Chat Completions tool envelope cannot represent.
+pub(super) fn encode(ctx: &CodecCtx<'_>, stream: bool) -> Result<EncodedRequest, Error> {
     let request = ctx.request;
     let chat_messages = translate::translate_messages(&request.messages);
     let tools = request
         .tools
         .as_ref()
-        .map(|t| translate::translate_tools(t));
+        .map(|t| translate::translate_tools(t))
+        .transpose()?;
     let tool_choice = request
         .tool_choice
         .as_ref()
@@ -25,13 +27,22 @@ pub(super) fn encode(ctx: &CodecCtx<'_>, stream: bool) -> EncodedRequest {
         .response_format
         .as_ref()
         .map(translate::translate_response_format);
+    let (temperature, top_p) = if ctx
+        .model
+        .is_none_or(fabro_model::Model::supports_sampling_params)
+    {
+        (request.temperature, request.top_p)
+    } else {
+        (None, None)
+    };
 
     let api_request = ApiRequest {
         model: ctx.deployment_id.to_string(),
         messages: chat_messages,
-        temperature: request.temperature,
+        temperature,
         max_tokens: request.max_tokens,
-        top_p: request.top_p,
+        top_p,
+        reasoning_effort: request.reasoning_effort,
         stop: request.stop_sequences.clone(),
         tools,
         tool_choice,
@@ -46,11 +57,11 @@ pub(super) fn encode(ctx: &CodecCtx<'_>, stream: bool) -> EncodedRequest {
         ctx.provider_name,
     );
 
-    EncodedRequest {
+    Ok(EncodedRequest {
         body,
         endpoint: "/chat/completions".to_string(),
         headers: Vec::new(),
-    }
+    })
 }
 
 /// Merge `provider_options.<provider_name>` fields into the serialized API
@@ -68,10 +79,12 @@ pub(super) fn merge_provider_options(
 
 #[cfg(test)]
 mod tests {
+    use fabro_model::Catalog;
+
     use super::super::wire::ApiRequest;
     use super::*;
     use crate::codec::CodecParams;
-    use crate::types::{Message, Request};
+    use crate::types::{Message, ReasoningEffort, Request, ToolDefinition};
 
     fn minimal_request() -> Request {
         Request {
@@ -104,37 +117,39 @@ mod tests {
             model: None,
             params: &params,
         };
-        encode(&ctx, stream).body
+        encode(&ctx, stream).unwrap().body
     }
 
     #[test]
     fn api_request_stream_field_serialization() {
         let req = ApiRequest {
-            model:           "test".into(),
-            messages:        vec![],
-            temperature:     None,
-            max_tokens:      None,
-            top_p:           None,
-            stop:            None,
-            tools:           None,
-            tool_choice:     None,
-            response_format: None,
-            stream:          Some(true),
+            model:            "test".into(),
+            messages:         vec![],
+            temperature:      None,
+            max_tokens:       None,
+            top_p:            None,
+            reasoning_effort: None,
+            stop:             None,
+            tools:            None,
+            tool_choice:      None,
+            response_format:  None,
+            stream:           Some(true),
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["stream"], true);
 
         let req_no_stream = ApiRequest {
-            model:           "test".into(),
-            messages:        vec![],
-            temperature:     None,
-            max_tokens:      None,
-            top_p:           None,
-            stop:            None,
-            tools:           None,
-            tool_choice:     None,
-            response_format: None,
-            stream:          None,
+            model:            "test".into(),
+            messages:         vec![],
+            temperature:      None,
+            max_tokens:       None,
+            top_p:            None,
+            reasoning_effort: None,
+            stop:             None,
+            tools:            None,
+            tool_choice:      None,
+            response_format:  None,
+            stream:           None,
         };
         let json_no_stream = serde_json::to_value(&req_no_stream).unwrap();
         assert!(json_no_stream.get("stream").is_none());
@@ -152,8 +167,68 @@ mod tests {
             model:         None,
             params:        &params,
         };
-        let body = encode(&ctx, false).body;
+        let body = encode(&ctx, false).unwrap().body;
         assert_eq!(body["model"], "acme/model-large");
+    }
+
+    #[test]
+    fn encode_serializes_reasoning_effort_at_top_level() {
+        let mut request = minimal_request();
+        request.reasoning_effort = Some(ReasoningEffort::High);
+
+        let body = encode_body(&request, "kimi", false);
+
+        assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn encode_omits_sampling_params_for_models_that_reject_them() {
+        let model = Catalog::builtin().get("kimi-k3").unwrap();
+        let mut request = minimal_request();
+        request.model = model.id.clone();
+        request.temperature = Some(0.7);
+        request.top_p = Some(0.9);
+        let params = CodecParams::default();
+        let ctx = CodecCtx {
+            request:       &request,
+            provider_name: "kimi",
+            deployment_id: &model.id,
+            model:         Some(model),
+            params:        &params,
+        };
+
+        let body = encode(&ctx, false).unwrap().body;
+
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("top_p").is_none());
+    }
+
+    #[test]
+    fn encode_rejects_custom_tool_definitions() {
+        let mut request = minimal_request();
+        request.tools = Some(vec![ToolDefinition::custom(
+            "apply_patch",
+            "Apply a patch",
+            serde_json::json!({"type": "grammar"}),
+        )]);
+        let params = CodecParams::default();
+        let deployment_id = request.model.clone();
+        let ctx = CodecCtx {
+            request:       &request,
+            provider_name: "kimi",
+            deployment_id: &deployment_id,
+            model:         None,
+            params:        &params,
+        };
+
+        let Err(error) = encode(&ctx, false) else {
+            panic!("custom tool definition should be rejected");
+        };
+        assert!(matches!(
+            error,
+            Error::Configuration { message, source: None }
+                if message.contains("custom tool definition 'apply_patch'")
+        ));
     }
 
     #[test]
