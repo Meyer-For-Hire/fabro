@@ -17,7 +17,6 @@ __pycache__
 .worktrees/
 **/*.pending-snap
 .worktrees
-.fabro/workflows/implement-plan/prompts/
 .claude/scheduled_tasks.lock
 .mcp.json
 docs/internal/agent
