@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -10,10 +11,10 @@ use fabro_core::state::ExecutionState;
 use fabro_graphviz::graph::types::{Edge as GvEdge, Graph as GvGraph, Node as GvNode};
 
 use crate::artifact;
-use crate::context::keys;
+use crate::context::{Context, ParallelBranchPreamble, keys};
 use crate::graph::{WorkflowGraph, WorkflowNode};
 use crate::handler::llm::preamble::build_preamble;
-use crate::outcome::BilledModelUsage;
+use crate::outcome::{BilledModelUsage, Outcome};
 use crate::runtime_store::RunStoreHandle;
 
 type WfRunState = ExecutionState<Option<BilledModelUsage>>;
@@ -61,6 +62,65 @@ impl FidelityLifecycle {
             "fidelity mutex should not be poisoned: no code panics while holding this lock",
         ) = flag;
     }
+
+    /// Render the per-branch preamble stash for a parallel node, indexed by
+    /// outgoing-edge order (the same order `ParallelHandler` fans out in).
+    /// `Null` entries inherit the fork's preamble.
+    fn build_parallel_branch_preambles(
+        &self,
+        node_id: &str,
+        fork_fidelity: keys::Fidelity,
+        resolved_context: &Context,
+        resolved_outcomes: &HashMap<String, Outcome>,
+        completed_nodes: &[String],
+    ) -> Vec<serde_json::Value> {
+        let edges = self.graph.outgoing_edges(node_id);
+        let mut preambles: Vec<serde_json::Value> = Vec::with_capacity(edges.len());
+        let mut rendered: HashMap<keys::Fidelity, usize> = HashMap::new();
+
+        for (branch_index, edge) in edges.into_iter().enumerate() {
+            let Some(target_node) = self.graph.nodes.get(&edge.to) else {
+                preambles.push(serde_json::Value::Null);
+                continue;
+            };
+            let resolution = resolve_parallel_branch_fidelity(edge, target_node, fork_fidelity);
+            if resolution.requested == Some(keys::Fidelity::Full) {
+                tracing::warn!(
+                    parallel_node = %node_id,
+                    branch = %edge.to,
+                    branch_index,
+                    effective_fidelity = %keys::Fidelity::Full.degraded(),
+                    "Parallel branch fidelity degraded from full"
+                );
+            }
+            let Some(branch_fidelity) = resolution.effective else {
+                preambles.push(serde_json::Value::Null);
+                continue;
+            };
+            if let Some(&rendered_index) = rendered.get(&branch_fidelity) {
+                preambles.push(preambles[rendered_index].clone());
+                continue;
+            }
+
+            let entry = ParallelBranchPreamble {
+                fidelity: branch_fidelity,
+                preamble: build_preamble(
+                    branch_fidelity,
+                    resolved_context,
+                    &self.graph,
+                    completed_nodes,
+                    resolved_outcomes,
+                ),
+            };
+            rendered.insert(branch_fidelity, preambles.len());
+            preambles.push(
+                serde_json::to_value(entry)
+                    .expect("ParallelBranchPreamble serialization cannot fail"),
+            );
+        }
+
+        preambles
+    }
 }
 
 #[async_trait]
@@ -78,6 +138,11 @@ impl RunLifecycle<WorkflowGraph> for FidelityLifecycle {
         node: &WorkflowNode,
         state: &WfRunState,
     ) -> CoreResult<WfNodeDecision> {
+        state.context.set(
+            keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES,
+            serde_json::Value::Null,
+        );
+
         let incoming = self
             .incoming_edge_data
             .lock()
@@ -138,7 +203,23 @@ impl RunLifecycle<WorkflowGraph> for FidelityLifecycle {
             .context
             .set(keys::CURRENT_PREAMBLE, serde_json::json!(preamble));
 
-        // 5. Thread ID resolution via resolve_thread_id: edge → node → graph default →
+        // 5. Parallel nodes: pre-render per-branch preambles into the stash that
+        //    ParallelHandler consumes at fan-out.
+        if gv_node.handler_type() == Some("parallel") {
+            let branch_preambles = self.build_parallel_branch_preambles(
+                node.id(),
+                fidelity,
+                &resolved_context,
+                &resolved_outcomes,
+                &state.completed_nodes,
+            );
+            state.context.set(
+                keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES,
+                serde_json::Value::Array(branch_preambles),
+            );
+        }
+
+        // 6. Thread ID resolution via resolve_thread_id: edge → node → graph default →
         //    class → previous
         let thread_id = resolve_thread_id(
             incoming_edge_ref,
@@ -147,13 +228,13 @@ impl RunLifecycle<WorkflowGraph> for FidelityLifecycle {
             state.previous_node_id.as_deref(),
         );
 
-        // 6. Set thread.{tid}.current_node
+        // 7. Set thread.{tid}.current_node
         if let Some(ref tid) = thread_id {
             let key = keys::thread_current_node_key(tid);
             state.context.set(key, serde_json::json!(node.id()));
         }
 
-        // 7. Set INTERNAL_THREAD_ID (or null)
+        // 8. Set INTERNAL_THREAD_ID (or null)
         match thread_id {
             Some(tid) => {
                 state
@@ -167,7 +248,7 @@ impl RunLifecycle<WorkflowGraph> for FidelityLifecycle {
             }
         }
 
-        // 8. Set INTERNAL_NODE_VISIT_COUNT and CURRENT_NODE
+        // 9. Set INTERNAL_NODE_VISIT_COUNT and CURRENT_NODE
         let visits = state.node_visits.get(node.id()).copied().unwrap_or(1);
         state
             .context
@@ -198,6 +279,53 @@ impl RunLifecycle<WorkflowGraph> for FidelityLifecycle {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ParallelBranchFidelityResolution {
+    /// The explicit fidelity requested on the edge or node, pre-degradation.
+    requested: Option<keys::Fidelity>,
+    /// The fidelity to render an entry for; `None` inherits the fork preamble.
+    effective: Option<keys::Fidelity>,
+}
+
+/// Resolve explicit branch fidelity with edge-over-node precedence.
+///
+/// Branches with no explicit fidelity inherit the parallel node's preamble.
+/// Explicit full fidelity is degraded because concurrent branches cannot share
+/// an LLM session. An effective fidelity equal to the parallel node also
+/// inherits, avoiding a redundant preamble render.
+fn resolve_parallel_branch_fidelity(
+    edge: &GvEdge,
+    target_node: &GvNode,
+    parallel_fidelity: keys::Fidelity,
+) -> ParallelBranchFidelityResolution {
+    let requested = explicit_fidelity(Some(edge), target_node).map(|(fidelity, _)| fidelity);
+    let effective = requested
+        .map(keys::Fidelity::degraded)
+        .filter(|fidelity| *fidelity != parallel_fidelity);
+
+    ParallelBranchFidelityResolution {
+        requested,
+        effective,
+    }
+}
+
+/// Explicit fidelity from the incoming edge attribute, else the node
+/// attribute, with the winning source labeled for logging.
+fn explicit_fidelity(
+    incoming_edge: Option<&GvEdge>,
+    node: &GvNode,
+) -> Option<(keys::Fidelity, &'static str)> {
+    incoming_edge
+        .and_then(|e| e.fidelity())
+        .and_then(|s| s.parse().ok())
+        .map(|f| (f, "edge"))
+        .or_else(|| {
+            node.fidelity()
+                .and_then(|s| s.parse().ok())
+                .map(|f| (f, "node"))
+        })
+}
+
 /// Resolve the context fidelity for a node, following the precedence:
 /// 1. Incoming edge `fidelity` attribute
 /// 2. Target node `fidelity` attribute
@@ -208,13 +336,8 @@ fn resolve_fidelity(
     node: &GvNode,
     graph: &GvGraph,
 ) -> keys::Fidelity {
-    let (resolved, source) = if let Some(f) = incoming_edge
-        .and_then(|e| e.fidelity())
-        .and_then(|s| s.parse().ok())
-    {
-        (f, "edge")
-    } else if let Some(f) = node.fidelity().and_then(|s| s.parse().ok()) {
-        (f, "node")
+    let (resolved, source) = if let Some((f, source)) = explicit_fidelity(incoming_edge, node) {
+        (f, source)
     } else if let Some(f) = graph.default_fidelity().and_then(|s| s.parse().ok()) {
         (f, "graph")
     } else {
@@ -263,10 +386,213 @@ fn resolve_thread_id(
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+    use std::time::Duration;
+
+    use fabro_core::graph::Graph as CoreGraph;
     use fabro_graphviz::graph::{AttrValue, Edge, Graph, Node};
+    use fabro_store::Database;
+    use fabro_types::fixtures;
+    use object_store::memory::InMemory;
 
     use super::*;
+    use crate::context::WorkflowContext;
     use crate::context::keys::Fidelity;
+
+    fn str_attr(value: &str) -> AttrValue {
+        AttrValue::String(value.to_string())
+    }
+
+    fn parallel_workflow_graph(
+        fork_fidelity: Option<&str>,
+        branch_a_fidelity: Option<&str>,
+    ) -> WorkflowGraph {
+        let mut graph = Graph::new("parallel-fidelity");
+        let mut start = Node::new("start");
+        start
+            .attrs
+            .insert("shape".to_string(), str_attr("Mdiamond"));
+        let mut fork = Node::new("fork");
+        fork.attrs
+            .insert("shape".to_string(), str_attr("component"));
+        if let Some(fidelity) = fork_fidelity {
+            fork.attrs
+                .insert("fidelity".to_string(), str_attr(fidelity));
+        }
+        let mut branch_a = Node::new("branch_a");
+        if let Some(fidelity) = branch_a_fidelity {
+            branch_a
+                .attrs
+                .insert("fidelity".to_string(), str_attr(fidelity));
+        }
+        let branch_b = Node::new("branch_b");
+        let mut work = Node::new("work");
+        work.attrs.insert("shape".to_string(), str_attr("box"));
+
+        graph.nodes.insert(start.id.clone(), start);
+        graph.nodes.insert(fork.id.clone(), fork);
+        graph.nodes.insert(branch_a.id.clone(), branch_a);
+        graph.nodes.insert(branch_b.id.clone(), branch_b);
+        graph.nodes.insert(work.id.clone(), work);
+        graph.edges.push(Edge::new("start", "fork"));
+        graph.edges.push(Edge::new("fork", "branch_a"));
+        graph.edges.push(Edge::new("fork", "branch_b"));
+
+        WorkflowGraph(Arc::new(graph))
+    }
+
+    async fn test_lifecycle(graph: &WorkflowGraph, run_dir: &Path) -> FidelityLifecycle {
+        let store = Arc::new(Database::new(
+            Arc::new(InMemory::new()),
+            "",
+            Duration::from_millis(1),
+            None,
+        ));
+        let run_store = store.create_run(&fixtures::RUN_1).await.unwrap();
+        let sandbox: Arc<dyn Sandbox> =
+            Arc::new(fabro_agent::LocalSandbox::new(run_dir.to_path_buf()));
+        FidelityLifecycle::new(
+            graph.0.clone(),
+            sandbox,
+            RunStoreHandle::local(run_store),
+            run_dir.to_path_buf(),
+        )
+    }
+
+    #[test]
+    fn parallel_branch_fidelity_edge_overrides_node() {
+        let mut node = Node::new("branch");
+        node.attrs
+            .insert("fidelity".to_string(), str_attr("compact"));
+        let mut edge = Edge::new("fork", "branch");
+        edge.attrs
+            .insert("fidelity".to_string(), str_attr("truncate"));
+
+        let resolved = resolve_parallel_branch_fidelity(&edge, &node, Fidelity::SummaryHigh);
+
+        assert_eq!(resolved.requested, Some(Fidelity::Truncate));
+        assert_eq!(resolved.effective, Some(Fidelity::Truncate));
+    }
+
+    #[test]
+    fn parallel_branch_fidelity_without_attribute_inherits() {
+        let node = Node::new("branch");
+        let edge = Edge::new("fork", "branch");
+
+        let resolution = resolve_parallel_branch_fidelity(&edge, &node, Fidelity::Compact);
+
+        assert_eq!(resolution.requested, None);
+        assert_eq!(resolution.effective, None);
+    }
+
+    #[test]
+    fn parallel_branch_full_fidelity_degrades_to_summary_high() {
+        let mut node = Node::new("branch");
+        node.attrs.insert("fidelity".to_string(), str_attr("full"));
+        let edge = Edge::new("fork", "branch");
+
+        let resolved = resolve_parallel_branch_fidelity(&edge, &node, Fidelity::Compact);
+
+        assert_eq!(resolved.requested, Some(Fidelity::Full));
+        assert_eq!(resolved.effective, Some(Fidelity::SummaryHigh));
+    }
+
+    #[test]
+    fn parallel_branch_fidelity_equal_to_fork_inherits() {
+        let mut node = Node::new("branch");
+        node.attrs
+            .insert("fidelity".to_string(), str_attr("summary:high"));
+        let edge = Edge::new("fork", "branch");
+
+        let resolution = resolve_parallel_branch_fidelity(&edge, &node, Fidelity::SummaryHigh);
+
+        assert_eq!(resolution.requested, Some(Fidelity::SummaryHigh));
+        assert_eq!(resolution.effective, None);
+    }
+
+    #[test]
+    fn explicit_full_branch_equal_to_degraded_fork_inherits() {
+        let mut node = Node::new("branch");
+        node.attrs.insert("fidelity".to_string(), str_attr("full"));
+        let edge = Edge::new("fork", "branch");
+
+        let resolution = resolve_parallel_branch_fidelity(&edge, &node, Fidelity::SummaryHigh);
+
+        assert_eq!(resolution.requested, Some(Fidelity::Full));
+        assert_eq!(resolution.effective, None);
+    }
+
+    #[test]
+    fn full_fork_without_branch_fidelity_does_not_create_entry() {
+        let node = Node::new("branch");
+        let edge = Edge::new("fork", "branch");
+
+        let resolution = resolve_parallel_branch_fidelity(&edge, &node, Fidelity::Full);
+
+        assert_eq!(resolution.requested, None);
+        assert_eq!(resolution.effective, None);
+    }
+
+    #[tokio::test]
+    async fn parallel_before_node_rebuilds_branch_preamble_stash() {
+        let graph = parallel_workflow_graph(None, Some("truncate"));
+        let run_dir = tempfile::tempdir().unwrap();
+        let lifecycle = test_lifecycle(&graph, run_dir.path()).await;
+        let state: WfRunState = ExecutionState::new(&graph).unwrap();
+        let fork = graph.get_node("fork").unwrap();
+
+        lifecycle.before_node(&fork, &state).await.unwrap();
+        state.context.set(
+            keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES,
+            serde_json::json!(["stale", "entries", "must disappear"]),
+        );
+        lifecycle.before_node(&fork, &state).await.unwrap();
+
+        let stash = state
+            .context
+            .get(keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES)
+            .expect("parallel stash should be set");
+        let entries = stash.as_array().expect("parallel stash should be an array");
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].is_object());
+        assert!(entries[1].is_null());
+    }
+
+    #[tokio::test]
+    async fn non_parallel_before_node_overwrites_branch_preamble_stash_with_null() {
+        let graph = parallel_workflow_graph(None, Some("truncate"));
+        let run_dir = tempfile::tempdir().unwrap();
+        let lifecycle = test_lifecycle(&graph, run_dir.path()).await;
+        let state: WfRunState = ExecutionState::new(&graph).unwrap();
+        let fork = graph.get_node("fork").unwrap();
+        let work = graph.get_node("work").unwrap();
+
+        lifecycle.before_node(&fork, &state).await.unwrap();
+        lifecycle.before_node(&work, &state).await.unwrap();
+
+        assert_eq!(
+            state.context.get(keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES),
+            Some(serde_json::Value::Null)
+        );
+    }
+
+    #[tokio::test]
+    async fn resumed_full_fork_degrades_without_rendering_fallback_branches() {
+        let graph = parallel_workflow_graph(Some("full"), None);
+        let run_dir = tempfile::tempdir().unwrap();
+        let lifecycle = test_lifecycle(&graph, run_dir.path()).await;
+        lifecycle.set_degrade_fidelity_on_resume(true);
+        let state: WfRunState = ExecutionState::new(&graph).unwrap();
+        let fork = graph.get_node("fork").unwrap();
+
+        lifecycle.before_node(&fork, &state).await.unwrap();
+
+        assert_eq!(state.context.fidelity(), Fidelity::SummaryHigh);
+        assert_eq!(
+            state.context.get(keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES),
+            Some(serde_json::json!([null, null]))
+        );
+    }
 
     #[test]
     fn fidelity_defaults_to_compact() {

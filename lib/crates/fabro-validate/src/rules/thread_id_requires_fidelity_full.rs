@@ -1,5 +1,6 @@
 use fabro_graphviz::graph::Graph;
 
+use super::parallel_branch::ParallelBranches;
 use crate::{Diagnostic, LintRule, Severity};
 
 pub(super) fn rule() -> Box<dyn LintRule> {
@@ -20,9 +21,16 @@ impl LintRule for Rule {
     fn apply(&self, graph: &Graph) -> Vec<Diagnostic> {
         let mut diagnostics = Vec::new();
         let graph_default_full = graph.default_fidelity() == Some("full");
+        let branches = ParallelBranches::new(graph);
 
+        // thread_id is inert on parallel branches, where
+        // parallel_branch_inert_attribute already says "remove thread_id" —
+        // advising fidelity="full" there would contradict it.
         for node in graph.nodes.values() {
-            if node.thread_id().is_some() && node.fidelity() != Some("full") && !graph_default_full
+            if node.thread_id().is_some()
+                && !branches.is_branch_only_node(&node.id)
+                && node.fidelity() != Some("full")
+                && !graph_default_full
             {
                 diagnostics.push(Diagnostic {
                     rule: self.name().to_string(),
@@ -41,7 +49,7 @@ impl LintRule for Rule {
         }
 
         for edge in &graph.edges {
-            if edge.thread_id().is_some() {
+            if edge.thread_id().is_some() && !branches.is_fork_edge(edge) {
                 let edge_full = edge.fidelity() == Some("full");
                 let target_full =
                     graph.nodes.get(&edge.to).and_then(|n| n.fidelity()) == Some("full");
@@ -82,11 +90,28 @@ impl LintRule for Rule {
 
 #[cfg(test)]
 mod tests {
-    use fabro_graphviz::graph::{AttrValue, Edge, Node};
+    use fabro_graphviz::graph::{AttrValue, Edge, Graph, Node};
 
     use super::Rule;
     use crate::rules::test_support::minimal_graph;
     use crate::{LintRule, Severity};
+
+    fn parallel_graph() -> Graph {
+        let mut g = minimal_graph();
+        let mut fork = Node::new("fork");
+        fork.attrs.insert(
+            "shape".to_string(),
+            AttrValue::String("component".to_string()),
+        );
+        g.nodes.insert("fork".to_string(), fork);
+        g.nodes.insert("branch".to_string(), Node::new("branch"));
+        g.edges = vec![
+            Edge::new("start", "fork"),
+            Edge::new("fork", "branch"),
+            Edge::new("branch", "exit"),
+        ];
+        g
+    }
 
     #[test]
     fn thread_id_requires_fidelity_full_node_warns() {
@@ -204,6 +229,51 @@ mod tests {
         let rule = Rule;
         let d = rule.apply(&g);
         assert!(d.is_empty());
+    }
+
+    #[test]
+    fn skips_thread_id_on_parallel_branch_edge() {
+        let mut g = parallel_graph();
+        g.edges[1].attrs.insert(
+            "thread_id".to_string(),
+            AttrValue::String("branch-thread".to_string()),
+        );
+
+        assert!(Rule.apply(&g).is_empty());
+    }
+
+    #[test]
+    fn skips_thread_id_on_branch_only_node() {
+        let mut g = parallel_graph();
+        g.nodes
+            .get_mut("branch")
+            .expect("graph has branch")
+            .attrs
+            .insert(
+                "thread_id".to_string(),
+                AttrValue::String("branch-thread".to_string()),
+            );
+
+        assert!(Rule.apply(&g).is_empty());
+    }
+
+    #[test]
+    fn checks_thread_id_on_branch_node_with_normal_entry() {
+        let mut g = parallel_graph();
+        g.edges.push(Edge::new("start", "branch"));
+        g.nodes
+            .get_mut("branch")
+            .expect("graph has branch")
+            .attrs
+            .insert(
+                "thread_id".to_string(),
+                AttrValue::String("shared-thread".to_string()),
+            );
+
+        let d = Rule.apply(&g);
+
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].node_id.as_deref(), Some("branch"));
     }
 
     #[test]

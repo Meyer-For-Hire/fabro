@@ -139,6 +139,16 @@ Fidelity can be set at three levels. The first match wins:
 
 If none of these are set, fidelity defaults to `compact`.
 
+### Parallel branch fidelity
+
+The first node in each parallel branch uses this precedence:
+
+1. `fidelity` on the fork-to-branch edge
+2. `fidelity` on the branch node
+3. Otherwise, inherit the fork's preamble unchanged
+
+Fabro renders any branch-specific preambles before fan-out from the fork's context snapshot, then places them into the isolated branch contexts. An explicit branch-level `full` degrades to `summary:high` because concurrent branches cannot share conversation sessions. `thread_id` on a branch node or fork-to-branch edge is inert.
+
 ### Full fidelity and threads
 
 `full` fidelity is typically used with `thread_id` to create a shared conversation across multiple nodes. Nodes with the same `thread_id` share a single LLM session, preserving full context continuity:

@@ -201,8 +201,8 @@ Start nodes can also be identified by ID (`start` or `Start`). Exit nodes can be
 | `prompt` | String | Task instructions for the LLM. Supports file references with `@path/to/file.md` |
 | `reasoning_effort` | String | `low`, `medium`, or `high` (default: `high`) |
 | `max_tokens` | Integer | Maximum output tokens |
-| `fidelity` | String | How much prior context is passed: `compact`, `full`, `summary:high`, `summary:medium`, `summary:low`, `truncate` |
-| `thread_id` | String | Groups nodes into a shared conversation thread |
+| `fidelity` | String | How much prior context is passed: `compact`, `full`, `summary:high`, `summary:medium`, `summary:low`, `truncate`. On a node entered directly from a parallel fork, this is overridden by the fork-to-branch edge; explicit `full` degrades to `summary:high`. |
+| `thread_id` | String | Groups nodes into a shared conversation thread. Inert when the node is entered directly from a parallel fork. |
 | `model` | String | Explicit model ID (overrides stylesheet) |
 | `provider` | String | Explicit provider name (overrides stylesheet). Auto-inferred from the model catalog when omitted. |
 | `project_memory` | Boolean | When `true` (default), prompt nodes discover and include project docs (`AGENTS.md`, `CLAUDE.md`, etc.) as a system prompt. Set to `false` to disable. |
@@ -252,6 +252,8 @@ audit [
 | `join_policy` | String | When the merge can proceed: `wait_all` (default), `first_success` |
 | `max_parallel` | Integer | Maximum concurrent branches (default: 4) |
 
+For the first node in each branch, `fidelity` resolves from the fork-to-branch edge, then the branch node; without either, the fork preamble is inherited unchanged. Branch-specific preambles are rendered before fan-out from the fork's context snapshot. Concurrent branches cannot share sessions, so explicit branch `full` becomes `summary:high`, and branch-level `thread_id` is inert.
+
 ### Wait nodes
 
 | Attribute | Type | Description |
@@ -282,8 +284,8 @@ audit [
 | `label` | String | Display text; also used for human gate option matching |
 | `condition` | String | Boolean expression for conditional routing (see below) |
 | `weight` | Integer | Priority for tiebreaking (higher wins, default: 0) |
-| `fidelity` | String | Override fidelity level for this transition |
-| `thread_id` | String | Override thread ID for this transition |
+| `fidelity` | String | Override fidelity level for this transition. On a fork-to-branch edge, takes precedence over the branch node; explicit `full` degrades to `summary:high`. |
+| `thread_id` | String | Override thread ID for this transition. Inert on fork-to-branch edges. |
 | `loop_restart` | Boolean | Restart the workflow from this edge's target when taken: stage history and retry counts clear and the context resets to empty (visit counts are kept). Failed outcomes may only take it for `transient_infra` failures — see [Failures](/execution/failures#loop-restart-edges) |
 | `freeform` | Boolean | When `true` on a human-gate edge, accept free-text input instead of fixed choices |
 

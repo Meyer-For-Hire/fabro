@@ -4964,6 +4964,27 @@ struct FidelityCapturingHandler {
     captures: FidelityCaptures,
 }
 
+struct ParallelFidelitySeedHandler;
+
+#[async_trait::async_trait]
+impl Handler for ParallelFidelitySeedHandler {
+    async fn execute(
+        &self,
+        _node: &Node,
+        _context: &Context,
+        _graph: &Graph,
+        _run_dir: &Path,
+        _services: &fabro_workflow::handler::EngineServices,
+    ) -> Result<Outcome, Error> {
+        let mut outcome = Outcome::success();
+        outcome.context_updates.insert(
+            "parallel_fidelity_marker".to_string(),
+            serde_json::json!("marker visible to inherited preambles"),
+        );
+        Ok(outcome)
+    }
+}
+
 #[async_trait::async_trait]
 impl Handler for FidelityCapturingHandler {
     async fn execute(
@@ -9359,6 +9380,176 @@ async fn run_fidelity_prompt_pipeline(fidelity: &str) -> String {
         .stage(&fabro_types::StageId::new("report", 1))
         .and_then(|node| node.prompt.clone())
         .expect("report prompt should exist")
+}
+
+async fn run_parallel_fidelity_capture(
+    fork_fidelity: Option<&str>,
+    branch_node_fidelity: Option<&str>,
+    branch_edge_fidelity: Option<&str>,
+) -> FidelityCaptures {
+    use fabro_workflow::handler::fan_in::FanInHandler;
+    use fabro_workflow::handler::parallel::ParallelHandler;
+
+    let mut graph = make_graph_with_start_exit("ParallelFidelityTest");
+    graph.attrs.insert(
+        "goal".to_string(),
+        AttrValue::String("Verify parallel branch context".to_string()),
+    );
+
+    let mut seed = Node::new("seed");
+    seed.attrs.insert(
+        "type".to_string(),
+        AttrValue::String("parallel_fidelity_seed".to_string()),
+    );
+    let mut fork = Node::new("fork");
+    fork.attrs.insert(
+        "shape".to_string(),
+        AttrValue::String("component".to_string()),
+    );
+    if let Some(fidelity) = fork_fidelity {
+        fork.attrs.insert(
+            "fidelity".to_string(),
+            AttrValue::String(fidelity.to_string()),
+        );
+    }
+    let mut branch_a = Node::new("branch_a");
+    branch_a.attrs.insert(
+        "type".to_string(),
+        AttrValue::String("fidelity_capture".to_string()),
+    );
+    if let Some(fidelity) = branch_node_fidelity {
+        branch_a.attrs.insert(
+            "fidelity".to_string(),
+            AttrValue::String(fidelity.to_string()),
+        );
+    }
+    let mut branch_b = Node::new("branch_b");
+    branch_b.attrs.insert(
+        "type".to_string(),
+        AttrValue::String("fidelity_capture".to_string()),
+    );
+    let mut fan_in = Node::new("fan_in");
+    fan_in.attrs.insert(
+        "shape".to_string(),
+        AttrValue::String("tripleoctagon".to_string()),
+    );
+
+    graph.nodes.insert(seed.id.clone(), seed);
+    graph.nodes.insert(fork.id.clone(), fork);
+    graph.nodes.insert(branch_a.id.clone(), branch_a);
+    graph.nodes.insert(branch_b.id.clone(), branch_b);
+    graph.nodes.insert(fan_in.id.clone(), fan_in);
+    graph.edges.push(Edge::new("start", "seed"));
+    graph.edges.push(Edge::new("seed", "fork"));
+    let mut branch_a_edge = Edge::new("fork", "branch_a");
+    if let Some(fidelity) = branch_edge_fidelity {
+        branch_a_edge.attrs.insert(
+            "fidelity".to_string(),
+            AttrValue::String(fidelity.to_string()),
+        );
+    }
+    graph.edges.push(branch_a_edge);
+    graph.edges.push(Edge::new("fork", "branch_b"));
+    graph.edges.push(Edge::new("branch_a", "fan_in"));
+    graph.edges.push(Edge::new("branch_b", "fan_in"));
+    graph.edges.push(Edge::new("fan_in", "exit"));
+
+    let captures = FidelityCaptures::new();
+    let mut registry = HandlerRegistry::new(Box::new(StartHandler));
+    registry.register("start", Box::new(StartHandler));
+    registry.register("exit", Box::new(ExitHandler));
+    registry.register("parallel", Box::new(ParallelHandler));
+    registry.register(
+        "parallel.fan_in",
+        Box::new(FanInHandler::new(Some(Box::new(MockCodergenBackend)))),
+    );
+    registry.register(
+        "parallel_fidelity_seed",
+        Box::new(ParallelFidelitySeedHandler),
+    );
+    registry.register(
+        "fidelity_capture",
+        Box::new(FidelityCapturingHandler {
+            captures: captures.clone(),
+        }),
+    );
+
+    let dir = tempfile::tempdir().expect("parallel fidelity run directory should be created");
+    let engine = WorkflowRunner::new(registry, Arc::new(Emitter::default()), local_env());
+    let run_options = RunOptions {
+        settings:         WorkflowSettings::default(),
+        run_dir:          dir.path().to_path_buf(),
+        cancel_token:     CancellationToken::new(),
+        run_id:           test_run_id("parallel-fidelity"),
+        labels:           std::collections::HashMap::new(),
+        workflow_slug:    None,
+        github_app:       None,
+        base_branch:      None,
+        display_base_sha: None,
+        pre_run_git:      None,
+        fork_source_ref:  None,
+        git:              None,
+    };
+    let (outcome, _state) = engine
+        .run_with_state(&graph, &run_options)
+        .await
+        .expect("parallel fidelity workflow should succeed");
+    assert_eq!(outcome.status, StageOutcome::Succeeded);
+    captures
+}
+
+fn captured_fidelity_preamble(captures: &FidelityCaptures, node_id: &str) -> (String, String) {
+    let fidelity = captures
+        .fidelities
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(captured_node_id, _)| captured_node_id == node_id)
+        .map(|(_, fidelity)| fidelity.clone())
+        .expect("branch fidelity should be captured");
+    let preamble = captures
+        .preambles
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(captured_node_id, _)| captured_node_id == node_id)
+        .map(|(_, preamble)| preamble.clone())
+        .expect("branch preamble should be captured");
+    (fidelity, preamble)
+}
+
+#[tokio::test]
+async fn parallel_branches_get_per_branch_preambles_by_fidelity() {
+    let captures = run_parallel_fidelity_capture(None, Some("truncate"), None).await;
+
+    let (branch_a_fidelity, branch_a_preamble) = captured_fidelity_preamble(&captures, "branch_a");
+    let (branch_b_fidelity, branch_b_preamble) = captured_fidelity_preamble(&captures, "branch_b");
+
+    assert_eq!(branch_a_fidelity, "truncate");
+    assert!(!branch_a_preamble.contains("parallel_fidelity_marker"));
+    assert_eq!(branch_b_fidelity, "compact");
+    assert!(branch_b_preamble.contains("parallel_fidelity_marker"));
+}
+
+#[tokio::test]
+async fn parallel_fork_fidelity_still_applies_to_all_branches() {
+    let captures = run_parallel_fidelity_capture(Some("truncate"), None, None).await;
+
+    for branch_id in ["branch_a", "branch_b"] {
+        let (fidelity, preamble) = captured_fidelity_preamble(&captures, branch_id);
+        assert_eq!(fidelity, "truncate");
+        assert!(!preamble.contains("parallel_fidelity_marker"));
+    }
+}
+
+#[tokio::test]
+async fn parallel_branch_edge_fidelity_overrides_node_fidelity() {
+    let captures =
+        run_parallel_fidelity_capture(None, Some("summary:high"), Some("truncate")).await;
+
+    let (fidelity, preamble) = captured_fidelity_preamble(&captures, "branch_a");
+    assert_eq!(fidelity, "truncate");
+    assert!(!preamble.contains("parallel_fidelity_marker"));
 }
 
 #[tokio::test]

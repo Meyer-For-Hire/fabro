@@ -1,9 +1,24 @@
+use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString, VariantArray};
 
 /// Fidelity mode controlling how much prior context is provided to LLM
 /// sessions.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Display, EnumString, VariantArray)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Hash,
+    Display,
+    EnumString,
+    VariantArray,
+    Serialize,
+    Deserialize,
+)]
 #[strum(serialize_all = "lowercase")]
+#[serde(rename_all = "lowercase")]
 pub enum Fidelity {
     /// Complete context, no summarization — sessions share a thread.
     Full,
@@ -14,12 +29,15 @@ pub enum Fidelity {
     Compact,
     /// Brief textual summary (~600 token target).
     #[strum(serialize = "summary:low")]
+    #[serde(rename = "summary:low")]
     SummaryLow,
     /// Moderate textual summary (~1500 token target).
     #[strum(serialize = "summary:medium")]
+    #[serde(rename = "summary:medium")]
     SummaryMedium,
     /// Detailed per-stage Markdown report.
     #[strum(serialize = "summary:high")]
+    #[serde(rename = "summary:high")]
     SummaryHigh,
 }
 
@@ -72,5 +90,15 @@ mod tests {
     #[test]
     fn fidelity_unknown_mode_errors() {
         assert!("bogus".parse::<Fidelity>().is_err());
+    }
+
+    #[test]
+    fn fidelity_serde_matches_strum_display() {
+        for mode in Fidelity::variants() {
+            let json = serde_json::to_value(mode).unwrap();
+            assert_eq!(json, serde_json::Value::String(mode.to_string()));
+            let parsed: Fidelity = serde_json::from_value(json).unwrap();
+            assert_eq!(parsed, *mode);
+        }
     }
 }
