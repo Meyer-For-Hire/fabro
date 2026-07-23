@@ -15,7 +15,7 @@ use fabro_llm::{Error as LlmError, retry};
 use fabro_mcp::config::{McpServerSettings, McpTransport};
 use fabro_mcp::connection_manager::McpConnectionManager;
 use fabro_mcp::http_transport;
-use fabro_model::{AgentProfileKind, Catalog, ModelRef, Speed};
+use fabro_model::{AgentProfileKind, Catalog, ModelRef, Speed, UsdMicros};
 use fabro_types::{
     AgentToolSummary, PermissionLevel, Principal, SessionMessage, SessionRecord,
     StageContextWindowProjection, SteeringMessage,
@@ -354,6 +354,7 @@ pub struct Session {
     completion_coordinator: Option<Arc<dyn CompletionCoordinator>>,
     last_input_timing: SessionInputTiming,
     last_input_usage: TokenCounts,
+    last_input_cost: Option<UsdMicros>,
 }
 
 impl Session {
@@ -393,6 +394,7 @@ impl Session {
             completion_coordinator: None,
             last_input_timing: SessionInputTiming::default(),
             last_input_usage: TokenCounts::default(),
+            last_input_cost: None,
         }
     }
 
@@ -1222,6 +1224,11 @@ impl Session {
         self.last_input_usage.clone()
     }
 
+    #[must_use]
+    pub const fn last_input_cost(&self) -> Option<UsdMicros> {
+        self.last_input_cost
+    }
+
     /// Process an input. The inference/tool timing accumulated during the call
     /// is available via [`Self::last_input_timing`] after this returns, even on
     /// error.
@@ -1232,8 +1239,10 @@ impl Session {
     ) -> Result<(), Error> {
         let mut timing = SessionInputTiming::default();
         let mut usage = TokenCounts::default();
+        let mut cost = None;
         self.last_input_timing = timing;
         self.last_input_usage = TokenCounts::default();
+        self.last_input_cost = None;
         if self.state == SessionState::Closed {
             return Err(Error::SessionClosed);
         }
@@ -1258,7 +1267,13 @@ impl Session {
 
         // Process the initial input, then drain any followups
         let mut result = self
-            .run_single_input(input, &agent_tool_runtime, &mut timing, &mut usage)
+            .run_single_input(
+                input,
+                &agent_tool_runtime,
+                &mut timing,
+                &mut usage,
+                &mut cost,
+            )
             .await;
 
         if result.is_ok() {
@@ -1270,7 +1285,13 @@ impl Session {
                     .pop_front();
                 let Some(followup) = followup else { break };
                 result = self
-                    .run_single_input(&followup, &agent_tool_runtime, &mut timing, &mut usage)
+                    .run_single_input(
+                        &followup,
+                        &agent_tool_runtime,
+                        &mut timing,
+                        &mut usage,
+                        &mut cost,
+                    )
                     .await;
                 if result.is_err() {
                     break;
@@ -1290,6 +1311,7 @@ impl Session {
 
         self.last_input_timing = timing;
         self.last_input_usage = usage;
+        self.last_input_cost = cost;
         result
     }
 
@@ -1299,6 +1321,7 @@ impl Session {
         agent_tool_runtime: &AgentToolRuntime,
         timing: &mut SessionInputTiming,
         usage_accumulator: &mut TokenCounts,
+        cost_accumulator: &mut Option<UsdMicros>,
     ) -> Result<(), Error> {
         const STREAM_CONSUME_RETRIES: usize = 3;
 
@@ -1704,6 +1727,7 @@ impl Session {
                 &usage,
             ));
             *usage_accumulator += usage.clone();
+            UsdMicros::accumulate(cost_accumulator, response.cost_usd.map(UsdMicros::from_usd));
 
             self.history.push(Message::Assistant {
                 content: text.clone(),
@@ -1729,6 +1753,8 @@ impl Session {
                     text: text.clone(),
                     model,
                     usage: response.usage.clone(),
+                    cost_usd: response.cost_usd,
+                    cost_source: response.cost_source,
                     tool_call_count: tool_calls.len(),
                     context_window,
                 });
@@ -2274,6 +2300,25 @@ mod tests {
             assert_eq!(results[0].tool_call_id, "call_1");
             assert!(!results[0].is_error);
         }
+    }
+
+    #[tokio::test]
+    async fn last_input_cost_sums_each_response_in_a_multi_turn_input() {
+        let mut registry = ToolRegistry::new();
+        registry.register(make_echo_tool());
+
+        let responses = vec![
+            response_with_cost(
+                tool_call_response("echo", "call_1", serde_json::json!({"text": "hello"})),
+                0.04,
+            ),
+            response_with_cost(text_response("Done!"), 0.06),
+        ];
+
+        let mut session = make_session_with_tools(responses, registry).await;
+        session.process_input("Use echo tool").await.unwrap();
+
+        assert_eq!(session.last_input_cost(), Some(UsdMicros(100_000)));
     }
 
     #[tokio::test]
@@ -4006,6 +4051,12 @@ mod tests {
 
     fn response_with_usage(mut response: Response, usage: TokenCounts) -> Response {
         response.usage = usage;
+        response
+    }
+
+    fn response_with_cost(mut response: Response, cost_usd: f64) -> Response {
+        response.cost_usd = Some(cost_usd);
+        response.cost_source = Some(fabro_model::CostSource::Authoritative);
         response
     }
 
