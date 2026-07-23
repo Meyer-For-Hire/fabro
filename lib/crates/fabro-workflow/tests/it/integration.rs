@@ -33,7 +33,7 @@ use fabro_interview::{
 use fabro_model::catalog::{LlmCatalogSettings, ProviderCatalogSettings};
 use fabro_model::{Catalog, ProviderId};
 use fabro_store::{ArtifactKey, ArtifactStore, Database};
-use fabro_types::{RunEvent, RunId, StageId, WorkflowSettings, parse_blob_ref};
+use fabro_types::{EventBody, RunEvent, RunId, StageId, WorkflowSettings, parse_blob_ref};
 use fabro_validate::{Severity, validate, validate_or_raise};
 use fabro_workflow::context::Context;
 use fabro_workflow::error::{Error, FailureSignatureExt};
@@ -1964,20 +1964,8 @@ async fn command_schema_validation_failure_does_not_consume_retries() {
     registry.register("exit", Box::new(ExitHandler));
     registry.register("command", Box::new(CommandHandler));
     let engine = WorkflowRunner::new(registry, Arc::new(emitter), local_env());
-    let run_options = RunOptions {
-        settings:         WorkflowSettings::default(),
-        run_dir:          dir.path().to_path_buf(),
-        cancel_token:     CancellationToken::new(),
-        run_id:           test_run_id("command-schema-no-retry"),
-        labels:           std::collections::HashMap::new(),
-        workflow_slug:    None,
-        github_app:       None,
-        base_branch:      None,
-        display_base_sha: None,
-        pre_run_git:      None,
-        fork_source_ref:  None,
-        git:              None,
-    };
+    let mut run_options = make_run_options(dir.path());
+    run_options.run_id = test_run_id("command-schema-no-retry");
 
     let (outcome, state) = engine
         .run_with_state(&graph, &run_options)
@@ -2014,7 +2002,7 @@ async fn command_schema_validation_failure_does_not_consume_retries() {
         .lock()
         .unwrap()
         .iter()
-        .filter(|event| event.event_name() == "command.started")
+        .filter(|event| matches!(event.body, EventBody::CommandStarted(_)))
         .count();
     assert_eq!(command_starts, 1, "command should execute exactly once");
 }

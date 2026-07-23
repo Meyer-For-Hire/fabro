@@ -20,6 +20,7 @@ const HANDLER_SPECIFIC_ATTRS: &[(&str, &[&str])] = &[
     ("duration", &["wait"]),
     ("join_policy", &["parallel"]),
     ("max_parallel", &["parallel"]),
+    ("output_retries", &["agent", "prompt"]),
     ("output_schema", &["agent", "prompt", "command"]),
     ("prompt", &["agent", "prompt", "parallel.fan_in"]),
 ];
@@ -152,6 +153,21 @@ mod tests {
     }
 
     #[test]
+    fn warns_on_output_retries_on_command_node() {
+        let mut g = minimal_graph();
+        g.nodes.insert(
+            "run".to_string(),
+            node_with_attr("run", "parallelogram", "output_retries", "2"),
+        );
+
+        let d = Rule.apply(&g);
+
+        assert_eq!(d.len(), 1);
+        assert!(d[0].message.contains("'output_retries'"));
+        assert!(d[0].message.contains("agent, prompt"));
+    }
+
+    #[test]
     fn accepts_attrs_on_their_own_handler_types() {
         let mut g = minimal_graph();
         g.nodes.insert(
@@ -171,12 +187,20 @@ mod tests {
             node_with_attr("work", "box", "prompt", "do things"),
         );
         g.nodes.insert(
+            "review".to_string(),
+            node_with_attr("review", "box", "output_retries", "2"),
+        );
+        g.nodes.insert(
             "fork".to_string(),
             node_with_attr("fork", "component", "join_policy", "wait_all"),
         );
         g.nodes.insert(
             "spec".to_string(),
             node_with_attr("spec", "tab", "output_schema", "routing"),
+        );
+        g.nodes.insert(
+            "prompt".to_string(),
+            node_with_attr("prompt", "tab", "output_retries", "2"),
         );
         assert!(Rule.apply(&g).is_empty());
     }
