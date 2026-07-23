@@ -718,16 +718,7 @@ async fn get_aggregate_billing(
         agg.by_model
             .values()
             .fold(BilledTokenCounts::default(), |mut acc, totals| {
-                let billing = &totals.billing;
-                acc.input_tokens += billing.input_tokens;
-                acc.output_tokens += billing.output_tokens;
-                acc.reasoning_tokens += billing.reasoning_tokens;
-                acc.cache_read_tokens += billing.cache_read_tokens;
-                acc.cache_write_tokens += billing.cache_write_tokens;
-                acc.total_tokens += billing.total_tokens;
-                if let Some(value) = billing.total_usd_micros {
-                    *acc.total_usd_micros.get_or_insert(0) += value;
-                }
+                acc.add_counts(&totals.billing);
                 acc
             });
     let response = AggregateBilling {
