@@ -150,14 +150,6 @@ impl From<String> for ModelId {
     }
 }
 
-impl FromStr for ModelId {
-    type Err = std::convert::Infallible;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self::from(s))
-    }
-}
-
 impl AsRef<str> for ModelId {
     fn as_ref(&self) -> &str {
         &self.0

@@ -805,37 +805,22 @@ fn selected_session_model(
         .provider_ids()
         .into_iter()
         .collect::<std::collections::HashSet<_>>();
-    let (provider_id, model) = if let Some(model_id) = session.record.model.as_deref() {
-        match catalog.select(model_id, session.record.provider.as_ref(), &eligible) {
-            Ok(selected) => (selected.provider.clone(), selected.id.to_string()),
-            Err(ModelSelectionError::UnknownSelectorOnProvider { provider, .. }) => {
-                (provider, model_id.to_string())
-            }
-            Err(ModelSelectionError::UnknownSelector { .. })
-                if session.record.provider.is_none() =>
+    let record = &session.record;
+    let selected = catalog
+        .resolve_selection(record.model.as_deref(), record.provider.as_ref(), &eligible)
+        .map_err(|error| {
+            // A missing default with no provider pin means no LLM is
+            // configured at all; every other failure is about the requested
+            // model/provider.
+            if record.provider.is_none()
+                && matches!(error, ModelSelectionError::NoDefaultModel { .. })
             {
-                let selected = catalog
-                    .select_default(&eligible)
-                    .map_err(|error| AskFabroBuildError::LlmUnconfigured(error.to_string()))?;
-                (selected.provider.clone(), model_id.to_string())
+                AskFabroBuildError::LlmUnconfigured(error.to_string())
+            } else {
+                AskFabroBuildError::ModelUnavailable(error.to_string())
             }
-            Err(error) => {
-                return Err(AskFabroBuildError::ModelUnavailable(error.to_string()));
-            }
-        }
-    } else {
-        let selected = if let Some(provider) = session.record.provider.as_ref() {
-            let provider_only = std::collections::HashSet::from([provider.clone()]);
-            catalog
-                .select_default(&provider_only)
-                .map_err(|error| AskFabroBuildError::ModelUnavailable(error.to_string()))?
-        } else {
-            catalog
-                .select_default(&eligible)
-                .map_err(|error| AskFabroBuildError::LlmUnconfigured(error.to_string()))?
-        };
-        (selected.provider.clone(), selected.id.to_string())
-    };
+        })?;
+    let (provider_id, model) = (selected.provider, selected.model);
     let profile_kind = catalog
         .effective_agent_profile(&provider_id, Some(&model))
         .ok_or_else(|| {
@@ -865,27 +850,10 @@ fn canonical_session_model(
         })
         .transpose()?;
     let Some(requested) = requested else {
-        let eligible = if let Some(provider) = explicit_provider.as_ref() {
-            let provider_is_ready = eligible.iter().any(|eligible_provider| {
-                catalog
-                    .provider(eligible_provider)
-                    .is_some_and(|eligible_provider| eligible_provider.id == *provider)
-            });
-            if !provider_is_ready {
-                return Err(session_selection_error(
-                    &ModelSelectionError::ProviderUnavailable {
-                        provider: provider.clone(),
-                    },
-                ));
-            }
-            std::collections::HashSet::from([provider.clone()])
-        } else {
-            eligible.clone()
-        };
-        let model = catalog
-            .select_default(&eligible)
+        let selected = catalog
+            .resolve_selection(None, explicit_provider.as_ref(), eligible)
             .map_err(|error| session_selection_error(&error))?;
-        return Ok((model.provider.clone(), model.id.to_string()));
+        return Ok((selected.provider, selected.model));
     };
     let requested = requested.trim();
     if requested.is_empty() {
@@ -942,19 +910,10 @@ fn canonical_session_model(
         }
     };
     let provider = qualified_provider.as_ref().or(explicit_provider.as_ref());
-    match catalog.select(&model, provider, eligible) {
-        Ok(selected) => Ok((selected.provider.clone(), selected.id.to_string())),
-        Err(ModelSelectionError::UnknownSelectorOnProvider { provider, .. }) => {
-            Ok((provider, model))
-        }
-        Err(ModelSelectionError::UnknownSelector { .. }) if provider.is_none() => {
-            let selected = catalog
-                .select_default(eligible)
-                .map_err(|error| session_selection_error(&error))?;
-            Ok((selected.provider.clone(), model))
-        }
-        Err(error) => Err(session_selection_error(&error)),
-    }
+    let selected = catalog
+        .resolve_selection(Some(&model), provider, eligible)
+        .map_err(|error| session_selection_error(&error))?;
+    Ok((selected.provider, selected.model))
 }
 
 fn session_selection_error(error: &ModelSelectionError) -> ApiError {

@@ -9,7 +9,7 @@ use crate::error::Error;
 use crate::provider::{
     ProviderAdapter, StreamEventStream, validate_standard_speed, validate_tool_choice,
 };
-use crate::providers::common::{self as common};
+use crate::providers::common::{self as common, CatalogRoute};
 use crate::token_count::{InputTokenCount, InputTokenCountMethod};
 use crate::transport::{self, HttpTransport, SseFraming};
 use crate::types::{AdapterTimeout, Request, Response};
@@ -102,11 +102,7 @@ impl Adapter {
             request,
             provider_name: &self.provider_name,
             deployment_id,
-            model: common::catalog_model(
-                self.catalog.as_deref(),
-                &self.provider_name,
-                &request.model,
-            ),
+            model: self.catalog_model(&request.model),
             params,
         }
     }
@@ -126,6 +122,16 @@ impl Adapter {
             req = req.header(key, value);
         }
         req.json(&encoded.body)
+    }
+}
+
+impl common::CatalogRoute for Adapter {
+    fn catalog(&self) -> Option<&Catalog> {
+        self.catalog.as_deref()
+    }
+
+    fn provider_name(&self) -> &str {
+        &self.provider_name
     }
 }
 
@@ -151,11 +157,7 @@ impl ProviderAdapter for Adapter {
 
         let resolved = self.resolve_request(request).await;
         let codec = GeminiGenerate;
-        let deployment_id = common::api_model_id(
-            self.catalog.as_deref(),
-            &self.provider_name,
-            &resolved.model,
-        );
+        let deployment_id = self.api_model_id(&resolved.model);
         let params = CodecParams::default();
         let ctx = self.codec_ctx(&resolved, &deployment_id, &params);
 
@@ -185,11 +187,7 @@ impl ProviderAdapter for Adapter {
 
         let resolved = self.resolve_request(request).await;
         let codec = GeminiGenerate;
-        let deployment_id = common::api_model_id(
-            self.catalog.as_deref(),
-            &self.provider_name,
-            &resolved.model,
-        );
+        let deployment_id = self.api_model_id(&resolved.model);
         let params = CodecParams::default();
         let ctx = self.codec_ctx(&resolved, &deployment_id, &params);
 
@@ -206,11 +204,7 @@ impl ProviderAdapter for Adapter {
 
         let resolved = self.resolve_request(request).await;
         let codec = GeminiGenerate;
-        let deployment_id = common::api_model_id(
-            self.catalog.as_deref(),
-            &self.provider_name,
-            &resolved.model,
-        );
+        let deployment_id = self.api_model_id(&resolved.model);
         let params = CodecParams::default();
         let ctx = self.codec_ctx(&resolved, &deployment_id, &params);
 

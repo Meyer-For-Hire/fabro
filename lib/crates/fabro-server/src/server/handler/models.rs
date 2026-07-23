@@ -272,7 +272,8 @@ fn model_selection_response(error: &ModelSelectionError) -> Response {
         }
         ModelSelectionError::RetiredModelIdentifier { .. }
         | ModelSelectionError::ProviderUnavailable { .. }
-        | ModelSelectionError::NoEligibleOffering { .. } => {
+        | ModelSelectionError::NoEligibleOffering { .. }
+        | ModelSelectionError::NoDefaultModel { .. } => {
             ApiError::bad_request(error.to_string()).into_response()
         }
     }

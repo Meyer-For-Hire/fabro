@@ -34,7 +34,7 @@ pub fn materialize_run(
         resolve_run_model(catalog, &eligible, model.as_deref(), provider.as_deref())?;
 
     settings.run.model.name = Some(resolved_model);
-    settings.run.model.provider = resolved_provider;
+    settings.run.model.provider = Some(resolved_provider.into_inner());
 
     let goal = graph.goal().to_string();
     settings.run.goal = if goal.is_empty() {
@@ -60,55 +60,10 @@ pub(crate) fn resolve_run_model(
     eligible: &HashSet<ProviderId>,
     model: Option<&str>,
     provider: Option<&str>,
-) -> Result<(String, Option<String>), ModelSelectionError> {
-    if let Some(provider) = provider.filter(|provider| !provider.is_empty()) {
-        let requested = ProviderId::new(provider);
-        let provider =
-            catalog
-                .provider(&requested)
-                .ok_or_else(|| ModelSelectionError::UnknownProvider {
-                    provider: requested.clone(),
-                })?;
-        let canonical_provider = provider.id.clone();
-        let canonical_eligible = eligible.iter().any(|eligible| {
-            catalog
-                .provider(eligible)
-                .is_some_and(|provider| provider.id == canonical_provider)
-        });
-        if !canonical_eligible {
-            return Err(ModelSelectionError::ProviderUnavailable {
-                provider: canonical_provider,
-            });
-        }
-        if let Some(model) = model {
-            return match catalog.resolve_on_provider(&provider.id, model) {
-                Ok(offering) => Ok((offering.id.to_string(), Some(offering.provider.to_string()))),
-                Err(ModelSelectionError::UnknownSelectorOnProvider { .. }) => {
-                    Ok((model.to_string(), Some(provider.id.to_string())))
-                }
-                Err(error) => Err(error),
-            };
-        }
-        let offering = catalog.default_for_provider(&provider.id).ok_or_else(|| {
-            ModelSelectionError::UnknownSelectorOnProvider {
-                selector: "<default model>".to_string(),
-                provider: provider.id.clone(),
-            }
-        })?;
-        return Ok((offering.id.to_string(), Some(offering.provider.to_string())));
-    }
-
-    if let Some(model) = model {
-        return match catalog.select(model, None, eligible) {
-            Ok(offering) => Ok((offering.id.to_string(), Some(offering.provider.to_string()))),
-            Err(ModelSelectionError::UnknownSelector { .. }) => {
-                let default = catalog.select_default(eligible)?;
-                Ok((model.to_string(), Some(default.provider.to_string())))
-            }
-            Err(error) => Err(error),
-        };
-    }
-
-    let default = catalog.select_default(eligible)?;
-    Ok((default.id.to_string(), Some(default.provider.to_string())))
+) -> Result<(String, ProviderId), ModelSelectionError> {
+    let provider = provider
+        .filter(|provider| !provider.is_empty())
+        .map(ProviderId::new);
+    let selected = catalog.resolve_selection(model, provider.as_ref(), eligible)?;
+    Ok((selected.model, selected.provider))
 }

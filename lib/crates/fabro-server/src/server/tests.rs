@@ -3414,7 +3414,7 @@ async fn create_run_without_ready_llm_provider_rejects_implicit_model_selection(
     assert!(
         body["errors"][0]["detail"]
             .as_str()
-            .is_some_and(|detail| detail.contains("no offering on an eligible provider")),
+            .is_some_and(|detail| detail.contains("no default model is available")),
         "unexpected response: {body}"
     );
     assert!(state.runs.lock().expect("runs lock poisoned").is_empty());

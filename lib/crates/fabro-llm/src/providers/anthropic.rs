@@ -7,7 +7,7 @@ use crate::codec::anthropic_messages::{AnthropicMessages, anthropic_option};
 use crate::codec::{AnthropicVersion, Codec, CodecCtx, CodecParams, EncodedRequest};
 use crate::error::Error;
 use crate::provider::{self, ProviderAdapter, StreamEventStream};
-use crate::providers::common::{self as common};
+use crate::providers::common::{self as common, CatalogRoute};
 use crate::token_count::{InputTokenCount, InputTokenCountMethod};
 use crate::transport::{self, HttpTransport, SseFraming};
 use crate::types::{AdapterTimeout, Request, Response, StreamEvent};
@@ -118,11 +118,7 @@ impl Adapter {
             request,
             provider_name: &self.provider_name,
             deployment_id,
-            model: common::catalog_model(
-                self.catalog.as_deref(),
-                &self.provider_name,
-                &request.model,
-            ),
+            model: self.catalog_model(&request.model),
             params,
         }
     }
@@ -214,6 +210,16 @@ fn anthropic_thinking_type(provider_options: Option<&serde_json::Value>) -> Opti
         .and_then(serde_json::Value::as_str)
 }
 
+impl common::CatalogRoute for Adapter {
+    fn catalog(&self) -> Option<&Catalog> {
+        self.catalog.as_deref()
+    }
+
+    fn provider_name(&self) -> &str {
+        &self.provider_name
+    }
+}
+
 #[async_trait::async_trait]
 impl ProviderAdapter for Adapter {
     fn name(&self) -> &str {
@@ -232,11 +238,7 @@ impl ProviderAdapter for Adapter {
         self.validate_request(request)?;
         let resolved = self.resolve_request(request).await;
         let codec = AnthropicMessages;
-        let deployment_id = common::api_model_id(
-            self.catalog.as_deref(),
-            &self.provider_name,
-            &resolved.model,
-        );
+        let deployment_id = self.api_model_id(&resolved.model);
         let ctx = self.codec_ctx(&resolved, &deployment_id, &route.codec_params);
 
         let Some(encoded) = codec.encode_count_tokens(&ctx).transpose()? else {
@@ -272,11 +274,7 @@ impl ProviderAdapter for Adapter {
 
         let resolved = self.resolve_request(request).await;
         let codec = AnthropicMessages;
-        let deployment_id = common::api_model_id(
-            self.catalog.as_deref(),
-            &self.provider_name,
-            &resolved.model,
-        );
+        let deployment_id = self.api_model_id(&resolved.model);
         let ctx = self.codec_ctx(&resolved, &deployment_id, &route.codec_params);
 
         let encoded = codec.encode(&ctx, false)?;
@@ -293,11 +291,7 @@ impl ProviderAdapter for Adapter {
         let route = self.route_config();
         let resolved = self.resolve_request(request).await;
         let codec = AnthropicMessages;
-        let deployment_id = common::api_model_id(
-            self.catalog.as_deref(),
-            &self.provider_name,
-            &resolved.model,
-        );
+        let deployment_id = self.api_model_id(&resolved.model);
         let ctx = self.codec_ctx(&resolved, &deployment_id, &route.codec_params);
 
         let encoded = codec.encode(&ctx, true)?;
@@ -323,8 +317,7 @@ impl ProviderAdapter for Adapter {
         // Always-adaptive models reject manual enabled/disabled thinking
         // configs at the API, so fail them locally with a clear message
         // instead.
-        let model_info =
-            common::catalog_model(self.catalog.as_deref(), &self.provider_name, &request.model);
+        let model_info = self.catalog_model(&request.model);
         if let Some(model) = model_info
             .filter(|m| m.features.reasoning_effort == ReasoningEffortFeature::AlwaysAdaptive)
         {

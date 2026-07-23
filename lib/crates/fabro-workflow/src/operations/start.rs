@@ -35,7 +35,6 @@ use crate::event::{
     Emitter, Event, EventBody, RunEventLogger, RunEventSink, RunNoticeLevel, append_event_to_sink,
 };
 use crate::handler::HandlerRegistry;
-use crate::handler::llm::routing;
 use crate::outcome::{Outcome, StageOutcome};
 use crate::pipeline::{
     self, FinalizeOptions, Finalized, InitOptions, LlmSpec, Persisted, PullRequestOptions,
@@ -618,22 +617,12 @@ fn resolve_start_llm(
     settings: &ResolvedRunSettings,
 ) -> Result<ResolvedStartLlm, Error> {
     let eligible = configured.iter().cloned().collect::<HashSet<_>>();
-    let (model, provider) = resolve_run_model(
+    let (model, provider_id) = resolve_run_model(
         catalog,
         &eligible,
         settings.model.name.as_deref(),
         settings.model.provider.as_deref(),
     )?;
-    let provider_id = ProviderId::new(
-        provider.expect("catalog-backed run model resolution always selects a provider"),
-    );
-    let provider_context = routing::resolve_provider_context(
-        catalog,
-        &provider_id,
-        &model,
-        Some(provider_id.as_str()),
-    )?;
-    let provider_id = provider_context.provider_id;
     let fallback_chain =
         resolve_fallback_chain(catalog, &provider_id, &model, &settings.model, &eligible)?;
 

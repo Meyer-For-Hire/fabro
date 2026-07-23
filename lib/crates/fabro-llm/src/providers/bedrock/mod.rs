@@ -29,7 +29,7 @@ use crate::codec::bedrock_converse::BedrockConverse;
 use crate::codec::{Codec, CodecCtx, CodecParams, EncodedRequest, RawEvent, StreamDecoder};
 use crate::error::Error;
 use crate::provider::{self, ProviderAdapter, StreamEventStream};
-use crate::providers::common::{self as common};
+use crate::providers::common::{self as common, CatalogRoute};
 use crate::transport::{self, HttpTransport};
 use crate::types::{AdapterTimeout, Request, Response, StreamEvent};
 
@@ -169,11 +169,7 @@ impl Adapter {
             request,
             provider_name: &self.provider_name,
             deployment_id,
-            model: common::catalog_model(
-                self.catalog.as_deref(),
-                &self.provider_name,
-                &request.model,
-            ),
+            model: self.catalog_model(&request.model),
             params,
         }
     }
@@ -232,6 +228,16 @@ impl Adapter {
     }
 }
 
+impl common::CatalogRoute for Adapter {
+    fn catalog(&self) -> Option<&Catalog> {
+        self.catalog.as_deref()
+    }
+
+    fn provider_name(&self) -> &str {
+        &self.provider_name
+    }
+}
+
 #[async_trait::async_trait]
 impl ProviderAdapter for Adapter {
     fn name(&self) -> &str {
@@ -243,11 +249,7 @@ impl ProviderAdapter for Adapter {
 
         let resolved = self.resolve_request(request).await;
         let codec = BedrockConverse;
-        let deployment_id = common::api_model_id(
-            self.catalog.as_deref(),
-            &self.provider_name,
-            &resolved.model,
-        );
+        let deployment_id = self.api_model_id(&resolved.model);
         let params = CodecParams::default();
         let ctx = self.codec_ctx(&resolved, &deployment_id, &params);
 
@@ -261,11 +263,7 @@ impl ProviderAdapter for Adapter {
 
         let resolved = self.resolve_request(request).await;
         let codec = BedrockConverse;
-        let deployment_id = common::api_model_id(
-            self.catalog.as_deref(),
-            &self.provider_name,
-            &resolved.model,
-        );
+        let deployment_id = self.api_model_id(&resolved.model);
         let params = CodecParams::default();
         let ctx = self.codec_ctx(&resolved, &deployment_id, &params);
 

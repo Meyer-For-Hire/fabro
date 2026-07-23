@@ -309,20 +309,19 @@ impl Client {
         let eligible = self.eligible_provider_ids();
         if let Some(explicit) = request.provider.as_deref() {
             let explicit = ProviderId::new(explicit);
-            if let Some(catalog_provider) = catalog.provider(&explicit) {
+            if catalog.provider(&explicit).is_some() {
+                let selected = catalog
+                    .resolve_selection(Some(&request.model), Some(&explicit), &eligible)
+                    .map_err(selection_error)?;
                 let provider = self
-                    .provider_adapter(catalog_provider.id.as_str())
+                    .provider_adapter(selected.provider.as_str())
                     .ok_or_else(|| {
                         selection_error(ModelSelectionError::ProviderUnavailable {
-                            provider: catalog_provider.id.clone(),
+                            provider: selected.provider.clone(),
                         })
                     })?;
-                match catalog.resolve_on_provider(&catalog_provider.id, &request.model) {
-                    Ok(model) => resolved.model = model.id.to_string(),
-                    Err(ModelSelectionError::UnknownSelectorOnProvider { .. }) => {}
-                    Err(error) => return Err(selection_error(error)),
-                }
-                resolved.provider = Some(catalog_provider.id.to_string());
+                resolved.model = selected.model;
+                resolved.provider = Some(selected.provider.into_inner());
                 return Ok(ResolvedRequest {
                     provider,
                     request: resolved,

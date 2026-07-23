@@ -1,7 +1,8 @@
 use std::fmt;
 
+use fabro_model::catalog::LegacyModelError;
+
 use crate::SettingsLayer;
-use crate::layers::LlmNormalizationError;
 
 const CURRENT_VERSION: u32 = 1;
 
@@ -31,7 +32,7 @@ const LEGACY_LLM_KEYS: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseError {
     Toml(String),
-    LlmCatalog(LlmNormalizationError),
+    LlmCatalog(LegacyModelError),
     Version(VersionError),
     UnknownTopLevelKey {
         key:  String,
@@ -325,7 +326,7 @@ provider = "openai"
 
         assert!(matches!(
             error,
-            ParseError::LlmCatalog(LlmNormalizationError::ScopedModelDeclaresProvider {
+            ParseError::LlmCatalog(LegacyModelError::ScopedModelDeclaresProvider {
                 provider,
                 model,
             }) if provider.as_str() == "openai" && model.as_str() == "gpt-5.4"
@@ -398,7 +399,7 @@ display_name = "Ambiguous"
 
         assert!(matches!(
             error,
-            ParseError::LlmCatalog(LlmNormalizationError::AmbiguousLegacyModel {
+            ParseError::LlmCatalog(LegacyModelError::AmbiguousModel {
                 model,
                 candidates,
             }) if model == "gpt-5.6-sol" && candidates.len() >= 2
@@ -420,7 +421,7 @@ display_name = "Legacy"
 
         assert!(matches!(
             error,
-            ParseError::LlmCatalog(LlmNormalizationError::DuplicateModelDefinition {
+            ParseError::LlmCatalog(LegacyModelError::DuplicateModel {
                 provider,
                 model,
             }) if provider.as_str() == "openai" && model.as_str() == "gpt-5.4"
@@ -438,7 +439,7 @@ provider = "openrouter"
 
         assert!(matches!(
             error,
-            ParseError::LlmCatalog(LlmNormalizationError::RetiredModel {
+            ParseError::LlmCatalog(LegacyModelError::Retired {
                 identifier,
                 provider,
                 model,

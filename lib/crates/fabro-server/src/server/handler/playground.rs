@@ -130,7 +130,7 @@ async fn create_playground_chat(
     let (model_id, selected_provider) = match super::completions::resolve_request_model(
         catalog.as_ref(),
         &client.provider_ids(),
-        req.model,
+        req.model.as_deref(),
         req.provider.map(|provider| provider.to_string()),
     ) {
         Ok(selection) => selection,
@@ -146,7 +146,7 @@ async fn create_playground_chat(
     let request = LlmRequest {
         model: model_id,
         messages,
-        provider: Some(selected_provider.to_string()),
+        provider: Some(selected_provider.into_inner()),
         tools: Some(playground_tools()),
         tool_choice: Some(ToolChoice::Auto),
         response_format: None,
@@ -158,10 +158,6 @@ async fn create_playground_chat(
         speed: None,
         metadata: None,
         provider_options: None,
-    };
-    let request = match client.resolve_request(&request) {
-        Ok(request) => request,
-        Err(error) => return ApiError::bad_request(error.to_string()).into_response(),
     };
     info!(
         model = %request.model,

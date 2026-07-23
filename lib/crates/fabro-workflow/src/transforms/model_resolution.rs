@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use fabro_graphviz::graph::{AttrValue, Graph};
-use fabro_model::{Catalog, ModelSelectionError, ProviderId};
+use fabro_model::{Catalog, ProviderId};
 
 use super::Transform;
 use crate::error::Error;
@@ -46,24 +46,12 @@ impl ModelResolutionTransform {
         model: &str,
         explicit_provider: Option<&ProviderId>,
     ) -> Result<(String, ProviderId), Error> {
-        match self
-            .catalog
-            .select(model, explicit_provider, &self.eligible_providers)
-        {
-            Ok(info) => Ok((info.id.to_string(), info.provider.clone())),
-            Err(ModelSelectionError::UnknownSelectorOnProvider { provider, .. }) => {
-                Ok((model.to_string(), provider))
-            }
-            Err(ModelSelectionError::UnknownSelector { .. }) => {
-                let provider = self
-                    .catalog
-                    .select_default(&self.eligible_providers)?
-                    .provider
-                    .clone();
-                Ok((model.to_string(), provider))
-            }
-            Err(error) => Err(error.into()),
-        }
+        let selected = self.catalog.resolve_selection(
+            Some(model),
+            explicit_provider,
+            &self.eligible_providers,
+        )?;
+        Ok((selected.model, selected.provider))
     }
 }
 

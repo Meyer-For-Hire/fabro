@@ -20,6 +20,23 @@ pub fn api_model_id(catalog: Option<&Catalog>, provider: &str, model: &str) -> S
         .map_or_else(|| model.to_string(), |settings| settings.api_id.clone())
 }
 
+/// Adapters that route models through an optional catalog scoped to one
+/// provider name.
+pub trait CatalogRoute {
+    fn catalog(&self) -> Option<&Catalog>;
+    fn provider_name(&self) -> &str;
+
+    /// Catalog offering for a canonical ID or alias on this provider.
+    fn catalog_model(&self, model: &str) -> Option<&Model> {
+        catalog_model(self.catalog(), self.provider_name(), model)
+    }
+
+    /// Identifier sent to the provider API for a model.
+    fn api_model_id(&self, model: &str) -> String {
+        api_model_id(self.catalog(), self.provider_name(), model)
+    }
+}
+
 /// Check if a URL string looks like a local file path.
 #[must_use]
 pub fn is_file_path(url: &str) -> bool {

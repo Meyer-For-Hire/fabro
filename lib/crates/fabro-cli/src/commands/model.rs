@@ -45,6 +45,10 @@ struct CompletedModelTest {
     status:       String,
 }
 
+fn model_matches_selector(model: &Model, selector: &str) -> bool {
+    model.id == selector || model.aliases.iter().any(|alias| alias == selector)
+}
+
 fn find_model_by_id_or_alias(
     models: &[Model],
     id: &str,
@@ -54,7 +58,7 @@ fn find_model_by_id_or_alias(
         .iter()
         .find(|model| {
             provider.is_none_or(|provider| &model.provider == provider)
-                && (model.id == id || model.aliases.iter().any(|alias| alias == id))
+                && model_matches_selector(model, id)
         })
         .cloned()
 }
@@ -275,10 +279,9 @@ async fn test_models_via_server(
         if !json_output {
             eprint!("Testing {model_id}...");
         }
-        let has_configured_match = listed_models.iter().any(|model| {
-            model.configured
-                && (model.id == model_id || model.aliases.iter().any(|alias| alias == model_id))
-        });
+        let has_configured_match = listed_models
+            .iter()
+            .any(|model| model.configured && model_matches_selector(model, model_id));
         let result =
             if requested_provider.is_none() && listed_info.is_some() && !has_configured_match {
                 None

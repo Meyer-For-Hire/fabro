@@ -53,7 +53,7 @@ async fn create_completion(
     let (model_id, selected_provider) = match resolve_request_model(
         catalog.as_ref(),
         &client.provider_ids(),
-        req.model,
+        req.model.as_deref(),
         req.provider,
     ) {
         Ok(selection) => selection,
@@ -114,20 +114,8 @@ async fn create_completion(
         metadata: None,
         provider_options: req.provider_options,
     };
-    let request = match client.resolve_request(&request) {
-        Ok(request) => request,
-        Err(error) => return ApiError::bad_request(error.to_string()).into_response(),
-    };
-    let selected_provider = ProviderId::new(
-        request
-            .provider
-            .as_deref()
-            .expect("resolved LLM request always has a provider"),
-    );
-    let selected_model = request.model.clone();
-
     info!(
-        model = %selected_model,
+        model = %model_id,
         provider = %selected_provider,
         "Completion request received"
     );
@@ -177,7 +165,7 @@ async fn create_completion(
                     let stop_reason = finish_reason_to_api_stop_reason(&response.finish_reason);
                     Json(CompletionResponse {
                         id: msg_id,
-                        model: selected_model,
+                        model: model_id,
                         provider: selected_provider,
                         message: response.message,
                         stop_reason,
@@ -224,44 +212,11 @@ async fn create_completion(
 pub(super) fn resolve_request_model(
     catalog: &Catalog,
     eligible: &HashSet<ProviderId>,
-    requested_model: Option<String>,
+    requested_model: Option<&str>,
     explicit_provider: Option<String>,
 ) -> Result<(String, ProviderId), ModelSelectionError> {
     let explicit_provider = explicit_provider.map(ProviderId::new);
-    if let Some(model) = requested_model {
-        return match catalog.select(&model, explicit_provider.as_ref(), eligible) {
-            Ok(offering) => Ok((offering.id.to_string(), offering.provider.clone())),
-            Err(ModelSelectionError::UnknownSelectorOnProvider { provider, .. }) => {
-                Ok((model, provider))
-            }
-            Err(ModelSelectionError::UnknownSelector { .. }) => {
-                let default = catalog.select_default(eligible)?;
-                Ok((model, default.provider.clone()))
-            }
-            Err(error) => Err(error),
-        };
-    }
-
-    let eligible = if let Some(requested_provider) = explicit_provider {
-        let provider = catalog.provider(&requested_provider).ok_or_else(|| {
-            ModelSelectionError::UnknownProvider {
-                provider: requested_provider.clone(),
-            }
-        })?;
-        let provider_is_ready = eligible.iter().any(|eligible_provider| {
-            catalog
-                .provider(eligible_provider)
-                .is_some_and(|eligible_provider| eligible_provider.id == provider.id)
-        });
-        if !provider_is_ready {
-            return Err(ModelSelectionError::ProviderUnavailable {
-                provider: provider.id.clone(),
-            });
-        }
-        HashSet::from([provider.id.clone()])
-    } else {
-        eligible.clone()
-    };
-    let default = catalog.select_default(&eligible)?;
-    Ok((default.id.to_string(), default.provider.clone()))
+    let selected =
+        catalog.resolve_selection(requested_model, explicit_provider.as_ref(), eligible)?;
+    Ok((selected.model, selected.provider))
 }

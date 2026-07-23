@@ -544,33 +544,8 @@ pub enum CatalogBuildError {
         first:    ModelId,
         second:   ModelId,
     },
-    #[error(
-        "provider '{provider}' model '{model}' is defined through both provider-scoped and legacy top-level syntax"
-    )]
-    DuplicateProviderModelDefinition {
-        provider: ProviderId,
-        model:    ModelId,
-    },
-    #[error("provider-scoped model '{provider}/{model}' must not declare a provider field")]
-    ScopedModelDeclaresProvider {
-        provider: ProviderId,
-        model:    ModelId,
-    },
-    #[error("legacy model row '{model}' omits provider and does not match a unique known offering")]
-    LegacyModelProviderUnknown { model: String },
-    #[error(
-        "legacy model row '{model}' omits provider and matches multiple providers: {providers:?}"
-    )]
-    LegacyModelProviderAmbiguous {
-        model:     String,
-        providers: Vec<ProviderId>,
-    },
-    #[error("model identifier '{identifier}' has been retired; use '{provider}/{model}' instead")]
-    RetiredModelIdentifier {
-        identifier: String,
-        provider:   ProviderId,
-        model:      ModelId,
-    },
+    #[error(transparent)]
+    LegacyModel(#[from] LegacyModelError),
     #[error("provider '{provider}' model '{model}' has an empty api_id")]
     EmptyModelApiId {
         provider: ProviderId,
@@ -637,12 +612,25 @@ pub enum ModelSelectionError {
         selector:  String,
         providers: Vec<ProviderId>,
     },
+    #[error(
+        "no default model is available on an eligible provider; providers with defaults: {providers:?}"
+    )]
+    NoDefaultModel { providers: Vec<ProviderId> },
     #[error("model identifier '{identifier}' has been retired; use '{provider}/{model}' instead")]
     RetiredModelIdentifier {
         identifier: String,
         provider:   ProviderId,
         model:      ModelId,
     },
+}
+
+/// One provider/model pair chosen by [`Catalog::resolve_selection`]. The
+/// model is the canonical catalog ID when the selector matched an offering,
+/// or the caller's selector passed through verbatim when it did not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedModel {
+    pub provider: ProviderId,
+    pub model:    String,
 }
 
 /// Typed model catalog backed by a `Vec<Model>`.
@@ -724,13 +712,14 @@ impl Catalog {
                 }
 
                 if let Some((replacement_provider, replacement_model)) =
-                    retired_model_address(&model_id)
+                    retired_model_replacement(&model_id)
                 {
-                    return Err(CatalogBuildError::RetiredModelIdentifier {
+                    return Err(LegacyModelError::Retired {
                         identifier: model_id,
                         provider:   replacement_provider,
                         model:      replacement_model,
-                    });
+                    }
+                    .into());
                 }
 
                 let (model, resolved_settings) = build_model(&model_id, model_settings, provider)?;
@@ -905,7 +894,8 @@ impl Catalog {
         provider: &ProviderId,
         selector: &str,
     ) -> Result<&Model, ModelSelectionError> {
-        if let Some((replacement_provider, replacement_model)) = retired_model_address(selector) {
+        if let Some((replacement_provider, replacement_model)) = retired_model_replacement(selector)
+        {
             return Err(ModelSelectionError::RetiredModelIdentifier {
                 identifier: selector.to_string(),
                 provider:   replacement_provider,
@@ -937,7 +927,8 @@ impl Catalog {
         explicit_provider: Option<&ProviderId>,
         eligible_providers: &HashSet<ProviderId>,
     ) -> Result<&'a Model, ModelSelectionError> {
-        if let Some((replacement_provider, replacement_model)) = retired_model_address(selector) {
+        if let Some((replacement_provider, replacement_model)) = retired_model_replacement(selector)
+        {
             return Err(ModelSelectionError::RetiredModelIdentifier {
                 identifier: selector.to_string(),
                 provider:   replacement_provider,
@@ -1042,10 +1033,82 @@ impl Catalog {
             .collect::<Vec<_>>();
         providers.sort();
         providers.dedup();
-        Err(ModelSelectionError::NoEligibleOffering {
-            selector: "<default model>".to_string(),
-            providers,
-        })
+        Err(ModelSelectionError::NoDefaultModel { providers })
+    }
+
+    /// Canonicalize a provider ID or alias and require it to be in the
+    /// eligible snapshot.
+    pub fn ready_provider(
+        &self,
+        provider: &ProviderId,
+        eligible_providers: &HashSet<ProviderId>,
+    ) -> Result<ProviderId, ModelSelectionError> {
+        let provider =
+            self.provider(provider)
+                .ok_or_else(|| ModelSelectionError::UnknownProvider {
+                    provider: provider.clone(),
+                })?;
+        let ready = eligible_providers.iter().any(|eligible| {
+            self.provider(eligible)
+                .is_some_and(|eligible| eligible.id == provider.id)
+        });
+        if !ready {
+            return Err(ModelSelectionError::ProviderUnavailable {
+                provider: provider.id.clone(),
+            });
+        }
+        Ok(provider.id.clone())
+    }
+
+    /// Resolve an optional selector to one provider/model pair, applying the
+    /// passthrough policy shared by every dispatch boundary:
+    ///
+    /// - A selector known to the catalog resolves to its canonical offering.
+    /// - An unknown selector pinned to a provider passes through verbatim on
+    ///   that provider.
+    /// - An unqualified unknown selector passes through on the default
+    ///   provider.
+    /// - No selector picks the default offering (of the pinned provider, when
+    ///   one is given).
+    pub fn resolve_selection(
+        &self,
+        selector: Option<&str>,
+        explicit_provider: Option<&ProviderId>,
+        eligible_providers: &HashSet<ProviderId>,
+    ) -> Result<SelectedModel, ModelSelectionError> {
+        let Some(selector) = selector else {
+            let eligible = match explicit_provider {
+                Some(provider) => {
+                    HashSet::from([self.ready_provider(provider, eligible_providers)?])
+                }
+                None => eligible_providers.clone(),
+            };
+            let offering = self.select_default(&eligible)?;
+            return Ok(SelectedModel {
+                provider: offering.provider.clone(),
+                model:    offering.id.to_string(),
+            });
+        };
+        match self.select(selector, explicit_provider, eligible_providers) {
+            Ok(offering) => Ok(SelectedModel {
+                provider: offering.provider.clone(),
+                model:    offering.id.to_string(),
+            }),
+            Err(ModelSelectionError::UnknownSelectorOnProvider { provider, .. }) => {
+                Ok(SelectedModel {
+                    provider,
+                    model: selector.to_string(),
+                })
+            }
+            Err(ModelSelectionError::UnknownSelector { .. }) => {
+                let default = self.select_default(eligible_providers)?;
+                Ok(SelectedModel {
+                    provider: default.provider.clone(),
+                    model:    selector.to_string(),
+                })
+            }
+            Err(error) => Err(error),
+        }
     }
 
     #[must_use]
@@ -1411,52 +1474,24 @@ fn normalize_catalog_settings(
     mut settings: LlmCatalogSettings,
     known: Option<&LlmCatalogSettings>,
 ) -> Result<LlmCatalogSettings, CatalogBuildError> {
-    for (provider, settings) in &settings.providers {
-        for (model, settings) in &settings.models {
-            if settings.provider.is_some() {
-                return Err(CatalogBuildError::ScopedModelDeclaresProvider {
-                    provider: ProviderId::new(provider.clone()),
-                    model:    ModelId::new(model.clone()),
-                });
-            }
-        }
-    }
+    reject_scoped_provider_fields(&settings)?;
 
     let legacy_models = std::mem::take(&mut settings.models);
-    for (legacy_id, mut model_settings) in legacy_models {
-        if let Some((provider, model)) = retired_model_address(&legacy_id) {
-            return Err(CatalogBuildError::RetiredModelIdentifier {
-                identifier: legacy_id,
-                provider,
-                model,
-            });
-        }
+    if legacy_models.is_empty() {
+        return Ok(settings);
+    }
+    let mut legacy_models = legacy_models.into_iter().collect::<Vec<_>>();
+    legacy_models.sort_by(|(left, _), (right, _)| left.cmp(right));
 
+    let mut index = LegacyModelIndex::default();
+    index.add_settings(&settings);
+    if let Some(known) = known {
+        index.add_settings(known);
+    }
+
+    for (legacy_id, mut model_settings) in legacy_models {
         let explicit_provider = model_settings.provider.take();
-        let (provider, model_id) = if let Some(provider) = explicit_provider {
-            let provider = canonical_settings_provider(&provider, &settings, known)
-                .unwrap_or_else(|| ProviderId::new(provider));
-            let model_id = canonical_settings_model(&provider, &legacy_id, &settings, known)
-                .unwrap_or_else(|| ModelId::new(legacy_id.clone()));
-            (provider, model_id)
-        } else {
-            let candidates = settings_model_candidates(&legacy_id, &settings, known);
-            match candidates.as_slice() {
-                [(provider, model)] => (provider.clone(), model.clone()),
-                [] => {
-                    return Err(CatalogBuildError::LegacyModelProviderUnknown { model: legacy_id });
-                }
-                _ => {
-                    return Err(CatalogBuildError::LegacyModelProviderAmbiguous {
-                        model:     legacy_id,
-                        providers: candidates
-                            .into_iter()
-                            .map(|(provider, _)| provider)
-                            .collect(),
-                    });
-                }
-            }
-        };
+        let (provider, model_id) = index.resolve(&legacy_id, explicit_provider.as_deref())?;
 
         if !settings.providers.contains_key(provider.as_str())
             && !known.is_some_and(|known| known.providers.contains_key(provider.as_str()))
@@ -1469,10 +1504,11 @@ fn normalize_catalog_settings(
 
         let provider_settings = settings.providers.entry(provider.to_string()).or_default();
         if provider_settings.models.contains_key(model_id.as_str()) {
-            return Err(CatalogBuildError::DuplicateProviderModelDefinition {
+            return Err(LegacyModelError::DuplicateModel {
                 provider,
                 model: model_id,
-            });
+            }
+            .into());
         }
         provider_settings
             .models
@@ -1481,154 +1517,242 @@ fn normalize_catalog_settings(
     Ok(settings)
 }
 
-fn canonical_settings_provider(
-    selector: &str,
-    settings: &LlmCatalogSettings,
-    known: Option<&LlmCatalogSettings>,
-) -> Option<ProviderId> {
-    let providers = || {
-        settings
-            .providers
-            .iter()
-            .chain(known.into_iter().flat_map(|known| known.providers.iter()))
-    };
-    providers()
-        .find(|(id, _)| id.as_str() == selector)
-        .or_else(|| {
-            providers().find(|(_, provider)| {
-                provider
-                    .aliases
-                    .as_ref()
-                    .is_some_and(|aliases| aliases.iter().any(|alias| alias == selector))
-            })
-        })
-        .map(|(id, _)| ProviderId::new(id.clone()))
-}
-
-fn canonical_settings_model(
-    provider: &ProviderId,
-    selector: &str,
-    settings: &LlmCatalogSettings,
-    known: Option<&LlmCatalogSettings>,
-) -> Option<ModelId> {
-    let models = || {
-        settings
-            .providers
-            .get(provider.as_str())
-            .into_iter()
-            .chain(known.and_then(|known| known.providers.get(provider.as_str())))
-            .flat_map(|provider| provider.models.iter())
-    };
-    models()
-        .find(|(id, _)| id.as_str() == selector)
-        .or_else(|| {
-            models().find(|(_, model)| {
-                model
-                    .aliases
-                    .as_ref()
-                    .is_some_and(|aliases| aliases.iter().any(|alias| alias == selector))
-            })
-        })
-        .map(|(id, _)| ModelId::new(id.clone()))
-}
-
-fn settings_model_candidates(
-    selector: &str,
-    settings: &LlmCatalogSettings,
-    known: Option<&LlmCatalogSettings>,
-) -> Vec<(ProviderId, ModelId)> {
-    let collect = |matches: &dyn Fn(&str, &ModelCatalogSettings) -> bool| {
-        let mut candidates = BTreeSet::<(ProviderId, ModelId)>::new();
-        for (provider_id, provider) in settings
-            .providers
-            .iter()
-            .chain(known.into_iter().flat_map(|known| known.providers.iter()))
-        {
-            for (model_id, model) in &provider.models {
-                if matches(model_id, model) {
-                    candidates.insert((
-                        ProviderId::new(provider_id.clone()),
-                        ModelId::new(model_id.clone()),
-                    ));
-                }
+fn reject_scoped_provider_fields(settings: &LlmCatalogSettings) -> Result<(), LegacyModelError> {
+    for (provider, settings) in &settings.providers {
+        for (model, settings) in &settings.models {
+            if settings.provider.is_some() {
+                return Err(LegacyModelError::ScopedModelDeclaresProvider {
+                    provider: ProviderId::new(provider.clone()),
+                    model:    ModelId::new(model.clone()),
+                });
             }
         }
-        candidates.into_iter().collect::<Vec<_>>()
-    };
-
-    let canonical = collect(&|model_id, _| model_id == selector);
-    if canonical.is_empty() {
-        collect(&|_, model| {
-            model
-                .aliases
-                .as_ref()
-                .is_some_and(|aliases| aliases.iter().any(|alias| alias == selector))
-        })
-    } else {
-        canonical
     }
+    Ok(())
 }
 
-/// Return every built-in offering whose canonical model ID is `selector`.
-///
-/// This includes disabled providers because config compatibility
-/// normalization happens before runtime availability is known.
-pub fn builtin_canonical_model_offerings(
-    selector: &str,
-) -> Result<Vec<(ProviderId, ModelId)>, CatalogBuildError> {
-    let settings = Catalog::builtin_settings()?;
-    Ok(settings
-        .providers
-        .iter()
-        .filter_map(|(provider, settings)| {
-            settings.models.get_key_value(selector).map(|(model, _)| {
-                (
-                    ProviderId::new(provider.clone()),
-                    ModelId::new(model.clone()),
-                )
-            })
-        })
-        .collect())
+/// Failure to resolve a legacy top-level `[models.<id>]` row onto its
+/// provider.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum LegacyModelError {
+    #[error("failed to inspect the built-in model catalog: {message}")]
+    BuiltinCatalog { message: String },
+    #[error("model identifier '{identifier}' has been retired; use '{provider}/{model}' instead")]
+    Retired {
+        identifier: String,
+        provider:   ProviderId,
+        model:      ModelId,
+    },
+    #[error("legacy model row '{model}' omits provider and does not match a unique known offering")]
+    UnknownModel { model: String },
+    #[error(
+        "legacy model row '{model}' omits provider and matches multiple offerings: {candidates:?}"
+    )]
+    AmbiguousModel {
+        model:      String,
+        candidates: Vec<(ProviderId, ModelId)>,
+    },
+    #[error("legacy model selector '{selector}' is ambiguous on provider '{provider}': {models:?}")]
+    AmbiguousAlias {
+        provider: ProviderId,
+        selector: String,
+        models:   Vec<ModelId>,
+    },
+    #[error("provider-scoped model '{provider}/{model}' must not declare a provider field")]
+    ScopedModelDeclaresProvider {
+        provider: ProviderId,
+        model:    ModelId,
+    },
+    #[error(
+        "provider '{provider}' model '{model}' is defined through both provider-scoped and legacy top-level syntax"
+    )]
+    DuplicateModel {
+        provider: ProviderId,
+        model:    ModelId,
+    },
 }
 
-/// Return every built-in offering that declares `selector` as an alias.
+/// Identifier/alias view used to resolve legacy top-level `[models.<id>]`
+/// rows onto their provider before provider-scoped settings merge.
 ///
-/// This includes disabled providers because config compatibility
-/// normalization happens before runtime availability is known.
-pub fn builtin_alias_model_offerings(
-    selector: &str,
-) -> Result<Vec<(ProviderId, ModelId)>, CatalogBuildError> {
-    let settings = Catalog::builtin_settings()?;
-    let mut offerings = settings
-        .providers
-        .iter()
-        .flat_map(|(provider, settings)| {
-            settings
-                .models
-                .iter()
-                .filter(move |(_, settings)| {
-                    settings
-                        .aliases
-                        .as_ref()
-                        .is_some_and(|aliases| aliases.iter().any(|alias| alias == selector))
-                })
-                .map(move |(model, _)| {
+/// Both the settings-layer normalization in `fabro-config` and catalog-build
+/// normalization here feed this index: local entries first, lower-precedence
+/// known entries (e.g. the built-in catalog) after. Canonical IDs always win
+/// over aliases; alias ties resolve to the first entry added.
+#[derive(Debug, Default)]
+pub struct LegacyModelIndex {
+    providers: Vec<LegacyProviderEntry>,
+}
+
+#[derive(Debug)]
+struct LegacyProviderEntry {
+    id:      ProviderId,
+    aliases: Vec<String>,
+    models:  Vec<LegacyModelEntry>,
+}
+
+#[derive(Debug)]
+struct LegacyModelEntry {
+    id:      ModelId,
+    aliases: Vec<String>,
+}
+
+impl LegacyModelIndex {
+    pub fn add_provider(
+        &mut self,
+        id: ProviderId,
+        aliases: Vec<String>,
+        models: impl IntoIterator<Item = (ModelId, Vec<String>)>,
+    ) {
+        self.providers.push(LegacyProviderEntry {
+            id,
+            aliases,
+            models: models
+                .into_iter()
+                .map(|(id, aliases)| LegacyModelEntry { id, aliases })
+                .collect(),
+        });
+    }
+
+    fn add_settings(&mut self, settings: &LlmCatalogSettings) {
+        let mut provider_ids = settings.providers.keys().collect::<Vec<_>>();
+        provider_ids.sort_unstable();
+        for provider_id in provider_ids {
+            let provider = &settings.providers[provider_id];
+            let mut model_ids = provider.models.keys().collect::<Vec<_>>();
+            model_ids.sort_unstable();
+            self.add_provider(
+                ProviderId::new(provider_id.clone()),
+                provider.aliases.clone().unwrap_or_default(),
+                model_ids.into_iter().map(|model_id| {
+                    let model = &provider.models[model_id];
                     (
-                        ProviderId::new(provider.clone()),
-                        ModelId::new(model.clone()),
+                        ModelId::new(model_id.clone()),
+                        model.aliases.clone().unwrap_or_default(),
                     )
-                })
-        })
-        .collect::<Vec<_>>();
-    offerings.sort();
-    offerings.dedup();
-    Ok(offerings)
-}
+                }),
+            );
+        }
+    }
 
-/// Resolve a built-in provider ID or alias without filtering disabled rows.
-pub fn builtin_provider_id(selector: &str) -> Result<Option<ProviderId>, CatalogBuildError> {
-    let settings = Catalog::builtin_settings()?;
-    Ok(canonical_settings_provider(selector, &settings, None))
+    /// Append the built-in catalog as the lowest-precedence tier. Includes
+    /// disabled providers because config compatibility normalization happens
+    /// before runtime availability is known.
+    pub fn with_builtin(mut self) -> Result<Self, LegacyModelError> {
+        let builtin =
+            Catalog::builtin_settings().map_err(|error| LegacyModelError::BuiltinCatalog {
+                message: error.to_string(),
+            })?;
+        self.add_settings(&builtin);
+        Ok(self)
+    }
+
+    /// Resolve one legacy row to its provider-scoped address. An unknown
+    /// explicit provider or model selector passes through verbatim; rows
+    /// without an explicit provider must match exactly one known offering.
+    pub fn resolve(
+        &self,
+        legacy_id: &str,
+        explicit_provider: Option<&str>,
+    ) -> Result<(ProviderId, ModelId), LegacyModelError> {
+        if let Some((provider, model)) = retired_model_replacement(legacy_id) {
+            return Err(LegacyModelError::Retired {
+                identifier: legacy_id.to_string(),
+                provider,
+                model,
+            });
+        }
+        if let Some(explicit) = explicit_provider {
+            let provider = self
+                .canonical_provider(explicit)
+                .unwrap_or_else(|| ProviderId::new(explicit));
+            let model = self
+                .canonical_model_on(&provider, legacy_id)?
+                .unwrap_or_else(|| ModelId::new(legacy_id));
+            return Ok((provider, model));
+        }
+        let candidates = self.candidates(legacy_id);
+        match candidates.as_slice() {
+            [(provider, model)] => Ok((provider.clone(), model.clone())),
+            [] => Err(LegacyModelError::UnknownModel {
+                model: legacy_id.to_string(),
+            }),
+            _ => Err(LegacyModelError::AmbiguousModel {
+                model: legacy_id.to_string(),
+                candidates,
+            }),
+        }
+    }
+
+    fn canonical_provider(&self, selector: &str) -> Option<ProviderId> {
+        self.providers
+            .iter()
+            .find(|provider| provider.id.as_str() == selector)
+            .or_else(|| {
+                self.providers
+                    .iter()
+                    .find(|provider| provider.aliases.iter().any(|alias| alias == selector))
+            })
+            .map(|provider| provider.id.clone())
+    }
+
+    fn canonical_model_on(
+        &self,
+        provider: &ProviderId,
+        selector: &str,
+    ) -> Result<Option<ModelId>, LegacyModelError> {
+        let models = || {
+            self.providers
+                .iter()
+                .filter(|entry| entry.id == *provider)
+                .flat_map(|entry| entry.models.iter())
+        };
+        if models().any(|model| model.id.as_str() == selector) {
+            return Ok(Some(ModelId::new(selector)));
+        }
+        let matches = models()
+            .filter(|model| model.aliases.iter().any(|alias| alias == selector))
+            .map(|model| model.id.clone())
+            .collect::<BTreeSet<_>>();
+        match matches.len() {
+            0 => Ok(None),
+            1 => Ok(matches.into_iter().next()),
+            _ => Err(LegacyModelError::AmbiguousAlias {
+                provider: provider.clone(),
+                selector: selector.to_string(),
+                models:   matches.into_iter().collect(),
+            }),
+        }
+    }
+
+    fn candidates(&self, selector: &str) -> Vec<(ProviderId, ModelId)> {
+        let canonical = self
+            .providers
+            .iter()
+            .filter(|entry| {
+                entry
+                    .models
+                    .iter()
+                    .any(|model| model.id.as_str() == selector)
+            })
+            .map(|entry| (entry.id.clone(), ModelId::new(selector)))
+            .collect::<BTreeSet<_>>();
+        if !canonical.is_empty() {
+            return canonical.into_iter().collect();
+        }
+        self.providers
+            .iter()
+            .flat_map(|entry| {
+                entry
+                    .models
+                    .iter()
+                    .filter(|model| model.aliases.iter().any(|alias| alias == selector))
+                    .map(|model| (entry.id.clone(), model.id.clone()))
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
 }
 
 /// Built-in catalog keys retired when provider API identifiers stopped being
@@ -1716,10 +1840,6 @@ pub fn retired_model_replacement(identifier: &str) -> Option<(ProviderId, ModelI
         .iter()
         .find(|(retired, _, _)| *retired == identifier)
         .map(|(_, provider, model)| (ProviderId::new(*provider), ModelId::new(*model)))
-}
-
-fn retired_model_address(identifier: &str) -> Option<(ProviderId, ModelId)> {
-    retired_model_replacement(identifier)
 }
 
 fn merge_catalog_settings(
@@ -3676,8 +3796,10 @@ provider = "test"
 
         assert!(matches!(
             error,
-            CatalogBuildError::ScopedModelDeclaresProvider { provider, model }
-                if provider == ProviderId::new("test") && model == "one"
+            CatalogBuildError::LegacyModel(LegacyModelError::ScopedModelDeclaresProvider {
+                provider,
+                model,
+            }) if provider == ProviderId::new("test") && model == "one"
         ));
     }
 
