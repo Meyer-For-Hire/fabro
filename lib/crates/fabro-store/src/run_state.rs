@@ -2033,15 +2033,19 @@ mod tests {
         // terminal. Guards against branches spinning Running forever.
         let mut state = initialized_projection();
         let branch = StageId::new("review_ux", 1);
+        let branch_started_at = test_dt("2026-04-07T12:00:00Z");
 
         state
-            .apply_event(&test_stage_event(
+            .apply_event(&test_stage_event_at(
                 3,
+                "2026-04-07T12:00:00Z",
                 EventBody::ParallelBranchStarted(ParallelBranchStartedProps { index: 0 }),
                 branch.clone(),
             ))
             .unwrap();
-        assert_eq!(state.stage(&branch).unwrap().state, StageState::Running);
+        let stage = state.stage(&branch).unwrap();
+        assert_eq!(stage.state, StageState::Running);
+        assert_eq!(stage.started_at, Some(branch_started_at));
 
         state
             .apply_event(&test_stage_event(
@@ -2062,6 +2066,42 @@ mod tests {
         assert_eq!(
             stage.completion.as_ref().unwrap().outcome,
             StageOutcome::Succeeded
+        );
+    }
+
+    #[test]
+    fn parallel_branch_completed_folds_failed_status_as_failed() {
+        let mut state = initialized_projection();
+        let branch = StageId::new("review_ux", 1);
+
+        state
+            .apply_event(&test_stage_event(
+                3,
+                EventBody::ParallelBranchStarted(ParallelBranchStartedProps { index: 0 }),
+                branch.clone(),
+            ))
+            .unwrap();
+        state
+            .apply_event(&test_stage_event(
+                4,
+                EventBody::ParallelBranchCompleted(ParallelBranchCompletedProps {
+                    index:       0,
+                    duration_ms: 500,
+                    status:      "failed".to_string(),
+                    head_sha:    None,
+                }),
+                branch.clone(),
+            ))
+            .unwrap();
+
+        let stage = state.stage(&branch).unwrap();
+        assert_eq!(stage.state, StageState::Failed);
+        assert_eq!(stage.timing.unwrap().wall_time_ms, 500);
+        assert_eq!(
+            stage.completion.as_ref().unwrap().outcome,
+            StageOutcome::Failed {
+                retry_requested: false,
+            }
         );
     }
 
