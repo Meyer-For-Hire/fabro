@@ -386,16 +386,44 @@ fn collect_workflow_files(
 
     for node in graph.nodes.values() {
         if let Some(prompt_ref) = node.attrs.get("prompt").and_then(AttrValue::as_str) {
-            if prompt_ref.starts_with('@') {
-                let bundled = collect_bundled_file(
+            if !prompt_ref.starts_with('@') {
+                collect_template_include_files(
                     files,
-                    workflow_base_dir,
                     context.cwd,
-                    prompt_ref.trim_start_matches('@'),
-                    types::ManifestFileRefType::FileInline,
-                    manifest_attr_reference_kind(AttributeScope::Node, "prompt", prompt_ref)?,
-                    Some(workflow.dot_path.clone()),
+                    TemplateSource::new(
+                        workflow.dot_path.clone(),
+                        workflow_template_root.clone(),
+                        prompt_ref.to_owned(),
+                    ),
+                    Some(&workflow.dot_path),
+                    &context.inputs,
                 )?;
+            }
+        }
+
+        for (name, value) in &node.attrs {
+            let Some(value) = value.as_str() else {
+                continue;
+            };
+            let Some(ReferenceKind::FileInline) =
+                reference_kind_for_attribute(AttributeScope::Node, name, value)
+            else {
+                continue;
+            };
+            let reference = value.strip_prefix('@').ok_or_else(|| {
+                anyhow!("file inline reference must start with '@': {name}={value}")
+            })?;
+            let bundled = collect_bundled_file(
+                files,
+                workflow_base_dir,
+                context.cwd,
+                reference,
+                types::ManifestFileRefType::FileInline,
+                ReferenceKind::FileInline,
+                Some(workflow.dot_path.clone()),
+            )?;
+
+            if name == "prompt" {
                 let source =
                     std::fs::read_to_string(&bundled.absolute_path).with_context(|| {
                         format!("Failed to read {}", bundled.absolute_path.display())
@@ -407,18 +435,6 @@ fn collect_workflow_files(
                     context.cwd,
                     TemplateSource::new(bundled.path.clone(), template_root, source),
                     Some(&bundled.path),
-                    &context.inputs,
-                )?;
-            } else {
-                collect_template_include_files(
-                    files,
-                    context.cwd,
-                    TemplateSource::new(
-                        workflow.dot_path.clone(),
-                        workflow_template_root.clone(),
-                        prompt_ref.to_owned(),
-                    ),
-                    Some(&workflow.dot_path),
                     &context.inputs,
                 )?;
             }
@@ -897,6 +913,52 @@ mod tests {
         )]))
     }
 
+    fn assert_manifest_bundles_output_schema_file(node_attributes: &str) {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path();
+        let workflow_dir = project.join(".fabro/workflows/demo");
+        let schema_source = r#"{"type":"object","required":["ok"]}"#;
+        std::fs::create_dir_all(workflow_dir.join("schemas")).unwrap();
+        std::fs::write(project.join(".fabro/project.toml"), "_version = 1\n").unwrap();
+        std::fs::write(
+            workflow_dir.join("workflow.toml"),
+            "_version = 1\n\n[workflow]\ngraph = \"workflow.fabro\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            workflow_dir.join("workflow.fabro"),
+            format!(
+                r#"digraph Demo {{
+                    start [shape=Mdiamond]
+                    output [{node_attributes}, output_schema="@schemas/output.schema.json"]
+                    exit [shape=Msquare]
+                    start -> output -> exit
+                }}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            workflow_dir.join("schemas/output.schema.json"),
+            schema_source,
+        )
+        .unwrap();
+
+        let built = build_run_manifest(ManifestBuildInput {
+            workflow: PathBuf::from(".fabro/workflows/demo/workflow.toml"),
+            cwd: project.to_path_buf(),
+            environment_defaults: test_environment_defaults(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let root = &built.manifest.workflows[".fabro/workflows/demo/workflow.fabro"];
+        let schema = root
+            .files
+            .get(".fabro/workflows/demo/schemas/output.schema.json")
+            .expect("output_schema file should be bundled");
+        assert_eq!(schema.content, schema_source);
+    }
+
     #[test]
     fn build_run_overrides_sets_common_cli_and_mcp_layers() {
         let overrides = build_run_overrides(RunOverrideInput {
@@ -964,6 +1026,17 @@ mod tests {
             overrides.metadata.0.get("source").map(String::as_str),
             Some("mcp")
         );
+    }
+
+    // Regression coverage for https://github.com/fabro-sh/fabro/issues/476.
+    #[test]
+    fn build_manifest_bundles_agent_output_schema_file() {
+        assert_manifest_bundles_output_schema_file(r#"type="agent", prompt="Return JSON""#);
+    }
+
+    #[test]
+    fn build_manifest_bundles_command_output_schema_file() {
+        assert_manifest_bundles_output_schema_file(r#"type="command", script="echo""#);
     }
 
     #[test]
