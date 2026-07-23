@@ -48,10 +48,8 @@ pub mod keys {
     pub const PARALLEL_FAN_IN_BEST_OUTCOME: &str = "parallel.fan_in.best_outcome";
     pub const PARALLEL_FAN_IN_BEST_HEAD_SHA: &str = "parallel.fan_in.best_head_sha";
 
-    /// Runtime-only keys stripped from durable context projections
-    /// (checkpoint snapshots and resume normalization). Add new transient
-    /// keys here so both strip sites stay in sync.
-    pub const TRANSIENT_CONTEXT_KEYS: &[&str] =
+    /// Runtime-only keys stripped from durable context projections.
+    pub(crate) const TRANSIENT_CONTEXT_KEYS: &[&str] =
         &[CURRENT_PREAMBLE, INTERNAL_PARALLEL_BRANCH_PREAMBLES];
 
     // --- Prefix constants (for filtering and dynamic keys) ---
@@ -152,15 +150,12 @@ use crate::event::StageScope;
 /// One entry of the [`keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES`] stash.
 ///
 /// The stash is a JSON array indexed by the parallel node's outgoing-edge
-/// order (`Graph::outgoing_edges` preserves declaration order, so producer and
-/// consumer align even with duplicate targets). `null` entries mean the branch
-/// inherits the fork's preamble. `FidelityLifecycle::before_node` produces the
-/// stash; `ParallelHandler::execute` consumes and clears it.
+/// order. `null` entries mean the branch inherits the fork's preamble.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ParallelBranchPreamble {
-    pub fidelity: Fidelity,
-    pub preamble: String,
+pub(crate) struct ParallelBranchPreamble {
+    pub(crate) fidelity: Fidelity,
+    pub(crate) preamble: String,
 }
 
 /// Domain-specific typed accessors for workflow context values.

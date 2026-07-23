@@ -83,8 +83,8 @@ pub fn durable_context_snapshot(context: &Context) -> HashMap<String, Value> {
     snapshot
 }
 
-/// Remove runtime-only keys that must never reach durable storage or events.
-pub fn strip_transient_keys(values: &mut HashMap<String, Value>) {
+/// Remove runtime-only keys that must never reach durable storage.
+pub(crate) fn strip_transient_keys(values: &mut HashMap<String, Value>) {
     for key in context::keys::TRANSIENT_CONTEXT_KEYS {
         values.remove(*key);
     }

@@ -74,47 +74,52 @@ impl FidelityLifecycle {
         resolved_outcomes: &HashMap<String, Outcome>,
         completed_nodes: &[String],
     ) -> Vec<serde_json::Value> {
-        let mut rendered: HashMap<keys::Fidelity, serde_json::Value> = HashMap::new();
-        self.graph
-            .outgoing_edges(node_id)
-            .into_iter()
-            .enumerate()
-            .map(|(branch_index, edge)| {
-                let Some(target_node) = self.graph.nodes.get(&edge.to) else {
-                    return serde_json::Value::Null;
-                };
-                let resolution = resolve_parallel_branch_fidelity(edge, target_node, fork_fidelity);
-                if resolution.requested == Some(keys::Fidelity::Full) {
-                    tracing::warn!(
-                        parallel_node = %node_id,
-                        branch = %edge.to,
-                        branch_index,
-                        effective_fidelity = %keys::Fidelity::Full.degraded(),
-                        "Parallel branch fidelity degraded from full"
-                    );
-                }
-                let Some(branch_fidelity) = resolution.effective else {
-                    return serde_json::Value::Null;
-                };
-                rendered
-                    .entry(branch_fidelity)
-                    .or_insert_with(|| {
-                        let entry = ParallelBranchPreamble {
-                            fidelity: branch_fidelity,
-                            preamble: build_preamble(
-                                branch_fidelity,
-                                resolved_context,
-                                &self.graph,
-                                completed_nodes,
-                                resolved_outcomes,
-                            ),
-                        };
-                        serde_json::to_value(entry)
-                            .expect("ParallelBranchPreamble serialization cannot fail")
-                    })
-                    .clone()
-            })
-            .collect()
+        let edges = self.graph.outgoing_edges(node_id);
+        let mut preambles: Vec<serde_json::Value> = Vec::with_capacity(edges.len());
+        let mut rendered: HashMap<keys::Fidelity, usize> = HashMap::new();
+
+        for (branch_index, edge) in edges.into_iter().enumerate() {
+            let Some(target_node) = self.graph.nodes.get(&edge.to) else {
+                preambles.push(serde_json::Value::Null);
+                continue;
+            };
+            let resolution = resolve_parallel_branch_fidelity(edge, target_node, fork_fidelity);
+            if resolution.requested == Some(keys::Fidelity::Full) {
+                tracing::warn!(
+                    parallel_node = %node_id,
+                    branch = %edge.to,
+                    branch_index,
+                    effective_fidelity = %keys::Fidelity::Full.degraded(),
+                    "Parallel branch fidelity degraded from full"
+                );
+            }
+            let Some(branch_fidelity) = resolution.effective else {
+                preambles.push(serde_json::Value::Null);
+                continue;
+            };
+            if let Some(&rendered_index) = rendered.get(&branch_fidelity) {
+                preambles.push(preambles[rendered_index].clone());
+                continue;
+            }
+
+            let entry = ParallelBranchPreamble {
+                fidelity: branch_fidelity,
+                preamble: build_preamble(
+                    branch_fidelity,
+                    resolved_context,
+                    &self.graph,
+                    completed_nodes,
+                    resolved_outcomes,
+                ),
+            };
+            rendered.insert(branch_fidelity, preambles.len());
+            preambles.push(
+                serde_json::to_value(entry)
+                    .expect("ParallelBranchPreamble serialization cannot fail"),
+            );
+        }
+
+        preambles
     }
 }
 
