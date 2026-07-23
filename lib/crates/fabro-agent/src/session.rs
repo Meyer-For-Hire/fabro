@@ -1727,9 +1727,7 @@ impl Session {
                 &usage,
             ));
             *usage_accumulator += usage.clone();
-            if let Some(cost_usd) = response.cost_usd {
-                *cost_accumulator.get_or_insert_default() += UsdMicros::from_usd(cost_usd);
-            }
+            UsdMicros::accumulate(cost_accumulator, response.cost_usd.map(UsdMicros::from_usd));
 
             self.history.push(Message::Assistant {
                 content: text.clone(),

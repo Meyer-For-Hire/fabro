@@ -54,6 +54,14 @@ impl UsdMicros {
             (usd * USD_MICROS_PER_USD_F64).round(),
         ))
     }
+
+    /// Folds a cost into a running total that stays `None` until a cost is
+    /// observed (`None` means "no provider data", not $0).
+    pub fn accumulate(total: &mut Option<Self>, cost: Option<Self>) {
+        if let Some(cost) = cost {
+            *total.get_or_insert_default() += cost;
+        }
+    }
 }
 
 impl std::ops::Add for UsdMicros {
@@ -337,6 +345,16 @@ impl BilledModelUsage {
     pub fn tokens(&self) -> &TokenCounts {
         &self.input.usage.tokens
     }
+
+    /// Overrides the billed total with a provider-reported cost; `None` leaves
+    /// the catalog estimate in place.
+    #[must_use]
+    pub fn with_reported_cost(mut self, cost: Option<UsdMicros>) -> Self {
+        if let Some(cost) = cost {
+            self.total_usd_micros = Some(cost.0);
+        }
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -420,6 +438,16 @@ impl BilledTokenCounts {
 
     pub fn replace_with_billed_usage(&mut self, usage: &BilledModelUsage) {
         *self = Self::from_billed_usage(std::slice::from_ref(usage));
+    }
+
+    /// Overrides the billed total with a provider-reported cost; `None` leaves
+    /// any existing estimate in place.
+    #[must_use]
+    pub fn with_reported_cost(mut self, cost: Option<UsdMicros>) -> Self {
+        if let Some(cost) = cost {
+            self.total_usd_micros = Some(cost.0);
+        }
+        self
     }
 
     #[must_use]
@@ -737,6 +765,18 @@ mod tests {
             },
             total_usd_micros,
         }
+    }
+
+    #[test]
+    fn usd_micros_accumulate_keeps_none_until_a_cost_is_observed() {
+        let mut total = None;
+        UsdMicros::accumulate(&mut total, None);
+        assert_eq!(total, None);
+
+        UsdMicros::accumulate(&mut total, Some(UsdMicros(40_000)));
+        UsdMicros::accumulate(&mut total, None);
+        UsdMicros::accumulate(&mut total, Some(UsdMicros(60_000)));
+        assert_eq!(total, Some(UsdMicros(100_000)));
     }
 
     #[test]

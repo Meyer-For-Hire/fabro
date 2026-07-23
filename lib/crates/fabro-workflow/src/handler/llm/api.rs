@@ -40,7 +40,7 @@ use crate::context::WorkflowContext;
 use crate::context::keys::Fidelity;
 use crate::error::Error;
 use crate::event::{Emitter, Event, StageScope};
-use crate::outcome::billed_model_usage_from_llm_with_cost;
+use crate::outcome::billed_model_usage_from_llm;
 use crate::services::FabroRunToolServices;
 use crate::steering_hub::{ActiveControlHandle, SteeringHub};
 
@@ -601,12 +601,6 @@ struct OneShotCompletion {
     model:    ModelRef,
 }
 
-fn add_cost(total: &mut Option<UsdMicros>, cost: Option<UsdMicros>) {
-    if let Some(cost) = cost {
-        *total.get_or_insert_default() += cost;
-    }
-}
-
 impl AgentApiBackend {
     #[must_use]
     pub fn new(
@@ -1100,7 +1094,7 @@ impl CodergenBackend for AgentApiBackend {
             inference_duration = inference_duration.saturating_add(inference_start.elapsed());
             let completion = completion_result?;
             total_usage += completion.response.usage.clone();
-            add_cost(
+            UsdMicros::accumulate(
                 &mut total_cost,
                 completion.response.cost_usd.map(UsdMicros::from_usd),
             );
@@ -1127,12 +1121,12 @@ impl CodergenBackend for AgentApiBackend {
                 continue;
             }
 
-            let stage_usage = billed_model_usage_from_llm_with_cost(
+            let stage_usage = billed_model_usage_from_llm(
                 self.catalog.as_ref(),
                 &completion.model,
                 &total_usage,
-                total_cost,
-            )?;
+            )?
+            .with_reported_cost(total_cost);
 
             return Ok(CodergenResult::Text {
                 text:              response_text,
@@ -1289,7 +1283,7 @@ impl CodergenBackend for AgentApiBackend {
                 tool_duration = tool_duration.saturating_add(timing.tool);
                 if process_result.is_ok() {
                     total_usage += session.last_input_usage();
-                    add_cost(&mut total_cost, session.last_input_cost());
+                    UsdMicros::accumulate(&mut total_cost, session.last_input_cost());
                 }
                 process_result
             }
@@ -1425,7 +1419,7 @@ impl CodergenBackend for AgentApiBackend {
                         match process_result {
                             Ok(()) => {
                                 total_usage += session.last_input_usage();
-                                add_cost(&mut total_cost, session.last_input_cost());
+                                UsdMicros::accumulate(&mut total_cost, session.last_input_cost());
                                 succeeded = true;
                                 break;
                             }
@@ -1497,7 +1491,7 @@ impl CodergenBackend for AgentApiBackend {
                         match repair_result {
                             Ok(()) => {
                                 total_usage += session.last_input_usage();
-                                add_cost(&mut total_cost, session.last_input_cost());
+                                UsdMicros::accumulate(&mut total_cost, session.last_input_cost());
                                 repair_attempts += 1;
                                 response = last_assistant_response(&session);
                             }
@@ -1525,7 +1519,7 @@ impl CodergenBackend for AgentApiBackend {
         }
 
         let billing_controls = self.resolve_effective_request_controls(node)?;
-        let stage_usage = billed_model_usage_from_llm_with_cost(
+        let stage_usage = billed_model_usage_from_llm(
             self.catalog.as_ref(),
             &ModelRef {
                 provider: session.provider_id(),
@@ -1533,8 +1527,8 @@ impl CodergenBackend for AgentApiBackend {
                 speed:    billing_controls.speed,
             },
             &total_usage,
-            total_cost,
-        )?;
+        )?
+        .with_reported_cost(total_cost);
 
         // Collect files_touched from the shared tracking state.
         let (files_touched, last_file_touched) = file_tracking_snapshot(&file_tracking);

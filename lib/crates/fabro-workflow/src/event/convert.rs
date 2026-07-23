@@ -617,8 +617,8 @@ fn event_body_from_event(event: &Event) -> EventBody {
                 tool_call_count,
                 context_window,
             } => {
-                let mut billing = billed_token_counts_from_llm(usage);
-                billing.total_usd_micros = cost_usd.map(|cost| UsdMicros::from_usd(cost).0);
+                let billing = billed_token_counts_from_llm(usage)
+                    .with_reported_cost(cost_usd.map(UsdMicros::from_usd));
                 EventBody::AgentMessage(fabro_types::AgentMessageProps {
                     text: text.clone(),
                     model: model.clone(),
