@@ -92,6 +92,10 @@ fn response_from_outcome(node_id: &str, outcome: &Outcome) -> Option<String> {
         .and_then(|value| value.as_str().map(ToOwned::to_owned))
 }
 
+/// Context values for `StageCompleted` events. Unlike
+/// `artifact::strip_transient_keys`, this keeps `CURRENT_PREAMBLE` — stage
+/// events have always included the active preamble — and drops only the
+/// parallel stash, which can embed every branch's rendered preamble.
 fn stage_context_values(workflow_context: &Context) -> Option<BTreeMap<String, serde_json::Value>> {
     let mut snapshot = workflow_context.snapshot();
     snapshot.remove(context::keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES);

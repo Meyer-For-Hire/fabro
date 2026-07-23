@@ -4,14 +4,13 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use fabro_agent::{Sandbox, WorktreeOptions, WorktreeSandbox};
-use fabro_graphviz::Fidelity;
 use fabro_graphviz::graph::{AttrValue, Graph, Node};
 use fabro_hooks::{HookContext, HookEvent};
 use fabro_types::{ParallelBranchId, RunId, StageId};
 use tokio::sync::Semaphore;
 
 use super::{EngineServices, Handler};
-use crate::context::{Context, WorkflowContext, keys};
+use crate::context::{Context, ParallelBranchPreamble, WorkflowContext, keys};
 use crate::error::Error;
 use crate::event::{Event, RunNoticeCode, RunNoticeLevel, StageScope};
 use crate::git::sanitize_ref_component;
@@ -57,15 +56,15 @@ struct BranchResult {
     worktree_path: Option<PathBuf>,
 }
 
-struct BranchPreamble {
-    fidelity: Fidelity,
-    preamble: String,
-}
-
+/// Parse the per-branch preamble stash produced by `FidelityLifecycle`.
+///
+/// Outer `None` means the stash is absent, malformed, or has the wrong branch
+/// count — every branch then inherits the fork context (legacy behavior).
+/// Inner `None` means that single branch inherits.
 fn parse_branch_preambles(
     value: Option<serde_json::Value>,
     branch_count: usize,
-) -> Option<Vec<Option<BranchPreamble>>> {
+) -> Option<Vec<Option<ParallelBranchPreamble>>> {
     let serde_json::Value::Array(entries) = value? else {
         return None;
     };
@@ -77,15 +76,7 @@ fn parse_branch_preambles(
         .into_iter()
         .map(|entry| match entry {
             serde_json::Value::Null => Some(None),
-            serde_json::Value::Object(entry) if entry.len() == 2 => {
-                let fidelity = entry.get("fidelity")?.as_str()?.parse().ok()?;
-                let preamble = entry.get("preamble")?.as_str()?;
-                Some(Some(BranchPreamble {
-                    fidelity,
-                    preamble: preamble.to_string(),
-                }))
-            }
-            _ => None,
+            entry => serde_json::from_value(entry).ok().map(Some),
         })
         .collect()
 }
@@ -258,6 +249,13 @@ impl Handler for ParallelHandler {
             context.get(keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES),
             branches.len(),
         );
+        // Clear the stash before forking so branch contexts never carry the
+        // outer array — a nested parallel branch target must not misread it as
+        // its own. The write-back diff also clears it on the run state.
+        context.set(
+            keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES,
+            serde_json::Value::Null,
+        );
         let mut branch_setups: Vec<BranchSetup> = Vec::new();
         for (branch_index, edge) in branches.iter().enumerate() {
             let target_id = edge.to.clone();
@@ -279,16 +277,15 @@ impl Handler for ParallelHandler {
                 .and_then(|entries| entries.get(branch_index))
                 .and_then(Option::as_ref)
             {
-                branch_context.set(keys::CURRENT_PREAMBLE, serde_json::json!(&entry.preamble));
+                branch_context.set(
+                    keys::CURRENT_PREAMBLE,
+                    serde_json::Value::String(entry.preamble.clone()),
+                );
                 branch_context.set(
                     keys::INTERNAL_FIDELITY,
-                    serde_json::json!(entry.fidelity.to_string()),
+                    serde_json::Value::String(entry.fidelity.to_string()),
                 );
             }
-            branch_context.set(
-                keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES,
-                serde_json::Value::Null,
-            );
 
             let (branch_sandbox, worktree_path): (Arc<dyn Sandbox>, Option<PathBuf>) = if let (
                 Some(ref gs),
@@ -350,10 +347,6 @@ impl Handler for ParallelHandler {
                 worktree_path,
             });
         }
-        context.set(
-            keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES,
-            serde_json::Value::Null,
-        );
 
         // --- Fan out: concurrent execution ---
         let mut handles = Vec::new();

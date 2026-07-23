@@ -25,6 +25,9 @@ pub mod keys {
     pub const INTERNAL_PARENT_PREAMBLE: &str = "internal.parent_preamble";
     pub const INTERNAL_PARALLEL_GROUP_ID: &str = "internal.parallel_group_id";
     pub const INTERNAL_PARALLEL_BRANCH_ID: &str = "internal.parallel_branch_id";
+    /// Stash of pre-rendered per-branch preambles for a parallel node; see
+    /// [`super::ParallelBranchPreamble`] for the entry shape and the
+    /// producer/consumer contract.
     pub const INTERNAL_PARALLEL_BRANCH_PREAMBLES: &str = "internal.parallel_branch_preambles";
 
     // --- current.* keys ---
@@ -44,6 +47,12 @@ pub mod keys {
     pub const PARALLEL_FAN_IN_BEST_ID: &str = "parallel.fan_in.best_id";
     pub const PARALLEL_FAN_IN_BEST_OUTCOME: &str = "parallel.fan_in.best_outcome";
     pub const PARALLEL_FAN_IN_BEST_HEAD_SHA: &str = "parallel.fan_in.best_head_sha";
+
+    /// Runtime-only keys stripped from durable context projections
+    /// (checkpoint snapshots and resume normalization). Add new transient
+    /// keys here so both strip sites stay in sync.
+    pub const TRANSIENT_CONTEXT_KEYS: &[&str] =
+        &[CURRENT_PREAMBLE, INTERNAL_PARALLEL_BRANCH_PREAMBLES];
 
     // --- Prefix constants (for filtering and dynamic keys) ---
     pub const GRAPH_PREFIX: &str = "graph.";
@@ -136,8 +145,23 @@ pub mod keys {
 pub use fabro_core::Context;
 use fabro_graphviz::Fidelity;
 use fabro_types::{ParallelBranchId, StageId};
+use serde::{Deserialize, Serialize};
 
 use crate::event::StageScope;
+
+/// One entry of the [`keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES`] stash.
+///
+/// The stash is a JSON array indexed by the parallel node's outgoing-edge
+/// order (`Graph::outgoing_edges` preserves declaration order, so producer and
+/// consumer align even with duplicate targets). `null` entries mean the branch
+/// inherits the fork's preamble. `FidelityLifecycle::before_node` produces the
+/// stash; `ParallelHandler::execute` consumes and clears it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ParallelBranchPreamble {
+    pub fidelity: Fidelity,
+    pub preamble: String,
+}
 
 /// Domain-specific typed accessors for workflow context values.
 pub trait WorkflowContext {

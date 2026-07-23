@@ -23,6 +23,9 @@ impl LintRule for Rule {
         let graph_default_full = graph.default_fidelity() == Some("full");
         let branches = ParallelBranches::new(graph);
 
+        // thread_id is inert on parallel branches, where
+        // parallel_branch_inert_attribute already says "remove thread_id" —
+        // advising fidelity="full" there would contradict it.
         for node in graph.nodes.values() {
             if node.thread_id().is_some()
                 && !branches.is_branch_only_node(&node.id)

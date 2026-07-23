@@ -7,10 +7,14 @@ pub(super) fn rule() -> Box<dyn LintRule> {
     Box::new(Rule)
 }
 
-/// Attributes that parallel branch execution does not resolve. Per-branch
-/// preambles now honor fidelity, while `thread_id` remains inert because
-/// concurrent branches cannot share an LLM session.
+/// Attributes that parallel branch execution does not resolve. Only
+/// `thread_id` is inert on branches (concurrent branches cannot share an LLM
+/// session); per-branch `fidelity` is honored via pre-rendered preambles.
 const BRANCH_IGNORED_ATTRS: &[&str] = &["thread_id"];
+
+const FULL_FIDELITY_MESSAGE: &str = "Parallel branches run at most at summary:high; full is degraded at runtime because branches cannot share a session";
+
+const THREAD_ID_FIX: &str = "Remove 'thread_id': parallel branches inherit the thread resolved when the parallel node started";
 
 struct Rule;
 
@@ -22,19 +26,6 @@ fn quoted_list(ids: &[String]) -> String {
         .join(", ")
 }
 
-fn fix_message(attr: &str) -> String {
-    match attr {
-        "thread_id" => format!(
-            "Remove '{attr}': parallel branches inherit the thread resolved when the parallel node started"
-        ),
-        _ => format!("Remove '{attr}'"),
-    }
-}
-
-fn full_fidelity_message() -> String {
-    "parallel branches run at most at summary:high; full is degraded at runtime because branches cannot share a session".to_string()
-}
-
 fn full_fidelity_fix(parallel_ids: &[String]) -> String {
     let parent = if parallel_ids.len() == 1 {
         format!("parallel node {}", quoted_list(parallel_ids))
@@ -44,6 +35,23 @@ fn full_fidelity_fix(parallel_ids: &[String]) -> String {
     format!(
         "Use fidelity=\"summary:high\" or another lower mode on this branch; to reuse a full session before fan-out, set fidelity=\"full\" on {parent} or its incoming edge"
     )
+}
+
+fn full_fidelity_diagnostic(
+    rule_name: &str,
+    node_id: Option<String>,
+    edge: Option<(String, String)>,
+    parallel_ids: &[String],
+) -> Diagnostic {
+    Diagnostic {
+        rule: rule_name.to_string(),
+        severity: Severity::Warning,
+        message: FULL_FIDELITY_MESSAGE.to_string(),
+        node_id,
+        edge,
+        fix: Some(full_fidelity_fix(parallel_ids)),
+        ..Diagnostic::default()
+    }
 }
 
 impl LintRule for Rule {
@@ -64,15 +72,12 @@ impl LintRule for Rule {
                 continue;
             }
             if edge.fidelity() == Some("full") {
-                diagnostics.push(Diagnostic {
-                    rule: self.name().to_string(),
-                    severity: Severity::Warning,
-                    message: full_fidelity_message(),
-                    node_id: None,
-                    edge: Some((edge.from.clone(), edge.to.clone())),
-                    fix: Some(full_fidelity_fix(std::slice::from_ref(&edge.from))),
-                    ..Diagnostic::default()
-                });
+                diagnostics.push(full_fidelity_diagnostic(
+                    self.name(),
+                    None,
+                    Some((edge.from.clone(), edge.to.clone())),
+                    std::slice::from_ref(&edge.from),
+                ));
             }
             for attr in BRANCH_IGNORED_ATTRS {
                 if !edge.attrs.contains_key(*attr) {
@@ -87,7 +92,7 @@ impl LintRule for Rule {
                     ),
                     node_id: None,
                     edge: Some((edge.from.clone(), edge.to.clone())),
-                    fix: Some(fix_message(attr)),
+                    fix: Some(THREAD_ID_FIX.to_string()),
                     ..Diagnostic::default()
                 });
             }
@@ -103,15 +108,12 @@ impl LintRule for Rule {
                 continue;
             };
             if node.fidelity() == Some("full") {
-                diagnostics.push(Diagnostic {
-                    rule: self.name().to_string(),
-                    severity: Severity::Warning,
-                    message: full_fidelity_message(),
-                    node_id: Some(node.id.clone()),
-                    edge: None,
-                    fix: Some(full_fidelity_fix(&parents)),
-                    ..Diagnostic::default()
-                });
+                diagnostics.push(full_fidelity_diagnostic(
+                    self.name(),
+                    Some(node.id.clone()),
+                    None,
+                    &parents,
+                ));
             }
             for attr in BRANCH_IGNORED_ATTRS {
                 if !node.attrs.contains_key(*attr) {
@@ -127,7 +129,7 @@ impl LintRule for Rule {
                     ),
                     node_id: Some(node.id.clone()),
                     edge: None,
-                    fix: Some(fix_message(attr)),
+                    fix: Some(THREAD_ID_FIX.to_string()),
                     ..Diagnostic::default()
                 });
             }

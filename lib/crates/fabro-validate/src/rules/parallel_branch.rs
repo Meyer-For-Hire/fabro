@@ -35,22 +35,25 @@ impl<'a> ParallelBranches<'a> {
             .collect()
     }
 
+    /// True when every incoming edge of `node_id` comes from a parallel fork
+    /// (and there is at least one). Such a node only ever runs as a branch.
     pub(super) fn is_branch_only_node(&self, node_id: &str) -> bool {
-        self.branch_only_parents(node_id).is_some()
+        let incoming = self.graph.incoming_edges(node_id);
+        !incoming.is_empty() && incoming.iter().all(|edge| self.is_fork_edge(edge))
     }
 
+    /// The sorted, deduplicated fork parents of a branch-only node, or `None`
+    /// when the node has a non-fork entry path (or no entry at all).
     pub(super) fn branch_only_parents(&self, node_id: &str) -> Option<Vec<String>> {
-        let mut incoming = self
+        if !self.is_branch_only_node(node_id) {
+            return None;
+        }
+        let parents: BTreeSet<&str> = self
             .graph
-            .edges
-            .iter()
-            .filter(|edge| edge.to == node_id)
-            .peekable();
-        incoming.peek()?;
-
-        incoming
-            .map(|edge| self.is_fork_edge(edge).then(|| edge.from.clone()))
-            .collect::<Option<BTreeSet<_>>>()
-            .map(|parents| parents.into_iter().collect())
+            .incoming_edges(node_id)
+            .into_iter()
+            .map(|edge| edge.from.as_str())
+            .collect();
+        Some(parents.into_iter().map(String::from).collect())
     }
 }

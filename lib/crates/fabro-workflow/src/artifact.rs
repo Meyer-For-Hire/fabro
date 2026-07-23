@@ -78,10 +78,16 @@ pub fn format_artifact_reference(path: &str) -> String {
 
 pub fn durable_context_snapshot(context: &Context) -> HashMap<String, Value> {
     let mut snapshot = context.snapshot();
-    snapshot.remove(context::keys::CURRENT_PREAMBLE);
-    snapshot.remove(context::keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES);
+    strip_transient_keys(&mut snapshot);
     normalize_durable_updates(&mut snapshot);
     snapshot
+}
+
+/// Remove runtime-only keys that must never reach durable storage or events.
+pub fn strip_transient_keys(values: &mut HashMap<String, Value>) {
+    for key in context::keys::TRANSIENT_CONTEXT_KEYS {
+        values.remove(*key);
+    }
 }
 
 pub fn normalize_durable_updates(updates: &mut HashMap<String, Value>) {
@@ -97,12 +103,7 @@ pub fn normalize_durable_outcomes(node_outcomes: &mut HashMap<String, Outcome>) 
 }
 
 pub fn normalize_checkpoint_for_resume(checkpoint: &mut Checkpoint) {
-    checkpoint
-        .context_values
-        .remove(context::keys::CURRENT_PREAMBLE);
-    checkpoint
-        .context_values
-        .remove(context::keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES);
+    strip_transient_keys(&mut checkpoint.context_values);
     normalize_durable_updates(&mut checkpoint.context_values);
     normalize_durable_outcomes(&mut checkpoint.node_outcomes);
 }
