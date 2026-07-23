@@ -20,7 +20,7 @@ use fabro_llm::types::{
 use fabro_mcp::config::McpServerSettings;
 #[cfg(test)]
 use fabro_model::catalog::LlmCatalogSettings;
-use fabro_model::{AgentProfileKind, Catalog, FallbackTarget, ModelRef, ProviderId};
+use fabro_model::{AgentProfileKind, Catalog, FallbackTarget, ModelRef, ProviderId, UsdMicros};
 use fabro_types::settings::run::RunModelControls;
 use fabro_types::{PermissionLevel, RunId, SessionCapability, StageId, StageTiming};
 use serde::de::DeserializeOwned;
@@ -1060,6 +1060,7 @@ impl CodergenBackend for AgentApiBackend {
             .map(structured_output::prompt_response_format);
         let mut repair_attempts = 0_i64;
         let mut total_usage = TokenCounts::default();
+        let mut total_cost = None;
         let mut inference_duration = Duration::ZERO;
 
         loop {
@@ -1095,6 +1096,10 @@ impl CodergenBackend for AgentApiBackend {
             inference_duration = inference_duration.saturating_add(inference_start.elapsed());
             let completion = completion_result?;
             total_usage += completion.response.usage.clone();
+            UsdMicros::accumulate(
+                &mut total_cost,
+                completion.response.cost_usd.map(UsdMicros::from_usd),
+            );
             let response_text = completion.response.text();
 
             let validation_error = if let Some(schema) = &output_schema {
@@ -1122,7 +1127,8 @@ impl CodergenBackend for AgentApiBackend {
                 self.catalog.as_ref(),
                 &completion.model,
                 &total_usage,
-            )?;
+            )?
+            .with_reported_cost(total_cost);
 
             return Ok(CodergenResult::Text {
                 text:              response_text,
@@ -1216,6 +1222,7 @@ impl CodergenBackend for AgentApiBackend {
         );
 
         let mut total_usage = TokenCounts::default();
+        let mut total_cost = None;
         let mut inference_duration = Duration::ZERO;
         let mut tool_duration = Duration::ZERO;
 
@@ -1278,6 +1285,7 @@ impl CodergenBackend for AgentApiBackend {
                 tool_duration = tool_duration.saturating_add(timing.tool);
                 if process_result.is_ok() {
                     total_usage += session.last_input_usage();
+                    UsdMicros::accumulate(&mut total_cost, session.last_input_cost());
                 }
                 process_result
             }
@@ -1413,6 +1421,7 @@ impl CodergenBackend for AgentApiBackend {
                         match process_result {
                             Ok(()) => {
                                 total_usage += session.last_input_usage();
+                                UsdMicros::accumulate(&mut total_cost, session.last_input_cost());
                                 succeeded = true;
                                 break;
                             }
@@ -1484,6 +1493,7 @@ impl CodergenBackend for AgentApiBackend {
                         match repair_result {
                             Ok(()) => {
                                 total_usage += session.last_input_usage();
+                                UsdMicros::accumulate(&mut total_cost, session.last_input_cost());
                                 repair_attempts += 1;
                                 response = last_assistant_response(&session);
                             }
@@ -1519,7 +1529,8 @@ impl CodergenBackend for AgentApiBackend {
                 speed:    billing_controls.speed,
             },
             &total_usage,
-        )?;
+        )?
+        .with_reported_cost(total_cost);
 
         // Collect files_touched from the shared tracking state.
         let (files_touched, last_file_touched) = file_tracking_snapshot(&file_tracking);
@@ -2780,7 +2791,11 @@ reasoning = false
                 .body_excludes(r#""role":"assistant""#);
             then.status(200)
                 .header("content-type", "application/json")
-                .json_body(chat_completion_response("not json", 10, 1));
+                .json_body({
+                    let mut response = chat_completion_response("not json", 10, 1);
+                    response["usage"]["cost"] = serde_json::json!(0.04);
+                    response
+                });
         });
         let repair = server.mock(|when, then| {
             when.method(POST)
@@ -2791,7 +2806,11 @@ reasoning = false
                 .body_includes("output_schema");
             then.status(200)
                 .header("content-type", "application/json")
-                .json_body(chat_completion_response(r#"{"passed":true}"#, 11, 2));
+                .json_body({
+                    let mut response = chat_completion_response(r#"{"passed":true}"#, 11, 2);
+                    response["usage"]["cost"] = serde_json::json!(0.06);
+                    response
+                });
         });
         let backend = mock_api_backend(&server);
         let mut node = Node::new("audit");
@@ -2828,6 +2847,7 @@ reasoning = false
         let usage = usage.expect("usage should be aggregated");
         assert_eq!(usage.tokens().input_tokens, 21);
         assert_eq!(usage.tokens().output_tokens, 3);
+        assert_eq!(usage.total_usd_micros, Some(100_000));
     }
 
     #[tokio::test]

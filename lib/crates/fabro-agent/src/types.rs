@@ -3,7 +3,7 @@ use std::time::SystemTime;
 use chrono::{DateTime, Utc};
 use fabro_llm::Error as LlmError;
 use fabro_llm::types::{ContentPart, ThinkingData, TokenCounts, ToolCall, ToolResult};
-use fabro_model::ModelRef;
+use fabro_model::{CostSource, ModelRef};
 use fabro_types::{SessionMessage, StageContextWindowProjection};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -245,6 +245,12 @@ pub enum AgentEvent {
         text:            String,
         model:           ModelRef,
         usage:           TokenCounts,
+        /// USD cost reported or estimated for this individual response.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_usd:        Option<f64>,
+        /// Provenance of `cost_usd`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_source:     Option<CostSource>,
         tool_call_count: usize,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         context_window:  Option<StageContextWindowProjection>,
@@ -880,12 +886,16 @@ mod tests {
                 speed:    None,
             },
             usage:           usage.clone(),
+            cost_usd:        Some(0.125),
+            cost_source:     Some(CostSource::Authoritative),
             tool_call_count: 2,
             context_window:  None,
         };
         match &event {
             AgentEvent::AssistantMessage {
                 usage,
+                cost_usd,
+                cost_source,
                 tool_call_count,
                 ..
             } => {
@@ -893,6 +903,8 @@ mod tests {
                 assert_eq!(usage.input_tokens, 100);
                 assert_eq!(usage.cache_read_tokens, 80);
                 assert_eq!(usage.reasoning_tokens, 20);
+                assert_eq!(*cost_usd, Some(0.125));
+                assert_eq!(*cost_source, Some(CostSource::Authoritative));
             }
             _ => panic!("expected AssistantMessage"),
         }

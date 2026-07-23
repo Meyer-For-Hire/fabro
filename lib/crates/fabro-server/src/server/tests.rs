@@ -4148,6 +4148,8 @@ fn context_window_event(
                 speed:    None,
             },
             usage:           TokenCounts::default(),
+            cost_usd:        None,
+            cost_source:     None,
             tool_call_count: 0,
             context_window:  Some(context_window),
         },
@@ -13769,6 +13771,48 @@ async fn get_aggregate_billing_returns_provider_model_speed_identity() {
     assert_eq!(fast["model"]["provider"], "anthropic");
     assert_eq!(fast["model"]["model_id"], "claude-opus-4-6");
     assert_eq!(fast["billing"]["input_tokens"], 20);
+}
+
+#[tokio::test]
+async fn get_aggregate_billing_saturates_total_cost_across_models() {
+    let state = test_app_state();
+    {
+        let mut agg = state
+            .aggregate_billing
+            .lock()
+            .expect("aggregate billing lock");
+        for (model_id, total_usd_micros) in [("maximum", i64::MAX), ("one", 1)] {
+            agg.by_model.insert(
+                ModelRef {
+                    provider: ProviderId::openai(),
+                    model_id: model_id.to_string(),
+                    speed:    None,
+                },
+                ModelBillingTotals {
+                    stages:  1,
+                    billing: BilledTokenCounts {
+                        total_usd_micros: Some(total_usd_micros),
+                        ..BilledTokenCounts::default()
+                    },
+                },
+            );
+        }
+    }
+    let app = crate::test_support::build_test_router(Arc::clone(&state));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(api("/billing"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = response_json!(response, StatusCode::OK).await;
+
+    assert_eq!(body["totals"]["total_usd_micros"].as_i64(), Some(i64::MAX));
 }
 
 #[test]

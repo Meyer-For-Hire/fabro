@@ -49,6 +49,12 @@ fn brew_command(context: &TestContext, formula: &str, version: &str) -> Command 
         }
     }
     cmd.env(EnvVars::NO_COLOR, "1");
+    // Unlike context.command(), this command inherits the developer's
+    // environment, and inherited FORCE_COLOR/CLICOLOR_FORCE override NO_COLOR
+    // in the CLI's color detection — breaking these snapshots.
+    cmd.env_remove(EnvVars::FORCE_COLOR);
+    cmd.env_remove(EnvVars::CLICOLOR_FORCE);
+    cmd.env_remove(EnvVars::CLICOLOR);
     cmd.env(EnvVars::HOME, &context.home_dir);
     cmd.env(EnvVars::FABRO_NO_UPGRADE_CHECK, "true")
         .env(EnvVars::FABRO_HTTP_PROXY_POLICY, "disabled")
