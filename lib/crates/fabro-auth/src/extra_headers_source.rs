@@ -29,10 +29,14 @@ impl CredentialSource for ExtraHeadersCredentialSource {
         let mut resolved = self.inner.resolve(catalog).await?;
         for credential in &mut resolved.credentials {
             for (name, value) in &self.headers {
-                credential
+                if credential
                     .extra_headers
-                    .entry(name.clone())
-                    .or_insert_with(|| value.clone());
+                    .keys()
+                    .any(|existing| existing.eq_ignore_ascii_case(name))
+                {
+                    continue;
+                }
+                credential.extra_headers.insert(name.clone(), value.clone());
             }
         }
         Ok(resolved)
@@ -49,8 +53,9 @@ mod tests {
     use crate::{ApiCredential, ResolveError};
 
     struct StubSource {
-        credentials: Vec<ApiCredential>,
-        auth_issues: Vec<(ProviderId, ResolveError)>,
+        credentials:          Vec<ApiCredential>,
+        auth_issue_provider:  Option<ProviderId>,
+        configured_providers: Vec<ProviderId>,
     }
 
     #[async_trait]
@@ -59,12 +64,12 @@ mod tests {
             Ok(ResolvedCredentials {
                 credentials: self.credentials.clone(),
                 auth_issues: self
-                    .auth_issues
+                    .auth_issue_provider
                     .iter()
-                    .map(|(provider, _)| {
+                    .map(|provider| {
                         (
                             provider.clone(),
-                            ResolveError::NotConfigured(provider.clone()),
+                            ResolveError::RefreshTokenMissing(provider.clone()),
                         )
                     })
                     .collect(),
@@ -72,16 +77,13 @@ mod tests {
         }
 
         async fn configured_providers(&self, _catalog: &Catalog) -> Vec<ProviderId> {
-            self.credentials
-                .iter()
-                .map(|c| c.provider.clone())
-                .collect()
+            self.configured_providers.clone()
         }
     }
 
-    fn credential(provider: &str, extra_headers: HashMap<String, String>) -> ApiCredential {
+    fn credential(provider: ProviderId, extra_headers: HashMap<String, String>) -> ApiCredential {
         ApiCredential {
-            provider: ProviderId::new(provider),
+            provider,
             auth_header: None,
             extra_headers,
             base_url: None,
@@ -91,74 +93,83 @@ mod tests {
         }
     }
 
-    fn catalog() -> Catalog {
-        Catalog::from_builtin().unwrap()
-    }
-
     #[tokio::test]
     async fn appends_headers_to_every_resolved_credential() {
         let source = ExtraHeadersCredentialSource::new(
             Arc::new(StubSource {
-                credentials: vec![
-                    credential("anthropic", HashMap::new()),
-                    credential("openai", HashMap::new()),
+                credentials:          vec![
+                    credential(ProviderId::anthropic(), HashMap::new()),
+                    credential(ProviderId::openai(), HashMap::new()),
                 ],
-                auth_issues: Vec::new(),
+                auth_issue_provider:  None,
+                configured_providers: Vec::new(),
             }),
             HashMap::from([("x-session-id".to_string(), "run-123".to_string())]),
         );
 
-        let resolved = source.resolve(&catalog()).await.unwrap();
+        let resolved = source.resolve(Catalog::builtin()).await.unwrap();
 
         assert_eq!(resolved.credentials.len(), 2);
         for credential in &resolved.credentials {
             assert_eq!(
-                credential.extra_headers.get("x-session-id"),
-                Some(&"run-123".to_string())
+                credential
+                    .extra_headers
+                    .get("x-session-id")
+                    .map(String::as_str),
+                Some("run-123")
             );
         }
     }
 
     #[tokio::test]
-    async fn preserves_headers_already_set_on_a_credential() {
+    async fn preserves_case_insensitive_headers_already_set_on_a_credential() {
         let source = ExtraHeadersCredentialSource::new(
             Arc::new(StubSource {
-                credentials: vec![credential(
-                    "openrouter",
-                    HashMap::from([("x-session-id".to_string(), "configured".to_string())]),
+                credentials:          vec![credential(
+                    ProviderId::new("openrouter"),
+                    HashMap::from([("X-Session-Id".to_string(), "configured".to_string())]),
                 )],
-                auth_issues: Vec::new(),
+                auth_issue_provider:  None,
+                configured_providers: Vec::new(),
             }),
             HashMap::from([("x-session-id".to_string(), "run-123".to_string())]),
         );
 
-        let resolved = source.resolve(&catalog()).await.unwrap();
+        let resolved = source.resolve(Catalog::builtin()).await.unwrap();
 
         assert_eq!(
-            resolved.credentials[0].extra_headers.get("x-session-id"),
-            Some(&"configured".to_string())
+            resolved.credentials[0]
+                .extra_headers
+                .get("X-Session-Id")
+                .map(String::as_str),
+            Some("configured")
         );
+        assert_eq!(resolved.credentials[0].extra_headers.len(), 1);
     }
 
     #[tokio::test]
     async fn passes_through_auth_issues_and_configured_providers() {
-        let provider = ProviderId::new("anthropic");
+        let auth_issue_provider = ProviderId::anthropic();
+        let configured_provider = ProviderId::gemini();
         let source = ExtraHeadersCredentialSource::new(
             Arc::new(StubSource {
-                credentials: vec![credential("openai", HashMap::new())],
-                auth_issues: vec![(
-                    provider.clone(),
-                    ResolveError::NotConfigured(provider.clone()),
-                )],
+                credentials:          vec![credential(ProviderId::openai(), HashMap::new())],
+                auth_issue_provider:  Some(auth_issue_provider.clone()),
+                configured_providers: vec![configured_provider.clone()],
             }),
             HashMap::from([("x-session-id".to_string(), "run-123".to_string())]),
         );
 
-        let resolved = source.resolve(&catalog()).await.unwrap();
-        assert_eq!(resolved.auth_issues.len(), 1);
-        assert_eq!(resolved.auth_issues[0].0, provider);
+        let resolved = source.resolve(Catalog::builtin()).await.unwrap();
+        let [(reported_provider, ResolveError::RefreshTokenMissing(error_provider))] =
+            resolved.auth_issues.as_slice()
+        else {
+            panic!("expected the inner source's refresh-token issue");
+        };
+        assert_eq!(reported_provider, &auth_issue_provider);
+        assert_eq!(error_provider, &auth_issue_provider);
 
-        let providers = source.configured_providers(&catalog()).await;
-        assert_eq!(providers, vec![ProviderId::new("openai")]);
+        let providers = source.configured_providers(Catalog::builtin()).await;
+        assert_eq!(providers, vec![configured_provider]);
     }
 }

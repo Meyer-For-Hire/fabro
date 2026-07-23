@@ -831,7 +831,6 @@ impl RunSession {
         store_progress_logger.register(self.emitter.as_ref());
 
         let init_options = InitOptions {
-            run_id: record.run_id,
             run_store: self.run_store.clone(),
             dry_run: run_options.dry_run_enabled(),
             emitter: self.emitter,

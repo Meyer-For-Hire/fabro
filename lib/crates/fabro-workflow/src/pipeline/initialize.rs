@@ -360,7 +360,7 @@ pub async fn initialize(
         let sandbox = reconnect_for_run_with_callback(
             instance,
             daytona_api_key,
-            Some(options.run_id),
+            Some(options.run_options.run_id),
             Some(Arc::clone(&sandbox_event_callback)),
         )
         .await
@@ -825,7 +825,6 @@ mod tests {
         });
 
         let result = initialize(persisted, InitOptions {
-            run_id:            test_run_id(),
             run_store:         {
                 let store = memory_store();
                 let inner = store.create_run(&test_run_id()).await.unwrap();
@@ -907,7 +906,6 @@ mod tests {
         let emitter = Arc::new(crate::event::Emitter::new(test_run_id()));
 
         let initialized = initialize(persisted, InitOptions {
-            run_id:            test_run_id(),
             run_store:         {
                 let store = memory_store();
                 let inner = store.create_run(&test_run_id()).await.unwrap();
@@ -1043,26 +1041,24 @@ mod tests {
 
     #[tokio::test]
     async fn build_llm_source_appends_run_session_trace_header() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut vault = Vault::load(dir.path().join("secrets.json")).unwrap();
-        vault
-            .set(
-                "ANTHROPIC_API_KEY",
-                "anthropic-key",
-                SecretType::Token,
-                None,
-            )
+        let mut vault = Vault::from_entries(HashMap::new());
+        fabro_auth::vault_set_token(&mut vault, EnvVars::ANTHROPIC_API_KEY, "anthropic-key")
             .unwrap();
         let vault = Arc::new(AsyncRwLock::new(vault));
+        let run_id = test_run_id();
+        let expected_session_id = run_id.to_string();
 
-        let source = build_llm_source(Some(vault), test_run_id());
+        let source = build_llm_source(Some(vault), run_id);
         let resolved = source.resolve(test_catalog().as_ref()).await.unwrap();
 
         assert!(!resolved.credentials.is_empty());
         for credential in &resolved.credentials {
             assert_eq!(
-                credential.extra_headers.get(SESSION_ID_HEADER),
-                Some(&test_run_id().to_string())
+                credential
+                    .extra_headers
+                    .get(SESSION_ID_HEADER)
+                    .map(String::as_str),
+                Some(expected_session_id.as_str())
             );
         }
     }
@@ -1135,7 +1131,6 @@ mod tests {
         let store = memory_store();
         let run_store = store.create_run(&test_run_id()).await.unwrap();
         let initialized = initialize(test_persisted(graph, source, &run_dir), InitOptions {
-            run_id:            test_run_id(),
             run_store:         run_store.into(),
             dry_run:           false,
             emitter:           emitter.clone(),
@@ -1231,7 +1226,6 @@ mod tests {
         store_logger.register(&emitter);
 
         let initialized = initialize(persisted, InitOptions {
-            run_id:            test_run_id(),
             run_store:         run_store.into(),
             dry_run:           false,
             emitter:           emitter.clone(),
@@ -1370,7 +1364,6 @@ mod tests {
 
         let emitter = Arc::new(crate::event::Emitter::new(test_run_id()));
         let result = initialize(persisted, InitOptions {
-            run_id: test_run_id(),
             run_store: {
                 let store = memory_store();
                 let inner = store.create_run(&test_run_id()).await.unwrap();

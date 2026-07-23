@@ -249,7 +249,6 @@ pub struct SandboxEnvSpec {
 }
 
 pub struct InitOptions {
-    pub run_id:            RunId,
     pub run_store:         RunStoreHandle,
     pub dry_run:           bool,
     pub emitter:           Arc<Emitter>,
