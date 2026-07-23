@@ -546,7 +546,7 @@ impl RunProjectionReducer for RunProjection {
                 stage.state = StageState::from(outcome);
             }
             EventBody::TodoCreated(props) => {
-                if !should_project_stage_todo_event(stored, props.list_kind) {
+                if !should_project_root_agent_todo_event(stored, props.list_kind) {
                     return Ok(());
                 }
                 let Some(stage) = stage_at_stored_or_current_visit(self, stored, event.seq) else {
@@ -555,7 +555,7 @@ impl RunProjectionReducer for RunProjection {
                 apply_todo_created(stage, props);
             }
             EventBody::TodoUpdated(props) => {
-                if !should_project_stage_todo_event(stored, props.list_kind) {
+                if !should_project_root_agent_todo_event(stored, props.list_kind) {
                     return Ok(());
                 }
                 let Some(stage) = stage_at_stored_or_current_visit(self, stored, event.seq) else {
@@ -564,7 +564,7 @@ impl RunProjectionReducer for RunProjection {
                 apply_todo_updated(stage, props);
             }
             EventBody::TodoDeleted(props) => {
-                if !should_project_stage_todo_event(stored, props.list_kind) {
+                if !should_project_root_agent_todo_event(stored, props.list_kind) {
                     return Ok(());
                 }
                 let Some(stage) = stage_at_stored_or_current_visit(self, stored, event.seq) else {
@@ -690,32 +690,37 @@ impl RunProjectionReducer for RunProjection {
     }
 }
 
-/// Decide whether a TODO event should mutate `StageProjection.todos`.
+/// Decide whether a TODO event should mutate
+/// `StageProjection.root_agent_todos`.
 ///
 /// OpenAI plan lists are scoped per agent session (`openai_plan:<session_id>`),
 /// so a child/subagent session emits its own list events on the same stage.
-/// The stage sidebar represents the root stage agent, so child OpenAI plan
-/// events do not belong in this projection. Anthropic task lists are
-/// root-scoped (`anthropic_tasks:<root_session_id>`) and intentionally shared
-/// with subagents, so they always project.
-fn should_project_stage_todo_event(stored: &RunEvent, list_kind: TodoListKind) -> bool {
-    let is_child_openai_plan_event =
-        matches!(list_kind, TodoListKind::OpenAiPlan) && stored.parent_session_id.is_some();
-    !is_child_openai_plan_event
+/// The root-agent projection excludes those child plans, while the underlying
+/// events remain in the run event log. Anthropic task lists are root-scoped
+/// (`anthropic_tasks:<root_session_id>`) and intentionally shared with
+/// subagents, so they always project.
+fn should_project_root_agent_todo_event(stored: &RunEvent, list_kind: TodoListKind) -> bool {
+    match list_kind {
+        TodoListKind::OpenAiPlan => stored.parent_session_id.is_none(),
+        TodoListKind::AnthropicTasks => true,
+    }
 }
 
 fn apply_todo_created(stage: &mut StageProjection, props: &TodoCreatedProps) {
     if stage
-        .todos
+        .root_agent_todos
         .as_ref()
         .is_none_or(|list| list.list_id != props.list_id || list.kind != props.list_kind)
     {
-        stage.todos = Some(TodoListProjection::new(
+        stage.root_agent_todos = Some(TodoListProjection::new(
             props.list_kind,
             props.list_id.clone(),
         ));
     }
-    let list = stage.todos.as_mut().expect("todo list was just inserted");
+    let list = stage
+        .root_agent_todos
+        .as_mut()
+        .expect("todo list was just inserted");
     list.upsert(TodoProjection {
         id:          props.todo_id.clone(),
         status:      props.status,
@@ -732,7 +737,7 @@ fn apply_todo_created(stage: &mut StageProjection, props: &TodoCreatedProps) {
 
 fn apply_todo_updated(stage: &mut StageProjection, props: &TodoUpdatedProps) {
     if let Some(list) = stage
-        .todos
+        .root_agent_todos
         .as_mut()
         .filter(|list| list.list_id == props.list_id)
     {
@@ -742,7 +747,7 @@ fn apply_todo_updated(stage: &mut StageProjection, props: &TodoUpdatedProps) {
 
 fn apply_todo_deleted(stage: &mut StageProjection, props: &TodoDeletedProps) {
     let Some(list) = stage
-        .todos
+        .root_agent_todos
         .as_mut()
         .filter(|list| list.list_id == props.list_id)
     else {
@@ -750,7 +755,7 @@ fn apply_todo_deleted(stage: &mut StageProjection, props: &TodoDeletedProps) {
     };
     list.remove(&props.todo_id);
     if list.items.is_empty() {
-        stage.todos = None;
+        stage.root_agent_todos = None;
     }
 }
 
@@ -4450,11 +4455,14 @@ mod tests {
             StageId::new("code", 1)
         }
 
-        fn stage_todos<'a>(state: &'a RunProjection, stage_id: &StageId) -> &'a TodoListProjection {
+        fn root_agent_todos<'a>(
+            state: &'a RunProjection,
+            stage_id: &StageId,
+        ) -> &'a TodoListProjection {
             state
                 .stage(stage_id)
-                .and_then(|stage| stage.todos.as_ref())
-                .expect("stage todos present")
+                .and_then(|stage| stage.root_agent_todos.as_ref())
+                .expect("root agent todos present")
         }
 
         fn child_stage_event(seq: u32, body: EventBody, stage_id: StageId) -> EventEnvelope {
@@ -4544,7 +4552,7 @@ mod tests {
                 ))
                 .unwrap();
 
-            let projection = stage_todos(&state, &stage_id);
+            let projection = root_agent_todos(&state, &stage_id);
             assert_eq!(projection.list_id, list);
             assert_eq!(projection.items.len(), 2);
             assert_eq!(projection.items[0].id, "a");
@@ -4579,7 +4587,7 @@ mod tests {
                 ))
                 .unwrap();
 
-            let projection = stage_todos(&state, &stage_id);
+            let projection = root_agent_todos(&state, &stage_id);
             assert_eq!(projection.items.len(), 1);
             assert_eq!(projection.items[0].id, "b");
         }
@@ -4618,9 +4626,12 @@ mod tests {
                 ))
                 .unwrap();
 
-            assert_eq!(stage_todos(&state, &plan_one).items[0].subject, "p1");
-            assert_eq!(stage_todos(&state, &plan_two).items[0].subject, "p2");
-            assert_eq!(stage_todos(&state, &claude).items[0].subject, "claude task");
+            assert_eq!(root_agent_todos(&state, &plan_one).items[0].subject, "p1");
+            assert_eq!(root_agent_todos(&state, &plan_two).items[0].subject, "p2");
+            assert_eq!(
+                root_agent_todos(&state, &claude).items[0].subject,
+                "claude task"
+            );
         }
 
         #[test]
@@ -4706,7 +4717,7 @@ mod tests {
                 ))
                 .unwrap();
 
-            let projection = stage_todos(&state, &stage_id);
+            let projection = root_agent_todos(&state, &stage_id);
             assert_eq!(projection.list_id, root_list);
             assert_eq!(projection.kind, TodoListKind::OpenAiPlan);
             assert_eq!(projection.items.len(), 2);
@@ -4743,9 +4754,54 @@ mod tests {
 
             let stage = state.stage(&stage_id).expect("stage projection present");
             assert!(
-                stage.todos.is_none(),
+                stage.root_agent_todos.is_none(),
                 "a child session's plan must not become the stage's root plan"
             );
+        }
+
+        #[test]
+        fn root_openai_plan_projects_after_earlier_child_plan_event() {
+            let mut state = initialized_projection();
+            let stage_id = stage_id();
+            let root_list = "openai_plan:root_session";
+            state
+                .apply_event(&test_stage_event(
+                    1,
+                    EventBody::StageStarted(started_props()),
+                    stage_id.clone(),
+                ))
+                .unwrap();
+            state
+                .apply_event(&child_stage_event(
+                    2,
+                    created(
+                        "openai_plan:child_session",
+                        TodoListKind::OpenAiPlan,
+                        "child-a",
+                        0,
+                        "child work",
+                    ),
+                    stage_id.clone(),
+                ))
+                .unwrap();
+            state
+                .apply_event(&test_stage_event(
+                    3,
+                    created(
+                        root_list,
+                        TodoListKind::OpenAiPlan,
+                        "root-a",
+                        0,
+                        "root work",
+                    ),
+                    stage_id.clone(),
+                ))
+                .unwrap();
+
+            let projection = root_agent_todos(&state, &stage_id);
+            assert_eq!(projection.list_id, root_list);
+            assert_eq!(projection.items.len(), 1);
+            assert_eq!(projection.items[0].subject, "root work");
         }
 
         #[test]
@@ -4779,7 +4835,7 @@ mod tests {
                 ))
                 .unwrap();
 
-            let projection = stage_todos(&state, &stage_id);
+            let projection = root_agent_todos(&state, &stage_id);
             assert_eq!(projection.list_id, list);
             assert_eq!(projection.kind, TodoListKind::AnthropicTasks);
             assert_eq!(projection.items.len(), 1);
@@ -4845,7 +4901,7 @@ mod tests {
                 ))
                 .unwrap();
 
-            let todo = &stage_todos(&state, &stage_id).items[0];
+            let todo = &root_agent_todos(&state, &stage_id).items[0];
             assert!(!todo.metadata.contains_key("k1"));
             assert_eq!(todo.metadata.get("k2"), Some(&serde_json::json!("v2")));
         }

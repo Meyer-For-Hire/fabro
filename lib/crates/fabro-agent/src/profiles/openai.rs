@@ -229,6 +229,11 @@ and focused on the task.
 {file_edit_failure_guidance}
 - Do not `git commit` your changes or create new git branches unless explicitly requested.
 
+# Planning
+
+If you create a checklist or task list, you update item statuses incrementally as each item is \
+completed rather than marking every item done only at the end.
+
 # Validating Your Work
 
 If the codebase has tests or the ability to build or run, consider using them to verify your \
@@ -336,6 +341,17 @@ mod tests {
         let prompt = profile.build_system_prompt(&env, &EnvContext::default(), &[], None, &[]);
         assert!(prompt.contains("clean, maintainable code"));
         assert!(prompt.contains("existing code conventions"));
+    }
+
+    #[test]
+    fn openai_system_prompt_matches_codex_incremental_plan_guidance() {
+        let profile = OpenAiProfile::new("gpt-5.5");
+        let env = MockSandbox::linux();
+        let prompt = profile.build_system_prompt(&env, &EnvContext::default(), &[], None, &[]);
+        assert!(prompt.contains(
+            "update item statuses incrementally as each item is completed rather than \
+                 marking every item done only at the end"
+        ));
     }
 
     #[test]
