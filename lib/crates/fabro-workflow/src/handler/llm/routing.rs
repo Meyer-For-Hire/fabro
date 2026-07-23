@@ -58,6 +58,11 @@ pub(crate) fn resolve_provider_context(
             })?
             .id
             .clone()
+    } else if catalog
+        .get_on_provider(default_provider_id, model)
+        .is_some()
+    {
+        default_provider_id.clone()
     } else {
         // The run's selected provider is a pin, matching transform-time
         // semantics: a selector the pinned provider does not offer passes

@@ -2666,6 +2666,33 @@ reasoning = false
     }
 
     #[test]
+    fn api_backend_preserves_default_provider_for_legacy_model_identifier() {
+        let settings: LlmCatalogSettings = toml::from_str(
+            r"
+[providers.openrouter]
+enabled = true
+",
+        )
+        .unwrap();
+        let catalog = Arc::new(Catalog::from_builtin_with_overrides(&settings).unwrap());
+        let backend = AgentApiBackend::new_with_catalog(
+            "openai/gpt-5.4".to_string(),
+            ProviderId::from("openrouter"),
+            Vec::new(),
+            Arc::new(EnvCredentialSource::new()),
+            SteeringHub::for_tests(),
+            catalog,
+        );
+
+        let provider = backend
+            .resolve_provider_context("openai/gpt-5.4", None)
+            .unwrap();
+
+        assert_eq!(provider.provider_id, ProviderId::from("openrouter"));
+        assert_eq!(provider.profile_kind, AgentProfileKind::OpenAi);
+    }
+
+    #[test]
     fn run_model_controls_apply_when_node_omits_controls() {
         let backend = AgentApiBackend::new_from_env(
             "gpt-5.4".to_string(),

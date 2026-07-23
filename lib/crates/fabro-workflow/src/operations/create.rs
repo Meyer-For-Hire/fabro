@@ -1462,11 +1462,11 @@ reasoning = false
     }
 
     #[tokio::test]
-    async fn create_materializes_shared_alias_for_ready_provider_snapshot_and_pin() {
-        const ALIAS_DOT: &str = r#"digraph Test {
+    async fn create_materializes_portable_selectors_for_ready_provider_snapshot_and_pin() {
+        const MODEL_DOT: &str = r#"digraph Test {
             graph [goal="Test"]
             start [shape=Mdiamond]
-            work [prompt="Do work", model="gpt-56-sol"]
+            work [prompt="Do work", model="MODEL_SELECTOR"]
             exit [shape=Msquare]
             start -> work -> exit
         }"#;
@@ -1490,65 +1490,94 @@ reasoning = false
             ),
         ];
 
-        for (ready, explicit_provider, expected_provider) in cases {
-            let dir = tempfile::tempdir().unwrap();
-            let mut settings = test_default_settings();
-            settings.run.model.name = Some("gpt-56-sol".to_string());
-            settings.run.model.provider = explicit_provider.map(str::to_string);
-            let store = memory_store();
-            let created = create(
-                store.as_ref(),
-                CreateRunInput {
-                    workflow: WorkflowInput::DotSource {
-                        source:   ALIAS_DOT.to_string(),
-                        base_dir: None,
+        for selector in ["gpt-56-sol", "openai/gpt-5.6-sol"] {
+            for (ready, explicit_provider, expected_provider) in &cases {
+                let dir = tempfile::tempdir().unwrap();
+                let mut settings = test_default_settings();
+                settings.run.model.name = Some(selector.to_string());
+                settings.run.model.provider = explicit_provider.map(str::to_string);
+                let store = memory_store();
+                let created = create(
+                    store.as_ref(),
+                    CreateRunInput {
+                        workflow: WorkflowInput::DotSource {
+                            source:   MODEL_DOT.replace("MODEL_SELECTOR", selector),
+                            base_dir: None,
+                        },
+                        settings,
+                        vars: HashMap::new(),
+                        cwd: dir.path().to_path_buf(),
+                        workflow_slug: None,
+                        workflow_path: None,
+                        workflow_bundle: None,
+                        submitted_manifest_bytes: None,
+                        run_id: None,
+                        title: None,
+                        automation: None,
+                        git: None,
+                        fork_source_ref: None,
+                        parent_id: None,
+                        provenance: test_support::test_run_provenance(),
+                        configured_providers: ready.clone(),
+                        web_url: None,
                     },
-                    settings,
-                    vars: HashMap::new(),
-                    cwd: dir.path().to_path_buf(),
-                    workflow_slug: None,
-                    workflow_path: None,
-                    workflow_bundle: None,
-                    submitted_manifest_bytes: None,
-                    run_id: None,
-                    title: None,
-                    automation: None,
-                    git: None,
-                    fork_source_ref: None,
-                    parent_id: None,
-                    provenance: test_support::test_run_provenance(),
-                    configured_providers: ready,
-                    web_url: None,
-                },
-                dir.path().join("storage"),
-                Arc::clone(&catalog),
-            )
-            .await
-            .unwrap();
-            let run_spec = created.persisted.run_spec();
+                    dir.path().join("storage"),
+                    Arc::clone(&catalog),
+                )
+                .await
+                .unwrap();
+                let run_spec = created.persisted.run_spec();
 
-            assert_eq!(
-                run_spec.settings.run.model.name.as_deref(),
-                Some("gpt-5.6-sol")
-            );
-            assert_eq!(
-                run_spec.settings.run.model.provider.as_deref(),
-                Some(expected_provider.as_str())
-            );
-            assert_eq!(
-                run_spec.graph.nodes["work"]
-                    .attrs
-                    .get("model")
-                    .and_then(AttrValue::as_str),
-                Some("gpt-5.6-sol")
-            );
-            assert_eq!(
-                run_spec.graph.nodes["work"]
-                    .attrs
-                    .get("provider")
-                    .and_then(AttrValue::as_str),
-                Some(expected_provider.as_str())
-            );
+                assert_eq!(
+                    run_spec.settings.run.model.name.as_deref(),
+                    Some("gpt-5.6-sol"),
+                    "{selector}"
+                );
+                assert_eq!(
+                    run_spec.settings.run.model.provider.as_deref(),
+                    Some(expected_provider.as_str()),
+                    "{selector}"
+                );
+                assert_eq!(
+                    run_spec.graph.nodes["work"]
+                        .attrs
+                        .get("model")
+                        .and_then(AttrValue::as_str),
+                    Some("gpt-5.6-sol"),
+                    "{selector}"
+                );
+                assert_eq!(
+                    run_spec.graph.nodes["work"]
+                        .attrs
+                        .get("provider")
+                        .and_then(AttrValue::as_str),
+                    Some(expected_provider.as_str()),
+                    "{selector}"
+                );
+
+                let run_store = store.open_run(&created.run_id).await.unwrap();
+                let run_store = run_store.into();
+                let reloaded = Persisted::load_from_store(&run_store, &created.run_dir)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    reloaded.run_spec().settings.run.model.provider.as_deref(),
+                    Some(expected_provider.as_str()),
+                    "{selector}"
+                );
+                assert_eq!(
+                    reloaded.run_spec().graph.nodes["work"]
+                        .attrs
+                        .get("provider")
+                        .and_then(AttrValue::as_str),
+                    Some(expected_provider.as_str()),
+                    "{selector}"
+                );
+                assert!(
+                    reloaded.source().contains(selector),
+                    "persisted source should preserve the user's selector '{selector}'"
+                );
+            }
         }
     }
 

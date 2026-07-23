@@ -188,13 +188,33 @@ impl SessionMessage {
 
 #[cfg(test)]
 mod tests {
+    use chrono::Utc;
     use serde_json::json;
 
-    use super::SessionStatus;
+    use super::{SessionId, SessionRecord, SessionStatus};
+    use crate::fixtures;
 
     #[test]
     fn session_status_rejects_removed_terminal_states() {
         assert!(serde_json::from_value::<SessionStatus>(json!("closed")).is_err());
         assert!(serde_json::from_value::<SessionStatus>(json!("deleted")).is_err());
+    }
+
+    #[test]
+    fn session_record_deserializes_legacy_json_without_provider() {
+        let mut value = serde_json::to_value(SessionRecord::new(
+            SessionId::new(),
+            fixtures::RUN_1,
+            Utc::now(),
+        ))
+        .unwrap();
+        value
+            .as_object_mut()
+            .expect("session record should serialize as an object")
+            .remove("provider");
+
+        let record: SessionRecord = serde_json::from_value(value).unwrap();
+
+        assert_eq!(record.provider, None);
     }
 }
