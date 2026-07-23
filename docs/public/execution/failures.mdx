@@ -224,7 +224,11 @@ Failure signature counts are never reset on success. This is intentional — it 
 
 ### Loop restart edges
 
-Edges marked with `loop_restart=true` trigger a special restart of the workflow from the target node. These have an additional guard: only `transient_infra` failures may cross a `loop_restart` edge. If the failure class is anything else, the run is terminated:
+Taking an edge marked with `loop_restart=true` restarts the workflow from the edge's target node. A restart is more than a jump: the completed-stage history, per-node outcomes, and retry counts are cleared, and the run context is replaced with a **fresh, empty context** — the target node starts over as if the run had just begun there, with no preamble of prior stages. Node visit counts are the one thing preserved, so `max_visits` and `max_node_visits` still bound how many times a restart loop can run.
+
+A **successful** outcome may take a `loop_restart` edge freely. This is the "start another round from a clean slate" pattern — for example, a self-loop that begins a fresh batch of work and re-derives its remaining work from the repository state rather than from accumulated context.
+
+A **failed** outcome faces an additional guard: only `transient_infra` failures may cross a `loop_restart` edge. If the failure class is anything else, the run is terminated:
 
 ```
 loop_restart blocked: failure_class=deterministic (requires transient_infra)

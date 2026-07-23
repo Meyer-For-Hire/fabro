@@ -8,9 +8,11 @@ mod fidelity_valid;
 mod freeform_edge_count;
 mod goal_gate_has_retry;
 mod import_error;
+mod inert_attribute;
 mod model_support;
 mod node_model_known;
 mod orphan_custom_outcome;
+mod parallel_branch_inert_attribute;
 mod prompt_on_llm_nodes;
 mod random_selection_no_conditions;
 mod reachability;
@@ -60,6 +62,8 @@ pub fn built_in_rules() -> Vec<Box<dyn LintRule>> {
         thread_id_requires_fidelity_full::rule(),
         selection_valid::rule(),
         random_selection_no_conditions::rule(),
+        inert_attribute::rule(),
+        parallel_branch_inert_attribute::rule(),
     ]
 }
 
