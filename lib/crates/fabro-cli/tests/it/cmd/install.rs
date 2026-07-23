@@ -338,10 +338,16 @@ fn keep_existing_settings_persists_secrets_without_rewriting_server_target() {
     let mut context = test_context!();
     let storage_dir = context.temp_dir.join("install-storage");
     context.manage_storage_dir(&storage_dir);
-    let existing_web_url = unused_loopback_web_url();
-    let requested_web_url = unused_loopback_web_url();
-    write_http_install_settings(&context, &storage_dir, &existing_web_url, "keep-me");
-    login_with_storage_dev_token(&context, &storage_dir, &existing_web_url);
+    let socket_path = context.temp_dir.join("install-storage.sock");
+    let existing_web_url = "https://existing.example.test".to_string();
+    let requested_web_url = "https://requested.example.test".to_string();
+    write_unix_install_settings(
+        &context,
+        &storage_dir,
+        &socket_path,
+        &existing_web_url,
+        "keep-me",
+    );
 
     let path = fake_gh_path(&context, "ghp_keep_existing");
     let output = context
@@ -382,15 +388,19 @@ fn keep_existing_settings_persists_secrets_without_rewriting_server_target() {
             .and_then(toml::Value::as_str),
         Some(existing_web_url.as_str())
     );
+    let target = parsed
+        .get("cli")
+        .and_then(toml::Value::as_table)
+        .and_then(|cli| cli.get("target"))
+        .and_then(toml::Value::as_table)
+        .expect("cli.target should remain configured");
     assert_eq!(
-        parsed
-            .get("cli")
-            .and_then(toml::Value::as_table)
-            .and_then(|cli| cli.get("target"))
-            .and_then(toml::Value::as_table)
-            .and_then(|target| target.get("url"))
-            .and_then(toml::Value::as_str),
-        Some(existing_web_url.as_str())
+        target.get("type").and_then(toml::Value::as_str),
+        Some("unix")
+    );
+    assert_eq!(
+        target.get("path").and_then(toml::Value::as_str),
+        socket_path.to_str()
     );
     assert!(
         !settings.contains(&requested_web_url),
@@ -869,6 +879,53 @@ mode = "{}"
             web_url,
             address,
             web_url,
+            metadata_mode
+        ),
+    );
+}
+
+fn write_unix_install_settings(
+    context: &fabro_test::TestContext,
+    storage_dir: &std::path::Path,
+    socket_path: &std::path::Path,
+    web_url: &str,
+    metadata_mode: &str,
+) {
+    write_raw_home_settings(
+        context,
+        &format!(
+            r#"
+_version = 1
+
+[server.storage]
+root = "{}"
+
+[server.api]
+url = "{}/api/v1"
+
+[server.web]
+enabled = true
+url = "{}"
+
+[server.auth]
+methods = ["dev-token"]
+
+[server.listen]
+type = "unix"
+path = "{}"
+
+[cli.target]
+type = "unix"
+path = "{}"
+
+[project.metadata]
+mode = "{}"
+"#,
+            storage_dir.display(),
+            web_url,
+            web_url,
+            socket_path.display(),
+            socket_path.display(),
             metadata_mode
         ),
     );
