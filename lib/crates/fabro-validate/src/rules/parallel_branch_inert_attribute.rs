@@ -16,11 +16,29 @@ const BRANCH_IGNORED_ATTRS: &[&str] = &["fidelity", "thread_id"];
 
 struct Rule;
 
-fn fix_message(attr: &str, parallel_id: &str) -> String {
+/// Renders one or more parallel-node ids as `'a'` or `'a', 'b'`.
+fn quoted_list(ids: &[String]) -> String {
+    ids.iter()
+        .map(|id| format!("'{id}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn fix_message(attr: &str, parallel_ids: &[String]) -> String {
     match attr {
-        "fidelity" => format!(
-            "Set fidelity on the parallel node '{parallel_id}' (or its incoming edge) to control what every branch sees"
-        ),
+        "fidelity" => {
+            if parallel_ids.len() == 1 {
+                format!(
+                    "Set fidelity on the parallel node {} (or its incoming edge) to control what every branch sees",
+                    quoted_list(parallel_ids),
+                )
+            } else {
+                format!(
+                    "Set fidelity on the parallel nodes {} (or their incoming edges) to control what every branch sees",
+                    quoted_list(parallel_ids),
+                )
+            }
+        }
         _ => format!("Remove '{attr}': parallel branches never join conversation threads"),
     }
 }
@@ -62,7 +80,7 @@ impl LintRule for Rule {
                     ),
                     node_id: None,
                     edge: Some((edge.from.clone(), edge.to.clone())),
-                    fix: Some(fix_message(attr, &edge.from)),
+                    fix: Some(fix_message(attr, std::slice::from_ref(&edge.from))),
                     ..Diagnostic::default()
                 });
             }
@@ -90,11 +108,14 @@ impl LintRule for Rule {
             let Some(node) = graph.nodes.get(target) else {
                 continue;
             };
-            let parallel_id = graph
+            let parents: Vec<String> = graph
                 .edges
                 .iter()
-                .find(|e| e.to == target && parallel_ids.contains(e.from.as_str()))
-                .map_or_else(String::new, |e| e.from.clone());
+                .filter(|e| e.to == target && parallel_ids.contains(e.from.as_str()))
+                .map(|e| e.from.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
             for attr in BRANCH_IGNORED_ATTRS {
                 if !node.attrs.contains_key(*attr) {
                     continue;
@@ -103,12 +124,13 @@ impl LintRule for Rule {
                     rule: self.name().to_string(),
                     severity: Severity::Warning,
                     message: format!(
-                        "Node '{}' sets '{attr}', but it only runs as a parallel branch (of '{parallel_id}'), where '{attr}' is ignored: branches receive the context snapshot taken when the parallel node started",
+                        "Node '{}' sets '{attr}', but it only runs as a parallel branch (of {}), where '{attr}' is ignored: branches receive the context snapshot taken when the parallel node started",
                         node.id,
+                        quoted_list(&parents),
                     ),
                     node_id: Some(node.id.clone()),
                     edge: None,
-                    fix: Some(fix_message(attr, &parallel_id)),
+                    fix: Some(fix_message(attr, &parents)),
                     ..Diagnostic::default()
                 });
             }
@@ -219,6 +241,29 @@ mod tests {
                 AttrValue::String("truncate".to_string()),
             );
         assert!(Rule.apply(&g).is_empty());
+    }
+
+    #[test]
+    fn names_every_parallel_parent_of_a_shared_branch_node() {
+        let mut g = parallel_graph();
+        g.nodes
+            .insert("fork2".to_string(), shaped_node("fork2", "component"));
+        g.edges.push(Edge::new("start", "fork2"));
+        g.edges.push(Edge::new("fork2", "branch_a"));
+        g.nodes
+            .get_mut("branch_a")
+            .expect("graph has branch_a")
+            .attrs
+            .insert(
+                "fidelity".to_string(),
+                AttrValue::String("truncate".to_string()),
+            );
+        let d = Rule.apply(&g);
+        assert_eq!(d.len(), 1);
+        assert!(d[0].message.contains("'fork', 'fork2'"));
+        let fix = d[0].fix.as_deref().expect("diagnostic has a fix");
+        assert!(fix.contains("'fork', 'fork2'"));
+        assert!(fix.contains("parallel nodes"));
     }
 
     #[test]
