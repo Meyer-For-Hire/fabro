@@ -2136,6 +2136,131 @@ enabled = true
     }
 
     #[test]
+    fn builtin_openrouter_includes_gpt_5_6_and_current_claude_models_when_enabled() {
+        let catalog = Catalog::from_builtin_with_overrides(&minimal_settings(
+            r"
+[providers.openrouter]
+enabled = true
+",
+        ))
+        .expect("enabled OpenRouter override should build from the built-in provider settings");
+
+        let expected = [
+            (
+                "openai/gpt-5.6-sol",
+                "openai/gpt-5.6-sol",
+                "gpt-5",
+                1_050_000,
+                5.0,
+                30.0,
+                0.5,
+                ReasoningEffortFeature::Levels,
+                false,
+                BillingPolicy::OpenAi,
+            ),
+            (
+                "openai/gpt-5.6-terra",
+                "openai/gpt-5.6-terra",
+                "gpt-5",
+                1_050_000,
+                2.5,
+                15.0,
+                0.25,
+                ReasoningEffortFeature::Levels,
+                false,
+                BillingPolicy::OpenAi,
+            ),
+            (
+                "openai/gpt-5.6-luna",
+                "openai/gpt-5.6-luna",
+                "gpt-5",
+                1_050_000,
+                1.0,
+                6.0,
+                0.1,
+                ReasoningEffortFeature::Levels,
+                false,
+                BillingPolicy::OpenAi,
+            ),
+            (
+                "anthropic/claude-opus-4-8",
+                "anthropic/claude-opus-4.8",
+                "claude-4",
+                1_000_000,
+                5.0,
+                25.0,
+                0.5,
+                ReasoningEffortFeature::Levels,
+                false,
+                BillingPolicy::Anthropic,
+            ),
+            (
+                "anthropic/claude-fable-5",
+                "anthropic/claude-fable-5",
+                "claude-5",
+                1_000_000,
+                10.0,
+                50.0,
+                1.0,
+                ReasoningEffortFeature::AlwaysAdaptive,
+                false,
+                BillingPolicy::Anthropic,
+            ),
+        ];
+
+        for (
+            id,
+            api_id,
+            family,
+            context_window,
+            input_cost,
+            output_cost,
+            cache_input_cost,
+            reasoning_effort,
+            sampling_params,
+            billing_policy,
+        ) in expected
+        {
+            let model = catalog
+                .get(id)
+                .unwrap_or_else(|| panic!("OpenRouter model '{id}' should be present"));
+            assert_eq!(model.provider, ProviderId::new("openrouter"), "{id}");
+            assert_eq!(model.family, family, "{id}");
+            assert_eq!(model.limits.context_window, context_window, "{id}");
+            assert_eq!(model.limits.max_output, Some(128_000), "{id}");
+            assert!(model.features.tools, "{id}");
+            assert!(model.features.vision, "{id}");
+            assert!(model.features.reasoning, "{id}");
+            assert!(model.features.prompt_cache, "{id}");
+            assert_eq!(model.features.reasoning_effort, reasoning_effort, "{id}");
+            assert_eq!(model.features.sampling_params, sampling_params, "{id}");
+            assert_eq!(model.costs.input_cost_per_mtok, Some(input_cost), "{id}");
+            assert_eq!(model.costs.output_cost_per_mtok, Some(output_cost), "{id}");
+            assert_eq!(
+                model.costs.cache_input_cost_per_mtok,
+                Some(cache_input_cost),
+                "{id}"
+            );
+
+            let settings = catalog
+                .model_settings(id)
+                .unwrap_or_else(|| panic!("OpenRouter settings for '{id}' should be present"));
+            assert_eq!(settings.api_id, api_id, "{id}");
+            assert_eq!(settings.billing_policy, billing_policy, "{id}");
+            assert_eq!(
+                catalog.get(api_id).map(|model| model.id.as_str()),
+                Some(id),
+                "{id}"
+            );
+            assert_eq!(
+                settings.controls.reasoning_effort,
+                ReasoningEffort::VARIANTS,
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
     fn builtin_openrouter_includes_glm_5_2_when_enabled() {
         let catalog = Catalog::from_builtin_with_overrides(&minimal_settings(
             r"

@@ -33,6 +33,57 @@ credentials = ["env:OPENROUTER_API_KEY", "vault:OPENROUTER_API_KEY"]
 # best-effort estimates; OpenRouter returns the authoritative usage.cost
 # in-band on every response.
 
+[models."anthropic/claude-fable-5"]
+provider = "openrouter"
+api_id = "anthropic/claude-fable-5"
+display_name = "Claude Fable 5 (via OpenRouter)"
+family = "claude-5"
+billing_policy = "anthropic"
+
+[models."anthropic/claude-fable-5".limits]
+context_window = 1000000
+max_output = 128000
+
+[models."anthropic/claude-fable-5".features]
+tools = true
+vision = true
+reasoning = true
+reasoning_effort = "always_adaptive"
+prompt_cache = true
+sampling_params = false
+
+[models."anthropic/claude-fable-5".costs]
+input_cost_per_mtok = 10.0
+output_cost_per_mtok = 50.0
+cache_input_cost_per_mtok = 1.0
+
+[models."anthropic/claude-opus-4-8"]
+provider = "openrouter"
+api_id = "anthropic/claude-opus-4.8"
+display_name = "Claude Opus 4.8 (via OpenRouter)"
+family = "claude-4"
+billing_policy = "anthropic"
+training = "2026-01-01"
+knowledge_cutoff = "Jan 2026"
+aliases = ["anthropic/claude-opus-4.8"]
+
+[models."anthropic/claude-opus-4-8".limits]
+context_window = 1000000
+max_output = 128000
+
+[models."anthropic/claude-opus-4-8".features]
+tools = true
+vision = true
+reasoning = true
+reasoning_effort = "levels"
+prompt_cache = true
+sampling_params = false
+
+[models."anthropic/claude-opus-4-8".costs]
+input_cost_per_mtok = 5.0
+output_cost_per_mtok = 25.0
+cache_input_cost_per_mtok = 0.5
+
 [models."anthropic/claude-opus-4-7"]
 provider = "openrouter"
 api_id = "anthropic/claude-opus-4.7"
@@ -102,6 +153,85 @@ output_cost_per_mtok = 5.0
 cache_input_cost_per_mtok = 0.1
 
 # ---------- OpenAI via OpenRouter ----------
+
+# GPT-5.6 entries use OpenRouter's base rates below the 272k-token
+# long-context threshold. Authoritative in-band usage.cost covers
+# long-context and cache-write pricing.
+
+[models."openai/gpt-5.6-sol"]
+provider = "openrouter"
+api_id = "openai/gpt-5.6-sol"
+display_name = "GPT-5.6 Sol (via OpenRouter)"
+family = "gpt-5"
+training = "2026-02-16"
+knowledge_cutoff = "February 16, 2026"
+
+[models."openai/gpt-5.6-sol".limits]
+context_window = 1050000
+max_output = 128000
+
+[models."openai/gpt-5.6-sol".features]
+tools = true
+vision = true
+reasoning = true
+reasoning_effort = "levels"
+prompt_cache = true
+sampling_params = false
+
+[models."openai/gpt-5.6-sol".costs]
+input_cost_per_mtok = 5.0
+output_cost_per_mtok = 30.0
+cache_input_cost_per_mtok = 0.5
+
+[models."openai/gpt-5.6-terra"]
+provider = "openrouter"
+api_id = "openai/gpt-5.6-terra"
+display_name = "GPT-5.6 Terra (via OpenRouter)"
+family = "gpt-5"
+training = "2026-02-16"
+knowledge_cutoff = "February 16, 2026"
+
+[models."openai/gpt-5.6-terra".limits]
+context_window = 1050000
+max_output = 128000
+
+[models."openai/gpt-5.6-terra".features]
+tools = true
+vision = true
+reasoning = true
+reasoning_effort = "levels"
+prompt_cache = true
+sampling_params = false
+
+[models."openai/gpt-5.6-terra".costs]
+input_cost_per_mtok = 2.5
+output_cost_per_mtok = 15.0
+cache_input_cost_per_mtok = 0.25
+
+[models."openai/gpt-5.6-luna"]
+provider = "openrouter"
+api_id = "openai/gpt-5.6-luna"
+display_name = "GPT-5.6 Luna (via OpenRouter)"
+family = "gpt-5"
+training = "2026-02-16"
+knowledge_cutoff = "February 16, 2026"
+
+[models."openai/gpt-5.6-luna".limits]
+context_window = 1050000
+max_output = 128000
+
+[models."openai/gpt-5.6-luna".features]
+tools = true
+vision = true
+reasoning = true
+reasoning_effort = "levels"
+prompt_cache = true
+sampling_params = false
+
+[models."openai/gpt-5.6-luna".costs]
+input_cost_per_mtok = 1.0
+output_cost_per_mtok = 6.0
+cache_input_cost_per_mtok = 0.1
 
 [models."openai/gpt-5.4"]
 provider = "openrouter"
