@@ -1,4 +1,4 @@
-use fabro_graphviz::graph::Graph;
+use fabro_graphviz::graph::{self, Graph};
 
 use crate::{Diagnostic, LintRule, Severity};
 
@@ -39,6 +39,9 @@ impl LintRule for Rule {
             let Some(handler) = node.handler_type() else {
                 continue;
             };
+            if !graph::is_known_handler_type(handler) {
+                continue;
+            }
             for (attr, consumers) in HANDLER_SPECIFIC_ATTRS {
                 if !node.attrs.contains_key(*attr) {
                     continue;
@@ -215,6 +218,22 @@ mod tests {
             "odd".to_string(),
             node_with_attr("odd", "doubleoctagon", "script", "echo hi"),
         );
+        assert!(Rule.apply(&g).is_empty());
+    }
+
+    #[test]
+    fn ignores_handler_specific_attrs_on_unrecognized_explicit_types() {
+        let mut g = minimal_graph();
+        let mut node = Node::new("custom");
+        node.attrs.insert(
+            "type".to_string(),
+            AttrValue::String("custom.handler".to_string()),
+        );
+        node.attrs.insert(
+            "script".to_string(),
+            AttrValue::String("echo hi".to_string()),
+        );
+        g.nodes.insert("custom".to_string(), node);
         assert!(Rule.apply(&g).is_empty());
     }
 }

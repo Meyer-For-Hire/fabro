@@ -11,7 +11,7 @@ pub(super) fn rule() -> Box<dyn LintRule> {
 /// Attributes that parallel branch execution does not resolve. Branch nodes
 /// are dispatched with a snapshot of the context taken when the parallel node
 /// started, so per-branch `fidelity` never changes what a branch sees, and
-/// branches never join conversation threads regardless of `thread_id`.
+/// per-branch `thread_id` never replaces the thread inherited in that snapshot.
 const BRANCH_IGNORED_ATTRS: &[&str] = &["fidelity", "thread_id"];
 
 struct Rule;
@@ -39,7 +39,10 @@ fn fix_message(attr: &str, parallel_ids: &[String]) -> String {
                 )
             }
         }
-        _ => format!("Remove '{attr}': parallel branches never join conversation threads"),
+        "thread_id" => format!(
+            "Remove '{attr}': parallel branches inherit the thread resolved when the parallel node started"
+        ),
+        _ => format!("Remove '{attr}'"),
     }
 }
 
@@ -210,6 +213,12 @@ mod tests {
             Some(("fork".to_string(), "branch_a".to_string()))
         );
         assert!(d[0].message.contains("'thread_id'"));
+        assert_eq!(
+            d[0].fix.as_deref(),
+            Some(
+                "Remove 'thread_id': parallel branches inherit the thread resolved when the parallel node started"
+            )
+        );
     }
 
     #[test]
