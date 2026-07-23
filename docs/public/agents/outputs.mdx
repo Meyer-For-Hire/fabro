@@ -95,7 +95,7 @@ Agent nodes can provide routing directives through fallback files. Fabro checks 
 
 This fallback chain applies to normal routing extraction and to `output_schema="routing"`. For validated routing, Fabro only advances to the next source when the current source has no JSON object or no object with recognized routing fields. If the current source contains malformed routing JSON or valid JSON with wrong routing field types, validation fails and Fabro starts the repair loop instead.
 
-The last-file fallback only reads `.json` and `.md` files (case-insensitive), and the routing JSON must be the final standalone object in the file, followed only by whitespace. Fabro ignores other file types and routing JSON followed by any other content. These restrictions do not apply to the dedicated `status.json` fallback.
+The last-file fallback only reads `.json` and `.md` files (case-insensitive), and the routing JSON must be the final JSON object in the file, with only whitespace after it. Fabro ignores other file types and routing JSON followed by any other content. These restrictions do not apply to the dedicated `status.json` fallback.
 
 Prompt nodes do not use file fallbacks; they validate or extract routing directives from the response text only.
 

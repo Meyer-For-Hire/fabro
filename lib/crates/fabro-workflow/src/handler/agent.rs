@@ -183,6 +183,9 @@ async fn read_sandbox_file(sandbox: &Arc<dyn Sandbox>, path: &str) -> Option<Str
     sandbox.read_file_text(path).await.ok()
 }
 
+/// Extract the terminal JSON object from the last-touched file when it has an
+/// eligible extension. Does not check that the object contains routing fields;
+/// callers validate that.
 async fn read_last_file_routing_json(sandbox: &Arc<dyn Sandbox>, path: &str) -> Option<String> {
     let extension = Path::new(path).extension()?.to_str()?;
     if !LAST_FILE_ROUTING_EXTENSIONS
@@ -539,9 +542,17 @@ mod tests {
         }
     }
 
-    async fn execute_with_last_file(path: &str, contents: &str) -> Outcome {
+    fn sandbox_with_file(path: &str, contents: &str) -> (TempDir, Arc<dyn Sandbox>) {
         let sandbox_dir = TempDir::new().unwrap();
         std::fs::write(sandbox_dir.path().join(path), contents).unwrap();
+        let sandbox: Arc<dyn Sandbox> = Arc::new(fabro_agent::LocalSandbox::new(
+            sandbox_dir.path().to_path_buf(),
+        ));
+        (sandbox_dir, sandbox)
+    }
+
+    async fn execute_with_last_file(path: &str, contents: &str) -> Outcome {
+        let (_sandbox_dir, sandbox) = sandbox_with_file(path, contents);
 
         let handler = AgentHandler::new(Some(Box::new(LastFileBackend {
             path: path.to_string(),
@@ -552,12 +563,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
 
         let mut services = EngineServices::test_default();
-        services.run =
-            services
-                .run
-                .with_sandbox(std::sync::Arc::new(fabro_agent::LocalSandbox::new(
-                    sandbox_dir.path().to_path_buf(),
-                )));
+        services.run = services.run.with_sandbox(sandbox);
 
         handler
             .execute(&node, &context, &graph, tmp.path(), &services)
@@ -569,11 +575,7 @@ mod tests {
         path: &str,
         contents: &str,
     ) -> Result<ValidatedStructuredOutput, StructuredOutputError> {
-        let sandbox_dir = TempDir::new().unwrap();
-        std::fs::write(sandbox_dir.path().join(path), contents).unwrap();
-        let sandbox: Arc<dyn Sandbox> = Arc::new(fabro_agent::LocalSandbox::new(
-            sandbox_dir.path().to_path_buf(),
-        ));
+        let (_sandbox_dir, sandbox) = sandbox_with_file(path, contents);
 
         validate_agent_output_sources(
             &OutputSchemaKind::Routing,

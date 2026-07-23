@@ -235,7 +235,7 @@ audit [
 - On validation failure, Fabro sends validation feedback to the same active context before failing: prompt nodes keep the prior assistant response in the message list, and API-backed agent nodes repair in the same live session.
 - `output_retries` defaults to `2` and controls only these corrective structured-output turns. Negative values are treated as `0`. It is not the same as `max_retries` and does not consume workflow retry attempts.
 - Custom schema output is stored in context at `output.{node_id}`. Routing schema output updates routing fields and any `context_updates`.
-- Agent routing fallbacks still apply to `output_schema="routing"`: response text first, then `status.json`, then the last file touched by the agent. The last-file fallback only accepts `.json` and `.md` files (case-insensitive) whose final standalone JSON object contains the routing directive; only whitespace may follow it. Custom schemas and prompt nodes validate response text only.
+- Agent routing fallbacks still apply to `output_schema="routing"`: response text first, then `status.json`, then the last file touched by the agent. The last-file fallback only accepts `.json` and `.md` files (case-insensitive) whose final JSON object contains the routing directive; only whitespace may follow it. Custom schemas and prompt nodes validate response text only.
 - `backend="acp"` with `output_schema` is unsupported in this release.
 
 ### Command nodes
