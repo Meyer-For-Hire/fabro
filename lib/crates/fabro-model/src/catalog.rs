@@ -3145,6 +3145,42 @@ enabled = true
     }
 
     #[test]
+    fn every_legacy_builtin_identifier_targets_an_existing_offering() {
+        let catalog = Catalog::from_builtin_with_overrides(&minimal_settings(
+            r"
+[providers.bedrock]
+enabled = true
+
+[providers.bedrock-openai]
+enabled = true
+
+[providers.openrouter]
+enabled = true
+",
+        ))
+        .expect("all providers referenced by the legacy table should build");
+
+        for (legacy_id, provider_id, canonical_id) in LEGACY_BUILTIN_MODEL_IDENTIFIERS {
+            let provider = ProviderId::new(*provider_id);
+            let model = catalog
+                .resolve_on_provider(&provider, legacy_id)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "legacy identifier '{legacy_id}' should resolve on '{provider}': {error}"
+                    )
+                });
+
+            assert_eq!(model.provider, provider, "{legacy_id}");
+            assert_eq!(model.id, *canonical_id, "{legacy_id}");
+            assert_eq!(
+                legacy_builtin_model(legacy_id),
+                Some((provider, ModelId::new(*canonical_id))),
+                "{legacy_id}"
+            );
+        }
+    }
+
+    #[test]
     fn builtin_openrouter_includes_glm_5_2_when_enabled() {
         let catalog = Catalog::from_builtin_with_overrides(&minimal_settings(
             r"
@@ -5115,6 +5151,61 @@ reasoning = false
         assert_eq!(
             catalog.effective_agent_profile(&ProviderId::new("one"), Some("two_model")),
             Some(AgentProfileKind::OpenAi)
+        );
+    }
+
+    #[test]
+    fn effective_agent_profile_is_scoped_by_provider_for_shared_model_id() {
+        let layer = minimal_settings(
+            r#"
+[providers.one]
+display_name = "One"
+adapter = "openai"
+agent_profile = "openai"
+
+[providers.one.models.shared]
+display_name = "Shared on One"
+family = "test"
+default = true
+
+[providers.one.models.shared.limits]
+context_window = 1000
+
+[providers.one.models.shared.features]
+tools = false
+vision = false
+reasoning = false
+
+[providers.two]
+display_name = "Two"
+adapter = "openai"
+agent_profile = "anthropic"
+
+[providers.two.models.shared]
+display_name = "Shared on Two"
+family = "test"
+default = true
+agent_profile = "gemini"
+
+[providers.two.models.shared.limits]
+context_window = 1000
+
+[providers.two.models.shared.features]
+tools = false
+vision = false
+reasoning = false
+"#,
+        );
+
+        let catalog = Catalog::from_settings(&layer).unwrap();
+
+        assert_eq!(
+            catalog.effective_agent_profile(&ProviderId::new("one"), Some("shared")),
+            Some(AgentProfileKind::OpenAi)
+        );
+        assert_eq!(
+            catalog.effective_agent_profile(&ProviderId::new("two"), Some("shared")),
+            Some(AgentProfileKind::Gemini)
         );
     }
 

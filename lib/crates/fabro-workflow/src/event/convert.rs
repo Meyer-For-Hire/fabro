@@ -2184,7 +2184,7 @@ mod tests {
                 text:            "ok".to_string(),
                 model:           ModelRef {
                     provider: ProviderId::new("openrouter"),
-                    model_id: "openai/gpt-5.4".to_string(),
+                    model_id: "openai/gpt-5.4".into(),
                     speed:    None,
                 },
                 usage:           LlmTokenCounts {

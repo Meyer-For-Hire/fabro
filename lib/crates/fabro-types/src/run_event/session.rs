@@ -110,3 +110,22 @@ pub struct RunSessionTurnInterruptedProps {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error:   Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::RunSessionCreatedProps;
+
+    #[test]
+    fn session_created_deserializes_legacy_payload_without_provider() {
+        let props: RunSessionCreatedProps = serde_json::from_value(json!({
+            "title": "Legacy session",
+            "model": "gpt-5.4"
+        }))
+        .unwrap();
+
+        assert_eq!(props.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(props.provider, None);
+    }
+}

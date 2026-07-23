@@ -58,6 +58,11 @@ pub(crate) fn resolve_provider_context(
             })?
             .id
             .clone()
+    } else if catalog
+        .get_on_provider(default_provider_id, model)
+        .is_some()
+    {
+        default_provider_id.clone()
     } else {
         match catalog.select(model, None, &catalog.all_provider_ids()) {
             Ok(model) => model.provider.clone(),
