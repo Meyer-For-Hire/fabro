@@ -168,41 +168,31 @@ impl Handler for CommandHandler {
         }
 
         if result.exit_code == Some(0) {
-            let mut outcome = Outcome::success();
+            let validation = output_schema.as_ref().map(|schema| {
+                (
+                    schema,
+                    structured_output::validate_response_text(schema, &finalized.output_text),
+                )
+            });
+            let mut outcome = if let Some((_, Err(error))) = &validation {
+                Outcome::fail_deterministic(schema_validation_failure_reason(
+                    script,
+                    error,
+                    &finalized.output_text,
+                ))
+            } else {
+                let mut outcome = Outcome::success();
+                outcome.notes = Some(format!("Script completed: {script}"));
+                outcome
+            };
             outcome.context_updates.insert(
                 keys::COMMAND_OUTPUT.to_string(),
                 serde_json::json!(finalized.output_ref),
             );
-            outcome.notes = Some(format!("Script completed: {script}"));
             outcome.timing = Some(StageTiming::active_only(0, result.duration_ms));
-
-            if let Some(schema) = output_schema.as_ref() {
-                match structured_output::validate_response_text(schema, &finalized.output_text) {
-                    Ok(validated) => {
-                        structured_output::apply_validated_output(
-                            node,
-                            schema,
-                            &validated,
-                            &mut outcome,
-                        );
-                    }
-                    Err(error) => {
-                        let reason = schema_validation_failure_reason(
-                            script,
-                            &error,
-                            &finalized.output_text,
-                        );
-                        let mut failed = Outcome::fail_deterministic(reason);
-                        failed.context_updates.insert(
-                            keys::COMMAND_OUTPUT.to_string(),
-                            serde_json::json!(finalized.output_ref),
-                        );
-                        failed.timing = Some(StageTiming::active_only(0, result.duration_ms));
-                        return Ok(failed);
-                    }
-                }
+            if let Some((schema, Ok(validated))) = validation {
+                structured_output::apply_validated_output(node, schema, &validated, &mut outcome);
             }
-
             Ok(outcome)
         } else {
             let mut reason = format!(
@@ -230,11 +220,10 @@ fn schema_validation_failure_reason(
     error: &StructuredOutputError,
     output_text: &str,
 ) -> String {
-    let mut reason = format!("Script output failed output_schema validation: {script}");
-    for message in error.messages() {
-        reason.push_str("\n- ");
-        reason.push_str(message);
-    }
+    let mut reason = format!(
+        "Script output failed output_schema validation: {script}\n{}",
+        error.bulleted_messages()
+    );
     append_output_tail(&mut reason, output_text);
     reason
 }

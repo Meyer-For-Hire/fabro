@@ -72,9 +72,20 @@ impl StructuredOutputError {
         self.kind
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn messages(&self) -> &[String] {
         &self.messages
+    }
+
+    /// One `- {message}` bullet line per validator error, joined by newlines.
+    #[must_use]
+    pub(crate) fn bulleted_messages(&self) -> String {
+        self.messages
+            .iter()
+            .map(|message| format!("- {message}"))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[must_use]
@@ -97,12 +108,7 @@ impl StructuredOutputError {
                 "Return a single JSON object that satisfies the configured JSON Schema.".to_string()
             }
         };
-        let errors = self
-            .messages
-            .iter()
-            .map(|message| format!("- {message}"))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let errors = self.bulleted_messages();
         format!(
             "Your previous response did not satisfy the node's output_schema.\n\n\
              Validation errors:\n{errors}\n\n\

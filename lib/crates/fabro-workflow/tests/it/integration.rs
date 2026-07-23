@@ -33,7 +33,7 @@ use fabro_interview::{
 use fabro_model::catalog::{LlmCatalogSettings, ProviderCatalogSettings};
 use fabro_model::{Catalog, ProviderId};
 use fabro_store::{ArtifactKey, ArtifactStore, Database};
-use fabro_types::{EventBody, RunEvent, RunId, StageId, WorkflowSettings, parse_blob_ref};
+use fabro_types::{RunEvent, RunId, StageId, WorkflowSettings, parse_blob_ref};
 use fabro_validate::{Severity, validate, validate_or_raise};
 use fabro_workflow::context::Context;
 use fabro_workflow::error::{Error, FailureSignatureExt};
@@ -2014,7 +2014,7 @@ async fn command_schema_validation_failure_does_not_consume_retries() {
         .lock()
         .unwrap()
         .iter()
-        .filter(|event| matches!(event.body, EventBody::CommandStarted(_)))
+        .filter(|event| event.event_name() == "command.started")
         .count();
     assert_eq!(command_starts, 1, "command should execute exactly once");
 }

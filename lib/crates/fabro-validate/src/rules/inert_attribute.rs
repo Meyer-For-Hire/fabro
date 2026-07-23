@@ -152,21 +152,15 @@ mod tests {
     }
 
     #[test]
-    fn accepts_output_schema_on_command_node() {
-        let mut g = minimal_graph();
-        g.nodes.insert(
-            "run".to_string(),
-            node_with_attr("run", "parallelogram", "output_schema", "routing"),
-        );
-        assert!(Rule.apply(&g).is_empty());
-    }
-
-    #[test]
     fn accepts_attrs_on_their_own_handler_types() {
         let mut g = minimal_graph();
         g.nodes.insert(
             "run".to_string(),
             node_with_attr("run", "parallelogram", "script", "echo hi"),
+        );
+        g.nodes.insert(
+            "audit".to_string(),
+            node_with_attr("audit", "parallelogram", "output_schema", "routing"),
         );
         g.nodes.insert(
             "pause".to_string(),

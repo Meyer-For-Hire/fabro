@@ -83,7 +83,7 @@ Validated routing uses the same reverse scan as normal routing extraction: Fabro
 
 Fabro repairs invalid structured output inside the same LLM context before failing an agent or prompt node. For prompt nodes, Fabro appends the invalid assistant response and a corrective user message to the same message list. For agent nodes using the API backend, Fabro sends the corrective message to the same live agent session. `output_retries` controls these repair turns and defaults to `2`; `output_retries=0` validates once and fails without a repair turn. Negative values are treated as `0`. These repair turns are separate from workflow `max_retries` and do not consume node retry attempts.
 
-Command nodes instead validate only after an exit-code-`0` script, using the last JSON object in merged stdout and stderr. Print the intended JSON object last. Invalid output fails deterministically without a repair turn, command retry, or `status.json` fallback; `output_retries`, `retry_policy`, and `max_retries` do not retry the validation failure. Nonzero exits keep their normal command failure behavior without schema validation.
+Command nodes instead validate only after an exit-code-`0` script, applying the same reverse scan to merged stdout and stderr. Print the intended JSON object last. Invalid output fails deterministically without a repair turn, command retry, or `status.json` fallback; `output_retries`, `retry_policy`, and `max_retries` do not retry the validation failure. Nonzero exits keep their normal command failure behavior without schema validation.
 
 ### Routing fallback sources
 
