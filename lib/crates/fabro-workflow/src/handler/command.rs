@@ -6,6 +6,7 @@ use fabro_graphviz::graph::{Graph, Node};
 use fabro_types::{CommandTermination, StageTiming};
 use fabro_util::shell::shell_quote;
 
+use super::structured_output::{self, StructuredOutputError};
 use super::{EngineServices, Handler, NodeTimeoutPolicy};
 use crate::command_log::CommandLogRecorder;
 use crate::context::{Context, keys};
@@ -75,6 +76,8 @@ impl Handler for CommandHandler {
                 "Invalid language: {language:?} (expected \"shell\" or \"python\")"
             )));
         }
+
+        let output_schema = structured_output::parse_node_output_schema(node)?;
 
         let command = if language == "python" {
             format!("python3 -c {}", shell_quote(script))
@@ -165,13 +168,31 @@ impl Handler for CommandHandler {
         }
 
         if result.exit_code == Some(0) {
-            let mut outcome = Outcome::success();
+            let validation = output_schema.as_ref().map(|schema| {
+                (
+                    schema,
+                    structured_output::validate_response_text(schema, &finalized.output_text),
+                )
+            });
+            let mut outcome = if let Some((_, Err(error))) = &validation {
+                Outcome::fail_deterministic(schema_validation_failure_reason(
+                    script,
+                    error,
+                    &finalized.output_text,
+                ))
+            } else {
+                let mut outcome = Outcome::success();
+                outcome.notes = Some(format!("Script completed: {script}"));
+                outcome
+            };
             outcome.context_updates.insert(
                 keys::COMMAND_OUTPUT.to_string(),
                 serde_json::json!(finalized.output_ref),
             );
-            outcome.notes = Some(format!("Script completed: {script}"));
             outcome.timing = Some(StageTiming::active_only(0, result.duration_ms));
+            if let Some((schema, Ok(validated))) = validation {
+                structured_output::apply_validated_output(node, schema, &validated, &mut outcome);
+            }
             Ok(outcome)
         } else {
             let mut reason = format!(
@@ -192,6 +213,20 @@ impl Handler for CommandHandler {
     fn node_timeout_policy(&self, _node: &Node) -> NodeTimeoutPolicy {
         NodeTimeoutPolicy::HandlerManaged
     }
+}
+
+fn schema_validation_failure_reason(
+    script: &str,
+    error: &StructuredOutputError,
+    output_text: &str,
+) -> String {
+    let mut reason = format!("Script output failed output_schema validation: {script}");
+    for message in error.messages() {
+        reason.push_str("\n- ");
+        reason.push_str(message);
+    }
+    append_output_tail(&mut reason, output_text);
+    reason
 }
 
 fn append_output_tail(reason: &mut String, output: &str) {
@@ -227,8 +262,11 @@ mod tests {
 
     use super::*;
     use crate::command_log::command_log_path;
-    use crate::outcome::StageOutcome;
+    use crate::outcome::{FailureCategory, StageOutcome};
     use crate::runtime_store::{RunStoreBackend, RunStoreHandle};
+
+    const PASSED_OUTPUT_SCHEMA: &str =
+        r#"{"type":"object","required":["passed"],"properties":{"passed":{"type":"boolean"}}}"#;
 
     #[derive(Default)]
     struct MemoryRunStoreBackend {
@@ -463,6 +501,385 @@ mod tests {
                 .contains("hello")
         );
         assert!(!outcome.context_updates.contains_key("command.stderr"));
+    }
+
+    #[tokio::test]
+    async fn command_custom_output_schema_stores_output_context_key() {
+        let handler = CommandHandler;
+        let mut node = Node::new("audit");
+        node.attrs.insert(
+            "script".to_string(),
+            AttrValue::String(r#"echo '{"passed": true}'"#.to_string()),
+        );
+        node.attrs.insert(
+            "output_schema".to_string(),
+            AttrValue::String(PASSED_OUTPUT_SCHEMA.to_string()),
+        );
+        let context = Context::new();
+        let graph = Graph::new("test");
+        let run_dir = tempfile::tempdir().unwrap();
+        let services = make_services();
+
+        let outcome = handler
+            .execute(&node, &context, &graph, run_dir.path(), &services)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status, StageOutcome::Succeeded);
+        assert_eq!(
+            outcome.context_updates.get("output.audit"),
+            Some(&serde_json::json!({"passed": true})),
+        );
+        let command_output = outcome
+            .context_updates
+            .get(keys::COMMAND_OUTPUT)
+            .expect("command.output should still be set");
+        assert!(
+            command_text(&services, command_output)
+                .await
+                .contains(r#"{"passed": true}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn command_custom_output_schema_validates_last_json_object() {
+        let handler = CommandHandler;
+        let mut node = Node::new("audit");
+        node.attrs.insert(
+            "script".to_string(),
+            AttrValue::String(
+                r#"printf '%s\n' 'starting audit' '{"passed": false}' 'final result:' '{"passed": true}'"#
+                    .to_string(),
+            ),
+        );
+        node.attrs.insert(
+            "output_schema".to_string(),
+            AttrValue::String(PASSED_OUTPUT_SCHEMA.to_string()),
+        );
+        let context = Context::new();
+        let graph = Graph::new("test");
+        let run_dir = tempfile::tempdir().unwrap();
+
+        let outcome = handler
+            .execute(&node, &context, &graph, run_dir.path(), &make_services())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status, StageOutcome::Succeeded);
+        assert_eq!(
+            outcome.context_updates.get("output.audit"),
+            Some(&serde_json::json!({"passed": true})),
+        );
+    }
+
+    #[tokio::test]
+    async fn command_custom_output_schema_failure_is_deterministic() {
+        let handler = CommandHandler;
+        let mut node = Node::new("audit");
+        node.attrs.insert(
+            "script".to_string(),
+            AttrValue::String(r#"echo '{"passed":"yes"}'"#.to_string()),
+        );
+        node.attrs.insert(
+            "output_schema".to_string(),
+            AttrValue::String(PASSED_OUTPUT_SCHEMA.to_string()),
+        );
+        node.attrs
+            .insert("output_retries".to_string(), AttrValue::Integer(7));
+        let context = Context::new();
+        let graph = Graph::new("test");
+        let run_dir = tempfile::tempdir().unwrap();
+        let services = make_services();
+
+        let outcome = handler
+            .execute(&node, &context, &graph, run_dir.path(), &services)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status, StageOutcome::Failed {
+            retry_requested: false,
+        });
+        assert_eq!(
+            outcome.failure_category(),
+            Some(FailureCategory::Deterministic)
+        );
+        let reason = outcome
+            .failure_reason()
+            .expect("schema validation failure should have a reason");
+        assert!(
+            reason.contains("Script output failed output_schema validation: echo"),
+            "unexpected failure reason: {reason}"
+        );
+        assert!(
+            reason.contains("boolean"),
+            "validator message should be included: {reason}"
+        );
+        assert!(
+            reason.contains("## output"),
+            "output heading missing: {reason}"
+        );
+        assert!(
+            reason.contains(r#"{"passed":"yes"}"#),
+            "output tail missing: {reason}"
+        );
+        assert!(
+            !reason.contains("repair attempt"),
+            "commands must not claim repair attempts: {reason}"
+        );
+        assert!(
+            outcome.context_updates.contains_key(keys::COMMAND_OUTPUT),
+            "command.output should be set on validation failure"
+        );
+        assert!(outcome.timing.is_some());
+        assert_eq!(outcome.notes, None);
+    }
+
+    #[tokio::test]
+    async fn command_routing_output_schema_no_json_object_fails() {
+        let handler = CommandHandler;
+        let mut node = Node::new("route");
+        node.attrs.insert(
+            "script".to_string(),
+            AttrValue::String("echo not-json".to_string()),
+        );
+        node.attrs.insert(
+            "output_schema".to_string(),
+            AttrValue::String("routing".to_string()),
+        );
+        let context = Context::new();
+        let graph = Graph::new("test");
+        let run_dir = tempfile::tempdir().unwrap();
+
+        let outcome = handler
+            .execute(&node, &context, &graph, run_dir.path(), &make_services())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status, StageOutcome::Failed {
+            retry_requested: false,
+        });
+        assert_eq!(
+            outcome.failure_category(),
+            Some(FailureCategory::Deterministic)
+        );
+        let reason = outcome.failure_reason().unwrap();
+        assert!(reason.contains("no JSON object found"), "got: {reason}");
+        assert!(reason.contains("## output\nnot-json"), "got: {reason}");
+    }
+
+    #[tokio::test]
+    async fn command_routing_output_schema_applies_routing_fields() {
+        let handler = CommandHandler;
+        let mut node = Node::new("route");
+        node.attrs.insert(
+            "script".to_string(),
+            AttrValue::String(
+                r#"echo '{"preferred_next_label":"fix","context_updates":{"kept_count":2}}'"#
+                    .to_string(),
+            ),
+        );
+        node.attrs.insert(
+            "output_schema".to_string(),
+            AttrValue::String("routing".to_string()),
+        );
+        let context = Context::new();
+        let graph = Graph::new("test");
+        let run_dir = tempfile::tempdir().unwrap();
+
+        let outcome = handler
+            .execute(&node, &context, &graph, run_dir.path(), &make_services())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status, StageOutcome::Succeeded);
+        assert_eq!(outcome.preferred_label.as_deref(), Some("fix"));
+        assert_eq!(
+            outcome.context_updates.get("kept_count"),
+            Some(&serde_json::json!(2))
+        );
+        assert!(outcome.context_updates.contains_key(keys::COMMAND_OUTPUT));
+    }
+
+    #[tokio::test]
+    async fn command_routing_output_schema_outcome_failed_override() {
+        let handler = CommandHandler;
+        let mut node = Node::new("route");
+        node.attrs.insert(
+            "script".to_string(),
+            AttrValue::String(
+                r#"echo '{"outcome":"failed","failure_reason":"tests failed"}'"#.to_string(),
+            ),
+        );
+        node.attrs.insert(
+            "output_schema".to_string(),
+            AttrValue::String("routing".to_string()),
+        );
+        let context = Context::new();
+        let graph = Graph::new("test");
+        let run_dir = tempfile::tempdir().unwrap();
+
+        let outcome = handler
+            .execute(&node, &context, &graph, run_dir.path(), &make_services())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status, StageOutcome::Failed {
+            retry_requested: false,
+        });
+        assert_eq!(outcome.failure_reason(), Some("tests failed"));
+        assert_eq!(
+            outcome.failure_category(),
+            Some(FailureCategory::Deterministic)
+        );
+    }
+
+    #[tokio::test]
+    async fn command_invalid_output_schema_fails_before_execution() {
+        let spy = std::sync::Arc::new(SpySandbox::new(fabro_agent::sandbox::ExecResult {
+            stdout:      String::new(),
+            stderr:      String::new(),
+            exit_code:   Some(0),
+            termination: CommandTermination::Exited,
+            duration_ms: 1,
+        }));
+        let handler = CommandHandler;
+        let mut node = Node::new("audit");
+        node.attrs.insert(
+            "script".to_string(),
+            AttrValue::String("echo should-not-run".to_string()),
+        );
+        node.attrs.insert(
+            "output_schema".to_string(),
+            AttrValue::String("{".to_string()),
+        );
+        let context = Context::new();
+        let graph = Graph::new("test");
+        let run_dir = tempfile::tempdir().unwrap();
+        let mut services = make_spy_services(spy.clone());
+        let event_names = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_event_names = Arc::clone(&event_names);
+        let emitter = Arc::new(crate::event::Emitter::new(fixtures::RUN_1));
+        emitter.on_event(move |event| {
+            captured_event_names
+                .lock()
+                .unwrap()
+                .push(event.event_name().to_string());
+        });
+        services.run = services.run.with_emitter(emitter);
+
+        let error = handler
+            .execute(&node, &context, &graph, run_dir.path(), &services)
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("Invalid output_schema"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            spy.captured_command(),
+            None,
+            "invalid schema must fail before sandbox execution"
+        );
+        assert!(
+            event_names.lock().unwrap().is_empty(),
+            "invalid schema must fail before event emission"
+        );
+    }
+
+    #[tokio::test]
+    async fn command_nonzero_exit_skips_schema_validation() {
+        let handler = CommandHandler;
+        let mut node = Node::new("audit");
+        node.attrs.insert(
+            "script".to_string(),
+            AttrValue::String(r#"echo '{"passed":"bad"}'; exit 1"#.to_string()),
+        );
+        node.attrs.insert(
+            "output_schema".to_string(),
+            AttrValue::String(PASSED_OUTPUT_SCHEMA.to_string()),
+        );
+        let context = Context::new();
+        let graph = Graph::new("test");
+        let run_dir = tempfile::tempdir().unwrap();
+
+        let outcome = handler
+            .execute(&node, &context, &graph, run_dir.path(), &make_services())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status, StageOutcome::Failed {
+            retry_requested: false,
+        });
+        let reason = outcome.failure_reason().unwrap();
+        assert!(reason.contains("exit code: 1"), "got: {reason}");
+        assert!(
+            !reason.contains("output_schema validation"),
+            "nonzero exits must skip schema validation: {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn command_simulate_ignores_output_schema() {
+        let handler = CommandHandler;
+        let mut node = Node::new("audit");
+        node.attrs.insert(
+            "script".to_string(),
+            AttrValue::String("echo should-not-run".to_string()),
+        );
+        node.attrs.insert(
+            "output_schema".to_string(),
+            AttrValue::String("{not a valid schema".to_string()),
+        );
+        let context = Context::new();
+        let graph = Graph::new("test");
+        let run_dir = tempfile::tempdir().unwrap();
+
+        let outcome = handler
+            .simulate(&node, &context, &graph, run_dir.path(), &make_services())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status, StageOutcome::Succeeded);
+        assert!(outcome.notes.as_deref().unwrap().contains("[Simulated]"));
+        assert_eq!(
+            outcome.context_updates.get(keys::COMMAND_OUTPUT),
+            Some(&serde_json::json!(""))
+        );
+        assert!(!outcome.context_updates.contains_key("output.audit"));
+    }
+
+    #[tokio::test]
+    async fn command_python_custom_output_schema() {
+        let handler = CommandHandler;
+        let mut node = Node::new("audit");
+        node.attrs.insert(
+            "script".to_string(),
+            AttrValue::String(r#"import json; print(json.dumps({"passed": True}))"#.to_string()),
+        );
+        node.attrs.insert(
+            "language".to_string(),
+            AttrValue::String("python".to_string()),
+        );
+        node.attrs.insert(
+            "output_schema".to_string(),
+            AttrValue::String(PASSED_OUTPUT_SCHEMA.to_string()),
+        );
+        let context = Context::new();
+        let graph = Graph::new("test");
+        let run_dir = tempfile::tempdir().unwrap();
+
+        let outcome = handler
+            .execute(&node, &context, &graph, run_dir.path(), &make_services())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status, StageOutcome::Succeeded);
+        assert_eq!(
+            outcome.context_updates.get("output.audit"),
+            Some(&serde_json::json!({"passed": true})),
+        );
+        assert!(outcome.context_updates.contains_key(keys::COMMAND_OUTPUT));
     }
 
     #[tokio::test]
