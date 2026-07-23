@@ -428,6 +428,7 @@ mod tests {
     fn test_state_with_materializer(materializer: TestAutomationRunMaterializer) -> Arc<AppState> {
         TestAppStateBuilder::new()
             .env_lookup(|_| None)
+            .vault_entries([("OPENAI_API_KEY", "test-openai-api-key")])
             .automation_materializer(materializer)
             .build()
     }

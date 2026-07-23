@@ -382,7 +382,7 @@ mod tests {
     fn sample_model_ref() -> ModelRef {
         ModelRef {
             provider: fabro_model::ProviderId::openai(),
-            model_id: "gpt-5".to_string(),
+            model_id: "gpt-5".into(),
             speed:    None,
         }
     }

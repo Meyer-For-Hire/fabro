@@ -29,7 +29,7 @@ export interface CreateCompletionRequest {
      */
     'messages': Array<CompletionMessage>;
     /**
-     * Model ID or alias. Server picks default if omitted.
+     * Model ID or alias. Server picks a ready-provider default if omitted.
      */
     'model'?: string;
     /**
@@ -58,7 +58,7 @@ export interface CreateCompletionRequest {
      */
     'reasoning_effort'?: string;
     /**
-     * Provider to route to.
+     * Optional provider pin.
      */
     'provider'?: string;
     'provider_options'?: any;

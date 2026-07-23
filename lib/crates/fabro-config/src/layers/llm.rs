@@ -12,8 +12,7 @@
 //! enabled = true
 //! aliases = ["moonshot"]
 //!
-//! [llm.models."kimi-k2.5"]
-//! provider = "kimi"
+//! [llm.providers.kimi.models."kimi-k2.5"]
 //! ...
 //! ```
 //!
@@ -26,10 +25,12 @@
 //! Resolution against the static adapter registry happens in `fabro-model`
 //! when the resolved [`Catalog`](fabro_model::Catalog) is built.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use fabro_model::catalog::deserialize_knowledge_cutoff;
-use fabro_model::{AgentProfileKind, BillingPolicy, CodecKind, ProviderAuthConfig};
+use fabro_model::{
+    AgentProfileKind, BillingPolicy, CodecKind, ModelId, ProviderAuthConfig, ProviderId, catalog,
+};
 pub use fabro_model::{CredentialRef, CredentialRefParseError, ReasoningEffortFeature};
 use fabro_types::settings::InterpString;
 use serde::{Deserialize, Serialize};
@@ -43,7 +44,8 @@ pub struct LlmLayer {
     /// Provider definitions keyed by provider ID.
     #[serde(default, skip_serializing_if = "MergeMap::is_empty")]
     pub providers: MergeMap<ProviderSettings>,
-    /// Model definitions keyed by canonical model ID.
+    /// Legacy top-level model definitions. New settings put models below
+    /// their provider; parsing normalizes this map before layers combine.
     #[serde(default, skip_serializing_if = "MergeMap::is_empty")]
     pub models:    MergeMap<ModelSettings>,
 }
@@ -87,13 +89,16 @@ pub struct ProviderSettings {
     pub enabled:        Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aliases:        Option<Vec<String>>,
+    /// Model offerings served by this provider, keyed by canonical model ID.
+    #[serde(default, skip_serializing_if = "MergeMap::is_empty")]
+    pub models:         MergeMap<ModelSettings>,
 }
 
-/// One entry in `[llm.models.<id>]`.
+/// One entry in `[llm.providers.<provider>.models.<id>]`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, fabro_macros::Combine)]
 #[serde(deny_unknown_fields)]
 pub struct ModelSettings {
-    /// Provider ID this model belongs to.
+    /// Compatibility-only provider for legacy `[llm.models.<id>]` rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider:             Option<String>,
     /// Identifier sent to the provider API. Defaults to the catalog model ID
@@ -153,6 +158,279 @@ pub struct ModelSettings {
     pub controls:             Option<ModelControls>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub costs:                Option<ModelCostTable>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LlmNormalizationError {
+    BuiltinCatalog {
+        message: String,
+    },
+    RetiredModel {
+        identifier: String,
+        provider:   ProviderId,
+        model:      ModelId,
+    },
+    UnknownLegacyModel {
+        model: String,
+    },
+    AmbiguousLegacyModel {
+        model:      String,
+        candidates: Vec<(ProviderId, ModelId)>,
+    },
+    AmbiguousProviderModel {
+        provider: ProviderId,
+        selector: String,
+        models:   Vec<ModelId>,
+    },
+    DuplicateModelDefinition {
+        provider: ProviderId,
+        model:    ModelId,
+    },
+    ScopedModelDeclaresProvider {
+        provider: ProviderId,
+        model:    ModelId,
+    },
+}
+
+impl std::fmt::Display for LlmNormalizationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BuiltinCatalog { message } => {
+                write!(f, "failed to inspect the built-in model catalog: {message}")
+            }
+            Self::RetiredModel {
+                identifier,
+                provider,
+                model,
+            } => write!(
+                f,
+                "model identifier '{identifier}' has been retired; use '{provider}/{model}' instead"
+            ),
+            Self::UnknownLegacyModel { model } => write!(
+                f,
+                "legacy model row '{model}' omits provider and does not match a unique known offering"
+            ),
+            Self::AmbiguousLegacyModel { model, candidates } => write!(
+                f,
+                "legacy model row '{model}' omits provider and matches multiple offerings: {candidates:?}"
+            ),
+            Self::AmbiguousProviderModel {
+                provider,
+                selector,
+                models,
+            } => write!(
+                f,
+                "legacy model selector '{selector}' is ambiguous on provider '{provider}': {models:?}"
+            ),
+            Self::DuplicateModelDefinition { provider, model } => write!(
+                f,
+                "provider '{provider}' model '{model}' is defined through both provider-scoped and legacy top-level syntax"
+            ),
+            Self::ScopedModelDeclaresProvider { provider, model } => write!(
+                f,
+                "provider-scoped model '{provider}/{model}' must not declare a provider field"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LlmNormalizationError {}
+
+impl LlmLayer {
+    /// Normalize the temporary legacy model table before this source is
+    /// combined with any other settings source.
+    pub(crate) fn normalize_legacy_models(&mut self) -> Result<(), LlmNormalizationError> {
+        for (provider, settings) in self.providers.iter() {
+            for (model, settings) in settings.models.iter() {
+                if settings.provider.is_some() {
+                    return Err(LlmNormalizationError::ScopedModelDeclaresProvider {
+                        provider: ProviderId::new(provider.clone()),
+                        model:    ModelId::new(model.clone()),
+                    });
+                }
+            }
+        }
+
+        let mut legacy_models = std::mem::take(&mut self.models.0)
+            .into_iter()
+            .collect::<Vec<_>>();
+        legacy_models.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+        for (legacy_id, mut settings) in legacy_models {
+            if let Some((provider, model)) = catalog::retired_model_replacement(&legacy_id) {
+                return Err(LlmNormalizationError::RetiredModel {
+                    identifier: legacy_id,
+                    provider,
+                    model,
+                });
+            }
+
+            let explicit_provider = settings.provider.take();
+            let (provider, model) = if let Some(provider) = explicit_provider {
+                let provider = self.canonical_provider(&provider)?;
+                let model = self
+                    .canonical_model_on_provider(&provider, &legacy_id)?
+                    .unwrap_or_else(|| ModelId::new(legacy_id.clone()));
+                (provider, model)
+            } else {
+                let candidates = self.model_candidates(&legacy_id)?;
+                match candidates.as_slice() {
+                    [(provider, model)] => (provider.clone(), model.clone()),
+                    [] => {
+                        return Err(LlmNormalizationError::UnknownLegacyModel { model: legacy_id });
+                    }
+                    _ => {
+                        return Err(LlmNormalizationError::AmbiguousLegacyModel {
+                            model: legacy_id,
+                            candidates,
+                        });
+                    }
+                }
+            };
+
+            let provider_settings = self.providers.entry(provider.to_string()).or_default();
+            if provider_settings.models.contains_key(model.as_str()) {
+                return Err(LlmNormalizationError::DuplicateModelDefinition { provider, model });
+            }
+            provider_settings
+                .models
+                .insert(model.into_inner(), settings);
+        }
+        Ok(())
+    }
+
+    fn canonical_provider(&self, selector: &str) -> Result<ProviderId, LlmNormalizationError> {
+        if self.providers.contains_key(selector) {
+            return Ok(ProviderId::new(selector));
+        }
+        let mut aliases = self
+            .providers
+            .iter()
+            .filter(|(_, settings)| {
+                settings
+                    .aliases
+                    .as_ref()
+                    .is_some_and(|aliases| aliases.iter().any(|alias| alias == selector))
+            })
+            .map(|(provider, _)| ProviderId::new(provider.clone()))
+            .collect::<Vec<_>>();
+        aliases.sort();
+        if let Some(provider) = aliases.into_iter().next() {
+            return Ok(provider);
+        }
+        catalog::builtin_provider_id(selector)
+            .map_err(|error| normalization_catalog_error(&error))
+            .map(|provider| provider.unwrap_or_else(|| ProviderId::new(selector)))
+    }
+
+    fn canonical_model_on_provider(
+        &self,
+        provider: &ProviderId,
+        selector: &str,
+    ) -> Result<Option<ModelId>, LlmNormalizationError> {
+        let current = self
+            .providers
+            .get(provider.as_str())
+            .map(|settings| &settings.models);
+        if current.is_some_and(|models| models.contains_key(selector)) {
+            return Ok(Some(ModelId::new(selector)));
+        }
+
+        let builtin_canonical = catalog::builtin_canonical_model_offerings(selector)
+            .map_err(|error| normalization_catalog_error(&error))?
+            .into_iter()
+            .find_map(|(candidate_provider, model)| {
+                (candidate_provider == *provider).then_some(model)
+            });
+        if builtin_canonical.is_some() {
+            return Ok(builtin_canonical);
+        }
+
+        let mut aliases = current
+            .into_iter()
+            .flat_map(|models| models.iter())
+            .filter(|(_, settings)| {
+                settings
+                    .aliases
+                    .as_ref()
+                    .is_some_and(|aliases| aliases.iter().any(|alias| alias == selector))
+            })
+            .map(|(model, _)| ModelId::new(model.clone()))
+            .collect::<BTreeSet<_>>();
+        aliases.extend(
+            catalog::builtin_alias_model_offerings(selector)
+                .map_err(|error| normalization_catalog_error(&error))?
+                .into_iter()
+                .filter_map(|(candidate_provider, model)| {
+                    (candidate_provider == *provider).then_some(model)
+                }),
+        );
+        match aliases.len() {
+            0 => Ok(None),
+            1 => Ok(aliases.into_iter().next()),
+            _ => Err(LlmNormalizationError::AmbiguousProviderModel {
+                provider: provider.clone(),
+                selector: selector.to_string(),
+                models:   aliases.into_iter().collect(),
+            }),
+        }
+    }
+
+    fn model_candidates(
+        &self,
+        selector: &str,
+    ) -> Result<Vec<(ProviderId, ModelId)>, LlmNormalizationError> {
+        let mut canonical = self
+            .providers
+            .iter()
+            .filter(|(_, settings)| settings.models.contains_key(selector))
+            .map(|(provider, _)| {
+                (
+                    ProviderId::new(provider.clone()),
+                    ModelId::new(selector.to_string()),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        canonical.extend(
+            catalog::builtin_canonical_model_offerings(selector)
+                .map_err(|error| normalization_catalog_error(&error))?,
+        );
+        if !canonical.is_empty() {
+            return Ok(canonical.into_iter().collect());
+        }
+
+        let mut aliases =
+            self.providers
+                .iter()
+                .flat_map(|(provider, settings)| {
+                    settings
+                        .models
+                        .iter()
+                        .filter(move |(_, settings)| {
+                            settings.aliases.as_ref().is_some_and(|aliases| {
+                                aliases.iter().any(|alias| alias == selector)
+                            })
+                        })
+                        .map(move |(model, _)| {
+                            (
+                                ProviderId::new(provider.clone()),
+                                ModelId::new(model.clone()),
+                            )
+                        })
+                })
+                .collect::<BTreeSet<_>>();
+        aliases.extend(
+            catalog::builtin_alias_model_offerings(selector)
+                .map_err(|error| normalization_catalog_error(&error))?,
+        );
+        Ok(aliases.into_iter().collect())
+    }
+}
+
+fn normalization_catalog_error(error: &catalog::CatalogBuildError) -> LlmNormalizationError {
+    LlmNormalizationError::BuiltinCatalog {
+        message: error.to_string(),
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, fabro_macros::Combine)]

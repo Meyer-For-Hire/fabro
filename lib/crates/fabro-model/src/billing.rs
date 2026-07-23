@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString, IntoStaticStr};
 
 use crate::catalog::{BillingPolicy, Catalog, CatalogModelSettings};
-use crate::{Model, ModelCosts, ProviderId};
+use crate::{Model, ModelCosts, ModelId, ProviderId};
 
 const TOKENS_PER_MTOK: i128 = 1_000_000;
 const ANTHROPIC_CACHE_WRITE_5M_NUMERATOR: i64 = 5;
@@ -138,7 +138,7 @@ pub enum CostSource {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ModelRef {
     pub provider: ProviderId,
-    pub model_id: String,
+    pub model_id: ModelId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speed:    Option<Speed>,
 }
@@ -321,7 +321,7 @@ impl BilledModelUsage {
 
     #[must_use]
     pub fn model_id(&self) -> &str {
-        &self.input.usage.model.model_id
+        self.input.usage.model.model_id.as_str()
     }
 
     #[must_use]
@@ -435,13 +435,9 @@ fn anthropic_billing_facts(tokens: &TokenCounts) -> AnthropicBillingFacts {
 impl Catalog {
     #[must_use]
     pub fn pricing_for(&self, model_ref: &ModelRef) -> Option<ModelPricing> {
-        let model = self.get(&model_ref.model_id)?;
+        let model = self.offering(&model_ref.provider, &model_ref.model_id)?;
         let provider = self.provider(&model_ref.provider)?;
-        if model.provider != provider.id {
-            return None;
-        }
-
-        let settings = self.model_settings(&model.id)?;
+        let settings = self.settings_for(model)?;
         let costs = costs_for_speed(model, settings, model_ref.speed)?;
         pricing_for_model_costs(
             model,
@@ -459,7 +455,7 @@ impl Catalog {
         tokens: &TokenCounts,
     ) -> Option<ModelBillingFacts> {
         let policy =
-            self.effective_billing_policy(&model_ref.provider, Some(&model_ref.model_id))?;
+            self.effective_billing_policy(&model_ref.provider, Some(model_ref.model_id.as_str()))?;
         ModelBillingFacts::for_policy(policy, tokens)
     }
 
@@ -713,7 +709,7 @@ mod tests {
                 usage: ModelUsage {
                     model:  ModelRef {
                         provider: ProviderId::openai(),
-                        model_id: "gpt-5.4".to_string(),
+                        model_id: ModelId::new("gpt-5.4"),
                         speed:    None,
                     },
                     tokens: TokenCounts {
@@ -785,12 +781,12 @@ cache_input_cost_per_mtok = 0.3
         };
         let claude = ModelRef {
             provider: ProviderId::new("aggregator"),
-            model_id: "claude-via-aggregator".to_string(),
+            model_id: ModelId::new("claude-via-aggregator"),
             speed:    None,
         };
         let plain = ModelRef {
             provider: ProviderId::new("aggregator"),
-            model_id: "plain-model".to_string(),
+            model_id: ModelId::new("plain-model"),
             speed:    None,
         };
 
@@ -919,7 +915,7 @@ cache_input_cost_per_mtok = 0.3
         let pricing = ModelPricing {
             model:  ModelRef {
                 provider: ProviderId::openai(),
-                model_id: "gpt-5.4".to_string(),
+                model_id: ModelId::new("gpt-5.4"),
                 speed:    None,
             },
             policy: ModelPricingPolicy::OpenAi(OpenAiModelPricing {
@@ -956,7 +952,7 @@ cache_input_cost_per_mtok = 0.3
         let pricing = Catalog::builtin()
             .pricing_for(&ModelRef {
                 provider: ProviderId::anthropic(),
-                model_id: "claude-opus-4-6".to_string(),
+                model_id: ModelId::new("claude-opus-4-6"),
                 speed:    Some(Speed::Fast),
             })
             .unwrap();
@@ -980,7 +976,7 @@ cache_input_cost_per_mtok = 0.3
         let pricing = Catalog::builtin()
             .pricing_for(&ModelRef {
                 provider: ProviderId::anthropic(),
-                model_id: "claude-opus-4-6".to_string(),
+                model_id: ModelId::new("claude-opus-4-6"),
                 speed:    Some(Speed::Standard),
             })
             .unwrap();
@@ -1033,7 +1029,7 @@ cache_input_cost_per_mtok = 0.25
         let pricing = catalog
             .pricing_for(&ModelRef {
                 provider: ProviderId::new("test_anthropic"),
-                model_id: "test-opus".to_string(),
+                model_id: ModelId::new("test-opus"),
                 speed:    Some(Speed::Fast),
             })
             .unwrap();
@@ -1081,7 +1077,7 @@ cache_input_cost_per_mtok = 0.1
         let pricing = catalog
             .pricing_for(&ModelRef {
                 provider: ProviderId::new("proxy"),
-                model_id: "proxy-model".to_string(),
+                model_id: ModelId::new("proxy-model"),
                 speed:    None,
             })
             .unwrap();
@@ -1131,7 +1127,7 @@ output_cost_per_mtok = 2.0
             catalog
                 .pricing_for(&ModelRef {
                     provider: ProviderId::new("proxy"),
-                    model_id: "canonical-model".to_string(),
+                    model_id: ModelId::new("canonical-model"),
                     speed:    None,
                 })
                 .is_some()
@@ -1140,7 +1136,7 @@ output_cost_per_mtok = 2.0
             catalog
                 .pricing_for(&ModelRef {
                     provider: ProviderId::new("proxy"),
-                    model_id: "wire-model".to_string(),
+                    model_id: ModelId::new("wire-model"),
                     speed:    None,
                 })
                 .is_none()
@@ -1153,7 +1149,7 @@ output_cost_per_mtok = 2.0
             Catalog::builtin()
                 .pricing_for(&ModelRef {
                     provider: ProviderId::new("unknown"),
-                    model_id: "claude-opus-4-6".to_string(),
+                    model_id: ModelId::new("claude-opus-4-6"),
                     speed:    None,
                 })
                 .is_none()
@@ -1162,7 +1158,7 @@ output_cost_per_mtok = 2.0
             Catalog::builtin()
                 .pricing_for(&ModelRef {
                     provider: ProviderId::anthropic(),
-                    model_id: "unknown".to_string(),
+                    model_id: ModelId::new("unknown"),
                     speed:    None,
                 })
                 .is_none()
@@ -1171,7 +1167,7 @@ output_cost_per_mtok = 2.0
             Catalog::builtin()
                 .pricing_for(&ModelRef {
                     provider: ProviderId::openai(),
-                    model_id: "gpt-5.4".to_string(),
+                    model_id: ModelId::new("gpt-5.4"),
                     speed:    Some(Speed::Fast),
                 })
                 .is_none()
@@ -1183,7 +1179,7 @@ output_cost_per_mtok = 2.0
         let pricing = ModelPricing {
             model:  ModelRef {
                 provider: ProviderId::anthropic(),
-                model_id: "claude-opus-4-6".to_string(),
+                model_id: ModelId::new("claude-opus-4-6"),
                 speed:    Some(Speed::Fast),
             },
             policy: ModelPricingPolicy::Anthropic(AnthropicModelPricing {
@@ -1229,7 +1225,7 @@ output_cost_per_mtok = 2.0
         let pricing = ModelPricing {
             model:  ModelRef {
                 provider: ProviderId::gemini(),
-                model_id: "gemini-3.1-pro-preview".to_string(),
+                model_id: ModelId::new("gemini-3.1-pro-preview"),
                 speed:    None,
             },
             policy: ModelPricingPolicy::Gemini(GeminiModelPricing {

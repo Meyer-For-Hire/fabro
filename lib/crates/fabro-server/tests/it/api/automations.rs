@@ -7,6 +7,7 @@ use fabro_server::server::build_router;
 use fabro_server::test_support::{
     TestAppStateBuilder, TestAutomationRunMaterializer, build_test_router, test_auth_mode,
 };
+use fabro_static::EnvVars;
 use serde_json::{Value, json};
 use sqlx::Row as _;
 use tower::ServiceExt;
@@ -86,6 +87,7 @@ fn automation_app_with_fake_materializer() -> (axum::Router, tempfile::TempDir, 
     let state = TestAppStateBuilder::new()
         .active_config_path(active_config_path)
         .vault_path(vault_path)
+        .vault_entries([(EnvVars::OPENAI_API_KEY, "test-openai-api-key")])
         .automation_materializer(TestAutomationRunMaterializer::succeed(
             materialized_manifest,
             submitted_manifest_bytes,

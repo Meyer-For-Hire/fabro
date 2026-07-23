@@ -22,7 +22,9 @@ use fabro_api::types::{
 };
 use fabro_llm::client::Client as LlmClient;
 use fabro_llm::types::ToolDefinition;
-use fabro_model::{AgentProfileKind, Catalog, ModelHandle, ProviderId};
+use fabro_model::{
+    AgentProfileKind, Catalog, ModelHandle, ModelSelectionError, ProviderId, catalog,
+};
 use fabro_sandbox::reconnect::reconnect_for_run;
 use fabro_static::EnvVars;
 use fabro_store::{
@@ -35,7 +37,7 @@ use fabro_types::run_event::{
     RunSessionTurnFailedProps, RunSessionTurnInterruptedProps, RunSessionTurnStartedProps,
     RunSessionTurnSucceededProps, RunSessionUserMessageProps,
 };
-use fabro_types::settings::{ModelRef as SettingsModelRef, ModelRegistry, ResolvedModelRef};
+use fabro_types::settings::ModelRef as SettingsModelRef;
 use fabro_types::{EventBody, EventEnvelope, RunEvent, RunId, SessionDetail, SessionId, TurnId};
 use fabro_workflow::handler::llm::api::register_named_fabro_run_tools;
 use fabro_workflow::services::FabroRunToolServices;
@@ -160,8 +162,24 @@ async fn create_run_session(
         Ok(store) => store,
         Err(response) => return response,
     };
-    let model = match canonical_session_model(state.catalog().as_ref(), request.model.as_deref()) {
-        Ok(model) => model,
+    let llm_result = match state.resolve_llm_client().await {
+        Ok(result) => result,
+        Err(err) => {
+            return ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to resolve LLM providers: {err}"),
+            )
+            .into_response();
+        }
+    };
+    let eligible = llm_result.provider_ids().into_iter().collect();
+    let (provider, model) = match canonical_session_model(
+        state.catalog().as_ref(),
+        &eligible,
+        request.model.as_deref(),
+        request.provider.as_ref(),
+    ) {
+        Ok(selection) => selection,
         Err(err) => return err.into_response(),
     };
 
@@ -180,8 +198,9 @@ async fn create_run_session(
         run_id,
         session_id,
         EventBody::RunSessionCreated(RunSessionCreatedProps {
-            title: request.title,
-            model,
+            title:    request.title,
+            model:    Some(model),
+            provider: Some(provider),
         }),
         now,
     )
@@ -782,17 +801,41 @@ fn selected_session_model(
     llm_result: &LlmClientResult,
     session: &ProjectedRunSession,
 ) -> Result<(ProviderId, String, AgentProfileKind), AskFabroBuildError> {
-    let configured_provider_ids = llm_result.provider_ids();
-    let selected = match session.record.model.as_deref() {
-        Some(model_id) => catalog.get(model_id).ok_or_else(|| {
-            AskFabroBuildError::ModelUnavailable(format!(
-                "session model '{model_id}' is not in the catalog"
-            ))
-        })?,
-        None => catalog.default_for_configured_ids(&configured_provider_ids),
+    let eligible = llm_result
+        .provider_ids()
+        .into_iter()
+        .collect::<std::collections::HashSet<_>>();
+    let (provider_id, model) = if let Some(model_id) = session.record.model.as_deref() {
+        match catalog.select(model_id, session.record.provider.as_ref(), &eligible) {
+            Ok(selected) => (selected.provider.clone(), selected.id.to_string()),
+            Err(ModelSelectionError::UnknownSelectorOnProvider { provider, .. }) => {
+                (provider, model_id.to_string())
+            }
+            Err(ModelSelectionError::UnknownSelector { .. })
+                if session.record.provider.is_none() =>
+            {
+                let selected = catalog
+                    .select_default(&eligible)
+                    .map_err(|error| AskFabroBuildError::LlmUnconfigured(error.to_string()))?;
+                (selected.provider.clone(), model_id.to_string())
+            }
+            Err(error) => {
+                return Err(AskFabroBuildError::ModelUnavailable(error.to_string()));
+            }
+        }
+    } else {
+        let selected = if let Some(provider) = session.record.provider.as_ref() {
+            let provider_only = std::collections::HashSet::from([provider.clone()]);
+            catalog
+                .select_default(&provider_only)
+                .map_err(|error| AskFabroBuildError::ModelUnavailable(error.to_string()))?
+        } else {
+            catalog
+                .select_default(&eligible)
+                .map_err(|error| AskFabroBuildError::LlmUnconfigured(error.to_string()))?
+        };
+        (selected.provider.clone(), selected.id.to_string())
     };
-    let provider_id = selected.provider.clone();
-    let model = selected.id.clone();
     let profile_kind = catalog
         .effective_agent_profile(&provider_id, Some(&model))
         .ok_or_else(|| {
@@ -805,79 +848,117 @@ fn selected_session_model(
 
 fn canonical_session_model(
     catalog: &Catalog,
+    eligible: &std::collections::HashSet<ProviderId>,
     requested: Option<&str>,
-) -> Result<Option<String>, ApiError> {
+    explicit_provider: Option<&ProviderId>,
+) -> Result<(ProviderId, String), ApiError> {
+    let explicit_provider = explicit_provider
+        .map(|provider| {
+            catalog
+                .provider(provider)
+                .map(|provider| provider.id.clone())
+                .ok_or_else(|| {
+                    session_selection_error(&ModelSelectionError::UnknownProvider {
+                        provider: provider.clone(),
+                    })
+                })
+        })
+        .transpose()?;
     let Some(requested) = requested else {
-        return Ok(None);
+        let eligible = if let Some(provider) = explicit_provider.as_ref() {
+            let provider_is_ready = eligible.iter().any(|eligible_provider| {
+                catalog
+                    .provider(eligible_provider)
+                    .is_some_and(|eligible_provider| eligible_provider.id == *provider)
+            });
+            if !provider_is_ready {
+                return Err(session_selection_error(
+                    &ModelSelectionError::ProviderUnavailable {
+                        provider: provider.clone(),
+                    },
+                ));
+            }
+            std::collections::HashSet::from([provider.clone()])
+        } else {
+            eligible.clone()
+        };
+        let model = catalog
+            .select_default(&eligible)
+            .map_err(|error| session_selection_error(&error))?;
+        return Ok((model.provider.clone(), model.id.to_string()));
     };
     let requested = requested.trim();
     if requested.is_empty() {
         return Err(ApiError::bad_request("Session model must not be empty."));
     }
+    if let Some((provider, model)) = catalog::retired_model_replacement(requested) {
+        return Err(session_selection_error(
+            &ModelSelectionError::RetiredModelIdentifier {
+                identifier: requested.to_string(),
+                provider,
+                model,
+            },
+        ));
+    }
     let model_ref = requested
         .parse::<SettingsModelRef>()
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
-    let registry = CatalogModelRegistry { catalog };
-    match model_ref
-        .resolve(&registry)
-        .map_err(|err| ApiError::bad_request(err.to_string()))?
-    {
-        ResolvedModelRef::Provider(provider) => Err(ApiError::bad_request(format!(
-            "Session model reference '{provider}' names a provider; include a model ID."
-        ))),
-        ResolvedModelRef::Model {
-            provider: Some(provider),
-            model,
-        } => resolve_provider_qualified_session_model(catalog, &provider, &model).map(Some),
-        ResolvedModelRef::Model {
-            provider: None,
-            model,
-        } => catalog
-            .get(&model)
-            .map(|model| Some(model.id.clone()))
-            .ok_or_else(|| ApiError::bad_request(format!("Unknown session model '{model}'."))),
+    let (qualified_provider, model) = match model_ref {
+        SettingsModelRef::Qualified { provider, model } => {
+            let requested_provider = ProviderId::new(provider);
+            let provider = catalog
+                .provider(&requested_provider)
+                .map(|provider| provider.id.clone())
+                .ok_or_else(|| {
+                    session_selection_error(&ModelSelectionError::UnknownProvider {
+                        provider: requested_provider,
+                    })
+                })?;
+            if let Some(explicit) = explicit_provider.as_ref() {
+                if explicit != &provider {
+                    return Err(ApiError::bad_request(format!(
+                        "Session provider pin '{explicit}' conflicts with model reference provider \
+                         '{provider}'."
+                    )));
+                }
+            }
+            (Some(provider), model)
+        }
+        SettingsModelRef::Bare(model) => {
+            if explicit_provider.is_none() && catalog.provider(&ProviderId::new(&model)).is_some() {
+                let detail = if catalog.is_model_selector(&model) {
+                    format!(
+                        "Session model reference '{model}' is ambiguous between a provider and a \
+                         model selector; supply `provider` or use `provider/model`."
+                    )
+                } else {
+                    format!(
+                        "Session model reference '{model}' names a provider; include a model ID."
+                    )
+                };
+                return Err(ApiError::bad_request(detail));
+            }
+            (None, model)
+        }
+    };
+    let provider = qualified_provider.as_ref().or(explicit_provider.as_ref());
+    match catalog.select(&model, provider, eligible) {
+        Ok(selected) => Ok((selected.provider.clone(), selected.id.to_string())),
+        Err(ModelSelectionError::UnknownSelectorOnProvider { provider, .. }) => {
+            Ok((provider, model))
+        }
+        Err(ModelSelectionError::UnknownSelector { .. }) if provider.is_none() => {
+            let selected = catalog
+                .select_default(eligible)
+                .map_err(|error| session_selection_error(&error))?;
+            Ok((selected.provider.clone(), model))
+        }
+        Err(error) => Err(session_selection_error(&error)),
     }
 }
 
-fn resolve_provider_qualified_session_model(
-    catalog: &Catalog,
-    provider_ref: &str,
-    model_ref: &str,
-) -> Result<String, ApiError> {
-    let provider_id = ProviderId::new(provider_ref);
-    let provider = catalog.provider(&provider_id).ok_or_else(|| {
-        ApiError::bad_request(format!("Unknown session model provider '{provider_ref}'."))
-    })?;
-    let model = catalog
-        .get(model_ref)
-        .ok_or_else(|| ApiError::bad_request(format!("Unknown session model '{model_ref}'.")))?;
-    if model.provider != provider.id {
-        return Err(ApiError::bad_request(format!(
-            "Session model '{model_ref}' belongs to provider '{}', not '{}'.",
-            model.provider, provider.id
-        )));
-    }
-    Ok(model.id.clone())
-}
-
-struct CatalogModelRegistry<'a> {
-    catalog: &'a Catalog,
-}
-
-impl ModelRegistry for CatalogModelRegistry<'_> {
-    fn is_provider(&self, token: &str) -> bool {
-        self.catalog.provider(&ProviderId::new(token)).is_some()
-    }
-
-    fn is_model(&self, token: &str) -> bool {
-        self.catalog.get(token).is_some()
-    }
-
-    fn provider_of(&self, token: &str) -> Option<String> {
-        self.catalog
-            .get(token)
-            .map(|model| model.provider.to_string())
-    }
+fn session_selection_error(error: &ModelSelectionError) -> ApiError {
+    ApiError::bad_request(error.to_string())
 }
 
 fn build_profile(
@@ -1275,7 +1356,7 @@ fn agent_event_payload(event_turn_id: TurnId, event: AgentEvent) -> Option<Event
             RunSessionAssistantMessageProps {
                 turn_id: event_turn_id,
                 text,
-                model: Some(model.model_id),
+                model: Some(model.model_id.to_string()),
                 usage: serde_json::to_value(usage).unwrap_or(Value::Null),
             },
         )),
@@ -1510,6 +1591,7 @@ mod tests {
     use fabro_agent::config::ToolAccess;
     use fabro_agent::tool_registry::{RegisteredTool, ToolContext, ToolRegistry, ToolSource};
     use fabro_llm::types::{ToolCall, ToolDefinition};
+    use fabro_model::catalog::LlmCatalogSettings;
     use fabro_types::test_support;
 
     use super::*;
@@ -1548,6 +1630,149 @@ mod tests {
             registry.register(stub_tool(name));
         }
         registry
+    }
+
+    fn portable_session_catalog() -> Catalog {
+        let settings: LlmCatalogSettings = toml::from_str(
+            r#"
+[providers.openai]
+display_name = "OpenAI"
+adapter = "openai"
+agent_profile = "openai"
+priority = 90
+
+[providers.openai.models."gpt-5.6-sol"]
+display_name = "GPT-5.6 Sol"
+family = "gpt-5"
+aliases = ["gpt-56-sol"]
+default = true
+
+[providers.openai.models."gpt-5.6-sol".limits]
+context_window = 1000
+
+[providers.openai.models."gpt-5.6-sol".features]
+tools = true
+vision = false
+reasoning = false
+
+[providers.openrouter]
+display_name = "OpenRouter"
+adapter = "openai_compatible"
+agent_profile = "openai"
+priority = 25
+
+[providers.openrouter.models."gpt-5.6-sol"]
+api_id = "openai/gpt-5.6-sol"
+display_name = "GPT-5.6 Sol (via OpenRouter)"
+family = "gpt-5"
+aliases = ["gpt-56-sol"]
+default = true
+
+[providers.openrouter.models."gpt-5.6-sol".limits]
+context_window = 1000
+
+[providers.openrouter.models."gpt-5.6-sol".features]
+tools = true
+vision = false
+reasoning = false
+"#,
+        )
+        .unwrap();
+        Catalog::from_settings(&settings).unwrap()
+    }
+
+    #[test]
+    fn canonical_session_model_uses_readiness_priority_and_explicit_pins() {
+        let catalog = portable_session_catalog();
+        let openai = ProviderId::openai();
+        let openrouter = ProviderId::new("openrouter");
+
+        assert_eq!(
+            canonical_session_model(
+                &catalog,
+                &std::collections::HashSet::from([openai.clone()]),
+                Some("gpt-56-sol"),
+                None,
+            )
+            .unwrap(),
+            (openai.clone(), "gpt-5.6-sol".to_string())
+        );
+        assert_eq!(
+            canonical_session_model(
+                &catalog,
+                &std::collections::HashSet::from([openrouter.clone()]),
+                Some("gpt-56-sol"),
+                None,
+            )
+            .unwrap(),
+            (openrouter.clone(), "gpt-5.6-sol".to_string())
+        );
+        let both = std::collections::HashSet::from([openai.clone(), openrouter.clone()]);
+        assert_eq!(
+            canonical_session_model(&catalog, &both, Some("gpt-56-sol"), None).unwrap(),
+            (openai, "gpt-5.6-sol".to_string())
+        );
+        assert_eq!(
+            canonical_session_model(&catalog, &both, Some("gpt-56-sol"), Some(&openrouter),)
+                .unwrap(),
+            (openrouter.clone(), "gpt-5.6-sol".to_string())
+        );
+        assert_eq!(
+            canonical_session_model(&catalog, &both, Some("openrouter/gpt-56-sol"), None,).unwrap(),
+            (openrouter, "gpt-5.6-sol".to_string())
+        );
+    }
+
+    #[test]
+    fn canonical_session_model_preserves_unknown_passthrough_on_selected_provider() {
+        let catalog = portable_session_catalog();
+        let openai = ProviderId::openai();
+        let openrouter = ProviderId::new("openrouter");
+        let both = std::collections::HashSet::from([openai.clone(), openrouter.clone()]);
+
+        assert_eq!(
+            canonical_session_model(&catalog, &both, Some("future-model"), Some(&openrouter),)
+                .unwrap(),
+            (openrouter, "future-model".to_string())
+        );
+        assert_eq!(
+            canonical_session_model(&catalog, &both, Some("future-model"), None).unwrap(),
+            (openai, "future-model".to_string())
+        );
+    }
+
+    #[test]
+    fn canonical_session_model_rejects_an_unavailable_explicit_provider() {
+        let catalog = portable_session_catalog();
+        let error = canonical_session_model(
+            &catalog,
+            &std::collections::HashSet::from([ProviderId::openai()]),
+            Some("gpt-56-sol"),
+            Some(&ProviderId::new("openrouter")),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn canonical_session_model_rejects_retired_wire_identifier_before_qualification() {
+        let catalog = Catalog::from_builtin().unwrap();
+        let error = canonical_session_model(
+            &catalog,
+            &catalog.all_provider_ids(),
+            Some("openai/gpt-5.6-sol"),
+            None,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            error
+                .into_response_entry()
+                .detail
+                .contains("openrouter/gpt-5.6-sol")
+        );
     }
 
     #[test]

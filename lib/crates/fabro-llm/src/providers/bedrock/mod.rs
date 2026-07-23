@@ -169,7 +169,11 @@ impl Adapter {
             request,
             provider_name: &self.provider_name,
             deployment_id,
-            model: common::catalog_model(self.catalog.as_deref(), &request.model),
+            model: common::catalog_model(
+                self.catalog.as_deref(),
+                &self.provider_name,
+                &request.model,
+            ),
             params,
         }
     }
@@ -239,7 +243,11 @@ impl ProviderAdapter for Adapter {
 
         let resolved = self.resolve_request(request).await;
         let codec = BedrockConverse;
-        let deployment_id = common::api_model_id(self.catalog.as_deref(), &resolved.model);
+        let deployment_id = common::api_model_id(
+            self.catalog.as_deref(),
+            &self.provider_name,
+            &resolved.model,
+        );
         let params = CodecParams::default();
         let ctx = self.codec_ctx(&resolved, &deployment_id, &params);
 
@@ -253,7 +261,11 @@ impl ProviderAdapter for Adapter {
 
         let resolved = self.resolve_request(request).await;
         let codec = BedrockConverse;
-        let deployment_id = common::api_model_id(self.catalog.as_deref(), &resolved.model);
+        let deployment_id = common::api_model_id(
+            self.catalog.as_deref(),
+            &self.provider_name,
+            &resolved.model,
+        );
         let params = CodecParams::default();
         let ctx = self.codec_ctx(&resolved, &deployment_id, &params);
 

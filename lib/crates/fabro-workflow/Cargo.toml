@@ -13,6 +13,9 @@ readme = "README.md"
 [lib]
 doctest = false
 
+[features]
+test-support = []
+
 [lints]
 workspace = true
 

@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::LazyLock;
 
@@ -12,7 +12,7 @@ use tracing::warn;
 use crate::Speed;
 use crate::adapter::{AdapterKind, AgentProfileKind};
 use crate::codec::CodecKind;
-use crate::ids::ProviderId;
+use crate::ids::{ModelId, ProviderId};
 use crate::provider::Provider;
 use crate::reasoning::ReasoningEffort;
 use crate::types::{Model, ModelCosts, ModelFeatures, ModelLimits, ReasoningEffortFeature};
@@ -32,6 +32,8 @@ struct BuiltinCatalogToml;
 pub struct LlmCatalogSettings {
     #[serde(default)]
     pub providers: HashMap<String, ProviderCatalogSettings>,
+    /// Legacy `[models."<id>"]` input. Canonical settings place model rows
+    /// under their provider; this map is normalized before layers merge.
     #[serde(default)]
     pub models:    HashMap<String, ModelCatalogSettings>,
 }
@@ -68,11 +70,16 @@ pub struct ProviderCatalogSettings {
     pub enabled:        Option<bool>,
     #[serde(default)]
     pub aliases:        Option<Vec<String>>,
+    /// Model declarations keyed by Fabro's canonical model slug.
+    #[serde(default)]
+    pub models:         HashMap<String, ModelCatalogSettings>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelCatalogSettings {
+    /// Provider used only by the temporary legacy top-level `[models]`
+    /// compatibility shape. Canonical provider-scoped rows leave this unset.
     #[serde(default)]
     pub provider:             Option<String>,
     #[serde(default)]
@@ -528,11 +535,46 @@ pub enum CatalogBuildError {
         model:    String,
         provider: ProviderId,
     },
-    #[error("model identifier '{identifier}' is declared by both '{first}' and '{second}'")]
-    DuplicateModelIdentifier {
+    #[error(
+        "provider '{provider}' model selector '{selector}' is declared by both '{first}' and '{second}'"
+    )]
+    DuplicateProviderModelSelector {
+        provider: ProviderId,
+        selector: String,
+        first:    ModelId,
+        second:   ModelId,
+    },
+    #[error(
+        "provider '{provider}' model '{model}' is defined through both provider-scoped and legacy top-level syntax"
+    )]
+    DuplicateProviderModelDefinition {
+        provider: ProviderId,
+        model:    ModelId,
+    },
+    #[error("provider-scoped model '{provider}/{model}' must not declare a provider field")]
+    ScopedModelDeclaresProvider {
+        provider: ProviderId,
+        model:    ModelId,
+    },
+    #[error("legacy model row '{model}' omits provider and does not match a unique known offering")]
+    LegacyModelProviderUnknown { model: String },
+    #[error(
+        "legacy model row '{model}' omits provider and matches multiple providers: {providers:?}"
+    )]
+    LegacyModelProviderAmbiguous {
+        model:     String,
+        providers: Vec<ProviderId>,
+    },
+    #[error("model identifier '{identifier}' has been retired; use '{provider}/{model}' instead")]
+    RetiredModelIdentifier {
         identifier: String,
-        first:      String,
-        second:     String,
+        provider:   ProviderId,
+        model:      ModelId,
+    },
+    #[error("provider '{provider}' model '{model}' has an empty api_id")]
+    EmptyModelApiId {
+        provider: ProviderId,
+        model:    ModelId,
     },
     #[error("provider '{provider}' has multiple default models: {models:?}")]
     MultipleProviderDefaults {
@@ -574,17 +616,49 @@ pub enum CatalogBuildError {
     UndeclaredSpeedCost { model: String, speed: Speed },
 }
 
+/// Failure to select one concrete provider/model offering.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ModelSelectionError {
+    #[error("unknown model provider '{provider}'")]
+    UnknownProvider { provider: ProviderId },
+    #[error("model provider '{provider}' is unavailable")]
+    ProviderUnavailable { provider: ProviderId },
+    #[error("unknown model selector '{selector}'")]
+    UnknownSelector { selector: String },
+    #[error("model selector '{selector}' is unknown on provider '{provider}'")]
+    UnknownSelectorOnProvider {
+        selector: String,
+        provider: ProviderId,
+    },
+    #[error(
+        "model selector '{selector}' is known but has no offering on an eligible provider; available providers: {providers:?}"
+    )]
+    NoEligibleOffering {
+        selector:  String,
+        providers: Vec<ProviderId>,
+    },
+    #[error("model identifier '{identifier}' has been retired; use '{provider}/{model}' instead")]
+    RetiredModelIdentifier {
+        identifier: String,
+        provider:   ProviderId,
+        model:      ModelId,
+    },
+}
+
 /// Typed model catalog backed by a `Vec<Model>`.
 ///
 /// Use [`Catalog::builtin()`] for the embedded settings-backed catalog.
 #[derive(Debug)]
 pub struct Catalog {
-    models:           Vec<Model>,
-    providers:        Vec<CatalogProvider>,
-    model_settings:   HashMap<String, CatalogModelSettings>,
-    model_index:      HashMap<String, usize>,
-    provider_aliases: HashMap<String, ProviderId>,
-    provider_index:   HashMap<ProviderId, usize>,
+    models:                  Vec<Model>,
+    providers:               Vec<CatalogProvider>,
+    model_settings:          HashMap<(ProviderId, ModelId), CatalogModelSettings>,
+    offering_index:          HashMap<(ProviderId, ModelId), usize>,
+    provider_selector_index: HashMap<(ProviderId, String), usize>,
+    canonical_candidates:    HashMap<ModelId, Vec<usize>>,
+    alias_candidates:        HashMap<String, Vec<usize>>,
+    provider_aliases:        HashMap<String, ProviderId>,
+    provider_index:          HashMap<ProviderId, usize>,
 }
 
 impl Catalog {
@@ -596,7 +670,8 @@ impl Catalog {
     }
 
     pub fn from_settings(settings: &LlmCatalogSettings) -> Result<Self, CatalogBuildError> {
-        let mut providers = build_providers(settings)?;
+        let settings = normalize_catalog_settings(settings.clone(), None)?;
+        let mut providers = build_providers(&settings)?;
         providers.sort_by(provider_order);
 
         let mut provider_index = HashMap::new();
@@ -617,63 +692,84 @@ impl Catalog {
             .collect();
 
         let mut models_with_settings = Vec::new();
-        let mut model_identifiers = BTreeMap::<String, String>::new();
-        let mut defaults_by_provider = HashMap::<ProviderId, Vec<String>>::new();
-        let mut small_defaults_by_provider = HashMap::<ProviderId, Vec<String>>::new();
+        let mut model_identifiers = HashMap::<ProviderId, BTreeMap<String, ModelId>>::new();
+        let mut defaults_by_provider = HashMap::<ProviderId, Vec<ModelId>>::new();
+        let mut small_defaults_by_provider = HashMap::<ProviderId, Vec<ModelId>>::new();
 
-        let mut model_ids = settings.models.keys().cloned().collect::<Vec<_>>();
-        model_ids.sort_unstable();
-        for model_id in model_ids {
-            let model_settings = settings
-                .models
-                .get(&model_id)
-                .expect("model ID came from settings map keys");
-            if model_settings.enabled == Some(false) {
+        let mut provider_ids = settings.providers.keys().cloned().collect::<Vec<_>>();
+        provider_ids.sort_unstable();
+        for provider_id in provider_ids {
+            if !known_providers.contains(provider_id.as_str())
+                || !enabled_providers.contains(provider_id.as_str())
+            {
                 continue;
             }
-
-            let provider_id =
-                required_model_string(&model_id, model_settings.provider.as_ref(), "provider")?;
-            if !known_providers.contains(provider_id.as_str()) {
-                return Err(CatalogBuildError::UnknownModelProvider {
-                    model:    model_id,
-                    provider: ProviderId::from(provider_id),
-                });
-            }
-            if !enabled_providers.contains(provider_id.as_str()) {
-                continue;
-            }
-
             let provider = provider_by_id
                 .get(provider_id.as_str())
                 .expect("enabled provider ID should have provider metadata");
-            let (model, resolved_settings) = build_model(&model_id, model_settings, provider)?;
+            let provider_settings = settings
+                .providers
+                .get(&provider_id)
+                .expect("provider ID came from settings map keys");
+            let identifiers = model_identifiers.entry(provider.id.clone()).or_default();
+            let mut model_ids = provider_settings.models.keys().cloned().collect::<Vec<_>>();
+            model_ids.sort_unstable();
+            for model_id in model_ids {
+                let model_settings = provider_settings
+                    .models
+                    .get(&model_id)
+                    .expect("model ID came from provider model map keys");
+                if model_settings.enabled == Some(false) {
+                    continue;
+                }
 
-            register_model_identifier(&mut model_identifiers, model.id.clone(), model.id.clone())?;
-            for alias in &model.aliases {
-                register_model_identifier(&mut model_identifiers, alias.clone(), model.id.clone())?;
-            }
+                if let Some((replacement_provider, replacement_model)) =
+                    retired_model_address(&model_id)
+                {
+                    return Err(CatalogBuildError::RetiredModelIdentifier {
+                        identifier: model_id,
+                        provider:   replacement_provider,
+                        model:      replacement_model,
+                    });
+                }
 
-            if model.default {
-                defaults_by_provider
-                    .entry(model.provider.clone())
-                    .or_default()
-                    .push(model.id.clone());
+                let (model, resolved_settings) = build_model(&model_id, model_settings, provider)?;
+                register_model_identifier(
+                    identifiers,
+                    model.id.as_str().to_string(),
+                    model.id.clone(),
+                    &model.provider,
+                )?;
+                for alias in &model.aliases {
+                    register_model_identifier(
+                        identifiers,
+                        alias.clone(),
+                        model.id.clone(),
+                        &model.provider,
+                    )?;
+                }
+
+                if model.default {
+                    defaults_by_provider
+                        .entry(model.provider.clone())
+                        .or_default()
+                        .push(model.id.clone());
+                }
+                if model.small_default {
+                    small_defaults_by_provider
+                        .entry(model.provider.clone())
+                        .or_default()
+                        .push(model.id.clone());
+                }
+                models_with_settings.push((model, resolved_settings));
             }
-            if model.small_default {
-                small_defaults_by_provider
-                    .entry(model.provider.clone())
-                    .or_default()
-                    .push(model.id.clone());
-            }
-            models_with_settings.push((model, resolved_settings));
         }
 
         for (provider, defaults) in defaults_by_provider {
             if defaults.len() > 1 {
                 return Err(CatalogBuildError::MultipleProviderDefaults {
                     provider,
-                    models: defaults,
+                    models: defaults.into_iter().map(ModelId::into_inner).collect(),
                 });
             }
         }
@@ -681,7 +777,10 @@ impl Catalog {
             if small_defaults.len() > 1 {
                 return Err(CatalogBuildError::MultipleProviderSmallDefaults {
                     provider,
-                    models: small_defaults,
+                    models: small_defaults
+                        .into_iter()
+                        .map(ModelId::into_inner)
+                        .collect(),
                 });
             }
         }
@@ -689,21 +788,29 @@ impl Catalog {
             return Err(CatalogBuildError::NoDefaultModel);
         }
 
-        models_with_settings.sort_by(|(left, _), (right, _)| model_order(left, right));
+        models_with_settings.sort_by(|(left, _), (right, _)| {
+            provider_index[&left.provider]
+                .cmp(&provider_index[&right.provider])
+                .then_with(|| left.id.cmp(&right.id))
+        });
         warn_multiple_probe_models(&models_with_settings);
-        let mut model_settings_by_id = HashMap::new();
+        let mut model_settings_by_offering = HashMap::new();
         let mut models = Vec::new();
         for (model, settings) in models_with_settings {
-            model_settings_by_id.insert(model.id.clone(), settings);
+            model_settings_by_offering.insert((model.provider.clone(), model.id.clone()), settings);
             models.push(model);
         }
-        let model_index = build_model_index(&models);
+        let (offering_index, provider_selector_index, canonical_candidates, alias_candidates) =
+            build_model_indexes(&models);
 
         Ok(Self {
             models,
             providers,
-            model_settings: model_settings_by_id,
-            model_index,
+            model_settings: model_settings_by_offering,
+            offering_index,
+            provider_selector_index,
+            canonical_candidates,
+            alias_candidates,
             provider_aliases,
             provider_index,
         })
@@ -712,8 +819,9 @@ impl Catalog {
     pub fn from_builtin_with_overrides(
         overrides: &LlmCatalogSettings,
     ) -> Result<Self, CatalogBuildError> {
-        let builtins = Self::builtin_settings()?;
-        let settings = merge_catalog_settings(overrides.clone(), builtins);
+        let builtins = normalize_catalog_settings(Self::builtin_settings()?, None)?;
+        let overrides = normalize_catalog_settings(overrides.clone(), Some(&builtins))?;
+        let settings = merge_catalog_settings(overrides, builtins);
         Self::from_settings(&settings)
     }
 
@@ -753,19 +861,202 @@ impl Catalog {
             layer.models.extend(fragment.models);
         }
 
-        Ok(layer)
+        normalize_catalog_settings(layer, None)
     }
 
     fn from_builtin_toml() -> Result<Self, CatalogBuildError> {
         Self::from_settings(&Self::builtin_settings()?)
     }
 
-    /// Look up a model by ID or alias.
+    /// Test-only shorthand for selecting from every enabled catalog provider.
+    ///
+    /// Production callers must supply an explicit ready-provider snapshot to
+    /// [`Catalog::select`] or use a provider-scoped lookup.
+    #[cfg(test)]
     #[must_use]
-    pub fn get(&self, id: &str) -> Option<&Model> {
-        self.model_index
-            .get(id)
+    pub(crate) fn get(&self, selector: &str) -> Option<&Model> {
+        self.candidate_indices(selector)
+            .and_then(|indices| indices.first())
             .and_then(|idx| self.models.get(*idx))
+    }
+
+    /// Look up a selector on exactly one provider, without considering
+    /// provider availability.
+    #[must_use]
+    pub fn get_on_provider(&self, provider: &ProviderId, selector: &str) -> Option<&Model> {
+        let provider = self.provider(provider)?;
+        self.provider_selector_index
+            .get(&(provider.id.clone(), selector.to_string()))
+            .and_then(|idx| self.models.get(*idx))
+    }
+
+    /// Look up a canonical offering by its composite identity.
+    #[must_use]
+    pub fn offering(&self, provider: &ProviderId, model: &ModelId) -> Option<&Model> {
+        let provider = self.provider(provider)?;
+        self.offering_index
+            .get(&(provider.id.clone(), model.clone()))
+            .and_then(|idx| self.models.get(*idx))
+    }
+
+    /// Resolve a selector on exactly one provider.
+    pub fn resolve_on_provider(
+        &self,
+        provider: &ProviderId,
+        selector: &str,
+    ) -> Result<&Model, ModelSelectionError> {
+        if let Some((replacement_provider, replacement_model)) = retired_model_address(selector) {
+            return Err(ModelSelectionError::RetiredModelIdentifier {
+                identifier: selector.to_string(),
+                provider:   replacement_provider,
+                model:      replacement_model,
+            });
+        }
+        let provider =
+            self.provider(provider)
+                .ok_or_else(|| ModelSelectionError::UnknownProvider {
+                    provider: provider.clone(),
+                })?;
+        if let Some(model) = self.get_on_provider(&provider.id, selector) {
+            return Ok(model);
+        }
+        Err(ModelSelectionError::UnknownSelectorOnProvider {
+            selector: selector.to_string(),
+            provider: provider.id.clone(),
+        })
+    }
+
+    /// Select one concrete offering for a selector and ready-provider
+    /// snapshot.
+    ///
+    /// An explicit provider is a pin. Unqualified selection checks canonical
+    /// IDs before aliases and uses the catalog's provider priority ordering.
+    pub fn select<'a>(
+        &'a self,
+        selector: &str,
+        explicit_provider: Option<&ProviderId>,
+        eligible_providers: &HashSet<ProviderId>,
+    ) -> Result<&'a Model, ModelSelectionError> {
+        if let Some((replacement_provider, replacement_model)) = retired_model_address(selector) {
+            return Err(ModelSelectionError::RetiredModelIdentifier {
+                identifier: selector.to_string(),
+                provider:   replacement_provider,
+                model:      replacement_model,
+            });
+        }
+        let eligible = eligible_providers
+            .iter()
+            .filter_map(|provider| self.provider(provider).map(|provider| provider.id.clone()))
+            .collect::<HashSet<_>>();
+
+        if let Some(explicit_provider) = explicit_provider {
+            let provider = self.provider(explicit_provider).ok_or_else(|| {
+                ModelSelectionError::UnknownProvider {
+                    provider: explicit_provider.clone(),
+                }
+            })?;
+            if !eligible.contains(&provider.id) {
+                return Err(ModelSelectionError::ProviderUnavailable {
+                    provider: provider.id.clone(),
+                });
+            }
+            return self.resolve_on_provider(&provider.id, selector);
+        }
+
+        let canonical = self.canonical_candidates.get(&ModelId::new(selector));
+        if let Some(indices) = canonical {
+            if let Some(model) = indices
+                .iter()
+                .filter_map(|idx| self.models.get(*idx))
+                .find(|model| eligible.contains(&model.provider))
+            {
+                return Ok(model);
+            }
+        }
+
+        let aliases = self.alias_candidates.get(selector);
+        if let Some(indices) = aliases {
+            if let Some(model) = indices
+                .iter()
+                .filter_map(|idx| self.models.get(*idx))
+                .find(|model| eligible.contains(&model.provider))
+            {
+                return Ok(model);
+            }
+        }
+
+        let mut providers = Vec::new();
+        for index in canonical
+            .into_iter()
+            .flatten()
+            .chain(aliases.into_iter().flatten())
+        {
+            let Some(model) = self.models.get(*index) else {
+                continue;
+            };
+            if !providers.contains(&model.provider) {
+                providers.push(model.provider.clone());
+            }
+        }
+        if !providers.is_empty() {
+            return Err(ModelSelectionError::NoEligibleOffering {
+                selector: selector.to_string(),
+                providers,
+            });
+        }
+
+        Err(ModelSelectionError::UnknownSelector {
+            selector: selector.to_string(),
+        })
+    }
+
+    #[must_use]
+    pub fn all_provider_ids(&self) -> HashSet<ProviderId> {
+        self.providers
+            .iter()
+            .map(|provider| provider.id.clone())
+            .collect()
+    }
+
+    /// Select the highest-priority default model on an eligible provider.
+    pub fn select_default(
+        &self,
+        eligible_providers: &HashSet<ProviderId>,
+    ) -> Result<&Model, ModelSelectionError> {
+        let eligible = eligible_providers
+            .iter()
+            .filter_map(|provider| self.provider(provider).map(|provider| provider.id.clone()))
+            .collect::<HashSet<_>>();
+        if let Some(model) = self
+            .models
+            .iter()
+            .find(|model| model.default && eligible.contains(&model.provider))
+        {
+            return Ok(model);
+        }
+        let mut providers = self
+            .models
+            .iter()
+            .filter(|model| model.default)
+            .map(|model| model.provider.clone())
+            .collect::<Vec<_>>();
+        providers.sort();
+        providers.dedup();
+        Err(ModelSelectionError::NoEligibleOffering {
+            selector: "<default model>".to_string(),
+            providers,
+        })
+    }
+
+    #[must_use]
+    pub fn is_model_selector(&self, selector: &str) -> bool {
+        self.candidate_indices(selector).is_some()
+    }
+
+    fn candidate_indices(&self, selector: &str) -> Option<&Vec<usize>> {
+        self.canonical_candidates
+            .get(&ModelId::new(selector))
+            .or_else(|| self.alias_candidates.get(selector))
     }
 
     #[must_use]
@@ -786,7 +1077,7 @@ impl Catalog {
             let stats = stats_by_provider.entry(model.provider.clone()).or_default();
             stats.model_count = stats.model_count.saturating_add(1);
             if model.default {
-                stats.default_model = Some(model.id.clone());
+                stats.default_model = Some(model.id.to_string());
             }
         }
 
@@ -818,9 +1109,32 @@ impl Catalog {
     }
 
     #[must_use]
-    pub fn model_settings(&self, id: &str) -> Option<&CatalogModelSettings> {
-        let model = self.get(id)?;
-        self.model_settings.get(&model.id)
+    pub fn settings_for(&self, model: &Model) -> Option<&CatalogModelSettings> {
+        self.model_settings
+            .get(&(model.provider.clone(), model.id.clone()))
+    }
+
+    /// Test-only shorthand for settings on the highest-priority enabled
+    /// offering. Production callers must retain the resolved offering and use
+    /// [`Catalog::settings_for`].
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn model_settings(
+        &self,
+        selector: impl AsRef<str>,
+    ) -> Option<&CatalogModelSettings> {
+        self.get(selector.as_ref())
+            .and_then(|model| self.settings_for(model))
+    }
+
+    #[must_use]
+    pub fn model_settings_on_provider(
+        &self,
+        provider: &ProviderId,
+        selector: &str,
+    ) -> Option<&CatalogModelSettings> {
+        let model = self.get_on_provider(provider, selector)?;
+        self.settings_for(model)
     }
 
     #[must_use]
@@ -831,9 +1145,8 @@ impl Catalog {
     ) -> Option<AgentProfileKind> {
         let provider = self.provider(provider_id)?;
         let model_profile = model_id_or_alias
-            .and_then(|model_id| self.get(model_id))
-            .filter(|model| model.provider == provider.id)
-            .and_then(|model| self.model_settings.get(&model.id))
+            .and_then(|model_id| self.get_on_provider(&provider.id, model_id))
+            .and_then(|model| self.settings_for(model))
             .map(|settings| settings.agent_profile);
         Some(model_profile.unwrap_or(provider.agent_profile))
     }
@@ -849,9 +1162,8 @@ impl Catalog {
     ) -> Option<CodecKind> {
         let provider = self.provider(provider_id)?;
         let model_codec = model_id_or_alias
-            .and_then(|model_id| self.get(model_id))
-            .filter(|model| model.provider == provider.id)
-            .and_then(|model| self.model_settings.get(&model.id))
+            .and_then(|model_id| self.get_on_provider(&provider.id, model_id))
+            .and_then(|model| self.settings_for(model))
             .map(|settings| settings.codec);
         Some(model_codec.unwrap_or(provider.codec))
     }
@@ -867,9 +1179,8 @@ impl Catalog {
     ) -> Option<BillingPolicy> {
         let provider = self.provider(provider_id)?;
         let model_policy = model_id_or_alias
-            .and_then(|model_id| self.get(model_id))
-            .filter(|model| model.provider == provider.id)
-            .and_then(|model| self.model_settings.get(&model.id))
+            .and_then(|model_id| self.get_on_provider(&provider.id, model_id))
+            .and_then(|model| self.settings_for(model))
             .map(|settings| settings.billing_policy);
         Some(model_policy.unwrap_or(provider.billing_policy))
     }
@@ -993,8 +1304,7 @@ impl Catalog {
         if let Some(model) = self.models.iter().find(|model| {
             &model.provider == provider_id
                 && self
-                    .model_settings
-                    .get(&model.id)
+                    .settings_for(model)
                     .is_some_and(|settings| settings.probe)
         }) {
             return Some(model);
@@ -1043,7 +1353,7 @@ impl Catalog {
         model: &str,
         fallbacks: &HashMap<String, Vec<String>>,
     ) -> Vec<FallbackTarget> {
-        let Some(reference) = self.get(model) else {
+        let Some(reference) = self.get_on_provider(primary, model) else {
             return Vec::new();
         };
 
@@ -1057,22 +1367,359 @@ impl Catalog {
                 let provider = ProviderId::from(provider_str.clone());
                 self.closest(&provider, reference).map(|m| FallbackTarget {
                     provider: provider_str.clone(),
-                    model:    m.id.clone(),
+                    model:    m.id.to_string(),
                 })
             })
             .collect()
     }
 }
 
-fn build_model_index(models: &[Model]) -> HashMap<String, usize> {
-    let mut index = HashMap::new();
+type ModelIndexes = (
+    HashMap<(ProviderId, ModelId), usize>,
+    HashMap<(ProviderId, String), usize>,
+    HashMap<ModelId, Vec<usize>>,
+    HashMap<String, Vec<usize>>,
+);
+
+fn build_model_indexes(models: &[Model]) -> ModelIndexes {
+    let mut offering_index = HashMap::new();
+    let mut provider_selector_index = HashMap::new();
+    let mut canonical_candidates = HashMap::<ModelId, Vec<usize>>::new();
+    let mut alias_candidates = HashMap::<String, Vec<usize>>::new();
     for (idx, model) in models.iter().enumerate() {
-        index.insert(model.id.clone(), idx);
+        offering_index.insert((model.provider.clone(), model.id.clone()), idx);
+        provider_selector_index
+            .insert((model.provider.clone(), model.id.as_str().to_string()), idx);
+        canonical_candidates
+            .entry(model.id.clone())
+            .or_default()
+            .push(idx);
         for alias in &model.aliases {
-            index.insert(alias.clone(), idx);
+            provider_selector_index.insert((model.provider.clone(), alias.clone()), idx);
+            alias_candidates.entry(alias.clone()).or_default().push(idx);
         }
     }
-    index
+    (
+        offering_index,
+        provider_selector_index,
+        canonical_candidates,
+        alias_candidates,
+    )
+}
+
+fn normalize_catalog_settings(
+    mut settings: LlmCatalogSettings,
+    known: Option<&LlmCatalogSettings>,
+) -> Result<LlmCatalogSettings, CatalogBuildError> {
+    for (provider, settings) in &settings.providers {
+        for (model, settings) in &settings.models {
+            if settings.provider.is_some() {
+                return Err(CatalogBuildError::ScopedModelDeclaresProvider {
+                    provider: ProviderId::new(provider.clone()),
+                    model:    ModelId::new(model.clone()),
+                });
+            }
+        }
+    }
+
+    let legacy_models = std::mem::take(&mut settings.models);
+    for (legacy_id, mut model_settings) in legacy_models {
+        if let Some((provider, model)) = retired_model_address(&legacy_id) {
+            return Err(CatalogBuildError::RetiredModelIdentifier {
+                identifier: legacy_id,
+                provider,
+                model,
+            });
+        }
+
+        let explicit_provider = model_settings.provider.take();
+        let (provider, model_id) = if let Some(provider) = explicit_provider {
+            let provider = canonical_settings_provider(&provider, &settings, known)
+                .unwrap_or_else(|| ProviderId::new(provider));
+            let model_id = canonical_settings_model(&provider, &legacy_id, &settings, known)
+                .unwrap_or_else(|| ModelId::new(legacy_id.clone()));
+            (provider, model_id)
+        } else {
+            let candidates = settings_model_candidates(&legacy_id, &settings, known);
+            match candidates.as_slice() {
+                [(provider, model)] => (provider.clone(), model.clone()),
+                [] => {
+                    return Err(CatalogBuildError::LegacyModelProviderUnknown { model: legacy_id });
+                }
+                _ => {
+                    return Err(CatalogBuildError::LegacyModelProviderAmbiguous {
+                        model:     legacy_id,
+                        providers: candidates
+                            .into_iter()
+                            .map(|(provider, _)| provider)
+                            .collect(),
+                    });
+                }
+            }
+        };
+
+        if !settings.providers.contains_key(provider.as_str())
+            && !known.is_some_and(|known| known.providers.contains_key(provider.as_str()))
+        {
+            return Err(CatalogBuildError::UnknownModelProvider {
+                model: legacy_id,
+                provider,
+            });
+        }
+
+        let provider_settings = settings.providers.entry(provider.to_string()).or_default();
+        if provider_settings.models.contains_key(model_id.as_str()) {
+            return Err(CatalogBuildError::DuplicateProviderModelDefinition {
+                provider,
+                model: model_id,
+            });
+        }
+        provider_settings
+            .models
+            .insert(model_id.into_inner(), model_settings);
+    }
+    Ok(settings)
+}
+
+fn canonical_settings_provider(
+    selector: &str,
+    settings: &LlmCatalogSettings,
+    known: Option<&LlmCatalogSettings>,
+) -> Option<ProviderId> {
+    let providers = || {
+        settings
+            .providers
+            .iter()
+            .chain(known.into_iter().flat_map(|known| known.providers.iter()))
+    };
+    providers()
+        .find(|(id, _)| id.as_str() == selector)
+        .or_else(|| {
+            providers().find(|(_, provider)| {
+                provider
+                    .aliases
+                    .as_ref()
+                    .is_some_and(|aliases| aliases.iter().any(|alias| alias == selector))
+            })
+        })
+        .map(|(id, _)| ProviderId::new(id.clone()))
+}
+
+fn canonical_settings_model(
+    provider: &ProviderId,
+    selector: &str,
+    settings: &LlmCatalogSettings,
+    known: Option<&LlmCatalogSettings>,
+) -> Option<ModelId> {
+    let models = || {
+        settings
+            .providers
+            .get(provider.as_str())
+            .into_iter()
+            .chain(known.and_then(|known| known.providers.get(provider.as_str())))
+            .flat_map(|provider| provider.models.iter())
+    };
+    models()
+        .find(|(id, _)| id.as_str() == selector)
+        .or_else(|| {
+            models().find(|(_, model)| {
+                model
+                    .aliases
+                    .as_ref()
+                    .is_some_and(|aliases| aliases.iter().any(|alias| alias == selector))
+            })
+        })
+        .map(|(id, _)| ModelId::new(id.clone()))
+}
+
+fn settings_model_candidates(
+    selector: &str,
+    settings: &LlmCatalogSettings,
+    known: Option<&LlmCatalogSettings>,
+) -> Vec<(ProviderId, ModelId)> {
+    let collect = |matches: &dyn Fn(&str, &ModelCatalogSettings) -> bool| {
+        let mut candidates = BTreeSet::<(ProviderId, ModelId)>::new();
+        for (provider_id, provider) in settings
+            .providers
+            .iter()
+            .chain(known.into_iter().flat_map(|known| known.providers.iter()))
+        {
+            for (model_id, model) in &provider.models {
+                if matches(model_id, model) {
+                    candidates.insert((
+                        ProviderId::new(provider_id.clone()),
+                        ModelId::new(model_id.clone()),
+                    ));
+                }
+            }
+        }
+        candidates.into_iter().collect::<Vec<_>>()
+    };
+
+    let canonical = collect(&|model_id, _| model_id == selector);
+    if canonical.is_empty() {
+        collect(&|_, model| {
+            model
+                .aliases
+                .as_ref()
+                .is_some_and(|aliases| aliases.iter().any(|alias| alias == selector))
+        })
+    } else {
+        canonical
+    }
+}
+
+/// Return every built-in offering whose canonical model ID is `selector`.
+///
+/// This includes disabled providers because config compatibility
+/// normalization happens before runtime availability is known.
+pub fn builtin_canonical_model_offerings(
+    selector: &str,
+) -> Result<Vec<(ProviderId, ModelId)>, CatalogBuildError> {
+    let settings = Catalog::builtin_settings()?;
+    Ok(settings
+        .providers
+        .iter()
+        .filter_map(|(provider, settings)| {
+            settings.models.get_key_value(selector).map(|(model, _)| {
+                (
+                    ProviderId::new(provider.clone()),
+                    ModelId::new(model.clone()),
+                )
+            })
+        })
+        .collect())
+}
+
+/// Return every built-in offering that declares `selector` as an alias.
+///
+/// This includes disabled providers because config compatibility
+/// normalization happens before runtime availability is known.
+pub fn builtin_alias_model_offerings(
+    selector: &str,
+) -> Result<Vec<(ProviderId, ModelId)>, CatalogBuildError> {
+    let settings = Catalog::builtin_settings()?;
+    let mut offerings = settings
+        .providers
+        .iter()
+        .flat_map(|(provider, settings)| {
+            settings
+                .models
+                .iter()
+                .filter(move |(_, settings)| {
+                    settings
+                        .aliases
+                        .as_ref()
+                        .is_some_and(|aliases| aliases.iter().any(|alias| alias == selector))
+                })
+                .map(move |(model, _)| {
+                    (
+                        ProviderId::new(provider.clone()),
+                        ModelId::new(model.clone()),
+                    )
+                })
+        })
+        .collect::<Vec<_>>();
+    offerings.sort();
+    offerings.dedup();
+    Ok(offerings)
+}
+
+/// Resolve a built-in provider ID or alias without filtering disabled rows.
+pub fn builtin_provider_id(selector: &str) -> Result<Option<ProviderId>, CatalogBuildError> {
+    let settings = Catalog::builtin_settings()?;
+    Ok(canonical_settings_provider(selector, &settings, None))
+}
+
+/// Built-in catalog keys retired when provider API identifiers stopped being
+/// Fabro model IDs. Keep this list explicit so old workflow and persisted-run
+/// references fail with an actionable replacement instead of silently
+/// selecting another route.
+const RETIRED_MODEL_IDENTIFIERS: &[(&str, &str, &str)] = &[
+    ("openai.gpt-5.5", "bedrock-openai", "gpt-5.5"),
+    ("openai.gpt-5.4", "bedrock-openai", "gpt-5.4"),
+    (
+        "us.anthropic.claude-sonnet-4-6",
+        "bedrock",
+        "claude-sonnet-4-6",
+    ),
+    ("us.anthropic.claude-opus-4-8", "bedrock", "claude-opus-4-8"),
+    (
+        "us.anthropic.claude-haiku-4-5",
+        "bedrock",
+        "claude-haiku-4-5",
+    ),
+    ("openai.gpt-oss-120b", "bedrock", "gpt-oss-120b"),
+    ("openai.gpt-oss-20b", "bedrock", "gpt-oss-20b"),
+    ("amazon.nova-2-lite", "bedrock", "nova-2-lite"),
+    ("meta.llama4-maverick", "bedrock", "llama-4-maverick"),
+    ("mistral.mistral-large-3", "bedrock", "mistral-large-3"),
+    ("mistral.devstral-2", "bedrock", "devstral-2"),
+    ("deepseek.v3-2", "bedrock", "deepseek-v3.2"),
+    ("moonshotai.kimi-k2.5", "bedrock", "kimi-k2.5"),
+    ("zai.glm-5", "bedrock", "glm-5"),
+    ("minimax.minimax-m2.5", "bedrock", "minimax-m2.5"),
+    ("nvidia.nemotron-3-super", "bedrock", "nemotron-3-super"),
+    ("us.anthropic.claude-fable-5", "bedrock", "claude-fable-5"),
+    ("anthropic/claude-fable-5", "openrouter", "claude-fable-5"),
+    ("anthropic/claude-opus-4-8", "openrouter", "claude-opus-4-8"),
+    ("anthropic/claude-opus-4-7", "openrouter", "claude-opus-4-7"),
+    (
+        "anthropic/claude-sonnet-4-6",
+        "openrouter",
+        "claude-sonnet-4-6",
+    ),
+    (
+        "anthropic/claude-haiku-4-5",
+        "openrouter",
+        "claude-haiku-4-5",
+    ),
+    ("openai/gpt-5.6-sol", "openrouter", "gpt-5.6-sol"),
+    ("openai/gpt-5.6-terra", "openrouter", "gpt-5.6-terra"),
+    ("openai/gpt-5.6-luna", "openrouter", "gpt-5.6-luna"),
+    ("openai/gpt-5.4", "openrouter", "gpt-5.4"),
+    ("openai/gpt-5.5", "openrouter", "gpt-5.5"),
+    (
+        "google/gemini-3.1-pro-preview",
+        "openrouter",
+        "gemini-3.1-pro-preview",
+    ),
+    ("google/gemini-3.5-flash", "openrouter", "gemini-3.5-flash"),
+    ("xiaomi/mimo-v2.5-pro", "openrouter", "mimo-v2.5-pro"),
+    ("minimax/minimax-m2.7", "openrouter", "minimax-m2.7"),
+    ("deepseek/deepseek-v4-pro", "openrouter", "deepseek-v4-pro"),
+    (
+        "deepseek/deepseek-v4-flash",
+        "openrouter",
+        "deepseek-v4-flash",
+    ),
+    ("moonshotai/kimi-k2.6", "openrouter", "kimi-k2.6"),
+    ("moonshotai/kimi-k3", "openrouter", "kimi-k3"),
+    ("poolside/laguna-s-2.1", "openrouter", "laguna-s-2.1"),
+    ("poolside/laguna-xs-2.1", "openrouter", "laguna-xs-2.1"),
+    ("qwen/qwen3-coder", "openrouter", "qwen3-coder"),
+    ("qwen/qwen3.6-flash", "openrouter", "qwen3.6-flash"),
+    ("z-ai/glm-5.2", "openrouter", "glm-5.2"),
+    ("z-ai/glm-4.6", "openrouter", "glm-4.6"),
+    (
+        "nvidia/nemotron-3-super-120b-a12b",
+        "openrouter",
+        "nemotron-3-super-120b-a12b",
+    ),
+    ("mistralai/devstral-2512", "openrouter", "devstral-2512"),
+];
+
+/// Return the replacement address for a retired built-in catalog key.
+#[must_use]
+pub fn retired_model_replacement(identifier: &str) -> Option<(ProviderId, ModelId)> {
+    RETIRED_MODEL_IDENTIFIERS
+        .iter()
+        .find(|(retired, _, _)| *retired == identifier)
+        .map(|(_, provider, model)| (ProviderId::new(*provider), ModelId::new(*model)))
+}
+
+fn retired_model_address(identifier: &str) -> Option<(ProviderId, ModelId)> {
+    retired_model_replacement(identifier)
 }
 
 fn merge_catalog_settings(
@@ -1087,21 +1734,20 @@ fn merge_catalog_settings(
         fallback.providers.insert(id, provider);
     }
 
-    for (id, model) in higher.models {
+    fallback
+}
+
+fn merge_provider_settings(
+    mut higher: ProviderCatalogSettings,
+    mut fallback: ProviderCatalogSettings,
+) -> ProviderCatalogSettings {
+    for (id, model) in higher.models.drain() {
         let model = match fallback.models.remove(&id) {
             Some(fallback_model) => merge_model_settings(model, fallback_model),
             None => model,
         };
         fallback.models.insert(id, model);
     }
-
-    fallback
-}
-
-fn merge_provider_settings(
-    higher: ProviderCatalogSettings,
-    fallback: ProviderCatalogSettings,
-) -> ProviderCatalogSettings {
     ProviderCatalogSettings {
         display_name:   higher.display_name.or(fallback.display_name),
         adapter:        higher.adapter.or(fallback.adapter),
@@ -1115,6 +1761,7 @@ fn merge_provider_settings(
         priority:       higher.priority.or(fallback.priority),
         enabled:        higher.enabled.or(fallback.enabled),
         aliases:        higher.aliases.or(fallback.aliases),
+        models:         fallback.models,
     }
 }
 
@@ -1418,7 +2065,7 @@ fn build_model(
     let speed_costs = build_speed_costs(model_id, settings.costs.as_ref(), &controls)?;
 
     let model = Model {
-        id: model_id.to_string(),
+        id: ModelId::new(model_id),
         provider: provider.id.clone(),
         family,
         display_name,
@@ -1436,11 +2083,18 @@ fn build_model(
         small_default: settings.small_default.unwrap_or_default(),
         configured: false,
     };
+    let api_id = match settings.api_id.as_ref() {
+        Some(api_id) if api_id.is_empty() => {
+            return Err(CatalogBuildError::EmptyModelApiId {
+                provider: provider.id.clone(),
+                model:    ModelId::new(model_id),
+            });
+        }
+        Some(api_id) => api_id.clone(),
+        None => model_id.to_string(),
+    };
     let catalog_settings = CatalogModelSettings {
-        api_id: settings
-            .api_id
-            .clone()
-            .unwrap_or_else(|| model_id.to_string()),
+        api_id,
         codec: resolve_model_codec(model_id, provider, settings.codec)?,
         billing_policy: settings.billing_policy.unwrap_or(provider.billing_policy),
         agent_profile: settings.agent_profile.unwrap_or(provider.agent_profile),
@@ -1458,7 +2112,7 @@ fn warn_multiple_probe_models(models_with_settings: &[(Model, CatalogModelSettin
             probes_by_provider
                 .entry(model.provider.clone())
                 .or_default()
-                .push(model.id.clone());
+                .push(model.id.to_string());
         }
     }
 
@@ -1675,16 +2329,20 @@ fn register_provider_identifier(
 }
 
 fn register_model_identifier(
-    identifiers: &mut BTreeMap<String, String>,
+    identifiers: &mut BTreeMap<String, ModelId>,
     identifier: String,
-    owner: String,
+    owner: ModelId,
+    provider: &ProviderId,
 ) -> Result<(), CatalogBuildError> {
     match identifiers.get(&identifier) {
-        Some(existing) if existing != &owner => Err(CatalogBuildError::DuplicateModelIdentifier {
-            identifier,
-            first: existing.clone(),
-            second: owner,
-        }),
+        Some(existing) if existing != &owner => {
+            Err(CatalogBuildError::DuplicateProviderModelSelector {
+                provider: provider.clone(),
+                selector: identifier,
+                first:    existing.clone(),
+                second:   owner,
+            })
+        }
         _ => {
             identifiers.insert(identifier, owner);
             Ok(())
@@ -1743,12 +2401,6 @@ fn provider_order(left: &CatalogProvider, right: &CatalogProvider) -> std::cmp::
         .then_with(|| left.id.cmp(&right.id))
 }
 
-fn model_order(left: &Model, right: &Model) -> std::cmp::Ordering {
-    left.provider
-        .cmp(&right.provider)
-        .then_with(|| left.id.cmp(&right.id))
-}
-
 #[cfg(test)]
 mod tests {
     use strum::VariantArray;
@@ -1760,6 +2412,54 @@ mod tests {
 
     fn minimal_settings(source: &str) -> LlmCatalogSettings {
         toml::from_str(source).expect("fixture should parse as an LLM settings layer")
+    }
+
+    fn portable_model_catalog() -> Catalog {
+        Catalog::from_settings(&minimal_settings(
+            r#"
+[providers.openai]
+display_name = "OpenAI"
+adapter = "openai"
+agent_profile = "openai"
+priority = 90
+
+[providers.openai.models."gpt-5.6-sol"]
+display_name = "GPT-5.6 Sol"
+family = "gpt-5"
+aliases = ["gpt-56-sol", "portable"]
+default = true
+
+[providers.openai.models."gpt-5.6-sol".limits]
+context_window = 1000
+
+[providers.openai.models."gpt-5.6-sol".features]
+tools = true
+vision = false
+reasoning = true
+
+[providers.openrouter]
+display_name = "OpenRouter"
+adapter = "openai_compatible"
+agent_profile = "openai"
+priority = 25
+
+[providers.openrouter.models."gpt-5.6-sol"]
+api_id = "openai/gpt-5.6-sol"
+display_name = "GPT-5.6 Sol (via OpenRouter)"
+family = "gpt-5"
+aliases = ["gpt-56-sol", "portable"]
+default = true
+
+[providers.openrouter.models."gpt-5.6-sol".limits]
+context_window = 1000
+
+[providers.openrouter.models."gpt-5.6-sol".features]
+tools = true
+vision = false
+reasoning = true
+"#,
+        ))
+        .expect("portable model fixture should build")
     }
 
     const BEDROCK_SIGV4_LAYER: &str = r#"
@@ -1934,18 +2634,21 @@ enabled = true
         // provider's Anthropic defaults the other way.
         assert_eq!(
             catalog
-                .model_settings("us.anthropic.claude-sonnet-4-6")
+                .model_settings_on_provider(&bedrock, "claude-sonnet-4-6")
                 .unwrap()
                 .billing_policy,
             BillingPolicy::Anthropic
         );
         assert_eq!(
-            catalog.model_settings("zai.glm-5").unwrap().billing_policy,
+            catalog
+                .model_settings_on_provider(&bedrock, "glm-5")
+                .unwrap()
+                .billing_policy,
             BillingPolicy::OpenAi
         );
         assert_eq!(
             catalog
-                .model_settings("us.anthropic.claude-haiku-4-5")
+                .model_settings_on_provider(&bedrock, "claude-haiku-4-5")
                 .unwrap()
                 .api_id,
             "us.anthropic.claude-haiku-4-5-20251001-v1:0"
@@ -1954,17 +2657,17 @@ enabled = true
             catalog
                 .default_for_provider(&bedrock)
                 .map(|model| model.id.as_str()),
-            Some("us.anthropic.claude-sonnet-4-6")
+            Some("claude-sonnet-4-6")
         );
         // Fable 5 ships with sampling params pinned off (the Converse
         // encoder drops temperature/top_p for it).
         let fable = catalog
-            .get("us.anthropic.claude-fable-5")
+            .get_on_provider(&bedrock, "claude-fable-5")
             .expect("fable row should be present");
         assert!(!fable.features.sampling_params);
         assert_eq!(
             catalog
-                .model_settings("us.anthropic.claude-fable-5")
+                .model_settings_on_provider(&bedrock, "claude-fable-5")
                 .unwrap()
                 .billing_policy,
             BillingPolicy::Anthropic
@@ -2001,7 +2704,7 @@ enabled = true
             catalog
                 .default_for_provider(&provider_id)
                 .map(|model| model.id.as_str()),
-            Some("openai.gpt-5.5")
+            Some("gpt-5.5")
         );
     }
 
@@ -2115,14 +2818,14 @@ enabled = true
         // open-weights rows inherit it.
         assert_eq!(
             catalog
-                .model_settings("anthropic/claude-sonnet-4-6")
+                .model_settings_on_provider(&openrouter, "claude-sonnet-4-6")
                 .unwrap()
                 .billing_policy,
             BillingPolicy::Anthropic
         );
         assert_eq!(
             catalog
-                .model_settings("deepseek/deepseek-v4-flash")
+                .model_settings_on_provider(&openrouter, "deepseek-v4-flash")
                 .unwrap()
                 .billing_policy,
             BillingPolicy::OpenAi
@@ -2131,7 +2834,7 @@ enabled = true
             catalog
                 .default_for_provider(&openrouter)
                 .map(|model| model.id.as_str()),
-            Some("anthropic/claude-sonnet-4-6")
+            Some("claude-sonnet-4-6")
         );
     }
 
@@ -2147,7 +2850,7 @@ enabled = true
 
         let expected = [
             (
-                "openai/gpt-5.6-sol",
+                "gpt-5.6-sol",
                 "openai/gpt-5.6-sol",
                 "gpt-5",
                 1_050_000,
@@ -2159,7 +2862,7 @@ enabled = true
                 BillingPolicy::OpenAi,
             ),
             (
-                "openai/gpt-5.6-terra",
+                "gpt-5.6-terra",
                 "openai/gpt-5.6-terra",
                 "gpt-5",
                 1_050_000,
@@ -2171,7 +2874,7 @@ enabled = true
                 BillingPolicy::OpenAi,
             ),
             (
-                "openai/gpt-5.6-luna",
+                "gpt-5.6-luna",
                 "openai/gpt-5.6-luna",
                 "gpt-5",
                 1_050_000,
@@ -2183,7 +2886,7 @@ enabled = true
                 BillingPolicy::OpenAi,
             ),
             (
-                "anthropic/claude-opus-4-8",
+                "claude-opus-4-8",
                 "anthropic/claude-opus-4.8",
                 "claude-4",
                 1_000_000,
@@ -2195,7 +2898,7 @@ enabled = true
                 BillingPolicy::Anthropic,
             ),
             (
-                "anthropic/claude-fable-5",
+                "claude-fable-5",
                 "anthropic/claude-fable-5",
                 "claude-5",
                 1_000_000,
@@ -2222,7 +2925,7 @@ enabled = true
         ) in expected
         {
             let model = catalog
-                .get(id)
+                .get_on_provider(&ProviderId::new("openrouter"), id)
                 .unwrap_or_else(|| panic!("OpenRouter model '{id}' should be present"));
             assert_eq!(model.provider, ProviderId::new("openrouter"), "{id}");
             assert_eq!(model.family, family, "{id}");
@@ -2243,20 +2946,42 @@ enabled = true
             );
 
             let settings = catalog
-                .model_settings(id)
+                .model_settings_on_provider(&ProviderId::new("openrouter"), id)
                 .unwrap_or_else(|| panic!("OpenRouter settings for '{id}' should be present"));
             assert_eq!(settings.api_id, api_id, "{id}");
             assert_eq!(settings.billing_policy, billing_policy, "{id}");
-            assert_eq!(
-                catalog.get(api_id).map(|model| model.id.as_str()),
-                Some(id),
-                "{id}"
-            );
             assert_eq!(
                 settings.controls.reasoning_effort,
                 ReasoningEffort::VARIANTS,
                 "{id}"
             );
+        }
+    }
+
+    #[test]
+    fn builtin_gpt_5_6_short_aliases_are_portable() {
+        let catalog = Catalog::from_builtin_with_overrides(&minimal_settings(
+            r"
+[providers.openrouter]
+enabled = true
+",
+        ))
+        .expect("enabled OpenRouter override should build from the built-in provider settings");
+
+        for provider in [ProviderId::openai(), ProviderId::new("openrouter")] {
+            for (alias, canonical_id) in [
+                ("sol", "gpt-5.6-sol"),
+                ("terra", "gpt-5.6-terra"),
+                ("luna", "gpt-5.6-luna"),
+            ] {
+                let model = catalog
+                    .resolve_on_provider(&provider, alias)
+                    .unwrap_or_else(|error| {
+                        panic!("{alias} should resolve on {provider}: {error}")
+                    });
+                assert_eq!(model.provider, provider, "{alias}");
+                assert_eq!(model.id, canonical_id, "{alias}");
+            }
         }
     }
 
@@ -2271,11 +2996,11 @@ enabled = true
         .expect("enabled OpenRouter override should build from the built-in provider settings");
 
         let model = catalog
-            .get("z-ai/glm-5.2")
+            .get_on_provider(&ProviderId::new("openrouter"), "glm-5.2")
             .expect("OpenRouter GLM 5.2 should be present");
         insta::assert_debug_snapshot!(model, @r#"
         Model {
-            id: "z-ai/glm-5.2",
+            id: "glm-5.2",
             provider: openrouter,
             family: "glm-5",
             display_name: "GLM 5.2 (via OpenRouter)",
@@ -2315,7 +3040,7 @@ enabled = true
         "#);
 
         let settings = catalog
-            .model_settings("z-ai/glm-5.2")
+            .model_settings_on_provider(&ProviderId::new("openrouter"), "glm-5.2")
             .expect("OpenRouter GLM 5.2 settings should be present");
         assert_eq!(settings.api_id, "z-ai/glm-5.2");
         assert_eq!(settings.controls.reasoning_effort, vec![
@@ -2335,11 +3060,11 @@ enabled = true
         .expect("enabled OpenRouter override should build from the built-in provider settings");
 
         let model = catalog
-            .get("moonshotai/kimi-k3")
+            .get_on_provider(&ProviderId::new("openrouter"), "kimi-k3")
             .expect("OpenRouter Kimi K3 should be present");
         insta::assert_debug_snapshot!(model, @r#"
         Model {
-            id: "moonshotai/kimi-k3",
+            id: "kimi-k3",
             provider: openrouter,
             family: "kimi-k3",
             display_name: "Kimi K3 (via OpenRouter)",
@@ -2379,7 +3104,7 @@ enabled = true
         "#);
 
         let settings = catalog
-            .model_settings("moonshotai/kimi-k3")
+            .model_settings_on_provider(&ProviderId::new("openrouter"), "kimi-k3")
             .expect("OpenRouter Kimi K3 settings should be present");
         assert_eq!(settings.api_id, "moonshotai/kimi-k3");
         assert_eq!(settings.controls.reasoning_effort, vec![
@@ -2400,20 +3125,13 @@ enabled = true
         .expect("enabled OpenRouter override should build from the built-in provider settings");
 
         let expected = [
-            (
-                "poolside/laguna-s-2.1",
-                1_048_576,
-                131_072,
-                0.10,
-                0.20,
-                0.01,
-            ),
-            ("poolside/laguna-xs-2.1", 262_144, 32_768, 0.06, 0.12, 0.03),
+            ("laguna-s-2.1", 1_048_576, 131_072, 0.10, 0.20, 0.01),
+            ("laguna-xs-2.1", 262_144, 32_768, 0.06, 0.12, 0.03),
         ];
 
         for (id, context, max_output, input, output, cache_read) in expected {
             let model = catalog
-                .get(id)
+                .get_on_provider(&ProviderId::new("openrouter"), id)
                 .unwrap_or_else(|| panic!("OpenRouter model '{id}' should be present"));
             assert_eq!(model.provider, ProviderId::new("openrouter"), "{id}");
             assert_eq!(model.family, "laguna-2", "{id}");
@@ -2434,9 +3152,9 @@ enabled = true
             );
 
             let settings = catalog
-                .model_settings(id)
+                .model_settings_on_provider(&ProviderId::new("openrouter"), id)
                 .unwrap_or_else(|| panic!("OpenRouter settings for '{id}' should be present"));
-            assert_eq!(settings.api_id, id, "{id}");
+            assert_eq!(settings.api_id, format!("poolside/{id}"), "{id}");
             assert!(settings.controls.reasoning_effort.is_empty(), "{id}");
         }
     }
@@ -2898,30 +3616,28 @@ adapter = "openai"
 agent_profile = "openai"
 enabled = true
 
-[models.one]
-provider = "test"
+[providers.test.models.one]
 display_name = "One"
 family = "test"
 aliases = ["shared"]
 
-[models.one.limits]
+[providers.test.models.one.limits]
 context_window = 1000
 
-[models.one.features]
+[providers.test.models.one.features]
 tools = false
 vision = false
 reasoning = false
 
-[models.two]
-provider = "test"
+[providers.test.models.two]
 display_name = "Two"
 family = "test"
 aliases = ["shared"]
 
-[models.two.limits]
+[providers.test.models.two.limits]
 context_window = 1000
 
-[models.two.features]
+[providers.test.models.two.features]
 tools = false
 vision = false
 reasoning = false
@@ -2932,8 +3648,238 @@ reasoning = false
 
         assert!(matches!(
             err,
-            CatalogBuildError::DuplicateModelIdentifier { identifier, first, second }
-                if identifier == "shared" && first == "one" && second == "two"
+            CatalogBuildError::DuplicateProviderModelSelector {
+                provider,
+                selector,
+                first,
+                second,
+            } if provider == ProviderId::new("test")
+                && selector == "shared"
+                && first == "one"
+                && second == "two"
+        ));
+    }
+
+    #[test]
+    fn provider_scoped_model_rejects_redundant_provider_field() {
+        let error = Catalog::from_settings(&minimal_settings(
+            r#"
+[providers.test]
+display_name = "Test"
+adapter = "openai"
+
+[providers.test.models.one]
+provider = "test"
+"#,
+        ))
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CatalogBuildError::ScopedModelDeclaresProvider { provider, model }
+                if provider == ProviderId::new("test") && model == "one"
+        ));
+    }
+
+    #[test]
+    fn provider_aware_selection_uses_readiness_priority_and_api_ids() {
+        let catalog = portable_model_catalog();
+        let openai = ProviderId::openai();
+        let openrouter = ProviderId::new("openrouter");
+
+        let offerings = catalog
+            .list(None)
+            .into_iter()
+            .filter(|model| model.id.as_str() == "gpt-5.6-sol")
+            .collect::<Vec<_>>();
+        assert_eq!(offerings.len(), 2);
+
+        let direct = catalog
+            .select("gpt-56-sol", None, &HashSet::from([openai.clone()]))
+            .unwrap();
+        assert_eq!(direct.provider, openai);
+        assert_eq!(direct.id, "gpt-5.6-sol");
+        assert_eq!(catalog.settings_for(direct).unwrap().api_id, "gpt-5.6-sol");
+
+        let aggregator = catalog
+            .select("gpt-56-sol", None, &HashSet::from([openrouter.clone()]))
+            .unwrap();
+        assert_eq!(aggregator.provider, openrouter);
+        assert_eq!(aggregator.id, "gpt-5.6-sol");
+        assert_eq!(
+            catalog.settings_for(aggregator).unwrap().api_id,
+            "openai/gpt-5.6-sol"
+        );
+
+        let both = HashSet::from([ProviderId::openai(), ProviderId::new("openrouter")]);
+        assert_eq!(
+            catalog.select("portable", None, &both).unwrap().provider,
+            ProviderId::openai()
+        );
+        assert_eq!(
+            catalog
+                .select("portable", Some(&ProviderId::new("openrouter")), &both,)
+                .unwrap()
+                .provider,
+            ProviderId::new("openrouter")
+        );
+        assert!(matches!(
+            catalog.select(
+                "portable",
+                Some(&ProviderId::new("openrouter")),
+                &HashSet::from([ProviderId::openai()]),
+            ),
+            Err(ModelSelectionError::ProviderUnavailable { provider })
+                if provider == ProviderId::new("openrouter")
+        ));
+    }
+
+    #[test]
+    fn equal_provider_priorities_use_canonical_provider_id_as_tie_breaker() {
+        let catalog = Catalog::from_settings(&minimal_settings(
+            r#"
+[providers.zeta]
+display_name = "Zeta"
+adapter = "openai"
+agent_profile = "openai"
+priority = 10
+
+[providers.zeta.models.zeta]
+display_name = "Zeta"
+family = "test"
+aliases = ["shared"]
+default = true
+
+[providers.zeta.models.zeta.limits]
+context_window = 1000
+
+[providers.zeta.models.zeta.features]
+tools = false
+vision = false
+reasoning = false
+
+[providers.alpha]
+display_name = "Alpha"
+adapter = "openai"
+agent_profile = "openai"
+priority = 10
+
+[providers.alpha.models.alpha]
+display_name = "Alpha"
+family = "test"
+aliases = ["shared"]
+default = true
+
+[providers.alpha.models.alpha.limits]
+context_window = 1000
+
+[providers.alpha.models.alpha.features]
+tools = false
+vision = false
+reasoning = false
+"#,
+        ))
+        .unwrap();
+
+        let eligible = HashSet::from([ProviderId::new("zeta"), ProviderId::new("alpha")]);
+        assert_eq!(
+            catalog.select("shared", None, &eligible).unwrap().provider,
+            ProviderId::new("alpha")
+        );
+    }
+
+    #[test]
+    fn canonical_id_wins_over_cross_provider_alias() {
+        let catalog = Catalog::from_settings(&minimal_settings(
+            r#"
+[providers.direct]
+display_name = "Direct"
+adapter = "openai"
+agent_profile = "openai"
+priority = 1
+
+[providers.direct.models.shared]
+display_name = "Canonical Shared"
+family = "test"
+default = true
+
+[providers.direct.models.shared.limits]
+context_window = 1000
+
+[providers.direct.models.shared.features]
+tools = false
+vision = false
+reasoning = false
+
+[providers.aggregator]
+display_name = "Aggregator"
+adapter = "openai"
+agent_profile = "openai"
+priority = 100
+
+[providers.aggregator.models.other]
+display_name = "Alias Shared"
+family = "test"
+aliases = ["shared"]
+default = true
+
+[providers.aggregator.models.other.limits]
+context_window = 1000
+
+[providers.aggregator.models.other.features]
+tools = false
+vision = false
+reasoning = false
+"#,
+        ))
+        .unwrap();
+        let eligible = HashSet::from([ProviderId::new("direct"), ProviderId::new("aggregator")]);
+
+        let unqualified = catalog.select("shared", None, &eligible).unwrap();
+        assert_eq!(unqualified.provider, ProviderId::new("direct"));
+        assert_eq!(unqualified.id, "shared");
+
+        let qualified = catalog
+            .resolve_on_provider(&ProviderId::new("aggregator"), "shared")
+            .unwrap();
+        assert_eq!(qualified.id, "other");
+
+        let aggregator_only = HashSet::from([ProviderId::new("aggregator")]);
+        let portable_alias = catalog.select("shared", None, &aggregator_only).unwrap();
+        assert_eq!(portable_alias.provider, ProviderId::new("aggregator"));
+        assert_eq!(portable_alias.id, "other");
+    }
+
+    #[test]
+    fn empty_api_id_is_rejected() {
+        let error = Catalog::from_settings(&minimal_settings(
+            r#"
+[providers.test]
+display_name = "Test"
+adapter = "openai"
+agent_profile = "openai"
+
+[providers.test.models.model]
+api_id = ""
+display_name = "Model"
+family = "test"
+default = true
+
+[providers.test.models.model.limits]
+context_window = 1000
+
+[providers.test.models.model.features]
+tools = false
+vision = false
+reasoning = false
+"#,
+        ))
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CatalogBuildError::EmptyModelApiId { provider, model }
+                if provider == ProviderId::new("test") && model == "model"
         ));
     }
 
@@ -3068,7 +4014,7 @@ reasoning = false
     }
 
     #[test]
-    fn catalog_lists_models_by_provider_then_model_id() {
+    fn catalog_lists_models_by_provider_priority_then_model_id() {
         let layer = minimal_settings(
             r#"
 [providers.zeta]
@@ -3133,7 +4079,7 @@ reasoning = false
             .map(|model| model.id.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(ids, ["alpha_one", "zeta_one", "zeta_two"]);
+        assert_eq!(ids, ["zeta_one", "zeta_two", "alpha_one"]);
         assert_eq!(catalog.default_model().id, "zeta_two");
     }
 
@@ -4964,7 +5910,7 @@ sampling_params = false
     fn openai_context_window_can_be_overridden_for_direct_api_usage() {
         let catalog = Catalog::from_builtin_with_overrides(&minimal_settings(
             r#"
-[models."gpt-5.5".limits]
+[providers.openai.models."gpt-5.5".limits]
 context_window = 1050000
 "#,
         ))

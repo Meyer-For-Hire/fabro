@@ -23,7 +23,7 @@ fn provider_id_json_matches_openapi_shape_through_model() {
     );
 
     let model = Model {
-        id:                   "venice-custom".to_string(),
+        id:                   "venice-custom".into(),
         provider:             ProviderId::new("venice"),
         family:               "venice".to_string(),
         display_name:         "Venice Custom".to_string(),

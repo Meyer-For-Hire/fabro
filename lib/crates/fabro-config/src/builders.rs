@@ -340,6 +340,12 @@ fn provider_settings_to_catalog(
             .map(|(name, value)| (name, value.as_source()))
             .collect()
     });
+    let models = settings
+        .models
+        .into_inner()
+        .into_iter()
+        .map(|(id, settings)| (id, model_settings_to_catalog(settings)))
+        .collect();
     model_catalog::ProviderCatalogSettings {
         display_name: settings.display_name,
         adapter: settings.adapter,
@@ -353,6 +359,7 @@ fn provider_settings_to_catalog(
         priority: settings.priority,
         enabled: settings.enabled,
         aliases: settings.aliases,
+        models,
     }
 }
 
@@ -863,7 +870,7 @@ reasoning = false
 
         assert_eq!(
             catalog
-                .get("acme-large")
+                .get_on_provider(&fabro_model::ProviderId::new("acme"), "acme-large")
                 .map(|model| model.provider.clone()),
             Some(fabro_model::ProviderId::new("acme"))
         );

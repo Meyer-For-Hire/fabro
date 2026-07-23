@@ -1,12 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use fabro_auth::{ApiCredential, CredentialSource};
-use fabro_model::{AdapterKind, Catalog, ProviderId};
+use fabro_model::{AdapterKind, Catalog, ModelSelectionError, ProviderId};
 use tracing::debug;
 
 use crate::adapter_registry::{
-    self, AdapterConfig, AdapterKindOptions, OpenAiAdapterOptions, factory_for,
+    AdapterConfig, AdapterKindOptions, OpenAiAdapterOptions, factory_for,
 };
 use crate::cost;
 use crate::error::{Error, ProviderErrorKind};
@@ -42,6 +42,11 @@ pub struct ClientRegistrationReport {
 enum RegistrationMode {
     FailFast,
     CollectIssues,
+}
+
+struct ResolvedRequest {
+    provider: Arc<dyn ProviderAdapter>,
+    request:  Request,
 }
 
 impl Client {
@@ -259,44 +264,150 @@ impl Client {
             )
     }
 
-    /// Resolve the provider for a request: an explicit `request.provider`
-    /// wins, then the model's catalog route, then the default provider.
-    fn resolve_provider(&self, request: &Request) -> Result<Arc<dyn ProviderAdapter>, Error> {
-        let route = self
-            .catalog
-            .as_ref()
-            .and_then(|catalog| adapter_registry::resolve_route(catalog, &request.model));
-
-        let provider_name = request
-            .provider
-            .as_deref()
-            .or_else(|| route.as_ref().map(|route| route.provider.as_str()))
-            .or(self.default_provider.as_deref())
-            .ok_or_else(|| Error::Configuration {
-                message: "No provider specified and no default provider set".into(),
-                source:  None,
-            })?;
-        let provider_name = self.canonical_provider_name(provider_name);
-
-        self.providers
-            .get(&provider_name)
-            .cloned()
-            .ok_or_else(|| Error::Configuration {
-                message: format!("Provider '{provider_name}' not registered"),
-                source:  None,
+    fn provider_adapter(&self, provider_name: &str) -> Option<Arc<dyn ProviderAdapter>> {
+        let canonical = self.canonical_provider_name(provider_name);
+        self.providers.get(&canonical).cloned().or_else(|| {
+            self.providers.iter().find_map(|(name, adapter)| {
+                (self.canonical_provider_name(name) == canonical).then(|| Arc::clone(adapter))
             })
+        })
+    }
+
+    fn eligible_provider_ids(&self) -> HashSet<ProviderId> {
+        self.providers
+            .keys()
+            .map(|provider| ProviderId::new(self.canonical_provider_name(provider)))
+            .collect()
+    }
+
+    /// Resolve one concrete provider/model offering and canonicalize a cloned
+    /// request. Explicit-provider unknown models remain passthrough values.
+    fn resolve_request_with_adapter(&self, request: &Request) -> Result<ResolvedRequest, Error> {
+        let mut resolved = request.clone();
+        let Some(catalog) = &self.catalog else {
+            let provider_name = request
+                .provider
+                .as_deref()
+                .or(self.default_provider.as_deref())
+                .ok_or_else(|| Error::Configuration {
+                    message: "No provider specified and no default provider set".into(),
+                    source:  None,
+                })?;
+            let provider =
+                self.provider_adapter(provider_name)
+                    .ok_or_else(|| Error::Configuration {
+                        message: format!("Provider '{provider_name}' not registered"),
+                        source:  None,
+                    })?;
+            resolved.provider = Some(provider.name().to_string());
+            return Ok(ResolvedRequest {
+                provider,
+                request: resolved,
+            });
+        };
+
+        let eligible = self.eligible_provider_ids();
+        if let Some(explicit) = request.provider.as_deref() {
+            let explicit = ProviderId::new(explicit);
+            if let Some(catalog_provider) = catalog.provider(&explicit) {
+                let provider = self
+                    .provider_adapter(catalog_provider.id.as_str())
+                    .ok_or_else(|| {
+                        selection_error(ModelSelectionError::ProviderUnavailable {
+                            provider: catalog_provider.id.clone(),
+                        })
+                    })?;
+                match catalog.resolve_on_provider(&catalog_provider.id, &request.model) {
+                    Ok(model) => resolved.model = model.id.to_string(),
+                    Err(ModelSelectionError::UnknownSelectorOnProvider { .. }) => {}
+                    Err(error) => return Err(selection_error(error)),
+                }
+                resolved.provider = Some(catalog_provider.id.to_string());
+                return Ok(ResolvedRequest {
+                    provider,
+                    request: resolved,
+                });
+            }
+
+            let provider =
+                self.provider_adapter(explicit.as_str())
+                    .ok_or_else(|| Error::Configuration {
+                        message: format!("Provider '{explicit}' not registered"),
+                        source:  None,
+                    })?;
+            resolved.provider = Some(provider.name().to_string());
+            return Ok(ResolvedRequest {
+                provider,
+                request: resolved,
+            });
+        }
+
+        match catalog.select(&request.model, None, &eligible) {
+            Ok(model) => {
+                let provider = self
+                    .provider_adapter(model.provider.as_str())
+                    .ok_or_else(|| {
+                        selection_error(ModelSelectionError::ProviderUnavailable {
+                            provider: model.provider.clone(),
+                        })
+                    })?;
+                resolved.model = model.id.to_string();
+                resolved.provider = Some(model.provider.to_string());
+                Ok(ResolvedRequest {
+                    provider,
+                    request: resolved,
+                })
+            }
+            Err(ModelSelectionError::UnknownSelector { .. }) => {
+                let provider_name =
+                    self.default_provider
+                        .as_deref()
+                        .ok_or_else(|| Error::Configuration {
+                            message: "No provider specified and no default provider set".into(),
+                            source:  None,
+                        })?;
+                let provider =
+                    self.provider_adapter(provider_name)
+                        .ok_or_else(|| Error::Configuration {
+                            message: format!("Provider '{provider_name}' not registered"),
+                            source:  None,
+                        })?;
+                resolved.provider = Some(self.canonical_provider_name(provider.name()));
+                Ok(ResolvedRequest {
+                    provider,
+                    request: resolved,
+                })
+            }
+            Err(error) => Err(selection_error(error)),
+        }
+    }
+
+    /// Resolve the concrete provider/model route and return a canonicalized
+    /// clone of the request without dispatching it.
+    ///
+    /// This is useful at persistence and API boundaries that must expose the
+    /// selected provider alongside the canonical model ID. The caller-owned
+    /// request is never modified.
+    pub fn resolve_request(&self, request: &Request) -> Result<Request, Error> {
+        self.resolve_request_with_adapter(request)
+            .map(|resolved| resolved.request)
     }
 
     fn validate_request_controls(&self, request: &Request) -> Result<(), Error> {
         let Some(catalog) = &self.catalog else {
             return Ok(());
         };
-        let Some(settings) = catalog.model_settings(&request.model) else {
+        let Some(provider) = request.provider.as_deref() else {
             return Ok(());
         };
-        let model_id = catalog
-            .get(&request.model)
-            .map_or(request.model.as_str(), |model| model.id.as_str());
+        let Some(model) = catalog.get_on_provider(&ProviderId::new(provider), &request.model)
+        else {
+            return Ok(());
+        };
+        let Some(settings) = catalog.settings_for(model) else {
+            return Ok(());
+        };
+        let model_id = model.id.as_str();
 
         if let Some(effort) = request.reasoning_effort {
             if !settings.controls.reasoning_effort.contains(&effort) {
@@ -333,11 +444,11 @@ impl Client {
     /// registered, or any provider/middleware error encountered during the
     /// request.
     pub async fn complete(&self, request: &Request) -> Result<Response, Error> {
-        self.validate_request_controls(request)?;
-        let provider = self.resolve_provider(request)?;
+        let ResolvedRequest { provider, request } = self.resolve_request_with_adapter(request)?;
+        self.validate_request_controls(&request)?;
 
         if self.middleware.is_empty() {
-            return complete_stamped(&provider, self.catalog.as_deref(), request).await;
+            return complete_stamped(&provider, self.catalog.as_deref(), &request).await;
         }
 
         // Build middleware chain. Cost is stamped at the base so middleware
@@ -358,7 +469,7 @@ impl Client {
             })
         });
 
-        chain(request.clone()).await
+        chain(request).await
     }
 
     /// Send a streaming request (Section 4.2).
@@ -369,11 +480,11 @@ impl Client {
     /// registered, or any provider/middleware error encountered during the
     /// request.
     pub async fn stream(&self, request: &Request) -> Result<StreamEventStream, Error> {
-        self.validate_request_controls(request)?;
-        let provider = self.resolve_provider(request)?;
+        let ResolvedRequest { provider, request } = self.resolve_request_with_adapter(request)?;
+        self.validate_request_controls(&request)?;
 
         if self.middleware.is_empty() {
-            return stream_stamped(&provider, self.catalog.clone(), request).await;
+            return stream_stamped(&provider, self.catalog.clone(), &request).await;
         }
 
         // Build streaming middleware chain. Cost is stamped at the base so
@@ -394,7 +505,7 @@ impl Client {
             })
         });
 
-        chain(request.clone()).await
+        chain(request).await
     }
 
     /// Count the model-visible input/context tokens for a request without
@@ -410,19 +521,19 @@ impl Client {
         request: &Request,
         preference: InputTokenCountPreference,
     ) -> Result<InputTokenCount, Error> {
-        self.validate_request_controls(request)?;
-        let provider = self.resolve_provider(request)?;
-        provider.validate_request(request)?;
+        let ResolvedRequest { provider, request } = self.resolve_request_with_adapter(request)?;
+        self.validate_request_controls(&request)?;
+        provider.validate_request(&request)?;
 
         if preference == InputTokenCountPreference::EstimateOnly {
-            return Ok(estimate_input_tokens(request, provider.name()));
+            return Ok(estimate_input_tokens(&request, provider.name()));
         }
 
-        match provider.count_input_tokens(request).await {
+        match provider.count_input_tokens(&request).await {
             Ok(Some(count)) => Ok(count),
             Ok(None) if preference == InputTokenCountPreference::PreferProvider => {
                 Ok(fallback_estimate(
-                    request,
+                    &request,
                     provider.name(),
                     "provider_token_count_unsupported",
                     "provider does not support input token counting; returned local estimate",
@@ -440,7 +551,7 @@ impl Client {
                     && token_count_fallback_eligible(&error) =>
             {
                 Ok(fallback_estimate(
-                    request,
+                    &request,
                     provider.name(),
                     "provider_token_count_failed",
                     "provider input token counting failed; returned local estimate",
@@ -471,6 +582,12 @@ impl Client {
             .collect()
     }
 
+    /// Canonical IDs for provider adapters that registered successfully.
+    #[must_use]
+    pub fn provider_ids(&self) -> HashSet<ProviderId> {
+        self.eligible_provider_ids()
+    }
+
     /// Check whether a provider adapter is registered.
     #[must_use]
     pub fn has_provider(&self, name: &str) -> bool {
@@ -489,6 +606,10 @@ impl Client {
     }
 }
 
+fn selection_error(error: ModelSelectionError) -> Error {
+    Error::configuration_error(error.to_string(), error)
+}
+
 /// Validate, run, and cost-stamp a blocking request. Shared by
 /// [`Client::complete`]'s direct path and its middleware-chain base so cost
 /// stamping stays single-sited.
@@ -499,7 +620,19 @@ async fn complete_stamped(
 ) -> Result<Response, Error> {
     provider.validate_request(request)?;
     let mut response = provider.complete(request).await?;
-    cost::apply_estimated_cost(catalog, &request.model, request.speed, &mut response);
+    let selected_provider = request
+        .provider
+        .as_deref()
+        .unwrap_or_else(|| provider.name());
+    response.model.clone_from(&request.model);
+    response.provider = selected_provider.to_string();
+    cost::apply_estimated_cost(
+        catalog,
+        selected_provider,
+        &request.model,
+        request.speed,
+        &mut response,
+    );
     Ok(response)
 }
 
@@ -515,6 +648,10 @@ async fn stream_stamped(
     let stream = provider.stream(request).await?;
     Ok(stamp_stream_costs(
         catalog,
+        request
+            .provider
+            .clone()
+            .unwrap_or_else(|| provider.name().to_string()),
         request.model.clone(),
         request.speed,
         stream,
@@ -526,6 +663,7 @@ async fn stream_stamped(
 /// [`Client::complete`] stamps on blocking responses.
 fn stamp_stream_costs(
     catalog: Option<Arc<Catalog>>,
+    provider: String,
     model: String,
     speed: Option<Speed>,
     stream: StreamEventStream,
@@ -534,8 +672,12 @@ fn stamp_stream_costs(
 
     Box::pin(stream.map(move |event| {
         event.map(|mut event| {
-            if let StreamEvent::Finish { response, .. } = &mut event {
-                cost::apply_estimated_cost(catalog.as_deref(), &model, speed, response);
+            if let StreamEvent::Finish { response, .. } | StreamEvent::StepFinish { response, .. } =
+                &mut event
+            {
+                response.model.clone_from(&model);
+                response.provider.clone_from(&provider);
+                cost::apply_estimated_cost(catalog.as_deref(), &provider, &model, speed, response);
             }
             event
         })
@@ -606,7 +748,9 @@ mod tests {
     use futures::stream;
 
     use super::*;
+    use crate::adapter_registry;
     use crate::error::ProviderErrorDetail;
+    use crate::providers::openai_compatible;
     use crate::types::*;
 
     /// A mock provider for testing.
@@ -861,6 +1005,169 @@ output_cost_per_mtok = 2.0
         )
         .unwrap();
         Arc::new(Catalog::from_settings(&settings).unwrap())
+    }
+
+    fn portable_model_catalog(openrouter_base_url: &str) -> Arc<Catalog> {
+        let settings: LlmCatalogSettings = toml::from_str(&format!(
+            r#"
+[providers.openai]
+display_name = "OpenAI"
+adapter = "openai_compatible"
+agent_profile = "openai"
+base_url = "https://openai.invalid/v1"
+priority = 90
+
+[providers.openai.models."gpt-5.6-sol"]
+display_name = "GPT-5.6 Sol"
+family = "gpt-5"
+aliases = ["gpt-56-sol"]
+default = true
+
+[providers.openai.models."gpt-5.6-sol".limits]
+context_window = 1000
+
+[providers.openai.models."gpt-5.6-sol".features]
+tools = true
+vision = false
+reasoning = false
+
+[providers.openai.models."gpt-5.6-sol".costs]
+input_cost_per_mtok = 1.0
+output_cost_per_mtok = 2.0
+
+[providers.openrouter]
+display_name = "OpenRouter"
+adapter = "openai_compatible"
+agent_profile = "openai"
+base_url = "{openrouter_base_url}"
+priority = 25
+
+[providers.openrouter.models."gpt-5.6-sol"]
+api_id = "openai/gpt-5.6-sol"
+display_name = "GPT-5.6 Sol (via OpenRouter)"
+family = "gpt-5"
+aliases = ["gpt-56-sol"]
+default = true
+
+[providers.openrouter.models."gpt-5.6-sol".limits]
+context_window = 1000
+
+[providers.openrouter.models."gpt-5.6-sol".features]
+tools = true
+vision = false
+reasoning = false
+
+[providers.openrouter.models."gpt-5.6-sol".costs]
+input_cost_per_mtok = 10.0
+output_cost_per_mtok = 20.0
+"#,
+        ))
+        .unwrap();
+        Arc::new(Catalog::from_settings(&settings).unwrap())
+    }
+
+    async fn portable_mock_client(catalog: &Arc<Catalog>, providers: &[&str]) -> Client {
+        let mut client = Client::new(HashMap::new(), None, vec![]);
+        for provider in providers {
+            client
+                .register_provider(Arc::new(MockProvider::new(provider, provider)))
+                .await
+                .unwrap();
+        }
+        client.catalog = Some(Arc::clone(catalog));
+        client
+    }
+
+    #[tokio::test]
+    async fn shared_alias_selects_by_ready_providers_and_priority_without_mutating_request() {
+        let catalog = portable_model_catalog("https://openrouter.invalid/v1");
+        let mut original = test_request();
+        original.model = "gpt-56-sol".to_string();
+
+        let direct = portable_mock_client(&catalog, &["openai"]).await;
+        let direct_request = direct.resolve_request(&original).unwrap();
+        assert_eq!(direct_request.model, "gpt-5.6-sol");
+        assert_eq!(direct_request.provider.as_deref(), Some("openai"));
+
+        let aggregator = portable_mock_client(&catalog, &["openrouter"]).await;
+        let aggregator_request = aggregator.resolve_request(&original).unwrap();
+        assert_eq!(aggregator_request.model, "gpt-5.6-sol");
+        assert_eq!(aggregator_request.provider.as_deref(), Some("openrouter"));
+
+        let both = portable_mock_client(&catalog, &["openrouter", "openai"]).await;
+        let both_request = both.resolve_request(&original).unwrap();
+        assert_eq!(both_request.provider.as_deref(), Some("openai"));
+
+        assert_eq!(original.model, "gpt-56-sol");
+        assert_eq!(original.provider, None);
+
+        let response = aggregator.complete(&original).await.unwrap();
+        assert_eq!(response.model, "gpt-5.6-sol");
+        assert_eq!(response.provider, "openrouter");
+        assert_eq!(response.cost_source, Some(CostSource::Estimated));
+        assert_eq!(response.cost_usd, Some(0.0005));
+    }
+
+    #[tokio::test]
+    async fn explicit_provider_pins_shared_alias_and_preserves_unknown_passthrough() {
+        let catalog = portable_model_catalog("https://openrouter.invalid/v1");
+        let client = portable_mock_client(&catalog, &["openai", "openrouter"]).await;
+
+        let mut aliased = test_request();
+        aliased.model = "gpt-56-sol".to_string();
+        aliased.provider = Some("openrouter".to_string());
+        let resolved = client.resolve_request(&aliased).unwrap();
+        assert_eq!(resolved.model, "gpt-5.6-sol");
+        assert_eq!(resolved.provider.as_deref(), Some("openrouter"));
+
+        let mut unknown = test_request();
+        unknown.model = "provider-private-preview".to_string();
+        unknown.provider = Some("openrouter".to_string());
+        let resolved = client.resolve_request(&unknown).unwrap();
+        assert_eq!(resolved.model, "provider-private-preview");
+        assert_eq!(resolved.provider.as_deref(), Some("openrouter"));
+    }
+
+    #[tokio::test]
+    async fn selected_offering_api_id_reaches_openai_compatible_wire_request() {
+        let upstream = httpmock::MockServer::start_async().await;
+        let completion = upstream
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/chat/completions")
+                    .json_body_includes(r#"{"model":"openai/gpt-5.6-sol"}"#);
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(serde_json::json!({
+                        "id": "chatcmpl-portable",
+                        "model": "openai/gpt-5.6-sol",
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "OK"},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {
+                            "prompt_tokens": 1,
+                            "completion_tokens": 1,
+                            "total_tokens": 2
+                        }
+                    }));
+            })
+            .await;
+        let catalog = portable_model_catalog(&upstream.base_url());
+        let adapter = openai_compatible::Adapter::new("test-key", upstream.base_url())
+            .with_name("openrouter")
+            .with_catalog(Arc::clone(&catalog));
+        let mut client = Client::new(HashMap::new(), None, vec![]);
+        client.register_provider(Arc::new(adapter)).await.unwrap();
+        client.catalog = Some(catalog);
+        let mut request = test_request();
+        request.model = "gpt-56-sol".to_string();
+
+        let response = client.complete(&request).await.unwrap();
+
+        assert_eq!(response.model, "gpt-5.6-sol");
+        assert_eq!(response.provider, "openrouter");
+        completion.assert_async().await;
     }
 
     #[tokio::test]
@@ -1592,7 +1899,10 @@ reasoning = false
         let mut request = test_request();
         request.provider = Some("acme-ai".to_string());
 
-        let provider = client.resolve_provider(&request).unwrap();
+        let provider = client
+            .resolve_request_with_adapter(&request)
+            .unwrap()
+            .provider;
 
         assert_eq!(provider.name(), "acme");
     }
@@ -1620,12 +1930,15 @@ reasoning = false
         let client = client_with_all_catalog_providers(&catalog).await;
 
         for model in catalog.list(None) {
-            let route = adapter_registry::resolve_route(&catalog, &model.id)
+            let route = adapter_registry::resolve_route(&catalog, model)
                 .expect("built-in model should resolve to a route");
             let mut request = test_request();
-            request.model = model.id.clone();
+            request.model = model.id.to_string();
 
-            let provider = client.resolve_provider(&request).unwrap();
+            let provider = client
+                .resolve_request_with_adapter(&request)
+                .unwrap()
+                .provider;
 
             assert_eq!(provider.name(), route.provider.as_str(), "{}", model.id);
         }
@@ -1640,7 +1953,10 @@ reasoning = false
         request.model = "gpt-5.4-mini".to_string();
         request.provider = Some("anthropic".to_string());
 
-        let provider = client.resolve_provider(&request).unwrap();
+        let provider = client
+            .resolve_request_with_adapter(&request)
+            .unwrap()
+            .provider;
 
         assert_eq!(provider.name(), "anthropic");
     }
@@ -1654,7 +1970,10 @@ reasoning = false
         let mut request = test_request();
         request.model = "model-not-in-any-catalog".to_string();
 
-        let provider = client.resolve_provider(&request).unwrap();
+        let provider = client
+            .resolve_request_with_adapter(&request)
+            .unwrap()
+            .provider;
 
         assert_eq!(provider.name(), default);
     }

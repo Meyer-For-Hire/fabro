@@ -24,18 +24,17 @@ _version = 1
 enabled = true
 base_url = "http://localhost:4000/v1"
 
-[llm.models."litellm-gpt-5"]
-provider = "litellm"
+[llm.providers.litellm.models."litellm-gpt-5"]
 api_id = "gpt-5"
 display_name = "LiteLLM GPT-5"
 family = "litellm"
 default = true
 
-[llm.models."litellm-gpt-5".limits]
+[llm.providers.litellm.models."litellm-gpt-5".limits]
 context_window = 128000
 max_output = 8192
 
-[llm.models."litellm-gpt-5".features]
+[llm.providers.litellm.models."litellm-gpt-5".features]
 tools = true
 vision = false
 reasoning = false
@@ -94,18 +93,17 @@ digraph Example {
 Declare each LiteLLM-routed model explicitly so Fabro knows its provider, context window, tool support, and routing defaults:
 
 ```toml title="settings.toml"
-[llm.models."litellm-fast"]
-provider = "litellm"
+[llm.providers.litellm.models."litellm-fast"]
 api_id = "fast-model"
 display_name = "LiteLLM Fast"
 family = "litellm"
 aliases = ["fast"]
 
-[llm.models."litellm-fast".limits]
+[llm.providers.litellm.models."litellm-fast".limits]
 context_window = 64000
 max_output = 4096
 
-[llm.models."litellm-fast".features]
+[llm.providers.litellm.models."litellm-fast".features]
 tools = true
 vision = false
 reasoning = false
@@ -128,6 +126,6 @@ Only one model for a provider should set `default = true`. You may also mark one
     How Fabro routes model IDs, providers, and fallbacks.
   </Card>
   <Card title="Settings Configuration" icon="gear" href="/reference/user-configuration">
-    Full reference for `[llm.providers.<id>]` and `[llm.models.<id>]`.
+    Full reference for provider settings and provider-scoped model offerings.
   </Card>
 </Columns>

@@ -85,6 +85,7 @@ const TEST_SESSION_SECRET: &str =
     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const TEST_DEV_TOKEN: &str =
     "fabro_dev_abababababababababababababababababababababababababababababababab";
+const FABRO_TEST_ASSUME_LLM_READY: &str = "FABRO_TEST_ASSUME_LLM_READY";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TestMode {
@@ -187,6 +188,7 @@ pub fn isolated_env(home_dir: &Path) -> HashMap<String, String> {
         EnvVars::FABRO_TEST_IN_MEMORY_STORE.to_string(),
         "1".to_string(),
     );
+    env.insert(FABRO_TEST_ASSUME_LLM_READY.to_string(), "1".to_string());
     env
 }
 
@@ -210,6 +212,7 @@ fn apply_test_isolation_with_lookup(
         .env(EnvVars::FABRO_SUPPRESS_OPEN_BROWSER, "1");
     cmd.env(EnvVars::FABRO_SERVER_MAX_CONCURRENT_RUNS, "64");
     cmd.env(EnvVars::FABRO_TEST_IN_MEMORY_STORE, "1");
+    cmd.env(FABRO_TEST_ASSUME_LLM_READY, "1");
 }
 
 /// Create a fresh tempdir containing an empty `storage/` subdirectory, for

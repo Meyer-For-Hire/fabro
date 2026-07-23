@@ -109,11 +109,33 @@ async fn create_playground_chat(
     }
 
     let catalog = state.catalog();
-    let model_id = req
-        .model
-        .unwrap_or_else(|| catalog.default_model().id.clone());
-
-    info!(model = %model_id, "Playground chat turn");
+    let llm_result = match state.resolve_llm_client().await {
+        Ok(result) => result,
+        Err(err) => {
+            error!(error = ?err, "playground: failed to create LLM client");
+            return ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to resolve LLM providers: {err}"),
+            )
+            .into_response();
+        }
+    };
+    for (provider, issue) in &llm_result.auth_issues {
+        warn!(provider = %provider, error = %issue, "playground: provider auth issue");
+    }
+    for issue in &llm_result.registration_issues {
+        warn!(provider = %issue.provider, error = %issue.error, "playground: provider registration issue");
+    }
+    let client = llm_result.client;
+    let (model_id, selected_provider) = match super::completions::resolve_request_model(
+        catalog.as_ref(),
+        &client.provider_ids(),
+        req.model,
+        req.provider.map(|provider| provider.to_string()),
+    ) {
+        Ok(selection) => selection,
+        Err(error) => return ApiError::bad_request(error.to_string()).into_response(),
+    };
 
     // Request messages are already the canonical `fabro_types::Message` —
     // the API schema reuses it via build.rs `with_replacement`.
@@ -124,7 +146,7 @@ async fn create_playground_chat(
     let request = LlmRequest {
         model: model_id,
         messages,
-        provider: None,
+        provider: Some(selected_provider.to_string()),
         tools: Some(playground_tools()),
         tool_choice: Some(ToolChoice::Auto),
         response_format: None,
@@ -137,22 +159,15 @@ async fn create_playground_chat(
         metadata: None,
         provider_options: None,
     };
-
-    let llm_result = match state.resolve_llm_client().await {
-        Ok(r) => r,
-        Err(err) => {
-            error!(error = ?err, "playground: failed to create LLM client");
-            return ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to create LLM client: {err}"),
-            )
-            .into_response();
-        }
+    let request = match client.resolve_request(&request) {
+        Ok(request) => request,
+        Err(error) => return ApiError::bad_request(error.to_string()).into_response(),
     };
-    for (provider, issue) in &llm_result.auth_issues {
-        warn!(provider = %provider, error = %issue, "playground: provider auth issue");
-    }
-    let client = llm_result.client;
+    info!(
+        model = %request.model,
+        provider = request.provider.as_deref().unwrap_or(""),
+        "Playground chat turn"
+    );
 
     let stream_result = match client.stream(&request).await {
         Ok(s) => s,
@@ -238,6 +253,7 @@ mod tests {
             messages,
             workflow_fabro,
             model: None,
+            provider: None,
         }
     }
 

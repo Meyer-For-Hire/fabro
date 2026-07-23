@@ -24,6 +24,7 @@ use fabro_server::auth::GithubEndpoints;
 use fabro_server::jwt_auth::resolve_auth_mode_with_lookup;
 use fabro_server::server::{RouterOptions, build_router_with_options};
 use fabro_server::test_support::TestAppStateBuilder;
+use fabro_static::EnvVars;
 use fabro_test::{GitHubAppState, TestContext, apply_test_isolation};
 use serde_json::Value;
 use tokio::net::TcpListener;
@@ -88,7 +89,10 @@ impl RealAuthHarness {
             .max_concurrent_runs(5)
             .env_lookup(|_| None)
             .server_secret_env(secrets)
-            .vault_entries([("GITHUB_APP_CLIENT_SECRET", github_client_secret.as_str())])
+            .vault_entries([
+                ("GITHUB_APP_CLIENT_SECRET", github_client_secret.as_str()),
+                (EnvVars::OPENAI_API_KEY, "test-openai-api-key"),
+            ])
             .build();
         let github_base = github_base_url(&twin.base_url);
         let router = build_router_with_options(state, &auth_mode, RouterOptions {

@@ -1,6 +1,7 @@
 use std::fmt;
 
 use crate::SettingsLayer;
+use crate::layers::LlmNormalizationError;
 
 const CURRENT_VERSION: u32 = 1;
 
@@ -30,6 +31,7 @@ const LEGACY_LLM_KEYS: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseError {
     Toml(String),
+    LlmCatalog(LlmNormalizationError),
     Version(VersionError),
     UnknownTopLevelKey {
         key:  String,
@@ -45,6 +47,7 @@ impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Toml(msg) => write!(f, "settings file is not valid TOML: {msg}"),
+            Self::LlmCatalog(err) => fmt::Display::fmt(err, f),
             Self::Version(err) => fmt::Display::fmt(err, f),
             Self::UnknownTopLevelKey { key, hint } => {
                 if let Some(hint) = hint {
@@ -118,8 +121,14 @@ pub(crate) fn parse_settings(input: &str) -> Result<SettingsLayer, ParseError> {
         }
     }
 
-    raw.try_into::<SettingsLayer>()
-        .map_err(|e| ParseError::Toml(e.to_string()))
+    let mut layer = raw
+        .try_into::<SettingsLayer>()
+        .map_err(|e| ParseError::Toml(e.to_string()))?;
+    if let Some(llm) = layer.llm.as_mut() {
+        llm.normalize_legacy_models()
+            .map_err(ParseError::LlmCatalog)?;
+    }
+    Ok(layer)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -290,10 +299,196 @@ mod tests {
 
     #[test]
     fn accepts_new_llm_models_subtree() {
-        let parsed = "[llm.models.\"foo\"]\nprovider = \"kimi\"\n"
+        let parsed = "[llm.providers.kimi.models.\"foo\"]\n"
             .parse::<SettingsLayer>()
             .unwrap();
-        assert!(parsed.llm.unwrap().models.contains_key("foo"));
+        assert!(
+            parsed
+                .llm
+                .unwrap()
+                .providers
+                .get("kimi")
+                .unwrap()
+                .models
+                .contains_key("foo")
+        );
+    }
+
+    #[test]
+    fn provider_scoped_model_rejects_redundant_provider_field() {
+        let error = r#"
+[llm.providers.openai.models."gpt-5.4"]
+provider = "openai"
+"#
+        .parse::<SettingsLayer>()
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ParseError::LlmCatalog(LlmNormalizationError::ScopedModelDeclaresProvider {
+                provider,
+                model,
+            }) if provider.as_str() == "openai" && model.as_str() == "gpt-5.4"
+        ));
+    }
+
+    #[test]
+    fn legacy_model_row_with_provider_normalizes_before_merge() {
+        use crate::layers::Combine as _;
+
+        let higher = r#"
+[llm.models."gpt-5.4"]
+provider = "openai"
+display_name = "Configured display name"
+"#
+        .parse::<SettingsLayer>()
+        .unwrap();
+        let fallback = r#"
+[llm.providers.openai.models."gpt-5.4"]
+family = "gpt-5"
+"#
+        .parse::<SettingsLayer>()
+        .unwrap();
+
+        let merged = higher.combine(fallback);
+        let llm = merged.llm.unwrap();
+        assert!(llm.models.is_empty());
+        let model = llm
+            .providers
+            .get("openai")
+            .unwrap()
+            .models
+            .get("gpt-5.4")
+            .unwrap();
+        assert_eq!(
+            model.display_name.as_deref(),
+            Some("Configured display name")
+        );
+        assert_eq!(model.family.as_deref(), Some("gpt-5"));
+    }
+
+    #[test]
+    fn provider_less_legacy_row_adopts_unique_builtin_offering() {
+        let parsed = r#"
+[llm.models.mercury]
+display_name = "Configured Mercury"
+"#
+        .parse::<SettingsLayer>()
+        .unwrap();
+        let llm = parsed.llm.unwrap();
+
+        assert!(llm.models.is_empty());
+        assert!(
+            llm.providers
+                .get("inception")
+                .unwrap()
+                .models
+                .contains_key("mercury-2")
+        );
+    }
+
+    #[test]
+    fn provider_less_legacy_row_rejects_ambiguous_builtin_offering() {
+        let error = r#"
+[llm.models."gpt-5.6-sol"]
+display_name = "Ambiguous"
+"#
+        .parse::<SettingsLayer>()
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ParseError::LlmCatalog(LlmNormalizationError::AmbiguousLegacyModel {
+                model,
+                candidates,
+            }) if model == "gpt-5.6-sol" && candidates.len() >= 2
+        ));
+    }
+
+    #[test]
+    fn same_source_legacy_and_provider_scoped_rows_conflict() {
+        let error = r#"
+[llm.providers.openai.models."gpt-5.4"]
+display_name = "Canonical"
+
+[llm.models."gpt-5.4"]
+provider = "openai"
+display_name = "Legacy"
+"#
+        .parse::<SettingsLayer>()
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ParseError::LlmCatalog(LlmNormalizationError::DuplicateModelDefinition {
+                provider,
+                model,
+            }) if provider.as_str() == "openai" && model.as_str() == "gpt-5.4"
+        ));
+    }
+
+    #[test]
+    fn retired_legacy_model_id_names_replacement() {
+        let error = r#"
+[llm.models."openai/gpt-5.6-sol"]
+provider = "openrouter"
+"#
+        .parse::<SettingsLayer>()
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ParseError::LlmCatalog(LlmNormalizationError::RetiredModel {
+                identifier,
+                provider,
+                model,
+            }) if identifier == "openai/gpt-5.6-sol"
+                && provider.as_str() == "openrouter"
+                && model.as_str() == "gpt-5.6-sol"
+        ));
+    }
+
+    #[test]
+    fn same_model_slug_on_different_providers_merges_independently() {
+        use crate::layers::Combine as _;
+
+        let direct = r#"
+[llm.providers.openai.models.shared]
+display_name = "Direct"
+"#
+        .parse::<SettingsLayer>()
+        .unwrap();
+        let aggregator = r#"
+[llm.providers.openrouter.models.shared]
+display_name = "Aggregator"
+"#
+        .parse::<SettingsLayer>()
+        .unwrap();
+
+        let merged = direct.combine(aggregator);
+        let providers = merged.llm.unwrap().providers;
+        assert_eq!(
+            providers
+                .get("openai")
+                .unwrap()
+                .models
+                .get("shared")
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some("Direct")
+        );
+        assert_eq!(
+            providers
+                .get("openrouter")
+                .unwrap()
+                .models
+                .get("shared")
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some("Aggregator")
+        );
     }
 
     #[test]

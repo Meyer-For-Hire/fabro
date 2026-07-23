@@ -118,7 +118,11 @@ impl Adapter {
             request,
             provider_name: &self.provider_name,
             deployment_id,
-            model: common::catalog_model(self.catalog.as_deref(), &request.model),
+            model: common::catalog_model(
+                self.catalog.as_deref(),
+                &self.provider_name,
+                &request.model,
+            ),
             params,
         }
     }
@@ -228,7 +232,11 @@ impl ProviderAdapter for Adapter {
         self.validate_request(request)?;
         let resolved = self.resolve_request(request).await;
         let codec = AnthropicMessages;
-        let deployment_id = common::api_model_id(self.catalog.as_deref(), &resolved.model);
+        let deployment_id = common::api_model_id(
+            self.catalog.as_deref(),
+            &self.provider_name,
+            &resolved.model,
+        );
         let ctx = self.codec_ctx(&resolved, &deployment_id, &route.codec_params);
 
         let Some(encoded) = codec.encode_count_tokens(&ctx).transpose()? else {
@@ -264,7 +272,11 @@ impl ProviderAdapter for Adapter {
 
         let resolved = self.resolve_request(request).await;
         let codec = AnthropicMessages;
-        let deployment_id = common::api_model_id(self.catalog.as_deref(), &resolved.model);
+        let deployment_id = common::api_model_id(
+            self.catalog.as_deref(),
+            &self.provider_name,
+            &resolved.model,
+        );
         let ctx = self.codec_ctx(&resolved, &deployment_id, &route.codec_params);
 
         let encoded = codec.encode(&ctx, false)?;
@@ -281,7 +293,11 @@ impl ProviderAdapter for Adapter {
         let route = self.route_config();
         let resolved = self.resolve_request(request).await;
         let codec = AnthropicMessages;
-        let deployment_id = common::api_model_id(self.catalog.as_deref(), &resolved.model);
+        let deployment_id = common::api_model_id(
+            self.catalog.as_deref(),
+            &self.provider_name,
+            &resolved.model,
+        );
         let ctx = self.codec_ctx(&resolved, &deployment_id, &route.codec_params);
 
         let encoded = codec.encode(&ctx, true)?;
@@ -307,7 +323,8 @@ impl ProviderAdapter for Adapter {
         // Always-adaptive models reject manual enabled/disabled thinking
         // configs at the API, so fail them locally with a clear message
         // instead.
-        let model_info = common::catalog_model(self.catalog.as_deref(), &request.model);
+        let model_info =
+            common::catalog_model(self.catalog.as_deref(), &self.provider_name, &request.model);
         if let Some(model) = model_info
             .filter(|m| m.features.reasoning_effort == ReasoningEffortFeature::AlwaysAdaptive)
         {

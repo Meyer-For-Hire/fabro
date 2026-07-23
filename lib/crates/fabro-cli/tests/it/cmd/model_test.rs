@@ -202,6 +202,7 @@ fn model_test_does_not_announce_unconfigured() {
             .header("Content-Type", "application/json")
             .json_body(serde_json::json!({
                 "model_id": "claude-opus-4-7",
+                "provider": "anthropic",
                 "status": "ok"
             }));
     });
@@ -251,6 +252,7 @@ fn model_test_skipped_footer_sources_from_listing() {
             .header("Content-Type", "application/json")
             .json_body(serde_json::json!({
                 "model_id": "claude-opus-4-7",
+                "provider": "anthropic",
                 "status": "ok"
             }));
     });
@@ -282,6 +284,7 @@ fn model_test_post_list_race_is_a_failure() {
             .header("Content-Type", "application/json")
             .json_body(serde_json::json!({
                 "model_id": "claude-opus-4-7",
+                "provider": "anthropic",
                 "status": "skip"
             }));
     });
@@ -323,6 +326,7 @@ fn model_test_json_partitions_skip_and_fail() {
             .header("Content-Type", "application/json")
             .json_body(serde_json::json!({
                 "model_id": "claude-opus-4-7",
+                "provider": "anthropic",
                 "status": "skip"
             }));
     });
@@ -529,6 +533,7 @@ async fn concurrent_test_model(
 
     Json(serde_json::json!({
         "model_id": id,
+        "provider": "anthropic",
         "status": "ok"
     }))
 }

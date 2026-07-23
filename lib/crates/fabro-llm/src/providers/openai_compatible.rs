@@ -88,7 +88,7 @@ impl Adapter {
     /// Resolve the wire model id (catalog `api_id`, falling back to the
     /// requested model).
     fn deployment_id(&self, request: &Request) -> String {
-        common::api_model_id(self.catalog.as_deref(), &request.model)
+        common::api_model_id(self.catalog.as_deref(), &self.provider_name, &request.model)
     }
 
     /// Build the borrowed codec context. `deployment_id` and `params` are
@@ -103,7 +103,11 @@ impl Adapter {
             request,
             provider_name: &self.provider_name,
             deployment_id,
-            model: common::catalog_model(self.catalog.as_deref(), &request.model),
+            model: common::catalog_model(
+                self.catalog.as_deref(),
+                &self.provider_name,
+                &request.model,
+            ),
             params,
         }
     }

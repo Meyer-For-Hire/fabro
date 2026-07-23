@@ -25,8 +25,8 @@ pub(crate) fn estimate_cost_usd(
     let catalog = catalog?;
     // The billing machinery compares ModelRefs against the catalog's
     // canonical identity, so resolve model aliases and provider names first.
-    let model = catalog.get(model)?;
     let provider = catalog.provider(&ProviderId::new(provider))?;
+    let model = catalog.get_on_provider(&provider.id, model)?;
     let model_ref = ModelRef {
         provider: provider.id.clone(),
         model_id: model.id.clone(),
@@ -47,6 +47,7 @@ pub(crate) fn estimate_cost_usd(
 /// aliases); the response's provider name selects the billing policy.
 pub(crate) fn apply_estimated_cost(
     catalog: Option<&Catalog>,
+    provider: &str,
     model: &str,
     speed: Option<Speed>,
     response: &mut Response,
@@ -54,7 +55,7 @@ pub(crate) fn apply_estimated_cost(
     if response.cost_usd.is_some() {
         return;
     }
-    let estimate = estimate_cost_usd(catalog, &response.provider, model, &response.usage, speed);
+    let estimate = estimate_cost_usd(catalog, provider, model, &response.usage, speed);
     response.cost_usd = estimate;
     response.cost_source = estimate.map(|_| CostSource::Estimated);
 }
@@ -214,7 +215,7 @@ output_cost_per_mtok = {output_cost_per_mtok}
             ..TokenCounts::default()
         });
 
-        apply_estimated_cost(Some(&catalog), "gpt-test", None, &mut response);
+        apply_estimated_cost(Some(&catalog), "openai", "gpt-test", None, &mut response);
 
         assert_eq!(response.cost_source, Some(CostSource::Estimated));
         assert!(response.cost_usd.is_some());
@@ -224,7 +225,7 @@ output_cost_per_mtok = {output_cost_per_mtok}
     fn apply_estimated_cost_leaves_source_unset_without_estimate() {
         let mut response = response_with_usage(TokenCounts::default());
 
-        apply_estimated_cost(None, "gpt-test", None, &mut response);
+        apply_estimated_cost(None, "openai", "gpt-test", None, &mut response);
 
         assert_eq!(response.cost_usd, None);
         assert_eq!(response.cost_source, None);
@@ -241,7 +242,7 @@ output_cost_per_mtok = {output_cost_per_mtok}
         response.cost_usd = Some(0.42);
         response.cost_source = Some(CostSource::Authoritative);
 
-        apply_estimated_cost(Some(&catalog), "gpt-test", None, &mut response);
+        apply_estimated_cost(Some(&catalog), "openai", "gpt-test", None, &mut response);
 
         assert_eq!(response.cost_usd, Some(0.42));
         assert_eq!(response.cost_source, Some(CostSource::Authoritative));

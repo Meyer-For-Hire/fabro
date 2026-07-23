@@ -58,10 +58,14 @@ pub(crate) fn resolve_provider_context(
             })?
             .id
             .clone()
-    } else if let Some(model) = catalog.get(model) {
-        model.provider.clone()
     } else {
-        default_provider_id.clone()
+        match catalog.select(model, None, &catalog.all_provider_ids()) {
+            Ok(model) => model.provider.clone(),
+            Err(fabro_model::ModelSelectionError::UnknownSelector { .. }) => {
+                default_provider_id.clone()
+            }
+            Err(error) => return Err(error.into()),
+        }
     };
 
     let provider = catalog.provider(&provider_id).ok_or_else(|| {

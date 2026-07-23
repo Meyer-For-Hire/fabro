@@ -833,11 +833,15 @@ impl Client {
     pub async fn test_model(
         &self,
         id: &str,
+        provider: Option<&ProviderId>,
         mode: Option<ModelTestMode>,
     ) -> Result<types::ModelTestResult> {
         let response = self
             .send_api(|client| async move {
                 let mut request = client.test_model().id(id.to_string());
+                if let Some(provider) = provider {
+                    request = request.provider(provider.clone());
+                }
                 if let Some(mode) = mode {
                     request = request.mode(mode);
                 }

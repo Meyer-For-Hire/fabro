@@ -303,6 +303,15 @@ fn create_from_source(
         template_context,
         goal_override,
         RenderMode::Structural,
+        options
+            .settings
+            .run
+            .model
+            .provider
+            .as_deref()
+            .filter(|provider| !provider.is_empty())
+            .map(ProviderId::new),
+        &options.configured_providers,
         &options.catalog,
     )?;
 
@@ -325,6 +334,8 @@ pub(super) fn preprocess_and_validate(
     template_context: TemplateContext,
     goal_override: Option<&str>,
     render_mode: RenderMode,
+    default_provider: Option<ProviderId>,
+    eligible_providers: &[ProviderId],
     catalog: &Arc<Catalog>,
 ) -> Result<Validated, Error> {
     let mut parsed = pipeline::parse(dot_source)?;
@@ -338,6 +349,8 @@ pub(super) fn preprocess_and_validate(
         render_mode,
         custom_transforms,
         catalog: Arc::clone(catalog),
+        default_provider,
+        eligible_providers: eligible_providers.iter().cloned().collect(),
     })?;
     Ok(pipeline::validate(transformed, catalog.as_ref(), &[]))
 }
@@ -391,7 +404,7 @@ fn persist_validated(
         validated.graph(),
         catalog.as_ref(),
         &configured_providers,
-    );
+    )?;
 
     let run_id = run_id.unwrap_or_else(RunId::new);
     let run_dir = run_dir.unwrap_or_else(|| default_run_dir(&run_id));
@@ -483,6 +496,59 @@ mod tests {
         Arc::new(Catalog::from_builtin().unwrap())
     }
 
+    fn portable_model_catalog() -> Arc<Catalog> {
+        let settings: fabro_model::catalog::LlmCatalogSettings = toml::from_str(
+            r#"
+[providers.openai]
+display_name = "OpenAI"
+adapter = "openai"
+agent_profile = "openai"
+priority = 90
+
+[providers.openai.models."gpt-5.6-sol"]
+display_name = "GPT-5.6 Sol"
+family = "gpt-5"
+aliases = ["gpt-56-sol"]
+default = true
+
+[providers.openai.models."gpt-5.6-sol".limits]
+context_window = 1000
+
+[providers.openai.models."gpt-5.6-sol".features]
+tools = true
+vision = false
+reasoning = false
+
+[providers.openrouter]
+display_name = "OpenRouter"
+adapter = "openai_compatible"
+agent_profile = "openai"
+priority = 25
+
+[providers.openrouter.models."gpt-5.6-sol"]
+api_id = "openai/gpt-5.6-sol"
+display_name = "GPT-5.6 Sol (via OpenRouter)"
+family = "gpt-5"
+aliases = ["gpt-56-sol"]
+default = true
+
+[providers.openrouter.models."gpt-5.6-sol".limits]
+context_window = 1000
+
+[providers.openrouter.models."gpt-5.6-sol".features]
+tools = true
+vision = false
+reasoning = false
+"#,
+        )
+        .unwrap();
+        Arc::new(Catalog::from_settings(&settings).unwrap())
+    }
+
+    fn test_provider_ids() -> Vec<ProviderId> {
+        Catalog::builtin().all_provider_ids().into_iter().collect()
+    }
+
     fn validate_dot(dot_source: &str, settings: WorkflowSettings) -> Validated {
         validate(ValidateInput {
             workflow: WorkflowInput::DotSource {
@@ -511,6 +577,8 @@ mod tests {
             template_context(Some(&WorkflowSettings::default()), vars),
             None,
             RenderMode::Structural,
+            None,
+            &test_provider_ids(),
             &test_catalog(),
         )
         .unwrap()
@@ -679,6 +747,8 @@ mod tests {
             template_context(Some(&WorkflowSettings::default()), HashMap::new()),
             None,
             RenderMode::Strict,
+            None,
+            &test_provider_ids(),
             &test_catalog(),
         );
         let Err(err) = result else {
@@ -715,6 +785,8 @@ mod tests {
             template_context(Some(&WorkflowSettings::default()), HashMap::new()),
             None,
             RenderMode::Strict,
+            None,
+            &test_provider_ids(),
             &test_catalog(),
         );
         let Err(err) = result else {
@@ -1245,7 +1317,7 @@ mod tests {
                 fork_source_ref: None,
                 parent_id: None,
                 provenance: test_support::test_run_provenance(),
-                configured_providers: Vec::new(),
+                configured_providers: test_provider_ids(),
                 web_url: None,
             },
             storage_root,
@@ -1318,7 +1390,7 @@ mod tests {
                 fork_source_ref: None,
                 parent_id: None,
                 provenance: test_support::test_run_provenance(),
-                configured_providers: Vec::new(),
+                configured_providers: test_provider_ids(),
                 web_url: None,
             },
             storage_root.clone(),
@@ -1390,6 +1462,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_materializes_shared_alias_for_ready_provider_snapshot_and_pin() {
+        const ALIAS_DOT: &str = r#"digraph Test {
+            graph [goal="Test"]
+            start [shape=Mdiamond]
+            work [prompt="Do work", model="gpt-56-sol"]
+            exit [shape=Msquare]
+            start -> work -> exit
+        }"#;
+        let catalog = portable_model_catalog();
+        let cases = [
+            (vec![ProviderId::openai()], None, ProviderId::openai()),
+            (
+                vec![ProviderId::new("openrouter")],
+                None,
+                ProviderId::new("openrouter"),
+            ),
+            (
+                vec![ProviderId::openai(), ProviderId::new("openrouter")],
+                None,
+                ProviderId::openai(),
+            ),
+            (
+                vec![ProviderId::openai(), ProviderId::new("openrouter")],
+                Some("openrouter"),
+                ProviderId::new("openrouter"),
+            ),
+        ];
+
+        for (ready, explicit_provider, expected_provider) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let mut settings = test_default_settings();
+            settings.run.model.name = Some("gpt-56-sol".to_string());
+            settings.run.model.provider = explicit_provider.map(str::to_string);
+            let store = memory_store();
+            let created = create(
+                store.as_ref(),
+                CreateRunInput {
+                    workflow: WorkflowInput::DotSource {
+                        source:   ALIAS_DOT.to_string(),
+                        base_dir: None,
+                    },
+                    settings,
+                    vars: HashMap::new(),
+                    cwd: dir.path().to_path_buf(),
+                    workflow_slug: None,
+                    workflow_path: None,
+                    workflow_bundle: None,
+                    submitted_manifest_bytes: None,
+                    run_id: None,
+                    title: None,
+                    automation: None,
+                    git: None,
+                    fork_source_ref: None,
+                    parent_id: None,
+                    provenance: test_support::test_run_provenance(),
+                    configured_providers: ready,
+                    web_url: None,
+                },
+                dir.path().join("storage"),
+                Arc::clone(&catalog),
+            )
+            .await
+            .unwrap();
+            let run_spec = created.persisted.run_spec();
+
+            assert_eq!(
+                run_spec.settings.run.model.name.as_deref(),
+                Some("gpt-5.6-sol")
+            );
+            assert_eq!(
+                run_spec.settings.run.model.provider.as_deref(),
+                Some(expected_provider.as_str())
+            );
+            assert_eq!(
+                run_spec.graph.nodes["work"]
+                    .attrs
+                    .get("model")
+                    .and_then(AttrValue::as_str),
+                Some("gpt-5.6-sol")
+            );
+            assert_eq!(
+                run_spec.graph.nodes["work"]
+                    .attrs
+                    .get("provider")
+                    .and_then(AttrValue::as_str),
+                Some(expected_provider.as_str())
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn create_persists_secret_tokens_in_run_created_settings_source_form() {
         let dir = tempfile::tempdir().unwrap();
         let storage_root = dir.path().join("storage");
@@ -1435,7 +1598,7 @@ mod tests {
                 fork_source_ref: None,
                 parent_id: None,
                 provenance: test_support::test_run_provenance(),
-                configured_providers: Vec::new(),
+                configured_providers: test_provider_ids(),
                 web_url: None,
             },
             storage_root,
@@ -1512,7 +1675,7 @@ mod tests {
                 fork_source_ref: None,
                 parent_id: None,
                 provenance: test_support::test_run_provenance(),
-                configured_providers: Vec::new(),
+                configured_providers: test_provider_ids(),
                 web_url: None,
             },
             storage_root,
@@ -1559,7 +1722,7 @@ mod tests {
                 fork_source_ref: None,
                 parent_id: None,
                 provenance: test_support::test_run_provenance(),
-                configured_providers: Vec::new(),
+                configured_providers: test_provider_ids(),
                 web_url: None,
             },
             storage_root,
@@ -1633,7 +1796,7 @@ mod tests {
                 fork_source_ref: None,
                 parent_id: None,
                 provenance: test_support::test_run_provenance(),
-                configured_providers: Vec::new(),
+                configured_providers: test_provider_ids(),
                 web_url: None,
             },
             storage_dir.clone(),
@@ -1701,7 +1864,7 @@ mod tests {
                         fabro_types::AuthMethod::Github,
                     ),
                 },
-                configured_providers: Vec::new(),
+                configured_providers: test_provider_ids(),
                 web_url: None,
             },
             storage_dir,

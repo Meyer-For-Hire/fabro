@@ -935,7 +935,7 @@ impl AgentApiBackend {
                         .clone()
                         .unwrap_or_else(|| default_provider.clone()),
                 ),
-                model_id: request.model.clone(),
+                model_id: request.model.clone().into(),
                 speed:    controls.speed,
             }),
             Err(sdk_err) if sdk_err.failover_eligible() && !fallback_chain.is_empty() => {
@@ -964,7 +964,7 @@ impl AgentApiBackend {
 
                     let max_tokens = node.max_tokens().or_else(|| {
                         self.catalog
-                            .get(&target.model)
+                            .get_on_provider(&ProviderId::new(&target.provider), &target.model)
                             .and_then(|model| model.limits.max_output)
                     });
 
@@ -983,7 +983,7 @@ impl AgentApiBackend {
                                 response: resp,
                                 model:    ModelRef {
                                     provider: ProviderId::from(target.provider.clone()),
-                                    model_id: target.model.clone(),
+                                    model_id: target.model.clone().into(),
                                     speed:    controls.speed,
                                 },
                             });
@@ -1034,9 +1034,11 @@ impl CodergenBackend for AgentApiBackend {
         let provider_id = provider.provider_id.to_string();
         let controls = self.resolve_effective_request_controls(node)?;
 
-        let max_tokens = node
-            .max_tokens()
-            .or_else(|| self.catalog.get(model).and_then(|m| m.limits.max_output));
+        let max_tokens = node.max_tokens().or_else(|| {
+            self.catalog
+                .get_on_provider(&provider.provider_id, model)
+                .and_then(|model| model.limits.max_output)
+        });
 
         let mut messages = Vec::new();
         if let Some(sys) = system_prompt {
@@ -1513,7 +1515,7 @@ impl CodergenBackend for AgentApiBackend {
             self.catalog.as_ref(),
             &ModelRef {
                 provider: session.provider_id(),
-                model_id: session.model().to_string(),
+                model_id: session.model().into(),
                 speed:    billing_controls.speed,
             },
             &total_usage,

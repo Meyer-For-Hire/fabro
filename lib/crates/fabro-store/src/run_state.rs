@@ -1036,7 +1036,7 @@ fn run_models(state: &RunProjection) -> Vec<RunModel> {
         .filter_map(|(_, stage)| stage.model.as_ref())
         .map(|model| RunModel {
             provider: Some(model.provider.to_string()),
-            name:     model.model_id.clone(),
+            name:     model.model_id.to_string(),
         })
         .collect::<Vec<_>>();
     models.sort_by(|left, right| {

@@ -34,6 +34,11 @@ pub fn validate(input: ValidateInput) -> Result<Validated, Error> {
         cwd:      input.cwd,
     })
     .map_err(|err| Error::Parse(err.to_string()))?;
+    let eligible_providers = input
+        .catalog
+        .all_provider_ids()
+        .into_iter()
+        .collect::<Vec<_>>();
 
     preprocess_and_validate(
         &resolved.raw_source,
@@ -47,6 +52,15 @@ pub fn validate(input: ValidateInput) -> Result<Validated, Error> {
         template_context(Some(&resolved.settings), input.vars),
         resolved.goal_override.as_deref(),
         RenderMode::Structural,
+        resolved
+            .settings
+            .run
+            .model
+            .provider
+            .as_deref()
+            .filter(|provider| !provider.is_empty())
+            .map(fabro_model::ProviderId::new),
+        &eligible_providers,
         &input.catalog,
     )
 }

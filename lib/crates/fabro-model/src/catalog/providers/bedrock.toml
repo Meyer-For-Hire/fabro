@@ -45,68 +45,67 @@ credentials = [
 # file because its Bedrock deployment pins sampling parameters and requires an
 # extra data-sharing opt-in.
 
-[models."us.anthropic.claude-sonnet-4-6"]
-provider = "bedrock"
+[providers.bedrock.models."claude-sonnet-4-6"]
+api_id = "us.anthropic.claude-sonnet-4-6"
 display_name = "Claude Sonnet 4.6 (Bedrock)"
 family = "claude-4"
 billing_policy = "anthropic"
 default = true
 
-[models."us.anthropic.claude-sonnet-4-6".limits]
+[providers.bedrock.models."claude-sonnet-4-6".limits]
 context_window = 1000000
 max_output = 64000
 
-[models."us.anthropic.claude-sonnet-4-6".features]
+[providers.bedrock.models."claude-sonnet-4-6".features]
 tools = true
 vision = true
 reasoning = true
 prompt_cache = true
 
-[models."us.anthropic.claude-sonnet-4-6".costs]
+[providers.bedrock.models."claude-sonnet-4-6".costs]
 input_cost_per_mtok = 3.0
 output_cost_per_mtok = 15.0
 cache_input_cost_per_mtok = 0.3
 
-[models."us.anthropic.claude-opus-4-8"]
-provider = "bedrock"
+[providers.bedrock.models."claude-opus-4-8"]
+api_id = "us.anthropic.claude-opus-4-8"
 display_name = "Claude Opus 4.8 (Bedrock)"
 family = "claude-4"
 billing_policy = "anthropic"
 
-[models."us.anthropic.claude-opus-4-8".limits]
+[providers.bedrock.models."claude-opus-4-8".limits]
 context_window = 1000000
 max_output = 128000
 
-[models."us.anthropic.claude-opus-4-8".features]
+[providers.bedrock.models."claude-opus-4-8".features]
 tools = true
 vision = true
 reasoning = true
 prompt_cache = true
 
-[models."us.anthropic.claude-opus-4-8".costs]
+[providers.bedrock.models."claude-opus-4-8".costs]
 input_cost_per_mtok = 5.0
 output_cost_per_mtok = 25.0
 cache_input_cost_per_mtok = 0.5
 
-[models."us.anthropic.claude-haiku-4-5"]
-provider = "bedrock"
+[providers.bedrock.models."claude-haiku-4-5"]
 api_id = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 display_name = "Claude Haiku 4.5 (Bedrock)"
 family = "claude-4"
 billing_policy = "anthropic"
 small_default = true
 
-[models."us.anthropic.claude-haiku-4-5".limits]
+[providers.bedrock.models."claude-haiku-4-5".limits]
 context_window = 200000
 max_output = 64000
 
-[models."us.anthropic.claude-haiku-4-5".features]
+[providers.bedrock.models."claude-haiku-4-5".features]
 tools = true
 vision = true
 reasoning = false
 prompt_cache = true
 
-[models."us.anthropic.claude-haiku-4-5".costs]
+[providers.bedrock.models."claude-haiku-4-5".costs]
 input_cost_per_mtok = 1.0
 output_cost_per_mtok = 5.0
 cache_input_cost_per_mtok = 0.1
@@ -116,149 +115,142 @@ cache_input_cost_per_mtok = 0.1
 # GPT-5.5/5.4 are NOT here: on Bedrock they are Responses-API-only on the
 # bedrock-mantle endpoint (no Converse), a named follow-up route.
 
-[models."openai.gpt-oss-120b"]
-provider = "bedrock"
+[providers.bedrock.models."gpt-oss-120b"]
 api_id = "openai.gpt-oss-120b-1:0"
 display_name = "GPT-OSS 120B (Bedrock)"
 family = "gpt-oss"
 billing_policy = "openai"
 agent_profile = "openai"
 
-[models."openai.gpt-oss-120b".limits]
+[providers.bedrock.models."gpt-oss-120b".limits]
 context_window = 128000
 max_output = 16384
 
-[models."openai.gpt-oss-120b".features]
+[providers.bedrock.models."gpt-oss-120b".features]
 tools = true
 vision = false
 reasoning = true
 
-[models."openai.gpt-oss-120b".costs]
+[providers.bedrock.models."gpt-oss-120b".costs]
 input_cost_per_mtok = 0.15
 output_cost_per_mtok = 0.60
 
-[models."openai.gpt-oss-20b"]
-provider = "bedrock"
+[providers.bedrock.models."gpt-oss-20b"]
 api_id = "openai.gpt-oss-20b-1:0"
 display_name = "GPT-OSS 20B (Bedrock)"
 family = "gpt-oss"
 billing_policy = "openai"
 agent_profile = "openai"
 
-[models."openai.gpt-oss-20b".limits]
+[providers.bedrock.models."gpt-oss-20b".limits]
 context_window = 128000
 max_output = 16384
 
-[models."openai.gpt-oss-20b".features]
+[providers.bedrock.models."gpt-oss-20b".features]
 tools = true
 vision = false
 reasoning = true
 
-[models."openai.gpt-oss-20b".costs]
+[providers.bedrock.models."gpt-oss-20b".costs]
 input_cost_per_mtok = 0.07
 output_cost_per_mtok = 0.30
 
 # ---------- Amazon Nova ----------
 
-[models."amazon.nova-2-lite"]
-provider = "bedrock"
+[providers.bedrock.models."nova-2-lite"]
 api_id = "global.amazon.nova-2-lite-v1:0"
 display_name = "Nova 2 Lite (Bedrock)"
 family = "nova-2"
 billing_policy = "openai"
 agent_profile = "openai"
 
-[models."amazon.nova-2-lite".limits]
+[providers.bedrock.models."nova-2-lite".limits]
 context_window = 1000000
 # Bedrock caps Nova output at 65535 (2^16 - 1); 65536 trips
 # "maximum tokens exceeds the model limit of 65535" since the prompt handler
 # defaults max_tokens to max_output.
 max_output = 65535
 
-[models."amazon.nova-2-lite".features]
+[providers.bedrock.models."nova-2-lite".features]
 tools = true
 vision = true
 reasoning = false
 
-[models."amazon.nova-2-lite".costs]
+[providers.bedrock.models."nova-2-lite".costs]
 input_cost_per_mtok = 0.30
 output_cost_per_mtok = 2.50
 
 # ---------- Open-weights ----------
 
-[models."meta.llama4-maverick"]
-provider = "bedrock"
+[providers.bedrock.models."llama-4-maverick"]
 api_id = "us.meta.llama4-maverick-17b-instruct-v1:0"
 display_name = "Llama 4 Maverick (Bedrock)"
 family = "llama-4"
 billing_policy = "openai"
 agent_profile = "openai"
 
-[models."meta.llama4-maverick".limits]
+[providers.bedrock.models."llama-4-maverick".limits]
 context_window = 1000000
 max_output = 8192
 
-[models."meta.llama4-maverick".features]
+[providers.bedrock.models."llama-4-maverick".features]
 tools = true
 vision = true
 reasoning = false
 
-[models."mistral.mistral-large-3"]
-provider = "bedrock"
+[providers.bedrock.models."mistral-large-3"]
 api_id = "mistral.mistral-large-3-675b-instruct"
 display_name = "Mistral Large 3 (Bedrock)"
 family = "mistral-large"
 billing_policy = "openai"
 agent_profile = "openai"
 
-[models."mistral.mistral-large-3".limits]
+[providers.bedrock.models."mistral-large-3".limits]
 context_window = 256000
 max_output = 32768
 
-[models."mistral.mistral-large-3".features]
+[providers.bedrock.models."mistral-large-3".features]
 tools = true
 vision = true
 reasoning = false
 
-[models."mistral.mistral-large-3".costs]
+[providers.bedrock.models."mistral-large-3".costs]
 input_cost_per_mtok = 0.50
 output_cost_per_mtok = 1.50
 
-[models."mistral.devstral-2"]
-provider = "bedrock"
+[providers.bedrock.models."devstral-2"]
 api_id = "mistral.devstral-2-123b"
 display_name = "Devstral 2 (Bedrock)"
 family = "devstral"
 billing_policy = "openai"
 agent_profile = "openai"
 
-[models."mistral.devstral-2".limits]
+[providers.bedrock.models."devstral-2".limits]
 context_window = 256000
 max_output = 32768
 
-[models."mistral.devstral-2".features]
+[providers.bedrock.models."devstral-2".features]
 tools = true
 vision = false
 reasoning = false
 
-[models."deepseek.v3-2"]
-provider = "bedrock"
+[providers.bedrock.models."deepseek-v3.2"]
 api_id = "deepseek.v3.2"
 display_name = "DeepSeek V3.2 (Bedrock)"
 family = "deepseek-v3"
 billing_policy = "openai"
 agent_profile = "openai"
 
-[models."deepseek.v3-2".limits]
+[providers.bedrock.models."deepseek-v3.2".limits]
 context_window = 164000
 max_output = 8192
 
-[models."deepseek.v3-2".features]
+[providers.bedrock.models."deepseek-v3.2".features]
 tools = true
 vision = false
 reasoning = true
 
-[models."deepseek.v3-2".costs]
+[providers.bedrock.models."deepseek-v3.2".costs]
 input_cost_per_mtok = 0.62
 output_cost_per_mtok = 1.85
 
@@ -267,92 +259,90 @@ output_cost_per_mtok = 1.85
 # "The provided model identifier is invalid"), so this row needs an explicit
 # `api_id` confirmed against `aws bedrock list-inference-profiles` before it
 # ships. Re-add with:
-#   [models."qwen.qwen3-coder-next"]
-#   provider = "bedrock"
+#   [providers.bedrock.models."qwen3-coder-next"]
 #   api_id = "<verified bedrock id>"
 #   display_name = "Qwen3 Coder Next (Bedrock)"
 #   family = "qwen3"
 #   billing_policy = "openai"
 #   agent_profile = "openai"
-#   [models."qwen.qwen3-coder-next".limits]
+#   [providers.bedrock.models."qwen3-coder-next".limits]
 #   context_window = 256000
 #   max_output = 16384
-#   [models."qwen.qwen3-coder-next".features]
+#   [providers.bedrock.models."qwen3-coder-next".features]
 #   tools = true
 
-[models."moonshotai.kimi-k2.5"]
-provider = "bedrock"
+[providers.bedrock.models."kimi-k2.5"]
+api_id = "moonshotai.kimi-k2.5"
 display_name = "Kimi K2.5 (Bedrock)"
 family = "kimi-k2"
 billing_policy = "openai"
 agent_profile = "openai"
 
-[models."moonshotai.kimi-k2.5".limits]
+[providers.bedrock.models."kimi-k2.5".limits]
 context_window = 262144
 max_output = 16384
 
-[models."moonshotai.kimi-k2.5".features]
+[providers.bedrock.models."kimi-k2.5".features]
 tools = true
 vision = true
 reasoning = false
 
-[models."moonshotai.kimi-k2.5".costs]
+[providers.bedrock.models."kimi-k2.5".costs]
 input_cost_per_mtok = 0.60
 output_cost_per_mtok = 3.00
 
-[models."zai.glm-5"]
-provider = "bedrock"
+[providers.bedrock.models."glm-5"]
+api_id = "zai.glm-5"
 display_name = "GLM 5 (Bedrock)"
 family = "glm"
 billing_policy = "openai"
 agent_profile = "openai"
 
-[models."zai.glm-5".limits]
+[providers.bedrock.models."glm-5".limits]
 context_window = 200000
 max_output = 128000
 
-[models."zai.glm-5".features]
+[providers.bedrock.models."glm-5".features]
 tools = true
 vision = false
 reasoning = false
 
-[models."zai.glm-5".costs]
+[providers.bedrock.models."glm-5".costs]
 input_cost_per_mtok = 1.00
 output_cost_per_mtok = 3.20
 
-[models."minimax.minimax-m2.5"]
-provider = "bedrock"
+[providers.bedrock.models."minimax-m2.5"]
+api_id = "minimax.minimax-m2.5"
 display_name = "MiniMax M2.5 (Bedrock)"
 family = "minimax-m2"
 billing_policy = "openai"
 agent_profile = "openai"
 
-[models."minimax.minimax-m2.5".limits]
+[providers.bedrock.models."minimax-m2.5".limits]
 context_window = 196000
 max_output = 8192
 
-[models."minimax.minimax-m2.5".features]
+[providers.bedrock.models."minimax-m2.5".features]
 tools = true
 vision = false
 reasoning = false
 
-[models."minimax.minimax-m2.5".costs]
+[providers.bedrock.models."minimax-m2.5".costs]
 input_cost_per_mtok = 0.30
 output_cost_per_mtok = 1.20
 
-[models."nvidia.nemotron-3-super"]
-provider = "bedrock"
+[providers.bedrock.models."nemotron-3-super"]
 api_id = "nvidia.nemotron-super-3-120b"
 display_name = "Nemotron 3 Super (Bedrock)"
 family = "nemotron-3"
 billing_policy = "openai"
 agent_profile = "openai"
 
-[models."nvidia.nemotron-3-super".limits]
+[providers.bedrock.models."nemotron-3-super".limits]
 context_window = 256000
 max_output = 32768
 
-[models."nvidia.nemotron-3-super".features]
+[providers.bedrock.models."nemotron-3-super".features]
 tools = true
 vision = false
 reasoning = false
@@ -365,24 +355,24 @@ reasoning = false
 # reasoning_effort stays undeclared here (requests carrying one are
 # rejected up front rather than silently dropped).
 
-[models."us.anthropic.claude-fable-5"]
-provider = "bedrock"
+[providers.bedrock.models."claude-fable-5"]
+api_id = "us.anthropic.claude-fable-5"
 display_name = "Claude Fable 5 (Bedrock)"
 family = "claude-5"
 billing_policy = "anthropic"
 
-[models."us.anthropic.claude-fable-5".limits]
+[providers.bedrock.models."claude-fable-5".limits]
 context_window = 1000000
 max_output = 128000
 
-[models."us.anthropic.claude-fable-5".features]
+[providers.bedrock.models."claude-fable-5".features]
 tools = true
 vision = true
 reasoning = true
 prompt_cache = true
 sampling_params = false
 
-[models."us.anthropic.claude-fable-5".costs]
+[providers.bedrock.models."claude-fable-5".costs]
 input_cost_per_mtok = 10.0
 output_cost_per_mtok = 50.0
 cache_input_cost_per_mtok = 1.0

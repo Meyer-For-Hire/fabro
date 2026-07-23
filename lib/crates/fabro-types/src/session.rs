@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use fabro_model::ProviderId;
 use serde::{Deserialize, Serialize};
 use strum::{Display, EnumString, IntoStaticStr};
 
@@ -63,6 +64,8 @@ pub struct SessionRecord {
     pub status:      SessionStatus,
     pub model:       Option<String>,
     #[serde(default)]
+    pub provider:    Option<ProviderId>,
+    #[serde(default)]
     pub active_turn: Option<SessionTurn>,
     pub created_at:  DateTime<Utc>,
     pub updated_at:  DateTime<Utc>,
@@ -76,6 +79,7 @@ impl SessionRecord {
             title: None,
             status: SessionStatus::Idle,
             model: None,
+            provider: None,
             active_turn: None,
             created_at: now,
             updated_at: now,
@@ -91,6 +95,8 @@ pub struct SessionSummary {
     pub status:      SessionStatus,
     pub model:       Option<String>,
     #[serde(default)]
+    pub provider:    Option<ProviderId>,
+    #[serde(default)]
     pub active_turn: Option<SessionTurn>,
     pub created_at:  DateTime<Utc>,
     pub updated_at:  DateTime<Utc>,
@@ -104,6 +110,7 @@ impl From<&SessionRecord> for SessionSummary {
             title:       record.title.clone(),
             status:      record.status,
             model:       record.model.clone(),
+            provider:    record.provider.clone(),
             active_turn: record.active_turn.clone(),
             created_at:  record.created_at,
             updated_at:  record.updated_at,
