@@ -127,6 +127,8 @@ When Anthropic fails, Fabro tries Gemini first, then OpenAI. Fallback resolution
 - A qualified selector such as `"openrouter/gpt-56-sol"` resolves only within that provider.
 - A bare model slug or alias considers ready providers and uses provider priority.
 
+Qualified fallback references always remain provider pins, including strings that were historical built-in API IDs. For example, `"openai/gpt-5.6-sol"` pins the direct OpenAI offering.
+
 The primary provider and model were already resolved and persisted when the run was created; resuming does not re-run primary selection. Fallbacks are only considered after an eligible runtime failure.
 
 ### What triggers failover

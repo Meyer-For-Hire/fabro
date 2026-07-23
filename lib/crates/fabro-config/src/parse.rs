@@ -429,24 +429,46 @@ display_name = "Legacy"
     }
 
     #[test]
-    fn retired_legacy_model_id_names_replacement() {
-        let error = r#"
+    fn legacy_builtin_model_id_normalizes_with_explicit_provider() {
+        let parsed = r#"
 [llm.models."openai/gpt-5.6-sol"]
 provider = "openrouter"
+display_name = "Configured Sol"
 "#
         .parse::<SettingsLayer>()
-        .unwrap_err();
+        .unwrap();
+        let llm = parsed.llm.unwrap();
 
-        assert!(matches!(
-            error,
-            ParseError::LlmCatalog(LegacyModelError::Retired {
-                identifier,
-                provider,
-                model,
-            }) if identifier == "openai/gpt-5.6-sol"
-                && provider.as_str() == "openrouter"
-                && model.as_str() == "gpt-5.6-sol"
-        ));
+        assert!(llm.models.is_empty());
+        let model = llm
+            .providers
+            .get("openrouter")
+            .unwrap()
+            .models
+            .get("gpt-5.6-sol")
+            .unwrap();
+        assert_eq!(model.display_name.as_deref(), Some("Configured Sol"));
+        assert!(model.provider.is_none());
+    }
+
+    #[test]
+    fn legacy_builtin_model_id_without_provider_uses_historical_catalog_provider() {
+        let parsed = r#"
+[llm.models."anthropic/claude-fable-5"]
+display_name = "Configured Fable"
+"#
+        .parse::<SettingsLayer>()
+        .unwrap();
+        let llm = parsed.llm.unwrap();
+
+        assert!(llm.models.is_empty());
+        assert!(
+            llm.providers
+                .get("openrouter")
+                .unwrap()
+                .models
+                .contains_key("claude-fable-5")
+        );
     }
 
     #[test]

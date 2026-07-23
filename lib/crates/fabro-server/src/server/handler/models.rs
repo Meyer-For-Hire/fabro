@@ -270,8 +270,7 @@ fn model_selection_response(error: &ModelSelectionError) -> Response {
         | ModelSelectionError::UnknownSelectorOnProvider { .. } => {
             ApiError::not_found(error.to_string()).into_response()
         }
-        ModelSelectionError::RetiredModelIdentifier { .. }
-        | ModelSelectionError::ProviderUnavailable { .. }
+        ModelSelectionError::ProviderUnavailable { .. }
         | ModelSelectionError::NoEligibleOffering { .. }
         | ModelSelectionError::NoDefaultModel { .. } => {
             ApiError::bad_request(error.to_string()).into_response()

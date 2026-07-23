@@ -616,12 +616,6 @@ pub enum ModelSelectionError {
         "no default model is available on an eligible provider; providers with defaults: {providers:?}"
     )]
     NoDefaultModel { providers: Vec<ProviderId> },
-    #[error("model identifier '{identifier}' has been retired; use '{provider}/{model}' instead")]
-    RetiredModelIdentifier {
-        identifier: String,
-        provider:   ProviderId,
-        model:      ModelId,
-    },
 }
 
 /// One provider/model pair chosen by [`Catalog::resolve_selection`]. The
@@ -711,13 +705,11 @@ impl Catalog {
                     continue;
                 }
 
-                if let Some((replacement_provider, replacement_model)) =
-                    retired_model_replacement(&model_id)
-                {
-                    return Err(LegacyModelError::Retired {
+                if let Some((_, canonical_model)) = legacy_builtin_model(&model_id) {
+                    return Err(LegacyModelError::LegacyIdentifierAsModelId {
                         identifier: model_id,
-                        provider:   replacement_provider,
-                        model:      replacement_model,
+                        provider:   provider.id.clone(),
+                        model:      canonical_model,
                     }
                     .into());
                 }
@@ -870,12 +862,14 @@ impl Catalog {
     }
 
     /// Look up a selector on exactly one provider, without considering
-    /// provider availability.
+    /// provider availability. Historical built-in API identifiers normalize
+    /// to their canonical model slug before lookup.
     #[must_use]
     pub fn get_on_provider(&self, provider: &ProviderId, selector: &str) -> Option<&Model> {
         let provider = self.provider(provider)?;
+        let selector = normalize_legacy_builtin_selector(selector);
         self.provider_selector_index
-            .get(&(provider.id.clone(), selector.to_string()))
+            .get(&(provider.id.clone(), selector.into_owned()))
             .and_then(|idx| self.models.get(*idx))
     }
 
@@ -894,14 +888,6 @@ impl Catalog {
         provider: &ProviderId,
         selector: &str,
     ) -> Result<&Model, ModelSelectionError> {
-        if let Some((replacement_provider, replacement_model)) = retired_model_replacement(selector)
-        {
-            return Err(ModelSelectionError::RetiredModelIdentifier {
-                identifier: selector.to_string(),
-                provider:   replacement_provider,
-                model:      replacement_model,
-            });
-        }
         let provider =
             self.provider(provider)
                 .ok_or_else(|| ModelSelectionError::UnknownProvider {
@@ -919,6 +905,9 @@ impl Catalog {
     /// Select one concrete offering for a selector and ready-provider
     /// snapshot.
     ///
+    /// Historical built-in API identifiers normalize to their canonical model
+    /// slug before selection.
+    ///
     /// An explicit provider is a pin. Unqualified selection checks canonical
     /// IDs before aliases and uses the catalog's provider priority ordering.
     pub fn select<'a>(
@@ -927,14 +916,6 @@ impl Catalog {
         explicit_provider: Option<&ProviderId>,
         eligible_providers: &HashSet<ProviderId>,
     ) -> Result<&'a Model, ModelSelectionError> {
-        if let Some((replacement_provider, replacement_model)) = retired_model_replacement(selector)
-        {
-            return Err(ModelSelectionError::RetiredModelIdentifier {
-                identifier: selector.to_string(),
-                provider:   replacement_provider,
-                model:      replacement_model,
-            });
-        }
         let eligible = eligible_providers
             .iter()
             .filter_map(|provider| self.provider(provider).map(|provider| provider.id.clone()))
@@ -954,7 +935,10 @@ impl Catalog {
             return self.resolve_on_provider(&provider.id, selector);
         }
 
-        let canonical = self.canonical_candidates.get(&ModelId::new(selector));
+        let normalized_selector = normalize_legacy_builtin_selector(selector);
+        let canonical = self
+            .canonical_candidates
+            .get(&ModelId::new(normalized_selector.as_ref()));
         if let Some(indices) = canonical {
             if let Some(model) = indices
                 .iter()
@@ -965,7 +949,7 @@ impl Catalog {
             }
         }
 
-        let aliases = self.alias_candidates.get(selector);
+        let aliases = self.alias_candidates.get(normalized_selector.as_ref());
         if let Some(indices) = aliases {
             if let Some(model) = indices
                 .iter()
@@ -1117,9 +1101,10 @@ impl Catalog {
     }
 
     fn candidate_indices(&self, selector: &str) -> Option<&Vec<usize>> {
+        let selector = normalize_legacy_builtin_selector(selector);
         self.canonical_candidates
-            .get(&ModelId::new(selector))
-            .or_else(|| self.alias_candidates.get(selector))
+            .get(&ModelId::new(selector.as_ref()))
+            .or_else(|| self.alias_candidates.get(selector.as_ref()))
     }
 
     #[must_use]
@@ -1537,8 +1522,10 @@ fn reject_scoped_provider_fields(settings: &LlmCatalogSettings) -> Result<(), Le
 pub enum LegacyModelError {
     #[error("failed to inspect the built-in model catalog: {message}")]
     BuiltinCatalog { message: String },
-    #[error("model identifier '{identifier}' has been retired; use '{provider}/{model}' instead")]
-    Retired {
+    #[error(
+        "legacy built-in model identifier '{identifier}' cannot be used as a canonical model ID under provider '{provider}'; use '{model}'"
+    )]
+    LegacyIdentifierAsModelId {
         identifier: String,
         provider:   ProviderId,
         model:      ModelId,
@@ -1647,20 +1634,23 @@ impl LegacyModelIndex {
         Ok(self)
     }
 
-    /// Resolve one legacy row to its provider-scoped address. An unknown
-    /// explicit provider or model selector passes through verbatim; rows
-    /// without an explicit provider must match exactly one known offering.
+    /// Resolve one legacy row to its provider-scoped address. Historical
+    /// built-in identifiers normalize to their canonical slug and use their
+    /// historical provider when no explicit provider is present. Other
+    /// unknown explicit providers or model selectors pass through verbatim;
+    /// rows without an explicit provider must match exactly one known
+    /// offering.
     pub fn resolve(
         &self,
         legacy_id: &str,
         explicit_provider: Option<&str>,
     ) -> Result<(ProviderId, ModelId), LegacyModelError> {
-        if let Some((provider, model)) = retired_model_replacement(legacy_id) {
-            return Err(LegacyModelError::Retired {
-                identifier: legacy_id.to_string(),
-                provider,
-                model,
+        if let Some((historical_provider, model)) = legacy_builtin_model(legacy_id) {
+            let provider = explicit_provider.map_or(historical_provider, |explicit| {
+                self.canonical_provider(explicit)
+                    .unwrap_or_else(|| ProviderId::new(explicit))
             });
+            return Ok((provider, model));
         }
         if let Some(explicit) = explicit_provider {
             let provider = self
@@ -1755,11 +1745,11 @@ impl LegacyModelIndex {
     }
 }
 
-/// Built-in catalog keys retired when provider API identifiers stopped being
-/// Fabro model IDs. Keep this list explicit so old workflow and persisted-run
-/// references fail with an actionable replacement instead of silently
-/// selecting another route.
-const RETIRED_MODEL_IDENTIFIERS: &[(&str, &str, &str)] = &[
+/// Historical built-in catalog keys from before Fabro separated canonical
+/// model slugs from provider API identifiers. The provider records the key's
+/// original offering for legacy catalog-row normalization; runtime selectors
+/// normalize to the model slug and use normal provider-aware selection.
+const LEGACY_BUILTIN_MODEL_IDENTIFIERS: &[(&str, &str, &str)] = &[
     ("openai.gpt-5.5", "bedrock-openai", "gpt-5.5"),
     ("openai.gpt-5.4", "bedrock-openai", "gpt-5.4"),
     (
@@ -1833,13 +1823,21 @@ const RETIRED_MODEL_IDENTIFIERS: &[(&str, &str, &str)] = &[
     ("mistralai/devstral-2512", "openrouter", "devstral-2512"),
 ];
 
-/// Return the replacement address for a retired built-in catalog key.
+/// Return the historical provider and canonical model slug for a legacy
+/// built-in catalog key.
 #[must_use]
-pub fn retired_model_replacement(identifier: &str) -> Option<(ProviderId, ModelId)> {
-    RETIRED_MODEL_IDENTIFIERS
+pub fn legacy_builtin_model(identifier: &str) -> Option<(ProviderId, ModelId)> {
+    LEGACY_BUILTIN_MODEL_IDENTIFIERS
         .iter()
-        .find(|(retired, _, _)| *retired == identifier)
+        .find(|(legacy, _, _)| *legacy == identifier)
         .map(|(_, provider, model)| (ProviderId::new(*provider), ModelId::new(*model)))
+}
+
+fn normalize_legacy_builtin_selector(selector: &str) -> Cow<'_, str> {
+    legacy_builtin_model(selector).map_or_else(
+        || Cow::Borrowed(selector),
+        |(_, model)| Cow::Owned(model.into_inner()),
+    )
 }
 
 fn merge_catalog_settings(
@@ -3106,6 +3104,47 @@ enabled = true
     }
 
     #[test]
+    fn builtin_legacy_vendor_ids_normalize_for_pinned_and_unpinned_selection() {
+        let catalog = Catalog::from_builtin_with_overrides(&minimal_settings(
+            r"
+[providers.openrouter]
+enabled = true
+",
+        ))
+        .expect("enabled OpenRouter override should build from the built-in provider settings");
+        let openrouter = ProviderId::new("openrouter");
+
+        for (selector, canonical_id) in [
+            ("anthropic/claude-fable-5", "claude-fable-5"),
+            ("openai/gpt-5.6-sol", "gpt-5.6-sol"),
+        ] {
+            let model = catalog
+                .resolve_on_provider(&openrouter, selector)
+                .unwrap_or_else(|error| panic!("{selector} should resolve on OpenRouter: {error}"));
+            assert_eq!(model.provider, openrouter, "{selector}");
+            assert_eq!(model.id, canonical_id, "{selector}");
+        }
+
+        let anthropic = ProviderId::anthropic();
+        let selector = "anthropic/claude-fable-5";
+        let selected = catalog
+            .resolve_selection(
+                Some(selector),
+                None,
+                &HashSet::from([anthropic.clone(), openrouter.clone()]),
+            )
+            .unwrap();
+        assert_eq!(selected.provider, anthropic);
+        assert_eq!(selected.model, "claude-fable-5");
+
+        let selected = catalog
+            .resolve_selection(Some(selector), None, &HashSet::from([openrouter.clone()]))
+            .unwrap();
+        assert_eq!(selected.provider, openrouter);
+        assert_eq!(selected.model, "claude-fable-5");
+    }
+
+    #[test]
     fn builtin_openrouter_includes_glm_5_2_when_enabled() {
         let catalog = Catalog::from_builtin_with_overrides(&minimal_settings(
             r"
@@ -3804,6 +3843,33 @@ provider = "test"
     }
 
     #[test]
+    fn provider_scoped_model_rejects_legacy_builtin_id_as_canonical_id() {
+        let error = Catalog::from_settings(&minimal_settings(
+            r#"
+[providers.openrouter]
+display_name = "OpenRouter"
+adapter = "openai_compatible"
+
+[providers.openrouter.models."openai/gpt-5.6-sol"]
+"#,
+        ))
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CatalogBuildError::LegacyModel(
+                LegacyModelError::LegacyIdentifierAsModelId {
+                    identifier,
+                    provider,
+                    model,
+                }
+            ) if identifier == "openai/gpt-5.6-sol"
+                && provider == ProviderId::new("openrouter")
+                && model == "gpt-5.6-sol"
+        ));
+    }
+
+    #[test]
     fn provider_aware_selection_uses_readiness_priority_and_api_ids() {
         let catalog = portable_model_catalog();
         let openai = ProviderId::openai();
@@ -3854,6 +3920,36 @@ provider = "test"
             Err(ModelSelectionError::ProviderUnavailable { provider })
                 if provider == ProviderId::new("openrouter")
         ));
+    }
+
+    #[test]
+    fn legacy_builtin_selector_uses_readiness_priority_and_explicit_pins() {
+        let catalog = portable_model_catalog();
+        let openai = ProviderId::openai();
+        let openrouter = ProviderId::new("openrouter");
+        let selector = "openai/gpt-5.6-sol";
+
+        for (eligible, expected_provider) in [
+            (HashSet::from([openai.clone()]), openai.clone()),
+            (HashSet::from([openrouter.clone()]), openrouter.clone()),
+            (
+                HashSet::from([openai.clone(), openrouter.clone()]),
+                openai.clone(),
+            ),
+        ] {
+            let selected = catalog
+                .resolve_selection(Some(selector), None, &eligible)
+                .unwrap();
+            assert_eq!(selected.provider, expected_provider);
+            assert_eq!(selected.model, "gpt-5.6-sol");
+        }
+
+        let both = HashSet::from([openai, openrouter.clone()]);
+        let selected = catalog
+            .resolve_selection(Some(selector), Some(&openrouter), &both)
+            .unwrap();
+        assert_eq!(selected.provider, openrouter);
+        assert_eq!(selected.model, "gpt-5.6-sol");
     }
 
     #[test]

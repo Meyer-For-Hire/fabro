@@ -859,14 +859,11 @@ fn canonical_session_model(
     if requested.is_empty() {
         return Err(ApiError::bad_request("Session model must not be empty."));
     }
-    if let Some((provider, model)) = catalog::retired_model_replacement(requested) {
-        return Err(session_selection_error(
-            &ModelSelectionError::RetiredModelIdentifier {
-                identifier: requested.to_string(),
-                provider,
-                model,
-            },
-        ));
+    if catalog::legacy_builtin_model(requested).is_some() {
+        let selected = catalog
+            .resolve_selection(Some(requested), explicit_provider.as_ref(), eligible)
+            .map_err(|error| session_selection_error(&error))?;
+        return Ok((selected.provider, selected.model));
     }
     let model_ref = requested
         .parse::<SettingsModelRef>()
@@ -1715,13 +1712,63 @@ reasoning = false
     }
 
     #[test]
-    fn canonical_session_model_rejects_retired_wire_identifier_before_qualification() {
-        let catalog = Catalog::from_builtin().unwrap();
+    fn canonical_session_model_normalizes_legacy_builtin_selector_before_qualification() {
+        let catalog = portable_session_catalog();
+        let openai = ProviderId::openai();
+        let openrouter = ProviderId::new("openrouter");
+        let both = std::collections::HashSet::from([openai.clone(), openrouter.clone()]);
+
+        assert_eq!(
+            canonical_session_model(&catalog, &both, Some("openai/gpt-5.6-sol"), None,).unwrap(),
+            (openai, "gpt-5.6-sol".to_string())
+        );
+        assert_eq!(
+            canonical_session_model(
+                &catalog,
+                &both,
+                Some("openai/gpt-5.6-sol"),
+                Some(&openrouter),
+            )
+            .unwrap(),
+            (openrouter.clone(), "gpt-5.6-sol".to_string())
+        );
+        assert_eq!(
+            canonical_session_model(
+                &catalog,
+                &std::collections::HashSet::from([openrouter.clone()]),
+                Some("openai/gpt-5.6-sol"),
+                None,
+            )
+            .unwrap(),
+            (openrouter, "gpt-5.6-sol".to_string())
+        );
+    }
+
+    #[test]
+    fn canonical_session_model_still_treats_non_legacy_qualified_model_as_a_pin() {
+        let catalog = portable_session_catalog();
+        let openrouter = ProviderId::new("openrouter");
+
+        assert_eq!(
+            canonical_session_model(
+                &catalog,
+                &catalog.all_provider_ids(),
+                Some("openrouter/gpt-56-sol"),
+                None,
+            )
+            .unwrap(),
+            (openrouter, "gpt-5.6-sol".to_string())
+        );
+    }
+
+    #[test]
+    fn canonical_session_model_rejects_conflicting_non_legacy_provider_pins() {
+        let catalog = portable_session_catalog();
         let error = canonical_session_model(
             &catalog,
             &catalog.all_provider_ids(),
-            Some("openai/gpt-5.6-sol"),
-            None,
+            Some("openrouter/gpt-56-sol"),
+            Some(&ProviderId::openai()),
         )
         .unwrap_err();
 
@@ -1730,7 +1777,7 @@ reasoning = false
             error
                 .into_response_entry()
                 .detail
-                .contains("openrouter/gpt-5.6-sol")
+                .contains("conflicts with model reference provider")
         );
     }
 

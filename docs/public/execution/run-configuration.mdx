@@ -146,6 +146,8 @@ Provider values are catalog provider ID strings. Built-in IDs like `anthropic` a
 
 At run creation, Fabro resolves the primary selector and every node selector against the ready-provider snapshot. It persists the selected canonical model slug and provider, so resuming the run does not choose a different provider just because credentials or priorities changed. The configured fallback chain remains available for failures that occur while the materialized run is executing.
 
+Historical built-in provider API IDs are accepted for compatibility and normalize before this selection. For example, `name = "openai/gpt-5.6-sol"` is treated as the canonical `gpt-5.6-sol` selector; omit `provider` to use readiness and priority, or set `provider` separately to pin an offering.
+
 #### `[run.model.controls]`
 
 Set default model controls for all nodes that do not override them in the workflow stylesheet:

@@ -7,7 +7,7 @@ use fabro_auth::{CredentialSource, EnvCredentialSource, VaultCredentialSource};
 use fabro_interview::{AutoApproveInterviewer, Interviewer};
 use fabro_llm::client::Client as LlmClient;
 use fabro_mcp::config::McpServerSettings;
-use fabro_model::{Catalog, FallbackTarget, ModelSelectionError, ProviderId, catalog};
+use fabro_model::{Catalog, FallbackTarget, ModelSelectionError, ProviderId};
 use fabro_sandbox::daytona::DaytonaConfig;
 use fabro_sandbox::from_environment::{
     daytona_config_from_environment, docker_config_from_environment_with_secrets,
@@ -648,15 +648,6 @@ fn resolve_fallback_chain(
     let mut chain = Vec::new();
 
     for model_ref in &settings.fallbacks {
-        let identifier = model_ref.to_string();
-        if let Some((provider, model)) = catalog::retired_model_replacement(&identifier) {
-            return Err(ModelSelectionError::RetiredModelIdentifier {
-                identifier,
-                provider,
-                model,
-            }
-            .into());
-        }
         match model_ref.resolve(&registry)? {
             ResolvedModelRef::Provider(provider_name) => {
                 let provider_id = canonical_provider_id(catalog, &provider_name);
@@ -1411,32 +1402,35 @@ reasoning = false
     }
 
     #[test]
-    fn resolve_fallback_chain_rejects_retired_wire_identifier_before_qualification() {
+    fn resolve_fallback_chain_keeps_qualified_legacy_references_as_provider_pins() {
         let catalog = test_catalog();
         let settings = ResolvedRunModelSettings {
-            fallbacks: vec!["openai/gpt-5.6-sol".parse::<ModelRef>().unwrap()],
+            fallbacks: vec![
+                "openai/gpt-5.6-sol".parse::<ModelRef>().unwrap(),
+                "anthropic/claude-fable-5".parse::<ModelRef>().unwrap(),
+            ],
             ..ResolvedRunModelSettings::default()
         };
 
-        let error = resolve_fallback_chain(
+        let chain = resolve_fallback_chain(
             catalog.as_ref(),
             &ProviderId::anthropic(),
             "claude-opus-4-6",
             &settings,
             &catalog.all_provider_ids(),
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(matches!(
-            error,
-            Error::ModelSelection(ModelSelectionError::RetiredModelIdentifier {
-                identifier,
-                provider,
-                model,
-            }) if identifier == "openai/gpt-5.6-sol"
-                && provider == ProviderId::new("openrouter")
-                && model == fabro_model::ModelId::new("gpt-5.6-sol")
-        ));
+        assert_eq!(chain, vec![
+            FallbackTarget {
+                provider: "openai".to_string(),
+                model:    "gpt-5.6-sol".to_string(),
+            },
+            FallbackTarget {
+                provider: "anthropic".to_string(),
+                model:    "claude-fable-5".to_string(),
+            },
+        ]);
     }
 
     #[test]
