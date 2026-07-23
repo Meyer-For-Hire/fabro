@@ -528,6 +528,8 @@ mod tests {
                 speed:    None,
             },
             usage:           TokenCounts::default(),
+            cost_usd:        None,
+            cost_source:     None,
             tool_call_count: 0,
             context_window:  None,
         })

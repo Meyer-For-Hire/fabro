@@ -3,7 +3,7 @@ pub use fabro_core::outcome::{
 };
 use fabro_llm::types::TokenCounts as LlmTokenCounts;
 use fabro_model::{
-    BilledTokenCounts, Catalog, ModelBillingInput, ModelRef, ModelUsage, TokenCounts,
+    BilledTokenCounts, Catalog, ModelBillingInput, ModelRef, ModelUsage, TokenCounts, UsdMicros,
 };
 pub use fabro_types::BilledModelUsage;
 
@@ -37,6 +37,19 @@ pub fn billed_model_usage_from_llm(
         input,
         total_usd_micros,
     })
+}
+
+pub fn billed_model_usage_from_llm_with_cost(
+    catalog: &Catalog,
+    model: &ModelRef,
+    usage: &LlmTokenCounts,
+    total_cost: Option<UsdMicros>,
+) -> Result<BilledModelUsage, Error> {
+    let mut billed = billed_model_usage_from_llm(catalog, model, usage)?;
+    if let Some(total_cost) = total_cost {
+        billed.total_usd_micros = Some(total_cost.0);
+    }
+    Ok(billed)
 }
 
 #[must_use]
@@ -149,9 +162,9 @@ fn token_counts_from_llm_usage(usage: &LlmTokenCounts) -> TokenCounts {
 mod tests {
     use fabro_llm::types::TokenCounts;
     use fabro_model::catalog::LlmCatalogSettings;
-    use fabro_model::{Catalog, ModelRef, ProviderId, Speed};
+    use fabro_model::{Catalog, ModelRef, ProviderId, Speed, UsdMicros};
 
-    use super::{OutcomeExt, billed_model_usage_from_llm};
+    use super::{OutcomeExt, billed_model_usage_from_llm, billed_model_usage_from_llm_with_cost};
 
     fn model_ref(provider: ProviderId, model_id: &str, speed: Option<Speed>) -> ModelRef {
         ModelRef {
@@ -180,6 +193,24 @@ mod tests {
         assert_eq!(billed.total_usd_micros, Some(3_562_500));
         assert_eq!(billed.tokens().output_tokens, 125_000);
         assert_eq!(billed.tokens().reasoning_tokens, 25_000);
+    }
+
+    #[test]
+    fn response_cost_overrides_catalog_estimate() {
+        let usage = TokenCounts {
+            input_tokens: 11,
+            output_tokens: 7,
+            ..TokenCounts::default()
+        };
+        let billed = billed_model_usage_from_llm_with_cost(
+            Catalog::builtin(),
+            &model_ref(ProviderId::openai(), "gpt-5.4", None),
+            &usage,
+            Some(UsdMicros(125_000)),
+        )
+        .unwrap();
+
+        assert_eq!(billed.total_usd_micros, Some(125_000));
     }
 
     #[test]

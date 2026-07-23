@@ -3,6 +3,7 @@ use ::fabro_types::{
 };
 use chrono::Utc;
 use fabro_agent::{AgentEvent, SandboxEvent, SkillActivationSource};
+use fabro_model::UsdMicros;
 use uuid::Uuid;
 
 use super::Event;
@@ -611,14 +612,18 @@ fn event_body_from_event(event: &Event) -> EventBody {
                 text,
                 model,
                 usage,
+                cost_usd,
+                cost_source,
                 tool_call_count,
                 context_window,
             } => {
-                let billing = billed_token_counts_from_llm(usage);
+                let mut billing = billed_token_counts_from_llm(usage);
+                billing.total_usd_micros = cost_usd.map(|cost| UsdMicros::from_usd(cost).0);
                 EventBody::AgentMessage(fabro_types::AgentMessageProps {
                     text: text.clone(),
                     model: model.clone(),
                     billing,
+                    cost_source: *cost_source,
                     tool_call_count: *tool_call_count,
                     visit: *visit,
                     message: None,
@@ -2116,6 +2121,8 @@ mod tests {
                     speed:    None,
                 },
                 usage:           LlmTokenCounts::default(),
+                cost_usd:        None,
+                cost_source:     None,
                 tool_call_count: 0,
                 context_window:  None,
             },
@@ -2148,6 +2155,8 @@ mod tests {
                     output_tokens: 34,
                     ..LlmTokenCounts::default()
                 },
+                cost_usd:        None,
+                cost_source:     None,
                 tool_call_count: 0,
                 context_window:  None,
             },
@@ -2164,6 +2173,43 @@ mod tests {
         assert_eq!(message.billing.input_tokens, 12);
         assert_eq!(message.billing.output_tokens, 34);
         assert_eq!(message.billing.total_usd_micros, None);
+    }
+
+    #[test]
+    fn agent_assistant_message_preserves_provider_cost() {
+        let stored = to_run_event(&fixtures::RUN_1, &Event::Agent {
+            stage:             "code".to_string(),
+            visit:             1,
+            event:             AgentEvent::AssistantMessage {
+                text:            "ok".to_string(),
+                model:           ModelRef {
+                    provider: ProviderId::new("openrouter"),
+                    model_id: "openai/gpt-5.4".to_string(),
+                    speed:    None,
+                },
+                usage:           LlmTokenCounts {
+                    input_tokens: 12,
+                    output_tokens: 34,
+                    ..LlmTokenCounts::default()
+                },
+                cost_usd:        Some(0.125),
+                cost_source:     Some(fabro_model::CostSource::Authoritative),
+                tool_call_count: 0,
+                context_window:  None,
+            },
+            session_id:        Some("ses_agent".to_string()),
+            parent_session_id: None,
+            tool_call_id:      None,
+        });
+
+        let EventBody::AgentMessage(message) = stored.body else {
+            panic!("expected agent message body");
+        };
+        assert_eq!(message.billing.total_usd_micros, Some(125_000));
+        assert_eq!(
+            message.cost_source,
+            Some(fabro_model::CostSource::Authoritative)
+        );
     }
 
     #[test]
@@ -2196,6 +2242,8 @@ mod tests {
                     speed:    None,
                 },
                 usage:           LlmTokenCounts::default(),
+                cost_usd:        None,
+                cost_source:     None,
                 tool_call_count: 0,
                 context_window:  Some(context_window),
             },

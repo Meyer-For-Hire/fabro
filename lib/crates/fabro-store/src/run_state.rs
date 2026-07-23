@@ -3788,6 +3788,7 @@ mod tests {
             text: "assistant text".to_string(),
             model: billed_usage().model().clone(),
             billing,
+            cost_source: None,
             tool_call_count: 0,
             visit: 1,
             message: None,

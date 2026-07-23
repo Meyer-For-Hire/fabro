@@ -47,6 +47,15 @@ fn saturating_rounded_f64_to_i64(value: f64) -> i64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
 pub struct UsdMicros(pub i64);
 
+impl UsdMicros {
+    #[must_use]
+    pub fn from_usd(usd: f64) -> Self {
+        Self(saturating_rounded_f64_to_i64(
+            (usd * USD_MICROS_PER_USD_F64).round(),
+        ))
+    }
+}
+
 impl std::ops::Add for UsdMicros {
     type Output = Self;
 
@@ -76,7 +85,7 @@ impl PricePerMTok {
     #[must_use]
     pub fn from_usd(usd: f64) -> Self {
         Self {
-            usd_micros: saturating_rounded_f64_to_i64((usd * USD_MICROS_PER_USD_F64).round()),
+            usd_micros: UsdMicros::from_usd(usd).0,
         }
     }
 
