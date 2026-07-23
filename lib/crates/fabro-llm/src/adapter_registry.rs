@@ -367,7 +367,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_route_returns_none_for_model_from_another_catalog() {
+    fn resolve_route_resolves_by_id_for_model_from_another_catalog_instance() {
         let other = Catalog::from_builtin().unwrap();
         let model = select_from_all(&other, "gpt-5.4");
         assert!(resolve_route(Catalog::builtin(), model).is_some());

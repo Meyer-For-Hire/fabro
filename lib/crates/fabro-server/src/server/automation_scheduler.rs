@@ -336,6 +336,7 @@ fn run_due_schedules_once<'a>(
 mod tests {
     use fabro_api::types::RunManifest;
     use fabro_automation::{AutomationDraft, AutomationTarget, AutomationTrigger, ScheduleTrigger};
+    use fabro_static::EnvVars;
     use fabro_store::ListRunsQuery;
     use fabro_types::RunStatus;
     use serde_json::json;
@@ -428,7 +429,7 @@ mod tests {
     fn test_state_with_materializer(materializer: TestAutomationRunMaterializer) -> Arc<AppState> {
         TestAppStateBuilder::new()
             .env_lookup(|_| None)
-            .vault_entries([("OPENAI_API_KEY", "test-openai-api-key")])
+            .vault_entries([(EnvVars::OPENAI_API_KEY, "test-openai-api-key")])
             .automation_materializer(materializer)
             .build()
     }
