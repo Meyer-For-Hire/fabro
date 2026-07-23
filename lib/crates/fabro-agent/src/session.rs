@@ -2073,7 +2073,7 @@ mod tests {
     use super::*;
     use crate::config::{ToolAccess, ToolAccessPolicy, ToolApprovalAdapter, ToolExposureMode};
     use crate::skills::{Skill, make_use_skill_tool};
-    use crate::subagent::SubAgentStatus;
+    use crate::subagent::{SubAgentStatus, make_wait_tool};
     use crate::test_support::*;
     use crate::tool_registry::{RegisteredTool, ToolContext, ToolRegistry, ToolSource};
 
@@ -4701,6 +4701,165 @@ mod tests {
         assert!(
             matches!(&turns[1], Message::Assistant { content, .. } if content == "Fast response")
         );
+    }
+
+    async fn make_parent_waiting_on_blocked_subagent() -> (
+        Session,
+        Arc<AsyncMutex<SubAgentManager>>,
+        String,
+        CancellationToken,
+    ) {
+        let block_until_cancelled = RegisteredTool {
+            definition: ToolDefinition {
+                name:        "block_until_cancelled".into(),
+                description: "Waits until cancelled".into(),
+                parameters:  serde_json::json!({"type": "object"}),
+            },
+            executor:   Arc::new(|_args, ctx| {
+                Box::pin(async move {
+                    ctx.cancel.cancelled().await;
+                    Ok("cancelled".to_string())
+                })
+            }),
+            source:     ToolSource::Native,
+        };
+        let mut child_registry = ToolRegistry::new();
+        child_registry.register(block_until_cancelled);
+        let child = make_session_with_tools(
+            vec![tool_call_response(
+                "block_until_cancelled",
+                "child_call",
+                serde_json::json!({}),
+            )],
+            child_registry,
+        )
+        .await;
+        let child_cancel = child.cancel_token();
+
+        let manager = Arc::new(AsyncMutex::new(SubAgentManager::new(3)));
+        let agent_id = manager
+            .lock()
+            .await
+            .spawn(child, "block until cancelled".into(), 0)
+            .unwrap();
+
+        let mut parent_registry = ToolRegistry::new();
+        parent_registry.register(make_wait_tool(manager.clone()));
+        let parent_provider = Arc::new(ScriptedStreamProvider::new(vec![
+            ScriptedStreamCall::Response(Box::new(tool_call_response(
+                "wait",
+                "parent_wait_call",
+                serde_json::json!({ "agent_id": agent_id }),
+            ))),
+            ScriptedStreamCall::Response(Box::new(text_response("resumed"))),
+        ]));
+        let client = make_client(parent_provider).await;
+        let profile = Arc::new(TestProfile::with_tools(parent_registry));
+        let env = Arc::new(MockSandbox::default());
+        let session = Session::new(
+            client,
+            profile,
+            env,
+            SessionOptions::default(),
+            Some(manager.clone()),
+        );
+        manager
+            .lock()
+            .await
+            .set_event_callback(session.sub_agent_event_callback());
+
+        (session, manager, agent_id, child_cancel)
+    }
+
+    async fn wait_for_agent_event(
+        rx: &mut broadcast::Receiver<SessionEvent>,
+        predicate: impl Fn(&AgentEvent) -> bool,
+    ) {
+        loop {
+            let event = rx
+                .recv()
+                .await
+                .expect("session event stream should remain open");
+            if predicate(&event.event) {
+                return;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn control_interrupt_during_subagent_wait_closes_child_and_resumes_after_steer() {
+        let (mut session, manager, agent_id, child_cancel) =
+            make_parent_waiting_on_blocked_subagent().await;
+        let control = session.control_handle();
+        let mut events = session.subscribe();
+        let controller = tokio::spawn(async move {
+            wait_for_agent_event(&mut events, |event| {
+                matches!(
+                    event,
+                    AgentEvent::ToolCallStarted { tool_name, .. } if tool_name == "wait"
+                )
+            })
+            .await;
+            control.interrupt(None);
+            wait_for_agent_event(&mut events, |event| {
+                matches!(event, AgentEvent::SubAgentClosed { .. })
+            })
+            .await;
+            control.steer("resume after interrupt".into(), None);
+        });
+
+        timeout(
+            Duration::from_secs(1),
+            session.process_input("wait for the child"),
+        )
+        .await
+        .expect("interrupt should unblock the subagent wait")
+        .unwrap();
+        controller.await.unwrap();
+
+        assert_eq!(session.state(), SessionState::Idle);
+        assert!(child_cancel.is_cancelled());
+        assert!(matches!(
+            manager.lock().await.status(&agent_id),
+            Some(SubAgentStatus::Closed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn terminal_cancel_during_subagent_wait_closes_child_and_session() {
+        let (mut session, manager, agent_id, child_cancel) =
+            make_parent_waiting_on_blocked_subagent().await;
+        let cancel = session.cancel_token();
+        let mut events = session.subscribe();
+        let controller = tokio::spawn(async move {
+            wait_for_agent_event(&mut events, |event| {
+                matches!(
+                    event,
+                    AgentEvent::ToolCallStarted { tool_name, .. } if tool_name == "wait"
+                )
+            })
+            .await;
+            cancel.cancel();
+        });
+
+        let result = timeout(
+            Duration::from_secs(1),
+            session.process_input("wait for the child"),
+        )
+        .await
+        .expect("terminal cancellation should unblock the subagent wait");
+        controller.await.unwrap();
+
+        assert!(matches!(
+            result,
+            Err(Error::Interrupted(InterruptReason::Cancelled))
+        ));
+        assert_eq!(session.state(), SessionState::Closed);
+        assert!(child_cancel.is_cancelled());
+        assert!(matches!(
+            manager.lock().await.status(&agent_id),
+            Some(SubAgentStatus::Closed)
+        ));
     }
 
     #[tokio::test]
