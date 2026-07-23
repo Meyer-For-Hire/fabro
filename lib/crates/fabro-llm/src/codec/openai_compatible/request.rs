@@ -1,9 +1,13 @@
 //! Request encoding: canonical `Request` → Chat Completions body.
 
 use super::translate;
-use super::wire::ApiRequest;
-use crate::codec::{CodecCtx, EncodedRequest, merge_named_provider_options};
+use super::wire::{ApiRequest, ChatMessage};
+use crate::codec::{CodecCtx, EncodedRequest, cache, merge_named_provider_options};
 use crate::error::Error;
+
+/// Known `provider_options.<provider_name>` keys the codec consumes itself;
+/// not re-merged into the body.
+const KNOWN_OPTION_KEYS: &[&str] = &["auto_cache"];
 
 /// Build the Chat Completions request for `ctx.request`. `stream` toggles the
 /// `stream` body field. The body is assembled as a `serde_json::Value` so
@@ -13,7 +17,10 @@ use crate::error::Error;
 /// the Chat Completions tool envelope cannot represent.
 pub(super) fn encode(ctx: &CodecCtx<'_>, stream: bool) -> Result<EncodedRequest, Error> {
     let request = ctx.request;
-    let chat_messages = translate::translate_messages(&request.messages);
+    let mut chat_messages = translate::translate_messages(&request.messages);
+    if explicit_cache_breakpoints(ctx) {
+        apply_cache_breakpoints(&mut chat_messages);
+    }
     let tools = request
         .tools
         .as_ref()
@@ -64,6 +71,37 @@ pub(super) fn encode(ctx: &CodecCtx<'_>, stream: bool) -> Result<EncodedRequest,
     })
 }
 
+/// Whether this request opts into Anthropic-style explicit cache breakpoints:
+/// the catalog row declares the mechanism and the request hasn't disabled
+/// `auto_cache` under this provider's options namespace.
+fn explicit_cache_breakpoints(ctx: &CodecCtx<'_>) -> bool {
+    ctx.model
+        .is_some_and(|m| m.features.prompt_cache && m.features.cache_control_breakpoints)
+        && cache::auto_cache_enabled(ctx.request.provider_options.as_ref(), ctx.provider_name)
+}
+
+/// Mark the cacheable prefix: the last system message (upstream, tools and
+/// system precede the conversation, so this breakpoint covers them too) and
+/// the second-to-last user turn. Tool results count as user turns — they ride
+/// in user messages on the upstream Anthropic wire.
+fn apply_cache_breakpoints(messages: &mut [ChatMessage]) {
+    if let Some(system) = messages.iter_mut().rev().find(|m| m.role == "system") {
+        if let Some(content) = system.content.as_mut() {
+            content.mark_cache_breakpoint();
+        }
+    }
+
+    let user_turns: Vec<bool> = messages
+        .iter()
+        .map(|m| m.role == "user" || m.role == "tool")
+        .collect();
+    if let Some(idx) = cache::conversation_breakpoint_index(&user_turns) {
+        if let Some(content) = messages[idx].content.as_mut() {
+            content.mark_cache_breakpoint();
+        }
+    }
+}
+
 /// Merge `provider_options.<provider_name>` fields into the serialized API
 /// request body.
 ///
@@ -74,7 +112,7 @@ pub(super) fn merge_provider_options(
     provider_options: Option<&serde_json::Value>,
     provider_name: &str,
 ) {
-    merge_named_provider_options(body, provider_options, provider_name);
+    merge_named_provider_options(body, provider_options, provider_name, KNOWN_OPTION_KEYS);
 }
 
 #[cfg(test)]
@@ -314,5 +352,69 @@ mod tests {
         let opts = serde_json::json!({"groq": "not-an-object"});
         merge_provider_options(&mut body, Some(&opts), "groq");
         assert_eq!(body["model"], "test");
+    }
+
+    #[test]
+    fn merge_provider_options_consumes_auto_cache_control_key() {
+        let mut body = serde_json::json!({"model": "test"});
+        let opts = serde_json::json!({"groq": {"auto_cache": false, "top_k": 5}});
+        merge_provider_options(&mut body, Some(&opts), "groq");
+        assert!(body.get("auto_cache").is_none());
+        assert_eq!(body["top_k"], 5);
+    }
+
+    // --- apply_cache_breakpoints ---------------------------------------------
+
+    fn chat_message(role: &str, text: &str) -> ChatMessage {
+        ChatMessage {
+            role:              role.to_string(),
+            content:           Some(super::super::wire::ChatContent::Text(text.to_string())),
+            reasoning_content: None,
+            tool_call_id:      None,
+            tool_calls:        None,
+        }
+    }
+
+    fn marked(message: &ChatMessage) -> bool {
+        let json = serde_json::to_value(message).unwrap();
+        json["content"].is_array() && json["content"][0]["cache_control"]["type"] == "ephemeral"
+    }
+
+    #[test]
+    fn cache_breakpoints_on_first_turn_mark_only_the_system_prompt() {
+        let mut messages = vec![chat_message("system", "sys"), chat_message("user", "task")];
+        apply_cache_breakpoints(&mut messages);
+        assert!(marked(&messages[0]));
+        assert!(!marked(&messages[1]));
+    }
+
+    #[test]
+    fn cache_breakpoints_count_tool_results_as_user_turns() {
+        let mut messages = vec![
+            chat_message("system", "sys"),
+            chat_message("user", "task"),
+            chat_message("assistant", "calling a tool"),
+            chat_message("tool", "tool output"),
+            chat_message("assistant", "one more"),
+            chat_message("tool", "more output"),
+        ];
+        apply_cache_breakpoints(&mut messages);
+        assert!(marked(&messages[0]));
+        // Second-to-last user turn: the first tool result, not the user task.
+        assert!(!marked(&messages[1]));
+        assert!(marked(&messages[3]));
+        assert!(!marked(&messages[5]));
+    }
+
+    #[test]
+    fn cache_breakpoints_without_system_mark_only_the_conversation() {
+        let mut messages = vec![
+            chat_message("user", "task"),
+            chat_message("assistant", "answer"),
+            chat_message("user", "follow-up"),
+        ];
+        apply_cache_breakpoints(&mut messages);
+        assert!(marked(&messages[0]));
+        assert!(!marked(&messages[2]));
     }
 }

@@ -342,7 +342,7 @@ fn apply_cache_point_to_conversation_prefix(messages: &mut [Value]) {
 /// codec). This is the passthrough for `additionalModelRequestFields`,
 /// `guardrailConfig`, `serviceTier`, and other Converse extensions.
 fn merge_provider_options(body: &mut Value, provider_options: Option<&Value>, provider_name: &str) {
-    merge_named_provider_options(body, provider_options, provider_name);
+    merge_named_provider_options(body, provider_options, provider_name, &[]);
 }
 
 #[cfg(test)]

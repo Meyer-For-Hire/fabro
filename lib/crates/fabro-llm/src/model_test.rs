@@ -223,12 +223,13 @@ mod tests {
     #[tokio::test]
     async fn run_model_test_deep_errors_when_model_lacks_tools() {
         let info = test_model_with(ModelFeatures {
-            tools:            false,
-            vision:           false,
-            reasoning:        true,
-            reasoning_effort: ReasoningEffortFeature::Levels,
-            prompt_cache:     false,
-            sampling_params:  true,
+            tools:                     false,
+            vision:                    false,
+            reasoning:                 true,
+            reasoning_effort:          ReasoningEffortFeature::Levels,
+            prompt_cache:              false,
+            cache_control_breakpoints: false,
+            sampling_params:           true,
         });
 
         let outcome = run_model_test(&info, ModelTestMode::Deep, empty_test_client()).await;
@@ -243,12 +244,13 @@ mod tests {
     #[test]
     fn deep_test_omits_effort_for_reasoning_without_effort_controls() {
         let info = test_model_with(ModelFeatures {
-            tools:            true,
-            vision:           false,
-            reasoning:        true,
-            reasoning_effort: ReasoningEffortFeature::None,
-            prompt_cache:     true,
-            sampling_params:  true,
+            tools:                     true,
+            vision:                    false,
+            reasoning:                 true,
+            reasoning_effort:          ReasoningEffortFeature::None,
+            prompt_cache:              true,
+            cache_control_breakpoints: false,
+            sampling_params:           true,
         });
 
         let params = build_deep_test_params(&info, empty_test_client())
@@ -260,12 +262,13 @@ mod tests {
     #[test]
     fn deep_test_uses_high_effort_when_supported() {
         let info = test_model_with(ModelFeatures {
-            tools:            true,
-            vision:           false,
-            reasoning:        true,
-            reasoning_effort: ReasoningEffortFeature::Levels,
-            prompt_cache:     true,
-            sampling_params:  true,
+            tools:                     true,
+            vision:                    false,
+            reasoning:                 true,
+            reasoning_effort:          ReasoningEffortFeature::Levels,
+            prompt_cache:              true,
+            cache_control_breakpoints: false,
+            sampling_params:           true,
         });
 
         let params = build_deep_test_params(&info, empty_test_client())

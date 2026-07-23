@@ -11,12 +11,13 @@ fn model_features_reuses_canonical_type() {
 #[test]
 fn model_features_json_matches_openapi_shape() {
     let features = ModelFeatures {
-        tools:            true,
-        vision:           true,
-        reasoning:        true,
-        reasoning_effort: ReasoningEffortFeature::Levels,
-        prompt_cache:     false,
-        sampling_params:  true,
+        tools:                     true,
+        vision:                    true,
+        reasoning:                 true,
+        reasoning_effort:          ReasoningEffortFeature::Levels,
+        prompt_cache:              false,
+        cache_control_breakpoints: false,
+        sampling_params:           true,
     };
 
     let json = serde_json::to_value(&features).unwrap();
@@ -25,6 +26,7 @@ fn model_features_json_matches_openapi_shape() {
     assert_eq!(json["reasoning"], true);
     assert_eq!(json["reasoning_effort"], "levels");
     assert_eq!(json["prompt_cache"], false);
+    assert_eq!(json["cache_control_breakpoints"], false);
     assert_eq!(json["sampling_params"], true);
 
     let round_trip: ApiModelFeatures = serde_json::from_value(json).unwrap();

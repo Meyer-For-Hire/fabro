@@ -417,12 +417,13 @@ fn model_limits_to_catalog(limits: &LlmModelLimits) -> model_catalog::SettingsMo
 
 fn model_features_to_catalog(features: &LlmModelFeatures) -> model_catalog::SettingsModelFeatures {
     model_catalog::SettingsModelFeatures {
-        tools:            features.tools,
-        vision:           features.vision,
-        reasoning:        features.reasoning,
-        reasoning_effort: features.reasoning_effort,
-        prompt_cache:     features.prompt_cache,
-        sampling_params:  features.sampling_params,
+        tools:                     features.tools,
+        vision:                    features.vision,
+        reasoning:                 features.reasoning,
+        reasoning_effort:          features.reasoning_effort,
+        prompt_cache:              features.prompt_cache,
+        cache_control_breakpoints: features.cache_control_breakpoints,
+        sampling_params:           features.sampling_params,
     }
 }
 

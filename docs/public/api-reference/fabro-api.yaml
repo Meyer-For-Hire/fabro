@@ -8227,6 +8227,7 @@ components:
         - reasoning
         - reasoning_effort
         - prompt_cache
+        - cache_control_breakpoints
         - sampling_params
       properties:
         tools:
@@ -8243,6 +8244,12 @@ components:
         prompt_cache:
           type: boolean
           description: Whether the model endpoint supports prompt caching.
+        cache_control_breakpoints:
+          type: boolean
+          description: >-
+            Whether the endpoint only caches when the request marks the
+            cacheable prefix with Anthropic-style cache_control breakpoints
+            (e.g. Claude via OpenRouter).
         sampling_params:
           type: boolean
           description: Whether the model accepts classic sampling parameters (temperature, top_p).

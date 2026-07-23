@@ -139,17 +139,19 @@ pub struct SettingsModelLimits {
 #[serde(deny_unknown_fields)]
 pub struct SettingsModelFeatures {
     #[serde(default)]
-    pub tools:            Option<bool>,
+    pub tools:                     Option<bool>,
     #[serde(default)]
-    pub vision:           Option<bool>,
+    pub vision:                    Option<bool>,
     #[serde(default)]
-    pub reasoning:        Option<bool>,
+    pub reasoning:                 Option<bool>,
     #[serde(default)]
-    pub reasoning_effort: Option<ReasoningEffortFeature>,
+    pub reasoning_effort:          Option<ReasoningEffortFeature>,
     #[serde(default)]
-    pub prompt_cache:     Option<bool>,
+    pub prompt_cache:              Option<bool>,
     #[serde(default)]
-    pub sampling_params:  Option<bool>,
+    pub cache_control_breakpoints: Option<bool>,
+    #[serde(default)]
+    pub sampling_params:           Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -574,6 +576,10 @@ pub enum CatalogBuildError {
     ReasoningEffortControlsWithoutReasoning { model: String },
     #[error("model '{model}' declares reasoning_effort feature but features.reasoning is false")]
     ReasoningEffortWithoutReasoning { model: String },
+    #[error(
+        "model '{model}' declares cache_control_breakpoints but features.prompt_cache is false"
+    )]
+    CacheControlBreakpointsWithoutPromptCache { model: String },
     #[error(
         "model '{model}' must declare at least one reasoning_effort when features.reasoning_effort is levels or always_adaptive"
     )]
@@ -1947,12 +1953,15 @@ fn merge_model_features_settings(
     fallback: &SettingsModelFeatures,
 ) -> SettingsModelFeatures {
     SettingsModelFeatures {
-        tools:            higher.tools.or(fallback.tools),
-        vision:           higher.vision.or(fallback.vision),
-        reasoning:        higher.reasoning.or(fallback.reasoning),
-        reasoning_effort: higher.reasoning_effort.or(fallback.reasoning_effort),
-        prompt_cache:     higher.prompt_cache.or(fallback.prompt_cache),
-        sampling_params:  higher.sampling_params.or(fallback.sampling_params),
+        tools:                     higher.tools.or(fallback.tools),
+        vision:                    higher.vision.or(fallback.vision),
+        reasoning:                 higher.reasoning.or(fallback.reasoning),
+        reasoning_effort:          higher.reasoning_effort.or(fallback.reasoning_effort),
+        prompt_cache:              higher.prompt_cache.or(fallback.prompt_cache),
+        cache_control_breakpoints: higher
+            .cache_control_breakpoints
+            .or(fallback.cache_control_breakpoints),
+        sampling_params:           higher.sampling_params.or(fallback.sampling_params),
     }
 }
 
@@ -2261,6 +2270,15 @@ fn build_model_features(
             model: model_id.to_string(),
         });
     }
+    let prompt_cache = features.prompt_cache.unwrap_or_default();
+    let cache_control_breakpoints = features.cache_control_breakpoints.unwrap_or_default();
+    if cache_control_breakpoints && !prompt_cache {
+        return Err(
+            CatalogBuildError::CacheControlBreakpointsWithoutPromptCache {
+                model: model_id.to_string(),
+            },
+        );
+    }
 
     Ok(ModelFeatures {
         tools: features
@@ -2277,7 +2295,8 @@ fn build_model_features(
             })?,
         reasoning,
         reasoning_effort,
-        prompt_cache: features.prompt_cache.unwrap_or_default(),
+        prompt_cache,
+        cache_control_breakpoints,
         sampling_params: features.sampling_params.unwrap_or(true),
     })
 }
@@ -2977,6 +2996,7 @@ enabled = true
                 0.5,
                 ReasoningEffortFeature::Levels,
                 false,
+                false,
                 BillingPolicy::OpenAi,
             ),
             (
@@ -2988,6 +3008,7 @@ enabled = true
                 15.0,
                 0.25,
                 ReasoningEffortFeature::Levels,
+                false,
                 false,
                 BillingPolicy::OpenAi,
             ),
@@ -3001,6 +3022,7 @@ enabled = true
                 0.1,
                 ReasoningEffortFeature::Levels,
                 false,
+                false,
                 BillingPolicy::OpenAi,
             ),
             (
@@ -3013,6 +3035,7 @@ enabled = true
                 0.5,
                 ReasoningEffortFeature::Levels,
                 false,
+                true,
                 BillingPolicy::Anthropic,
             ),
             (
@@ -3025,6 +3048,7 @@ enabled = true
                 1.0,
                 ReasoningEffortFeature::AlwaysAdaptive,
                 false,
+                true,
                 BillingPolicy::Anthropic,
             ),
         ];
@@ -3039,6 +3063,7 @@ enabled = true
             cache_input_cost,
             reasoning_effort,
             sampling_params,
+            cache_control_breakpoints,
             billing_policy,
         ) in expected
         {
@@ -3055,6 +3080,10 @@ enabled = true
             assert!(model.features.prompt_cache, "{id}");
             assert_eq!(model.features.reasoning_effort, reasoning_effort, "{id}");
             assert_eq!(model.features.sampling_params, sampling_params, "{id}");
+            assert_eq!(
+                model.features.cache_control_breakpoints, cache_control_breakpoints,
+                "{id}"
+            );
             assert_eq!(model.costs.input_cost_per_mtok, Some(input_cost), "{id}");
             assert_eq!(model.costs.output_cost_per_mtok, Some(output_cost), "{id}");
             assert_eq!(
@@ -3213,6 +3242,7 @@ enabled = true
                 reasoning: true,
                 reasoning_effort: Levels,
                 prompt_cache: true,
+                cache_control_breakpoints: false,
                 sampling_params: true,
             },
             costs: ModelCosts {
@@ -3277,6 +3307,7 @@ enabled = true
                 reasoning: true,
                 reasoning_effort: AlwaysAdaptive,
                 prompt_cache: true,
+                cache_control_breakpoints: false,
                 sampling_params: false,
             },
             costs: ModelCosts {
@@ -5684,6 +5715,39 @@ reasoning_effort = "levels"
     }
 
     #[test]
+    fn catalog_from_settings_rejects_cache_control_breakpoints_without_prompt_cache() {
+        let settings = minimal_settings(
+            r#"
+[providers.test]
+display_name = "Test"
+adapter = "openai_compatible"
+agent_profile = "openai"
+base_url = "https://example.test/v1"
+
+[models.model]
+provider = "test"
+display_name = "Model"
+family = "test"
+
+[models.model.limits]
+context_window = 1000
+
+[models.model.features]
+tools = true
+vision = false
+reasoning = false
+cache_control_breakpoints = true
+"#,
+        );
+
+        assert!(matches!(
+            Catalog::from_settings(&settings).unwrap_err(),
+            CatalogBuildError::CacheControlBreakpointsWithoutPromptCache { model }
+                if model == "model"
+        ));
+    }
+
+    #[test]
     fn catalog_from_settings_rejects_always_adaptive_effort_without_reasoning() {
         let settings = minimal_settings(
             r#"
@@ -5843,6 +5907,7 @@ sampling_params = false
                 reasoning: true,
                 reasoning_effort: Levels,
                 prompt_cache: true,
+                cache_control_breakpoints: false,
                 sampling_params: true,
             },
             costs: ModelCosts {
@@ -5899,6 +5964,7 @@ sampling_params = false
                 reasoning: true,
                 reasoning_effort: None,
                 prompt_cache: true,
+                cache_control_breakpoints: false,
                 sampling_params: false,
             },
             costs: ModelCosts {
@@ -5947,6 +6013,7 @@ sampling_params = false
                 reasoning: true,
                 reasoning_effort: AlwaysAdaptive,
                 prompt_cache: true,
+                cache_control_breakpoints: false,
                 sampling_params: false,
             },
             costs: ModelCosts {
@@ -6019,6 +6086,7 @@ sampling_params = false
                 reasoning: true,
                 reasoning_effort: Levels,
                 prompt_cache: true,
+                cache_control_breakpoints: false,
                 sampling_params: true,
             },
             costs: ModelCosts {
@@ -6084,6 +6152,7 @@ sampling_params = false
                 reasoning: true,
                 reasoning_effort: Levels,
                 prompt_cache: false,
+                cache_control_breakpoints: false,
                 sampling_params: true,
             },
             costs: ModelCosts {
@@ -6140,6 +6209,7 @@ sampling_params = false
                 reasoning: true,
                 reasoning_effort: Levels,
                 prompt_cache: false,
+                cache_control_breakpoints: false,
                 sampling_params: true,
             },
             costs: ModelCosts {

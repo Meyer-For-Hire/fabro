@@ -39,6 +39,10 @@ export interface ModelFeatures {
      */
     'prompt_cache': boolean;
     /**
+     * Whether the endpoint only caches when the request marks the cacheable prefix with Anthropic-style cache_control breakpoints (e.g. Claude via OpenRouter).
+     */
+    'cache_control_breakpoints': boolean;
+    /**
      * Whether the model accepts classic sampling parameters (temperature, top_p).
      */
     'sampling_params': boolean;

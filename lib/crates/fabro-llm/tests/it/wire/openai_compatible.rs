@@ -10,7 +10,8 @@ use fabro_llm::types::{
     Message, ReasoningEffort, Request, ResponseFormat, ResponseFormatType, ToolChoice,
     ToolDefinition,
 };
-use fabro_model::Catalog;
+use fabro_model::catalog::LlmCatalogSettings;
+use fabro_model::{Catalog, ProviderId};
 use httpmock::prelude::*;
 
 use crate::support::{
@@ -254,6 +255,134 @@ async fn encode_kimi_k3_uses_catalog_reasoning_and_sampling_controls() {
     assert_eq!(capture.body["reasoning_effort"], "high");
     assert!(capture.body.get("temperature").is_none());
     assert!(capture.body.get("top_p").is_none());
+}
+
+/// Counts JSON objects anywhere in `value` carrying a `cache_control` key.
+fn count_cache_control_breakpoints(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Object(map) => {
+            usize::from(map.contains_key("cache_control"))
+                + map
+                    .values()
+                    .map(count_cache_control_breakpoints)
+                    .sum::<usize>()
+        }
+        serde_json::Value::Array(items) => items.iter().map(count_cache_control_breakpoints).sum(),
+        _ => 0,
+    }
+}
+
+/// Builtin catalog with the opt-in OpenRouter provider enabled.
+fn openrouter_catalog() -> Arc<Catalog> {
+    let overrides: LlmCatalogSettings = toml::from_str("[providers.openrouter]\nenabled = true\n")
+        .expect("override TOML should parse");
+    Arc::new(
+        Catalog::from_builtin_with_overrides(&overrides)
+            .expect("catalog with OpenRouter enabled should build"),
+    )
+}
+
+/// System + tools + two user turns against an OpenRouter model.
+fn openrouter_multi_turn(model: &str) -> Request {
+    Request {
+        messages: vec![
+            Message::system("You are a careful reviewer."),
+            Message::user("Review this."),
+            Message::assistant("Looking now."),
+            Message::user("Focus on the tests."),
+        ],
+        ..corpus_tools(model, None)
+    }
+}
+
+/// OpenRouter serves Claude through this adapter, and Anthropic prompt
+/// caching is opt-in per request: OpenRouter only forwards a cache write when
+/// the body carries explicit ephemeral `cache_control` breakpoints (OpenAI
+/// models cache implicitly; Anthropic models never do). The catalog row
+/// declares `cache_control_breakpoints`, so the encoded request must mark the
+/// cacheable prefix — otherwise every turn bills at the full uncached input
+/// rate.
+#[tokio::test]
+async fn encode_openrouter_claude_marks_prompt_cache_breakpoints() {
+    let catalog = openrouter_catalog();
+    let model = catalog
+        .get_on_provider(&ProviderId::new("openrouter"), "claude-fable-5")
+        .expect("OpenRouter Claude row should exist in the built-in catalog");
+    assert!(model.features.prompt_cache);
+    assert!(model.features.cache_control_breakpoints);
+
+    let request = openrouter_multi_turn("claude-fable-5");
+    let capture = encode_capture_with(&request, move |adapter| {
+        adapter.with_name("openrouter").with_catalog(catalog)
+    })
+    .await;
+
+    assert_eq!(capture.body["model"], "anthropic/claude-fable-5");
+    let messages = &capture.body["messages"];
+    // The system prompt converts to parts form carrying a breakpoint; it
+    // covers the tool definitions too (tools precede system upstream).
+    assert_eq!(messages[0]["content"][0]["type"], "text");
+    assert_eq!(
+        messages[0]["content"][0]["text"],
+        "You are a careful reviewer."
+    );
+    assert_eq!(
+        messages[0]["content"][0]["cache_control"]["type"],
+        "ephemeral"
+    );
+    // The second-to-last user turn carries the conversation breakpoint...
+    assert_eq!(messages[1]["content"][0]["text"], "Review this.");
+    assert_eq!(
+        messages[1]["content"][0]["cache_control"]["type"],
+        "ephemeral"
+    );
+    // ...and the newest turn stays in plain-string form.
+    assert_eq!(messages[3]["content"], "Focus on the tests.");
+    assert_eq!(count_cache_control_breakpoints(&capture.body), 2);
+}
+
+/// Models with implicit (server-side) caching must NOT get breakpoints even
+/// though they support prompt caching — the annotation is an Anthropic-ism
+/// the catalog row has to opt into.
+#[tokio::test]
+async fn encode_openrouter_implicit_cache_model_stays_plain() {
+    let catalog = openrouter_catalog();
+    let model = catalog
+        .get_on_provider(&ProviderId::new("openrouter"), "gpt-5.6-luna")
+        .expect("OpenRouter GPT row should exist in the built-in catalog");
+    assert!(model.features.prompt_cache);
+    assert!(!model.features.cache_control_breakpoints);
+
+    let request = openrouter_multi_turn("gpt-5.6-luna");
+    let capture = encode_capture_with(&request, move |adapter| {
+        adapter.with_name("openrouter").with_catalog(catalog)
+    })
+    .await;
+
+    assert_eq!(count_cache_control_breakpoints(&capture.body), 0);
+    assert_eq!(
+        capture.body["messages"][0]["content"],
+        "You are a careful reviewer."
+    );
+}
+
+/// `provider_options.openrouter.auto_cache = false` disables the breakpoints,
+/// and the control key is consumed rather than merged into the body.
+#[tokio::test]
+async fn encode_openrouter_claude_auto_cache_opt_out() {
+    let request = Request {
+        provider_options: Some(serde_json::json!({"openrouter": {"auto_cache": false}})),
+        ..openrouter_multi_turn("claude-fable-5")
+    };
+    let capture = encode_capture_with(&request, move |adapter| {
+        adapter
+            .with_name("openrouter")
+            .with_catalog(openrouter_catalog())
+    })
+    .await;
+
+    assert_eq!(count_cache_control_breakpoints(&capture.body), 0);
+    assert!(capture.body.get("auto_cache").is_none());
 }
 
 /// The provider_options namespace key is the runtime adapter NAME, not a

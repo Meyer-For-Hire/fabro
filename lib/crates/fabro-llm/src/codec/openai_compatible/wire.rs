@@ -1,5 +1,6 @@
 //! Serde types mirroring the OpenAI Chat Completions wire shapes.
 
+use crate::codec::cache::CacheControl;
 use crate::codec::split_inclusive_token_total;
 use crate::types::{ReasoningEffort, TokenCounts};
 
@@ -31,7 +32,7 @@ pub(super) struct ApiRequest {
 pub(super) struct ChatMessage {
     pub role:              String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub content:           Option<String>,
+    pub content:           Option<ChatContent>,
     /// Reasoning/thinking content echoed back for providers that require it
     /// (Kimi).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -40,6 +41,56 @@ pub(super) struct ChatMessage {
     pub tool_call_id:      Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls:        Option<Vec<ChatToolCall>>,
+}
+
+/// Message content: plain text, or text parts when a part carries a
+/// `cache_control` breakpoint (aggregators fronting Anthropic models forward
+/// it upstream). Unmarked messages keep the plain-string form for maximum
+/// compatibility with strict Chat Completions servers.
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+pub(super) enum ChatContent {
+    Text(String),
+    Parts(Vec<ChatTextPart>),
+}
+
+#[derive(serde::Serialize)]
+pub(super) struct ChatTextPart {
+    #[serde(rename = "type")]
+    pub kind:          String,
+    pub text:          String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
+}
+
+impl ChatContent {
+    /// Plain-text view for assertions.
+    #[cfg(test)]
+    pub(super) fn as_text(&self) -> Option<&str> {
+        match self {
+            Self::Text(text) => Some(text.as_str()),
+            Self::Parts(_) => None,
+        }
+    }
+
+    /// Mark this content as a prompt-cache breakpoint, converting to parts
+    /// form so the annotation has somewhere to live.
+    pub(super) fn mark_cache_breakpoint(&mut self) {
+        match self {
+            Self::Text(text) => {
+                *self = Self::Parts(vec![ChatTextPart {
+                    kind:          "text".to_string(),
+                    text:          std::mem::take(text),
+                    cache_control: Some(CacheControl::ephemeral()),
+                }]);
+            }
+            Self::Parts(parts) => {
+                if let Some(last) = parts.last_mut() {
+                    last.cache_control = Some(CacheControl::ephemeral());
+                }
+            }
+        }
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -229,8 +280,52 @@ pub(super) struct AccumulatedToolCall {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiResponse, ApiUsage, StreamChunk};
+    use super::{ApiResponse, ApiUsage, ChatContent, ChatTextPart, StreamChunk};
+    use crate::codec::cache::CacheControl;
     use crate::types::TokenCounts;
+
+    #[test]
+    fn chat_content_text_serializes_as_plain_string() {
+        let content = ChatContent::Text("Hello".to_string());
+        assert_eq!(
+            serde_json::to_value(&content).unwrap(),
+            serde_json::json!("Hello")
+        );
+    }
+
+    #[test]
+    fn mark_cache_breakpoint_converts_text_to_annotated_parts() {
+        let mut content = ChatContent::Text("Hello".to_string());
+        content.mark_cache_breakpoint();
+        assert_eq!(
+            serde_json::to_value(&content).unwrap(),
+            serde_json::json!([{
+                "type": "text",
+                "text": "Hello",
+                "cache_control": {"type": "ephemeral"}
+            }])
+        );
+    }
+
+    #[test]
+    fn mark_cache_breakpoint_annotates_last_existing_part() {
+        let mut content = ChatContent::Parts(vec![
+            ChatTextPart {
+                kind:          "text".to_string(),
+                text:          "first".to_string(),
+                cache_control: None,
+            },
+            ChatTextPart {
+                kind:          "text".to_string(),
+                text:          "second".to_string(),
+                cache_control: Some(CacheControl::ephemeral()),
+            },
+        ]);
+        content.mark_cache_breakpoint();
+        let json = serde_json::to_value(&content).unwrap();
+        assert!(json[0].get("cache_control").is_none());
+        assert_eq!(json[1]["cache_control"]["type"], "ephemeral");
+    }
 
     #[test]
     fn token_counts_bound_detail_to_parent_totals() {
