@@ -804,6 +804,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn append_event_if_evaluates_latest_projection_before_appending() {
+        let (_object_store, store) = make_store();
+        let run = store.create_run(&test_run_id("run-1")).await.unwrap();
+        append_created(&run, "run-1", dt("2026-03-27T12:00:00Z")).await;
+        let initial_title = run.state().await.unwrap().title().into_owned();
+
+        run.append_event(&event_payload(
+            "run-1",
+            "2026-03-27T12:00:01Z",
+            "run.title.updated",
+            &serde_json::json!({ "title": "User title" }),
+        ))
+        .await
+        .unwrap();
+
+        let generated_update = event_payload(
+            "run-1",
+            "2026-03-27T12:00:02Z",
+            "run.title.updated",
+            &serde_json::json!({ "title": "Generated title" }),
+        );
+        let appended = run
+            .append_event_if(&generated_update, |projection| {
+                projection.title() == initial_title
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(appended, None);
+        assert_eq!(run.state().await.unwrap().title(), "User title");
+        assert_eq!(run.list_events().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
     async fn control_request_events_set_pending_control_without_overwriting_status() {
         let (_object_store, store) = make_store();
         let run = store.create_run(&test_run_id("run-1")).await.unwrap();

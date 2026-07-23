@@ -743,23 +743,6 @@ fn spawn_generated_title_task(task: GeneratedTitleTask) {
             return;
         }
 
-        let current = match task
-            .state
-            .stores
-            .runs
-            .get_cached_summary(&task.run_id, Utc::now())
-            .await
-        {
-            Ok(Some(summary)) => summary,
-            Ok(None) => return,
-            Err(err) => {
-                tracing::debug!(run_id = %task.run_id, error = %err, "Failed to re-read run summary for title update");
-                return;
-            }
-        };
-        if current.title != task.deterministic_title {
-            return;
-        }
         let run_store = match task.state.stores.runs.open_run(&task.run_id).await {
             Ok(store) => store,
             Err(err) => {
@@ -767,7 +750,8 @@ fn spawn_generated_title_task(task: GeneratedTitleTask) {
                 return;
             }
         };
-        if let Err(err) = workflow_event::append_event(
+        let expected_title = task.deterministic_title;
+        if let Err(err) = workflow_event::append_event_if(
             &run_store,
             &task.run_id,
             &workflow_event::Event::RunTitleUpdated {
@@ -776,6 +760,7 @@ fn spawn_generated_title_task(task: GeneratedTitleTask) {
                     system_kind: SystemActorKind::Engine,
                 }),
             },
+            move |projection| projection.title().as_ref() == expected_title,
         )
         .await
         {

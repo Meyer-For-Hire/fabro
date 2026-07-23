@@ -3495,7 +3495,7 @@ async fn generated_title_does_not_overwrite_user_title_edit() {
     response_json!(response, StatusCode::OK).await;
 
     wait_for_mock_hits(&title_mock, 1).await;
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 
     assert_eq!(
         state

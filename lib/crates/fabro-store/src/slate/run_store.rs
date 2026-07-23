@@ -169,6 +169,10 @@ impl RunDatabase {
 
     async fn projected_state(&self) -> Result<RunProjection> {
         let _state_guard = self.inner.state_lock.lock().await;
+        self.projected_state_locked().await
+    }
+
+    async fn projected_state_locked(&self) -> Result<RunProjection> {
         let next_seq = {
             let cache = self.inner.projection_cache.lock().await;
             cache.last_seq.saturating_add(1)
@@ -254,12 +258,35 @@ impl RunDatabase {
         Ok(self.append_event_envelope(payload).await?.seq)
     }
 
+    /// Atomically appends `payload` when `predicate` matches the latest run
+    /// projection.
+    pub async fn append_event_if(
+        &self,
+        payload: &EventPayload,
+        predicate: impl FnOnce(&RunProjection) -> bool,
+    ) -> Result<Option<u32>> {
+        if self.read_only {
+            return Err(Error::ReadOnly);
+        }
+        payload.validate(&self.inner.run_id)?;
+        let _state_guard = self.inner.state_lock.lock().await;
+        let projection = self.projected_state_locked().await?;
+        if !predicate(&projection) {
+            return Ok(None);
+        }
+        Ok(Some(self.append_event_envelope_locked(payload).await?.seq))
+    }
+
     pub async fn append_event_envelope(&self, payload: &EventPayload) -> Result<EventEnvelope> {
         if self.read_only {
             return Err(Error::ReadOnly);
         }
         payload.validate(&self.inner.run_id)?;
         let _state_guard = self.inner.state_lock.lock().await;
+        self.append_event_envelope_locked(payload).await
+    }
+
+    async fn append_event_envelope_locked(&self, payload: &EventPayload) -> Result<EventEnvelope> {
         let seq = self.inner.event_seq.fetch_add(1, Ordering::SeqCst);
         let event = EventEnvelope {
             seq,
