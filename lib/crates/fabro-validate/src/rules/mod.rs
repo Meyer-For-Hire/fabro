@@ -12,6 +12,7 @@ mod inert_attribute;
 mod model_support;
 mod node_model_known;
 mod orphan_custom_outcome;
+mod parallel_branch;
 mod parallel_branch_inert_attribute;
 mod prompt_on_llm_nodes;
 mod random_selection_no_conditions;

@@ -78,9 +78,16 @@ pub fn format_artifact_reference(path: &str) -> String {
 
 pub fn durable_context_snapshot(context: &Context) -> HashMap<String, Value> {
     let mut snapshot = context.snapshot();
-    snapshot.remove(context::keys::CURRENT_PREAMBLE);
+    strip_transient_keys(&mut snapshot);
     normalize_durable_updates(&mut snapshot);
     snapshot
+}
+
+/// Remove runtime-only keys that must never reach durable storage.
+pub(crate) fn strip_transient_keys(values: &mut HashMap<String, Value>) {
+    for key in context::keys::TRANSIENT_CONTEXT_KEYS {
+        values.remove(*key);
+    }
 }
 
 pub fn normalize_durable_updates(updates: &mut HashMap<String, Value>) {
@@ -96,9 +103,7 @@ pub fn normalize_durable_outcomes(node_outcomes: &mut HashMap<String, Outcome>) 
 }
 
 pub fn normalize_checkpoint_for_resume(checkpoint: &mut Checkpoint) {
-    checkpoint
-        .context_values
-        .remove(context::keys::CURRENT_PREAMBLE);
+    strip_transient_keys(&mut checkpoint.context_values);
     normalize_durable_updates(&mut checkpoint.context_values);
     normalize_durable_outcomes(&mut checkpoint.node_outcomes);
 }
@@ -512,6 +517,59 @@ mod tests {
                     "file:///tmp/report.json",
                 ]
             })
+        );
+    }
+
+    #[test]
+    fn durable_context_snapshot_drops_parallel_branch_preambles() {
+        let context = Context::new();
+        context.set(
+            context::keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES,
+            serde_json::json!({"branch-a": "runtime only"}),
+        );
+        context.set("response.work", serde_json::json!("durable"));
+
+        let snapshot = durable_context_snapshot(&context);
+
+        assert!(!snapshot.contains_key(context::keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES));
+        assert_eq!(
+            snapshot.get("response.work"),
+            Some(&serde_json::json!("durable"))
+        );
+    }
+
+    #[test]
+    fn normalize_checkpoint_for_resume_drops_parallel_branch_preambles() {
+        let mut checkpoint = crate::records::Checkpoint {
+            timestamp:                  chrono::Utc::now(),
+            current_node:               "work".to_string(),
+            completed_nodes:            vec!["work".to_string()],
+            node_retries:               HashMap::new(),
+            context_values:             HashMap::from([
+                (
+                    context::keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES.to_string(),
+                    serde_json::json!({"branch-a": "runtime only"}),
+                ),
+                ("response.work".to_string(), serde_json::json!("durable")),
+            ]),
+            node_outcomes:              HashMap::new(),
+            next_node_id:               Some("exit".to_string()),
+            git_commit_sha:             None,
+            loop_failure_signatures:    HashMap::new(),
+            restart_failure_signatures: HashMap::new(),
+            node_visits:                HashMap::new(),
+        };
+
+        normalize_checkpoint_for_resume(&mut checkpoint);
+
+        assert!(
+            !checkpoint
+                .context_values
+                .contains_key(context::keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES)
+        );
+        assert_eq!(
+            checkpoint.context_values.get("response.work"),
+            Some(&serde_json::json!("durable"))
         );
     }
 

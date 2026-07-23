@@ -25,6 +25,10 @@ pub mod keys {
     pub const INTERNAL_PARENT_PREAMBLE: &str = "internal.parent_preamble";
     pub const INTERNAL_PARALLEL_GROUP_ID: &str = "internal.parallel_group_id";
     pub const INTERNAL_PARALLEL_BRANCH_ID: &str = "internal.parallel_branch_id";
+    /// Stash of pre-rendered per-branch preambles for a parallel node; see
+    /// [`super::ParallelBranchPreamble`] for the entry shape and the
+    /// producer/consumer contract.
+    pub const INTERNAL_PARALLEL_BRANCH_PREAMBLES: &str = "internal.parallel_branch_preambles";
 
     // --- current.* keys ---
     pub const CURRENT_PREAMBLE: &str = "current.preamble";
@@ -43,6 +47,10 @@ pub mod keys {
     pub const PARALLEL_FAN_IN_BEST_ID: &str = "parallel.fan_in.best_id";
     pub const PARALLEL_FAN_IN_BEST_OUTCOME: &str = "parallel.fan_in.best_outcome";
     pub const PARALLEL_FAN_IN_BEST_HEAD_SHA: &str = "parallel.fan_in.best_head_sha";
+
+    /// Runtime-only keys stripped from durable context projections.
+    pub(crate) const TRANSIENT_CONTEXT_KEYS: &[&str] =
+        &[CURRENT_PREAMBLE, INTERNAL_PARALLEL_BRANCH_PREAMBLES];
 
     // --- Prefix constants (for filtering and dynamic keys) ---
     pub const GRAPH_PREFIX: &str = "graph.";
@@ -135,8 +143,20 @@ pub mod keys {
 pub use fabro_core::Context;
 use fabro_graphviz::Fidelity;
 use fabro_types::{ParallelBranchId, StageId};
+use serde::{Deserialize, Serialize};
 
 use crate::event::StageScope;
+
+/// One entry of the [`keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES`] stash.
+///
+/// The stash is a JSON array indexed by the parallel node's outgoing-edge
+/// order. `null` entries mean the branch inherits the fork's preamble.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ParallelBranchPreamble {
+    pub(crate) fidelity: Fidelity,
+    pub(crate) preamble: String,
+}
 
 /// Domain-specific typed accessors for workflow context values.
 pub trait WorkflowContext {

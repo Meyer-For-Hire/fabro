@@ -497,8 +497,15 @@ fn with_session_lock<T>(root: &Path, f: impl FnOnce() -> T) -> T {
     // cleanup_session_root can remove_dir_all between the two calls.
     let deadline = std::time::Instant::now() + SESSION_LOCK_TIMEOUT;
     let lock_file = loop {
-        std::fs::create_dir_all(root)
-            .unwrap_or_else(|err| panic!("failed to create {}: {err}", root.display()));
+        if let Err(err) = std::fs::create_dir_all(root) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "failed to create {} after retries: {err}",
+                root.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        }
         ensure_parent_dir(&lock_path);
         match File::create(&lock_path) {
             Ok(f) => break f,

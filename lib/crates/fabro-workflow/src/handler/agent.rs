@@ -19,6 +19,8 @@ use crate::event::{Emitter, Event, StageScope};
 use crate::interview_runtime::WorkflowAgentQuestionRuntime;
 use crate::outcome::{BilledModelUsage, Outcome, OutcomeExt};
 
+const LAST_FILE_ROUTING_EXTENSIONS: &[&str] = &["json", "md"];
+
 /// Result from a `CodergenBackend` invocation.
 #[allow(
     clippy::large_enum_variant,
@@ -169,8 +171,8 @@ pub(crate) async fn validate_agent_output_sources(
     }
 
     if let Some(path) = last_file_touched {
-        if let Some(contents) = read_sandbox_file(sandbox, path).await {
-            return structured_output::validate_response_text(schema, &contents);
+        if let Some(routing_json) = read_last_file_routing_json(sandbox, path).await {
+            return structured_output::validate_response_text(schema, &routing_json);
         }
     }
 
@@ -179,6 +181,22 @@ pub(crate) async fn validate_agent_output_sources(
 
 async fn read_sandbox_file(sandbox: &Arc<dyn Sandbox>, path: &str) -> Option<String> {
     sandbox.read_file_text(path).await.ok()
+}
+
+/// Extract the terminal JSON object from the last-touched file when it has an
+/// eligible extension. Does not check that the object contains routing fields;
+/// callers validate that.
+async fn read_last_file_routing_json(sandbox: &Arc<dyn Sandbox>, path: &str) -> Option<String> {
+    let extension = Path::new(path).extension()?.to_str()?;
+    if !LAST_FILE_ROUTING_EXTENSIONS
+        .iter()
+        .any(|allowed| extension.eq_ignore_ascii_case(allowed))
+    {
+        return None;
+    }
+
+    let contents = read_sandbox_file(sandbox, path).await?;
+    structured_output::terminal_json_object(&contents).map(str::to_owned)
 }
 
 /// Truncate a string to at most `max_chars` characters (char-boundary safe).
@@ -382,7 +400,7 @@ impl Handler for AgentHandler {
         } else {
             // 7b. Parse routing directives from response text, falling back to
             //     status.json written by the agent into the sandbox CWD, then to
-            //     the last file the agent wrote.
+            //     a terminal JSON object in an eligible last-written file.
             let found_in_response = extract_status_fields(&response_text, &mut outcome);
             if !found_in_response {
                 let mut found_in_status_json = false;
@@ -393,9 +411,10 @@ impl Handler for AgentHandler {
                 }
                 if !found_in_status_json {
                     if let Some(ref path) = last_file_touched {
-                        if let Some(contents) = read_sandbox_file(&services.run.sandbox, path).await
+                        if let Some(routing_json) =
+                            read_last_file_routing_json(&services.run.sandbox, path).await
                         {
-                            extract_status_fields(&contents, &mut outcome);
+                            extract_status_fields(&routing_json, &mut outcome);
                         }
                     }
                 }
@@ -504,6 +523,67 @@ mod tests {
             serde_json::json!(fixtures::RUN_1.to_string()),
         );
         context
+    }
+
+    struct LastFileBackend {
+        path: String,
+    }
+
+    #[async_trait]
+    impl CodergenBackend for LastFileBackend {
+        async fn run(&self, _request: CodergenRunRequest<'_>) -> Result<CodergenResult, Error> {
+            Ok(CodergenResult::Text {
+                text:              "Done writing results.".to_string(),
+                usage:             None,
+                files_touched:     vec![self.path.clone()],
+                last_file_touched: Some(self.path.clone()),
+                timing:            StageTiming::default(),
+            })
+        }
+    }
+
+    fn sandbox_with_file(path: &str, contents: &str) -> (TempDir, Arc<dyn Sandbox>) {
+        let sandbox_dir = TempDir::new().unwrap();
+        std::fs::write(sandbox_dir.path().join(path), contents).unwrap();
+        let sandbox: Arc<dyn Sandbox> = Arc::new(fabro_agent::LocalSandbox::new(
+            sandbox_dir.path().to_path_buf(),
+        ));
+        (sandbox_dir, sandbox)
+    }
+
+    async fn execute_with_last_file(path: &str, contents: &str) -> Outcome {
+        let (_sandbox_dir, sandbox) = sandbox_with_file(path, contents);
+
+        let handler = AgentHandler::new(Some(Box::new(LastFileBackend {
+            path: path.to_string(),
+        })));
+        let node = Node::new("step");
+        let context = test_context();
+        let graph = Graph::new("test");
+        let tmp = TempDir::new().unwrap();
+
+        let mut services = EngineServices::test_default();
+        services.run = services.run.with_sandbox(sandbox);
+
+        handler
+            .execute(&node, &context, &graph, tmp.path(), &services)
+            .await
+            .unwrap()
+    }
+
+    async fn validate_routing_with_last_file(
+        path: &str,
+        contents: &str,
+    ) -> Result<ValidatedStructuredOutput, StructuredOutputError> {
+        let (_sandbox_dir, sandbox) = sandbox_with_file(path, contents);
+
+        validate_agent_output_sources(
+            &OutputSchemaKind::Routing,
+            "Done writing results.",
+            &sandbox,
+            Some(path),
+        )
+        .await
     }
 
     #[tokio::test]
@@ -731,55 +811,46 @@ mod tests {
 
     #[tokio::test]
     async fn codergen_handler_extracts_status_from_last_file_touched() {
-        struct LastFileBackend;
-
-        #[async_trait]
-        impl CodergenBackend for LastFileBackend {
-            async fn run(&self, _request: CodergenRunRequest<'_>) -> Result<CodergenResult, Error> {
-                Ok(CodergenResult::Text {
-                    text:              "Done writing results.".to_string(),
-                    usage:             None,
-                    files_touched:     vec!["results.md".to_string()],
-                    last_file_touched: Some("results.md".to_string()),
-                    timing:            StageTiming::default(),
-                })
-            }
-        }
-
-        let sandbox_dir = TempDir::new().unwrap();
-        // Write status fields into the file the agent "touched" — no status.json
-        std::fs::write(
-            sandbox_dir.path().join("results.md"),
+        let outcome = execute_with_last_file(
+            "results.md",
             r#"# Results
 {"context_updates": {"verified": "true"}}
 "#,
         )
-        .unwrap();
-
-        let handler = AgentHandler::new(Some(Box::new(LastFileBackend)));
-        let node = Node::new("step");
-        let context = test_context();
-        let graph = Graph::new("test");
-        let tmp = TempDir::new().unwrap();
-
-        let mut services = EngineServices::test_default();
-        services.run =
-            services
-                .run
-                .with_sandbox(std::sync::Arc::new(fabro_agent::LocalSandbox::new(
-                    sandbox_dir.path().to_path_buf(),
-                )));
-
-        let outcome = handler
-            .execute(&node, &context, &graph, tmp.path(), &services)
-            .await
-            .unwrap();
+        .await;
 
         assert_eq!(outcome.status, crate::outcome::StageOutcome::Succeeded);
         assert_eq!(
             outcome.context_updates.get("verified"),
             Some(&serde_json::json!("true")),
         );
+    }
+
+    #[tokio::test]
+    async fn codergen_handler_ignores_nonterminal_status_in_last_markdown_file() {
+        let outcome = execute_with_last_file(
+            "results.md",
+            r#"{"outcome":"failed","failure_reason":"tests failed"}
+
+All checks passed.
+"#,
+        )
+        .await;
+
+        assert_eq!(outcome.status, crate::outcome::StageOutcome::Succeeded);
+        assert!(outcome.failure.is_none());
+    }
+
+    #[tokio::test]
+    async fn codergen_handler_ignores_terminal_status_in_disallowed_last_file() {
+        let outcome = execute_with_last_file(
+            "command.rs",
+            r#"{"outcome":"failed","failure_reason":"tests failed"}"#,
+        )
+        .await;
+
+        assert_eq!(outcome.status, crate::outcome::StageOutcome::Succeeded);
+        assert!(outcome.failure.is_none());
     }
 
     #[tokio::test]
@@ -817,6 +888,51 @@ mod tests {
 
         assert_eq!(outcome.status, crate::outcome::StageOutcome::Succeeded);
         assert_eq!(outcome.preferred_label.as_deref(), Some("review"));
+    }
+
+    #[tokio::test]
+    async fn validated_routing_accepts_terminal_status_in_json_file_case_insensitively() {
+        let validated = validate_routing_with_last_file(
+            "results.JSON",
+            "# Results\n\n{\"preferred_next_label\":\"review\"}\n",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            validated.value,
+            serde_json::json!({"preferred_next_label": "review"}),
+        );
+    }
+
+    #[tokio::test]
+    async fn validated_routing_ignores_nonterminal_status_in_last_markdown_file() {
+        let error = validate_routing_with_last_file(
+            "results.md",
+            "{\"outcome\":\"failed\",\"failure_reason\":\"tests failed\"}\nAll checks passed.",
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            structured_output::StructuredOutputErrorKind::NoJsonObject,
+        );
+    }
+
+    #[tokio::test]
+    async fn validated_routing_ignores_terminal_status_in_disallowed_last_file() {
+        let error = validate_routing_with_last_file(
+            "command.rs",
+            r#"{"outcome":"failed","failure_reason":"tests failed"}"#,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            structured_output::StructuredOutputErrorKind::NoJsonObject,
+        );
     }
 
     #[tokio::test]

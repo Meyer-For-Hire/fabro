@@ -263,6 +263,15 @@ fn find_json_objects(text: &str) -> Vec<&str> {
     results
 }
 
+/// Return the outermost balanced JSON object that ends the text, ignoring
+/// trailing whitespace.
+pub(crate) fn terminal_json_object(text: &str) -> Option<&str> {
+    let trimmed = text.trim_end();
+    find_json_objects(trimmed)
+        .into_iter()
+        .find(|candidate| trimmed.ends_with(candidate))
+}
+
 pub(crate) fn extract_status_fields(text: &str, outcome: &mut Outcome) -> bool {
     let candidates = find_json_objects(text);
 
@@ -490,6 +499,31 @@ mod tests {
             StructuredOutputErrorKind::NoRelevantJsonObject
         );
         assert!(error.messages()[0].contains("recognized routing field"));
+    }
+
+    #[test]
+    fn terminal_json_object_accepts_final_object_after_prose() {
+        let object =
+            terminal_json_object("# Results\n\n{\"context_updates\":{\"verified\":true}}\n\n");
+
+        assert_eq!(object, Some(r#"{"context_updates":{"verified":true}}"#),);
+    }
+
+    #[test]
+    fn terminal_json_object_returns_outermost_nested_object() {
+        let object = terminal_json_object(r#"Results: {"context_updates":{"verified":true}}"#);
+
+        assert_eq!(object, Some(r#"{"context_updates":{"verified":true}}"#),);
+    }
+
+    #[test]
+    fn terminal_json_object_rejects_object_followed_by_content() {
+        assert_eq!(
+            terminal_json_object(
+                "{\"outcome\":\"failed\",\"failure_reason\":\"tests failed\"}\nMore details",
+            ),
+            None,
+        );
     }
 
     #[test]

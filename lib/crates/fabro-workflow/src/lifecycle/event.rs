@@ -14,7 +14,7 @@ use fabro_types::{Principal, RunId, StageTiming};
 
 use super::circuit_breaker::CircuitBreakerLifecycle;
 use super::git::GitCheckpointResult;
-use crate::context::WorkflowContext;
+use crate::context::{Context, WorkflowContext};
 use crate::event::{Emitter, Event, StageScope};
 use crate::graph::{WorkflowGraph, WorkflowNode};
 use crate::outcome::{BilledModelUsage, FailureCategory, FailureDetail, Outcome, StageOutcome};
@@ -90,6 +90,16 @@ fn response_from_outcome(node_id: &str, outcome: &Outcome) -> Option<String> {
         .context_updates
         .get(&context::keys::response_key(node_id))
         .and_then(|value| value.as_str().map(ToOwned::to_owned))
+}
+
+/// Context values for `StageCompleted` events. Unlike
+/// `artifact::strip_transient_keys`, this keeps `CURRENT_PREAMBLE` — stage
+/// events have always included the active preamble — and drops only the
+/// parallel stash, which can embed every branch's rendered preamble.
+fn stage_context_values(workflow_context: &Context) -> Option<BTreeMap<String, serde_json::Value>> {
+    let mut snapshot = workflow_context.snapshot();
+    snapshot.remove(context::keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES);
+    (!snapshot.is_empty()).then(|| snapshot.into_iter().collect())
 }
 
 pub(super) fn stage_visit(state: &WfRunState, node_id: &str) -> u32 {
@@ -318,11 +328,7 @@ impl RunLifecycle<WorkflowGraph> for EventLifecycle {
                             .collect::<BTreeMap<_, _>>()
                     }),
                     jump_to_node: outcome.jump_to_node.clone(),
-                    context_values: {
-                        let snapshot = state.context.snapshot();
-                        (!snapshot.is_empty())
-                            .then(|| snapshot.into_iter().collect::<BTreeMap<_, _>>())
-                    },
+                    context_values: stage_context_values(&state.context),
                     node_visits: (!state.node_visits.is_empty()).then(|| {
                         state
                             .node_visits
@@ -444,5 +450,28 @@ impl RunLifecycle<WorkflowGraph> for EventLifecycle {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stage_context_values_drops_parallel_branch_preambles() {
+        let workflow_context = Context::new();
+        workflow_context.set(
+            context::keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES,
+            serde_json::json!([{"fidelity": "summary:high", "preamble": "runtime only"}]),
+        );
+        workflow_context.set("response.work", serde_json::json!("durable"));
+
+        let values = stage_context_values(&workflow_context).expect("snapshot should not be empty");
+
+        assert!(!values.contains_key(context::keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES));
+        assert_eq!(
+            values.get("response.work"),
+            Some(&serde_json::json!("durable"))
+        );
     }
 }
