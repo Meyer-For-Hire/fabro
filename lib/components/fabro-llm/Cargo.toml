@@ -1,0 +1,58 @@
+[package]
+name = "fabro-llm"
+edition.workspace = true
+version.workspace = true
+publish = false
+license.workspace = true
+description = "A unified client library for multiple LLM providers"
+repository = "https://github.com/brynary/arc"
+readme = "README.md"
+keywords = ["llm", "ai", "openai", "anthropic"]
+categories = ["api-bindings"]
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+strum.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+rand.workspace = true
+futures.workspace = true
+tokio-stream.workspace = true
+async-trait.workspace = true
+base64.workspace = true
+bytes.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+aws-config.workspace = true
+aws-credential-types.workspace = true
+aws-sigv4.workspace = true
+aws-smithy-eventstream.workspace = true
+aws-smithy-runtime-api.workspace = true
+aws-smithy-types.workspace = true
+fabro-http.workspace = true
+fabro-auth = { path = "../../foundation/fabro-auth" }
+fabro-model = { path = "../../foundation/fabro-model" }
+fabro-redact.workspace = true
+fabro-static.workspace = true
+fabro-types = { path = "../../foundation/fabro-types" }
+fabro-util = { path = "../../foundation/fabro-util" }
+
+[dev-dependencies]
+http = "1"
+insta = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "macros"] }
+httpmock = "0.8"
+serde_json.workspace = true
+toml.workspace = true
+fabro-macros = { path = "../../foundation/fabro-macros" }
+fabro-test = { workspace = true }
+tracing-subscriber.workspace = true

@@ -17,7 +17,7 @@ Output a report with all the bugs using this format:
       <title>title of bug</title>
       <description>brief description of bug</description>
       <location>
-         <file>lib/crates/fabro-cli/src/commands/resume.rs</file>
+         <file>lib/apps/fabro-cli/src/commands/resume.rs</file>
          <start_line>115</start_line>
          <end_line>115</end_line>
       </location>

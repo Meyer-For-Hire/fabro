@@ -23,7 +23,7 @@ export const handle = { wide: true, fullHeight: true };
 
 type Direction = "LR" | "TB";
 
-// Mirrors fabro-graphviz's RANKDIR_RE (lib/crates/fabro-graphviz/src/render.rs) —
+// Mirrors fabro-graphviz's RANKDIR_RE (lib/components/fabro-graphviz/src/render.rs) —
 // keep the accepted `rankdir=` syntax in sync with that regex.
 const RANKDIR_RE = /rankdir\s*=\s*(\w+)/;
 

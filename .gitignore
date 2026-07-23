@@ -4,8 +4,8 @@ target
 node_modules
 apps/fabro-web/dist
 apps/fabro-web/.dist-builds/
-lib/crates/fabro-spa/assets/*
-!lib/crates/fabro-spa/assets/.gitkeep
+lib/apps/fabro-spa/assets/*
+!lib/apps/fabro-spa/assets/.gitkeep
 tmp
 evals/swe-bench/repos/
 evals/swe-bench/results/
