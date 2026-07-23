@@ -513,6 +513,38 @@ impl RunProjectionReducer for RunProjection {
                 };
                 stage.parallel_results = Some(parallel_results);
             }
+            EventBody::ParallelBranchStarted(_) => {
+                // Branches bypass the engine's StageStarted/StageCompleted
+                // lifecycle. Seed started_at so the branch stage drives a live
+                // wall-clock timer while it runs (the entry is created Running).
+                let Some(stage) = stage_at_stored_or_current_visit(self, stored, event.seq) else {
+                    return Ok(());
+                };
+                if stage.started_at.is_none() {
+                    stage.started_at = Some(ts);
+                }
+                stage.state = StageState::Running;
+            }
+            EventBody::ParallelBranchCompleted(props) => {
+                // A branch never emits its own StageCompleted, so finalize it
+                // here; otherwise the stage spins Running forever after the run
+                // (and the fan-in) is done.
+                let outcome =
+                    StageOutcome::from_str(&props.status).unwrap_or(StageOutcome::Failed {
+                        retry_requested: false,
+                    });
+                let Some(stage) = stage_at_stored_or_current_visit(self, stored, event.seq) else {
+                    return Ok(());
+                };
+                stage.completion = Some(StageCompletion {
+                    outcome,
+                    notes: None,
+                    failure_reason: None,
+                    timestamp: ts,
+                });
+                stage.timing = Some(fabro_types::StageTiming::wall_only(props.duration_ms));
+                stage.state = StageState::from(outcome);
+            }
             EventBody::TodoCreated(props) => {
                 let Some(stage) = stage_at_stored_or_current_visit(self, stored, event.seq) else {
                     return Ok(());
@@ -1260,8 +1292,9 @@ mod tests {
         AgentSubFailedProps, AgentSubSpawnedProps, AgentToolCategory, AgentToolSource,
         AgentToolStartedProps, AgentToolSummary, AgentToolsAvailableProps,
         CheckpointCompletedProps, InterviewCompletedProps, InterviewOption, InterviewStartedProps,
-        RunCompletedProps, RunControlEffectProps, StageCompletedProps, StageFailedProps,
-        StagePromptProps, StageRetryingProps, StageStartedProps,
+        ParallelBranchCompletedProps, ParallelBranchStartedProps, RunCompletedProps,
+        RunControlEffectProps, StageCompletedProps, StageFailedProps, StagePromptProps,
+        StageRetryingProps, StageStartedProps,
     };
     use fabro_types::settings::run::{DockerfileSource, EnvironmentProvider};
     use fabro_types::{
@@ -1991,6 +2024,86 @@ mod tests {
         let stage = state.stage(&stage_id).unwrap();
         assert_eq!(stage.first_event_seq, first_event_seq(3));
         assert_eq!(stage.prompt.as_deref(), Some("prompt"));
+    }
+
+    #[test]
+    fn parallel_branch_completed_finalizes_branch_stage() {
+        // A parallel branch never runs through the engine's StageStarted/
+        // StageCompleted lifecycle: its stage entry is created Running by the
+        // first branch-scoped event, and only ParallelBranchCompleted marks it
+        // terminal. Guards against branches spinning Running forever.
+        let mut state = initialized_projection();
+        let branch = StageId::new("review_ux", 1);
+        let branch_started_at = test_dt("2026-04-07T12:00:00Z");
+
+        state
+            .apply_event(&test_stage_event_at(
+                3,
+                "2026-04-07T12:00:00Z",
+                EventBody::ParallelBranchStarted(ParallelBranchStartedProps { index: 0 }),
+                branch.clone(),
+            ))
+            .unwrap();
+        let stage = state.stage(&branch).unwrap();
+        assert_eq!(stage.state, StageState::Running);
+        assert_eq!(stage.started_at, Some(branch_started_at));
+
+        state
+            .apply_event(&test_stage_event(
+                4,
+                EventBody::ParallelBranchCompleted(ParallelBranchCompletedProps {
+                    index:       0,
+                    duration_ms: 1234,
+                    status:      "succeeded".to_string(),
+                    head_sha:    None,
+                }),
+                branch.clone(),
+            ))
+            .unwrap();
+
+        let stage = state.stage(&branch).unwrap();
+        assert_eq!(stage.state, StageState::Succeeded);
+        assert_eq!(stage.timing.unwrap().wall_time_ms, 1234);
+        assert_eq!(
+            stage.completion.as_ref().unwrap().outcome,
+            StageOutcome::Succeeded
+        );
+    }
+
+    #[test]
+    fn parallel_branch_completed_folds_failed_status_as_failed() {
+        let mut state = initialized_projection();
+        let branch = StageId::new("review_ux", 1);
+
+        state
+            .apply_event(&test_stage_event(
+                3,
+                EventBody::ParallelBranchStarted(ParallelBranchStartedProps { index: 0 }),
+                branch.clone(),
+            ))
+            .unwrap();
+        state
+            .apply_event(&test_stage_event(
+                4,
+                EventBody::ParallelBranchCompleted(ParallelBranchCompletedProps {
+                    index:       0,
+                    duration_ms: 500,
+                    status:      "failed".to_string(),
+                    head_sha:    None,
+                }),
+                branch.clone(),
+            ))
+            .unwrap();
+
+        let stage = state.stage(&branch).unwrap();
+        assert_eq!(stage.state, StageState::Failed);
+        assert_eq!(stage.timing.unwrap().wall_time_ms, 500);
+        assert_eq!(
+            stage.completion.as_ref().unwrap().outcome,
+            StageOutcome::Failed {
+                retry_requested: false,
+            }
+        );
     }
 
     fn start_stage(state: &mut RunProjection, stage_id: &StageId) {
