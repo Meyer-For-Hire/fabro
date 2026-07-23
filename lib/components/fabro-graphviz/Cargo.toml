@@ -1,0 +1,26 @@
+[package]
+name = "fabro-graphviz"
+edition.workspace = true
+version.workspace = true
+publish = false
+license.workspace = true
+description = "Graphviz DOT parser and typed graph data model"
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+graphviz-sys.workspace = true
+fabro-types = { path = "../../foundation/fabro-types" }
+nom = "7"
+regex = { workspace = true }
+serde = { workspace = true }
+strum.workspace = true
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

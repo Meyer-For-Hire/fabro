@@ -1,0 +1,35 @@
+[package]
+name = "fabro-hooks"
+edition.workspace = true
+version.workspace = true
+publish = false
+license.workspace = true
+description = "User-defined lifecycle hooks for Fabro workflows"
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+fabro-agent = { path = "../fabro-agent" }
+fabro-auth = { path = "../../foundation/fabro-auth" }
+fabro-llm = { path = "../fabro-llm" }
+fabro-model = { path = "../../foundation/fabro-model" }
+fabro-redact.workspace = true
+fabro-types = { path = "../../foundation/fabro-types" }
+fabro-util = { path = "../../foundation/fabro-util" }
+fabro-http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+regex.workspace = true
+tracing.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+httpmock = "0.8"
+tokio = { workspace = true, features = ["test-util", "macros"] }
+toml.workspace = true

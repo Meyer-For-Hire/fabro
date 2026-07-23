@@ -9,7 +9,7 @@ Migrations are product-facing compatibility code. Treat them like startup and st
 Each crate owns the migrations for the data it owns.
 
 ```text
-lib/crates/<crate>/
+lib/<layer>/<crate>/
   migrations/
     YYYYMMDDSS_descriptive_name.rs
   src/migrations.rs

@@ -170,14 +170,14 @@ Required payload fields:
 
 Emit from the same places that currently call `put_status`:
 
-- `lib/crates/fabro-workflow/src/operations/create.rs`
-- `lib/crates/fabro-workflow/src/operations/start.rs`
-- `lib/crates/fabro-workflow/src/operations/resume.rs`
-- `lib/crates/fabro-workflow/src/pipeline/finalize.rs`
-- `lib/crates/fabro-workflow/src/lifecycle/disk.rs`
+- `lib/components/fabro-workflow/src/operations/create.rs`
+- `lib/components/fabro-workflow/src/operations/start.rs`
+- `lib/components/fabro-workflow/src/operations/resume.rs`
+- `lib/components/fabro-workflow/src/pipeline/finalize.rs`
+- `lib/components/fabro-workflow/src/lifecycle/disk.rs`
 - CLI administrative flows that directly mutate status:
-  - `lib/crates/fabro-cli/src/commands/runs/rm.rs`
-  - `lib/crates/fabro-cli/src/commands/run/rewind.rs`
+  - `lib/apps/fabro-cli/src/commands/runs/rm.rs`
+  - `lib/apps/fabro-cli/src/commands/run/rewind.rs`
 
 ### 2. Enrich `checkpoint.completed` to carry a full checkpoint snapshot
 
@@ -200,11 +200,11 @@ Add fields covering:
 
 Emitter seam:
 
-- `lib/crates/fabro-workflow/src/lifecycle/event.rs`
+- `lib/components/fabro-workflow/src/lifecycle/event.rs`
 
 Producer seam for the source checkpoint object:
 
-- `lib/crates/fabro-workflow/src/lifecycle/disk.rs`
+- `lib/components/fabro-workflow/src/lifecycle/disk.rs`
 
 Design rule:
 
@@ -231,7 +231,7 @@ Add:
 
 Producer seam:
 
-- `lib/crates/fabro-workflow/src/pipeline/pull_request.rs`
+- `lib/components/fabro-workflow/src/pipeline/pull_request.rs`
 
 After this lands, `put_pull_request` should become removable during the later memoized-state cutover.
 
@@ -245,7 +245,7 @@ Do not add a separate storage-shaped event. The final patch is run-level termina
 
 Enrich `run.completed`, using the patch already computed from:
 
-- `lib/crates/fabro-workflow/src/lifecycle/git.rs`
+- `lib/components/fabro-workflow/src/lifecycle/git.rs`
 
 Required payload:
 
@@ -287,9 +287,9 @@ Required projected output:
 
 Likely seams:
 
-- `lib/crates/fabro-workflow/src/handler/agent.rs`
-- `lib/crates/fabro-workflow/src/handler/llm/api.rs`
-- `lib/crates/fabro-workflow/src/pipeline/retro.rs` if retro uses the same forwarded agent session path
+- `lib/components/fabro-workflow/src/handler/agent.rs`
+- `lib/components/fabro-workflow/src/handler/llm/api.rs`
+- `lib/components/fabro-workflow/src/pipeline/retro.rs` if retro uses the same forwarded agent session path
 - any CLI-backed LLM path if it still produces `provider_used.json`
 
 Do not keep the current “read JSON sidecar, then `put_node_provider_used`” pattern once this event exists.
@@ -304,7 +304,7 @@ Use the existing terminal parallel event rather than adding a storage-shaped eve
 
 Add to `parallel.completed`, emitted from:
 
-- `lib/crates/fabro-workflow/src/handler/parallel.rs`
+- `lib/components/fabro-workflow/src/handler/parallel.rs`
 
 Required new payload:
 
@@ -346,19 +346,19 @@ Likely files to touch:
 - `docs-internal/events.md`
 - `docs-internal/run-directory-keys.md`
 - `docs-internal/events-strategy.md`
-- `lib/crates/fabro-workflow/src/event.rs`
-- `lib/crates/fabro-workflow/src/lifecycle/event.rs`
-- `lib/crates/fabro-workflow/src/lifecycle/disk.rs`
-- `lib/crates/fabro-workflow/src/lifecycle/git.rs`
-- `lib/crates/fabro-workflow/src/operations/create.rs`
-- `lib/crates/fabro-workflow/src/operations/start.rs`
-- `lib/crates/fabro-workflow/src/operations/resume.rs`
-- `lib/crates/fabro-workflow/src/pipeline/finalize.rs`
-- `lib/crates/fabro-workflow/src/pipeline/pull_request.rs`
-- `lib/crates/fabro-workflow/src/handler/agent.rs`
-- `lib/crates/fabro-workflow/src/handler/parallel.rs`
-- `lib/crates/fabro-cli/src/commands/runs/rm.rs`
-- `lib/crates/fabro-cli/src/commands/run/rewind.rs`
+- `lib/components/fabro-workflow/src/event.rs`
+- `lib/components/fabro-workflow/src/lifecycle/event.rs`
+- `lib/components/fabro-workflow/src/lifecycle/disk.rs`
+- `lib/components/fabro-workflow/src/lifecycle/git.rs`
+- `lib/components/fabro-workflow/src/operations/create.rs`
+- `lib/components/fabro-workflow/src/operations/start.rs`
+- `lib/components/fabro-workflow/src/operations/resume.rs`
+- `lib/components/fabro-workflow/src/pipeline/finalize.rs`
+- `lib/components/fabro-workflow/src/pipeline/pull_request.rs`
+- `lib/components/fabro-workflow/src/handler/agent.rs`
+- `lib/components/fabro-workflow/src/handler/parallel.rs`
+- `lib/apps/fabro-cli/src/commands/runs/rm.rs`
+- `lib/apps/fabro-cli/src/commands/run/rewind.rs`
 - tests in `fabro-workflow`, `fabro-cli`, and `fabro-store`
 
 ## Phases
