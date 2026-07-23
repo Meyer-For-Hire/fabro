@@ -98,8 +98,6 @@ pub trait Sandbox: Send + Sync {
 
 ```rust
 pub struct SessionConfig {
-    pub max_turns: usize,                    // 0 = unlimited
-    pub max_tool_rounds_per_input: usize,    // default: 200
     pub default_command_timeout_ms: u64,     // default: 10s
     pub max_command_timeout_ms: u64,         // default: 600s
     pub enable_loop_detection: bool,         // default: true
@@ -134,7 +132,6 @@ let env = Arc::new(LocalSandbox::new(
 
 // 4. Configure the session
 let config = SessionConfig {
-    max_tool_rounds_per_input: 50,
     enable_loop_detection: true,
     user_instructions: Some("Always write tests first".into()),
     ..SessionConfig::default()

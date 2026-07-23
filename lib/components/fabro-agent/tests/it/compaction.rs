@@ -53,7 +53,6 @@ fn make_openai_session(cwd: &Path, base_url: String, api_key: String) -> Session
     let profile: Arc<dyn AgentProfile> = Arc::new(OpenAiProfile::new(MODEL));
     let sandbox = Arc::new(LocalSandbox::new(cwd.to_path_buf()));
     let options = SessionOptions {
-        max_turns: 20,
         enable_context_compaction: true,
         compaction_threshold_percent: 80,
         compaction_preserve_turns: 6,

@@ -90,8 +90,6 @@ const BUDGET_EXHAUSTED_HINTS: &[&str] = &[
     "context length",
     "budget",
     "quota exceeded",
-    "max_turns",
-    "max turns",
     "max_tokens",
     "max tokens",
     "context window exceeded",
@@ -1233,7 +1231,7 @@ mod tests {
 
     #[test]
     fn budget_exhausted_hints_count() {
-        assert_eq!(BUDGET_EXHAUSTED_HINTS.len(), 12);
+        assert_eq!(BUDGET_EXHAUSTED_HINTS.len(), 10);
     }
 
     #[test]
@@ -1309,22 +1307,6 @@ mod tests {
     fn classify_reason_quota_exceeded() {
         assert_eq!(
             classify_failure_reason("quota exceeded"),
-            FailureCategory::BudgetExhausted
-        );
-    }
-
-    #[test]
-    fn classify_reason_max_turns() {
-        assert_eq!(
-            classify_failure_reason("hit max_turns limit"),
-            FailureCategory::BudgetExhausted
-        );
-    }
-
-    #[test]
-    fn classify_reason_max_turns_space() {
-        assert_eq!(
-            classify_failure_reason("max turns reached"),
             FailureCategory::BudgetExhausted
         );
     }

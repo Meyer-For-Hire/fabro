@@ -674,12 +674,6 @@ fn event_body_from_event(event: &Event) -> EventBody {
             AgentEvent::LoopDetected => {
                 EventBody::AgentLoopDetected(fabro_types::AgentLoopDetectedProps { visit: *visit })
             }
-            AgentEvent::TurnLimitReached { max_turns } => {
-                EventBody::AgentTurnLimitReached(fabro_types::AgentTurnLimitReachedProps {
-                    max_turns: *max_turns,
-                    visit:     *visit,
-                })
-            }
             AgentEvent::SteeringInjected { text, .. } => {
                 EventBody::AgentSteeringInjected(fabro_types::AgentSteeringInjectedProps {
                     text:  text.clone(),

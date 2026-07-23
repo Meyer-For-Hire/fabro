@@ -374,7 +374,6 @@ V2 keeps the current durable family surface broadly intact.
 - `agent.error`
 - `agent.warning`
 - `agent.loop.detected`
-- `agent.turn.limit`
 - `agent.steering.injected`
 - `agent.compaction.started`
 - `agent.compaction.completed`

@@ -220,8 +220,6 @@ pub enum EventBody {
     AgentWarning(AgentWarningProps),
     #[serde(rename = "agent.loop.detected")]
     AgentLoopDetected(AgentLoopDetectedProps),
-    #[serde(rename = "agent.turn.limit")]
-    AgentTurnLimitReached(AgentTurnLimitReachedProps),
     #[serde(rename = "agent.steering.injected")]
     AgentSteeringInjected(AgentSteeringInjectedProps),
     #[serde(rename = "agent.pair.user_message")]
@@ -499,7 +497,6 @@ impl EventBody {
             Self::AgentError(_) => "agent.error",
             Self::AgentWarning(_) => "agent.warning",
             Self::AgentLoopDetected(_) => "agent.loop.detected",
-            Self::AgentTurnLimitReached(_) => "agent.turn.limit",
             Self::AgentSteeringInjected(_) => "agent.steering.injected",
             Self::AgentPairUserMessage(_) => "agent.pair.user_message",
             Self::AgentPairSystemMessage(_) => "agent.pair.system_message",
@@ -671,7 +668,6 @@ fn is_known_event_name(event: &str) -> bool {
             | "agent.error"
             | "agent.warning"
             | "agent.loop.detected"
-            | "agent.turn.limit"
             | "agent.steering.injected"
             | "agent.pair.user_message"
             | "agent.pair.system_message"

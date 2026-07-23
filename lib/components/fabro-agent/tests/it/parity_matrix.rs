@@ -126,11 +126,7 @@ async fn make_session(
     profile.register_subagent_tools(manager, factory, 0);
 
     let profile: Arc<dyn AgentProfile> = Arc::from(profile);
-    let config = SessionOptions {
-        max_turns: 20,
-        ..SessionOptions::default()
-    };
-    Session::new(client, profile, env, config, None)
+    Session::new(client, profile, env, SessionOptions::default(), None)
 }
 
 async fn make_session_with_config(
@@ -315,20 +311,17 @@ async fn openai_compatible_twin_uses_json_edit_file_tool() {
                         "old_string": "old",
                         "new_string": "new"
                     }),
-                )),
+                ))
+                .text("Done."),
         )
         .load(twin_openai().await)
         .await;
 
-    let config = SessionOptions {
-        max_turns: 2,
-        ..SessionOptions::default()
-    };
     let mut session = make_openai_compatible_twin_session(
         ProviderId::new("litellm"),
         "gpt-5.4-mini",
         tmp.path(),
-        config,
+        SessionOptions::default(),
         &twin,
     );
     session.initialize().await.unwrap();
@@ -767,7 +760,6 @@ macro_rules! reasoning_effort_tests {
         async fn $test_name() {
             let tmp = tempfile::tempdir().expect("failed to create tempdir");
             let config = SessionOptions {
-                max_turns: 20,
                 reasoning_effort: Some(fabro_llm::types::ReasoningEffort::Low),
                 ..SessionOptions::default()
             };
@@ -846,7 +838,6 @@ macro_rules! loop_detection_tests {
         async fn $test_name() {
             let tmp = tempfile::tempdir().expect("failed to create tempdir");
             let config = SessionOptions {
-                max_turns: 20,
                 loop_detection_window: 3,
                 ..SessionOptions::default()
             };

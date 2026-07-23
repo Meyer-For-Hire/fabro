@@ -284,9 +284,6 @@ pub enum AgentEvent {
         details: serde_json::Value,
     },
     LoopDetected,
-    TurnLimitReached {
-        max_turns: usize,
-    },
     SteeringInjected {
         text:  String,
         /// Principal that authored the steer. Lifted to top-level
@@ -463,9 +460,6 @@ impl AgentEvent {
             }
             Self::LoopDetected => {
                 warn!(session_id, "Loop detected");
-            }
-            Self::TurnLimitReached { max_turns } => {
-                warn!(session_id, max_turns, "Message limit reached");
             }
             Self::SteeringInjected { text, .. } => {
                 debug!(session_id, text_len = text.len(), "Steering injected");
