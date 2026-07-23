@@ -1,4 +1,4 @@
-use fabro_model::{ReasoningEffort, Speed};
+use fabro_model::{CostSource, ReasoningEffort, Speed};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use strum::{Display, EnumString, IntoStaticStr};
@@ -121,6 +121,9 @@ pub struct AgentMessageProps {
     pub text:            String,
     pub model:           ModelRef,
     pub billing:         BilledTokenCounts,
+    /// Provenance of the optional total in `billing`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_source:     Option<CostSource>,
     pub tool_call_count: usize,
     pub visit:           u32,
     /// Canonical replay-authoritative transcript message. Present on events
@@ -403,6 +406,7 @@ mod tests {
         });
         let props: AgentMessageProps = serde_json::from_value(v).unwrap();
         assert_eq!(props.text, "hello");
+        assert!(props.cost_source.is_none());
         assert!(props.message.is_none());
         assert!(props.context_window.is_none());
     }
@@ -416,6 +420,7 @@ mod tests {
             text:            "ok".to_string(),
             model:           sample_model_ref(),
             billing:         BilledTokenCounts::default(),
+            cost_source:     None,
             tool_call_count: 0,
             visit:           1,
             message:         Some(msg.clone()),

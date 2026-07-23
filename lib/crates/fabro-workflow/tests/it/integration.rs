@@ -2319,6 +2319,121 @@ reasoning = false
     );
 }
 
+#[tokio::test]
+async fn workflow_persists_authoritative_openrouter_cost_for_agent_stage() {
+    use fabro_auth::EnvCredentialSource;
+    use fabro_workflow::steering_hub::SteeringHub;
+    use httpmock::Method::POST;
+    use httpmock::MockServer;
+
+    const AUTHORITATIVE_COST_USD: f64 = 0.125;
+    const AUTHORITATIVE_COST_USD_MICROS: i64 = 125_000;
+
+    let server = MockServer::start_async().await;
+    let text_chunk = serde_json::json!({
+        "id": "chatcmpl_authoritative_cost",
+        "model": "openai/gpt-5.4",
+        "choices": [{
+            "delta": {"content": "done"},
+            "finish_reason": null
+        }]
+    });
+    let usage_chunk = serde_json::json!({
+        "id": "chatcmpl_authoritative_cost",
+        "model": "openai/gpt-5.4",
+        "choices": [],
+        "usage": {
+            "prompt_tokens": 11,
+            "completion_tokens": 7,
+            "total_tokens": 18,
+            "cost": AUTHORITATIVE_COST_USD
+        }
+    });
+    let response = format!("data: {text_chunk}\n\ndata: {usage_chunk}\n\ndata: [DONE]\n\n");
+    let completion_mock = server
+        .mock_async(|when, then| {
+            when.method(POST)
+                .path("/chat/completions")
+                .body_includes(r#""stream":true"#)
+                .body_includes("Report completion");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(response);
+        })
+        .await;
+
+    let settings: LlmCatalogSettings = toml::from_str(&format!(
+        r#"
+[providers.openrouter]
+enabled = true
+base_url = "{}"
+"#,
+        server.base_url()
+    ))
+    .expect("test catalog should parse");
+    let catalog = Arc::new(Catalog::from_builtin_with_overrides(&settings).unwrap());
+    let source = Arc::new(EnvCredentialSource::with_env_lookup(Arc::new(|name| {
+        (name == "OPENROUTER_API_KEY").then(|| "sk-test".to_string())
+    })));
+    let backend = AgentApiBackend::new_with_catalog(
+        "openai/gpt-5.4".to_string(),
+        ProviderId::from("openrouter"),
+        Vec::new(),
+        source,
+        Arc::new(SteeringHub::new(Arc::new(Emitter::default()))),
+        catalog,
+    );
+
+    let mut graph = make_graph_with_start_exit("AuthoritativeOpenRouterCost");
+    let mut work = Node::new("work");
+    work.attrs.insert(
+        "prompt".to_string(),
+        AttrValue::String("Report completion".to_string()),
+    );
+    graph.nodes.insert("work".to_string(), work);
+    graph.edges.push(Edge::new("start", "work"));
+    graph.edges.push(Edge::new("work", "exit"));
+
+    let mut registry = HandlerRegistry::new(Box::new(AgentHandler::new(Some(Box::new(backend)))));
+    registry.register("start", Box::new(StartHandler));
+    registry.register("exit", Box::new(ExitHandler));
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = WorkflowRunner::new(registry, Arc::new(Emitter::default()), local_env());
+    let run_options = RunOptions {
+        settings:         WorkflowSettings::default(),
+        run_dir:          dir.path().to_path_buf(),
+        cancel_token:     CancellationToken::new(),
+        run_id:           test_run_id("authoritative-openrouter-cost"),
+        labels:           std::collections::HashMap::new(),
+        workflow_slug:    None,
+        github_app:       None,
+        base_branch:      None,
+        display_base_sha: None,
+        pre_run_git:      None,
+        fork_source_ref:  None,
+        git:              None,
+    };
+
+    let (outcome, state) = engine
+        .run_with_state(&graph, &run_options)
+        .await
+        .expect("workflow execution should complete");
+    assert_eq!(outcome.status, StageOutcome::Succeeded);
+    assert_eq!(completion_mock.calls_async().await, 1);
+
+    let work = state
+        .stage(&fabro_types::StageId::new("work", 1))
+        .expect("agent stage should be projected");
+    assert_eq!(work.usage.input_tokens, 11);
+    assert_eq!(work.usage.output_tokens, 7);
+    assert_eq!(
+        work.usage.total_usd_micros,
+        Some(AUTHORITATIVE_COST_USD_MICROS),
+        "provider-reported usage.cost should override the catalog estimate"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 12. Parallel fan-out / fan-in integration test (Gap #14)
 // ---------------------------------------------------------------------------

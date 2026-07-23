@@ -284,7 +284,7 @@ audit [
 | `weight` | Integer | Priority for tiebreaking (higher wins, default: 0) |
 | `fidelity` | String | Override fidelity level for this transition |
 | `thread_id` | String | Override thread ID for this transition |
-| `loop_restart` | Boolean | Mark this edge as a loop restart point |
+| `loop_restart` | Boolean | Restart the workflow from this edge's target when taken: stage history and retry counts clear and the context resets to empty (visit counts are kept). Failed outcomes may only take it for `transient_infra` failures — see [Failures](/execution/failures#loop-restart-edges) |
 | `freeform` | Boolean | When `true` on a human-gate edge, accept free-text input instead of fixed choices |
 
 ## Condition expressions

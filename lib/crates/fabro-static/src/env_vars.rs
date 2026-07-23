@@ -114,6 +114,7 @@ impl EnvVars {
     pub const CI: &'static str = "CI";
     pub const CLICOLOR: &'static str = "CLICOLOR";
     pub const CLICOLOR_FORCE: &'static str = "CLICOLOR_FORCE";
+    pub const FORCE_COLOR: &'static str = "FORCE_COLOR";
     pub const HOME: &'static str = "HOME";
     pub const KUBERNETES_SERVICE_HOST: &'static str = "KUBERNETES_SERVICE_HOST";
     pub const LANG: &'static str = "LANG";
@@ -251,6 +252,7 @@ mod tests {
             EnvVars::CI,
             EnvVars::CLICOLOR,
             EnvVars::CLICOLOR_FORCE,
+            EnvVars::FORCE_COLOR,
             EnvVars::HOME,
             EnvVars::KUBERNETES_SERVICE_HOST,
             EnvVars::LANG,

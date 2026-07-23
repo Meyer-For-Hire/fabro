@@ -149,7 +149,7 @@ fn token_counts_from_llm_usage(usage: &LlmTokenCounts) -> TokenCounts {
 mod tests {
     use fabro_llm::types::TokenCounts;
     use fabro_model::catalog::LlmCatalogSettings;
-    use fabro_model::{Catalog, ModelRef, ProviderId, Speed};
+    use fabro_model::{Catalog, ModelRef, ProviderId, Speed, UsdMicros};
 
     use super::{OutcomeExt, billed_model_usage_from_llm};
 
@@ -180,6 +180,24 @@ mod tests {
         assert_eq!(billed.total_usd_micros, Some(3_562_500));
         assert_eq!(billed.tokens().output_tokens, 125_000);
         assert_eq!(billed.tokens().reasoning_tokens, 25_000);
+    }
+
+    #[test]
+    fn response_cost_overrides_catalog_estimate() {
+        let usage = TokenCounts {
+            input_tokens: 11,
+            output_tokens: 7,
+            ..TokenCounts::default()
+        };
+        let billed = billed_model_usage_from_llm(
+            Catalog::builtin(),
+            &model_ref(ProviderId::openai(), "gpt-5.4", None),
+            &usage,
+        )
+        .unwrap()
+        .with_reported_cost(Some(UsdMicros(125_000)));
+
+        assert_eq!(billed.total_usd_micros, Some(125_000));
     }
 
     #[test]
