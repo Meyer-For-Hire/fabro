@@ -5,7 +5,8 @@ use std::time::Instant;
 
 use fabro_agent::{Sandbox, ToolSecrets};
 use fabro_auth::{
-    CredentialSource, EnvCredentialSource, VaultCredentialSource, auth_issue_message,
+    CredentialSource, EnvCredentialSource, ExtraHeadersCredentialSource, VaultCredentialSource,
+    auth_issue_message,
 };
 use fabro_graphviz::graph;
 use fabro_hooks::{HookContext, HookDecision, HookEvent, HookExecutionContext, HookRunner};
@@ -260,11 +261,23 @@ fn graph_needs_api_backend(graph: &graph::Graph) -> bool {
     graph.nodes.values().any(routing::node_needs_api_backend)
 }
 
-fn build_llm_source(vault: Option<Arc<AsyncRwLock<Vault>>>) -> Arc<dyn CredentialSource> {
-    match vault {
+/// Trace header attached to every LLM request in a run so gateways that
+/// understand it (e.g. OpenRouter broadcast) can group the run's requests
+/// into one session. Explicit `extra_headers` provider configuration wins.
+const SESSION_ID_HEADER: &str = "x-session-id";
+
+fn build_llm_source(
+    vault: Option<Arc<AsyncRwLock<Vault>>>,
+    run_id: fabro_types::RunId,
+) -> Arc<dyn CredentialSource> {
+    let inner: Arc<dyn CredentialSource> = match vault {
         Some(vault) => Arc::new(VaultCredentialSource::new(vault)),
         None => Arc::new(EnvCredentialSource::new()),
-    }
+    };
+    Arc::new(ExtraHeadersCredentialSource::new(
+        inner,
+        HashMap::from([(SESSION_ID_HEADER.to_string(), run_id.to_string())]),
+    ))
 }
 
 /// INITIALIZE phase: prepare the sandbox, env, and handlers for execution.
@@ -277,7 +290,7 @@ pub async fn initialize(
     options.run_options.run_dir = run_dir.clone();
     options.run_options.git = options.git.clone();
 
-    let llm_source = build_llm_source(options.vault.clone());
+    let llm_source = build_llm_source(options.vault.clone(), options.run_options.run_id);
     let tool_secrets = tool_secrets_from_configured_sources(options.vault.as_ref()).await;
     let catalog = Arc::clone(&options.catalog);
     let sandbox_git = Arc::new(SandboxGitRuntime::new());
@@ -1026,6 +1039,32 @@ mod tests {
         .unwrap();
 
         assert!(!effective_dry_run);
+    }
+
+    #[tokio::test]
+    async fn build_llm_source_appends_run_session_trace_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vault = Vault::load(dir.path().join("secrets.json")).unwrap();
+        vault
+            .set(
+                "ANTHROPIC_API_KEY",
+                "anthropic-key",
+                SecretType::Token,
+                None,
+            )
+            .unwrap();
+        let vault = Arc::new(AsyncRwLock::new(vault));
+
+        let source = build_llm_source(Some(vault), test_run_id());
+        let resolved = source.resolve(test_catalog().as_ref()).await.unwrap();
+
+        assert!(!resolved.credentials.is_empty());
+        for credential in &resolved.credentials {
+            assert_eq!(
+                credential.extra_headers.get(SESSION_ID_HEADER),
+                Some(&test_run_id().to_string())
+            );
+        }
     }
 
     #[tokio::test]
