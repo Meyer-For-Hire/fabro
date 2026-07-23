@@ -62,26 +62,13 @@ pub(crate) fn resolve_provider_context(
         .get_on_provider(default_provider_id, model)
         .is_some()
     {
+        // The run's selected provider is a pin whenever it offers the model.
         default_provider_id.clone()
     } else {
-        // The run's selected provider is a pin, matching transform-time
-        // semantics: a selector the pinned provider does not offer passes
-        // through to it as a custom model rather than re-selecting a
-        // higher-priority provider.
-        match catalog.resolve_selection(
-            Some(model),
-            Some(default_provider_id),
-            &catalog.all_provider_ids(),
-        ) {
-            Ok(selected) => selected.provider,
-            Err(fabro_model::ModelSelectionError::UnknownProvider { .. }) => {
-                match catalog.select(model, None, &catalog.all_provider_ids()) {
-                    Ok(model) => model.provider.clone(),
-                    Err(fabro_model::ModelSelectionError::UnknownSelector { .. }) => {
-                        default_provider_id.clone()
-                    }
-                    Err(error) => return Err(error.into()),
-                }
+        match catalog.select(model, None, &catalog.all_provider_ids()) {
+            Ok(model) => model.provider.clone(),
+            Err(fabro_model::ModelSelectionError::UnknownSelector { .. }) => {
+                default_provider_id.clone()
             }
             Err(error) => return Err(error.into()),
         }
