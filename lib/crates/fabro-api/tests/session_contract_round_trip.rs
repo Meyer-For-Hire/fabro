@@ -5,6 +5,7 @@ use fabro_api::types::{
     SessionDetail as ApiSessionDetail, SessionRecord as ApiSessionRecord,
     SessionSummary as ApiSessionSummary, SessionTurn as ApiSessionTurn, SubmitTurnRequest,
 };
+use fabro_model::ProviderId;
 use fabro_types::{
     SessionDetail, SessionId, SessionMessage, SessionRecord, SessionStatus, SessionSummary,
     SessionTurn, TurnId, fixtures,
@@ -33,6 +34,7 @@ fn session_detail_round_trips_messages_active_turn_and_last_seq() {
             title: Some("Ask Fabro".to_string()),
             status: SessionStatus::Running,
             model: Some("gpt-5.4".to_string()),
+            provider: Some(ProviderId::openai()),
             active_turn: Some(SessionTurn {
                 id:         turn_id,
                 started_at: turn_started_at,

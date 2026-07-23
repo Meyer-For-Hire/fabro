@@ -20,7 +20,7 @@ use fabro_llm::types::{Request, Response};
 use fabro_mcp::config::McpServerSettings;
 #[cfg(test)]
 use fabro_model::catalog::LlmCatalogSettings;
-use fabro_model::{AgentProfileKind, Catalog, ModelHandle, ProviderId};
+use fabro_model::{AgentProfileKind, Catalog, ModelHandle, ModelSelectionError, ProviderId};
 use fabro_static::EnvVars;
 use fabro_util::terminal::Styles;
 use fabro_vault::SecretStore;
@@ -255,7 +255,11 @@ fn parse_provider(args: &AgentArgs) -> anyhow::Result<ProviderId> {
     Ok(provider_str.parse()?)
 }
 
-fn resolve_provider_id(catalog: &Catalog, args: &AgentArgs) -> anyhow::Result<ProviderId> {
+fn resolve_provider_id(
+    catalog: &Catalog,
+    args: &AgentArgs,
+    eligible_providers: &std::collections::HashSet<ProviderId>,
+) -> anyhow::Result<ProviderId> {
     if args.provider.is_some() {
         let requested = parse_provider(args)?;
         return Ok(catalog
@@ -263,8 +267,10 @@ fn resolve_provider_id(catalog: &Catalog, args: &AgentArgs) -> anyhow::Result<Pr
             .map_or(requested, |provider| provider.id.clone()));
     }
     if let Some(model_id) = args.model.as_deref() {
-        if let Some(model) = catalog.get(model_id) {
-            return Ok(model.provider.clone());
+        match catalog.select(model_id, None, eligible_providers) {
+            Ok(model) => return Ok(model.provider.clone()),
+            Err(ModelSelectionError::UnknownSelector { .. }) => {}
+            Err(error) => return Err(error.into()),
         }
     }
     let requested = parse_provider(args)?;
@@ -530,7 +536,7 @@ pub async fn run_with_args_and_client_and_catalog(
     // threads
     let styles: &'static Styles = Box::leak(Box::new(Styles::detect_stderr()));
 
-    let provider_id = resolve_provider_id(&catalog, &args)?;
+    let provider_id = resolve_provider_id(&catalog, &args, &client.provider_ids())?;
     ensure_provider_registered(&client, &provider_id)?;
 
     if args.verbose {
@@ -550,6 +556,7 @@ pub async fn run_with_args_and_client_and_catalog(
                     "provider '{provider_id}' has no default model in the catalog; pass --model explicitly"
                 )
             })?
+            .to_string()
     };
     let profile_kind = profile_kind_for_provider(&catalog, &provider_id, Some(&model))?;
     eprintln!("{}", styles.dim.apply_to(format!("Using model: {model}")));
@@ -1089,7 +1096,7 @@ mod tests {
         };
 
         assert_eq!(
-            resolve_provider_id(&catalog, &args).unwrap(),
+            resolve_provider_id(&catalog, &args, &catalog.all_provider_ids()).unwrap(),
             ProviderId::new("acme-aws")
         );
     }
@@ -1121,7 +1128,7 @@ mod tests {
         };
 
         assert_eq!(
-            resolve_provider_id(&catalog, &args).unwrap(),
+            resolve_provider_id(&catalog, &args, &catalog.all_provider_ids()).unwrap(),
             ProviderId::new("acme-aws")
         );
     }

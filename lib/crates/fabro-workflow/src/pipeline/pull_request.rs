@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 
 use fabro_auth::CredentialSource;
@@ -5,7 +6,7 @@ use fabro_github::{self as github_app, ssh_url_to_https};
 use fabro_graphviz::parser;
 use fabro_llm::client::Client;
 use fabro_llm::generate::{GenerateParams, generate_object};
-use fabro_model::Catalog;
+use fabro_model::{Catalog, ProviderId};
 use fabro_store::RunProjection;
 use fabro_types::PullRequestLink;
 use fabro_types::settings::run::MergeStrategy;
@@ -66,9 +67,14 @@ const UNKNOWN_MODEL_CTX: usize = 200_000;
 
 /// Resolve truncation caps based on the model's context window. Unknown
 /// models use the baseline 200k context-window assumption.
-fn truncation_caps(model: &str, catalog: &Catalog) -> TruncationCaps {
+fn truncation_caps(
+    model: &str,
+    eligible: &HashSet<ProviderId>,
+    catalog: &Catalog,
+) -> TruncationCaps {
     let ctx = catalog
-        .get(model)
+        .select(model, None, eligible)
+        .ok()
         .and_then(|m| usize::try_from(m.context_window()).ok())
         .unwrap_or(UNKNOWN_MODEL_CTX);
 
@@ -395,7 +401,8 @@ async fn build_pr_content_with_client(
     let run_spec = run_state.map(|state| state.spec.clone());
     let dot_source = run_state.and_then(|state| state.spec.graph_source.clone());
 
-    let caps = truncation_caps(model, catalog);
+    let eligible = client.provider_ids();
+    let caps = truncation_caps(model, &eligible, catalog);
     let truncated_diff = truncate_chars(diff, caps.diff);
 
     let prompt = if let Some(ref plan) = plan_text {
@@ -1523,7 +1530,11 @@ mod tests {
             }
         );
         assert_eq!(
-            truncation_caps("unknown-model", Catalog::builtin()),
+            truncation_caps(
+                "unknown-model",
+                &Catalog::builtin().all_provider_ids(),
+                Catalog::builtin(),
+            ),
             TruncationCaps {
                 diff: 80_000,
                 plan: 20_000,

@@ -58,10 +58,20 @@ pub(crate) fn resolve_provider_context(
             })?
             .id
             .clone()
-    } else if let Some(model) = catalog.get(model) {
-        model.provider.clone()
-    } else {
+    } else if catalog
+        .get_on_provider(default_provider_id, model)
+        .is_some()
+    {
+        // The run's selected provider is a pin whenever it offers the model.
         default_provider_id.clone()
+    } else {
+        match catalog.select(model, None, &catalog.all_provider_ids()) {
+            Ok(model) => model.provider.clone(),
+            Err(fabro_model::ModelSelectionError::UnknownSelector { .. }) => {
+                default_provider_id.clone()
+            }
+            Err(error) => return Err(error.into()),
+        }
     };
 
     let provider = catalog.provider(&provider_id).ok_or_else(|| {

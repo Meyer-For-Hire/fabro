@@ -17,18 +17,18 @@ fn profile_context_window_matches_catalog_for_default_models() {
 
         let profile: Box<dyn AgentProfile> = match provider.agent_profile {
             fabro_model::AgentProfileKind::OpenAi if provider.id == ProviderId::openai() => {
-                Box::new(OpenAiProfile::new(model).with_catalog(Arc::clone(&catalog)))
+                Box::new(OpenAiProfile::new(model.as_str()).with_catalog(Arc::clone(&catalog)))
             }
             fabro_model::AgentProfileKind::OpenAi => Box::new(
-                OpenAiProfile::new(model)
+                OpenAiProfile::new(model.as_str())
                     .with_provider_id(provider.id.clone())
                     .with_catalog(Arc::clone(&catalog)),
             ),
             fabro_model::AgentProfileKind::Gemini => {
-                Box::new(GeminiProfile::new(model).with_catalog(Arc::clone(&catalog)))
+                Box::new(GeminiProfile::new(model.as_str()).with_catalog(Arc::clone(&catalog)))
             }
             fabro_model::AgentProfileKind::Anthropic => {
-                Box::new(AnthropicProfile::new(model).with_catalog(Arc::clone(&catalog)))
+                Box::new(AnthropicProfile::new(model.as_str()).with_catalog(Arc::clone(&catalog)))
             }
         };
 

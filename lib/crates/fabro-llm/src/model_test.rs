@@ -54,7 +54,7 @@ pub async fn run_model_test(
 }
 
 async fn run_basic_test(info: &Model, client: Arc<Client>) -> ModelTestOutcome {
-    run_basic_model_probe(&info.id, &info.provider, client).await
+    run_basic_model_probe(info.id.as_str(), &info.provider, client).await
 }
 
 /// Run the cheap single-prompt model availability probe without requiring a
@@ -132,7 +132,7 @@ fn build_deep_test_params(info: &Model, client: Arc<Client>) -> Option<GenerateP
         },
     );
 
-    let mut params = GenerateParams::new(&info.id, client)
+    let mut params = GenerateParams::new(info.id.to_string(), client)
         .provider(info.provider.to_string())
         .prompt(
             "Use the add tool twice: first add 15 and 27, then add that result to 42. \
@@ -176,7 +176,7 @@ mod tests {
 
     fn test_model_with(features: ModelFeatures) -> Model {
         Model {
-            id: "test-model".to_string(),
+            id: "test-model".into(),
             provider: ProviderId::anthropic(),
             family: "test".to_string(),
             display_name: "Test Model".to_string(),

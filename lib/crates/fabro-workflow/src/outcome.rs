@@ -156,7 +156,7 @@ mod tests {
     fn model_ref(provider: ProviderId, model_id: &str, speed: Option<Speed>) -> ModelRef {
         ModelRef {
             provider,
-            model_id: model_id.to_string(),
+            model_id: model_id.into(),
             speed,
         }
     }

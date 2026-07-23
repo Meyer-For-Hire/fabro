@@ -36,13 +36,13 @@ pub trait AgentProfile: Send + Sync {
     }
 
     fn knowledge_cutoff(&self) -> Option<String> {
-        self.catalog()
-            .and_then(|catalog| catalog.get(self.model()))
+        self.catalog_model()
             .and_then(|m| m.knowledge_cutoff().map(str::to_string))
     }
 
     fn catalog_model(&self) -> Option<&Model> {
-        self.catalog().and_then(|catalog| catalog.get(self.model()))
+        let catalog = self.catalog()?;
+        catalog.get_on_provider(&self.provider_id(), self.model())
     }
 
     fn context_window_size(&self) -> usize {

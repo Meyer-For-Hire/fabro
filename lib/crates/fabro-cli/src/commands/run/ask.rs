@@ -11,8 +11,9 @@ pub(crate) async fn run(args: AskArgs, base_ctx: &CommandContext) -> Result<()> 
     let run_id = client.resolve_run(&args.run).await?.id;
     let session = client
         .create_run_session(run_id, CreateRunSessionRequest {
-            title: Some(session_title(&args.prompt)),
-            model: args.model,
+            title:    Some(session_title(&args.prompt)),
+            model:    args.model,
+            provider: None,
         })
         .await?;
     let mut stream = client

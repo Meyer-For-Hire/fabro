@@ -17,6 +17,7 @@ use fabro_config::{RunLayer, ServerSettingsBuilder, Storage, envfile};
 use fabro_db::DbPool;
 use fabro_interview::Interviewer;
 use fabro_model::catalog::{LlmCatalogSettings, ProviderCatalogSettings};
+use fabro_model::{Catalog, ProviderId};
 use fabro_sandbox::SandboxProviderRegistry;
 use fabro_static::EnvVars;
 use fabro_store::{ArtifactStore, Database};
@@ -49,6 +50,27 @@ pub const TEST_DEV_TOKEN: &str =
     "fabro_dev_abababababababababababababababababababababababababababababababab";
 pub const TEST_SESSION_SECRET: &str =
     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const TEST_OPENAI_API_KEY: &str = "test-openai-api-key";
+const FABRO_TEST_ASSUME_LLM_READY: &str = "FABRO_TEST_ASSUME_LLM_READY";
+
+/// Supply enabled catalog providers to CLI fixture run materialization.
+///
+/// This is scoped to the `test-support` feature and an explicit child-process
+/// flag. The CLI suite shares a server whose credential state can change
+/// between tests, so the flag deliberately ignores that mutable state. It does
+/// not register adapters or make model execution available.
+pub(crate) fn test_run_materialization_provider_ids(
+    catalog: &Catalog,
+    ready_provider_ids: &[ProviderId],
+) -> Vec<ProviderId> {
+    let assume_ready = process_env_var(FABRO_TEST_ASSUME_LLM_READY)
+        .is_some_and(|value| !matches!(value.as_str(), "" | "0" | "false" | "no"));
+    if assume_ready {
+        catalog.all_provider_ids().into_iter().collect()
+    } else {
+        ready_provider_ids.to_vec()
+    }
+}
 
 pub fn default_test_server_settings() -> ServerSettings {
     ServerSettingsBuilder::from_toml(
@@ -320,13 +342,13 @@ pub fn llm_catalog_settings_with_provider_base_url(
 }
 
 pub fn test_app_state() -> Arc<AppState> {
-    TestAppStateBuilder::new().build()
+    ready_test_app_state_builder().build()
 }
 
 pub fn test_app_state_with_registry_factory(
     registry_factory_override: impl Fn(Arc<dyn Interviewer>) -> HandlerRegistry + Send + Sync + 'static,
 ) -> Arc<AppState> {
-    TestAppStateBuilder::new()
+    ready_test_app_state_builder()
         .registry_factory(registry_factory_override)
         .build()
 }
@@ -336,7 +358,7 @@ pub fn test_app_state_with_settings_and_registry_factory(
     manifest_run_defaults: RunLayer,
     registry_factory_override: impl Fn(Arc<dyn Interviewer>) -> HandlerRegistry + Send + Sync + 'static,
 ) -> Arc<AppState> {
-    TestAppStateBuilder::new()
+    ready_test_app_state_builder()
         .runtime_settings(server_settings, manifest_run_defaults)
         .registry_factory(registry_factory_override)
         .build()
@@ -348,7 +370,7 @@ pub fn test_app_state_with_options_and_registry_factory(
     max_concurrent_runs: usize,
     registry_factory_override: impl Fn(Arc<dyn Interviewer>) -> HandlerRegistry + Send + Sync + 'static,
 ) -> Arc<AppState> {
-    TestAppStateBuilder::new()
+    ready_test_app_state_builder()
         .runtime_settings(server_settings, manifest_run_defaults)
         .max_concurrent_runs(max_concurrent_runs)
         .registry_factory(registry_factory_override)
@@ -360,10 +382,14 @@ pub fn test_app_state_with_options(
     manifest_run_defaults: RunLayer,
     max_concurrent_runs: usize,
 ) -> Arc<AppState> {
-    TestAppStateBuilder::new()
+    ready_test_app_state_builder()
         .runtime_settings(server_settings, manifest_run_defaults)
         .max_concurrent_runs(max_concurrent_runs)
         .build()
+}
+
+fn ready_test_app_state_builder() -> TestAppStateBuilder {
+    TestAppStateBuilder::new().vault_entries([(EnvVars::OPENAI_API_KEY, TEST_OPENAI_API_KEY)])
 }
 
 pub(crate) fn resolved_runtime_settings_for_tests(
@@ -383,7 +409,7 @@ pub fn test_app_state_with_runtime_settings_and_registry_factory(
     manifest_run_defaults: RunLayer,
     registry_factory_override: impl Fn(Arc<dyn Interviewer>) -> HandlerRegistry + Send + Sync + 'static,
 ) -> Arc<AppState> {
-    TestAppStateBuilder::new()
+    ready_test_app_state_builder()
         .runtime_settings(server_settings, manifest_run_defaults)
         .registry_factory(registry_factory_override)
         .build()
@@ -395,7 +421,7 @@ pub fn test_app_state_with_runtime_settings_and_options_and_registry_factory(
     max_concurrent_runs: usize,
     registry_factory_override: impl Fn(Arc<dyn Interviewer>) -> HandlerRegistry + Send + Sync + 'static,
 ) -> Arc<AppState> {
-    TestAppStateBuilder::new()
+    ready_test_app_state_builder()
         .runtime_settings(server_settings, manifest_run_defaults)
         .max_concurrent_runs(max_concurrent_runs)
         .registry_factory(registry_factory_override)
@@ -407,7 +433,7 @@ pub fn test_app_state_with_runtime_settings_and_options(
     manifest_run_defaults: RunLayer,
     max_concurrent_runs: usize,
 ) -> Arc<AppState> {
-    TestAppStateBuilder::new()
+    ready_test_app_state_builder()
         .runtime_settings(server_settings, manifest_run_defaults)
         .max_concurrent_runs(max_concurrent_runs)
         .build()
@@ -475,7 +501,7 @@ pub fn test_app_state_with_runtime_settings_and_session_key(
         )
         .expect("test server env should be writable");
     }
-    TestAppStateBuilder::new()
+    ready_test_app_state_builder()
         .runtime_settings(server_settings, manifest_run_defaults)
         .vault_path(vault_path)
         .server_env_path(server_env_path)
@@ -501,7 +527,7 @@ pub fn test_app_state_with_store(
     store: Arc<Database>,
     artifact_store: ArtifactStore,
 ) -> Arc<AppState> {
-    TestAppStateBuilder::new()
+    ready_test_app_state_builder()
         .runtime_settings(server_settings, manifest_run_defaults)
         .max_concurrent_runs(max_concurrent_runs)
         .store_bundle(store, artifact_store)
@@ -612,7 +638,7 @@ pub fn test_app_state_with_store_and_runtime_settings(
     store: Arc<Database>,
     artifact_store: ArtifactStore,
 ) -> Arc<AppState> {
-    TestAppStateBuilder::new()
+    ready_test_app_state_builder()
         .runtime_settings(server_settings, manifest_run_defaults)
         .max_concurrent_runs(max_concurrent_runs)
         .store_bundle(store, artifact_store)

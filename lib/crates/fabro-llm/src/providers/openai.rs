@@ -9,7 +9,7 @@ use crate::error::Error;
 use crate::provider::{
     ProviderAdapter, StreamEventStream, validate_standard_speed, validate_tool_choice,
 };
-use crate::providers::common::{self as common};
+use crate::providers::common::{self as common, CatalogRoute};
 use crate::token_count::{InputTokenCount, InputTokenCountMethod};
 use crate::transport::{self, HttpTransport, SseFraming};
 use crate::types::{AdapterTimeout, Request, Response, StreamEvent};
@@ -131,7 +131,7 @@ impl Adapter {
             request,
             provider_name: &self.provider_name,
             deployment_id,
-            model: common::catalog_model(self.catalog.as_deref(), &request.model),
+            model: self.catalog_model(&request.model),
             params,
         }
     }
@@ -192,6 +192,16 @@ impl Adapter {
     }
 }
 
+impl common::CatalogRoute for Adapter {
+    fn catalog(&self) -> Option<&Catalog> {
+        self.catalog.as_deref()
+    }
+
+    fn provider_name(&self) -> &str {
+        &self.provider_name
+    }
+}
+
 #[async_trait::async_trait]
 impl ProviderAdapter for Adapter {
     fn name(&self) -> &str {
@@ -214,7 +224,7 @@ impl ProviderAdapter for Adapter {
 
         let resolved = self.resolve_request(request).await;
         let codec = OpenAiResponses;
-        let deployment_id = common::api_model_id(self.catalog.as_deref(), &resolved.model);
+        let deployment_id = self.api_model_id(&resolved.model);
         let params = self.codec_params();
         let ctx = self.codec_ctx(&resolved, &deployment_id, &params);
 
@@ -250,7 +260,7 @@ impl ProviderAdapter for Adapter {
 
         let resolved = self.resolve_request(request).await;
         let codec = OpenAiResponses;
-        let deployment_id = common::api_model_id(self.catalog.as_deref(), &resolved.model);
+        let deployment_id = self.api_model_id(&resolved.model);
         let params = self.codec_params();
         let ctx = self.codec_ctx(&resolved, &deployment_id, &params);
 
@@ -267,7 +277,7 @@ impl ProviderAdapter for Adapter {
 
         let resolved = self.resolve_request(request).await;
         let codec = OpenAiResponses;
-        let deployment_id = common::api_model_id(self.catalog.as_deref(), &resolved.model);
+        let deployment_id = self.api_model_id(&resolved.model);
         let params = self.codec_params();
         let ctx = self.codec_ctx(&resolved, &deployment_id, &params);
 

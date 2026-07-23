@@ -3,6 +3,7 @@ use std::sync::Arc;
 use fabro_auth::ApiCredential;
 use fabro_llm::client::Client as LlmClient;
 use fabro_llm::model_test::{ModelTestStatus, run_basic_model_probe};
+use fabro_model::ModelSelectionError;
 use fabro_redact::redact_string;
 
 use super::super::{
@@ -40,7 +41,9 @@ struct ModelListParams {
 #[derive(serde::Deserialize)]
 struct ModelTestParams {
     #[serde(default)]
-    mode: Option<String>,
+    mode:     Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
 }
 
 async fn list_models(
@@ -62,7 +65,7 @@ async fn list_models(
         .into_iter()
         .filter(|model| match &query {
             Some(query) => {
-                model.id.to_lowercase().contains(query)
+                model.id.as_str().to_lowercase().contains(query)
                     || model.display_name.to_lowercase().contains(query)
                     || model
                         .aliases
@@ -155,7 +158,7 @@ async fn test_provider_credentials(
         .into_response();
     };
 
-    let outcome = run_basic_model_probe(&model.id, &provider_id, client).await;
+    let outcome = run_basic_model_probe(model.id.as_str(), &provider_id, client).await;
     match outcome.status {
         ModelTestStatus::Ok => (
             StatusCode::OK,
@@ -204,11 +207,6 @@ async fn test_model(
         },
         None => ModelTestMode::Basic,
     };
-    let catalog = state.catalog();
-    let Some(info) = catalog.get(&id) else {
-        return ApiError::not_found(format!("Model not found: {id}")).into_response();
-    };
-
     let llm_result = match state.resolve_llm_client().await {
         Ok(result) => result,
         Err(err) => {
@@ -218,6 +216,23 @@ async fn test_model(
                 format!("Failed to resolve LLM client: {err}"),
             )
             .into_response();
+        }
+    };
+    let catalog = state.catalog();
+    let eligible = llm_result
+        .provider_ids()
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let explicit_provider = params.provider.map(ProviderId::new);
+    let info = if let Some(provider) = explicit_provider.as_ref() {
+        match catalog.resolve_on_provider(provider, &id) {
+            Ok(info) => info,
+            Err(error) => return model_selection_response(&error),
+        }
+    } else {
+        match catalog.select(&id, None, &eligible) {
+            Ok(info) => info,
+            Err(error) => return model_selection_response(&error),
         }
     };
     if let Some((_, issue)) = llm_result
@@ -231,6 +246,7 @@ async fn test_model(
     if !llm_result.client.has_provider(provider_name) {
         return Json(serde_json::json!({
             "model_id": info.id,
+            "provider": info.provider,
             "status": "skip",
         }))
         .into_response();
@@ -240,8 +256,24 @@ async fn test_model(
     let outcome = run_model_test(info, mode, client).await;
     Json(serde_json::json!({
         "model_id": info.id,
+        "provider": info.provider,
         "status": <&'static str>::from(outcome.status),
         "error_message": outcome.error_message,
     }))
     .into_response()
+}
+
+fn model_selection_response(error: &ModelSelectionError) -> Response {
+    match error {
+        ModelSelectionError::UnknownProvider { .. }
+        | ModelSelectionError::UnknownSelector { .. }
+        | ModelSelectionError::UnknownSelectorOnProvider { .. } => {
+            ApiError::not_found(error.to_string()).into_response()
+        }
+        ModelSelectionError::ProviderUnavailable { .. }
+        | ModelSelectionError::NoEligibleOffering { .. }
+        | ModelSelectionError::NoDefaultModel { .. } => {
+            ApiError::bad_request(error.to_string()).into_response()
+        }
+    }
 }

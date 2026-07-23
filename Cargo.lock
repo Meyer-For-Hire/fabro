@@ -3368,6 +3368,7 @@ dependencies = [
  "fabro-util",
  "fabro-validate",
  "fabro-vault",
+ "fabro-workflow",
  "futures",
  "git2",
  "hex",

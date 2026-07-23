@@ -100,9 +100,10 @@ pub(crate) async fn validate_api_key(
     .await
     .context("failed to create LLM client")?;
 
-    let probe_model = catalog
-        .probe_for_provider(provider)
-        .map_or_else(|| format!("unknown-{provider}"), |model| model.id.clone());
+    let probe_model = catalog.probe_for_provider(provider).map_or_else(
+        || format!("unknown-{provider}"),
+        |model| model.id.to_string(),
+    );
 
     let params = GenerateParams::new(probe_model, Arc::new(client))
         .provider(provider.to_string())

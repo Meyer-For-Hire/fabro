@@ -27,6 +27,9 @@ export interface HookDefinition {
     'type'?: HookDefinitionTypeEnum | null;
     'url'?: string | null;
     'headers'?: { [key: string]: string; } | null;
+    /**
+     * Allowlist of environment variable names that an http hook header may read via `{{ env.NAME }}`. An empty list (the default) permits no env vars in headers.
+     */
     'allowed_env_vars'?: Array<string>;
     'tls'?: TlsMode;
     'prompt'?: string | null;

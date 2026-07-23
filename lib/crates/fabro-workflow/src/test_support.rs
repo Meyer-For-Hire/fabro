@@ -9,6 +9,8 @@ use fabro_auth::{CredentialSource, EnvCredentialSource};
 use fabro_graphviz::graph::Graph as GvGraph;
 use fabro_interview::AutoApproveInterviewer;
 use fabro_model::Catalog;
+#[cfg(feature = "test-support")]
+use fabro_model::ProviderId;
 use fabro_store::{ArtifactStore, Database, RunProjection};
 use object_store::local::LocalFileSystem;
 
@@ -25,6 +27,19 @@ use crate::run_metadata::RunMetadataRuntime;
 use crate::run_options::RunOptions;
 use crate::sandbox_git_runtime::SandboxGitRuntime;
 use crate::services::{EngineServices, RunLocations, RunServices};
+
+#[cfg(feature = "test-support")]
+pub(crate) fn test_configured_provider_ids(
+    catalog: &Catalog,
+    configured_provider_ids: Vec<ProviderId>,
+    assume_ready: bool,
+) -> Vec<ProviderId> {
+    if assume_ready {
+        catalog.all_provider_ids().into_iter().collect()
+    } else {
+        configured_provider_ids
+    }
+}
 
 /// These helpers stop at EXECUTE, so they emit the terminal event here to
 /// keep test consumers seeing the same end-of-run signal as production

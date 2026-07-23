@@ -2167,7 +2167,7 @@ async fn validate_llm_provider(
         })?
         .id
         .clone();
-    let params = GenerateParams::new(probe_model, Arc::new(client))
+    let params = GenerateParams::new(probe_model.to_string(), Arc::new(client))
         .provider(input.provider.to_string())
         .prompt("Say OK")
         .max_tokens(16);

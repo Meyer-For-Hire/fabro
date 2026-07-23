@@ -1742,9 +1742,9 @@ impl Session {
             let model = ModelRef {
                 provider: self.provider_profile.provider_id(),
                 model_id: if response.model.is_empty() {
-                    self.provider_profile.model().to_string()
+                    self.provider_profile.model().into()
                 } else {
-                    response.model.clone()
+                    response.model.clone().into()
                 },
                 speed:    self.config.speed,
             };

@@ -19,9 +19,13 @@
  */
 export interface ModelTestResult {
     /**
-     * The model identifier that was tested.
+     * The canonical model ID that was tested.
      */
     'model_id': string;
+    /**
+     * LLM provider identifier.
+     */
+    'provider': string;
     /**
      * Whether the model responded successfully, failed, or was skipped because its provider is not configured.
      */

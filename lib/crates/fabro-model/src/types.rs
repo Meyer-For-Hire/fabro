@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::ids::ProviderId;
+use crate::ids::{ModelId, ProviderId};
 
 // --- 2.9 Model ---
 
@@ -78,7 +78,7 @@ pub struct ModelCosts {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Model {
-    pub id:                   String,
+    pub id:                   ModelId,
     pub provider:             ProviderId,
     pub family:               String,
     pub display_name:         String,
@@ -102,7 +102,7 @@ pub struct Model {
 
 impl Model {
     pub fn id(&self) -> &str {
-        &self.id
+        self.id.as_str()
     }
 
     pub fn provider(&self) -> &ProviderId {
@@ -210,7 +210,7 @@ mod tests {
     #[test]
     fn inherent_methods_return_correct_values() {
         let info = Model {
-            id:                   "model-id".to_string(),
+            id:                   ModelId::new("model-id"),
             provider:             ProviderId::new("provider-id"),
             family:               "family".to_string(),
             display_name:         "Display Name".to_string(),

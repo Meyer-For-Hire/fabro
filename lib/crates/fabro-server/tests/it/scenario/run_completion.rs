@@ -4,6 +4,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use fabro_auth::EnvCredentialSource;
 use fabro_model::{Catalog, ProviderId};
+use fabro_static::EnvVars;
 use fabro_test::{TwinScenario, TwinScenarios, twin_openai};
 use fabro_types::RunId;
 use tokio::time::sleep;
@@ -41,7 +42,7 @@ fn test_app_with_openai_agent_backend(openai_base_url: String, api_key: String) 
             .expect("test catalog should build"),
     );
     let source_api_key = api_key.clone();
-    let env_api_key = api_key;
+    let env_api_key = api_key.clone();
     let llm_source: Arc<dyn fabro_auth::CredentialSource> = Arc::new(
         EnvCredentialSource::with_env_lookup(Arc::new(move |name| match name {
             "OPENAI_API_KEY" => Some(source_api_key.clone()),
@@ -52,6 +53,7 @@ fn test_app_with_openai_agent_backend(openai_base_url: String, api_key: String) 
         .runtime_settings(settings.server_settings, settings.manifest_run_defaults)
         .max_concurrent_runs(5)
         .llm_catalog_settings(llm_catalog_settings)
+        .vault_entries([(EnvVars::OPENAI_API_KEY, api_key)])
         .registry_factory(move |interviewer| {
             let catalog = Arc::clone(&catalog);
             let llm_source = Arc::clone(&llm_source);

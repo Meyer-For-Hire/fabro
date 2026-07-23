@@ -28,6 +28,10 @@ import {
 } from "../components/runs-list/sort-header";
 import { Tooltip } from "../components/ui";
 import { formatContextWindow, formatTokensPerSecond } from "../lib/format";
+import {
+  modelOfferingKey,
+  modelOfferingTestArgs,
+} from "../lib/model-offerings";
 import { useDebouncedValue } from "../hooks/effects";
 
 export function meta() {
@@ -277,30 +281,46 @@ function ModelsSection({ providers }: { providers: Provider[] }) {
 
   const runSweep = useCallback(async () => {
     if (running) return;
-    const ids = rows.map((r) => r.id);
-    if (ids.length === 0) return;
+    const offerings = rows.map((model) => ({
+      id:       model.id,
+      provider: model.provider,
+      key:      modelOfferingKey(model),
+    }));
+    if (offerings.length === 0) return;
 
     const seed = new Map<string, RowState>();
-    for (const id of ids) seed.set(id, { phase: "queued" });
+    for (const offering of offerings) {
+      seed.set(offering.key, { phase: "queued" });
+    }
     setResults(seed);
-    setSweep({ done: 0, total: ids.length, ok: 0, failed: 0 });
+    setSweep({ done: 0, total: offerings.length, ok: 0, failed: 0 });
 
     let cursor = 0;
     const worker = async () => {
-      while (cursor < ids.length) {
+      while (cursor < offerings.length) {
         const i = cursor;
         cursor += 1;
-        const id = ids[i];
+        const offering = offerings[i];
         setResults((prev) => {
           const next = new Map(prev);
-          next.set(id, { phase: "running" });
+          next.set(offering.key, { phase: "running" });
           return next;
         });
 
         let outcome: RowState;
         try {
-          const result = await apiData(() => modelsApi.testModel(id));
-          if (result.status === "ok") {
+          const result = await apiData(() =>
+            modelsApi.testModel(...modelOfferingTestArgs(offering)),
+          );
+          if (
+            result.provider !== offering.provider ||
+            result.model_id !== offering.id
+          ) {
+            outcome = {
+              phase:   "error",
+              message: `Server tested unexpected offering ${result.provider}/${result.model_id}`,
+            };
+          } else if (result.status === "ok") {
             outcome = { phase: "ok" };
           } else if (result.status === "error") {
             outcome = {
@@ -319,7 +339,7 @@ function ModelsSection({ providers }: { providers: Provider[] }) {
 
         setResults((prev) => {
           const next = new Map(prev);
-          next.set(id, outcome);
+          next.set(offering.key, outcome);
           return next;
         });
         setSweep((prev) =>
@@ -336,7 +356,7 @@ function ModelsSection({ providers }: { providers: Provider[] }) {
     };
 
     await Promise.all(
-      Array.from({ length: Math.min(TEST_CONCURRENCY, ids.length) }, () =>
+      Array.from({ length: Math.min(TEST_CONCURRENCY, offerings.length) }, () =>
         worker(),
       ),
     );
@@ -435,12 +455,12 @@ function ModelsSection({ providers }: { providers: Provider[] }) {
             <tbody>
               {rows.map((model) => (
                 <ModelTableRow
-                  key={model.id}
+                  key={modelOfferingKey(model)}
                   model={model}
                   providerLabel={
                     providerNameById.get(model.provider) ?? model.provider
                   }
-                  state={results.get(model.id)}
+                  state={results.get(modelOfferingKey(model))}
                 />
               ))}
             </tbody>
@@ -468,7 +488,7 @@ function ModelTableRow({
   state:         RowState | undefined;
 }) {
   return (
-    <tr className="border-b border-line transition-colors last:border-b-0 hover:bg-overlay/40">
+    <tr className="border-b border-line last:border-b-0">
       <td className="whitespace-nowrap px-3 py-2.5 text-fg-3">
         {providerLabel}
       </td>
