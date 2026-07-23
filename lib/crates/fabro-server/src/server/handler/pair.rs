@@ -883,7 +883,7 @@ mod tests {
                     text:            "I found the issue.".to_string(),
                     model:           ModelRef {
                         provider: ProviderId::new("openai"),
-                        model_id: "gpt-5.4".to_string(),
+                        model_id: "gpt-5.4".into(),
                         speed:    None,
                     },
                     billing:         BilledTokenCounts::default(),
@@ -916,7 +916,7 @@ mod tests {
                         text:            "wrong stage".to_string(),
                         model:           ModelRef {
                             provider: ProviderId::new("openai"),
-                            model_id: "gpt-5.4".to_string(),
+                            model_id: "gpt-5.4".into(),
                             speed:    None,
                         },
                         billing:         BilledTokenCounts::default(),

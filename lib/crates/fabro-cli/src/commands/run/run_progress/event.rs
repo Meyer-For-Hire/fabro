@@ -323,7 +323,7 @@ pub(super) fn from_run_event(stored: &RunEvent) -> Option<ProgressEvent> {
         EventBody::ParallelCompleted(_) => Some(ProgressEvent::ParallelCompleted),
         EventBody::AgentMessage(props) => Some(ProgressEvent::AssistantMessage {
             stage_node_id: node_id,
-            model:         props.model.model_id.clone(),
+            model:         props.model.model_id.to_string(),
         }),
         EventBody::AgentToolStarted(props) => Some(ProgressEvent::ToolCallStarted {
             stage_node_id: node_id,

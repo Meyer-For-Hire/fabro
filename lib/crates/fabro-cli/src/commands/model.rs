@@ -45,10 +45,21 @@ struct CompletedModelTest {
     status:       String,
 }
 
-fn find_model_by_id_or_alias(models: &[Model], id: &str) -> Option<Model> {
+fn model_matches_selector(model: &Model, selector: &str) -> bool {
+    model.id == selector || model.aliases.iter().any(|alias| alias == selector)
+}
+
+fn find_model_by_id_or_alias(
+    models: &[Model],
+    id: &str,
+    provider: Option<&ProviderId>,
+) -> Option<Model> {
     models
         .iter()
-        .find(|model| model.id == id || model.aliases.iter().any(|alias| alias == id))
+        .find(|model| {
+            provider.is_none_or(|provider| &model.provider == provider)
+                && model_matches_selector(model, id)
+        })
         .cloned()
 }
 
@@ -116,7 +127,7 @@ fn model_row(model: &Model, use_color: bool) -> Vec<CellStruct> {
         format_cost(model.costs.output_cost_per_mtok),
     );
     vec![
-        model.id.clone().cell().bold(use_color),
+        model.id.as_str().cell().bold(use_color),
         model
             .provider
             .as_str()
@@ -172,9 +183,20 @@ fn print_models_table(models: &[Model], styles: &Styles) {
 }
 
 fn configured_model_test_status(
+    expected: &Model,
     result: Result<api_types::ModelTestResult>,
 ) -> (Color, String, bool) {
     match result {
+        Ok(resp) if resp.provider != expected.provider || resp.model_id != expected.id.as_str() => {
+            (
+                Color::Red,
+                format!(
+                    "error: server tested unexpected offering {}/{}",
+                    resp.provider, resp.model_id
+                ),
+                true,
+            )
+        }
         Ok(resp) if resp.status == api_types::ModelTestResultStatus::Ok => {
             (Color::Green, "ok".to_string(), false)
         }
@@ -197,21 +219,21 @@ fn model_test_row_from_status(model: &Model, status: &str, result_color: Color) 
     let trimmed = status.trim();
     match result_color {
         Color::Green => ModelTestRow {
-            model:    model.id.clone(),
+            model:    model.id.to_string(),
             provider: model.provider.clone(),
             result:   ModelTestResultKind::Pass,
             detail:   None,
             error:    None,
         },
         Color::Yellow => ModelTestRow {
-            model:    model.id.clone(),
+            model:    model.id.to_string(),
             provider: model.provider.clone(),
             result:   ModelTestResultKind::Skip,
             detail:   Some(trimmed.to_string()),
             error:    None,
         },
         _ => ModelTestRow {
-            model:    model.id.clone(),
+            model:    model.id.to_string(),
             provider: model.provider.clone(),
             result:   ModelTestResultKind::Fail,
             detail:   None,
@@ -251,21 +273,45 @@ async fn test_models_via_server(
     let mut skipped = 0u32;
     let mut skipped_providers: Vec<String> = Vec::new();
     if let Some(model_id) = model {
-        let listed_models = client.list_models(None, Some(model_id)).await?;
-        let listed_info = find_model_by_id_or_alias(&listed_models, model_id);
+        let requested_provider = provider.map(ProviderId::new);
+        let listed_models = client.list_models(provider, Some(model_id)).await?;
+        let listed_info = find_model_by_id_or_alias(&listed_models, model_id, None);
         if !json_output {
             eprint!("Testing {model_id}...");
         }
-        let result = client.test_model(model_id, request_mode).await;
+        let has_configured_match = listed_models
+            .iter()
+            .any(|model| model.configured && model_matches_selector(model, model_id));
+        let result =
+            if requested_provider.is_none() && listed_info.is_some() && !has_configured_match {
+                None
+            } else {
+                Some(
+                    client
+                        .test_model(model_id, requested_provider.as_ref(), request_mode)
+                        .await,
+                )
+            };
         if !json_output {
             eprintln!(" done");
         }
 
         let (info, result_color, status) = match result {
-            Ok(resp) => {
-                let info = find_model_by_id_or_alias(&listed_models, &resp.model_id).with_context(
-                    || format!("Unknown model returned by server: {}", resp.model_id),
-                )?;
+            None => {
+                let info = listed_info.with_context(|| format!("Unknown model: {model_id}"))?;
+                failures += 1;
+                skipped += 1;
+                (info, Color::Yellow, "not configured".to_string())
+            }
+            Some(Ok(resp)) => {
+                let info =
+                    find_model_by_id_or_alias(&listed_models, &resp.model_id, Some(&resp.provider))
+                        .with_context(|| {
+                            format!(
+                                "Unknown model returned by server: {}/{}",
+                                resp.provider, resp.model_id
+                            )
+                        })?;
                 if resp.status == api_types::ModelTestResultStatus::Ok {
                     (info, Color::Green, "ok".to_string())
                 } else if resp.status == api_types::ModelTestResultStatus::Skip {
@@ -280,10 +326,10 @@ async fn test_models_via_server(
                     (info, Color::Red, format!("error: {message}"))
                 }
             }
-            Err(err) if err.to_string().contains("Model not found") => {
+            Some(Err(err)) if err.to_string().contains("Model not found") => {
                 bail!("Unknown model: {model_id}");
             }
-            Err(err) => {
+            Some(Err(err)) => {
                 let info = listed_info.with_context(|| format!("Unknown model: {model_id}"))?;
                 failures += 1;
                 (info, Color::Red, format!("error: {err}"))
@@ -328,11 +374,14 @@ async fn test_models_via_server(
             .map(|(index, info)| {
                 let client = client.clone();
                 async move {
-                    let result = client.test_model(&info.id, request_mode).await;
+                    let result = client
+                        .test_model(info.id.as_str(), Some(&info.provider), request_mode)
+                        .await;
                     if !json_output {
                         eprintln!("Testing {}... done", info.id);
                     }
-                    let (result_color, status, failed) = configured_model_test_status(result);
+                    let (result_color, status, failed) =
+                        configured_model_test_status(&info, result);
                     (
                         CompletedModelTest {
                             index,
@@ -478,7 +527,7 @@ mod tests {
 
     fn test_model_json(id: &str, provider: ProviderId) -> serde_json::Value {
         serde_json::to_value(Model {
-            id: id.to_string(),
+            id: id.into(),
             provider,
             family: "test".to_string(),
             display_name: format!("{id} display"),
@@ -512,7 +561,7 @@ mod tests {
 
     fn custom_model_json(id: &str, provider: &str) -> serde_json::Value {
         serde_json::to_value(Model {
-            id:                   id.to_string(),
+            id:                   id.into(),
             provider:             ProviderId::new(provider),
             family:               "test".to_string(),
             display_name:         format!("{id} display"),
@@ -610,6 +659,7 @@ mod tests {
                     .body(
                         serde_json::json!({
                             "model_id": "test-model",
+                            "provider": "anthropic",
                             "status": "ok"
                         })
                         .to_string(),
@@ -618,7 +668,7 @@ mod tests {
             .await;
 
         let client = test_client(&server.url(""));
-        let response = client.test_model("test-model", None).await.unwrap();
+        let response = client.test_model("test-model", None, None).await.unwrap();
 
         assert_eq!(response.status, api_types::ModelTestResultStatus::Ok);
         assert!(response.error_message.is_none());
@@ -637,6 +687,7 @@ mod tests {
                     .body(
                         serde_json::json!({
                             "model_id": "test-model",
+                            "provider": "anthropic",
                             "status": "error",
                             "error_message": "timeout"
                         })
@@ -647,7 +698,7 @@ mod tests {
 
         let client = test_client(&server.url(""));
         let response = client
-            .test_model("test-model", Some(ModelTestMode::Deep))
+            .test_model("test-model", None, Some(ModelTestMode::Deep))
             .await
             .unwrap();
 
@@ -666,6 +717,7 @@ mod tests {
                     .body(
                         serde_json::json!({
                             "model_id": "kimi-k2.5",
+                            "provider": "kimi",
                             "status": "skip"
                         })
                         .to_string(),
@@ -674,7 +726,7 @@ mod tests {
             .await;
 
         let client = test_client(&server.url(""));
-        let response = client.test_model("kimi-k2.5", None).await.unwrap();
+        let response = client.test_model("kimi-k2.5", None, None).await.unwrap();
 
         assert_eq!(response.status, api_types::ModelTestResultStatus::Skip);
         assert!(response.error_message.is_none());
@@ -698,7 +750,7 @@ mod tests {
             .await;
 
         let client = test_client(&server.url(""));
-        let result = client.test_model("bad-model", None).await;
+        let result = client.test_model("bad-model", None, None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Model not found"));
     }
@@ -732,6 +784,7 @@ mod tests {
                     .body(
                         serde_json::json!({
                             "model_id": "venice-large",
+                            "provider": "venice",
                             "status": "ok"
                         })
                         .to_string(),
@@ -752,6 +805,80 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn bulk_model_test_keeps_duplicate_ids_scoped_by_provider() {
+        let server = httpmock::MockServer::start_async().await;
+        server
+            .mock_async(|when, then| {
+                when.method("GET")
+                    .path("/api/v1/models")
+                    .query_param("page[limit]", "100")
+                    .query_param("page[offset]", "0");
+                then.status(200)
+                    .header("Content-Type", "application/json")
+                    .body(
+                        serde_json::json!({
+                            "data": [
+                                custom_model_json("portable-model", "openai"),
+                                custom_model_json("portable-model", "openrouter")
+                            ],
+                            "meta": { "has_more": false }
+                        })
+                        .to_string(),
+                    );
+            })
+            .await;
+        let openai = server
+            .mock_async(|when, then| {
+                when.method("POST")
+                    .path("/api/v1/models/portable-model/test")
+                    .query_param("provider", "openai");
+                then.status(200)
+                    .header("Content-Type", "application/json")
+                    .body(
+                        serde_json::json!({
+                            "model_id": "portable-model",
+                            "provider": "openai",
+                            "status": "ok"
+                        })
+                        .to_string(),
+                    );
+            })
+            .await;
+        let openrouter = server
+            .mock_async(|when, then| {
+                when.method("POST")
+                    .path("/api/v1/models/portable-model/test")
+                    .query_param("provider", "openrouter");
+                then.status(200)
+                    .header("Content-Type", "application/json")
+                    .body(
+                        serde_json::json!({
+                            "model_id": "portable-model",
+                            "provider": "openrouter",
+                            "status": "ok"
+                        })
+                        .to_string(),
+                    );
+            })
+            .await;
+
+        test_models_via_server(
+            &test_client(&server.url("")),
+            None,
+            None,
+            false,
+            2,
+            &Styles::new(false),
+            true,
+        )
+        .await
+        .unwrap();
+
+        openai.assert_async().await;
+        openrouter.assert_async().await;
     }
 
     #[tokio::test]

@@ -8,46 +8,42 @@ priority = 70
 [providers.kimi.auth]
 credentials = ["env:KIMI_API_KEY", "vault:KIMI_API_KEY"]
 
-[models."kimi-k2.5"]
-provider = "kimi"
-api_id = "kimi-k2.5"
+[providers.kimi.models."kimi-k2.5"]
 display_name = "Kimi K2.5"
 family = "kimi-k2"
 training = "2025-10-01"
 knowledge_cutoff = "October 2025"
 estimated_output_tps = 50
 
-[models."kimi-k2.5".limits]
+[providers.kimi.models."kimi-k2.5".limits]
 context_window = 262144
 max_output = 32768
 
-[models."kimi-k2.5".features]
+[providers.kimi.models."kimi-k2.5".features]
 tools = true
 vision = true
 reasoning = true
 prompt_cache = true
 sampling_params = false
 
-[models."kimi-k2.5".costs]
+[providers.kimi.models."kimi-k2.5".costs]
 input_cost_per_mtok = 0.6
 output_cost_per_mtok = 3.0
 cache_input_cost_per_mtok = 0.1
 
-[models."kimi-k3"]
-provider = "kimi"
-api_id = "kimi-k3"
+[providers.kimi.models."kimi-k3"]
 display_name = "Kimi K3"
 family = "kimi-k3"
 default = true
 aliases = ["kimi"]
 
-[models."kimi-k3".limits]
+[providers.kimi.models."kimi-k3".limits]
 context_window = 1048576
 # K3 accepts explicit completion budgets up to 1048576, but Fabro also uses
 # max_output as the default request budget. Match Kimi's 131072-token default.
 max_output = 131072
 
-[models."kimi-k3".features]
+[providers.kimi.models."kimi-k3".features]
 tools = true
 vision = true
 reasoning = true
@@ -55,10 +51,10 @@ reasoning_effort = "always_adaptive"
 prompt_cache = true
 sampling_params = false
 
-[models."kimi-k3".controls]
+[providers.kimi.models."kimi-k3".controls]
 reasoning_effort = ["low", "high", "max"]
 
-[models."kimi-k3".costs]
+[providers.kimi.models."kimi-k3".costs]
 input_cost_per_mtok = 3.0
 output_cost_per_mtok = 15.0
 cache_input_cost_per_mtok = 0.3

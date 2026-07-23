@@ -77,6 +77,7 @@ impl RunSessionProjection {
                     let mut record = SessionRecord::new(session_id, run_id, envelope.event.ts);
                     record.title.clone_from(&props.title);
                     record.model.clone_from(&props.model);
+                    record.provider.clone_from(&props.provider);
                     let projected = ProjectedRunSession {
                         record,
                         runtime_context: Vec::new(),
@@ -254,8 +255,9 @@ mod tests {
                 1,
                 session_id,
                 EventBody::RunSessionCreated(RunSessionCreatedProps {
-                    title: Some("Ask".to_string()),
-                    model: Some("test-model".to_string()),
+                    title:    Some("Ask".to_string()),
+                    model:    Some("test-model".to_string()),
+                    provider: None,
                 }),
             ),
             event(
@@ -318,8 +320,9 @@ mod tests {
                 1,
                 session_id,
                 EventBody::RunSessionCreated(RunSessionCreatedProps {
-                    title: None,
-                    model: None,
+                    title:    None,
+                    model:    None,
+                    provider: None,
                 }),
             ),
             event(
@@ -387,8 +390,9 @@ mod tests {
                 1,
                 session_id,
                 EventBody::RunSessionCreated(RunSessionCreatedProps {
-                    title: Some("Ask".to_string()),
-                    model: Some("test-model".to_string()),
+                    title:    Some("Ask".to_string()),
+                    model:    Some("test-model".to_string()),
+                    provider: None,
                 }),
             ),
             event(
@@ -408,7 +412,7 @@ mod tests {
 
         assert!(value.get("runtime_context").is_none());
         assert!(value.get("working_dir").is_none());
-        assert!(value.get("provider").is_none());
+        assert!(value["provider"].is_null());
         assert!(value.get("permissions").is_none());
         assert!(value.get("deleted_at").is_none());
     }
@@ -423,8 +427,9 @@ mod tests {
                 1,
                 session_id,
                 EventBody::RunSessionCreated(RunSessionCreatedProps {
-                    title: None,
-                    model: None,
+                    title:    None,
+                    model:    None,
+                    provider: None,
                 }),
             ),
             event(
@@ -439,8 +444,9 @@ mod tests {
                 3,
                 other_session_id,
                 EventBody::RunSessionCreated(RunSessionCreatedProps {
-                    title: Some("Other".to_string()),
-                    model: None,
+                    title:    Some("Other".to_string()),
+                    model:    None,
+                    provider: None,
                 }),
             ),
         ];
@@ -478,8 +484,9 @@ mod tests {
                     1,
                     session_id,
                     EventBody::RunSessionCreated(RunSessionCreatedProps {
-                        title: None,
-                        model: None,
+                        title:    None,
+                        model:    None,
+                        provider: None,
                     }),
                 ),
                 event(

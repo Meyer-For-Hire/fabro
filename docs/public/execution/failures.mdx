@@ -121,7 +121,15 @@ provider = "anthropic"
 fallbacks = ["gemini", "openai"]
 ```
 
-When Anthropic is unavailable, Fabro tries Gemini first, then OpenAI. Each fallback entry may be a bare provider token (like `"gemini"`), a bare model alias (like `"gpt-5.4"`), or a qualified `"provider/model"` reference. For each fallback provider, Fabro selects the closest model by matching required capabilities (tool use, vision, reasoning) and minimizing cost difference.
+When Anthropic fails, Fabro tries Gemini first, then OpenAI. Fallback resolution is provider-aware:
+
+- A bare provider token such as `"gemini"` selects that provider's closest compatible model.
+- A qualified selector such as `"openrouter/gpt-56-sol"` resolves only within that provider.
+- A bare model slug or alias considers ready providers and uses provider priority.
+
+Qualified fallback references always remain provider pins, including strings that were historical built-in API IDs. For example, `"openai/gpt-5.6-sol"` pins the direct OpenAI offering.
+
+The primary provider and model were already resolved and persisted when the run was created; resuming does not re-run primary selection. Fallbacks are only considered after an eligible runtime failure.
 
 ### What triggers failover
 

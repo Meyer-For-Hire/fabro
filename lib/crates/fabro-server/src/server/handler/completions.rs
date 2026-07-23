@@ -1,10 +1,13 @@
+use std::collections::HashSet;
 use std::sync::Arc;
+
+use fabro_model::{Catalog, ModelSelectionError};
 
 use super::super::{
     ApiError, AppState, CompletionResponse, CompletionToolChoiceMode, CompletionUsage,
     CreateCompletionRequest, FinishReason, GenerateParams, IntoResponse, Json, LlmMessage,
-    LlmRequest, RequiredUser, Response, Router, State, StatusCode, ToolChoice, ToolDefinition,
-    Ulid, error, generate_object, info, post, warn,
+    LlmRequest, ProviderId, RequiredUser, Response, Router, State, StatusCode, ToolChoice,
+    ToolDefinition, Ulid, error, generate_object, info, post, warn,
 };
 use super::llm_sse;
 
@@ -28,21 +31,34 @@ async fn create_completion(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateCompletionRequest>,
 ) -> Response {
-    // Resolve model
     let catalog = state.catalog();
-    let model_id = req
-        .model
-        .unwrap_or_else(|| catalog.default_model().id.clone());
-
-    let catalog_info = catalog.get(&model_id);
-
-    // Resolve provider: explicit request > catalog > None
-    let explicit_provider = req.provider;
-    let provider_name = explicit_provider
-        .clone()
-        .or_else(|| catalog_info.map(|i| i.provider.to_string()));
-
-    info!(model = %model_id, provider = ?provider_name, "Completion request received");
+    let llm_result = match state.resolve_llm_client().await {
+        Ok(result) => result,
+        Err(err) => {
+            error!(error = ?err, "Failed to create LLM client");
+            return ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to resolve LLM providers: {err}"),
+            )
+            .into_response();
+        }
+    };
+    for (provider, issue) in &llm_result.auth_issues {
+        warn!(provider = %provider, error = %issue, "LLM provider unavailable due to auth issue");
+    }
+    for issue in &llm_result.registration_issues {
+        warn!(provider = %issue.provider, error = %issue.error, "LLM provider unavailable due to registration issue");
+    }
+    let client = llm_result.client;
+    let (model_id, selected_provider) = match resolve_request_model(
+        catalog.as_ref(),
+        &client.provider_ids(),
+        req.model.as_deref(),
+        req.provider,
+    ) {
+        Ok(selection) => selection,
+        Err(error) => return ApiError::bad_request(error.to_string()).into_response(),
+    };
 
     // Build messages list. Request messages are already the canonical
     // `fabro_types::Message` — the API schema reuses it via build.rs
@@ -81,7 +97,7 @@ async fn create_completion(
     let request = LlmRequest {
         model: model_id.clone(),
         messages,
-        provider: provider_name.clone(),
+        provider: Some(selected_provider.to_string()),
         tools,
         tool_choice,
         response_format: None,
@@ -98,34 +114,14 @@ async fn create_completion(
         metadata: None,
         provider_options: req.provider_options,
     };
+    info!(
+        model = %model_id,
+        provider = %selected_provider,
+        "Completion request received"
+    );
 
     // Force non-streaming for structured output
     let use_stream = req.stream && req.schema.is_none();
-
-    let llm_result = match state.resolve_llm_client().await {
-        Ok(result) => result,
-        Err(err) => {
-            error!(error = ?err, "Failed to create LLM client");
-            return ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to create LLM client: {err}"),
-            )
-            .into_response();
-        }
-    };
-    for (provider, issue) in &llm_result.auth_issues {
-        warn!(provider = %provider, error = %issue, "LLM provider unavailable due to auth issue");
-    }
-    for issue in &llm_result.registration_issues {
-        warn!(provider = %issue.provider, error = %issue.error, "LLM provider unavailable due to registration issue");
-    }
-    let client = llm_result.client;
-    if let Some(provider) = explicit_provider.as_deref() {
-        if !client.has_provider(provider) {
-            return ApiError::bad_request(format!("Provider \"{provider}\" is not configured"))
-                .into_response();
-        }
-    }
 
     if use_stream {
         // Streaming path: forward all StreamEvents as SSE
@@ -170,6 +166,7 @@ async fn create_completion(
                     Json(CompletionResponse {
                         id: msg_id,
                         model: model_id,
+                        provider: selected_provider,
                         message: response.message,
                         stop_reason,
                         usage: CompletionUsage {
@@ -192,6 +189,7 @@ async fn create_completion(
                     Json(CompletionResponse {
                         id: response.id,
                         model: response.model,
+                        provider: ProviderId::new(response.provider),
                         message: response.message,
                         stop_reason,
                         usage: CompletionUsage {
@@ -209,4 +207,16 @@ async fn create_completion(
             }
         }
     }
+}
+
+pub(super) fn resolve_request_model(
+    catalog: &Catalog,
+    eligible: &HashSet<ProviderId>,
+    requested_model: Option<&str>,
+    explicit_provider: Option<String>,
+) -> Result<(String, ProviderId), ModelSelectionError> {
+    let explicit_provider = explicit_provider.map(ProviderId::new);
+    let selected =
+        catalog.resolve_selection(requested_model, explicit_provider.as_ref(), eligible)?;
+    Ok((selected.model, selected.provider))
 }

@@ -597,7 +597,7 @@ mod tests {
             Catalog::builtin(),
             &ModelRef {
                 provider: ProviderId::anthropic(),
-                model_id: model.to_string(),
+                model_id: model.into(),
                 speed:    None,
             },
             &TokenCounts {

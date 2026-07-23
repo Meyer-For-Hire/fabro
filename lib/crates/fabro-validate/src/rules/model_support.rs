@@ -7,7 +7,7 @@ pub(super) fn check_model_known(
     context: &str,
     node_id: Option<String>,
 ) -> Option<Diagnostic> {
-    if catalog.get(model).is_some() {
+    if catalog.is_model_selector(model) {
         return None;
     }
     Some(Diagnostic {

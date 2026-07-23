@@ -476,19 +476,20 @@ async fn build_preflight_report(
 
     let catalog = state.catalog();
     let llm_result = state.resolve_llm_client().await;
-    let configured_providers = match &llm_result {
-        Ok(result) => result.provider_ids(),
-        Err(err) => {
-            warn!(error = ?err, "Failed to resolve LLM client while checking ready providers");
-            Vec::new()
-        }
-    };
+    if let Err(err) = &llm_result {
+        warn!(error = ?err, "Failed to resolve LLM client while checking ready providers");
+    }
+    // Preflight is credential-independent static validation. Materialize
+    // against every enabled catalog provider so aliases and defaults can be
+    // inspected even when the corresponding adapter is not currently ready;
+    // `run_llm_check` below reports actual credential/registration readiness.
+    let enabled_providers = catalog.all_provider_ids().into_iter().collect::<Vec<_>>();
     let materialized = materialize_run(
         prepared.settings.clone(),
         graph,
         catalog.as_ref(),
-        &configured_providers,
-    );
+        &enabled_providers,
+    )?;
     let resolved_run = materialized.run;
     let server_settings = state.server_settings();
     let github_integration = &server_settings.server.integrations.github;
@@ -1049,8 +1050,15 @@ async fn run_llm_check(
         has_llm_nodes = true;
         let node_model = node.model().unwrap_or(model);
         let node_provider = node.provider().unwrap_or(default_provider);
-        let (resolved_model, resolved_provider) = if let Some(info) = catalog.get(node_model) {
-            (info.id.clone(), info.provider.to_string())
+        let resolved = if node.provider().is_some() {
+            catalog.get_on_provider(&ProviderId::new(node_provider), node_model)
+        } else {
+            catalog
+                .select(node_model, None, &catalog.all_provider_ids())
+                .ok()
+        };
+        let (resolved_model, resolved_provider) = if let Some(info) = resolved {
+            (info.id.to_string(), info.provider.to_string())
         } else {
             (node_model.to_string(), node_provider.to_string())
         };
@@ -1534,6 +1542,7 @@ enabled = {clone_enabled}
             Catalog::builtin(),
             &[ProviderId::anthropic()],
         )
+        .unwrap()
         .run;
 
         (prepared, resolved)
@@ -2381,9 +2390,8 @@ digraph Demo {
         assert!(response_mock.calls_async().await >= 1);
     }
 
-    #[tokio::test]
-    async fn preflight_unknown_llm_provider_reports_not_configured() {
-        let state = crate::test_support::test_app_state();
+    #[test]
+    fn static_validation_rejects_unknown_llm_provider() {
         let mut manifest = minimal_manifest();
         manifest.workflows.get_mut("workflow.fabro").unwrap().source = r#"
 digraph Demo {
@@ -2399,29 +2407,16 @@ digraph Demo {
             &manifest,
         )
         .unwrap();
-        let validated = validate_prepared_manifest(&prepared, test_catalog()).unwrap();
+        let Err(error) = validate_prepared_manifest(&prepared, test_catalog()) else {
+            panic!("unknown provider should fail static validation");
+        };
 
-        let (response, ok) = run_preflight(state.as_ref(), &prepared, &validated)
-            .await
-            .unwrap();
-
-        assert!(!ok);
-        let llm_check = response.checks.sections[0]
-            .checks
-            .iter()
-            .find(|check| check.name == "LLM" && check.summary == "missing-model")
-            .expect("preflight should include the requested custom LLM provider");
-        assert_eq!(llm_check.status, types::PreflightCheckResultStatus::Warning);
-        assert_eq!(
-            llm_check.remediation.as_deref(),
-            Some("Provider \"missing-provider\" is not configured")
-        );
-        assert!(
-            llm_check
-                .details
-                .iter()
-                .any(|detail| detail.text == "Provider: missing-provider")
-        );
+        assert!(matches!(
+            error,
+            WorkflowError::ModelSelection(fabro_model::ModelSelectionError::UnknownProvider {
+                provider
+            }) if provider.as_str() == "missing-provider"
+        ));
     }
 
     #[tokio::test]
@@ -2437,17 +2432,16 @@ base_url = "https://api.acme.test/v1"
 [providers.acme.auth]
 credentials = ["env:ACME_API_KEY"]
 
-[models."acme-large"]
-provider = "acme"
+[providers.acme.models."acme-large"]
 display_name = "Acme Large"
 family = "acme"
 default = true
 aliases = ["vl"]
 
-[models."acme-large".limits]
+[providers.acme.models."acme-large".limits]
 context_window = 128000
 
-[models."acme-large".features]
+[providers.acme.models."acme-large".features]
 tools = true
 vision = false
 reasoning = false
@@ -2472,7 +2466,7 @@ digraph Demo {
             &manifest,
         )
         .unwrap();
-        let validated = validate_prepared_manifest(&prepared, test_catalog()).unwrap();
+        let validated = validate_prepared_manifest(&prepared, state.catalog()).unwrap();
 
         let (response, ok) = run_preflight(state.as_ref(), &prepared, &validated)
             .await

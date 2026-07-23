@@ -256,7 +256,6 @@ async fn execute_test_run_with_options(
     let initialized = initialize(
         persisted_workflow(graph, String::new(), &run_options.run_dir, run_id_value),
         InitOptions {
-            run_id: run_id_value,
             run_store: run_store.into(),
             dry_run: false,
             emitter: emitter.clone(),
@@ -317,7 +316,6 @@ async fn execute_runs_start_to_exit_and_returns_final_context() {
     let initialized = initialize(
         persisted_workflow(graph, source, &run_dir, test_run_id("run-test")),
         InitOptions {
-            run_id: test_run_id("run-test"),
             run_store: run_store.into(),
             dry_run: false,
             emitter: test_emitter_arc("run-test"),
@@ -393,7 +391,6 @@ async fn run_with_lifecycle(
     let initialized = initialize(
         persisted_workflow(graph.clone(), String::new(), &run_dir, run_id),
         InitOptions {
-            run_id,
             run_store: run_store.into(),
             dry_run: false,
             emitter: emitter.clone(),

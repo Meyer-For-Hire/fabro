@@ -30,7 +30,11 @@ export interface CreatePlaygroundChatRequest {
      */
     'workflow_fabro': string;
     /**
-     * Model id or alias. Server picks the default if omitted.
+     * Model ID or alias. Server picks a ready-provider default if omitted.
      */
     'model'?: string;
+    /**
+     * Optional provider pin.
+     */
+    'provider'?: string;
 }

@@ -618,26 +618,26 @@ reasoning = true
     /// Encode `request` on the direct-Anthropic route, optionally with a
     /// catalog (for capability-driven behavior like prompt-cache/effort).
     fn encode_direct(request: &Request, catalog: Option<&Catalog>, stream: bool) -> EncodedRequest {
-        let deployment_id = common::api_model_id(catalog, &request.model);
+        let deployment_id = common::api_model_id(catalog, "anthropic", &request.model);
         let params = direct_params();
         let ctx = CodecCtx {
             request,
             provider_name: "anthropic",
             deployment_id: &deployment_id,
-            model: common::catalog_model(catalog, &request.model),
+            model: common::catalog_model(catalog, "anthropic", &request.model),
             params: &params,
         };
         encode(&ctx, stream)
     }
 
     fn encode_count_direct(request: &Request, catalog: Option<&Catalog>) -> EncodedRequest {
-        let deployment_id = common::api_model_id(catalog, &request.model);
+        let deployment_id = common::api_model_id(catalog, "anthropic", &request.model);
         let params = direct_params();
         let ctx = CodecCtx {
             request,
             provider_name: "anthropic",
             deployment_id: &deployment_id,
-            model: common::catalog_model(catalog, &request.model),
+            model: common::catalog_model(catalog, "anthropic", &request.model),
             params: &params,
         };
         encode_count_tokens(&ctx)

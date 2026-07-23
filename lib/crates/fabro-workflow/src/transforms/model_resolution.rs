@@ -1,7 +1,8 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use fabro_graphviz::graph::{AttrValue, Graph};
-use fabro_model::Catalog;
+use fabro_model::{Catalog, ProviderId};
 
 use super::Transform;
 use crate::error::Error;
@@ -9,19 +10,88 @@ use crate::error::Error;
 /// Resolves model aliases to canonical IDs and infers the provider from the
 /// model catalog.
 pub struct ModelResolutionTransform {
-    catalog: Arc<Catalog>,
+    catalog:            Arc<Catalog>,
+    default_provider:   Option<ProviderId>,
+    eligible_providers: HashSet<ProviderId>,
 }
 
 impl ModelResolutionTransform {
     #[must_use]
     pub fn new(catalog: Arc<Catalog>) -> Self {
-        Self { catalog }
+        let eligible_providers = catalog.all_provider_ids();
+        Self {
+            catalog,
+            default_provider: None,
+            eligible_providers,
+        }
+    }
+
+    #[must_use]
+    pub fn for_eligible(catalog: Arc<Catalog>, eligible_providers: HashSet<ProviderId>) -> Self {
+        Self {
+            catalog,
+            default_provider: None,
+            eligible_providers,
+        }
+    }
+
+    #[must_use]
+    pub fn with_default_provider(mut self, provider: Option<ProviderId>) -> Self {
+        self.default_provider = provider;
+        self
+    }
+
+    fn resolve_model(
+        &self,
+        model: &str,
+        explicit_provider: Option<&ProviderId>,
+    ) -> Result<(String, ProviderId), Error> {
+        let selected = self.catalog.resolve_selection(
+            Some(model),
+            explicit_provider,
+            &self.eligible_providers,
+        )?;
+        Ok((selected.model, selected.provider))
     }
 }
 
 impl Transform for ModelResolutionTransform {
     fn apply(&self, graph: Graph) -> Result<Graph, Error> {
         let mut graph = graph;
+        let graph_default_provider = graph
+            .attrs
+            .get("default_provider")
+            .and_then(AttrValue::as_str)
+            .filter(|provider| !provider.is_empty())
+            .map(ProviderId::new);
+        let requested_default_provider = self
+            .default_provider
+            .as_ref()
+            .or(graph_default_provider.as_ref());
+        if let Some(default_model) = graph
+            .attrs
+            .get("default_model")
+            .and_then(AttrValue::as_str)
+            .map(str::to_string)
+        {
+            let (model, provider) =
+                self.resolve_model(&default_model, requested_default_provider)?;
+            graph
+                .attrs
+                .insert("default_model".to_string(), AttrValue::String(model));
+            graph.attrs.insert(
+                "default_provider".to_string(),
+                AttrValue::String(provider.to_string()),
+            );
+        }
+        let default_provider = self.default_provider.clone().or_else(|| {
+            graph
+                .attrs
+                .get("default_provider")
+                .and_then(AttrValue::as_str)
+                .filter(|provider| !provider.is_empty())
+                .map(ProviderId::new)
+        });
         for node in graph.nodes.values_mut() {
             let model = node
                 .attrs
@@ -29,19 +99,20 @@ impl Transform for ModelResolutionTransform {
                 .and_then(AttrValue::as_str)
                 .map(String::from);
             if let Some(model) = model {
-                if let Some(info) = self.catalog.get(&model) {
-                    let canonical_id = info.id.clone();
-                    let provider = info.provider.to_string();
-                    // Resolve alias to canonical model ID
-                    if model != canonical_id {
-                        node.attrs
-                            .insert("model".to_string(), AttrValue::String(canonical_id));
-                    }
-                    if !node.attrs.contains_key("provider") {
-                        node.attrs
-                            .insert("provider".to_string(), AttrValue::String(provider));
-                    }
-                }
+                let explicit_provider = node
+                    .attrs
+                    .get("provider")
+                    .and_then(AttrValue::as_str)
+                    .filter(|provider| !provider.is_empty())
+                    .map(ProviderId::new)
+                    .or_else(|| default_provider.clone());
+                let (model, provider) = self.resolve_model(&model, explicit_provider.as_ref())?;
+                node.attrs
+                    .insert("model".to_string(), AttrValue::String(model));
+                node.attrs.insert(
+                    "provider".to_string(),
+                    AttrValue::String(provider.to_string()),
+                );
             }
         }
 
@@ -117,7 +188,7 @@ reasoning = false
     }
 
     #[test]
-    fn provider_inference_does_not_override_explicit_provider() {
+    fn explicit_provider_allows_unknown_model_passthrough() {
         let mut graph = Graph::new("test");
         let mut node = Node::new("a");
         node.attrs.insert(
@@ -126,7 +197,7 @@ reasoning = false
         );
         node.attrs.insert(
             "provider".to_string(),
-            AttrValue::String("custom".to_string()),
+            AttrValue::String("openai".to_string()),
         );
         graph.nodes.insert("a".to_string(), node);
 
@@ -137,12 +208,19 @@ reasoning = false
                 .attrs
                 .get("provider")
                 .and_then(AttrValue::as_str),
-            Some("custom")
+            Some("openai")
+        );
+        assert_eq!(
+            graph.nodes["a"]
+                .attrs
+                .get("model")
+                .and_then(AttrValue::as_str),
+            Some("claude-sonnet-4-5")
         );
     }
 
     #[test]
-    fn provider_inference_unknown_model_leaves_no_provider() {
+    fn provider_inference_unknown_model_pins_default_eligible_provider() {
         let mut graph = Graph::new("test");
         let mut node = Node::new("a");
         node.attrs.insert(
@@ -153,7 +231,13 @@ reasoning = false
 
         let graph = builtin_transform().apply(graph).unwrap();
 
-        assert_eq!(graph.nodes["a"].attrs.get("provider"), None);
+        assert_eq!(
+            graph.nodes["a"]
+                .attrs
+                .get("provider")
+                .and_then(AttrValue::as_str),
+            Some("anthropic")
+        );
     }
 
     #[test]
@@ -237,6 +321,31 @@ reasoning = false
             graph.nodes["a"]
                 .attrs
                 .get("provider")
+                .and_then(AttrValue::as_str),
+            Some("venice")
+        );
+    }
+
+    #[test]
+    fn graph_default_alias_materializes_to_canonical_offering() {
+        let mut graph = Graph::new("test");
+        graph.attrs.insert(
+            "default_model".to_string(),
+            AttrValue::String("vl".to_string()),
+        );
+
+        let graph = ModelResolutionTransform::new(custom_catalog())
+            .apply(graph)
+            .unwrap();
+
+        assert_eq!(
+            graph.attrs.get("default_model").and_then(AttrValue::as_str),
+            Some("venice-large")
+        );
+        assert_eq!(
+            graph
+                .attrs
+                .get("default_provider")
                 .and_then(AttrValue::as_str),
             Some("venice")
         );

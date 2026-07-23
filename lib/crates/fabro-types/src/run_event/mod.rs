@@ -2135,7 +2135,7 @@ mod tests {
             text:            "ok".to_string(),
             model:           crate::ModelRef {
                 provider: fabro_model::ProviderId::openai(),
-                model_id: "gpt-5.4".to_string(),
+                model_id: "gpt-5.4".into(),
                 speed:    None,
             },
             billing:         BilledTokenCounts::default(),
@@ -2188,7 +2188,7 @@ mod tests {
             text:            "ok".to_string(),
             model:           crate::ModelRef {
                 provider: fabro_model::ProviderId::openai(),
-                model_id: "gpt-5.4".to_string(),
+                model_id: "gpt-5.4".into(),
                 speed:    None,
             },
             billing:         BilledTokenCounts::default(),

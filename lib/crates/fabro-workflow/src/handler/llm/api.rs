@@ -935,7 +935,7 @@ impl AgentApiBackend {
                         .clone()
                         .unwrap_or_else(|| default_provider.clone()),
                 ),
-                model_id: request.model.clone(),
+                model_id: request.model.clone().into(),
                 speed:    controls.speed,
             }),
             Err(sdk_err) if sdk_err.failover_eligible() && !fallback_chain.is_empty() => {
@@ -964,7 +964,7 @@ impl AgentApiBackend {
 
                     let max_tokens = node.max_tokens().or_else(|| {
                         self.catalog
-                            .get(&target.model)
+                            .get_on_provider(&ProviderId::new(&target.provider), &target.model)
                             .and_then(|model| model.limits.max_output)
                     });
 
@@ -983,7 +983,7 @@ impl AgentApiBackend {
                                 response: resp,
                                 model:    ModelRef {
                                     provider: ProviderId::from(target.provider.clone()),
-                                    model_id: target.model.clone(),
+                                    model_id: target.model.clone().into(),
                                     speed:    controls.speed,
                                 },
                             });
@@ -1034,9 +1034,11 @@ impl CodergenBackend for AgentApiBackend {
         let provider_id = provider.provider_id.to_string();
         let controls = self.resolve_effective_request_controls(node)?;
 
-        let max_tokens = node
-            .max_tokens()
-            .or_else(|| self.catalog.get(model).and_then(|m| m.limits.max_output));
+        let max_tokens = node.max_tokens().or_else(|| {
+            self.catalog
+                .get_on_provider(&provider.provider_id, model)
+                .and_then(|model| model.limits.max_output)
+        });
 
         let mut messages = Vec::new();
         if let Some(sys) = system_prompt {
@@ -1523,7 +1525,7 @@ impl CodergenBackend for AgentApiBackend {
             self.catalog.as_ref(),
             &ModelRef {
                 provider: session.provider_id(),
-                model_id: session.model().to_string(),
+                model_id: session.model().into(),
                 speed:    billing_controls.speed,
             },
             &total_usage,
@@ -2530,6 +2532,47 @@ reasoning = false
     }
 
     #[test]
+    fn api_backend_provider_pin_wins_over_priority_selection() {
+        let settings: LlmCatalogSettings = toml::from_str(
+            r"
+[providers.openrouter]
+enabled = true
+",
+        )
+        .unwrap();
+        let backend = AgentApiBackend::new_with_catalog(
+            "gpt-5.4".to_string(),
+            ProviderId::from("openrouter"),
+            Vec::new(),
+            Arc::new(EnvCredentialSource::new()),
+            SteeringHub::for_tests(),
+            Arc::new(Catalog::from_builtin_with_overrides(&settings).unwrap()),
+        );
+
+        let provider = backend.resolve_provider_context("gpt-5.4", None).unwrap();
+
+        assert_eq!(provider.provider_id, ProviderId::from("openrouter"));
+    }
+
+    #[test]
+    fn api_backend_node_provider_attr_overrides_backend_pin() {
+        let backend = AgentApiBackend::new_with_catalog(
+            "gpt-5.4".to_string(),
+            ProviderId::from("openrouter"),
+            Vec::new(),
+            Arc::new(EnvCredentialSource::new()),
+            SteeringHub::for_tests(),
+            Arc::new(Catalog::from_builtin().unwrap()),
+        );
+
+        let provider = backend
+            .resolve_provider_context("gpt-5.4", Some("openai"))
+            .unwrap();
+
+        assert_eq!(provider.provider_id, ProviderId::openai());
+    }
+
+    #[test]
     fn api_backend_resolves_custom_catalog_provider_profile() {
         let settings: LlmCatalogSettings = toml::from_str(
             r#"
@@ -2620,6 +2663,33 @@ reasoning = false
 
         assert_eq!(provider.provider_id, ProviderId::from("acme"));
         assert_eq!(provider.profile_kind, AgentProfileKind::Anthropic);
+    }
+
+    #[test]
+    fn api_backend_preserves_default_provider_for_legacy_model_identifier() {
+        let settings: LlmCatalogSettings = toml::from_str(
+            r"
+[providers.openrouter]
+enabled = true
+",
+        )
+        .unwrap();
+        let catalog = Arc::new(Catalog::from_builtin_with_overrides(&settings).unwrap());
+        let backend = AgentApiBackend::new_with_catalog(
+            "openai/gpt-5.4".to_string(),
+            ProviderId::from("openrouter"),
+            Vec::new(),
+            Arc::new(EnvCredentialSource::new()),
+            SteeringHub::for_tests(),
+            catalog,
+        );
+
+        let provider = backend
+            .resolve_provider_context("openai/gpt-5.4", None)
+            .unwrap();
+
+        assert_eq!(provider.provider_id, ProviderId::from("openrouter"));
+        assert_eq!(provider.profile_kind, AgentProfileKind::OpenAi);
     }
 
     #[test]

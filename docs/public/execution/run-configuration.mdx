@@ -138,11 +138,15 @@ name = "claude-sonnet-4-5"
 
 | Field | Description |
 |---|---|
-| `name` | Model ID or alias (e.g. `claude-sonnet-4-5`, `opus`, `gemini-pro`). See [Models](/core-concepts/models). |
-| `provider` | Provider name (optional — auto-inferred from the model catalog). Only needed for models not in the catalog or to force a specific provider. |
+| `name` | Canonical model slug or alias (e.g. `claude-sonnet-4-5`, `opus`, `gemini-pro`). See [Models](/core-concepts/models). |
+| `provider` | Optional provider pin. When omitted, Fabro selects among ready offerings by provider priority. When present, an unavailable provider is an error rather than permission to switch. |
 | `fallbacks` | Ordered list of model references to try when the primary is unavailable. Entries can be bare provider tokens (`"openai"`), bare model aliases, or qualified `"provider/model"` references. |
 
 Provider values are catalog provider ID strings. Built-in IDs like `anthropic` and `openai` work, and settings-defined IDs like `proxy` work after they are added under `[llm.providers.<id>]`.
+
+At run creation, Fabro resolves the primary selector and every node selector against the ready-provider snapshot. It persists the selected canonical model slug and provider, so resuming the run does not choose a different provider just because credentials or priorities changed. The configured fallback chain remains available for failures that occur while the materialized run is executing.
+
+Historical built-in provider API IDs are accepted for compatibility and normalize before this selection. For example, `name = "openai/gpt-5.6-sol"` is treated as the canonical `gpt-5.6-sol` selector; omit `provider` to use readiness and priority, or set `provider` separately to pin an offering.
 
 #### `[run.model.controls]`
 

@@ -347,8 +347,8 @@ fn merge_provider_options(body: &mut Value, provider_options: Option<&Value>, pr
 
 #[cfg(test)]
 mod tests {
-    use fabro_model::Catalog;
     use fabro_model::catalog::LlmCatalogSettings;
+    use fabro_model::{Catalog, ProviderId};
     use serde_json::json;
 
     use super::*;
@@ -617,7 +617,7 @@ sampling_params = false
             request:       &request,
             provider_name: "bedrock",
             deployment_id: "pinned-model",
-            model:         catalog.get("pinned-model"),
+            model:         catalog.get_on_provider(&ProviderId::new("bedrock"), "pinned-model"),
             params:        &params,
         };
         let encoded = encode(&ctx, false).unwrap();

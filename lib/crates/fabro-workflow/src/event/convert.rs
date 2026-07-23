@@ -2117,7 +2117,7 @@ mod tests {
                 text:            "ok".to_string(),
                 model:           ModelRef {
                     provider: ProviderId::anthropic(),
-                    model_id: "claude-sonnet".to_string(),
+                    model_id: "claude-sonnet".into(),
                     speed:    None,
                 },
                 usage:           LlmTokenCounts::default(),
@@ -2147,7 +2147,7 @@ mod tests {
                 text:            "ok".to_string(),
                 model:           ModelRef {
                     provider: ProviderId::new("custom_proxy"),
-                    model_id: "proxy-model".to_string(),
+                    model_id: "proxy-model".into(),
                     speed:    None,
                 },
                 usage:           LlmTokenCounts {
@@ -2184,7 +2184,7 @@ mod tests {
                 text:            "ok".to_string(),
                 model:           ModelRef {
                     provider: ProviderId::new("openrouter"),
-                    model_id: "openai/gpt-5.4".to_string(),
+                    model_id: "openai/gpt-5.4".into(),
                     speed:    None,
                 },
                 usage:           LlmTokenCounts {
@@ -2238,7 +2238,7 @@ mod tests {
                 text:            "ok".to_string(),
                 model:           ModelRef {
                     provider: ProviderId::openai(),
-                    model_id: "gpt-5.4".to_string(),
+                    model_id: "gpt-5.4".into(),
                     speed:    None,
                 },
                 usage:           LlmTokenCounts::default(),

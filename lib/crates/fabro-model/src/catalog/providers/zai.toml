@@ -8,50 +8,46 @@ priority = 60
 [providers.zai.auth]
 credentials = ["env:ZAI_API_KEY", "vault:ZAI_API_KEY"]
 
-[models."glm-5.2"]
-provider = "zai"
-api_id = "glm-5.2"
+[providers.zai.models."glm-5.2"]
 display_name = "GLM 5.2"
 family = "glm-5"
 default = true
 aliases = ["glm", "glm5"]
 
-[models."glm-5.2".limits]
+[providers.zai.models."glm-5.2".limits]
 context_window = 1048576
 max_output = 131072
 
-[models."glm-5.2".features]
+[providers.zai.models."glm-5.2".features]
 tools = true
 vision = false
 reasoning = true
 reasoning_effort = "levels"
 prompt_cache = true
 
-[models."glm-5.2".controls]
+[providers.zai.models."glm-5.2".controls]
 reasoning_effort = ["high", "max"]
 
-[models."glm-5.2".costs]
+[providers.zai.models."glm-5.2".costs]
 input_cost_per_mtok = 1.4
 output_cost_per_mtok = 4.4
 cache_input_cost_per_mtok = 0.26
 
-[models."glm-4.7"]
-provider = "zai"
-api_id = "glm-4.7"
+[providers.zai.models."glm-4.7"]
 display_name = "GLM 4.7"
 family = "glm-4"
 estimated_output_tps = 100
 aliases = ["glm4"]
 
-[models."glm-4.7".limits]
+[providers.zai.models."glm-4.7".limits]
 context_window = 202752
 max_output = 16384
 
-[models."glm-4.7".features]
+[providers.zai.models."glm-4.7".features]
 tools = true
 vision = false
 reasoning = false
 
-[models."glm-4.7".costs]
+[providers.zai.models."glm-4.7".costs]
 input_cost_per_mtok = 0.6
 output_cost_per_mtok = 2.2

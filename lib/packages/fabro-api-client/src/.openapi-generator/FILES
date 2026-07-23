@@ -293,6 +293,8 @@ models/principal-webhook.ts
 models/principal-worker.ts
 models/principal.ts
 models/project-namespace.ts
+models/provider-credential-test-request.ts
+models/provider-credential-test-response.ts
 models/provider-list.ts
 models/provider-test-list.ts
 models/provider-test-result.ts

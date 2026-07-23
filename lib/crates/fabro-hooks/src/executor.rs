@@ -323,11 +323,10 @@ impl HookExecutorImpl {
         }
     }
 
-    /// Resolve a model alias (e.g. "haiku") to a concrete model ID.
-    fn resolve_model(model: Option<&str>, catalog: &Catalog) -> String {
-        let model_id = model.unwrap_or("haiku");
-        let model_info = catalog.get(model_id);
-        model_info.map_or(model_id, |m| m.id.as_str()).to_string()
+    /// Keep the requested selector intact so the ready-provider-aware LLM
+    /// client can resolve aliases at dispatch time.
+    fn resolve_model(model: Option<&str>) -> String {
+        model.unwrap_or("haiku").to_string()
     }
 
     /// Build the user message for prompt/agent hooks.
@@ -377,7 +376,7 @@ impl HookExecutorImpl {
             }
         };
 
-        let resolved_model = Self::resolve_model(model.as_deref(), catalog.as_ref());
+        let resolved_model = Self::resolve_model(model.as_deref());
         let user_msg = Self::build_hook_user_message(&prompt, context);
 
         Self::execute_llm_with_timeout(definition.timeout(), "prompt", || async move {
@@ -446,7 +445,7 @@ impl HookExecutorImpl {
             }
         };
 
-        let resolved_model = Self::resolve_model(model.as_deref(), catalog.as_ref());
+        let resolved_model = Self::resolve_model(model.as_deref());
         let user_msg = Self::build_hook_user_message(&prompt, context);
 
         Self::execute_llm_with_timeout(definition.timeout(), "agent", || async move {

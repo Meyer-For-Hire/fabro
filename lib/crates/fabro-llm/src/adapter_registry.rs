@@ -10,7 +10,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use fabro_auth::ApiKeyHeader;
-use fabro_model::{AdapterKind, AgentProfileKind, BillingPolicy, Catalog, CodecKind, ProviderId};
+use fabro_model::{
+    AdapterKind, AgentProfileKind, BillingPolicy, Catalog, CodecKind, Model, ProviderId,
+};
 
 use crate::error::Error;
 use crate::provider::ProviderAdapter;
@@ -242,13 +244,11 @@ pub struct Route {
     pub agent_profile:  AgentProfileKind,
 }
 
-/// Resolve the route for `model_id_or_alias` from the catalog's provider and
-/// model rows. Returns `None` when the model or its provider is unknown.
+/// Resolve the route for one already-selected catalog offering.
 #[must_use]
-pub fn resolve_route(catalog: &Catalog, model_id_or_alias: &str) -> Option<Route> {
-    let model = catalog.get(model_id_or_alias)?;
+pub fn resolve_route(catalog: &Catalog, model: &Model) -> Option<Route> {
     let provider = catalog.provider(&model.provider)?;
-    let settings = catalog.model_settings(&model.id)?;
+    let settings = catalog.settings_for(model)?;
     Some(Route {
         provider:       provider.id.clone(),
         transport:      provider.adapter,
@@ -262,6 +262,12 @@ pub fn resolve_route(catalog: &Catalog, model_id_or_alias: &str) -> Option<Route
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn select_from_all<'a>(catalog: &'a Catalog, selector: &str) -> &'a Model {
+        catalog
+            .select(selector, None, &catalog.all_provider_ids())
+            .unwrap_or_else(|error| panic!("built-in model '{selector}' should resolve: {error}"))
+    }
 
     /// One row of the route-equivalence table: model id plus the
     /// `(deployment_id, transport, codec, billing_policy, agent_profile)`
@@ -336,7 +342,8 @@ mod tests {
         );
 
         for (model_id, deployment_id, transport, codec, billing_policy, agent_profile) in expected {
-            let route = resolve_route(catalog, model_id)
+            let model = select_from_all(catalog, model_id);
+            let route = resolve_route(catalog, model)
                 .unwrap_or_else(|| panic!("built-in model '{model_id}' should resolve"));
             assert_eq!(route.deployment_id, *deployment_id, "{model_id}");
             assert_eq!(route.transport, *transport, "{model_id}");
@@ -350,16 +357,20 @@ mod tests {
     fn resolve_route_follows_model_aliases() {
         let catalog = Catalog::builtin();
 
-        let by_alias = resolve_route(catalog, "sonnet").expect("alias should resolve");
-        let by_id = resolve_route(catalog, "claude-sonnet-4-6").expect("id should resolve");
+        let by_alias = resolve_route(catalog, select_from_all(catalog, "sonnet"))
+            .expect("alias should resolve");
+        let by_id = resolve_route(catalog, select_from_all(catalog, "claude-sonnet-4-6"))
+            .expect("id should resolve");
 
         assert_eq!(by_alias, by_id);
         assert_eq!(by_alias.provider, ProviderId::anthropic());
     }
 
     #[test]
-    fn resolve_route_returns_none_for_unknown_models() {
-        assert_eq!(resolve_route(Catalog::builtin(), "not-a-model"), None);
+    fn resolve_route_resolves_by_id_for_model_from_another_catalog_instance() {
+        let other = Catalog::from_builtin().unwrap();
+        let model = select_from_all(&other, "gpt-5.4");
+        assert!(resolve_route(Catalog::builtin(), model).is_some());
     }
 
     #[test]

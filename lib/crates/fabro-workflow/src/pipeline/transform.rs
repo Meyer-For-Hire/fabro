@@ -63,7 +63,12 @@ pub fn transform(parsed: Parsed, options: &TransformOptions) -> Result<Transform
     .apply_with_diagnostics(graph)?;
     diagnostics.extend(transform_diagnostics);
     let graph = StylesheetApplicationTransform.apply(graph)?;
-    let graph = ModelResolutionTransform::new(Arc::clone(&options.catalog)).apply(graph)?;
+    let graph = ModelResolutionTransform::for_eligible(
+        Arc::clone(&options.catalog),
+        options.eligible_providers.clone(),
+    )
+    .with_default_provider(options.default_provider.clone())
+    .apply(graph)?;
 
     // Custom transforms
     let graph = options
@@ -106,13 +111,15 @@ mod tests {
 
     fn transform_options() -> TransformOptions {
         TransformOptions {
-            current_dir:       None,
-            file_resolver:     None,
-            template_context:  fabro_template::TemplateContext::new(),
-            source_name:       None,
-            render_mode:       crate::operations::RenderMode::Strict,
-            custom_transforms: vec![],
-            catalog:           test_catalog(),
+            current_dir:        None,
+            file_resolver:      None,
+            template_context:   fabro_template::TemplateContext::new(),
+            source_name:        None,
+            render_mode:        crate::operations::RenderMode::Strict,
+            custom_transforms:  vec![],
+            catalog:            test_catalog(),
+            default_provider:   None,
+            eligible_providers: Catalog::builtin().all_provider_ids(),
         }
     }
 
@@ -168,13 +175,15 @@ mod tests {
         )
         .unwrap();
         let transformed = transform(parsed, &TransformOptions {
-            current_dir:       Some(dir.path().to_path_buf()),
-            file_resolver:     Some(Arc::new(FilesystemFileResolver::new(None))),
-            template_context:  fabro_template::TemplateContext::new(),
-            source_name:       None,
-            render_mode:       crate::operations::RenderMode::Strict,
-            custom_transforms: vec![],
-            catalog:           test_catalog(),
+            current_dir:        Some(dir.path().to_path_buf()),
+            file_resolver:      Some(Arc::new(FilesystemFileResolver::new(None))),
+            template_context:   fabro_template::TemplateContext::new(),
+            source_name:        None,
+            render_mode:        crate::operations::RenderMode::Strict,
+            custom_transforms:  vec![],
+            catalog:            test_catalog(),
+            default_provider:   None,
+            eligible_providers: Catalog::builtin().all_provider_ids(),
         })
         .unwrap();
 
@@ -215,18 +224,20 @@ mod tests {
         )
         .unwrap();
         let transformed = transform(parsed, &TransformOptions {
-            current_dir:       Some(dir.path().to_path_buf()),
-            file_resolver:     Some(Arc::new(FilesystemFileResolver::new(None))),
-            template_context:  fabro_template::TemplateContext::new().with_inputs(HashMap::from([
-                (
+            current_dir:        Some(dir.path().to_path_buf()),
+            file_resolver:      Some(Arc::new(FilesystemFileResolver::new(None))),
+            template_context:   fabro_template::TemplateContext::new().with_inputs(HashMap::from(
+                [(
                     "task".to_string(),
                     toml::Value::String("Launch".to_string()),
-                ),
-            ])),
-            source_name:       None,
-            render_mode:       crate::operations::RenderMode::Strict,
-            custom_transforms: vec![],
-            catalog:           test_catalog(),
+                )],
+            )),
+            source_name:        None,
+            render_mode:        crate::operations::RenderMode::Strict,
+            custom_transforms:  vec![],
+            catalog:            test_catalog(),
+            default_provider:   None,
+            eligible_providers: Catalog::builtin().all_provider_ids(),
         })
         .unwrap();
 
@@ -350,13 +361,15 @@ mod tests {
         )
         .unwrap();
         let transformed = transform(parsed, &TransformOptions {
-            current_dir:       Some(dir.path().to_path_buf()),
-            file_resolver:     Some(Arc::new(FilesystemFileResolver::new(None))),
-            template_context:  fabro_template::TemplateContext::new(),
-            source_name:       None,
-            render_mode:       crate::operations::RenderMode::Structural,
-            custom_transforms: vec![],
-            catalog:           test_catalog(),
+            current_dir:        Some(dir.path().to_path_buf()),
+            file_resolver:      Some(Arc::new(FilesystemFileResolver::new(None))),
+            template_context:   fabro_template::TemplateContext::new(),
+            source_name:        None,
+            render_mode:        crate::operations::RenderMode::Structural,
+            custom_transforms:  vec![],
+            catalog:            test_catalog(),
+            default_provider:   None,
+            eligible_providers: Catalog::builtin().all_provider_ids(),
         })
         .unwrap();
 

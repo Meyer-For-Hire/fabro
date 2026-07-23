@@ -34,7 +34,10 @@ fn materialize_run_applies_graph_and_catalog_defaults() {
         ..WorkflowSettings::default()
     };
 
-    let materialized = materialize_run(settings, &graph(source), Catalog::builtin(), &[]);
+    let materialized = materialize_run(settings, &graph(source), Catalog::builtin(), &[
+        ProviderId::anthropic(),
+    ])
+    .unwrap();
     let resolved = &materialized.run;
 
     assert_eq!(resolved.model.name.as_deref(), Some("claude-sonnet-4-6"));
@@ -60,7 +63,8 @@ fn materialize_run_uses_configured_provider_defaults() {
         &graph(source),
         Catalog::builtin(),
         &[ProviderId::openai()],
-    );
+    )
+    .unwrap();
     let resolved = &materialized.run;
 
     assert_eq!(resolved.model.provider.as_deref(), Some("openai"));

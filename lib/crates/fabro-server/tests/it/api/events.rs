@@ -4,6 +4,7 @@ use std::time::Duration;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use chrono::{SecondsFormat, Utc};
+use fabro_static::EnvVars;
 use object_store::ObjectStore;
 use object_store::memory::InMemory;
 use tokio::sync::Barrier;
@@ -23,6 +24,7 @@ fn app_with_store(object_store: Arc<dyn ObjectStore>) -> axum::Router {
     let state = fabro_server::test_support::TestAppStateBuilder::new()
         .runtime_settings(settings.server_settings, settings.manifest_run_defaults)
         .env_lookup(|_| None)
+        .vault_entries([(EnvVars::OPENAI_API_KEY, "test-openai-api-key")])
         .store_bundle(store, artifact_store)
         .build();
     fabro_server::test_support::build_test_router(state)
