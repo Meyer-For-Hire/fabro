@@ -72,7 +72,6 @@ impl StructuredOutputError {
         self.kind
     }
 
-    #[cfg(test)]
     #[must_use]
     pub(crate) fn messages(&self) -> &[String] {
         &self.messages

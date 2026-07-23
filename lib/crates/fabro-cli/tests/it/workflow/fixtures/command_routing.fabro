@@ -1,0 +1,23 @@
+digraph CommandRouting {
+    graph [goal="Route on structured output from a command"]
+    rankdir=LR
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare, label="Exit"]
+
+    classify [
+        label="Classify",
+        shape=parallelogram,
+        script="echo '{\"context_updates\":{\"kept_count\":2}}'",
+        output_schema="routing"
+    ]
+    gate [label="Check Count", shape=diamond]
+    kept [label="Kept", shape=parallelogram, script="echo kept"]
+    none [label="None", shape=parallelogram, script="echo none"]
+
+    start -> classify -> gate
+    gate -> kept [label="Kept", condition="context.kept_count > 0"]
+    gate -> none [label="None"]
+    kept -> exit
+    none -> exit
+}

@@ -33,7 +33,7 @@ use fabro_interview::{
 use fabro_model::catalog::{LlmCatalogSettings, ProviderCatalogSettings};
 use fabro_model::{Catalog, ProviderId};
 use fabro_store::{ArtifactKey, ArtifactStore, Database};
-use fabro_types::{RunEvent, RunId, StageId, WorkflowSettings, parse_blob_ref};
+use fabro_types::{EventBody, RunEvent, RunId, StageId, WorkflowSettings, parse_blob_ref};
 use fabro_validate::{Severity, validate, validate_or_raise};
 use fabro_workflow::context::Context;
 use fabro_workflow::error::{Error, FailureSignatureExt};
@@ -1929,6 +1929,94 @@ fn make_graph_with_start_exit(name: &str) -> Graph {
     );
     graph.nodes.insert("exit".to_string(), exit);
     graph
+}
+
+#[tokio::test]
+async fn command_schema_validation_failure_does_not_consume_retries() {
+    let mut graph = make_graph_with_start_exit("CommandSchemaNoRetry");
+    let mut audit = Node::new("audit");
+    audit.attrs.insert(
+        "shape".to_string(),
+        AttrValue::String("parallelogram".to_string()),
+    );
+    audit.attrs.insert(
+        "script".to_string(),
+        AttrValue::String(r#"echo '{"passed":"yes"}'"#.to_string()),
+    );
+    audit.attrs.insert(
+        "output_schema".to_string(),
+        AttrValue::String(
+            r#"{"type":"object","required":["passed"],"properties":{"passed":{"type":"boolean"}}}"#
+                .to_string(),
+        ),
+    );
+    audit
+        .attrs
+        .insert("max_retries".to_string(), AttrValue::Integer(2));
+    graph.nodes.insert("audit".to_string(), audit);
+    graph.edges.push(Edge::new("start", "audit"));
+
+    let emitter = Emitter::default();
+    let events = collect_events(&emitter);
+    let dir = tempfile::tempdir().unwrap();
+    let mut registry = HandlerRegistry::new(Box::new(StartHandler));
+    registry.register("start", Box::new(StartHandler));
+    registry.register("exit", Box::new(ExitHandler));
+    registry.register("command", Box::new(CommandHandler));
+    let engine = WorkflowRunner::new(registry, Arc::new(emitter), local_env());
+    let run_options = RunOptions {
+        settings:         WorkflowSettings::default(),
+        run_dir:          dir.path().to_path_buf(),
+        cancel_token:     CancellationToken::new(),
+        run_id:           test_run_id("command-schema-no-retry"),
+        labels:           std::collections::HashMap::new(),
+        workflow_slug:    None,
+        github_app:       None,
+        base_branch:      None,
+        display_base_sha: None,
+        pre_run_git:      None,
+        fork_source_ref:  None,
+        git:              None,
+    };
+
+    let (outcome, state) = engine
+        .run_with_state(&graph, &run_options)
+        .await
+        .expect("deterministic command failure should remain a workflow outcome");
+
+    assert_eq!(outcome.status, StageOutcome::Failed {
+        retry_requested: false,
+    });
+    assert_eq!(
+        outcome.failure_category(),
+        Some(fabro_workflow::outcome::FailureCategory::Deterministic)
+    );
+    let checkpoint = state
+        .current_checkpoint()
+        .expect("checkpoint should be captured");
+    let audit_outcome = checkpoint
+        .node_outcomes
+        .get("audit")
+        .expect("audit outcome should be checkpointed");
+    assert_eq!(audit_outcome.status, StageOutcome::Failed {
+        retry_requested: false,
+    });
+    assert_eq!(
+        audit_outcome.failure_category(),
+        Some(fabro_workflow::outcome::FailureCategory::Deterministic)
+    );
+    assert_eq!(
+        checkpoint.node_retries.get("audit").copied().unwrap_or(0),
+        0,
+        "schema validation should not consume node retries"
+    );
+    let command_starts = events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| matches!(event.body, EventBody::CommandStarted(_)))
+        .count();
+    assert_eq!(command_starts, 1, "command should execute exactly once");
 }
 
 #[tokio::test]

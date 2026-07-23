@@ -20,7 +20,7 @@ const HANDLER_SPECIFIC_ATTRS: &[(&str, &[&str])] = &[
     ("duration", &["wait"]),
     ("join_policy", &["parallel"]),
     ("max_parallel", &["parallel"]),
-    ("output_schema", &["agent", "prompt"]),
+    ("output_schema", &["agent", "prompt", "command"]),
     ("prompt", &["agent", "prompt", "parallel.fan_in"]),
 ];
 
@@ -152,15 +152,13 @@ mod tests {
     }
 
     #[test]
-    fn warns_on_output_schema_on_command_node() {
+    fn accepts_output_schema_on_command_node() {
         let mut g = minimal_graph();
         g.nodes.insert(
             "run".to_string(),
             node_with_attr("run", "parallelogram", "output_schema", "routing"),
         );
-        let d = Rule.apply(&g);
-        assert_eq!(d.len(), 1);
-        assert!(d[0].message.contains("'output_schema'"));
+        assert!(Rule.apply(&g).is_empty());
     }
 
     #[test]

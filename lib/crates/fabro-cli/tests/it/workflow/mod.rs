@@ -8,6 +8,7 @@ mod agent_linear;
 mod artifacts;
 mod command_agent_mixed;
 mod command_pipeline;
+mod command_routing;
 mod conditional_branching;
 mod dry_run_examples;
 mod full_stack;
