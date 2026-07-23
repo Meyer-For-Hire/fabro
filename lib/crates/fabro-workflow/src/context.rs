@@ -25,6 +25,7 @@ pub mod keys {
     pub const INTERNAL_PARENT_PREAMBLE: &str = "internal.parent_preamble";
     pub const INTERNAL_PARALLEL_GROUP_ID: &str = "internal.parallel_group_id";
     pub const INTERNAL_PARALLEL_BRANCH_ID: &str = "internal.parallel_branch_id";
+    pub const INTERNAL_PARALLEL_BRANCH_PREAMBLES: &str = "internal.parallel_branch_preambles";
 
     // --- current.* keys ---
     pub const CURRENT_PREAMBLE: &str = "current.preamble";

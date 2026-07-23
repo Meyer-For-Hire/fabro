@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use fabro_agent::{Sandbox, WorktreeOptions, WorktreeSandbox};
+use fabro_graphviz::Fidelity;
 use fabro_graphviz::graph::{AttrValue, Graph, Node};
 use fabro_hooks::{HookContext, HookEvent};
 use fabro_types::{ParallelBranchId, RunId, StageId};
@@ -54,6 +55,39 @@ struct BranchResult {
     outcome:       Outcome,
     head_sha:      Option<String>,
     worktree_path: Option<PathBuf>,
+}
+
+struct BranchPreamble {
+    fidelity: Fidelity,
+    preamble: String,
+}
+
+fn parse_branch_preambles(
+    value: Option<serde_json::Value>,
+    branch_count: usize,
+) -> Option<Vec<Option<BranchPreamble>>> {
+    let serde_json::Value::Array(entries) = value? else {
+        return None;
+    };
+    if entries.len() != branch_count {
+        return None;
+    }
+
+    entries
+        .into_iter()
+        .map(|entry| match entry {
+            serde_json::Value::Null => Some(None),
+            serde_json::Value::Object(entry) if entry.len() == 2 => {
+                let fidelity = entry.get("fidelity")?.as_str()?.parse().ok()?;
+                let preamble = entry.get("preamble")?.as_str()?;
+                Some(Some(BranchPreamble {
+                    fidelity,
+                    preamble: preamble.to_string(),
+                }))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 #[async_trait]
@@ -220,6 +254,10 @@ impl Handler for ParallelHandler {
             None
         };
 
+        let branch_preambles = parse_branch_preambles(
+            context.get(keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES),
+            branches.len(),
+        );
         let mut branch_setups: Vec<BranchSetup> = Vec::new();
         for (branch_index, edge) in branches.iter().enumerate() {
             let target_id = edge.to.clone();
@@ -235,6 +273,21 @@ impl Handler for ParallelHandler {
             branch_context.set(
                 keys::INTERNAL_PARALLEL_BRANCH_ID,
                 serde_json::Value::String(parallel_branch_id.to_string()),
+            );
+            if let Some(entry) = branch_preambles
+                .as_ref()
+                .and_then(|entries| entries.get(branch_index))
+                .and_then(Option::as_ref)
+            {
+                branch_context.set(keys::CURRENT_PREAMBLE, serde_json::json!(&entry.preamble));
+                branch_context.set(
+                    keys::INTERNAL_FIDELITY,
+                    serde_json::json!(entry.fidelity.to_string()),
+                );
+            }
+            branch_context.set(
+                keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES,
+                serde_json::Value::Null,
             );
 
             let (branch_sandbox, worktree_path): (Arc<dyn Sandbox>, Option<PathBuf>) = if let (
@@ -297,6 +350,10 @@ impl Handler for ParallelHandler {
                 worktree_path,
             });
         }
+        context.set(
+            keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES,
+            serde_json::Value::Null,
+        );
 
         // --- Fan out: concurrent execution ---
         let mut handles = Vec::new();
@@ -693,7 +750,7 @@ fn parallel_branch_commit_cmd(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use fabro_graphviz::graph::{AttrValue, Edge};
@@ -754,6 +811,185 @@ mod tests {
             serde_json::json!(fixtures::RUN_1.to_string()),
         );
         context
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct BranchContextCapture {
+        node_id:  String,
+        preamble: String,
+        fidelity: String,
+        stash:    Option<serde_json::Value>,
+    }
+
+    struct BranchContextRecordingHandler {
+        captures: Arc<Mutex<Vec<BranchContextCapture>>>,
+    }
+
+    #[async_trait]
+    impl Handler for BranchContextRecordingHandler {
+        async fn execute(
+            &self,
+            node: &Node,
+            context: &Context,
+            _graph: &Graph,
+            _run_dir: &Path,
+            _services: &EngineServices,
+        ) -> Result<Outcome, Error> {
+            self.captures.lock().unwrap().push(BranchContextCapture {
+                node_id:  node.id.clone(),
+                preamble: context.preamble(),
+                fidelity: context.fidelity().to_string(),
+                stash:    context.get(keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES),
+            });
+            Ok(Outcome::success())
+        }
+    }
+
+    async fn execute_with_branch_stash(
+        stash: Option<serde_json::Value>,
+        duplicate_target: bool,
+    ) -> (Context, Vec<BranchContextCapture>) {
+        let captures = Arc::new(Mutex::new(Vec::new()));
+        let recorder = BranchContextRecordingHandler {
+            captures: Arc::clone(&captures),
+        };
+        let mut registry = super::super::HandlerRegistry::new(Box::new(recorder));
+        registry.register(
+            "record",
+            Box::new(BranchContextRecordingHandler {
+                captures: Arc::clone(&captures),
+            }),
+        );
+        let mut services = EngineServices::test_default();
+        services.registry = Arc::new(registry);
+
+        let mut node = Node::new("par");
+        node.attrs.insert(
+            "shape".to_string(),
+            AttrValue::String("component".to_string()),
+        );
+        let mut branch_a = Node::new("branch_a");
+        branch_a
+            .attrs
+            .insert("type".to_string(), AttrValue::String("record".to_string()));
+        let mut branch_b = Node::new("branch_b");
+        branch_b
+            .attrs
+            .insert("type".to_string(), AttrValue::String("record".to_string()));
+
+        let mut graph = Graph::new("test");
+        graph.nodes.insert(node.id.clone(), node.clone());
+        graph.nodes.insert(branch_a.id.clone(), branch_a);
+        graph.nodes.insert(branch_b.id.clone(), branch_b);
+        graph.edges.push(Edge::new("par", "branch_a"));
+        graph.edges.push(Edge::new(
+            "par",
+            if duplicate_target {
+                "branch_a"
+            } else {
+                "branch_b"
+            },
+        ));
+
+        let context = test_context();
+        context.set(keys::CURRENT_PREAMBLE, serde_json::json!("fork preamble"));
+        context.set(keys::INTERNAL_FIDELITY, serde_json::json!("compact"));
+        if let Some(stash) = stash {
+            context.set(keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES, stash);
+        }
+
+        let run_dir = tempfile::tempdir().unwrap();
+        ParallelHandler
+            .execute(&node, &context, &graph, run_dir.path(), &services)
+            .await
+            .unwrap();
+
+        let captures = captures.lock().unwrap().clone();
+        (context, captures)
+    }
+
+    #[tokio::test]
+    async fn parallel_handler_applies_indexed_branch_preambles_and_clears_stash() {
+        let stash = serde_json::json!([
+            {"fidelity": "truncate", "preamble": "branch zero"},
+            {"fidelity": "summary:high", "preamble": "branch one"}
+        ]);
+
+        let (context, mut captures) = execute_with_branch_stash(Some(stash), false).await;
+        captures.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+
+        assert_eq!(captures.len(), 2);
+        assert_eq!(captures[0].node_id, "branch_a");
+        assert_eq!(captures[0].preamble, "branch zero");
+        assert_eq!(captures[0].fidelity, "truncate");
+        assert_eq!(captures[0].stash, Some(serde_json::Value::Null));
+        assert_eq!(captures[1].node_id, "branch_b");
+        assert_eq!(captures[1].preamble, "branch one");
+        assert_eq!(captures[1].fidelity, "summary:high");
+        assert_eq!(captures[1].stash, Some(serde_json::Value::Null));
+        assert_eq!(
+            context.get(keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES),
+            Some(serde_json::Value::Null)
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_handler_uses_edge_index_for_duplicate_targets() {
+        let stash = serde_json::json!([
+            {"fidelity": "truncate", "preamble": "first edge"},
+            {"fidelity": "summary:low", "preamble": "second edge"}
+        ]);
+
+        let (_context, captures) = execute_with_branch_stash(Some(stash), true).await;
+        let observed = captures
+            .iter()
+            .map(|capture| (capture.preamble.as_str(), capture.fidelity.as_str()))
+            .collect::<std::collections::HashSet<_>>();
+
+        assert_eq!(observed.len(), 2);
+        assert!(observed.contains(&("first edge", "truncate")));
+        assert!(observed.contains(&("second edge", "summary:low")));
+        assert!(
+            captures
+                .iter()
+                .all(|capture| capture.stash == Some(serde_json::Value::Null))
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_handler_legacy_stashes_inherit_fork_context() {
+        for stash in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!({
+                "fidelity": "truncate",
+                "preamble": "not an array"
+            })),
+            Some(serde_json::json!([
+                {"fidelity": "truncate", "preamble": "wrong length"}
+            ])),
+            Some(serde_json::json!([
+                {"fidelity": "truncate"},
+                null
+            ])),
+            Some(serde_json::json!([
+                {"fidelity": "not-a-fidelity", "preamble": "malformed fidelity"},
+                null
+            ])),
+        ] {
+            let (context, captures) = execute_with_branch_stash(stash, false).await;
+
+            assert_eq!(captures.len(), 2);
+            assert!(captures.iter().all(|capture| {
+                capture.preamble == "fork preamble"
+                    && capture.fidelity == "compact"
+                    && capture.stash == Some(serde_json::Value::Null)
+            }));
+            assert_eq!(
+                context.get(keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES),
+                Some(serde_json::Value::Null)
+            );
+        }
     }
 
     #[tokio::test]
