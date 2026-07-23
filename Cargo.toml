@@ -1,6 +1,12 @@
 [workspace]
-members = ["lib/crates/*", "test/twin/openai", "test/twin/github"]
-default-members = ["lib/crates/fabro-cli"]
+members = [
+    "lib/apps/*",
+    "lib/components/*",
+    "lib/foundation/*",
+    "test/twin/openai",
+    "test/twin/github",
+]
+default-members = ["lib/apps/fabro-cli"]
 resolver = "2"
 
 [workspace.package]
@@ -84,7 +90,7 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 insta = "1"
-fabro-test = { path = "lib/crates/fabro-test" }
+fabro-test = { path = "lib/foundation/fabro-test" }
 twin-openai = { path = "test/twin/openai" }
 twin-github = { path = "test/twin/github" }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
@@ -100,11 +106,11 @@ rust-embed = "8"
 percent-encoding = "2"
 minijinja = "=2.19.0"
 miette = { version = "7.6", features = ["fancy"] }
-fabro-http = { path = "lib/crates/fabro-http" }
-fabro-environment = { path = "lib/crates/fabro-environment" }
-fabro-options-metadata = { path = "lib/crates/fabro-options-metadata" }
-fabro-redact = { path = "lib/crates/fabro-redact" }
-fabro-static = { path = "lib/crates/fabro-static" }
+fabro-http = { path = "lib/foundation/fabro-http" }
+fabro-environment = { path = "lib/components/fabro-environment" }
+fabro-options-metadata = { path = "lib/foundation/fabro-options-metadata" }
+fabro-redact = { path = "lib/foundation/fabro-redact" }
+fabro-static = { path = "lib/foundation/fabro-static" }
 graphviz-sys = { git = "https://github.com/fabro-sh/graphviz-sys" }
 ref-cast = "1"
 strum = { version = "0.28", features = ["derive"] }

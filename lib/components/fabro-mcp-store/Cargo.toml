@@ -1,0 +1,30 @@
+[package]
+name = "fabro-mcp-store"
+edition.workspace = true
+version.workspace = true
+publish = false
+license.workspace = true
+description = "Server-managed MCP server catalog durable storage for Fabro"
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+chrono.workspace = true
+fabro-db = { path = "../../foundation/fabro-db" }
+fabro-types = { path = "../../foundation/fabro-types" }
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+strum.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "test-util"] }

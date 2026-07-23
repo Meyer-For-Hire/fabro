@@ -37,7 +37,7 @@ This is the right place for:
 
 If the setup requires direct writes to internal run files or runtime directories, prefer this layer over `fabro-cli/tests/it`.
 
-### `lib/crates/fabro-cli/tests/it/cmd/*.rs`
+### `lib/apps/fabro-cli/tests/it/cmd/*.rs`
 
 `cmd/*` tests are command-owned tests.
 
@@ -64,7 +64,7 @@ Bad command-test assertions:
 - behavior primarily owned by another command
 - runtime internals that only exist because the test planted them by hand
 
-### `lib/crates/fabro-cli/tests/it/workflow/*.rs`
+### `lib/apps/fabro-cli/tests/it/workflow/*.rs`
 
 `workflow/*` tests are black-box workflow-behavior tests.
 
@@ -79,7 +79,7 @@ Examples:
 
 These tests should focus on the workflow's observed behavior, not on CLI help text or command argument validation.
 
-### `lib/crates/fabro-cli/tests/it/scenario/*.rs`
+### `lib/apps/fabro-cli/tests/it/scenario/*.rs`
 
 `scenario/*` tests are cross-command lifecycle tests.
 

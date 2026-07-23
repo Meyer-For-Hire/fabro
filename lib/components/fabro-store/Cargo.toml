@@ -1,0 +1,42 @@
+[package]
+name = "fabro-store"
+edition.workspace = true
+version.workspace = true
+publish = false
+license.workspace = true
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+fabro-types = { path = "../../foundation/fabro-types" }
+fabro-util = { path = "../../foundation/fabro-util" }
+hex.workspace = true
+slatedb.workspace = true
+object_store.workspace = true
+percent-encoding.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tokio-stream.workspace = true
+dashmap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+strum.workspace = true
+chrono = { workspace = true, features = ["serde"] }
+bytes.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+futures.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+fabro-types = { path = "../../foundation/fabro-types", features = ["test-support"] }
+tokio = { workspace = true, features = ["test-util", "macros"] }
+tempfile = "3"
+ulid.workspace = true
+insta = { workspace = true }
+fabro-db = { path = "../../foundation/fabro-db" }
