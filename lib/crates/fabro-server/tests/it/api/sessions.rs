@@ -1,10 +1,10 @@
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
+use fabro_static::EnvVars;
 use tower::ServiceExt;
 
 use crate::helpers::{
     MINIMAL_DOT, api, minimal_manifest_json, response_json, response_status, test_app_state,
-    test_app_with_no_providers,
 };
 
 async fn create_run(app: &axum::Router) -> String {
@@ -196,6 +196,7 @@ async fn supplied_session_model_alias_is_canonicalized() {
         .find(|event| event["event"] == "run.session.created")
         .expect("session creation event should be recorded");
     assert_eq!(created_event["properties"]["model"], "gpt-5.4");
+    assert_eq!(created_event["properties"]["provider"], "openai");
 }
 
 #[tokio::test]
@@ -203,9 +204,23 @@ async fn provider_qualified_session_model_is_canonicalized() {
     let app = fabro_server::test_support::build_test_router(test_app_state());
     let run_id = create_run(&app).await;
 
-    let created = create_session_with_model(&app, &run_id, "Ask Fabro", "openai/gpt-5.4").await;
+    let created =
+        create_session_with_model(&app, &run_id, "Ask Fabro", "openai/gpt-5.4-mini").await;
 
-    assert_eq!(created["model"], "gpt-5.4");
+    assert_eq!(created["model"], "gpt-5.4-mini");
+    assert_eq!(created["provider"], "openai");
+}
+
+#[tokio::test]
+async fn unknown_session_models_preserve_passthrough_on_the_selected_provider() {
+    let app = fabro_server::test_support::build_test_router(test_app_state());
+    let run_id = create_run(&app).await;
+
+    for model in ["not-a-real-model", "openai/not-a-real-model"] {
+        let created = create_session_with_model(&app, &run_id, "Ask Fabro", model).await;
+        assert_eq!(created["model"], "not-a-real-model");
+        assert_eq!(created["provider"], "openai");
+    }
 }
 
 #[tokio::test]
@@ -213,7 +228,7 @@ async fn invalid_session_model_refs_are_rejected_at_creation() {
     let app = fabro_server::test_support::build_test_router(test_app_state());
     let run_id = create_run(&app).await;
 
-    for model in ["not-a-real-model", "openai", "openai/", "anthropic/gpt-5.4"] {
+    for model in ["openai", "openai/", "anthropic/gpt-5.4"] {
         let response = create_session_response(
             &app,
             &run_id,
@@ -241,6 +256,7 @@ async fn ambiguous_session_model_refs_are_rejected_at_creation() {
     );
     let state = fabro_server::test_support::TestAppStateBuilder::new()
         .llm_catalog_settings(catalog_settings)
+        .vault_entries([(EnvVars::OPENAI_API_KEY, "test-openai-api-key")])
         .build();
     let app = fabro_server::test_support::build_test_router(state);
     let run_id = create_run(&app).await;
@@ -260,13 +276,14 @@ async fn ambiguous_session_model_refs_are_rejected_at_creation() {
 }
 
 #[tokio::test]
-async fn session_turn_fails_when_selected_model_provider_is_unconfigured() {
-    let app = test_app_with_no_providers();
+async fn session_turn_fails_when_selected_model_provider_becomes_unconfigured() {
+    let app = fabro_server::test_support::build_test_router(test_app_state());
     let run_id = create_run(&app).await;
     let created = create_session_with_model(&app, &run_id, "Ask Fabro", "gpt54").await;
     let session_id = created["id"]
         .as_str()
         .expect("session response should include an id");
+    delete_openai_credential(&app).await;
 
     let request = Request::builder()
         .method("POST")
@@ -347,7 +364,7 @@ async fn unsupported_derived_turn_read_routes_are_removed() {
 
 #[tokio::test]
 async fn session_events_are_filtered_by_session_and_paginated_by_run_sequence() {
-    let app = test_app_with_no_providers();
+    let app = fabro_server::test_support::build_test_router(test_app_state());
     let run_id = create_run(&app).await;
     let first = create_session(&app, &run_id, "First").await;
     let second = create_session(&app, &run_id, "Second").await;
@@ -365,6 +382,7 @@ async fn session_events_are_filtered_by_session_and_paginated_by_run_sequence() 
     )
     .await;
     let after_first_created_seq = first_detail["last_seq"].as_u64().unwrap() + 1;
+    delete_openai_credential(&app).await;
 
     let turn_id = fabro_types::TurnId::new();
     let submit = Request::builder()
@@ -443,13 +461,33 @@ async fn session_sse_events(response: axum::response::Response) -> Vec<serde_jso
         .collect()
 }
 
+async fn delete_openai_credential(app: &axum::Router) {
+    let request = Request::builder()
+        .method("DELETE")
+        .uri(api("/secrets"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "name": EnvVars::OPENAI_API_KEY,
+            }))
+            .expect("delete-secret request should serialize"),
+        ))
+        .expect("delete-secret request should build");
+    response_status(
+        app.clone().oneshot(request).await.unwrap(),
+        StatusCode::NO_CONTENT,
+        "DELETE /api/v1/secrets",
+    )
+    .await;
+}
+
 fn assert_session_metadata_only(value: &serde_json::Value) {
     let object = value
         .as_object()
         .expect("session response should be a JSON object");
+    assert_eq!(value["provider"], "openai");
     for field in [
         "working_dir",
-        "provider",
         "permissions",
         "deleted_at",
         "runtime_context",

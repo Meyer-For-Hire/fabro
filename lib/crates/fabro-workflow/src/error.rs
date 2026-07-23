@@ -3,9 +3,11 @@ use std::sync::Arc;
 
 use fabro_graphviz::Error as GraphvizError;
 use fabro_llm::{Error as LlmError, ProviderErrorKind};
+use fabro_model::ModelSelectionError;
 use fabro_template::TemplateError;
 pub use fabro_types::failure_signature::FailureSignature;
 pub use fabro_types::outcome::FailureCategory;
+use fabro_types::settings::AmbiguousModelRef;
 use fabro_types::{ExecOutputTail, FailureReason, RunFailure};
 use fabro_util::error::{SharedError, collect_causes, collect_chain, render_with_causes};
 use fabro_validate::Diagnostic;
@@ -262,6 +264,12 @@ pub enum Error {
     #[error("Validation failed")]
     ValidationFailed { diagnostics: Vec<Diagnostic> },
 
+    #[error("Model selection failed: {0}")]
+    ModelSelection(#[from] ModelSelectionError),
+
+    #[error("Model reference failed: {0}")]
+    ModelReference(#[from] AmbiguousModelRef),
+
     #[error("{message}")]
     Template {
         message: String,
@@ -445,6 +453,8 @@ impl Error {
             Self::Parse(_)
             | Self::Validation(_)
             | Self::ValidationFailed { .. }
+            | Self::ModelSelection(_)
+            | Self::ModelReference(_)
             | Self::Template { .. }
             | Self::Stylesheet(_)
             | Self::Checkpoint(_)
@@ -466,6 +476,8 @@ impl Error {
             Self::Parse(_)
             | Self::Validation(_)
             | Self::ValidationFailed { .. }
+            | Self::ModelSelection(_)
+            | Self::ModelReference(_)
             | Self::Template { .. }
             | Self::Stylesheet(_)
             | Self::Checkpoint(_)

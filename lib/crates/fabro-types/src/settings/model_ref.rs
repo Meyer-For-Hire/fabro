@@ -142,9 +142,6 @@ pub enum ResolvedModelRef {
 pub trait ModelRegistry {
     fn is_provider(&self, token: &str) -> bool;
     fn is_model(&self, token: &str) -> bool;
-    /// Returns the canonical provider for a bare model token, when the registry
-    /// knows of a unique provider for that model.
-    fn provider_of(&self, token: &str) -> Option<String>;
 }
 
 impl ModelRef {
@@ -169,17 +166,13 @@ impl ModelRef {
                 let is_model = registry.is_model(token);
                 match (is_provider, is_model) {
                     (true, false) => Ok(ResolvedModelRef::Provider(token.clone())),
-                    (false, true) => Ok(ResolvedModelRef::Model {
-                        provider: registry.provider_of(token),
-                        model:    token.clone(),
-                    }),
                     (true, true) => Err(AmbiguousModelRef {
                         input:     token.clone(),
                         providers: vec![token.clone()],
                         models:    vec![token.clone()],
                     }),
-                    // Unknown tokens flow through as bare models — provider TBD at runtime.
-                    (false, false) => Ok(ResolvedModelRef::Model {
+                    // Known and unknown bare models leave provider selection to the runtime.
+                    (false, _) => Ok(ResolvedModelRef::Model {
                         provider: None,
                         model:    token.clone(),
                     }),
@@ -236,13 +229,6 @@ mod tests {
         }
         fn is_model(&self, token: &str) -> bool {
             self.models.contains(&token)
-        }
-        fn provider_of(&self, token: &str) -> Option<String> {
-            if self.models.contains(&token) {
-                Some("test".to_owned())
-            } else {
-                None
-            }
         }
     }
 
@@ -309,7 +295,7 @@ mod tests {
         };
         let resolved = ModelRef::Bare("gpt-5.4".into()).resolve(&reg).unwrap();
         assert_eq!(resolved, ResolvedModelRef::Model {
-            provider: Some("test".into()),
+            provider: None,
             model:    "gpt-5.4".into(),
         });
     }

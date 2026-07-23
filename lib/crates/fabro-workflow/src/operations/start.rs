@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -7,7 +7,7 @@ use fabro_auth::{CredentialSource, EnvCredentialSource, VaultCredentialSource};
 use fabro_interview::{AutoApproveInterviewer, Interviewer};
 use fabro_llm::client::Client as LlmClient;
 use fabro_mcp::config::McpServerSettings;
-use fabro_model::{Catalog, FallbackTarget, ProviderId};
+use fabro_model::{Catalog, FallbackTarget, ModelSelectionError, ProviderId};
 use fabro_sandbox::daytona::DaytonaConfig;
 use fabro_sandbox::from_environment::{
     daytona_config_from_environment, docker_config_from_environment_with_secrets,
@@ -35,7 +35,6 @@ use crate::event::{
     Emitter, Event, EventBody, RunEventLogger, RunEventSink, RunNoticeLevel, append_event_to_sink,
 };
 use crate::handler::HandlerRegistry;
-use crate::handler::llm::routing;
 use crate::outcome::{Outcome, StageOutcome};
 use crate::pipeline::{
     self, FinalizeOptions, Finalized, InitOptions, LlmSpec, Persisted, PullRequestOptions,
@@ -43,12 +42,15 @@ use crate::pipeline::{
 };
 use crate::records::Checkpoint;
 use crate::run_control::RunControlState;
+use crate::run_materialization::resolve_run_model;
 use crate::run_metadata::metadata_branch_name;
 use crate::run_options::{GitCheckpointOptions, LifecycleOptions, RunOptions, SetupCommand};
 use crate::run_status::{FailureReason, RunStatus};
 use crate::runtime_store::RunStoreHandle;
 use crate::services::FabroRunToolServices;
 use crate::steering_hub::SteeringHub;
+#[cfg(feature = "test-support")]
+use crate::test_support as workflow_test_support;
 use crate::workflow_bundle::{RunDefinition, WorkflowBundle};
 
 struct RunSession {
@@ -372,6 +374,13 @@ impl RunSession {
         let catalog = Arc::clone(&services.catalog);
         let configured =
             configured_providers_for_start(services.vault.as_ref(), Arc::clone(&catalog)).await;
+        #[cfg(feature = "test-support")]
+        let configured = workflow_test_support::test_configured_provider_ids(
+            catalog.as_ref(),
+            configured,
+            process_env_var("FABRO_TEST_ASSUME_LLM_READY")
+                .is_some_and(|value| !matches!(value.as_str(), "" | "0" | "false" | "no")),
+        );
         let llm = resolve_start_llm(catalog.as_ref(), &configured, resolved)?;
         let vault_guard = match services.vault.as_ref() {
             Some(vault) => Some(vault.read().await),
@@ -607,25 +616,15 @@ fn resolve_start_llm(
     configured: &[ProviderId],
     settings: &ResolvedRunSettings,
 ) -> Result<ResolvedStartLlm, Error> {
-    let model = settings
-        .model
-        .name
-        .clone()
-        .unwrap_or_else(|| catalog.default_for_configured_ids(configured).id.clone());
-    let provider = settings
-        .model
-        .provider
-        .as_deref()
-        .filter(|value| !value.is_empty());
-
-    let default_provider_id = catalog
-        .default_for_configured_ids(configured)
-        .provider
-        .clone();
-    let provider_context =
-        routing::resolve_provider_context(catalog, &default_provider_id, &model, provider)?;
-    let provider_id = provider_context.provider_id;
-    let fallback_chain = resolve_fallback_chain(catalog, &provider_id, &model, &settings.model);
+    let eligible = configured.iter().cloned().collect::<HashSet<_>>();
+    let (model, provider_id) = resolve_run_model(
+        catalog,
+        &eligible,
+        settings.model.name.as_deref(),
+        settings.model.provider.as_deref(),
+    )?;
+    let fallback_chain =
+        resolve_fallback_chain(catalog, &provider_id, &model, &settings.model, &eligible)?;
 
     Ok(ResolvedStartLlm {
         model,
@@ -636,44 +635,78 @@ fn resolve_start_llm(
 
 fn resolve_fallback_chain(
     catalog: &Catalog,
-    _provider: &ProviderId,
+    provider: &ProviderId,
     model: &str,
     settings: &ResolvedRunModelSettings,
-) -> Vec<FallbackTarget> {
+    eligible: &HashSet<ProviderId>,
+) -> Result<Vec<FallbackTarget>, Error> {
     if settings.fallbacks.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let registry = CatalogModelRegistry { catalog };
-    let primary = catalog.get(model);
+    let primary = catalog.get_on_provider(provider, model);
+    let mut chain = Vec::new();
 
-    settings
-        .fallbacks
-        .iter()
-        .filter_map(|model_ref| match model_ref.resolve(&registry).ok()? {
+    for model_ref in &settings.fallbacks {
+        match model_ref.resolve(&registry)? {
             ResolvedModelRef::Provider(provider_name) => {
                 let provider_id = canonical_provider_id(catalog, &provider_name);
-                let reference = primary?;
-                catalog
-                    .closest(&provider_id, reference)
-                    .map(|model| FallbackTarget {
+                if !eligible.contains(&provider_id) {
+                    return Err(ModelSelectionError::ProviderUnavailable {
+                        provider: provider_id,
+                    }
+                    .into());
+                }
+                if let Some(model) =
+                    primary.and_then(|reference| catalog.closest(&provider_id, reference))
+                {
+                    chain.push(FallbackTarget {
                         provider: provider_id.to_string(),
-                        model:    model.id.clone(),
-                    })
-            }
-            ResolvedModelRef::Model { provider, model } => {
-                let provider =
-                    provider.map(|provider| canonical_provider_id(catalog, &provider).to_string());
-                if let Some(info) = catalog.get(&model) {
-                    let provider = provider.unwrap_or_else(|| info.provider.to_string());
-                    return Some(FallbackTarget {
-                        provider,
-                        model: info.id.clone(),
+                        model:    model.id.to_string(),
                     });
                 }
-                provider.map(|provider| FallbackTarget { provider, model })
             }
-        })
-        .collect()
+            ResolvedModelRef::Model {
+                provider: fallback_provider,
+                model,
+            } => {
+                if let Some(provider) = fallback_provider {
+                    let provider = canonical_provider_id(catalog, &provider);
+                    if !eligible.contains(&provider) {
+                        return Err(ModelSelectionError::ProviderUnavailable { provider }.into());
+                    }
+                    match catalog.resolve_on_provider(&provider, &model) {
+                        Ok(info) => chain.push(FallbackTarget {
+                            provider: info.provider.to_string(),
+                            model:    info.id.to_string(),
+                        }),
+                        Err(ModelSelectionError::UnknownSelectorOnProvider { .. }) => {
+                            chain.push(FallbackTarget {
+                                provider: provider.to_string(),
+                                model,
+                            });
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                } else {
+                    match catalog.select(&model, None, eligible) {
+                        Ok(info) => chain.push(FallbackTarget {
+                            provider: info.provider.to_string(),
+                            model:    info.id.to_string(),
+                        }),
+                        Err(ModelSelectionError::UnknownSelector { .. }) => {
+                            chain.push(FallbackTarget {
+                                provider: provider.to_string(),
+                                model,
+                            });
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
+        }
+    }
+    Ok(chain)
 }
 
 fn canonical_provider_id(catalog: &Catalog, provider_name: &str) -> ProviderId {
@@ -693,13 +726,7 @@ impl ModelRegistry for CatalogModelRegistry<'_> {
     }
 
     fn is_model(&self, token: &str) -> bool {
-        self.catalog.get(token).is_some()
-    }
-
-    fn provider_of(&self, token: &str) -> Option<String> {
-        self.catalog
-            .get(token)
-            .map(|model| model.provider.to_string())
+        self.catalog.is_model_selector(token)
     }
 }
 
@@ -831,7 +858,6 @@ impl RunSession {
         store_progress_logger.register(self.emitter.as_ref());
 
         let init_options = InitOptions {
-            run_id: record.run_id,
             run_store: self.run_store.clone(),
             dry_run: run_options.dry_run_enabled(),
             emitter: self.emitter,
@@ -1229,6 +1255,59 @@ mod tests {
         Arc::new(Catalog::from_builtin().expect("default catalog should build"))
     }
 
+    fn test_provider_ids() -> Vec<ProviderId> {
+        Catalog::builtin().all_provider_ids().into_iter().collect()
+    }
+
+    fn portable_model_catalog() -> Catalog {
+        let settings: fabro_model::catalog::LlmCatalogSettings = toml::from_str(
+            r#"
+[providers.openai]
+display_name = "OpenAI"
+adapter = "openai"
+agent_profile = "openai"
+priority = 90
+
+[providers.openai.models."gpt-5.6-sol"]
+display_name = "GPT-5.6 Sol"
+family = "gpt-5"
+aliases = ["gpt-56-sol"]
+default = true
+
+[providers.openai.models."gpt-5.6-sol".limits]
+context_window = 1000
+
+[providers.openai.models."gpt-5.6-sol".features]
+tools = true
+vision = false
+reasoning = false
+
+[providers.openrouter]
+display_name = "OpenRouter"
+adapter = "openai_compatible"
+agent_profile = "openai"
+priority = 25
+
+[providers.openrouter.models."gpt-5.6-sol"]
+api_id = "openai/gpt-5.6-sol"
+display_name = "GPT-5.6 Sol (via OpenRouter)"
+family = "gpt-5"
+aliases = ["gpt-56-sol"]
+default = true
+
+[providers.openrouter.models."gpt-5.6-sol".limits]
+context_window = 1000
+
+[providers.openrouter.models."gpt-5.6-sol".features]
+tools = true
+vision = false
+reasoning = false
+"#,
+        )
+        .unwrap();
+        Catalog::from_settings(&settings).unwrap()
+    }
+
     #[test]
     fn resolve_fallback_chain_resolves_provider_fallbacks() {
         let catalog = test_catalog();
@@ -1242,7 +1321,9 @@ mod tests {
             &ProviderId::anthropic(),
             "claude-opus-4-6",
             &settings,
-        );
+            &catalog.all_provider_ids(),
+        )
+        .unwrap();
 
         assert_eq!(chain, vec![FallbackTarget {
             provider: "openai".to_string(),
@@ -1263,12 +1344,173 @@ mod tests {
             &ProviderId::anthropic(),
             "claude-opus-4-6",
             &settings,
-        );
+            &catalog.all_provider_ids(),
+        )
+        .unwrap();
 
         assert_eq!(chain, vec![FallbackTarget {
             provider: "openai".to_string(),
             model:    "gpt-5.4-mini".to_string(),
         }]);
+    }
+
+    #[test]
+    fn resolve_fallback_chain_selects_shared_bare_alias_from_ready_providers() {
+        let catalog = portable_model_catalog();
+        let settings = ResolvedRunModelSettings {
+            fallbacks: vec!["gpt-56-sol".parse::<ModelRef>().unwrap()],
+            ..ResolvedRunModelSettings::default()
+        };
+
+        let chain = resolve_fallback_chain(
+            &catalog,
+            &ProviderId::openai(),
+            "gpt-5.6-sol",
+            &settings,
+            &HashSet::from([ProviderId::new("openrouter")]),
+        )
+        .unwrap();
+
+        assert_eq!(chain, vec![FallbackTarget {
+            provider: "openrouter".to_string(),
+            model:    "gpt-5.6-sol".to_string(),
+        }]);
+    }
+
+    #[test]
+    fn resolve_fallback_chain_resolves_provider_qualified_shared_alias() {
+        let catalog = portable_model_catalog();
+        let settings = ResolvedRunModelSettings {
+            fallbacks: vec!["openrouter/gpt-56-sol".parse::<ModelRef>().unwrap()],
+            ..ResolvedRunModelSettings::default()
+        };
+
+        let chain = resolve_fallback_chain(
+            &catalog,
+            &ProviderId::openai(),
+            "gpt-5.6-sol",
+            &settings,
+            &catalog.all_provider_ids(),
+        )
+        .unwrap();
+
+        assert_eq!(chain, vec![FallbackTarget {
+            provider: "openrouter".to_string(),
+            model:    "gpt-5.6-sol".to_string(),
+        }]);
+    }
+
+    #[test]
+    fn resolve_fallback_chain_keeps_qualified_legacy_references_as_provider_pins() {
+        let catalog = test_catalog();
+        let settings = ResolvedRunModelSettings {
+            fallbacks: vec![
+                "openai/gpt-5.6-sol".parse::<ModelRef>().unwrap(),
+                "anthropic/claude-fable-5".parse::<ModelRef>().unwrap(),
+            ],
+            ..ResolvedRunModelSettings::default()
+        };
+
+        let chain = resolve_fallback_chain(
+            catalog.as_ref(),
+            &ProviderId::anthropic(),
+            "claude-opus-4-6",
+            &settings,
+            &catalog.all_provider_ids(),
+        )
+        .unwrap();
+
+        assert_eq!(chain, vec![
+            FallbackTarget {
+                provider: "openai".to_string(),
+                model:    "gpt-5.6-sol".to_string(),
+            },
+            FallbackTarget {
+                provider: "anthropic".to_string(),
+                model:    "claude-fable-5".to_string(),
+            },
+        ]);
+    }
+
+    #[test]
+    fn resolve_fallback_chain_propagates_provider_model_ambiguity() {
+        let settings: fabro_model::catalog::LlmCatalogSettings = toml::from_str(
+            r#"
+[providers.shared]
+display_name = "Shared Provider"
+adapter = "openai"
+agent_profile = "openai"
+
+[providers.shared.models.default]
+display_name = "Default"
+family = "test"
+default = true
+
+[providers.shared.models.default.limits]
+context_window = 1000
+
+[providers.shared.models.default.features]
+tools = false
+vision = false
+reasoning = false
+
+[providers.other]
+display_name = "Other"
+adapter = "openai"
+agent_profile = "openai"
+
+[providers.other.models.model]
+display_name = "Shared Alias"
+family = "test"
+aliases = ["shared"]
+default = true
+
+[providers.other.models.model.limits]
+context_window = 1000
+
+[providers.other.models.model.features]
+tools = false
+vision = false
+reasoning = false
+"#,
+        )
+        .unwrap();
+        let catalog = Catalog::from_settings(&settings).unwrap();
+        let run_model = ResolvedRunModelSettings {
+            fallbacks: vec!["shared".parse::<ModelRef>().unwrap()],
+            ..ResolvedRunModelSettings::default()
+        };
+
+        let error = resolve_fallback_chain(
+            &catalog,
+            &ProviderId::new("other"),
+            "model",
+            &run_model,
+            &catalog.all_provider_ids(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, Error::ModelReference(_)));
+    }
+
+    #[test]
+    fn materialized_provider_pin_is_not_reselected_when_readiness_changes() {
+        let catalog = portable_model_catalog();
+        let mut settings = ResolvedRunSettings::default();
+        settings.model.name = Some("gpt-5.6-sol".to_string());
+        settings.model.provider = Some("openai".to_string());
+
+        let Err(error) = resolve_start_llm(&catalog, &[ProviderId::new("openrouter")], &settings)
+        else {
+            panic!("materialized provider pin should remain fixed");
+        };
+
+        assert!(matches!(
+            error,
+            Error::ModelSelection(fabro_model::ModelSelectionError::ProviderUnavailable {
+                provider
+            }) if provider == ProviderId::openai()
+        ));
     }
 
     #[test]
@@ -1302,9 +1544,9 @@ reasoning = false
         let mut settings = ResolvedRunSettings::default();
         settings.model.name = Some("ac".to_string());
 
-        let resolved = resolve_start_llm(&catalog, &[], &settings).unwrap();
+        let resolved = resolve_start_llm(&catalog, &[ProviderId::new("acme")], &settings).unwrap();
 
-        assert_eq!(resolved.model, "ac");
+        assert_eq!(resolved.model, "acme-claude");
         assert_eq!(resolved.provider_id, ProviderId::new("acme"));
     }
 
@@ -1529,7 +1771,11 @@ reasoning = false
             persisted_workflow_with_settings(MINIMAL_DOT, &storage_root, settings).await;
         let emitter = Arc::new(Emitter::new(fixtures::RUN_1));
         let registry = Arc::new(test_registry());
-        let vault = Arc::new(AsyncRwLock::new(token_vault("DEPLOY_TOKEN", "vault-token")));
+        let vault = Arc::new(AsyncRwLock::new(start_vault(&[(
+            "DEPLOY_TOKEN",
+            "vault-token",
+            SecretType::Token,
+        )])));
 
         let session = RunSession::new(&persisted, StartServices {
             vault: Some(vault),
@@ -1587,7 +1833,7 @@ reasoning = false
             persisted_workflow_with_settings(MINIMAL_DOT, &storage_root, settings).await;
         let emitter = Arc::new(Emitter::new(fixtures::RUN_1));
         let registry = Arc::new(test_registry());
-        let vault = Arc::new(AsyncRwLock::new(temp_vault(&[])));
+        let vault = Arc::new(AsyncRwLock::new(start_vault(&[])));
 
         let Err(err) = RunSession::new(&persisted, StartServices {
             vault: Some(vault),
@@ -1703,7 +1949,7 @@ reasoning = false
                 fork_source_ref: None,
                 parent_id: None,
                 provenance: test_support::test_run_provenance(),
-                configured_providers: Vec::new(),
+                configured_providers: test_provider_ids(),
                 web_url: None,
             },
             storage_root.to_path_buf(),
@@ -1756,7 +2002,7 @@ reasoning = false
             run_control: None,
             github_app: None,
             github_permissions: HashMap::new(),
-            vault: None,
+            vault: Some(Arc::new(AsyncRwLock::new(start_vault(&[])))),
             catalog: test_catalog(),
             on_node: None,
             registry_override: Some(registry),
@@ -1775,6 +2021,12 @@ reasoning = false
 
     fn token_vault(name: &str, value: &str) -> Vault {
         temp_vault(&[(name, value, SecretType::Token)])
+    }
+
+    fn start_vault(entries: &[(&str, &str, SecretType)]) -> Vault {
+        let mut all_entries = vec![("ANTHROPIC_API_KEY", "test-key", SecretType::Token)];
+        all_entries.extend_from_slice(entries);
+        temp_vault(&all_entries)
     }
 
     fn vault_secret_lookup(vault: &Vault) -> impl FnMut(&str) -> Option<String> + '_ {
@@ -2183,7 +2435,7 @@ reasoning = false
                 fork_source_ref: None,
                 parent_id: None,
                 provenance: test_support::test_run_provenance(),
-                configured_providers: Vec::new(),
+                configured_providers: test_provider_ids(),
                 web_url: None,
             },
             storage_root,

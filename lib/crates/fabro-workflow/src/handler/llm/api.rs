@@ -24,7 +24,7 @@ use fabro_model::{AgentProfileKind, Catalog, FallbackTarget, ModelRef, ProviderI
 use fabro_types::settings::run::RunModelControls;
 use fabro_types::{PermissionLevel, RunId, SessionCapability, StageId, StageTiming};
 use serde::de::DeserializeOwned;
-use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::{Mutex as TokioMutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -532,16 +532,50 @@ fn emit_agent_tools_available(
 /// Spawn a task that subscribes to session events and:
 /// 1. Tracks file changes (write_file/edit_file tool calls) into shared state.
 /// 2. Forwards non-streaming agent events to the pipeline emitter.
+///
+/// The returned handle exposes a per-input barrier. A successful
+/// `process_input_with_runtime` emits `ProcessingEnd` after all events for
+/// that input, so waiting for the barrier keeps terminal stage events from
+/// overtaking queued agent events.
+struct EventForwarder {
+    processing_end_rx: mpsc::UnboundedReceiver<()>,
+    task:              JoinHandle<()>,
+}
+
+impl EventForwarder {
+    async fn wait_for_processing_end(&mut self) {
+        if self.processing_end_rx.recv().await.is_none() {
+            tracing::warn!("Agent event forwarder stopped before processing input events");
+        }
+    }
+
+    fn abort(&self) {
+        self.task.abort();
+    }
+}
+
+impl Drop for EventForwarder {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 fn spawn_event_forwarder(
     session: &Session,
     node_id: String,
     scope: StageScope,
     emitter: Arc<Emitter>,
     file_tracking: Arc<Mutex<FileTracking>>,
-) {
+) -> EventForwarder {
     let mut rx = session.subscribe();
-    tokio::spawn(async move {
+    let root_session_id = session.id().to_string();
+    let (processing_end_tx, processing_end_rx) = mpsc::unbounded_channel();
+    let task = tokio::spawn(async move {
         while let Ok(event) = rx.recv().await {
+            let is_root_processing_end = event.session_id == root_session_id
+                && event.parent_session_id.is_none()
+                && matches!(&event.event, AgentEvent::ProcessingEnd);
+
             // Reset watchdog on every event, including streaming deltas
             emitter.touch();
 
@@ -573,8 +607,17 @@ fn spawn_event_forwarder(
                     &scope,
                 );
             }
+
+            if is_root_processing_end {
+                let _ = processing_end_tx.send(());
+            }
         }
     });
+
+    EventForwarder {
+        processing_end_rx,
+        task,
+    }
 }
 
 /// LLM backend that delegates to an `agent` Session per invocation.
@@ -935,7 +978,7 @@ impl AgentApiBackend {
                         .clone()
                         .unwrap_or_else(|| default_provider.clone()),
                 ),
-                model_id: request.model.clone(),
+                model_id: request.model.clone().into(),
                 speed:    controls.speed,
             }),
             Err(sdk_err) if sdk_err.failover_eligible() && !fallback_chain.is_empty() => {
@@ -964,7 +1007,7 @@ impl AgentApiBackend {
 
                     let max_tokens = node.max_tokens().or_else(|| {
                         self.catalog
-                            .get(&target.model)
+                            .get_on_provider(&ProviderId::new(&target.provider), &target.model)
                             .and_then(|model| model.limits.max_output)
                     });
 
@@ -983,7 +1026,7 @@ impl AgentApiBackend {
                                 response: resp,
                                 model:    ModelRef {
                                     provider: ProviderId::from(target.provider.clone()),
-                                    model_id: target.model.clone(),
+                                    model_id: target.model.clone().into(),
                                     speed:    controls.speed,
                                 },
                             });
@@ -1034,9 +1077,11 @@ impl CodergenBackend for AgentApiBackend {
         let provider_id = provider.provider_id.to_string();
         let controls = self.resolve_effective_request_controls(node)?;
 
-        let max_tokens = node
-            .max_tokens()
-            .or_else(|| self.catalog.get(model).and_then(|m| m.limits.max_output));
+        let max_tokens = node.max_tokens().or_else(|| {
+            self.catalog
+                .get_on_provider(&provider.provider_id, model)
+                .and_then(|model| model.limits.max_output)
+        });
 
         let mut messages = Vec::new();
         if let Some(sys) = system_prompt {
@@ -1211,7 +1256,7 @@ impl CodergenBackend for AgentApiBackend {
         let stage_scope = StageScope::for_handler(context, &node.id);
 
         // Subscribe to session events: forward to pipeline emitter + track files.
-        spawn_event_forwarder(
+        let mut event_forwarder = spawn_event_forwarder(
             &session,
             node.id.clone(),
             stage_scope.clone(),
@@ -1282,6 +1327,7 @@ impl CodergenBackend for AgentApiBackend {
                 inference_duration = inference_duration.saturating_add(timing.inference);
                 tool_duration = tool_duration.saturating_add(timing.tool);
                 if process_result.is_ok() {
+                    event_forwarder.wait_for_processing_end().await;
                     total_usage += session.last_input_usage();
                     UsdMicros::accumulate(&mut total_cost, session.last_input_cost());
                 }
@@ -1313,6 +1359,7 @@ impl CodergenBackend for AgentApiBackend {
                     let mut succeeded = false;
 
                     bridge.abort();
+                    event_forwarder.abort();
                     discard_session(&mut session, &mut lease, emitter);
 
                     for (index, target) in self.fallback_chain.iter().enumerate() {
@@ -1366,7 +1413,7 @@ impl CodergenBackend for AgentApiBackend {
                         bridge.replace(cancel_token.clone(), &session);
 
                         // Re-subscribe to forward events + track files from the new session
-                        spawn_event_forwarder(
+                        event_forwarder = spawn_event_forwarder(
                             &session,
                             node.id.clone(),
                             stage_scope.clone(),
@@ -1418,6 +1465,7 @@ impl CodergenBackend for AgentApiBackend {
                         tool_duration = tool_duration.saturating_add(timing.tool);
                         match process_result {
                             Ok(()) => {
+                                event_forwarder.wait_for_processing_end().await;
                                 total_usage += session.last_input_usage();
                                 UsdMicros::accumulate(&mut total_cost, session.last_input_cost());
                                 succeeded = true;
@@ -1490,6 +1538,7 @@ impl CodergenBackend for AgentApiBackend {
                         tool_duration = tool_duration.saturating_add(timing.tool);
                         match repair_result {
                             Ok(()) => {
+                                event_forwarder.wait_for_processing_end().await;
                                 total_usage += session.last_input_usage();
                                 UsdMicros::accumulate(&mut total_cost, session.last_input_cost());
                                 repair_attempts += 1;
@@ -1523,7 +1572,7 @@ impl CodergenBackend for AgentApiBackend {
             self.catalog.as_ref(),
             &ModelRef {
                 provider: session.provider_id(),
-                model_id: session.model().to_string(),
+                model_id: session.model().into(),
                 speed:    billing_controls.speed,
             },
             &total_usage,
@@ -1532,6 +1581,7 @@ impl CodergenBackend for AgentApiBackend {
 
         // Collect files_touched from the shared tracking state.
         let (files_touched, last_file_touched) = file_tracking_snapshot(&file_tracking);
+        drop(event_forwarder);
 
         if let Some(lease) = lease.take() {
             lease.release();
@@ -2530,6 +2580,47 @@ reasoning = false
     }
 
     #[test]
+    fn api_backend_provider_pin_wins_over_priority_selection() {
+        let settings: LlmCatalogSettings = toml::from_str(
+            r"
+[providers.openrouter]
+enabled = true
+",
+        )
+        .unwrap();
+        let backend = AgentApiBackend::new_with_catalog(
+            "gpt-5.4".to_string(),
+            ProviderId::from("openrouter"),
+            Vec::new(),
+            Arc::new(EnvCredentialSource::new()),
+            SteeringHub::for_tests(),
+            Arc::new(Catalog::from_builtin_with_overrides(&settings).unwrap()),
+        );
+
+        let provider = backend.resolve_provider_context("gpt-5.4", None).unwrap();
+
+        assert_eq!(provider.provider_id, ProviderId::from("openrouter"));
+    }
+
+    #[test]
+    fn api_backend_node_provider_attr_overrides_backend_pin() {
+        let backend = AgentApiBackend::new_with_catalog(
+            "gpt-5.4".to_string(),
+            ProviderId::from("openrouter"),
+            Vec::new(),
+            Arc::new(EnvCredentialSource::new()),
+            SteeringHub::for_tests(),
+            Arc::new(Catalog::from_builtin().unwrap()),
+        );
+
+        let provider = backend
+            .resolve_provider_context("gpt-5.4", Some("openai"))
+            .unwrap();
+
+        assert_eq!(provider.provider_id, ProviderId::openai());
+    }
+
+    #[test]
     fn api_backend_resolves_custom_catalog_provider_profile() {
         let settings: LlmCatalogSettings = toml::from_str(
             r#"
@@ -2620,6 +2711,33 @@ reasoning = false
 
         assert_eq!(provider.provider_id, ProviderId::from("acme"));
         assert_eq!(provider.profile_kind, AgentProfileKind::Anthropic);
+    }
+
+    #[test]
+    fn api_backend_preserves_default_provider_for_legacy_model_identifier() {
+        let settings: LlmCatalogSettings = toml::from_str(
+            r"
+[providers.openrouter]
+enabled = true
+",
+        )
+        .unwrap();
+        let catalog = Arc::new(Catalog::from_builtin_with_overrides(&settings).unwrap());
+        let backend = AgentApiBackend::new_with_catalog(
+            "openai/gpt-5.4".to_string(),
+            ProviderId::from("openrouter"),
+            Vec::new(),
+            Arc::new(EnvCredentialSource::new()),
+            SteeringHub::for_tests(),
+            catalog,
+        );
+
+        let provider = backend
+            .resolve_provider_context("openai/gpt-5.4", None)
+            .unwrap();
+
+        assert_eq!(provider.provider_id, ProviderId::from("openrouter"));
+        assert_eq!(provider.profile_kind, AgentProfileKind::OpenAi);
     }
 
     #[test]

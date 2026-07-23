@@ -1,3 +1,4 @@
+use fabro_model::ProviderId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -6,9 +7,11 @@ use crate::TurnId;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunSessionCreatedProps {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub title: Option<String>,
+    pub title:    Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
+    pub model:    Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ProviderId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -106,4 +109,23 @@ pub struct RunSessionTurnInterruptedProps {
     pub turn_id: TurnId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error:   Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::RunSessionCreatedProps;
+
+    #[test]
+    fn session_created_deserializes_legacy_payload_without_provider() {
+        let props: RunSessionCreatedProps = serde_json::from_value(json!({
+            "title": "Legacy session",
+            "model": "gpt-5.4"
+        }))
+        .unwrap();
+
+        assert_eq!(props.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(props.provider, None);
+    }
 }

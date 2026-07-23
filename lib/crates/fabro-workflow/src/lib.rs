@@ -332,7 +332,7 @@ pub mod services;
 mod stage_scope;
 pub mod static_reference;
 pub mod steering_hub;
-#[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 #[doc(hidden)]
 pub mod transforms;

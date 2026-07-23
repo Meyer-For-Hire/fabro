@@ -52,6 +52,8 @@ use crate::run_manifest;
 use crate::run_selector::{ResolveRunError, resolve_run_by_selector};
 use crate::run_title_generation::{self, GenerateTitleInput, TitlePromptInput, WorkflowSummary};
 use crate::server_secrets::LlmClientResult;
+#[cfg(any(test, feature = "test-support"))]
+use crate::test_support as server_test_support;
 
 pub(super) fn manifest_routes() -> Router<Arc<AppState>> {
     Router::new()
@@ -600,10 +602,23 @@ pub(crate) async fn create_run_from_manifest(
         .as_ref()
         .map(LlmClientResult::provider_ids)
         .unwrap_or_default();
+    let run_materialization_provider_ids = {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            server_test_support::test_run_materialization_provider_ids(
+                catalog.as_ref(),
+                &ready_provider_ids,
+            )
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        {
+            ready_provider_ids.clone()
+        }
+    };
     let provenance = run_provenance(&headers, &actor);
     let mut create_input = run_manifest::create_run_input(
         prepared.clone(),
-        ready_provider_ids.clone(),
+        run_materialization_provider_ids,
         provenance,
         web_url.clone(),
         vars,
@@ -624,6 +639,9 @@ pub(crate) async fn create_run_from_manifest(
         Ok(created) => created,
         Err(WorkflowError::ValidationFailed { .. } | WorkflowError::Parse(_)) => {
             return ApiError::bad_request("Validation failed").into_response();
+        }
+        Err(err @ (WorkflowError::ModelSelection(_) | WorkflowError::ModelReference(_))) => {
+            return ApiError::bad_request(err.to_string()).into_response();
         }
         Err(err) => {
             return ApiError::new(
@@ -681,7 +699,7 @@ pub(crate) async fn create_run_from_manifest(
                 workflow,
                 run_inputs,
                 client: llm_result.client,
-                model_id: title_model_id,
+                model_id: title_model_id.to_string(),
                 provider_id: title_provider_id,
             });
         }
@@ -725,23 +743,6 @@ fn spawn_generated_title_task(task: GeneratedTitleTask) {
             return;
         }
 
-        let current = match task
-            .state
-            .stores
-            .runs
-            .get_cached_summary(&task.run_id, Utc::now())
-            .await
-        {
-            Ok(Some(summary)) => summary,
-            Ok(None) => return,
-            Err(err) => {
-                tracing::debug!(run_id = %task.run_id, error = %err, "Failed to re-read run summary for title update");
-                return;
-            }
-        };
-        if current.title != task.deterministic_title {
-            return;
-        }
         let run_store = match task.state.stores.runs.open_run(&task.run_id).await {
             Ok(store) => store,
             Err(err) => {
@@ -749,7 +750,8 @@ fn spawn_generated_title_task(task: GeneratedTitleTask) {
                 return;
             }
         };
-        if let Err(err) = workflow_event::append_event(
+        let expected_title = task.deterministic_title;
+        if let Err(err) = workflow_event::append_event_if(
             &run_store,
             &task.run_id,
             &workflow_event::Event::RunTitleUpdated {
@@ -758,6 +760,7 @@ fn spawn_generated_title_task(task: GeneratedTitleTask) {
                     system_kind: SystemActorKind::Engine,
                 }),
             },
+            move |projection| projection.title().as_ref() == expected_title,
         )
         .await
         {

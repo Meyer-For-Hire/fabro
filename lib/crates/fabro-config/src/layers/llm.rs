@@ -12,8 +12,7 @@
 //! enabled = true
 //! aliases = ["moonshot"]
 //!
-//! [llm.models."kimi-k2.5"]
-//! provider = "kimi"
+//! [llm.providers.kimi.models."kimi-k2.5"]
 //! ...
 //! ```
 //!
@@ -29,7 +28,9 @@
 use std::collections::{BTreeMap, HashMap};
 
 use fabro_model::catalog::deserialize_knowledge_cutoff;
-use fabro_model::{AgentProfileKind, BillingPolicy, CodecKind, ProviderAuthConfig};
+use fabro_model::{
+    AgentProfileKind, BillingPolicy, CodecKind, ModelId, ProviderAuthConfig, ProviderId, catalog,
+};
 pub use fabro_model::{CredentialRef, CredentialRefParseError, ReasoningEffortFeature};
 use fabro_types::settings::InterpString;
 use serde::{Deserialize, Serialize};
@@ -43,7 +44,8 @@ pub struct LlmLayer {
     /// Provider definitions keyed by provider ID.
     #[serde(default, skip_serializing_if = "MergeMap::is_empty")]
     pub providers: MergeMap<ProviderSettings>,
-    /// Model definitions keyed by canonical model ID.
+    /// Legacy top-level model definitions. New settings put models below
+    /// their provider; parsing normalizes this map before layers combine.
     #[serde(default, skip_serializing_if = "MergeMap::is_empty")]
     pub models:    MergeMap<ModelSettings>,
 }
@@ -87,13 +89,16 @@ pub struct ProviderSettings {
     pub enabled:        Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aliases:        Option<Vec<String>>,
+    /// Model offerings served by this provider, keyed by canonical model ID.
+    #[serde(default, skip_serializing_if = "MergeMap::is_empty")]
+    pub models:         MergeMap<ModelSettings>,
 }
 
-/// One entry in `[llm.models.<id>]`.
+/// One entry in `[llm.providers.<provider>.models.<id>]`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, fabro_macros::Combine)]
 #[serde(deny_unknown_fields)]
 pub struct ModelSettings {
-    /// Provider ID this model belongs to.
+    /// Compatibility-only provider for legacy `[llm.models.<id>]` rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider:             Option<String>,
     /// Identifier sent to the provider API. Defaults to the catalog model ID
@@ -153,6 +158,71 @@ pub struct ModelSettings {
     pub controls:             Option<ModelControls>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub costs:                Option<ModelCostTable>,
+}
+
+impl LlmLayer {
+    /// Normalize the temporary legacy model table before this source is
+    /// combined with any other settings source. Resolution runs against this
+    /// layer's own providers plus the built-in catalog, because a single
+    /// source may reference built-in offerings that merge in later.
+    pub(crate) fn normalize_legacy_models(&mut self) -> Result<(), catalog::LegacyModelError> {
+        for (provider, settings) in self.providers.iter() {
+            for (model, settings) in settings.models.iter() {
+                if settings.provider.is_some() {
+                    return Err(catalog::LegacyModelError::ScopedModelDeclaresProvider {
+                        provider: ProviderId::new(provider.clone()),
+                        model:    ModelId::new(model.clone()),
+                    });
+                }
+            }
+        }
+
+        let legacy_models = std::mem::take(&mut self.models.0);
+        if legacy_models.is_empty() {
+            return Ok(());
+        }
+        let mut legacy_models = legacy_models.into_iter().collect::<Vec<_>>();
+        legacy_models.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+        let mut index = catalog::LegacyModelIndex::default();
+        let mut provider_ids = self.providers.keys().cloned().collect::<Vec<_>>();
+        provider_ids.sort_unstable();
+        for provider_id in &provider_ids {
+            let settings = self
+                .providers
+                .get(provider_id)
+                .expect("provider ID came from provider map keys");
+            let mut model_ids = settings.models.keys().cloned().collect::<Vec<_>>();
+            model_ids.sort_unstable();
+            index.add_provider(
+                ProviderId::new(provider_id.clone()),
+                settings.aliases.clone().unwrap_or_default(),
+                model_ids.into_iter().map(|model_id| {
+                    let model = settings
+                        .models
+                        .get(&model_id)
+                        .expect("model ID came from model map keys");
+                    let aliases = model.aliases.clone().unwrap_or_default();
+                    (ModelId::new(model_id), aliases)
+                }),
+            );
+        }
+        let index = index.with_builtin()?;
+
+        for (legacy_id, mut settings) in legacy_models {
+            let explicit_provider = settings.provider.take();
+            let (provider, model) = index.resolve(&legacy_id, explicit_provider.as_deref())?;
+
+            let provider_settings = self.providers.entry(provider.to_string()).or_default();
+            if provider_settings.models.contains_key(model.as_str()) {
+                return Err(catalog::LegacyModelError::DuplicateModel { provider, model });
+            }
+            provider_settings
+                .models
+                .insert(model.into_inner(), settings);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, fabro_macros::Combine)]

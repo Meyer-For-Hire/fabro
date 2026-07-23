@@ -1553,7 +1553,7 @@ async fn github_webhook_accepts_valid_signature_with_wrong_bearer_token() {
 
 #[tokio::test]
 async fn create_secret_stores_valid_oauth_entries() {
-    let state = test_app_state();
+    let state = TestAppStateBuilder::new().build();
     let app = crate::test_support::build_test_router(Arc::clone(&state));
 
     let req = Request::builder()
@@ -1993,7 +1993,7 @@ async fn create_secret_rejects_invalid_oauth_name() {
 
 #[tokio::test]
 async fn delete_secret_by_name_removes_file_secret() {
-    let state = test_app_state();
+    let state = TestAppStateBuilder::new().build();
     let app = crate::test_support::build_test_router(Arc::clone(&state));
 
     let create_req = Request::builder()
@@ -3394,25 +3394,30 @@ async fn create_run_with_explicit_title_skips_generated_title_work() {
 }
 
 #[tokio::test]
-async fn create_run_without_ready_llm_provider_skips_generated_title_work() {
+async fn create_run_without_ready_llm_provider_rejects_implicit_model_selection() {
     let state = TestAppStateBuilder::new().env_lookup(|_| None).build();
     let app = crate::test_support::build_test_router(Arc::clone(&state));
 
-    let body = post_run_manifest(&app, minimal_manifest_json(MINIMAL_DOT)).await;
-    let run_id: RunId = body["id"].as_str().unwrap().parse().unwrap();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(api("/runs"))
+                .header("content-type", "application/json")
+                .body(Body::from(minimal_manifest_json(MINIMAL_DOT).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = response_json!(response, StatusCode::BAD_REQUEST).await;
 
-    assert_eq!(
-        state
-            .stores
-            .runs
-            .get_cached_summary(&run_id, Utc::now())
-            .await
-            .unwrap()
-            .unwrap()
-            .title,
-        "Test"
+    assert!(
+        body["errors"][0]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("no default model is available")),
+        "unexpected response: {body}"
     );
-    assert_eq!(title_update_event_count(&state, run_id).await, 0);
+    assert!(state.runs.lock().expect("runs lock poisoned").is_empty());
 }
 
 #[tokio::test]
@@ -3490,7 +3495,7 @@ async fn generated_title_does_not_overwrite_user_title_edit() {
     response_json!(response, StatusCode::OK).await;
 
     wait_for_mock_hits(&title_mock, 1).await;
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 
     assert_eq!(
         state
@@ -3524,7 +3529,10 @@ async fn post_run_manifest(app: &Router, manifest: serde_json::Value) -> serde_j
 
 #[tokio::test]
 async fn post_runs_create_regression_keeps_api_behavior_without_automation_metadata() {
-    let state = TestAppStateBuilder::new().env_lookup(|_| None).build();
+    let state = TestAppStateBuilder::new()
+        .env_lookup(|_| None)
+        .vault_entries([(EnvVars::OPENAI_API_KEY, "test-openai-api-key")])
+        .build();
     let app = crate::test_support::build_test_router(Arc::clone(&state));
     let mut manifest = minimal_manifest_json(MINIMAL_DOT);
     manifest["title"] = json!("API title");
@@ -3547,7 +3555,10 @@ async fn post_runs_create_regression_keeps_api_behavior_without_automation_metad
 
 #[tokio::test]
 async fn create_run_from_manifest_helper_persists_without_automation_metadata() {
-    let state = TestAppStateBuilder::new().env_lookup(|_| None).build();
+    let state = TestAppStateBuilder::new()
+        .env_lookup(|_| None)
+        .vault_entries([(EnvVars::OPENAI_API_KEY, "test-openai-api-key")])
+        .build();
     let manifest: RunManifest = serde_json::from_value(minimal_manifest_json(MINIMAL_DOT)).unwrap();
     let submitted_manifest_bytes = serde_json::to_vec(&manifest).unwrap();
     let run_id = RunId::new();
@@ -3583,7 +3594,10 @@ async fn create_run_from_manifest_helper_persists_without_automation_metadata() 
 
 #[tokio::test]
 async fn create_run_from_manifest_helper_persists_automation_metadata() {
-    let state = TestAppStateBuilder::new().env_lookup(|_| None).build();
+    let state = TestAppStateBuilder::new()
+        .env_lookup(|_| None)
+        .vault_entries([(EnvVars::OPENAI_API_KEY, "test-openai-api-key")])
+        .build();
     let manifest: RunManifest = serde_json::from_value(minimal_manifest_json(MINIMAL_DOT)).unwrap();
     let submitted_manifest_bytes = serde_json::to_vec(&manifest).unwrap();
     let run_id = RunId::new();
@@ -4130,7 +4144,7 @@ fn context_window_event(
             text:            "assistant response".to_string(),
             model:           ModelRef {
                 provider: ProviderId::openai(),
-                model_id: "gpt-5.4".to_string(),
+                model_id: "gpt-5.4".into(),
                 speed:    None,
             },
             usage:           TokenCounts::default(),
@@ -6094,6 +6108,15 @@ fn create_github_token_app_state_with_env_lookup_and_llm_catalog_settings(
             .set("GITHUB_TOKEN", token, SecretType::Token, None)
             .expect("test github token should be writable");
     }
+    Vault::load(vault_path.clone())
+        .expect("test vault should load")
+        .set(
+            EnvVars::OPENAI_API_KEY,
+            "test-openai-api-key",
+            SecretType::Token,
+            None,
+        )
+        .expect("test OpenAI credential should be writable");
     let db_pool = test_db_pool_for_vault_path(&vault_path).expect("test db pool should build");
     let preloaded_vault = crate::test_support::test_secret_snapshot(db_pool.clone())
         .expect("test secret snapshot should build");
@@ -6392,7 +6415,7 @@ async fn test_model_unknown_returns_404() {
 }
 
 #[tokio::test]
-async fn test_model_alias_returns_canonical_model_id() {
+async fn test_model_explicit_provider_alias_returns_canonical_model_id_when_unavailable() {
     let state = test_app_state_with_env_lookup(
         default_test_server_settings(),
         RunLayer::default(),
@@ -6403,7 +6426,7 @@ async fn test_model_alias_returns_canonical_model_id() {
 
     let req = Request::builder()
         .method("POST")
-        .uri(api("/models/sonnet/test"))
+        .uri(api("/models/sonnet/test?provider=anthropic"))
         .header("content-type", "application/json")
         .body(Body::empty())
         .unwrap();
@@ -6411,7 +6434,206 @@ async fn test_model_alias_returns_canonical_model_id() {
     let response = app.oneshot(req).await.unwrap();
     let body = response_json!(response, StatusCode::OK).await;
     assert_eq!(body["model_id"], "claude-sonnet-4-6");
+    assert_eq!(body["provider"], "anthropic");
     assert_eq!(body["status"], "skip");
+}
+
+#[tokio::test]
+async fn test_model_unqualified_known_alias_requires_a_ready_provider() {
+    let state = test_app_state_with_env_lookup(
+        default_test_server_settings(),
+        RunLayer::default(),
+        5,
+        |_| None,
+    );
+    let app = crate::test_support::build_test_router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(api("/models/sonnet/test"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_status!(response, StatusCode::BAD_REQUEST).await;
+}
+
+#[tokio::test]
+async fn model_api_keeps_duplicate_ids_provider_scoped_and_selects_ready_priority() {
+    let direct_upstream = MockServer::start();
+    let aggregator_upstream = MockServer::start();
+    let direct_probe = direct_upstream.mock(|when, then| {
+        when.method(POST)
+            .path("/chat/completions")
+            .json_body_includes(r#"{"model":"portable-model"}"#);
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(json!({
+                "id": "chatcmpl-direct",
+                "model": "portable-model",
+                "choices": [{
+                    "message": {"role": "assistant", "content": "OK"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2
+                }
+            }));
+    });
+    let aggregator_probe = aggregator_upstream.mock(|when, then| {
+        when.method(POST)
+            .path("/chat/completions")
+            .json_body_includes(r#"{"model":"vendor/portable-model"}"#);
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(json!({
+                "id": "chatcmpl-aggregator",
+                "model": "vendor/portable-model",
+                "choices": [{
+                    "message": {"role": "assistant", "content": "OK"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2
+                }
+            }));
+    });
+    let settings: LlmCatalogSettings = toml::from_str(&format!(
+        r#"
+[providers.direct]
+display_name = "Direct"
+adapter = "openai_compatible"
+agent_profile = "openai"
+base_url = "{}"
+priority = 120
+
+[providers.direct.auth]
+credentials = ["vault:DIRECT_API_KEY"]
+
+[providers.direct.models.portable-model]
+display_name = "Portable (direct)"
+family = "portable"
+aliases = ["portable"]
+default = true
+
+[providers.direct.models.portable-model.limits]
+context_window = 1000
+
+[providers.direct.models.portable-model.features]
+tools = false
+vision = false
+reasoning = false
+
+[providers.aggregator]
+display_name = "Aggregator"
+adapter = "openai_compatible"
+agent_profile = "openai"
+base_url = "{}"
+priority = 110
+
+[providers.aggregator.auth]
+credentials = ["vault:AGGREGATOR_API_KEY"]
+
+[providers.aggregator.models.portable-model]
+api_id = "vendor/portable-model"
+display_name = "Portable (aggregator)"
+family = "portable"
+aliases = ["portable"]
+default = true
+
+[providers.aggregator.models.portable-model.limits]
+context_window = 1000
+
+[providers.aggregator.models.portable-model.features]
+tools = false
+vision = false
+reasoning = false
+"#,
+        direct_upstream.base_url(),
+        aggregator_upstream.base_url(),
+    ))
+    .unwrap();
+    let state = TestAppStateBuilder::new()
+        .llm_catalog_settings(settings)
+        .vault_entries([
+            ("DIRECT_API_KEY", "direct-test-key"),
+            ("AGGREGATOR_API_KEY", "aggregator-test-key"),
+        ])
+        .build();
+    let app = crate::test_support::build_test_router(state);
+
+    let list = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(api("/models?query=portable-model"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let list = response_json!(list, StatusCode::OK).await;
+    let rows = list["data"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows.iter()
+            .map(|row| row["provider"].as_str().unwrap())
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from(["aggregator", "direct"])
+    );
+    assert!(
+        rows.iter()
+            .all(|row| row["id"] == "portable-model" && row["configured"] == true)
+    );
+
+    let filtered = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(api("/models?provider=aggregator&query=portable-model"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let filtered = response_json!(filtered, StatusCode::OK).await;
+    assert_eq!(filtered["data"].as_array().unwrap().len(), 1);
+    assert_eq!(filtered["data"][0]["provider"], "aggregator");
+
+    for (query, expected_provider) in [
+        ("?provider=direct", "direct"),
+        ("?provider=aggregator", "aggregator"),
+        ("", "direct"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(api(&format!("/models/portable/test{query}")))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response_json!(response, StatusCode::OK).await;
+        assert_eq!(body["model_id"], "portable-model");
+        assert_eq!(body["provider"], expected_provider);
+        assert_eq!(body["status"], "ok");
+    }
+
+    direct_probe.assert_calls(2);
+    aggregator_probe.assert_calls(1);
 }
 
 #[tokio::test]
@@ -13483,7 +13705,7 @@ async fn get_aggregate_billing_returns_provider_model_speed_identity() {
         agg.by_model.insert(
             ModelRef {
                 provider: ProviderId::anthropic(),
-                model_id: "claude-opus-4-6".to_string(),
+                model_id: "claude-opus-4-6".into(),
                 speed:    None,
             },
             ModelBillingTotals {
@@ -13502,7 +13724,7 @@ async fn get_aggregate_billing_returns_provider_model_speed_identity() {
         agg.by_model.insert(
             ModelRef {
                 provider: ProviderId::anthropic(),
-                model_id: "claude-opus-4-6".to_string(),
+                model_id: "claude-opus-4-6".into(),
                 speed:    Some(Speed::Fast),
             },
             ModelBillingTotals {
@@ -13563,7 +13785,7 @@ async fn get_aggregate_billing_saturates_total_cost_across_models() {
             agg.by_model.insert(
                 ModelRef {
                     provider: ProviderId::openai(),
-                    model_id: model_id.to_string(),
+                    model_id: model_id.into(),
                     speed:    None,
                 },
                 ModelBillingTotals {
@@ -13611,7 +13833,7 @@ fn aggregate_billing_counts_projection_rollup_usage_visits() {
             fabro_workflow::ProjectionBillingByModel {
                 model:   ModelRef {
                     provider: ProviderId::openai(),
-                    model_id: "gpt-5.4".to_string(),
+                    model_id: "gpt-5.4".into(),
                     speed:    None,
                 },
                 stages:  1,
@@ -13628,7 +13850,7 @@ fn aggregate_billing_counts_projection_rollup_usage_visits() {
             fabro_workflow::ProjectionBillingByModel {
                 model:   ModelRef {
                     provider: ProviderId::openai(),
-                    model_id: "gpt-5.4".to_string(),
+                    model_id: "gpt-5.4".into(),
                     speed:    Some(Speed::Fast),
                 },
                 stages:  1,
@@ -13655,7 +13877,7 @@ fn aggregate_billing_counts_projection_rollup_usage_visits() {
     assert_eq!(
         accumulator.by_model[&ModelRef {
             provider: ProviderId::openai(),
-            model_id: "gpt-5.4".to_string(),
+            model_id: "gpt-5.4".into(),
             speed:    None,
         }]
             .stages,
@@ -13664,7 +13886,7 @@ fn aggregate_billing_counts_projection_rollup_usage_visits() {
     assert_eq!(
         accumulator.by_model[&ModelRef {
             provider: ProviderId::openai(),
-            model_id: "gpt-5.4".to_string(),
+            model_id: "gpt-5.4".into(),
             speed:    None,
         }]
             .billing
@@ -13674,7 +13896,7 @@ fn aggregate_billing_counts_projection_rollup_usage_visits() {
     assert_eq!(
         accumulator.by_model[&ModelRef {
             provider: ProviderId::openai(),
-            model_id: "gpt-5.4".to_string(),
+            model_id: "gpt-5.4".into(),
             speed:    Some(Speed::Fast),
         }]
             .stages,
@@ -13683,7 +13905,7 @@ fn aggregate_billing_counts_projection_rollup_usage_visits() {
     assert_eq!(
         accumulator.by_model[&ModelRef {
             provider: ProviderId::openai(),
-            model_id: "gpt-5.4".to_string(),
+            model_id: "gpt-5.4".into(),
             speed:    Some(Speed::Fast),
         }]
             .billing
@@ -13771,6 +13993,17 @@ level = "debug"
         manifest_run_defaults_from_toml(source),
         5,
     );
+    state
+        .stores
+        .vault
+        .set(
+            EnvVars::ANTHROPIC_API_KEY,
+            "test-anthropic-api-key",
+            SecretType::Token,
+            None,
+        )
+        .await
+        .unwrap();
     let app = crate::test_support::build_test_router(Arc::clone(&state));
 
     let req = Request::builder()
@@ -13936,6 +14169,7 @@ async fn cancel_run_overwrites_pending_pause_request() {
 async fn cancel_run_requests_worker_runtime_stop_when_control_unavailable() {
     let runtime = StdArc::new(RecordingWorkerRuntime::default());
     let state = TestAppStateBuilder::new()
+        .vault_entries([(EnvVars::OPENAI_API_KEY, "test-openai-api-key")])
         .worker_runtime(runtime.clone())
         .build();
     let app = crate::test_support::build_test_router(Arc::clone(&state));
@@ -14815,42 +15049,52 @@ async fn create_completion_unknown_provider_returns_clear_error() {
     let body = response_json!(response, StatusCode::BAD_REQUEST).await;
     assert_eq!(
         body["errors"][0]["detail"],
-        "Provider \"missing-provider\" is not configured"
+        "unknown model provider 'missing-provider'"
     );
 }
 
 #[tokio::test]
 async fn create_completion_default_model_uses_app_state_catalog() {
-    let llm_catalog_settings: LlmCatalogSettings = toml::from_str(
+    let upstream = MockServer::start();
+    let completion = upstream.mock(|when, then| {
+        when.method(POST)
+            .path("/chat/completions")
+            .json_body_includes(r#"{"model":"acme-large"}"#);
+        then.status(500)
+            .header("content-type", "application/json")
+            .json_body(json!({"error": {"message": "expected test failure"}}));
+    });
+    let llm_catalog_settings: LlmCatalogSettings = toml::from_str(&format!(
         r#"
 [providers.acme]
 display_name = "Acme"
 adapter = "openai_compatible"
 agent_profile = "openai"
-base_url = "https://api.acme.test/v1"
+base_url = "{}"
 priority = 120
 
 [providers.acme.auth]
-credentials = ["env:ACME_API_KEY"]
+credentials = ["vault:ACME_API_KEY"]
 
-[models."acme-large"]
-provider = "acme"
+[providers.acme.models."acme-large"]
 display_name = "Acme Large"
 family = "acme"
 default = true
 
-[models."acme-large".limits]
+[providers.acme.models."acme-large".limits]
 context_window = 128000
 
-[models."acme-large".features]
+[providers.acme.models."acme-large".features]
 tools = true
 vision = false
 reasoning = false
 "#,
-    )
+        upstream.base_url()
+    ))
     .expect("catalog fixture should parse");
     let state = TestAppStateBuilder::new()
         .llm_catalog_settings(llm_catalog_settings)
+        .vault_entries([("ACME_API_KEY", "acme-test-key")])
         .build();
     let app = crate::test_support::build_test_router(state);
 
@@ -14878,9 +15122,10 @@ reasoning = false
         body["errors"][0]["detail"]
             .as_str()
             .unwrap()
-            .contains("Provider 'acme' not registered"),
+            .contains("expected test failure"),
         "unexpected error body: {body:?}"
     );
+    completion.assert();
 }
 
 #[tokio::test]

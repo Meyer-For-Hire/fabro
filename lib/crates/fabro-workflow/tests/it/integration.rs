@@ -2319,7 +2319,7 @@ reasoning = false
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn workflow_persists_authoritative_openrouter_cost_for_agent_stage() {
     use fabro_auth::EnvCredentialSource;
     use fabro_workflow::steering_hub::SteeringHub;
@@ -2398,8 +2398,18 @@ base_url = "{}"
     registry.register("start", Box::new(StartHandler));
     registry.register("exit", Box::new(ExitHandler));
 
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let events_for_listener = Arc::clone(&events);
+    let emitter = Arc::new(Emitter::default());
+    emitter.on_event(move |event| {
+        if event.event_name() == "agent.message" {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        events_for_listener.lock().unwrap().push(event.clone());
+    });
+
     let dir = tempfile::tempdir().unwrap();
-    let engine = WorkflowRunner::new(registry, Arc::new(Emitter::default()), local_env());
+    let engine = WorkflowRunner::new(registry, emitter, local_env());
     let run_options = RunOptions {
         settings:         WorkflowSettings::default(),
         run_dir:          dir.path().to_path_buf(),
@@ -2431,6 +2441,22 @@ base_url = "{}"
         work.usage.total_usd_micros,
         Some(AUTHORITATIVE_COST_USD_MICROS),
         "provider-reported usage.cost should override the catalog estimate"
+    );
+
+    let events = events.lock().unwrap();
+    let agent_message = events
+        .iter()
+        .position(|event| event.event_name() == "agent.message")
+        .expect("agent message should be emitted");
+    let stage_completed = events
+        .iter()
+        .position(|event| {
+            event.event_name() == "stage.completed" && event.node_id.as_deref() == Some("work")
+        })
+        .expect("work stage completion should be emitted");
+    assert!(
+        agent_message < stage_completed,
+        "agent messages must be forwarded before terminal stage events"
     );
 }
 
@@ -4795,15 +4821,17 @@ async fn import_e2e_through_engine() {
     )
     .expect("parse should succeed");
     let transformed = transform(parsed, &TransformOptions {
-        current_dir:       Some(dir.path().to_path_buf()),
-        file_resolver:     Some(std::sync::Arc::new(
+        current_dir:        Some(dir.path().to_path_buf()),
+        file_resolver:      Some(std::sync::Arc::new(
             fabro_workflow::file_resolver::FilesystemFileResolver::new(None),
         )),
-        template_context:  fabro_template::TemplateContext::new(),
-        source_name:       None,
-        render_mode:       fabro_workflow::operations::RenderMode::Strict,
-        custom_transforms: vec![],
-        catalog:           std::sync::Arc::clone(&catalog),
+        template_context:   fabro_template::TemplateContext::new(),
+        source_name:        None,
+        render_mode:        fabro_workflow::operations::RenderMode::Strict,
+        custom_transforms:  vec![],
+        catalog:            std::sync::Arc::clone(&catalog),
+        default_provider:   None,
+        eligible_providers: catalog.all_provider_ids(),
     })
     .unwrap();
     let validated = validate(transformed, catalog.as_ref(), &[]);

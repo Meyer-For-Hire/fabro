@@ -101,9 +101,12 @@ impl AsRef<str> for ProviderId {
     }
 }
 
-/// Stable model identifier — either the canonical catalog ID or one of its
-/// declared aliases.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+/// Stable canonical, human-facing model identifier.
+///
+/// Aliases are alternate selectors for a model offering; they are not model
+/// IDs. The same `ModelId` may be offered by more than one provider, so a
+/// concrete catalog offering is identified by `(ProviderId, ModelId)`.
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ModelId(String);
 
@@ -129,6 +132,12 @@ impl fmt::Display for ModelId {
     }
 }
 
+impl fmt::Debug for ModelId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 impl From<&str> for ModelId {
     fn from(s: &str) -> Self {
         Self(s.to_string())
@@ -144,6 +153,18 @@ impl From<String> for ModelId {
 impl AsRef<str> for ModelId {
     fn as_ref(&self) -> &str {
         &self.0
+    }
+}
+
+impl PartialEq<str> for ModelId {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for ModelId {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
     }
 }
 

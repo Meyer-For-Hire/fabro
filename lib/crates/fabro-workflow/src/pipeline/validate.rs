@@ -42,13 +42,15 @@ mod tests {
         let catalog = test_catalog();
         let parsed = parse(dot).unwrap();
         let transformed = transform::transform(parsed, &TransformOptions {
-            current_dir:       None,
-            file_resolver:     None,
-            template_context:  fabro_template::TemplateContext::new(),
-            source_name:       None,
-            render_mode:       crate::operations::RenderMode::Strict,
-            custom_transforms: vec![],
-            catalog:           std::sync::Arc::clone(&catalog),
+            current_dir:        None,
+            file_resolver:      None,
+            template_context:   fabro_template::TemplateContext::new(),
+            source_name:        None,
+            render_mode:        crate::operations::RenderMode::Strict,
+            custom_transforms:  vec![],
+            catalog:            std::sync::Arc::clone(&catalog),
+            default_provider:   None,
+            eligible_providers: catalog.all_provider_ids(),
         })
         .unwrap();
         validate(transformed, catalog.as_ref(), &[])

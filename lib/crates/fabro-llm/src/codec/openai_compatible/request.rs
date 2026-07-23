@@ -79,7 +79,7 @@ pub(super) fn merge_provider_options(
 
 #[cfg(test)]
 mod tests {
-    use fabro_model::Catalog;
+    use fabro_model::{Catalog, ProviderId};
 
     use super::super::wire::ApiRequest;
     use super::*;
@@ -183,16 +183,18 @@ mod tests {
 
     #[test]
     fn encode_omits_sampling_params_for_models_that_reject_them() {
-        let model = Catalog::builtin().get("kimi-k3").unwrap();
+        let model = Catalog::builtin()
+            .get_on_provider(&ProviderId::new("kimi"), "kimi-k3")
+            .unwrap();
         let mut request = minimal_request();
-        request.model = model.id.clone();
+        request.model = model.id.to_string();
         request.temperature = Some(0.7);
         request.top_p = Some(0.9);
         let params = CodecParams::default();
         let ctx = CodecCtx {
             request:       &request,
             provider_name: "kimi",
-            deployment_id: &model.id,
+            deployment_id: model.id.as_str(),
             model:         Some(model),
             params:        &params,
         };

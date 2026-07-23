@@ -264,6 +264,8 @@ export * from './principal-webhook';
 export * from './principal-worker';
 export * from './project-namespace';
 export * from './provider';
+export * from './provider-credential-test-request';
+export * from './provider-credential-test-response';
 export * from './provider-list';
 export * from './provider-test-list';
 export * from './provider-test-result';

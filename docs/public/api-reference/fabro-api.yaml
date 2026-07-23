@@ -5452,7 +5452,9 @@ paths:
       operationId: listModels
       tags: [Models]
       summary: List Models
-      description: Returns a paginated list of available LLM models from the built-in catalog.
+      description: |
+        Returns one row per provider/model offering from the catalog. Model IDs
+        are unique within a provider; `(provider, id)` is the resource identity.
       parameters:
         - $ref: "#/components/parameters/ModelProviderFilter"
         - $ref: "#/components/parameters/ModelQueryFilter"
@@ -5487,7 +5489,8 @@ paths:
           required: true
           schema:
             type: string
-          description: The model identifier.
+          description: The canonical model ID or an alias.
+        - $ref: "#/components/parameters/ModelTestProviderParam"
         - $ref: "#/components/parameters/ModelTestModeParam"
       responses:
         "200":
@@ -5995,6 +5998,17 @@ components:
       schema:
         $ref: "#/components/schemas/ModelTestMode"
       example: basic
+
+    ModelTestProviderParam:
+      name: provider
+      in: query
+      required: false
+      description: |
+        Pin the test to this provider's offering. When omitted, the server
+        selects among ready providers by catalog priority.
+      schema:
+        $ref: "#/components/schemas/ProviderId"
+      example: openrouter
 
   headers:
     XRequestId:
@@ -7766,6 +7780,12 @@ components:
           $ref: "#/components/schemas/SessionStatus"
         model:
           type: ["string", "null"]
+          description: Canonical model ID selected when the session was created.
+        provider:
+          oneOf:
+            - $ref: "#/components/schemas/ProviderId"
+            - type: "null"
+          description: Provider selected when the session was created.
         active_turn:
           oneOf:
             - $ref: "#/components/schemas/SessionTurn"
@@ -7798,6 +7818,12 @@ components:
           $ref: "#/components/schemas/SessionStatus"
         model:
           type: ["string", "null"]
+          description: Canonical model ID selected when the session was created.
+        provider:
+          oneOf:
+            - $ref: "#/components/schemas/ProviderId"
+            - type: "null"
+          description: Provider selected when the session was created.
         active_turn:
           oneOf:
             - $ref: "#/components/schemas/SessionTurn"
@@ -7832,6 +7858,12 @@ components:
           $ref: "#/components/schemas/SessionStatus"
         model:
           type: ["string", "null"]
+          description: Canonical model ID selected when the session was created.
+        provider:
+          oneOf:
+            - $ref: "#/components/schemas/ProviderId"
+            - type: "null"
+          description: Provider selected when the session was created.
         active_turn:
           oneOf:
             - $ref: "#/components/schemas/SessionTurn"
@@ -7857,7 +7889,12 @@ components:
           type: string
         model:
           type: string
-          description: Catalog model ID or alias, or provider-qualified provider/model reference. Stored as the canonical catalog model ID.
+          description: |
+            Catalog model ID or alias. The server selects among ready
+            providers and stores the canonical model ID.
+        provider:
+          $ref: "#/components/schemas/ProviderId"
+          description: Optional provider pin. Provider-qualified model references remain accepted for compatibility.
 
     SubmitTurnRequest:
       type: object
@@ -8235,7 +8272,9 @@ components:
           example: 1.50
 
     Model:
-      description: An available LLM model from the built-in catalog.
+      description: |
+        One provider's offering of an LLM model. The `id` is unique within
+        `provider`; `(provider, id)` is the stable resource identity.
       type: object
       required:
         - id
@@ -8255,7 +8294,7 @@ components:
       properties:
         id:
           type: string
-          description: Unique model identifier.
+          description: Canonical human-facing model ID, unique within the provider.
           example: "claude-opus-4-6"
         provider:
           $ref: "#/components/schemas/ProviderId"
@@ -8310,12 +8349,15 @@ components:
       type: object
       required:
         - model_id
+        - provider
         - status
       properties:
         model_id:
           type: string
-          description: The model identifier that was tested.
+          description: The canonical model ID that was tested.
           example: "claude-opus-4-6"
+        provider:
+          $ref: "#/components/schemas/ProviderId"
         status:
           type: string
           enum:
@@ -8406,7 +8448,7 @@ components:
             $ref: "#/components/schemas/CompletionMessage"
         model:
           type: string
-          description: Model ID or alias. Server picks default if omitted.
+          description: Model ID or alias. Server picks a ready-provider default if omitted.
         system:
           type: string
           description: System prompt (convenience; prepended as a system message).
@@ -8442,7 +8484,7 @@ components:
           description: Reasoning effort level.
         provider:
           type: string
-          description: Provider to route to.
+          description: Optional provider pin.
         provider_options:
           description: Provider-specific options.
 
@@ -8459,12 +8501,15 @@ components:
 
     CompletionResponse:
       type: object
-      required: [id, model, message, stop_reason, usage]
+      required: [id, model, provider, message, stop_reason, usage]
       properties:
         id:
           type: string
         model:
           type: string
+          description: Canonical model ID selected for the request.
+        provider:
+          $ref: "#/components/schemas/ProviderId"
         message:
           $ref: "#/components/schemas/CompletionMessage"
         stop_reason:
@@ -8518,7 +8563,10 @@ components:
             same format the model writes back via `write_workflow_file`.
         model:
           type: string
-          description: Model id or alias. Server picks the default if omitted.
+          description: Model ID or alias. Server picks a ready-provider default if omitted.
+        provider:
+          $ref: "#/components/schemas/ProviderId"
+          description: Optional provider pin.
 
     PaginatedSavedQueryList:
       description: Paginated list of saved queries.

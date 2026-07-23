@@ -2,7 +2,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use ::fabro_types::{RunEvent, RunId};
+use ::fabro_types::{RunEvent, RunId, RunProjection};
 use anyhow::Result;
 use fabro_store::RunDatabase;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
@@ -20,6 +20,21 @@ pub async fn append_event(run_store: &RunDatabase, run_id: &RunId, event: &Event
         .append_event(&payload)
         .await
         .map(|_| ())
+        .map_err(anyhow::Error::from)
+}
+
+pub async fn append_event_if(
+    run_store: &RunDatabase,
+    run_id: &RunId,
+    event: &Event,
+    predicate: impl FnOnce(&RunProjection) -> bool,
+) -> Result<bool> {
+    let stored = to_run_event(run_id, event);
+    let payload = build_redacted_event_payload(&stored, run_id)?;
+    run_store
+        .append_event_if(&payload, predicate)
+        .await
+        .map(|seq| seq.is_some())
         .map_err(anyhow::Error::from)
 }
 

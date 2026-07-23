@@ -294,7 +294,7 @@ mod tests {
         let mut projection = test_projection();
         let model = ModelRef {
             provider: ProviderId::openai(),
-            model_id: "gpt-5.4".to_string(),
+            model_id: "gpt-5.4".into(),
             speed:    None,
         };
         let stage = projection.stage_entry("agent", 1, first_event_seq(1));

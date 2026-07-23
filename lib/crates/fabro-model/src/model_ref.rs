@@ -22,7 +22,7 @@ impl ModelHandle {
     #[must_use]
     pub fn model_id(&self) -> &str {
         match self {
-            Self::Resolved(m) => &m.id,
+            Self::Resolved(m) => m.id.as_str(),
             Self::ByName { model, .. } => model,
         }
     }

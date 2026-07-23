@@ -438,6 +438,7 @@ async fn compute_final_patch(
     (final_patch, diff_summary)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn billing_from_projection(projection: &RunProjection) -> Option<BilledTokenCounts> {
     billing_rollup_from_projection(projection, None).billing_if_present()
 }

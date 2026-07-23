@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -249,7 +249,6 @@ pub struct SandboxEnvSpec {
 }
 
 pub struct InitOptions {
-    pub run_id:            RunId,
     pub run_store:         RunStoreHandle,
     pub dry_run:           bool,
     pub emitter:           Arc<Emitter>,
@@ -324,13 +323,15 @@ pub struct Finalized {
 
 /// Options for the TRANSFORM phase.
 pub struct TransformOptions {
-    pub current_dir:       Option<PathBuf>,
-    pub file_resolver:     Option<Arc<dyn FileResolver>>,
-    pub template_context:  TemplateContext,
-    pub source_name:       Option<String>,
-    pub render_mode:       RenderMode,
-    pub custom_transforms: Vec<Box<dyn Transform>>,
-    pub catalog:           Arc<fabro_model::Catalog>,
+    pub current_dir:        Option<PathBuf>,
+    pub file_resolver:      Option<Arc<dyn FileResolver>>,
+    pub template_context:   TemplateContext,
+    pub source_name:        Option<String>,
+    pub render_mode:        RenderMode,
+    pub custom_transforms:  Vec<Box<dyn Transform>>,
+    pub catalog:            Arc<fabro_model::Catalog>,
+    pub default_provider:   Option<ProviderId>,
+    pub eligible_providers: HashSet<ProviderId>,
 }
 
 /// Options for the FINALIZE phase.

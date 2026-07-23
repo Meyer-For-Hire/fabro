@@ -321,7 +321,10 @@ async fn create_run_pull_request(
     } else {
         let catalog = state.catalog();
         let configured = state.ready_llm_provider_ids().await;
-        catalog.default_for_configured_ids(&configured).id.clone()
+        catalog
+            .default_for_configured_ids(&configured)
+            .id
+            .to_string()
     };
     let catalog = state.catalog();
 

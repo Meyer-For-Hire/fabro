@@ -55,7 +55,7 @@ async fn dry_run_serve_starts_and_runs_workflow() {
 }
 
 #[tokio::test]
-async fn test_model_skip_when_no_providers() {
+async fn test_model_known_but_unavailable_returns_bad_request() {
     let app = test_app_with_no_providers();
 
     let req = Request::builder()
@@ -68,12 +68,15 @@ async fn test_model_skip_when_no_providers() {
     let response = app.oneshot(req).await.unwrap();
     let body = response_json(
         response,
-        StatusCode::OK,
+        StatusCode::BAD_REQUEST,
         "POST /api/v1/models/claude-opus-4-6/test",
     )
     .await;
-    assert_eq!(body["model_id"], "claude-opus-4-6");
-    assert_eq!(body["status"], "skip");
+    assert!(
+        body["errors"][0]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("no offering on an eligible provider"))
+    );
 }
 
 #[tokio::test]
@@ -114,26 +117,26 @@ async fn dry_run_serve_rejects_invalid_dot() {
 }
 
 #[tokio::test]
-async fn completion_no_provider_non_streaming_returns_502() {
+async fn completion_no_provider_non_streaming_returns_400() {
     let app = test_app_with_no_providers();
 
     let response = app.oneshot(completion_request(false)).await.unwrap();
     response_status(
         response,
-        StatusCode::BAD_GATEWAY,
+        StatusCode::BAD_REQUEST,
         "POST /api/v1/completions",
     )
     .await;
 }
 
 #[tokio::test]
-async fn completion_no_provider_streaming_returns_502() {
+async fn completion_no_provider_streaming_returns_400() {
     let app = test_app_with_no_providers();
 
     let response = app.oneshot(completion_request(true)).await.unwrap();
     response_status(
         response,
-        StatusCode::BAD_GATEWAY,
+        StatusCode::BAD_REQUEST,
         "POST /api/v1/completions?stream=true",
     )
     .await;

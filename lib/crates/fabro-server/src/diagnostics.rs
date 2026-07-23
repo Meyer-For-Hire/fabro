@@ -254,11 +254,11 @@ async fn probe_single_provider(
     };
     let model_id = model.id.clone();
 
-    let outcome = run_basic_model_probe(&model_id, &provider, client).await;
+    let outcome = run_basic_model_probe(model_id.as_str(), &provider, client).await;
     match outcome.status {
         ModelTestStatus::Ok => ProviderProbeResult {
             provider,
-            model_id: Some(model_id),
+            model_id: Some(model_id.to_string()),
             status: ProviderProbeStatus::Ok,
             error_message: None,
             diagnostic_detail: None,
@@ -267,7 +267,12 @@ async fn probe_single_provider(
             let raw = outcome
                 .error_message
                 .unwrap_or_else(|| "provider probe failed".to_string());
-            provider_probe_error(provider, Some(model_id), redact_string(&raw), None)
+            provider_probe_error(
+                provider,
+                Some(model_id.to_string()),
+                redact_string(&raw),
+                None,
+            )
         }
     }
 }

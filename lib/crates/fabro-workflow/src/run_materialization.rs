@@ -1,15 +1,19 @@
+use std::collections::HashSet;
+
 use fabro_graphviz::graph::Graph;
-use fabro_model::{Catalog, ProviderId};
+use fabro_model::{Catalog, ModelSelectionError, ProviderId};
 use fabro_types::WorkflowSettings;
 use fabro_types::settings::InterpString;
 use fabro_types::settings::run::RunGoal;
+
+use crate::error::Error;
 
 pub fn materialize_run(
     mut settings: WorkflowSettings,
     graph: &Graph,
     catalog: &Catalog,
     configured_providers: &[ProviderId],
-) -> WorkflowSettings {
+) -> Result<WorkflowSettings, Error> {
     let configured_model = settings.run.model.name.take();
     let configured_provider = settings.run.model.provider.take();
     let graph_provider = graph
@@ -24,26 +28,13 @@ pub fn materialize_run(
         .map(str::to_string);
 
     let provider = configured_provider.or(graph_provider);
-    let model = configured_model.or(graph_model).unwrap_or_else(|| {
-        provider
-            .as_deref()
-            .map(ProviderId::from)
-            .and_then(|provider| catalog.default_for_provider(&provider))
-            .unwrap_or_else(|| catalog.default_for_configured_ids(configured_providers))
-            .id
-            .clone()
-    });
-
-    let (resolved_model, resolved_provider) = match catalog.get(&model) {
-        Some(info) => (
-            info.id.clone(),
-            provider.or(Some(info.provider.to_string())),
-        ),
-        None => (model, provider),
-    };
+    let model = configured_model.or(graph_model);
+    let eligible = configured_providers.iter().cloned().collect::<HashSet<_>>();
+    let (resolved_model, resolved_provider) =
+        resolve_run_model(catalog, &eligible, model.as_deref(), provider.as_deref())?;
 
     settings.run.model.name = Some(resolved_model);
-    settings.run.model.provider = resolved_provider;
+    settings.run.model.provider = Some(resolved_provider.into_inner());
 
     let goal = graph.goal().to_string();
     settings.run.goal = if goal.is_empty() {
@@ -61,5 +52,18 @@ pub fn materialize_run(
         settings.run.pull_request = None;
     }
 
-    settings
+    Ok(settings)
+}
+
+pub(crate) fn resolve_run_model(
+    catalog: &Catalog,
+    eligible: &HashSet<ProviderId>,
+    model: Option<&str>,
+    provider: Option<&str>,
+) -> Result<(String, ProviderId), ModelSelectionError> {
+    let provider = provider
+        .filter(|provider| !provider.is_empty())
+        .map(ProviderId::new);
+    let selected = catalog.resolve_selection(model, provider.as_ref(), eligible)?;
+    Ok((selected.model, selected.provider))
 }

@@ -326,7 +326,7 @@ async fn poolside_laguna_xs_deep_tool_round_trip() {
             .expect("Poolside client should build from the catalog"),
     );
     let model = catalog
-        .get("laguna-xs-2.1")
+        .get_on_provider(&ProviderId::new("poolside"), "laguna-xs-2.1")
         .expect("direct Poolside Laguna XS should be present");
 
     let outcome = run_model_test(model, ModelTestMode::Deep, client).await;
@@ -572,7 +572,7 @@ async fn openrouter_kimi_k3_deep_tool_round_trip() {
             .expect("OpenRouter client should build from the catalog"),
     );
     let model = catalog
-        .get("moonshotai/kimi-k3")
+        .get_on_provider(&ProviderId::new("openrouter"), "kimi-k3")
         .expect("OpenRouter Kimi K3 should be present");
 
     let outcome = run_model_test(model, ModelTestMode::Deep, client).await;

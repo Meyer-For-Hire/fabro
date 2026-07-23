@@ -31,7 +31,14 @@ export interface SessionSummary {
     'run_id': string;
     'title'?: string | null;
     'status': SessionStatus;
+    /**
+     * Canonical model ID selected when the session was created.
+     */
     'model'?: string | null;
+    /**
+     * LLM provider identifier.
+     */
+    'provider'?: string | null;
     'active_turn': SessionTurn | null;
     'created_at': string;
     'updated_at': string;

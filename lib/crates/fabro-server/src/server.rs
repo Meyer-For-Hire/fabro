@@ -1453,7 +1453,7 @@ impl AppState {
                 self.catalog()
                     .default_for_configured_ids(&provider_ids)
                     .id
-                    .clone(),
+                    .to_string(),
             )
         };
         AskFabroReadiness { default_model }

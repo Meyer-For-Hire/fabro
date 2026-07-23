@@ -8,7 +8,7 @@ use crate::error::Error;
 use crate::provider::{
     ProviderAdapter, StreamEventStream, validate_standard_speed, validate_tool_choice,
 };
-use crate::providers::common::{self as common};
+use crate::providers::common::{self as common, CatalogRoute};
 use crate::transport::{self, HttpTransport, SseFraming};
 use crate::types::{AdapterTimeout, Request, Response};
 
@@ -88,7 +88,7 @@ impl Adapter {
     /// Resolve the wire model id (catalog `api_id`, falling back to the
     /// requested model).
     fn deployment_id(&self, request: &Request) -> String {
-        common::api_model_id(self.catalog.as_deref(), &request.model)
+        self.api_model_id(&request.model)
     }
 
     /// Build the borrowed codec context. `deployment_id` and `params` are
@@ -103,7 +103,7 @@ impl Adapter {
             request,
             provider_name: &self.provider_name,
             deployment_id,
-            model: common::catalog_model(self.catalog.as_deref(), &request.model),
+            model: self.catalog_model(&request.model),
             params,
         }
     }
@@ -124,6 +124,16 @@ impl Adapter {
             req = req.header(key, value);
         }
         Ok(req)
+    }
+}
+
+impl common::CatalogRoute for Adapter {
+    fn catalog(&self) -> Option<&Catalog> {
+        self.catalog.as_deref()
+    }
+
+    fn provider_name(&self) -> &str {
+        &self.provider_name
     }
 }
 
