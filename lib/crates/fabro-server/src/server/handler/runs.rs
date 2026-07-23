@@ -640,7 +640,7 @@ pub(crate) async fn create_run_from_manifest(
         Err(WorkflowError::ValidationFailed { .. } | WorkflowError::Parse(_)) => {
             return ApiError::bad_request("Validation failed").into_response();
         }
-        Err(err @ WorkflowError::ModelSelection(_)) => {
+        Err(err @ (WorkflowError::ModelSelection(_) | WorkflowError::ModelReference(_))) => {
             return ApiError::bad_request(err.to_string()).into_response();
         }
         Err(err) => {
