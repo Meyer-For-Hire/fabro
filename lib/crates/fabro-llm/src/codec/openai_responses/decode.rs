@@ -3,7 +3,7 @@
 use serde::Deserialize;
 
 use super::wire::{ApiResponse, ApiUsage, InputTokensResponse};
-use crate::codec::{CodecCtx, parse_tool_arguments_or_empty};
+use crate::codec::{CodecCtx, parse_tool_arguments_or_empty, split_inclusive_token_total};
 use crate::error::Error;
 use crate::types::{
     ContentPart, FinishReason, Message, RateLimitInfo, Response, Role, TokenCounts, ToolCall,
@@ -11,19 +11,23 @@ use crate::types::{
 
 pub(super) fn token_counts_from_api_usage(usage: Option<&ApiUsage>) -> TokenCounts {
     usage.map_or_else(TokenCounts::default, |u| {
-        let cached_tokens = u
+        let cached_detail = u
             .input_tokens_details
             .as_ref()
             .and_then(|d| d.cached_tokens)
             .unwrap_or(0);
-        let reasoning_tokens = u
+        let reasoning_detail = u
             .output_tokens_details
             .as_ref()
             .and_then(|d| d.reasoning_tokens)
             .unwrap_or(0);
+        let (input_tokens, cached_tokens) =
+            split_inclusive_token_total(u.input_tokens, cached_detail);
+        let (output_tokens, reasoning_tokens) =
+            split_inclusive_token_total(u.output_tokens, reasoning_detail);
         TokenCounts {
-            input_tokens: u.input_tokens.saturating_sub(cached_tokens),
-            output_tokens: u.output_tokens.saturating_sub(reasoning_tokens),
+            input_tokens,
+            output_tokens,
             reasoning_tokens,
             cache_read_tokens: cached_tokens,
             ..TokenCounts::default()
@@ -204,6 +208,24 @@ pub(super) fn decode_count_tokens(body: &str) -> Result<i64, Error> {
 mod tests {
     use super::super::encode;
     use super::*;
+
+    #[test]
+    fn token_counts_bound_detail_to_parent_totals() {
+        let usage: ApiUsage = serde_json::from_value(serde_json::json!({
+            "input_tokens": 53,
+            "output_tokens": 59,
+            "input_tokens_details": null,
+            "output_tokens_details": {"reasoning_tokens": 66}
+        }))
+        .unwrap();
+
+        assert_eq!(token_counts_from_api_usage(Some(&usage)), TokenCounts {
+            input_tokens: 53,
+            output_tokens: 0,
+            reasoning_tokens: 59,
+            ..TokenCounts::default()
+        });
+    }
 
     #[test]
     fn parse_output_preserves_both_ids_on_function_call() {

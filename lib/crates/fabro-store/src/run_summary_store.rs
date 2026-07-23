@@ -3,7 +3,7 @@ use std::fmt::Write as _;
 use std::sync::LazyLock;
 
 use chrono::{DateTime, Utc};
-use fabro_types::{Run, RunId, RunSize, RunStatusKind, RunTiming};
+use fabro_types::{BilledTokenCounts, Run, RunId, RunSize, RunStatusKind, RunTiming};
 use sqlx::sqlite::{SqliteConnection, SqliteRow};
 use sqlx::{QueryBuilder, Row as _, Sqlite, SqlitePool};
 use strum::VariantArray as _;
@@ -313,7 +313,7 @@ impl ProjectedRunSummary {
                 .unwrap_or(run.timestamps.created_at);
             run.timing = entry.projection.live_run_timing(at);
         }
-        let billing = projected_billing(&entry.projection);
+        let billing = normalize_billing_for_read_model(projected_billing(&entry.projection));
         let workflow_name = run.workflow.display_name().map(str::to_string);
         let repository_name = run
             .repository
@@ -333,6 +333,33 @@ impl ProjectedRunSummary {
             total_usd_micros: billing.total_usd_micros,
         }
     }
+}
+
+/// Older provider codecs could persist a negative disjoint bucket when a
+/// detail count exceeded its inclusive parent total. The SQLite summary is a
+/// rebuildable, nonnegative read model, so normalize those legacy values here
+/// without rewriting the authoritative run events.
+fn normalize_billing_for_read_model(mut billing: BilledTokenCounts) -> BilledTokenCounts {
+    let input_total = billing
+        .input_tokens
+        .saturating_add(billing.cache_read_tokens)
+        .saturating_add(billing.cache_write_tokens)
+        .max(0);
+    billing.cache_read_tokens = billing.cache_read_tokens.clamp(0, input_total);
+    billing.cache_write_tokens = billing
+        .cache_write_tokens
+        .clamp(0, input_total - billing.cache_read_tokens);
+    billing.input_tokens = input_total - billing.cache_read_tokens - billing.cache_write_tokens;
+
+    let output_total = billing
+        .output_tokens
+        .saturating_add(billing.reasoning_tokens)
+        .max(0);
+    billing.reasoning_tokens = billing.reasoning_tokens.clamp(0, output_total);
+    billing.output_tokens = output_total - billing.reasoning_tokens;
+    billing.total_tokens = input_total.saturating_add(output_total);
+    billing.total_usd_micros = billing.total_usd_micros.map(|value| value.max(0));
+    billing
 }
 
 async fn upsert_run(connection: &mut SqliteConnection, record: &ProjectedRunSummary) -> Result<()> {
@@ -804,6 +831,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn projection_normalizes_legacy_overlapping_reasoning_tokens() {
+        let (_directory, store) = store().await;
+        let created_at = dt("2026-07-11T12:00:00Z");
+        let run_id = run_id(created_at.timestamp_millis().cast_unsigned(), 1);
+        let mut projection = projection(run_id, "legacy billing", created_at);
+        projection.conclusion = Some(Conclusion {
+            timestamp:            created_at,
+            status:               StageOutcome::Succeeded,
+            timing:               RunTiming::default(),
+            failure:              None,
+            final_git_commit_sha: None,
+            stages:               Vec::new(),
+            billing:              Some(BilledTokenCounts {
+                input_tokens: 53,
+                output_tokens: -7,
+                total_tokens: 112,
+                reasoning_tokens: 66,
+                ..BilledTokenCounts::default()
+            }),
+            total_retries:        0,
+            diff:                 RunDiff::default(),
+        });
+
+        store
+            .upsert_projection(&entry(projection, 1))
+            .await
+            .unwrap();
+
+        let row = sqlx::query(
+            "SELECT input_tokens, output_tokens, reasoning_tokens FROM runs WHERE id = ?",
+        )
+        .bind(run_id.to_string())
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(sqlx::Row::get::<i64, _>(&row, "input_tokens"), 53);
+        assert_eq!(sqlx::Row::get::<i64, _>(&row, "output_tokens"), 0);
+        assert_eq!(sqlx::Row::get::<i64, _>(&row, "reasoning_tokens"), 59);
+    }
+
+    #[tokio::test]
     async fn reconcile_removes_rows_absent_from_authoritative_entries() {
         let (_directory, store) = store().await;
         let created_at = dt("2026-07-11T12:00:00Z");
@@ -833,33 +901,14 @@ mod tests {
             .unwrap();
 
         let good = entry(projection(good_id, "good", created_at), 1);
-        let mut invalid_projection = projection(recovered_id, "recovered", created_at);
-        invalid_projection.conclusion = Some(Conclusion {
-            timestamp:            created_at,
-            status:               StageOutcome::Succeeded,
-            timing:               RunTiming::default(),
-            failure:              None,
-            final_git_commit_sha: None,
-            stages:               Vec::new(),
-            billing:              Some(BilledTokenCounts {
-                input_tokens: -1,
-                ..BilledTokenCounts::default()
-            }),
-            total_retries:        0,
-            diff:                 RunDiff::default(),
-        });
-        let invalid = entry(invalid_projection.clone(), 1);
+        let recovered_projection = projection(recovered_id, "recovered", created_at);
+        let invalid = entry(recovered_projection.clone(), 0);
 
         assert!(store.reconcile(&[good.clone(), invalid]).await.is_err());
         assert!(store.get(&stale_id, created_at).await.unwrap().is_some());
         assert!(store.get(&good_id, created_at).await.unwrap().is_none());
 
-        invalid_projection.conclusion.as_mut().unwrap().billing = Some(BilledTokenCounts {
-            input_tokens: 1,
-            total_tokens: 1,
-            ..BilledTokenCounts::default()
-        });
-        let recovered = entry(invalid_projection, 1);
+        let recovered = entry(recovered_projection, 1);
         store.reconcile(&[good, recovered]).await.unwrap();
 
         assert!(store.get(&stale_id, created_at).await.unwrap().is_none());

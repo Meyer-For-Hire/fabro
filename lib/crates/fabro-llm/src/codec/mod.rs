@@ -27,6 +27,15 @@ pub(crate) fn parse_tool_arguments_or_empty(raw_arguments: &str) -> serde_json::
     serde_json::from_str(raw_arguments).unwrap_or_else(|_| serde_json::json!({}))
 }
 
+/// Split an inclusive provider token total into disjoint base and detail
+/// buckets. Provider detail counts are advisory and occasionally exceed their
+/// parent total, so bound both values while preserving the nonnegative total.
+pub(crate) fn split_inclusive_token_total(total: i64, detail: i64) -> (i64, i64) {
+    let total = total.max(0);
+    let detail = detail.clamp(0, total);
+    (total - detail, detail)
+}
+
 /// Merge `provider_options.<provider_name>` fields into an encoded request
 /// body. Used by codecs whose provider-options namespace is adapter-name keyed
 /// rather than a single fixed provider.

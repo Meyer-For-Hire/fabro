@@ -1,5 +1,6 @@
 //! Serde types mirroring the OpenAI Chat Completions wire shapes.
 
+use crate::codec::split_inclusive_token_total;
 use crate::types::{ReasoningEffort, TokenCounts};
 
 #[derive(serde::Serialize)]
@@ -139,29 +140,32 @@ impl ApiUsage {
     /// reasoning tokens out of `output_tokens`, mirroring the
     /// `openai_responses` convention.
     pub(super) fn token_counts(&self) -> TokenCounts {
-        let cached = self
+        let cached_detail = self
             .prompt_tokens_details
             .as_ref()
             .and_then(|d| d.cached_tokens)
             .unwrap_or(0);
-        let cache_write = self
+        let cache_write_detail = self
             .prompt_tokens_details
             .as_ref()
             .and_then(|d| d.cache_write_tokens)
             .unwrap_or(0);
-        let reasoning = self
+        let reasoning_detail = self
             .completion_tokens_details
             .as_ref()
             .and_then(|d| d.reasoning_tokens)
             .unwrap_or(0);
+        let (uncached_input, cached) =
+            split_inclusive_token_total(self.prompt_tokens, cached_detail);
+        let (input_tokens, cache_write) =
+            split_inclusive_token_total(uncached_input, cache_write_detail);
+        let (output_tokens, reasoning) =
+            split_inclusive_token_total(self.completion_tokens, reasoning_detail);
         TokenCounts {
-            input_tokens:       self
-                .prompt_tokens
-                .saturating_sub(cached)
-                .saturating_sub(cache_write),
-            output_tokens:      self.completion_tokens.saturating_sub(reasoning),
-            reasoning_tokens:   reasoning,
-            cache_read_tokens:  cached,
+            input_tokens,
+            output_tokens,
+            reasoning_tokens: reasoning,
+            cache_read_tokens: cached,
             cache_write_tokens: cache_write,
         }
     }
@@ -225,7 +229,25 @@ pub(super) struct AccumulatedToolCall {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiResponse, StreamChunk};
+    use super::{ApiResponse, ApiUsage, StreamChunk};
+    use crate::types::TokenCounts;
+
+    #[test]
+    fn token_counts_bound_detail_to_parent_totals() {
+        let usage: ApiUsage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 53,
+            "completion_tokens": 59,
+            "completion_tokens_details": {"reasoning_tokens": 66}
+        }))
+        .unwrap();
+
+        assert_eq!(usage.token_counts(), TokenCounts {
+            input_tokens: 53,
+            output_tokens: 0,
+            reasoning_tokens: 59,
+            ..TokenCounts::default()
+        });
+    }
 
     #[test]
     fn reasoning_accepts_provider_and_openrouter_spellings() {
