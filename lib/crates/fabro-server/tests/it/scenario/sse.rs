@@ -60,16 +60,17 @@ async fn sse_stream_contains_expected_event_types() {
 
     wait_for_run_status_not_in(&app, &run_id, &["runnable", "starting"]).await;
 
-    // Get SSE stream
+    // Replay from the beginning so the assertion does not depend on whether
+    // the run advances before the attach request is handled.
     let req = Request::builder()
         .method("GET")
-        .uri(api(&format!("/runs/{run_id}/attach")))
+        .uri(api(&format!("/runs/{run_id}/attach?since_seq=1")))
         .body(Body::empty())
         .unwrap();
     let response = checked_response(
         app.clone().oneshot(req).await.unwrap(),
         StatusCode::OK,
-        format!("GET /api/v1/runs/{run_id}/attach"),
+        format!("GET /api/v1/runs/{run_id}/attach?since_seq=1"),
     )
     .await;
 
@@ -103,18 +104,12 @@ async fn sse_stream_contains_expected_event_types() {
         }
     }
 
-    // Because we subscribe while the run is only guaranteed to be past
-    // "runnable", a live stream should include at least one stage event.
-    // If the run completes before we attach with no unread events, an empty
-    // stream is still a valid 200 response.
-    if !event_types.is_empty() {
-        assert!(
-            event_types
-                .iter()
-                .any(|t| t == "stage.started" || t == "stage.completed"),
-            "should contain stage events, got: {event_types:?}"
-        );
-    }
+    assert!(
+        event_types
+            .iter()
+            .any(|t| t == "stage.started" || t == "stage.completed"),
+        "should contain stage events, got: {event_types:?}"
+    );
 
     // Pipeline is complete (SSE stream ended), verify checkpoint
     let cp_body = wait_for_checkpoint(&app, &run_id).await;
