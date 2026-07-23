@@ -2532,6 +2532,47 @@ reasoning = false
     }
 
     #[test]
+    fn api_backend_provider_pin_wins_over_priority_selection() {
+        let settings: LlmCatalogSettings = toml::from_str(
+            r"
+[providers.openrouter]
+enabled = true
+",
+        )
+        .unwrap();
+        let backend = AgentApiBackend::new_with_catalog(
+            "gpt-5.4".to_string(),
+            ProviderId::from("openrouter"),
+            Vec::new(),
+            Arc::new(EnvCredentialSource::new()),
+            SteeringHub::for_tests(),
+            Arc::new(Catalog::from_builtin_with_overrides(&settings).unwrap()),
+        );
+
+        let provider = backend.resolve_provider_context("gpt-5.4", None).unwrap();
+
+        assert_eq!(provider.provider_id, ProviderId::from("openrouter"));
+    }
+
+    #[test]
+    fn api_backend_node_provider_attr_overrides_backend_pin() {
+        let backend = AgentApiBackend::new_with_catalog(
+            "gpt-5.4".to_string(),
+            ProviderId::from("openrouter"),
+            Vec::new(),
+            Arc::new(EnvCredentialSource::new()),
+            SteeringHub::for_tests(),
+            Arc::new(Catalog::from_builtin().unwrap()),
+        );
+
+        let provider = backend
+            .resolve_provider_context("gpt-5.4", Some("openai"))
+            .unwrap();
+
+        assert_eq!(provider.provider_id, ProviderId::openai());
+    }
+
+    #[test]
     fn api_backend_resolves_custom_catalog_provider_profile() {
         let settings: LlmCatalogSettings = toml::from_str(
             r#"

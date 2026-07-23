@@ -13785,7 +13785,7 @@ async fn get_aggregate_billing_saturates_total_cost_across_models() {
             agg.by_model.insert(
                 ModelRef {
                     provider: ProviderId::openai(),
-                    model_id: model_id.to_string(),
+                    model_id: model_id.into(),
                     speed:    None,
                 },
                 ModelBillingTotals {
