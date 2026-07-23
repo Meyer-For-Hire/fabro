@@ -22,7 +22,7 @@ Method:
 ### [x] 1. Change two slow `exec` mock responses from retriable `500` to non-retriable `400`
 
 Files:
-- `lib/crates/fabro-cli/tests/it/cmd/exec.rs`
+- `lib/apps/fabro-cli/tests/it/cmd/exec.rs`
 
 Measured evidence:
 - `fabro-cli::it::cmd::exec::exec_cli_server_target_overrides_configured_server_target`: `6.858s` median
@@ -32,7 +32,7 @@ Measured evidence:
   - mocked `400`: `0.053s` median
 
 Implementation status:
-- Implemented in `lib/crates/fabro-cli/tests/it/cmd/exec.rs`
+- Implemented in `lib/apps/fabro-cli/tests/it/cmd/exec.rs`
 - Verified with `ulimit -n 4096` via 5 targeted nextest runs per test
 - Post-change nextest exec-time medians:
   - `exec_server_target_uses_remote_transport_instead_of_local_api_key_resolution`: `1.580s`
@@ -57,7 +57,7 @@ Cons:
 ### 2. Short-circuit delete-path worker grace for already-terminal runs
 
 Files:
-- `lib/crates/fabro-server/src/server.rs`
+- `lib/apps/fabro-server/src/server.rs`
 
 Measured evidence:
 - `fabro-cli::it::cmd::system_prune::system_prune_yes_deletes_matching_runs`: `10.477s`
@@ -87,11 +87,11 @@ Cons:
 ### [x] 3. Collapse the five abnormally slow `help` integration tests into one smoke test or a lighter harness
 
 Files:
-- `lib/crates/fabro-cli/tests/it/cmd/artifact.rs`
-- `lib/crates/fabro-cli/tests/it/cmd/artifact_list.rs`
-- `lib/crates/fabro-cli/tests/it/cmd/artifact_cp.rs`
-- `lib/crates/fabro-cli/tests/it/cmd/config.rs`
-- `lib/crates/fabro-cli/tests/it/cmd/attach.rs`
+- `lib/apps/fabro-cli/tests/it/cmd/artifact.rs`
+- `lib/apps/fabro-cli/tests/it/cmd/artifact_list.rs`
+- `lib/apps/fabro-cli/tests/it/cmd/artifact_cp.rs`
+- `lib/apps/fabro-cli/tests/it/cmd/config.rs`
+- `lib/apps/fabro-cli/tests/it/cmd/attach.rs`
 
 Measured evidence:
 - Slow `help` tests:
@@ -131,8 +131,8 @@ Cons:
 ### [x] 4. Replace `doctor_no_color_when_no_color_set` with a render-path assertion
 
 Files:
-- `lib/crates/fabro-cli/tests/it/cmd/doctor.rs`
-- `lib/crates/fabro-util/src/check_report.rs`
+- `lib/apps/fabro-cli/tests/it/cmd/doctor.rs`
+- `lib/foundation/fabro-util/src/check_report.rs`
 
 Measured evidence:
 - `fabro-cli::it::cmd::doctor::doctor_no_color_when_no_color_set`: `5.131s`
@@ -144,7 +144,7 @@ Estimated impact:
 
 Implementation status:
 - Implemented by deleting `fabro-cli::it::cmd::doctor::doctor_no_color_when_no_color_set`
-- Added a unit-level render assertion in `lib/crates/fabro-cli/src/commands/doctor.rs`:
+- Added a unit-level render assertion in `lib/apps/fabro-cli/src/commands/doctor.rs`:
   - `render_report_text_without_color_has_no_ansi`
 - Verified with `ulimit -n 4096; cargo nextest run -p fabro-cli render_report_text_without_color_has_no_ansi --status-level fail --final-status-level fail --show-progress none`
 - Verification result: `1 passed`
@@ -166,8 +166,8 @@ Cons:
 ### [x] 5. Fix local Unix-socket autostart so it doesn't burn the full 5s readiness wait
 
 Files:
-- `lib/crates/fabro-cli/src/server_client.rs`
-- `lib/crates/fabro-cli/tests/it/cmd/server_start.rs`
+- `lib/apps/fabro-cli/src/server_client.rs`
+- `lib/apps/fabro-cli/tests/it/cmd/server_start.rs`
 
 Measured evidence:
 - Pre-fix 5-run timing for `fabro-cli::it::cmd::server_start::concurrent_autostart_converges_on_one_shared_daemon_and_cleans_up`:
@@ -197,7 +197,7 @@ Implementation status:
 - Implemented by splitting the Unix-socket connection path into:
   - a single immediate health probe before autostart
   - the existing retrying readiness wait after autostart
-- Kept the original integration test coverage in `lib/crates/fabro-cli/tests/it/cmd/server_start.rs`
+- Kept the original integration test coverage in `lib/apps/fabro-cli/tests/it/cmd/server_start.rs`
 - Verified with `ulimit -n 4096; cargo nextest run -p fabro-cli concurrent_autostart_converges_on_one_shared_daemon_and_cleans_up --status-level fail --final-status-level fail --show-progress none`
 - Verification result: `1 passed`
 - Post-change 5-run timing for `fabro-cli::it::cmd::server_start::concurrent_autostart_converges_on_one_shared_daemon_and_cleans_up`:
@@ -217,7 +217,7 @@ Implementation status:
 ### [x] 6. Collapse three lightweight `attach` smoke tests into one scenario-style test
 
 Files:
-- `lib/crates/fabro-cli/tests/it/cmd/attach.rs`
+- `lib/apps/fabro-cli/tests/it/cmd/attach.rs`
 
 Measured evidence:
 - `attach_requires_run_arg`: `1.595s`
@@ -230,7 +230,7 @@ Estimated impact:
 - Conservative recoverable time: about `3.15s`
 
 Implementation status:
-- Implemented by removing the 3 command-owned smoke tests from `lib/crates/fabro-cli/tests/it/cmd/attach.rs`
+- Implemented by removing the 3 command-owned smoke tests from `lib/apps/fabro-cli/tests/it/cmd/attach.rs`
 - Added `fabro-cli::it::scenario::smoke::attach_smoke_covers_arg_validation_and_remote_server_behaviors`
 - Verified with `ulimit -n 4096; cargo nextest run -p fabro-cli attach_smoke_covers_arg_validation_and_remote_server_behaviors --status-level fail --final-status-level fail --show-progress none`
 - Verification result: `1 passed`
@@ -256,7 +256,7 @@ Cons:
 ### [x] 7. Collapse the three `completion` tests
 
 Files:
-- `lib/crates/fabro-cli/tests/it/cmd/completion.rs`
+- `lib/apps/fabro-cli/tests/it/cmd/completion.rs`
 
 Measured evidence:
 - `completion::generates_zsh_completions`: `1.567s`
@@ -295,7 +295,7 @@ Cons:
 ### [x] 8. Remove or merge the duplicate attach replay test
 
 Files:
-- `lib/crates/fabro-cli/tests/it/cmd/attach.rs`
+- `lib/apps/fabro-cli/tests/it/cmd/attach.rs`
 
 Measured evidence:
 - `attach_replays_completed_detached_run`: `2.696s`
@@ -303,7 +303,7 @@ Measured evidence:
 - The two tests are currently identical in code and assertions
 
 Implementation status:
-- Implemented by removing the duplicate test from `lib/crates/fabro-cli/tests/it/cmd/attach.rs`
+- Implemented by removing the duplicate test from `lib/apps/fabro-cli/tests/it/cmd/attach.rs`
 - Verified with `ulimit -n 4096; cargo nextest run -p fabro-cli attach_replays_completed_detached_run --status-level fail --final-status-level fail --show-progress none`
 - Verification result: `1 passed`
 
@@ -325,7 +325,7 @@ Cons:
 ### [x] 9. Make `attach_before_completion_streams_to_finished_state` event-driven instead of sleep-driven
 
 Files:
-- `lib/crates/fabro-cli/tests/it/cmd/attach.rs`
+- `lib/apps/fabro-cli/tests/it/cmd/attach.rs`
 
 Measured evidence:
 - `attach_before_completion_streams_to_finished_state`: `3.043s`
@@ -333,7 +333,7 @@ Measured evidence:
 - `write_gated_workflow()` adds another fixed `sleep 0.2`
 
 Implementation status:
-- Implemented by replacing the fixed 1-second gate-release sleep with a real attach-output signal in `lib/crates/fabro-cli/tests/it/cmd/attach.rs`
+- Implemented by replacing the fixed 1-second gate-release sleep with a real attach-output signal in `lib/apps/fabro-cli/tests/it/cmd/attach.rs`
 - The test now spawns `fabro attach`, waits for replayed stderr output (`✓ start`), then releases the workflow gate
 - Verified with `ulimit -n 4096; cargo nextest run -p fabro-cli attach_before_completion_streams_to_finished_state --status-level fail --final-status-level fail --show-progress none`
 - Verification result: `1 passed`
@@ -361,14 +361,14 @@ Cons:
 ### [x] 10. Remove or parameterize the fixed `sleep 0.2` in `write_gated_workflow()`
 
 Files:
-- `lib/crates/fabro-cli/tests/it/cmd/support.rs`
+- `lib/apps/fabro-cli/tests/it/cmd/support.rs`
 
 Measured evidence:
 - `write_gated_workflow()` hardcodes `sleep 0.2`
 - The helper is used in 6 cmd tests
 
 Implementation status:
-- Implemented by deleting the fixed `sleep 0.2` from `write_gated_workflow()` in `lib/crates/fabro-cli/tests/it/cmd/support.rs`
+- Implemented by deleting the fixed `sleep 0.2` from `write_gated_workflow()` in `lib/apps/fabro-cli/tests/it/cmd/support.rs`
 - Verified with `ulimit -n 4096; cargo nextest run -p fabro-cli -E 'test(attach_before_completion_streams_to_finished_state) | test(ctrl_c_cancels_active_run_via_server) | test(rm_force_terminates_active_run_worker) | test(start_rejects_already_active_or_completed_run) | test(start_runs_under_server_ownership_without_launcher_record)' --status-level fail --final-status-level fail --show-progress none`
 - Verification result: `5 passed`
 - Targeted 5-pass benchmark with `ulimit -n 4096` over the 5 tests that currently use the helper:

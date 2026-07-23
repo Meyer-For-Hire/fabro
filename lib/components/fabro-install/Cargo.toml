@@ -1,0 +1,27 @@
+[package]
+name = "fabro-install"
+edition.workspace = true
+version.workspace = true
+publish = false
+license.workspace = true
+description = "Shared install primitives for Fabro CLI and server flows"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+ring = "0.17"
+toml.workspace = true
+tokio.workspace = true
+fabro-config = { path = "../../foundation/fabro-config" }
+fabro-db = { path = "../../foundation/fabro-db" }
+fabro-environment.workspace = true
+fabro-static.workspace = true
+fabro-types = { path = "../../foundation/fabro-types" }
+fabro-util = { path = "../../foundation/fabro-util" }
+fabro-vault = { path = "../../foundation/fabro-vault" }
+
+[dev-dependencies]
+tempfile = "3"

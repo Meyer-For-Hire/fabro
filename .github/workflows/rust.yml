@@ -4,7 +4,9 @@ on:
   push:
     branches: [main]
     paths:
-      - "lib/crates/**"
+      - "lib/apps/**"
+      - "lib/components/**"
+      - "lib/foundation/**"
       - "test/**"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -18,7 +20,9 @@ on:
   pull_request:
     branches: [main]
     paths:
-      - "lib/crates/**"
+      - "lib/apps/**"
+      - "lib/components/**"
+      - "lib/foundation/**"
       - "test/**"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -76,7 +80,7 @@ jobs:
       - name: Verify legacy auth identity removal
         run: |
           if git grep -nE 'AuthMode::Disabled|RunAuthMethod|RunSubjectProvenance|\bActorRef\b|\bActorKind\b|AuthenticatedSubject|AuthenticatedService|AuthorizeRunScoped|AuthorizeRunBlob|AuthorizeStageArtifact|AuthorizeCommandLog|auth_method\s*==\s*"disabled"' \
-            -- lib/crates apps lib/packages docs/public/api-reference/fabro-api.yaml; then
+            -- lib/apps lib/components lib/foundation apps lib/packages docs/public/api-reference/fabro-api.yaml; then
             echo "::error::Legacy auth identities remain in the repository"
             exit 1
           else
