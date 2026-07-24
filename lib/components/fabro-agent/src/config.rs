@@ -106,8 +106,6 @@ pub struct ToolSecrets {
 
 #[derive(Clone)]
 pub struct SessionOptions {
-    pub max_turns: usize,
-    pub max_tool_rounds_per_input: usize,
     pub default_command_timeout_ms: u64,
     pub max_command_timeout_ms: u64,
     pub reasoning_effort: Option<ReasoningEffort>,
@@ -149,8 +147,6 @@ pub struct SessionOptions {
 impl std::fmt::Debug for SessionOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SessionOptions")
-            .field("max_turns", &self.max_turns)
-            .field("max_tool_rounds_per_input", &self.max_tool_rounds_per_input)
             .field(
                 "default_command_timeout_ms",
                 &self.default_command_timeout_ms,
@@ -196,8 +192,6 @@ impl std::fmt::Debug for SessionOptions {
 impl Default for SessionOptions {
     fn default() -> Self {
         Self {
-            max_turns: 0,
-            max_tool_rounds_per_input: 0,
             default_command_timeout_ms: 10_000,
             max_command_timeout_ms: 600_000,
             max_tokens: None,
@@ -280,8 +274,6 @@ mod tests {
     #[test]
     fn default_config_values() {
         let config = SessionOptions::default();
-        assert_eq!(config.max_turns, 0);
-        assert_eq!(config.max_tool_rounds_per_input, 0);
         assert_eq!(config.default_command_timeout_ms, 10_000);
         assert_eq!(config.max_command_timeout_ms, 600_000);
         assert!(config.reasoning_effort.is_none());
@@ -328,13 +320,10 @@ mod tests {
     #[test]
     fn config_with_custom_values() {
         let config = SessionOptions {
-            max_turns: 50,
             reasoning_effort: Some(ReasoningEffort::High),
             ..Default::default()
         };
-        assert_eq!(config.max_turns, 50);
         assert_eq!(config.reasoning_effort, Some(ReasoningEffort::High));
-        assert_eq!(config.max_tool_rounds_per_input, 0);
     }
 
     #[test]

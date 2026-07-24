@@ -1195,10 +1195,6 @@ impl Session {
         self.config.speed = speed;
     }
 
-    pub const fn set_max_turns(&mut self, max_turns: usize) {
-        self.config.max_turns = max_turns;
-    }
-
     #[must_use]
     pub const fn history(&self) -> &History {
         &self.history
@@ -1210,7 +1206,14 @@ impl Session {
     }
 
     pub async fn process_input(&mut self, input: &str) -> Result<(), Error> {
-        self.process_input_with_runtime(input, AgentToolRuntime::default())
+        self.process_input_with_output(input).await.map(drop)
+    }
+
+    pub(crate) async fn process_input_with_output(
+        &mut self,
+        input: &str,
+    ) -> Result<Option<String>, Error> {
+        self.process_input_with_runtime_and_output(input, AgentToolRuntime::default())
             .await
     }
 
@@ -1237,6 +1240,16 @@ impl Session {
         input: &str,
         agent_tool_runtime: AgentToolRuntime,
     ) -> Result<(), Error> {
+        self.process_input_with_runtime_and_output(input, agent_tool_runtime)
+            .await
+            .map(drop)
+    }
+
+    async fn process_input_with_runtime_and_output(
+        &mut self,
+        input: &str,
+        agent_tool_runtime: AgentToolRuntime,
+    ) -> Result<Option<String>, Error> {
         let mut timing = SessionInputTiming::default();
         let mut usage = TokenCounts::default();
         let mut cost = None;
@@ -1322,7 +1335,7 @@ impl Session {
         timing: &mut SessionInputTiming,
         usage_accumulator: &mut TokenCounts,
         cost_accumulator: &mut Option<UsdMicros>,
-    ) -> Result<(), Error> {
+    ) -> Result<Option<String>, Error> {
         const STREAM_CONSUME_RETRIES: usize = 3;
 
         if self.state == SessionState::Closed {
@@ -1360,8 +1373,6 @@ impl Session {
                 text: expanded_input.clone(),
             });
 
-        let mut round_count: usize = 0;
-
         loop {
             // Top-of-loop: if the previous round's interrupt token fired,
             // swap in a fresh one before draining and rebuilding state.
@@ -1393,26 +1404,6 @@ impl Session {
             self.drain_steering();
             self.wait_for_steer_if_needed().await?;
             self.drain_steering();
-
-            // Check max_tool_rounds_per_input
-            if self.config.max_tool_rounds_per_input > 0
-                && round_count >= self.config.max_tool_rounds_per_input
-            {
-                self.event_emitter
-                    .emit(self.id.clone(), AgentEvent::TurnLimitReached {
-                        max_turns: self.config.max_tool_rounds_per_input,
-                    });
-                break;
-            }
-
-            // Check max_turns
-            if self.config.max_turns > 0 && self.history.turns().len() >= self.config.max_turns {
-                self.event_emitter
-                    .emit(self.id.clone(), AgentEvent::TurnLimitReached {
-                        max_turns: self.config.max_turns,
-                    });
-                break;
-            }
 
             // Snapshot the per-round token; it stays stable for this iteration.
             let round_token = self
@@ -1773,10 +1764,8 @@ impl Session {
                 if should_continue {
                     continue;
                 }
-                break;
+                return Ok((!text.trim().is_empty()).then_some(text));
             }
-
-            round_count += 1;
 
             // Build a composite cancellation token covering both terminal
             // cancel and round (steer) interrupt. Tools observe it
@@ -1859,8 +1848,6 @@ impl Session {
                     .emit(self.id.clone(), AgentEvent::LoopDetected);
             }
         }
-
-        Ok(())
     }
 
     async fn compact_if_needed(&mut self) {
@@ -2259,8 +2246,9 @@ mod tests {
     #[tokio::test]
     async fn text_only_response_natural_completion() {
         let mut session = make_session(vec![text_response("Hello there!")]).await;
-        session.process_input("Hi").await.unwrap();
+        let output = session.process_input_with_output("Hi").await.unwrap();
 
+        assert_eq!(output.as_deref(), Some("Hello there!"));
         assert_eq!(session.state(), SessionState::Idle);
         let turns = session.history().turns();
         // UserTurn + AssistantTurn = 2
@@ -2445,55 +2433,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn max_tool_rounds_enforced() {
-        let mut registry = ToolRegistry::new();
-        registry.register(make_echo_tool());
+    async fn empty_natural_completion_has_no_output() {
+        let mut session = make_session(vec![text_response("  ")]).await;
 
-        // Respond with tool calls indefinitely
-        let responses = vec![
-            tool_call_response("echo", "call_1", serde_json::json!({"text": "a"})),
-            tool_call_response("echo", "call_2", serde_json::json!({"text": "b"})),
-            tool_call_response("echo", "call_3", serde_json::json!({"text": "c"})),
-        ];
+        let output = session.process_input_with_output("Hi").await.unwrap();
 
-        let config = SessionOptions {
-            max_tool_rounds_per_input: 2,
-            enable_loop_detection: false,
-            ..Default::default()
-        };
-
-        let mut session = make_session_with_tools_and_config(responses, registry, config).await;
-        session.process_input("Keep using tools").await.unwrap();
-
-        // Should stop after 2 rounds: User + (Asst+ToolResult) * 2 = 5 turns
-        assert_eq!(session.state(), SessionState::Idle);
-        let turns = session.history().turns();
-        assert_eq!(turns.len(), 5);
-    }
-
-    #[tokio::test]
-    async fn max_turns_enforced() {
-        let responses = vec![
-            text_response("first"),
-            text_response("second"),
-            text_response("should not reach"),
-        ];
-
-        let config = SessionOptions {
-            max_turns: 3,
-            ..Default::default()
-        };
-
-        let mut session = make_session_with_config(responses, config).await;
-
-        // First input: adds User + Assistant = 2 turns
-        session.process_input("one").await.unwrap();
-        assert_eq!(session.history().turns().len(), 2);
-
-        // Second input: adds User (now 3 turns), then max_turns check triggers
-        session.process_input("two").await.unwrap();
-        // Should have 3 turns total (User + Asst + User), max_turns hit before LLM call
-        assert_eq!(session.history().turns().len(), 3);
+        assert_eq!(output, None);
     }
 
     #[tokio::test]

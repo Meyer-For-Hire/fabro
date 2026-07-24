@@ -10,7 +10,7 @@ use crate::error::Error;
 use crate::session::Session;
 use crate::tool_registry::{RegisteredTool, ToolSource};
 use crate::tools::required_str;
-use crate::types::{AgentEvent, Message, SessionEvent};
+use crate::types::{AgentEvent, SessionEvent};
 
 pub type SessionFactory = Arc<dyn Fn() -> Session + Send + Sync>;
 
@@ -112,15 +112,18 @@ impl SubAgentManager {
         let task_prompt_for_spawn = task_prompt.clone();
         let task = tokio::spawn(async move {
             session.initialize().await?;
-            session.process_input(&task_prompt_for_spawn).await?;
+            let output = session
+                .process_input_with_output(&task_prompt_for_spawn)
+                .await?
+                .ok_or_else(|| {
+                    Error::InvalidState(
+                        "Subagent completed without a non-empty final response".to_string(),
+                    )
+                })?;
             let turns = session.history().turns();
-            let last_text = turns.iter().rev().find_map(|t| match t {
-                Message::Assistant { content, .. } => Some(content.clone()),
-                _ => None,
-            });
             Ok(SubAgentResult {
-                output:     last_text.unwrap_or_default(),
-                success:    true,
+                output,
+                success: true,
                 turns_used: turns.len(),
             })
         });
@@ -314,18 +317,6 @@ pub fn make_spawn_agent_tool(
                     "task": {
                         "type": "string",
                         "description": "The task description for the subagent"
-                    },
-                    "working_dir": {
-                        "type": "string",
-                        "description": "Working directory for the subagent"
-                    },
-                    "model": {
-                        "type": "string",
-                        "description": "Model to use for the subagent"
-                    },
-                    "max_turns": {
-                        "type": "integer",
-                        "description": "Maximum number of turns for the subagent"
                     }
                 },
                 "required": ["task"]
@@ -337,13 +328,6 @@ pub fn make_spawn_agent_tool(
             Box::pin(async move {
                 let task = required_str(&args, "task")?;
 
-                // Extract optional max_turns parameter
-                let max_turns = args
-                    .get("max_turns")
-                    .and_then(serde_json::Value::as_u64)
-                    .map(|v| usize::try_from(v).unwrap_or(usize::MAX));
-
-                // Note: working_dir and model require session factory changes to wire through
                 let mut session = session_factory();
                 // Inherit the parent agent's root session ID so todo tools
                 // that scope by root (e.g. Anthropic tasks) share one list
@@ -351,9 +335,6 @@ pub fn make_spawn_agent_tool(
                 if let Some(root) = ctx.root_session_id.as_ref().or(ctx.session_id.as_ref()) {
                     session.set_root_session_id(root.clone());
                 }
-                // Default subagent max_turns is 0 (unlimited) per spec (overridable via
-                // parameter)
-                session.set_max_turns(max_turns.unwrap_or(0));
                 let mut mgr = manager.lock().await;
                 mgr.spawn(session, task.to_string(), current_depth)
                     .map_err(|e| e.to_string())
@@ -619,7 +600,11 @@ mod tests {
 
         let spawn_tool = make_spawn_agent_tool(manager.clone(), factory, 0);
         assert_eq!(spawn_tool.definition.name, "spawn_agent");
-        assert!(spawn_tool.definition.parameters["properties"]["task"].is_object());
+        let spawn_properties = spawn_tool.definition.parameters["properties"]
+            .as_object()
+            .unwrap();
+        assert_eq!(spawn_properties.len(), 1);
+        assert!(spawn_properties["task"].is_object());
         let spawn_required = spawn_tool.definition.parameters["required"]
             .as_array()
             .unwrap();
@@ -829,6 +814,21 @@ mod tests {
             manager.status(&agent_id),
             Some(SubAgentStatus::Finished(Ok(_)))
         ));
+    }
+
+    #[tokio::test]
+    async fn empty_final_response_is_not_reported_as_success() {
+        let mut manager = SubAgentManager::new(3);
+        let session = make_session(vec![text_response("")]).await;
+        let agent_id = manager.spawn(session, "Do something".into(), 0).unwrap();
+
+        let result = manager.wait(&agent_id).await;
+
+        assert!(
+            matches!(result, Err(Error::InvalidState(message)) if message.contains(
+                "without a non-empty final response"
+            ))
+        );
     }
 
     #[tokio::test]

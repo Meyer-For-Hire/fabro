@@ -196,12 +196,6 @@ pub struct AgentLoopDetectedProps {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AgentTurnLimitReachedProps {
-    pub max_turns: usize,
-    pub visit:     u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentSteeringInjectedProps {
     pub text:  String,
     pub visit: u32,
