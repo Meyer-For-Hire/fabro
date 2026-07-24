@@ -389,10 +389,15 @@ impl RunDatabase {
         before_seq: Option<u32>,
         limit: usize,
     ) -> Result<Vec<EventEnvelope>> {
+        // Event keys zero-pad seq to six digits (see `keys::run_event_key`),
+        // so an end bound past `MAX_EVENT_SEQ` would format as a seven-digit
+        // prefix that breaks lexicographic key order. No stored seq exceeds
+        // `MAX_EVENT_SEQ`, so clamp and treat that bound as unbounded.
         let end_seq = match before_seq {
             Some(seq) => u64::from(seq),
             None => u64::from(self.latest_event_seq().await?) + 1,
-        };
+        }
+        .min(u64::from(keys::MAX_EVENT_SEQ) + 1);
         if end_seq <= 1 {
             return Ok(Vec::new());
         }
@@ -400,7 +405,9 @@ impl RunDatabase {
         let window_size = u64::try_from(limit.saturating_add(1)).unwrap_or(u64::MAX);
         let start_seq =
             u32::try_from(end_seq.saturating_sub(window_size).max(1)).unwrap_or(u32::MAX);
-        let end_seq = u32::try_from(end_seq).ok();
+        let end_seq = u32::try_from(end_seq)
+            .ok()
+            .filter(|end| *end <= keys::MAX_EVENT_SEQ);
         let mut events = list_events_in_range_with_limit(
             &self.inner.db,
             &self.inner.run_id,
@@ -1036,6 +1043,53 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn list_events_before_with_limit_reads_newest_page_at_max_event_seq() {
+        let run = fresh_run().await;
+        let run_id = run.run_id();
+        run.inner
+            .event_seq
+            .as_ref()
+            .unwrap()
+            .store(keys::MAX_EVENT_SEQ - 1, Ordering::SeqCst);
+        run.append_event(&stage_prompt_payload(&run_id, 1, Some("alpha")))
+            .await
+            .unwrap();
+        run.append_event(&stage_prompt_payload(&run_id, 2, Some("beta")))
+            .await
+            .unwrap();
+
+        let events = run.list_events_before_with_limit(None, 2).await.unwrap();
+
+        let seqs: Vec<u32> = events.iter().map(|event| event.seq).collect();
+        assert_eq!(seqs, vec![keys::MAX_EVENT_SEQ, keys::MAX_EVENT_SEQ - 1]);
+    }
+
+    #[tokio::test]
+    async fn list_events_before_with_limit_clamps_cursor_beyond_max_event_seq() {
+        let run = fresh_run().await;
+        let run_id = run.run_id();
+        run.inner
+            .event_seq
+            .as_ref()
+            .unwrap()
+            .store(keys::MAX_EVENT_SEQ - 1, Ordering::SeqCst);
+        run.append_event(&stage_prompt_payload(&run_id, 1, Some("alpha")))
+            .await
+            .unwrap();
+        run.append_event(&stage_prompt_payload(&run_id, 2, Some("beta")))
+            .await
+            .unwrap();
+
+        let events = run
+            .list_events_before_with_limit(Some(u32::MAX), 2)
+            .await
+            .unwrap();
+
+        let seqs: Vec<u32> = events.iter().map(|event| event.seq).collect();
+        assert_eq!(seqs, vec![keys::MAX_EVENT_SEQ, keys::MAX_EVENT_SEQ - 1]);
     }
 
     #[tokio::test]
