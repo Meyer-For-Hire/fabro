@@ -55,7 +55,7 @@ The shared result type is:
 ```rust
 ParallelBranchResult {
     id: String,
-    status: String,
+    status: StageOutcome,
     context_updates: BTreeMap<String, serde_json::Value>,
 }
 ```
@@ -134,11 +134,12 @@ The final typed array is also projected into
 
 ## 7. Cancellation
 
-Semaphore acquisition observes the run cancellation token. Branches waiting for
-a permit can terminate as cancelled rather than waiting indefinitely. Branches
-already executing continue through their handler's cooperative cancellation
-path. The parallel handler joins every task before returning cancellation to the
-run executor.
+Semaphore acquisition observes the run cancellation token. Branches still
+waiting for a permit when cancellation fires stop without executing; because
+`StageOutcome` has no cancelled variant, their results record a failed outcome
+(reason `branch cancelled`). Branches already executing continue through their
+handler's cooperative cancellation path. The parallel handler joins every task
+before returning `Error::Cancelled` to the run executor.
 
 Cancellation does not trigger branch Git cleanup because no branch Git state is
 created.
