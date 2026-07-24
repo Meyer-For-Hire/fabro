@@ -31,7 +31,7 @@ use crate::handler::start::StartHandler;
 use crate::handler::{Handler as HandlerTrait, HandlerRegistry};
 use crate::outcome::{Outcome, OutcomeExt, StageOutcome};
 use crate::pipeline::initialize;
-use crate::pipeline::types::{InitOptions, LlmSpec, Persisted, SandboxEnvSpec};
+use crate::pipeline::types::{InitOptions, LlmSpec, Persisted, ResumeState, SandboxEnvSpec};
 use crate::records::RunSpec;
 use crate::run_options::{GitCheckpointOptions, LifecycleOptions, RunOptions, SetupCommand};
 use crate::test_support::run_graph;
@@ -256,7 +256,6 @@ async fn execute_test_run_with_options(
     let initialized = initialize(
         persisted_workflow(graph, String::new(), &run_options.run_dir, run_id_value),
         InitOptions {
-            stage_executions: crate::stage_execution::StageExecutionSeed::default(),
             run_store: run_store.into(),
             dry_run: false,
             emitter: emitter.clone(),
@@ -292,7 +291,7 @@ async fn execute_test_run_with_options(
             run_control: None,
             registry_override,
             artifact_sink: None,
-            checkpoint: None,
+            resume: None,
             seed_context: None,
             fabro_run_tools: None,
         },
@@ -317,7 +316,6 @@ async fn execute_runs_start_to_exit_and_returns_final_context() {
     let initialized = initialize(
         persisted_workflow(graph, source, &run_dir, test_run_id("run-test")),
         InitOptions {
-            stage_executions: crate::stage_execution::StageExecutionSeed::default(),
             run_store: run_store.into(),
             dry_run: false,
             emitter: test_emitter_arc("run-test"),
@@ -355,7 +353,7 @@ async fn execute_runs_start_to_exit_and_returns_final_context() {
             run_control: None,
             registry_override: None,
             artifact_sink: None,
-            checkpoint: None,
+            resume: None,
             seed_context: None,
             fabro_run_tools: None,
         },
@@ -450,15 +448,15 @@ async fn resumed_in_flight_node_starts_a_new_stage_execution() {
         restart_failure_signatures: HashMap::new(),
         node_visits:                HashMap::from([("start".to_string(), 1usize)]),
     };
-    let seed = crate::stage_execution::StageExecutionSeed {
-        high_water:   HashMap::from([("work".to_string(), 1)]),
-        resumed_from: HashMap::from([("work".to_string(), fabro_types::StageId::new("work", 1))]),
-    };
+    let seed = crate::stage_execution::StageExecutionSeed::test_with_high_water(
+        &fabro_types::StageId::new("work", 1),
+        Some(fabro_types::StageId::new("work", 1)),
+    );
+    let resume = ResumeState::for_test(checkpoint, seed);
 
     let initialized = initialize(
         persisted_workflow(graph, String::new(), &run_dir, run_id),
         InitOptions {
-            stage_executions: seed,
             run_store: run_store.into(),
             dry_run: false,
             emitter: emitter.clone(),
@@ -494,7 +492,7 @@ async fn resumed_in_flight_node_starts_a_new_stage_execution() {
             run_control: None,
             registry_override: Some(Arc::new(make_registry())),
             artifact_sink: None,
-            checkpoint: Some(checkpoint),
+            resume: Some(resume),
             seed_context: None,
             fabro_run_tools: None,
         },
@@ -573,7 +571,6 @@ async fn run_with_lifecycle(
     let initialized = initialize(
         persisted_workflow(graph.clone(), String::new(), &run_dir, run_id),
         InitOptions {
-            stage_executions: crate::stage_execution::StageExecutionSeed::default(),
             run_store: run_store.into(),
             dry_run: false,
             emitter: emitter.clone(),
@@ -606,7 +603,7 @@ async fn run_with_lifecycle(
             run_control: None,
             registry_override: Some(Arc::new(registry)),
             artifact_sink: None,
-            checkpoint: None,
+            resume: None,
             seed_context: None,
             fabro_run_tools: None,
         },

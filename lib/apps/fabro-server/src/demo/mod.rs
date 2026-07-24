@@ -1099,7 +1099,6 @@ mod runs {
     };
 
     use super::ts;
-    use crate::server::run_stage_from_stage_id;
 
     static DEMO_PRINCIPAL: LazyLock<Principal> = LazyLock::new(|| {
         Principal::user(
@@ -1121,6 +1120,29 @@ mod runs {
             provider,
             model_id: model_id.into(),
             speed: None,
+        }
+    }
+
+    fn stage(
+        stage_id: &StageId,
+        name: &str,
+        status: StageState,
+        wall_time_ms: Option<u64>,
+        handler: StageHandler,
+    ) -> RunStage {
+        RunStage {
+            id: stage_id.clone(),
+            name: name.to_owned(),
+            handler,
+            status,
+            wall_time_ms,
+            node_id: stage_id.node_id().to_owned(),
+            visit: std::num::NonZeroU32::new(stage_id.visit())
+                .expect("StageId stores a non-zero visit"),
+            provider_used: None,
+            started_at: None,
+            graph_visit: None,
+            resumed_from_stage_id: None,
         }
     }
 
@@ -1380,60 +1402,40 @@ mod runs {
 
     pub(super) fn stages() -> Vec<RunStage> {
         vec![
-            run_stage_from_stage_id(
+            stage(
                 &StageId::new("detect-drift", 1),
                 "Detect Drift",
                 StageState::Succeeded,
                 Some(72_000),
-                None,
                 StageHandler::Command,
-                None,
-                None,
-                None,
             ),
-            run_stage_from_stage_id(
+            stage(
                 &StageId::new("propose-changes", 1),
                 "Propose Changes",
                 StageState::Succeeded,
                 Some(154_000),
-                None,
                 StageHandler::Agent,
-                None,
-                None,
-                None,
             ),
-            run_stage_from_stage_id(
+            stage(
                 &StageId::new("review-changes", 1),
                 "Review Changes",
                 StageState::Succeeded,
                 Some(45_000),
-                None,
                 StageHandler::Agent,
-                None,
-                None,
-                None,
             ),
-            run_stage_from_stage_id(
+            stage(
                 &StageId::new("apply-changes", 1),
                 "Apply Changes",
                 StageState::Succeeded,
                 Some(118_000),
-                None,
                 StageHandler::Command,
-                None,
-                None,
-                None,
             ),
-            run_stage_from_stage_id(
+            stage(
                 &StageId::new("apply-changes", 2),
                 "Apply Changes",
                 StageState::Running,
                 None,
-                None,
                 StageHandler::Command,
-                None,
-                None,
-                None,
             ),
         ]
     }

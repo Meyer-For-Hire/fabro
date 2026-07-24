@@ -229,7 +229,7 @@ export function StagePopover({ runId, stage, duration }: StagePopoverProps) {
         {stage.resumedFromStageId && (
           <PopoverRow label="Resumed from">
             <Link
-              to={`/runs/${runId}/stages/${stage.resumedFromStageId}`}
+              to={`/runs/${runId}/stages/${encodeURIComponent(stage.resumedFromStageId)}`}
               className="font-mono text-teal-500 hover:underline"
             >
               {stage.resumedFromStageId}

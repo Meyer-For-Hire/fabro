@@ -19,11 +19,11 @@ export interface Stage {
   nodeId: string;
   /**
    * How many times workflow control entered this node. Differs from `visit`
-   * when a cancelled or crashed execution was reexecuted after resume; null
+   * when post-checkpoint work was replayed after resume; null
    * for stages recorded before execution identity was tracked.
    */
   graphVisit: number | null;
-  /** StageId of the prior execution this stage resumes from, if any. */
+  /** StageId of the prior execution superseded by this resumed replay, if any. */
   resumedFromStageId: string | null;
   startedAt: string | null;
   providerUsed: StageModelUsage | null;

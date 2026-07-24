@@ -177,7 +177,7 @@ pub trait WorkflowContext {
     fn parallel_group_id(&self) -> Option<StageId>;
     fn parallel_branch_id(&self) -> Option<ParallelBranchId>;
     /// Build the stage-level emit scope from the currently-executing node and
-    /// its accumulated visit count. Returns `None` for run-level emissions
+    /// its execution ordinal. Returns `None` for run-level emissions
     /// where no stage is active (i.e., `CURRENT_NODE` is unset).
     fn current_stage_scope(&self) -> Option<StageScope>;
 }

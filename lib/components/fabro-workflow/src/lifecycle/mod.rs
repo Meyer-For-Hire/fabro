@@ -313,7 +313,7 @@ impl RunLifecycle<WorkflowGraph> for WorkflowLifecycle {
             .ensure(node_id, event::stage_visit(state, node_id));
         state.context.set(
             context::keys::INTERNAL_STAGE_EXECUTION_ORDINAL,
-            serde_json::json!(execution.ordinal),
+            serde_json::json!(execution.stage_id.visit()),
         );
         // Event emission
         self.event.before_attempt(ctx, state).await?;
@@ -446,7 +446,7 @@ impl RunLifecycle<WorkflowGraph> for WorkflowLifecycle {
             .ensure(node.id(), event::stage_visit(state, node.id()));
         state.context.set(
             context::keys::INTERNAL_STAGE_EXECUTION_ORDINAL,
-            serde_json::json!(execution.ordinal),
+            serde_json::json!(execution.stage_id.visit()),
         );
         self.git
             .on_checkpoint(node, result, next_node_id, state)

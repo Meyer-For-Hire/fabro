@@ -2,18 +2,50 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use fabro_types::{RunProjection, StageHandler, StageProjection, StageState, StageTiming};
+use fabro_types::{
+    Graph, RunProjection, StageHandler, StageId, StageProjection, StageState, StageTiming,
+};
 
 use super::super::{
     ApiError, AppState, BillingByModel, BillingStageRef, IntoResponse, Json, ListResponse,
     PaginationParams, Path, Query, RequiredUser, Response, Router, RunBilling, RunBillingStage,
-    RunBillingTotals, RunId, State, StatusCode, get, parse_run_id_path, run_stage_from_stage_id,
+    RunBillingTotals, RunId, RunStage, State, StatusCode, get, parse_run_id_path,
 };
 
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/runs/{id}/stages", get(list_run_stages))
         .route("/runs/{id}/billing", get(get_run_billing))
+}
+
+fn run_stage_from_projection(
+    stage_id: &StageId,
+    stage: &StageProjection,
+    graph: &Graph,
+    now: DateTime<Utc>,
+) -> RunStage {
+    let handler = stage.handler.unwrap_or_else(|| {
+        StageHandler::from_handler_type(
+            graph
+                .nodes
+                .get(stage_id.node_id())
+                .and_then(|node| node.handler_type()),
+        )
+    });
+    RunStage {
+        id: stage_id.clone(),
+        name: stage_id.node_id().to_owned(),
+        handler,
+        status: stage.effective_state(),
+        wall_time_ms: stage.live_wall_time_ms(now),
+        node_id: stage_id.node_id().to_owned(),
+        visit: std::num::NonZeroU32::new(stage_id.visit())
+            .expect("StageId stores a non-zero visit"),
+        provider_used: stage.provider_used.clone(),
+        started_at: stage.started_at,
+        graph_visit: stage.graph_visit.and_then(std::num::NonZeroU32::new),
+        resumed_from_stage_id: stage.resumed_from_stage_id.clone(),
+    }
 }
 
 async fn list_run_stages(
@@ -41,27 +73,7 @@ async fn list_run_stages(
     let graph = projection.spec().graph();
     let stages = projection
         .iter_stages()
-        .map(|(stage_id, stage)| {
-            let handler = stage.handler.unwrap_or_else(|| {
-                StageHandler::from_handler_type(
-                    graph
-                        .nodes
-                        .get(stage_id.node_id())
-                        .and_then(|n| n.handler_type()),
-                )
-            });
-            run_stage_from_stage_id(
-                stage_id,
-                stage_id.node_id().to_string(),
-                stage.effective_state(),
-                stage.live_wall_time_ms(now),
-                stage.started_at,
-                handler,
-                stage.provider_used.clone(),
-                stage.graph_visit,
-                stage.resumed_from_stage_id.as_ref(),
-            )
-        })
+        .map(|(stage_id, stage)| run_stage_from_projection(stage_id, stage, graph, now))
         .collect::<Vec<_>>();
 
     (StatusCode::OK, Json(ListResponse::new(stages))).into_response()

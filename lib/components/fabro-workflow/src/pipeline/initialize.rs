@@ -33,7 +33,7 @@ use crate::sandbox_git_runtime::SandboxGitRuntime;
 use crate::services::{
     EngineServices, FabroRunToolServices, RunLocations, RunServices, WorkflowToolEnvProvider,
 };
-use crate::stage_execution::StageExecutionTracker;
+use crate::stage_execution::{StageExecutionSeed, StageExecutionTracker};
 use crate::steering_hub::SteeringHub;
 
 type BuiltSandboxEnv = (HashMap<String, String>, Option<Arc<GitHubTokenSource>>);
@@ -287,6 +287,13 @@ pub async fn initialize(
     mut options: InitOptions,
 ) -> Result<Initialized, Error> {
     let (graph, source, _diagnostics, run_dir, run_spec) = persisted.into_parts();
+    let (checkpoint, stage_executions) = options.resume.take().map_or_else(
+        || (None, StageExecutionSeed::default()),
+        |resume| {
+            let (checkpoint, stage_executions) = resume.into_parts();
+            (Some(checkpoint), stage_executions)
+        },
+    );
     let host_source_dir = run_spec.source_directory.as_deref().map(PathBuf::from);
     options.run_options.run_dir = run_dir.clone();
     options.run_options.git = options.git.clone();
@@ -307,7 +314,7 @@ pub async fn initialize(
         )))
     };
 
-    let attach_existing = options.checkpoint.is_some();
+    let attach_existing = checkpoint.is_some();
     options.run_options.display_base_sha = options
         .run_options
         .pre_run_git
@@ -620,7 +627,7 @@ pub async fn initialize(
         sandbox_git,
         metadata_runtime,
         metadata_writer,
-        StageExecutionTracker::seeded(options.stage_executions),
+        StageExecutionTracker::seeded(stage_executions),
     );
     let engine = Arc::new(EngineServices {
         run: Arc::clone(&run_services),
@@ -643,7 +650,7 @@ pub async fn initialize(
         graph,
         source,
         run_options: options.run_options,
-        checkpoint: options.checkpoint,
+        checkpoint,
         seed_context: options.seed_context,
         on_node: None,
         artifact_sink: options.artifact_sink,
@@ -827,7 +834,6 @@ mod tests {
         });
 
         let result = initialize(persisted, InitOptions {
-            stage_executions:  crate::stage_execution::StageExecutionSeed::default(),
             run_store:         {
                 let store = memory_store();
                 let inner = store.create_run(&test_run_id()).await.unwrap();
@@ -867,7 +873,7 @@ mod tests {
             run_control:       None,
             registry_override: None,
             artifact_sink:     None,
-            checkpoint:        None,
+            resume:            None,
             seed_context:      None,
             fabro_run_tools:   None,
         })
@@ -909,7 +915,6 @@ mod tests {
         let emitter = Arc::new(crate::event::Emitter::new(test_run_id()));
 
         let initialized = initialize(persisted, InitOptions {
-            stage_executions:  crate::stage_execution::StageExecutionSeed::default(),
             run_store:         {
                 let store = memory_store();
                 let inner = store.create_run(&test_run_id()).await.unwrap();
@@ -949,7 +954,7 @@ mod tests {
             run_control:       None,
             registry_override: None,
             artifact_sink:     None,
-            checkpoint:        None,
+            resume:            None,
             seed_context:      None,
             fabro_run_tools:   None,
         })
@@ -1135,7 +1140,6 @@ mod tests {
         let store = memory_store();
         let run_store = store.create_run(&test_run_id()).await.unwrap();
         let initialized = initialize(test_persisted(graph, source, &run_dir), InitOptions {
-            stage_executions:  crate::stage_execution::StageExecutionSeed::default(),
             run_store:         run_store.into(),
             dry_run:           false,
             emitter:           emitter.clone(),
@@ -1171,7 +1175,7 @@ mod tests {
             run_control:       None,
             registry_override: None,
             artifact_sink:     None,
-            checkpoint:        None,
+            resume:            None,
             seed_context:      None,
             fabro_run_tools:   None,
         })
@@ -1231,7 +1235,6 @@ mod tests {
         store_logger.register(&emitter);
 
         let initialized = initialize(persisted, InitOptions {
-            stage_executions:  crate::stage_execution::StageExecutionSeed::default(),
             run_store:         run_store.into(),
             dry_run:           false,
             emitter:           emitter.clone(),
@@ -1267,7 +1270,7 @@ mod tests {
             run_control:       None,
             registry_override: None,
             artifact_sink:     None,
-            checkpoint:        None,
+            resume:            None,
             seed_context:      None,
             fabro_run_tools:   None,
         })
@@ -1370,7 +1373,6 @@ mod tests {
 
         let emitter = Arc::new(crate::event::Emitter::new(test_run_id()));
         let result = initialize(persisted, InitOptions {
-            stage_executions: crate::stage_execution::StageExecutionSeed::default(),
             run_store: {
                 let store = memory_store();
                 let inner = store.create_run(&test_run_id()).await.unwrap();
@@ -1410,7 +1412,7 @@ mod tests {
             run_control: None,
             registry_override: None,
             artifact_sink: None,
-            checkpoint: None,
+            resume: None,
             seed_context: None,
             fabro_run_tools: None,
         })

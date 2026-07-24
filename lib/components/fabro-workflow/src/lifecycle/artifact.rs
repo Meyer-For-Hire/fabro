@@ -20,7 +20,7 @@ use crate::artifact_snapshot::{ArtifactCollectionSummary, collect_artifacts};
 use crate::artifact_upload::ArtifactSink;
 use crate::event::{Emitter, Event, RunNoticeCode, RunNoticeLevel};
 use crate::graph::{WorkflowGraph, WorkflowNode};
-use crate::lifecycle::event::{stage_scope_for, stage_visit};
+use crate::lifecycle::event::stage_scope_for;
 use crate::outcome::BilledModelUsage;
 use crate::runtime_store::RunStoreHandle;
 use crate::stage_execution::StageExecutionTracker;
@@ -127,10 +127,8 @@ impl RunLifecycle<WorkflowGraph> for ArtifactLifecycle {
         let node_id = ctx.node.id();
         // Artifact identity follows the stage execution ordinal so a resumed
         // reexecution stores its captures under the new `StageId`.
-        let visit = self.stage_executions.active(node_id).map_or_else(
-            || stage_visit(state, node_id),
-            |execution| execution.ordinal,
-        );
+        let scope = stage_scope_for(&self.stage_executions, state, node_id);
+        let visit = scope.visit;
         let node_slug = if visit <= 1 {
             node_id.to_string()
         } else {
@@ -154,7 +152,7 @@ impl RunLifecycle<WorkflowGraph> for ArtifactLifecycle {
                     return Ok(());
                 }
 
-                let stage_id = StageId::new(node_id.to_string(), visit);
+                let stage_id = scope.stage_id();
                 if let Err(err) = self
                     .persist_artifacts(
                         &stage_id,
@@ -172,7 +170,6 @@ impl RunLifecycle<WorkflowGraph> for ArtifactLifecycle {
                     return Ok(());
                 }
                 self.record_captured_assets(&new_assets);
-                let scope = stage_scope_for(&self.stage_executions, state, node_id);
                 for asset in &new_assets {
                     self.emitter.emit_scoped(
                         &Event::ArtifactCaptured {

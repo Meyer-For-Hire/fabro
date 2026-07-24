@@ -9,7 +9,7 @@ use fabro_model::{Catalog, FallbackTarget, ProviderId};
 use fabro_sandbox::SandboxSpec;
 use fabro_template::TemplateContext;
 use fabro_types::settings::run::{PullRequestSettings, RunModelControls};
-use fabro_types::{ManifestPath, RunId};
+use fabro_types::{ManifestPath, RunId, RunProjection};
 use fabro_validate::{Diagnostic, Severity};
 use fabro_vault::Vault;
 use tokio::sync::RwLock as AsyncRwLock;
@@ -249,6 +249,41 @@ pub struct SandboxEnvSpec {
     pub origin_url:         Option<String>,
 }
 
+/// Opaque, internally consistent state needed to resume from the latest
+/// checkpoint in a run projection.
+pub struct ResumeState {
+    checkpoint:       Checkpoint,
+    stage_executions: StageExecutionSeed,
+}
+
+impl ResumeState {
+    /// Build resume state from a projection's latest checkpoint and complete
+    /// stage history.
+    #[must_use]
+    pub fn from_projection(projection: &RunProjection) -> Option<Self> {
+        let checkpoint_record = projection.checkpoints.last()?;
+        Some(Self {
+            checkpoint:       checkpoint_record.checkpoint.clone(),
+            stage_executions: StageExecutionSeed::from_projection(
+                projection,
+                checkpoint_record.seq,
+            ),
+        })
+    }
+
+    pub(crate) fn into_parts(self) -> (Checkpoint, StageExecutionSeed) {
+        (self.checkpoint, self.stage_executions)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(checkpoint: Checkpoint, stage_executions: StageExecutionSeed) -> Self {
+        Self {
+            checkpoint,
+            stage_executions,
+        }
+    }
+}
+
 pub struct InitOptions {
     pub run_store:         RunStoreHandle,
     pub dry_run:           bool,
@@ -269,12 +304,8 @@ pub struct InitOptions {
     pub registry_override: Option<Arc<HandlerRegistry>>,
     pub artifact_sink:     Option<ArtifactSink>,
     pub run_control:       Option<Arc<RunControlState>>,
-    pub checkpoint:        Option<Checkpoint>,
+    pub resume:            Option<ResumeState>,
     pub seed_context:      Option<Context>,
-    /// Allocator seed for stage execution ordinals. Empty for a fresh run;
-    /// resume passes projection-derived high-water marks and provenance so a
-    /// reexecuted in-flight node gets a new `StageId` ordinal.
-    pub stage_executions:  StageExecutionSeed,
     pub fabro_run_tools:   Option<FabroRunToolServices>,
 }
 

@@ -29,7 +29,7 @@ pub struct ParallelBranchStartedProps {
     /// keep visit metadata even though their ordinals advanced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graph_visit:           Option<u32>,
-    /// Prior branch execution this one resumes from.
+    /// Prior branch execution superseded by this resumed replay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resumed_from_stage_id: Option<StageId>,
 }

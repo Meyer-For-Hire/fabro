@@ -66,7 +66,7 @@ pub mod types {
         SessionSummary, SessionTurn, SkillsProjection, StageCompletion, StageContextWindow,
         StageContextWindowBreakdownItem, StageContextWindowCategory, StageContextWindowCountMethod,
         StageContextWindowProjection, StageContextWindowStaleness,
-        StageContextWindowUnavailableReason, StageContextWindowWarning, StageHandler,
+        StageContextWindowUnavailableReason, StageContextWindowWarning, StageHandler, StageId,
         StageModelUsage, StageOutcome, StageProjection, StageState, SubAgentProjection,
         SubAgentStatus, SystemActorKind, SystemIntegrationStatus, SystemIntegrationsResponse,
         TodoListProjection, TurnId, UpdateVariableRequest, UserPrincipal, Variable,

@@ -38,8 +38,9 @@ use crate::handler::HandlerRegistry;
 use crate::outcome::{Outcome, StageOutcome};
 use crate::pipeline::{
     self, FinalizeOptions, Finalized, InitOptions, LlmSpec, Persisted, PullRequestOptions,
-    SandboxEnvSpec, build_conclusion_from_store, classify_engine_result,
+    ResumeState, SandboxEnvSpec, build_conclusion_from_store, classify_engine_result,
 };
+#[cfg(test)]
 use crate::records::Checkpoint;
 use crate::run_control::RunControlState;
 use crate::run_materialization::resolve_run_model;
@@ -48,7 +49,6 @@ use crate::run_options::{GitCheckpointOptions, LifecycleOptions, RunOptions, Set
 use crate::run_status::{FailureReason, RunStatus};
 use crate::runtime_store::RunStoreHandle;
 use crate::services::FabroRunToolServices;
-use crate::stage_execution::StageExecutionSeed;
 use crate::steering_hub::SteeringHub;
 #[cfg(feature = "test-support")]
 use crate::test_support as workflow_test_support;
@@ -170,19 +170,12 @@ pub async fn start(run_dir: &Path, services: StartServices) -> Result<Started, E
         .map_err(|err| Error::engine(err.to_string()))?;
     }
 
-    Box::pin(execute_persisted_run(
-        run_dir,
-        None,
-        StageExecutionSeed::default(),
-        services,
-    ))
-    .await
+    Box::pin(execute_persisted_run(run_dir, None, services)).await
 }
 
 pub(super) async fn execute_persisted_run(
     run_dir: &Path,
-    checkpoint: Option<Checkpoint>,
-    stage_executions: StageExecutionSeed,
+    resume: Option<ResumeState>,
     services: StartServices,
 ) -> Result<Started, Error> {
     let cancel_token = services.cancel_token.clone();
@@ -269,7 +262,7 @@ pub(super) async fn execute_persisted_run(
         cancel_token,
     );
     let run_start = Instant::now();
-    let started = Box::pin(session.run(persisted, checkpoint, stage_executions)).await;
+    let started = Box::pin(session.run(persisted, resume)).await;
 
     match started {
         Ok(started) => {
@@ -804,8 +797,7 @@ impl RunSession {
     async fn run(
         self,
         persisted: Persisted,
-        checkpoint: Option<Checkpoint>,
-        stage_executions: StageExecutionSeed,
+        resume: Option<ResumeState>,
     ) -> Result<Started, Error> {
         let on_node = self.on_node.clone();
 
@@ -886,9 +878,8 @@ impl RunSession {
             registry_override: self.registry_override,
             artifact_sink: self.artifact_sink,
             run_control: self.run_control,
-            checkpoint,
+            resume,
             seed_context: self.seed_context,
-            stage_executions,
             fabro_run_tools: self.fabro_run_tools,
         };
         let mut initialized = Box::pin(pipeline::initialize(persisted, init_options)).await?;

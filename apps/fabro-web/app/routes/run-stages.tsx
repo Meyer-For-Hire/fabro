@@ -1749,7 +1749,7 @@ function RunStageActivityStage({
               <p className="pb-2 text-xs text-fg-muted">
                 Resumed from{" "}
                 <Link
-                  to={`/runs/${runId}/stages/${selectedStage.resumedFromStageId}`}
+                  to={`/runs/${runId}/stages/${encodeURIComponent(selectedStage.resumedFromStageId)}`}
                   className="font-mono text-teal-500 hover:underline"
                 >
                   {selectedStage.resumedFromStageId}

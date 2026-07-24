@@ -17,10 +17,10 @@ use crate::git::sanitize_ref_component;
 use crate::hook_context::set_hook_node;
 use crate::millis_u64;
 use crate::outcome::{FailureCategory, FailureDetail, Outcome, OutcomeExt, StageOutcome};
+use crate::run_dir::visit_from_context;
 use crate::sandbox_git::{
     GIT_REMOTE, checked_git_checkpoint, git_merge_ff_only, git_remove_worktree,
 };
-use crate::stage_execution::StageExecution;
 
 /// Fans out execution to multiple branches concurrently.
 /// Each branch gets an isolated context clone and runs independently.
@@ -161,9 +161,6 @@ impl Handler for ParallelHandler {
             branch_context:     Context,
             sandbox:            Arc<dyn Sandbox>,
             worktree_path:      Option<PathBuf>,
-            /// Child stage execution reserved through the run's shared
-            /// tracker, so a resumed fan-out gets fresh branch identities.
-            execution:          StageExecution,
         }
 
         let parallel_start = Instant::now();
@@ -210,6 +207,7 @@ impl Handler for ParallelHandler {
 
         let semaphore = Arc::new(Semaphore::new(max_parallel));
         let git_state = services.git_state();
+        let branch_graph_visit = u32::try_from(visit_from_context(context)).unwrap_or(u32::MAX);
 
         // --- Git isolation: checkpoint "parallel base" before fan-out ---
         let base_sha: Option<String> = if let Some(ref gs) = git_state {
@@ -267,18 +265,9 @@ impl Handler for ParallelHandler {
                 parallel_group_id.clone(),
                 u32::try_from(branch_index).unwrap_or(u32::MAX),
             );
-            // Reserve the child's stage execution through the shared tracker
-            // and seed the branch context with its explicit stage scope, so
-            // branch lifecycle events and nested handler events agree on the
-            // child's identity instead of inheriting the fork's.
-            let execution = services.run.stage_executions.reserve(&target_id, 1);
             branch_context.set(
                 keys::CURRENT_NODE,
                 serde_json::Value::String(target_id.clone()),
-            );
-            branch_context.set(
-                keys::INTERNAL_STAGE_EXECUTION_ORDINAL,
-                serde_json::json!(execution.ordinal),
             );
             branch_context.set(
                 keys::INTERNAL_PARALLEL_GROUP_ID,
@@ -311,7 +300,7 @@ impl Handler for ParallelHandler {
             {
                 let branch_key = &target_id;
                 // `pass{N}` derives from the parent's execution ordinal so a
-                // resumed fan-out does not recreate the cancelled attempt's
+                // resumed fan-out does not recreate the prior dispatch's
                 // branch names.
                 let branch_name = format!(
                     "fabro/run/parallel/{}/{}/pass{}/{}",
@@ -363,7 +352,6 @@ impl Handler for ParallelHandler {
                 branch_context,
                 sandbox: branch_sandbox,
                 worktree_path,
-                execution,
             });
         }
 
@@ -393,12 +381,6 @@ impl Handler for ParallelHandler {
                 .map(|gs| gs.checkpoint.clone())
                 .unwrap_or_default();
             let group_id = parallel_group_id.clone();
-            let branch_scope = StageScope::for_parallel_branch(
-                setup.target_id.clone(),
-                setup.execution.ordinal,
-                group_id.clone(),
-                setup.parallel_branch_id.clone(),
-            );
 
             let handle = tokio::spawn(async move {
                 let _permit = sem
@@ -406,14 +388,30 @@ impl Handler for ParallelHandler {
                     .await
                     .map_err(|e| Error::handler_with_source("semaphore error", e))?;
 
+                // Only reserve once the branch is ready to become observable.
+                // This avoids consuming an execution identity for worktree
+                // setup failures or branches still waiting on the semaphore.
+                let execution = parent_run
+                    .stage_executions
+                    .reserve(&setup.target_id, branch_graph_visit);
+                setup.branch_context.set(
+                    keys::INTERNAL_STAGE_EXECUTION_ORDINAL,
+                    serde_json::json!(execution.stage_id.visit()),
+                );
+                let branch_scope = StageScope::for_parallel_branch(
+                    setup.target_id.clone(),
+                    execution.stage_id.visit(),
+                    group_id.clone(),
+                    setup.parallel_branch_id.clone(),
+                );
                 parent_run.emitter.emit_scoped(
                     &Event::ParallelBranchStarted {
                         parallel_group_id:     group_id.clone(),
                         parallel_branch_id:    setup.parallel_branch_id.clone(),
                         branch:                setup.target_id.clone(),
                         index:                 setup.branch_index,
-                        graph_visit:           Some(setup.execution.graph_visit),
-                        resumed_from_stage_id: setup.execution.resumed_from.clone(),
+                        graph_visit:           Some(execution.graph_visit),
+                        resumed_from_stage_id: execution.resumed_from.clone(),
                     },
                     &branch_scope,
                 );
@@ -1041,6 +1039,7 @@ mod tests {
             AttrValue::String("component".to_string()),
         );
         let context = test_context();
+        context.set(keys::INTERNAL_NODE_VISIT_COUNT, serde_json::json!(2));
         let mut graph = Graph::new("test");
         graph.nodes.insert("par".to_string(), node.clone());
         graph
@@ -1067,13 +1066,22 @@ mod tests {
         assert!(results.is_some());
 
         let state = run_store.state().await.unwrap();
-        let node_state = state.stage(&StageId::new("par", 1)).unwrap();
+        let node_state = state.stage(&StageId::new("par", 2)).unwrap();
         let parsed = node_state.parallel_results.as_ref().unwrap();
         assert!(
             parsed.is_array(),
             "parallel_results.json should be a JSON array"
         );
         assert_eq!(parsed.as_array().unwrap().len(), 2);
+        for branch in ["branch_a", "branch_b"] {
+            assert_eq!(
+                state
+                    .stage(&StageId::new(branch, 1))
+                    .and_then(|stage| stage.graph_visit),
+                Some(2),
+                "parallel children should inherit the parent graph visit"
+            );
+        }
     }
 
     #[tokio::test]

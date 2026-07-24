@@ -251,13 +251,13 @@ pub enum Event {
         attempt:               usize,
         max_attempts:          usize,
         /// Graph visit that produced this stage execution. Diverges from the
-        /// envelope `StageId` ordinal when a cancelled or crashed invocation
-        /// is reexecuted after resume.
+        /// envelope `StageId` ordinal when post-checkpoint work is replayed
+        /// after resume.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         graph_visit:           Option<u32>,
-        /// Prior execution this one resumes from, for the first execution
-        /// reserved after a resume when the node had an observable
-        /// post-checkpoint execution.
+        /// Prior execution superseded by this resumed replay, for the first
+        /// execution reserved after a resume when the node had an
+        /// observable post-checkpoint execution.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         resumed_from_stage_id: Option<StageId>,
     },

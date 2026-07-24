@@ -341,12 +341,12 @@ pub struct StageProjection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handler:               Option<StageHandler>,
     /// Graph visit that produced this stage execution. The `StageId` ordinal
-    /// counts executions, which diverges from the graph visit when a
-    /// cancelled or crashed invocation is reexecuted after resume. Absent on
+    /// counts executions, which diverges from the graph visit when
+    /// post-checkpoint work is replayed after resume. Absent on
     /// projections built from events written before stage execution identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graph_visit:           Option<u32>,
-    /// Prior execution this one resumes from.
+    /// Prior execution superseded by this resumed replay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resumed_from_stage_id: Option<StageId>,
     /// Timing breakdown for this stage execution's latest terminal attempt.
@@ -539,10 +539,10 @@ impl StageProjection {
     /// (identity / sort key) and the execution identity metadata
     /// (`graph_visit`, `resumed_from_stage_id`).
     ///
-    /// One stage projection represents one execution; a reexecution after
-    /// cancel or crash recovery gets a new `StageId` and never flows through
-    /// here. Replays of legacy histories with duplicate `stage.started`
-    /// events for one `StageId` retain this last-attempt behavior.
+    /// One stage projection represents one execution; a replay after resume
+    /// gets a new `StageId` and never flows through here. Replays of legacy
+    /// histories with duplicate `stage.started` events for one `StageId`
+    /// retain this last-attempt behavior.
     pub fn begin_attempt(&mut self, started_at: DateTime<Utc>, handler: StageHandler) {
         let graph_visit = self.graph_visit;
         let resumed_from_stage_id = self.resumed_from_stage_id.take();
@@ -594,11 +594,18 @@ impl RunProjection {
         self.stages.get(stage)
     }
 
+    /// Iterate stages in unspecified order without allocating or sorting.
+    ///
+    /// Use this only for order-independent aggregation. Presentation and
+    /// serialization callers should use [`Self::iter_stages`] instead.
+    pub fn iter_stages_unordered(&self) -> impl Iterator<Item = (&StageId, &StageProjection)> {
+        self.stages.iter()
+    }
+
     /// Iterate stages in `first_event_seq` order (the chronological order in
     /// which each stage's first lifecycle event was recorded). Internal
-    /// storage is a `HashMap`, so iteration would otherwise be
-    /// non-deterministic; every caller wants chronological order, so we sort
-    /// here once instead of asking each caller to remember.
+    /// storage is a `HashMap`, so presentation callers sort through this
+    /// helper instead of relying on non-deterministic map iteration.
     pub fn iter_stages(&self) -> impl Iterator<Item = (&StageId, &StageProjection)> {
         let mut entries: Vec<(&StageId, &StageProjection)> = self.stages.iter().collect();
         entries.sort_by(|(left_id, left_stage), (right_id, right_stage)| {

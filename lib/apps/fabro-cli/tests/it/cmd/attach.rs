@@ -1196,7 +1196,6 @@ fn attach_json_errors_without_prompting_for_human_input() {
             "internal.fidelity": "compact",
             "internal.node_visit_count": 1,
             "internal.run_id": "[ULID]",
-            "internal.stage_execution_ordinal": 1,
             "internal.thread_id": null
           },
           "index": 0,

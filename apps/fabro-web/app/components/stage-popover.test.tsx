@@ -283,7 +283,7 @@ describe("StagePopover rendering", () => {
       id: "implement@2",
       visit: 2,
       graphVisit: 1,
-      resumedFromStageId: "implement@1",
+      resumedFromStageId: "review/security@1",
       status: "running",
       duration: "--",
     });
@@ -294,10 +294,10 @@ describe("StagePopover rendering", () => {
     );
     const text = textOf(tree);
     expect(text).toContain("Resumed from");
-    expect(text).toContain("implement@1");
+    expect(text).toContain("review/security@1");
     expect(text).toContain("Graph visit");
     const json = JSON.stringify(tree.toJSON());
-    expect(json).toContain("/runs/run-1/stages/implement@1");
+    expect(json).toContain("/runs/run-1/stages/review%2Fsecurity%401");
   });
 
   test("stage without ordinal divergence hides the graph visit row", () => {

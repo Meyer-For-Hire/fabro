@@ -16,13 +16,12 @@ use crate::artifact_upload::ArtifactSink;
 use crate::condition::evaluate_condition;
 use crate::context::{Context, WorkflowContext, keys};
 use crate::error::Error;
-use crate::event::StageScope;
 use crate::operations::{ValidateInput, WorkflowInput, validate};
 use crate::outcome::{Outcome, OutcomeExt, StageOutcome};
 use crate::pipeline::types::Initialized;
 use crate::run_options::RunOptions;
 use crate::static_reference::{ReferenceKind, validate_static_reference};
-use crate::{ManifestPath, pipeline};
+use crate::{ManifestPath, pipeline, stage_scope};
 
 /// Orchestrates a child workflow engine, polling for completion or stop
 /// conditions.
@@ -198,9 +197,9 @@ impl Handler for SubWorkflowHandler {
         };
 
         // Build child RunOptions. The stage directory follows the execution
-        // ordinal so a reexecuted manager loop keeps the cancelled
-        // invocation's child logs intact.
-        let visit = u64::from(StageScope::for_handler(context, &node.id).visit);
+        // ordinal so a replayed manager loop keeps the prior execution's
+        // child logs intact.
+        let visit = u64::from(stage_scope::execution_ordinal_from_context(context));
         let child_logs = run_dir.join(format!("stages/{}@{visit}/child", node.id));
         let _ = fs::create_dir_all(&child_logs).await;
 

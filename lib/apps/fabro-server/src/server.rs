@@ -99,7 +99,7 @@ use fabro_types::{
     AgentBackend, AskFabro, AskFabroUnavailableReason, EventBody, InterviewQuestionRecord, PairId,
     PairMessageId, PairTarget, PendingReason, Principal, PullRequestLink, QuestionType, RunBlobId,
     RunControlAction, RunEvent, RunId, RunRunnableSource, SandboxProviderKind, ServerSettings,
-    SessionCapability, StageModelUsage,
+    SessionCapability,
 };
 use fabro_util::error::{
     SharedError, collect_causes, render_compact_with_causes, render_with_causes,
@@ -1329,33 +1329,6 @@ fn accumulate_billing_rollup(
         let entry = accumulator.by_model.entry(model.model.clone()).or_default();
         entry.stages += model.stages;
         entry.billing.add_counts(&model.billing);
-    }
-}
-
-pub(crate) fn run_stage_from_stage_id(
-    stage_id: &StageId,
-    name: impl Into<String>,
-    status: StageState,
-    wall_time_ms: Option<u64>,
-    started_at: Option<chrono::DateTime<chrono::Utc>>,
-    handler: StageHandler,
-    provider_used: Option<StageModelUsage>,
-    graph_visit: Option<u32>,
-    resumed_from_stage_id: Option<&StageId>,
-) -> RunStage {
-    RunStage {
-        id: stage_id.to_string(),
-        name: name.into(),
-        handler,
-        status,
-        wall_time_ms,
-        node_id: stage_id.node_id().to_string(),
-        visit: std::num::NonZeroU32::new(stage_id.visit())
-            .expect("StageId stores a non-zero visit"),
-        provider_used,
-        started_at,
-        graph_visit: graph_visit.and_then(std::num::NonZeroU32::new),
-        resumed_from_stage_id: resumed_from_stage_id.map(StageId::to_string),
     }
 }
 

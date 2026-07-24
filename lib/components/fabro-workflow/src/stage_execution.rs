@@ -10,7 +10,7 @@
 //! The tracker is deliberately not checkpointed: its durable source of truth
 //! is the append-only stage event history. On resume it is seeded from the
 //! run projection's per-node maxima, so a reexecuted in-flight node allocates
-//! the next unused ordinal instead of mutating the cancelled execution.
+//! the next unused ordinal instead of mutating the prior execution.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -19,27 +19,32 @@ use fabro_types::{RunProjection, StageId};
 
 /// One reserved stage execution: the identity of a single resumable handler
 /// invocation of a node.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct StageExecution {
-    /// 1-based execution ordinal; becomes the `@N` in the external `StageId`.
-    pub ordinal:      u32,
+    /// Canonical external identity for this execution.
+    pub stage_id:     StageId,
     /// Graph visit that produced this execution.
     pub graph_visit:  u32,
-    /// Prior execution this one resumes from, when the node had an observable
-    /// post-checkpoint execution before the run was interrupted.
+    /// Prior post-checkpoint execution superseded by this resumed execution.
     pub resumed_from: Option<StageId>,
+}
+
+#[derive(Debug, Default)]
+struct NodeExecutionState {
+    /// Highest execution ordinal observed or reserved for this node.
+    high_water:   u32,
+    /// Pending provenance link, consumed by the next reservation.
+    resumed_from: Option<StageId>,
+    /// Execution reserved since the latest node boundary.
+    active:       Option<Arc<StageExecution>>,
 }
 
 /// Seed data for the [`StageExecutionTracker`], derived from the run
 /// projection when a run is resumed. A fresh run uses the default (empty)
 /// seed; new run IDs own a new ordinal sequence.
-#[derive(Clone, Debug, Default)]
-pub struct StageExecutionSeed {
-    /// Highest execution ordinal already observable per node.
-    pub high_water:   HashMap<String, u32>,
-    /// Latest post-checkpoint execution per node; the next reservation for
-    /// that node links back to it via `resumed_from_stage_id`.
-    pub resumed_from: HashMap<String, StageId>,
+#[derive(Debug, Default)]
+pub(crate) struct StageExecutionSeed {
+    nodes: HashMap<String, NodeExecutionState>,
 }
 
 impl StageExecutionSeed {
@@ -49,37 +54,42 @@ impl StageExecutionSeed {
     /// checkpoint. Only stages that first became observable *after* that
     /// checkpoint are eligible provenance targets: an older execution with the
     /// same node ID completed before the checkpoint and is not what the
-    /// resumed invocation continues from.
+    /// resumed replay supersedes.
     #[must_use]
-    pub fn from_projection(projection: &RunProjection, checkpoint_seq: u32) -> Self {
-        let mut high_water: HashMap<String, u32> = HashMap::new();
-        let mut resumed_from: HashMap<String, StageId> = HashMap::new();
-        // `iter_stages` yields chronological `first_event_seq` order, so a
-        // later insert per node retains the latest post-checkpoint execution.
-        for (stage_id, stage) in projection.iter_stages() {
-            let node_id = stage_id.node_id();
-            let entry = high_water.entry(node_id.to_string()).or_default();
-            *entry = (*entry).max(stage_id.visit());
+    pub(crate) fn from_projection(projection: &RunProjection, checkpoint_seq: u32) -> Self {
+        let mut nodes = HashMap::new();
+        for (stage_id, stage) in projection.iter_stages_unordered() {
+            let entry = nodes
+                .entry(stage_id.node_id().to_owned())
+                .or_insert_with(NodeExecutionState::default);
+            entry.high_water = entry.high_water.max(stage_id.visit());
             if stage.first_event_seq.get() > checkpoint_seq {
-                resumed_from.insert(node_id.to_string(), stage_id.clone());
+                let is_latest = entry
+                    .resumed_from
+                    .as_ref()
+                    .is_none_or(|current| current.visit() < stage_id.visit());
+                if is_latest {
+                    entry.resumed_from = Some(stage_id.clone());
+                }
             }
         }
+        Self { nodes }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_with_high_water(
+        high_water: &StageId,
+        resumed_from: Option<StageId>,
+    ) -> Self {
+        let node_id = high_water.node_id().to_owned();
         Self {
-            high_water,
-            resumed_from,
+            nodes: HashMap::from([(node_id, NodeExecutionState {
+                high_water: high_water.visit(),
+                resumed_from,
+                active: None,
+            })]),
         }
     }
-}
-
-#[derive(Debug, Default)]
-struct TrackerState {
-    /// Highest ordinal observed or reserved per node.
-    high_water:   HashMap<String, u32>,
-    /// Pending provenance links, consumed by the first reservation per node.
-    resumed_from: HashMap<String, StageId>,
-    /// Active execution scope per node. Cleared at the node boundary and
-    /// replaced by the next reservation.
-    active:       HashMap<String, StageExecution>,
 }
 
 /// Cloneable, run-scoped allocator for stage execution ordinals. Clones share
@@ -87,22 +97,18 @@ struct TrackerState {
 /// (parallel branches) allocate from the same sequence.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct StageExecutionTracker {
-    state: Arc<Mutex<TrackerState>>,
+    state: Arc<Mutex<HashMap<String, NodeExecutionState>>>,
 }
 
 impl StageExecutionTracker {
     #[must_use]
     pub(crate) fn seeded(seed: StageExecutionSeed) -> Self {
         Self {
-            state: Arc::new(Mutex::new(TrackerState {
-                high_water:   seed.high_water,
-                resumed_from: seed.resumed_from,
-                active:       HashMap::new(),
-            })),
+            state: Arc::new(Mutex::new(seed.nodes)),
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, TrackerState> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, NodeExecutionState>> {
         self.state
             .lock()
             .expect("stage execution tracker mutex is never poisoned: no code panics while holding this lock")
@@ -113,40 +119,54 @@ impl StageExecutionTracker {
     /// made here so that a StageStart hook block or process exit before any
     /// stage-scoped event leaves no phantom execution.
     pub(crate) fn begin_node(&self, node_id: &str) {
-        self.lock().active.remove(node_id);
+        if let Some(node) = self.lock().get_mut(node_id) {
+            node.active = None;
+        }
     }
 
     /// The node's active execution scope, if one has been reserved since the
     /// last node boundary.
-    pub(crate) fn active(&self, node_id: &str) -> Option<StageExecution> {
-        self.lock().active.get(node_id).cloned()
+    pub(crate) fn active(&self, node_id: &str) -> Option<Arc<StageExecution>> {
+        self.lock()
+            .get(node_id)
+            .and_then(|node| node.active.as_ref().map(Arc::clone))
+    }
+
+    fn reserve_locked(
+        state: &mut HashMap<String, NodeExecutionState>,
+        node_id: &str,
+        graph_visit: u32,
+    ) -> Arc<StageExecution> {
+        let node = state.entry(node_id.to_owned()).or_default();
+        node.high_water = node.high_water.saturating_add(1);
+        let execution = Arc::new(StageExecution {
+            stage_id: StageId::new(node_id, node.high_water),
+            graph_visit,
+            resumed_from: node.resumed_from.take(),
+        });
+        node.active = Some(Arc::clone(&execution));
+        execution
     }
 
     /// Allocate the next execution ordinal for the node and make it the active
     /// scope. Consumes the node's pending provenance link, if any.
-    pub(crate) fn reserve(&self, node_id: &str, graph_visit: u32) -> StageExecution {
+    pub(crate) fn reserve(&self, node_id: &str, graph_visit: u32) -> Arc<StageExecution> {
         let mut state = self.lock();
-        let entry = state.high_water.entry(node_id.to_string()).or_default();
-        *entry = entry.saturating_add(1);
-        let ordinal = *entry;
-        let resumed_from = state.resumed_from.remove(node_id);
-        let execution = StageExecution {
-            ordinal,
-            graph_visit,
-            resumed_from,
-        };
-        state.active.insert(node_id.to_string(), execution.clone());
-        execution
+        Self::reserve_locked(&mut state, node_id, graph_visit)
     }
 
     /// The active scope for the node, reserving one only when none exists.
     /// Later attempts within one execution and checkpoint pre-steps reuse the
     /// first attempt's reservation.
-    pub(crate) fn ensure(&self, node_id: &str, graph_visit: u32) -> StageExecution {
-        if let Some(execution) = self.active(node_id) {
+    pub(crate) fn ensure(&self, node_id: &str, graph_visit: u32) -> Arc<StageExecution> {
+        let mut state = self.lock();
+        if let Some(execution) = state
+            .get(node_id)
+            .and_then(|node| node.active.as_ref().map(Arc::clone))
+        {
             return execution;
         }
-        self.reserve(node_id, graph_visit)
+        Self::reserve_locked(&mut state, node_id, graph_visit)
     }
 }
 
@@ -190,10 +210,10 @@ mod tests {
     fn reserve_starts_at_one_and_allocates_monotonically_per_node() {
         let tracker = StageExecutionTracker::default();
 
-        assert_eq!(tracker.reserve("work", 1).ordinal, 1);
+        assert_eq!(tracker.reserve("work", 1).stage_id.visit(), 1);
         tracker.begin_node("work");
-        assert_eq!(tracker.reserve("work", 2).ordinal, 2);
-        assert_eq!(tracker.reserve("other", 1).ordinal, 1);
+        assert_eq!(tracker.reserve("work", 2).stage_id.visit(), 2);
+        assert_eq!(tracker.reserve("other", 1).stage_id.visit(), 1);
     }
 
     #[test]
@@ -202,9 +222,9 @@ mod tests {
         let seed = StageExecutionSeed::from_projection(&projection, 0);
         let tracker = StageExecutionTracker::seeded(seed);
 
-        assert_eq!(tracker.reserve("work", 1).ordinal, 3);
-        assert_eq!(tracker.reserve("plan", 1).ordinal, 2);
-        assert_eq!(tracker.reserve("new", 1).ordinal, 1);
+        assert_eq!(tracker.reserve("work", 1).stage_id.visit(), 3);
+        assert_eq!(tracker.reserve("plan", 1).stage_id.visit(), 2);
+        assert_eq!(tracker.reserve("new", 1).stage_id.visit(), 1);
     }
 
     #[test]
@@ -214,7 +234,7 @@ mod tests {
         let tracker = StageExecutionTracker::seeded(seed);
 
         let execution = tracker.reserve("work", 2);
-        assert_eq!(execution.ordinal, 3);
+        assert_eq!(execution.stage_id.visit(), 3);
         assert_eq!(execution.graph_visit, 2);
     }
 
@@ -225,10 +245,10 @@ mod tests {
         let first = tracker.ensure("work", 1);
         let second = tracker.ensure("work", 1);
         assert_eq!(first, second);
-        assert_eq!(second.ordinal, 1);
+        assert_eq!(second.stage_id.visit(), 1);
 
         tracker.begin_node("work");
-        assert_eq!(tracker.ensure("work", 2).ordinal, 2);
+        assert_eq!(tracker.ensure("work", 2).stage_id.visit(), 2);
     }
 
     #[test]
@@ -240,7 +260,12 @@ mod tests {
         tracker.begin_node("work");
 
         assert_eq!(tracker.active("work"), None);
-        assert_eq!(tracker.active("verify").map(|e| e.ordinal), Some(1));
+        assert_eq!(
+            tracker
+                .active("verify")
+                .map(|execution| execution.stage_id.visit()),
+            Some(1)
+        );
     }
 
     #[test]
@@ -249,10 +274,17 @@ mod tests {
         let seed = StageExecutionSeed::from_projection(&projection, 5);
 
         assert_eq!(
-            seed.resumed_from.get("work"),
+            seed.nodes
+                .get("work")
+                .and_then(|node| node.resumed_from.as_ref()),
             Some(&StageId::new("work", 2))
         );
-        assert_eq!(seed.resumed_from.get("plan"), None);
+        assert_eq!(
+            seed.nodes
+                .get("plan")
+                .and_then(|node| node.resumed_from.as_ref()),
+            None
+        );
     }
 
     #[test]
@@ -262,12 +294,12 @@ mod tests {
         let tracker = StageExecutionTracker::seeded(seed);
 
         let first = tracker.reserve("work", 1);
-        assert_eq!(first.ordinal, 2);
+        assert_eq!(first.stage_id.visit(), 2);
         assert_eq!(first.resumed_from, Some(StageId::new("work", 1)));
 
         tracker.begin_node("work");
         let second = tracker.reserve("work", 2);
-        assert_eq!(second.ordinal, 3);
+        assert_eq!(second.stage_id.visit(), 3);
         assert_eq!(second.resumed_from, None);
     }
 
@@ -277,7 +309,7 @@ mod tests {
         let handles: Vec<_> = (0..8)
             .map(|_| {
                 let tracker = tracker.clone();
-                tokio::spawn(async move { tracker.reserve("branch", 1).ordinal })
+                tokio::spawn(async move { tracker.reserve("branch", 1).stage_id.visit() })
             })
             .collect();
 
@@ -287,5 +319,25 @@ mod tests {
         }
         ordinals.sort_unstable();
         assert_eq!(ordinals, (1..=8).collect::<Vec<_>>());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_ensure_calls_reuse_one_reservation() {
+        let tracker = StageExecutionTracker::default();
+        let barrier = Arc::new(tokio::sync::Barrier::new(16));
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let tracker = tracker.clone();
+                let barrier = Arc::clone(&barrier);
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    tracker.ensure("branch", 1).stage_id.visit()
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            assert_eq!(handle.await.expect("ensure task panicked"), 1);
+        }
     }
 }

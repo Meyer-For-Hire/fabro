@@ -224,12 +224,12 @@ impl RunProjectionReducer for RunProjection {
             }
             EventBody::CheckpointCompleted(props) => {
                 let checkpoint = checkpoint_from_props(props, ts);
-                if let Some(stage_id) = stored.stage_id.clone() {
+                if let Some(stage_id) = stored.stage_id.as_ref() {
                     // Envelope-first: the diff and any skipped-stage synthesis
                     // attach to the exact execution recorded on the event.
                     // Historical `node_outcomes` must not create or collide
                     // with a newer execution ordinal.
-                    apply_checkpoint_to_stage(self, &stage_id, props, &checkpoint, event.seq, ts);
+                    apply_checkpoint_to_stage(self, stage_id, props, &checkpoint, event.seq, ts);
                 } else {
                     // Legacy fallback for events without a stored stage id:
                     // resolve the visit from the checkpointed `node_visits`
@@ -353,19 +353,14 @@ impl RunProjectionReducer for RunProjection {
                 // stays immutable. `begin_attempt` on an existing entry
                 // remains the compatibility path for automatic retries and
                 // legacy histories that repeat one `StageId`.
-                let stage = self.stage_entry(
-                    stage_id.node_id(),
-                    stage_id.visit(),
-                    first_event_seq(event.seq),
-                );
+                let is_new = self.stage(stage_id).is_none();
+                let stage = stage_at_stored_stage_id(self, stage_id, event.seq);
                 stage.begin_attempt(
                     ts,
                     StageHandler::from_handler_type(Some(&props.handler_type)),
                 );
-                if props.graph_visit.is_some() {
+                if is_new {
                     stage.graph_visit = props.graph_visit;
-                }
-                if props.resumed_from_stage_id.is_some() {
                     stage
                         .resumed_from_stage_id
                         .clone_from(&props.resumed_from_stage_id);
@@ -565,16 +560,18 @@ impl RunProjectionReducer for RunProjection {
                 // Branches bypass the engine's StageStarted/StageCompleted
                 // lifecycle. Seed started_at so the branch stage drives a live
                 // wall-clock timer while it runs (the entry is created Running).
+                let is_new = stored
+                    .stage_id
+                    .as_ref()
+                    .is_none_or(|stage_id| self.stage(stage_id).is_none());
                 let Some(stage) = stage_at_stored_or_current_visit(self, stored, event.seq) else {
                     return Ok(());
                 };
                 if stage.started_at.is_none() {
                     stage.started_at = Some(ts);
                 }
-                if props.graph_visit.is_some() {
+                if is_new {
                     stage.graph_visit = props.graph_visit;
-                }
-                if props.resumed_from_stage_id.is_some() {
                     stage
                         .resumed_from_stage_id
                         .clone_from(&props.resumed_from_stage_id);
@@ -1009,7 +1006,7 @@ fn apply_checkpoint_to_stage(
     }
 
     let is_new = state.stage(stage_id).is_none();
-    let stage = state.stage_entry(node_id, stage_id.visit(), first_event_seq(seq));
+    let stage = stage_at_stored_stage_id(state, stage_id, seq);
     if is_new {
         stage.graph_visit = props.graph_visit;
         stage
@@ -4468,13 +4465,15 @@ mod tests {
                 stage_id.clone(),
             ))
             .unwrap();
-        // A legacy-shaped retry event for the same StageId omits the identity
-        // fields; the projection keeps the first attempt's metadata.
+        // A malformed retry event for the same StageId cannot rewrite the
+        // first attempt's immutable execution identity.
         state
             .apply_event(&test_stage_event(
                 5,
                 EventBody::StageStarted(StageStartedProps {
                     attempt: 2,
+                    graph_visit: Some(99),
+                    resumed_from_stage_id: Some(StageId::new("other", 7)),
                     ..started_props()
                 }),
                 stage_id.clone(),

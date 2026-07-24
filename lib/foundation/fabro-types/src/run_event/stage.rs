@@ -17,11 +17,11 @@ pub struct StageStartedProps {
     pub max_attempts:          usize,
     /// Graph visit that produced this stage execution. The envelope
     /// `stage_id` ordinal counts executions, which diverges from the graph
-    /// visit when a cancelled or crashed invocation is reexecuted after
+    /// visit when post-checkpoint work is replayed after
     /// resume. Absent on events written before stage execution identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graph_visit:           Option<u32>,
-    /// Prior execution this one resumes from.
+    /// Prior execution superseded by this resumed replay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resumed_from_stage_id: Option<StageId>,
 }
