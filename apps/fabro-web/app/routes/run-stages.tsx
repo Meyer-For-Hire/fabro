@@ -17,6 +17,8 @@ import {
   EventSearchInput,
   MultiSelectFilter,
   ThreadDnaStrip,
+  threadSelectionId,
+  threadSelectionsEqual,
 } from "../components/event-debug";
 import {
   debugCategory,
@@ -70,10 +72,20 @@ import {
   useRunStages,
   useRunState,
 } from "../lib/queries";
-import { STAGE_ACTIVITY_EVENT_TYPES, type StageActivityEventType } from "../lib/run-events";
-import { ACTIVE_STAGE_STATES, mapRunStagesToSidebarStages } from "../lib/stage-sidebar";
+import {
+  STAGE_ACTIVITY_EVENT_TYPES,
+  type StageActivityEventType,
+} from "../lib/run-events";
+import {
+  ACTIVE_STAGE_STATES,
+  mapRunStagesToSidebarStages,
+} from "../lib/stage-sidebar";
 import { getNumber, getString, type UnknownRecord } from "../lib/unknown";
-import type { EventEnvelope, StageHandler, StageModelUsage } from "@qltysh/fabro-api-client";
+import type {
+  EventEnvelope,
+  StageHandler,
+  StageModelUsage,
+} from "@qltysh/fabro-api-client";
 
 export const handle = { wide: true, fullHeight: true };
 
@@ -83,8 +95,23 @@ type TurnType =
   | { kind: "interrupt"; ts: string; content: string }
   | { kind: "pair_user"; ts: string; content: string }
   | { kind: "pair_system"; ts: string; content: string }
-  | { kind: "assistant"; ts: string; content: string; inputTokens: number; outputTokens: number }
-  | { kind: "tool"; ts: string; toolName: string; input: string; result: string; isError: boolean; durationMs: number }
+  | {
+      kind: "assistant";
+      ts: string;
+      content: string;
+      inputTokens: number;
+      outputTokens: number;
+      toolCallCount: number | null;
+    }
+  | {
+      kind: "tool";
+      ts: string;
+      toolName: string;
+      input: string;
+      result: string;
+      isError: boolean;
+      durationMs: number;
+    }
   | {
       kind: "command";
       ts: string;
@@ -111,7 +138,7 @@ type PanelSelection = ThreadDnaSelection;
 
 const STAGE_ACTIVITY_EVENT_SET = new Set<string>(STAGE_ACTIVITY_EVENT_TYPES);
 
-const EVENT_KINDS = [
+export const EVENT_KINDS = [
   "system",
   "steer",
   "interrupt",
@@ -121,7 +148,7 @@ const EVENT_KINDS = [
   "tool",
   "command",
 ] as const;
-type EventKind = (typeof EVENT_KINDS)[number];
+export type EventKind = (typeof EVENT_KINDS)[number];
 
 const EVENT_KIND_LABEL: Record<EventKind, string> = {
   system: "System",
@@ -184,7 +211,10 @@ const PRIMARY_TAB_LABEL: Record<StageRenderer, string> = {
   summary: "Summary",
 };
 
-export function eventsTabLabel(tab: EventsTab, renderer: StageRenderer): string {
+export function eventsTabLabel(
+  tab: EventsTab,
+  renderer: StageRenderer,
+): string {
   if (tab === "chat") return "Chat";
   if (tab === "debug") return "Debug";
   if (tab === "context") return "Context";
@@ -267,21 +297,26 @@ export function buildStageActivity(
     const props: UnknownRecord = e.properties ?? {};
     switch (eventType) {
       case "stage.prompt":
-        turns.push({ kind: "system", ts: e.ts, content: getString(props, "text") ?? e.text ?? "" });
+        turns.push({
+          kind: "system",
+          ts: e.ts,
+          content: getString(props, "text") ?? e.text ?? "",
+        });
         break;
       case "agent.message": {
         sawAssistantMessage = true;
-        const msg = getString(props, "text") ?? e.text ?? "";
-        if (msg) {
-          const billing = (props.billing ?? {}) as UnknownRecord;
-          turns.push({
-            kind: "assistant",
-            ts: e.ts,
-            content: msg,
-            inputTokens: getNumber(billing, "input_tokens") ?? 0,
-            outputTokens: getNumber(billing, "output_tokens") ?? 0,
-          });
-        }
+        // A text-free message still marks the end of a model response — it is
+        // the boundary between two batches of tool calls. Dropping it would
+        // splice unrelated batches into one tool group.
+        const billing = (props.billing ?? {}) as UnknownRecord;
+        turns.push({
+          kind: "assistant",
+          ts: e.ts,
+          content: getString(props, "text") ?? e.text ?? "",
+          inputTokens: getNumber(billing, "input_tokens") ?? 0,
+          outputTokens: getNumber(billing, "output_tokens") ?? 0,
+          toolCallCount: getNumber(props, "tool_call_count") ?? null,
+        });
         break;
       }
       case "prompt.completed": {
@@ -293,6 +328,7 @@ export function buildStageActivity(
             content: getString(props, "response") ?? "",
             inputTokens: getNumber(billing, "input_tokens") ?? 0,
             outputTokens: getNumber(billing, "output_tokens") ?? 0,
+            toolCallCount: null,
           });
         }
         break;
@@ -305,7 +341,11 @@ export function buildStageActivity(
         break;
       }
       case "agent.interrupt.injected":
-        turns.push({ kind: "interrupt", ts: e.ts, content: "Agent interrupted" });
+        turns.push({
+          kind: "interrupt",
+          ts: e.ts,
+          content: "Agent interrupted",
+        });
         break;
       case "agent.round.interrupted":
         turns.push({
@@ -345,11 +385,16 @@ export function buildStageActivity(
         const started = pendingTools.get(callId);
         pendingTools.delete(callId);
         const output = props.output ?? e.output ?? "";
-        const result = typeof output === "string" ? output : JSON.stringify(output, null, 2);
+        const result =
+          typeof output === "string" ? output : JSON.stringify(output, null, 2);
         turns.push({
           kind: "tool",
           ts: started?.ts ?? e.ts,
-          toolName: started?.toolName ?? getString(props, "tool_name") ?? e.tool_name ?? "",
+          toolName:
+            started?.toolName ??
+            getString(props, "tool_name") ??
+            e.tool_name ??
+            "",
           input: started?.input ?? "",
           result,
           isError: (props.is_error ?? e.is_error) === true,
@@ -404,20 +449,35 @@ export function buildStageActivity(
   };
 }
 
-export function eventsToActivity(events: EventEnvelope[], stageId: string): TurnType[] {
+export function eventsToActivity(
+  events: EventEnvelope[],
+  stageId: string,
+): TurnType[] {
   return buildStageActivity(events, stageId).turns;
 }
 
 type ToolTurn = Extract<TurnType, { kind: "tool" }>;
+type ToolGroupChild = { turn: ToolTurn; turnIndex: number };
+type ToolGroupChildren = readonly [
+  ToolGroupChild,
+  ToolGroupChild,
+  ...ToolGroupChild[],
+];
 
 export type DisplayItem =
-  | { kind: "single"; turn: TurnType; turnIndex: number }
+  | {
+      kind: "single";
+      turn: TurnType;
+      turnIndex: number;
+      selection: Extract<ThreadDnaSelection, { kind: "single" }>;
+    }
   | {
       kind: "group";
       toolName: string;
       ts: string;
       durationMs: number;
-      children: { turn: ToolTurn; turnIndex: number }[];
+      children: ToolGroupChildren;
+      selection: Extract<ThreadDnaSelection, { kind: "group" }>;
     };
 
 type ChatTurn = Exclude<TurnType, ToolTurn | CommandTurn>;
@@ -450,33 +510,94 @@ export function buildChatItems(turns: TurnType[]): ChatItem[] {
   return out;
 }
 
+// A group's elapsed time is the wall-clock envelope of its children —
+// earliest start to latest end — not the sum of their durations. Parallel
+// calls overlap, and completion order is not always start order, so neither
+// the summed duration nor the last array element is the right answer.
+function toolGroupBounds(children: ToolGroupChildren): {
+  ts: string;
+  durationMs: number;
+} {
+  let earliestTs = children[0].turn.ts;
+  let earliestStart: number | null = null;
+  let latestEnd: number | null = null;
+
+  for (const { turn } of children) {
+    const startMs = Date.parse(turn.ts);
+    if (Number.isNaN(startMs)) continue;
+    const endMs = startMs + Math.max(0, turn.durationMs);
+    if (earliestStart == null || startMs < earliestStart) {
+      earliestStart = startMs;
+      earliestTs = turn.ts;
+    }
+    if (latestEnd == null || endMs > latestEnd) latestEnd = endMs;
+  }
+
+  if (earliestStart == null || latestEnd == null) {
+    return { ts: earliestTs, durationMs: 0 };
+  }
+  return { ts: earliestTs, durationMs: Math.max(0, latestEnd - earliestStart) };
+}
+
+function singleDisplayItem(turn: TurnType, turnIndex: number): DisplayItem {
+  return {
+    kind: "single",
+    turn,
+    turnIndex,
+    selection: { kind: "single", turnIndex },
+  };
+}
+
+function toolGroupDisplayItem(
+  first: ToolGroupChild,
+  second: ToolGroupChild,
+  rest: ToolGroupChild[],
+): Extract<DisplayItem, { kind: "group" }> {
+  const children: ToolGroupChildren = [first, second, ...rest];
+  const bounds = toolGroupBounds(children);
+  return {
+    kind: "group",
+    toolName: first.turn.toolName,
+    ts: bounds.ts,
+    durationMs: bounds.durationMs,
+    children,
+    selection: {
+      kind: "group",
+      childTurnIndices: [
+        first.turnIndex,
+        second.turnIndex,
+        ...rest.map((child) => child.turnIndex),
+      ],
+    },
+  };
+}
+
+// Grouping runs over the complete turn stream, never a filtered one: any
+// non-tool turn is a real boundary whether or not the current filters make it
+// visible, and hiding one must not merge the tool batches on either side.
 export function groupConsecutiveTools(
-  filtered: { turn: TurnType; index: number }[],
+  turns: { turn: TurnType; index: number }[],
 ): DisplayItem[] {
   const out: DisplayItem[] = [];
   let buf: { turn: ToolTurn; turnIndex: number }[] = [];
 
   function flush() {
-    if (buf.length === 0) return;
-    if (buf.length === 1) {
-      out.push({ kind: "single", turn: buf[0].turn, turnIndex: buf[0].turnIndex });
-    } else {
-      const first = buf[0].turn;
-      const totalMs = buf.reduce((sum, b) => sum + b.turn.durationMs, 0);
-      out.push({
-        kind: "group",
-        toolName: first.toolName,
-        ts: first.ts,
-        durationMs: totalMs,
-        children: buf,
-      });
-    }
+    const [first, second, ...rest] = buf;
     buf = [];
+    if (!first) return;
+    out.push(
+      second
+        ? toolGroupDisplayItem(first, second, rest)
+        : singleDisplayItem(first.turn, first.turnIndex),
+    );
   }
 
-  for (const { turn, index } of filtered) {
+  for (const { turn, index } of turns) {
     const groupable = turn.kind === "tool" && !turn.isError;
-    if (groupable && (buf.length === 0 || buf[0].turn.toolName === turn.toolName)) {
+    if (
+      groupable &&
+      (buf.length === 0 || buf[0].turn.toolName === turn.toolName)
+    ) {
       buf.push({ turn, turnIndex: index });
       continue;
     }
@@ -484,22 +605,77 @@ export function groupConsecutiveTools(
     if (groupable) {
       buf.push({ turn, turnIndex: index });
     } else {
-      out.push({ kind: "single", turn, turnIndex: index });
+      out.push(singleDisplayItem(turn, index));
     }
   }
   flush();
   return out;
 }
 
-// Convert the event list / grouped tool view into bars for the Thread DNA
+// Hide display items that the kind filter or search excludes. This is purely
+// a visibility pass: it runs after grouping and after DNA timing, so it can
+// never change group membership, timestamps, or durations. A group survives
+// when Tool is selected and any child matches the search, and it is passed
+// through whole so its context is preserved.
+export function filterDisplayItems(
+  items: DisplayItem[],
+  selectedKinds: readonly EventKind[],
+  search: string,
+): DisplayItem[] {
+  if (
+    search.length === 0 &&
+    selectedKinds.length === EVENT_KINDS.length &&
+    EVENT_KINDS.every((kind) => selectedKinds.includes(kind))
+  ) {
+    return items;
+  }
+
+  const kinds = new Set<string>(selectedKinds);
+  const needle = search.toLowerCase();
+  const matchesSearch = (turn: TurnType) =>
+    !needle || searchableText(turn).toLowerCase().includes(needle);
+
+  return items.filter((item) => {
+    if (item.kind === "single") {
+      return kinds.has(item.turn.kind) && matchesSearch(item.turn);
+    }
+    return (
+      kinds.has("tool") && item.children.some((c) => matchesSearch(c.turn))
+    );
+  });
+}
+
+export function visibleTurnCount(items: DisplayItem[]): number {
+  return items.reduce(
+    (total, item) =>
+      total + (item.kind === "single" ? 1 : item.children.length),
+    0,
+  );
+}
+
+export function filterThreadDnaItems(
+  items: ThreadDnaItem[],
+  visibleItems: DisplayItem[],
+): ThreadDnaItem[] {
+  const visibleIds = new Set(
+    visibleItems.map((item) => threadSelectionId(item.selection)),
+  );
+  return items.filter((item) =>
+    visibleIds.has(threadSelectionId(item.selection)),
+  );
+}
+
+// Convert the complete grouped display list into bars for the Thread DNA
 // strip. Each bar carries the same selection identifier the event list uses,
 // so clicking a bar opens the same side-panel entry as clicking its row.
 //
 // Duration semantics:
 //   - tool / command turns use their explicit durationMs
-//   - tool groups span from the first child's start to the last child's end
-//   - assistant turns have no native duration; we treat the time from the
-//     previous activity's end to this message's ts as "thinking" time
+//   - tool groups use their wall-clock envelope (see toolGroupBounds)
+//   - assistant turns have no native duration; their bar covers the interval
+//     from the previous activity's end to the message's ts. That is the
+//     inferred model response time — provider queueing, network, streaming,
+//     and generation — not a reasoning trace.
 //   - system / steer / interrupt are instants (durationMs = 0)
 export function buildThreadDnaItems(
   items: DisplayItem[],
@@ -512,8 +688,7 @@ export function buildThreadDnaItems(
       const parsed = Date.parse(runStart);
       if (!Number.isNaN(parsed)) return parsed;
     }
-    const firstTs =
-      items[0].kind === "single" ? items[0].turn.ts : items[0].ts;
+    const firstTs = items[0].kind === "single" ? items[0].turn.ts : items[0].ts;
     const parsedFirst = Date.parse(firstTs);
     return Number.isNaN(parsedFirst) ? null : parsedFirst;
   })();
@@ -521,16 +696,19 @@ export function buildThreadDnaItems(
 
   const out: ThreadDnaItem[] = [];
   let prevEndMs: number | null = null;
+  // Overlapping or out-of-order tool completions must never move the
+  // previous-activity cursor backward, or the next Agent bar absorbs time
+  // that already belonged to a tool.
+  const advance = (endMs: number) => {
+    prevEndMs = prevEndMs == null ? endMs : Math.max(prevEndMs, endMs);
+  };
 
   for (const item of items) {
     if (item.kind === "single") {
       const turn = item.turn;
       const tsMs = Date.parse(turn.ts);
       if (Number.isNaN(tsMs)) continue;
-      const selection: ThreadDnaSelection = {
-        kind: "single",
-        turnIndex: item.turnIndex,
-      };
+      const selection = item.selection;
 
       switch (turn.kind) {
         case "system":
@@ -541,7 +719,7 @@ export function buildThreadDnaItems(
             durationMs: 0,
             selection,
           });
-          prevEndMs = tsMs;
+          advance(tsMs);
           break;
         case "steer":
           out.push({
@@ -551,7 +729,7 @@ export function buildThreadDnaItems(
             durationMs: 0,
             selection,
           });
-          prevEndMs = tsMs;
+          advance(tsMs);
           break;
         case "interrupt":
           out.push({
@@ -561,7 +739,7 @@ export function buildThreadDnaItems(
             durationMs: 0,
             selection,
           });
-          prevEndMs = tsMs;
+          advance(tsMs);
           break;
         case "pair_user":
           out.push({
@@ -571,7 +749,7 @@ export function buildThreadDnaItems(
             durationMs: 0,
             selection,
           });
-          prevEndMs = tsMs;
+          advance(tsMs);
           break;
         case "pair_system":
           out.push({
@@ -581,12 +759,13 @@ export function buildThreadDnaItems(
             durationMs: 0,
             selection,
           });
-          prevEndMs = tsMs;
+          advance(tsMs);
           break;
         case "assistant": {
           // turn.ts is the moment the assistant message arrived (end of
-          // generation). Its bar represents the gap from the last activity
-          // to that moment, so the visual width approximates "thinking".
+          // generation). Its bar covers the gap from the last activity to
+          // that moment: the model's response time, tool-call-only responses
+          // included.
           const startSourceMs = prevEndMs ?? tsMs;
           const startMs = Math.max(0, startSourceMs - anchorMs);
           const durationMs = Math.max(0, tsMs - startSourceMs);
@@ -597,7 +776,7 @@ export function buildThreadDnaItems(
             durationMs,
             selection,
           });
-          prevEndMs = tsMs;
+          advance(tsMs);
           break;
         }
         case "tool": {
@@ -610,7 +789,7 @@ export function buildThreadDnaItems(
             durationMs,
             selection,
           });
-          prevEndMs = tsMs + durationMs;
+          advance(tsMs + durationMs);
           break;
         }
         case "command": {
@@ -623,29 +802,24 @@ export function buildThreadDnaItems(
             durationMs,
             selection,
           });
-          prevEndMs = tsMs + durationMs;
+          advance(tsMs + durationMs);
           break;
         }
       }
     } else {
-      const firstStart = Date.parse(item.ts);
-      const lastChild = item.children[item.children.length - 1].turn;
-      const lastEnd = Date.parse(lastChild.ts) + lastChild.durationMs;
-      if (Number.isNaN(firstStart) || Number.isNaN(lastEnd)) continue;
-
-      const startMs = Math.max(0, firstStart - anchorMs);
-      const durationMs = Math.max(0, lastEnd - firstStart);
+      // item.ts / item.durationMs are already the group's wall-clock
+      // envelope, so the row, the details header, and this bar all agree.
+      const startTsMs = Date.parse(item.ts);
+      if (Number.isNaN(startTsMs)) continue;
+      const durationMs = Math.max(0, item.durationMs);
       out.push({
         category: "tool",
         label: `${humanizeToolName(item.toolName)} ×${item.children.length}`,
-        startMs,
+        startMs: Math.max(0, startTsMs - anchorMs),
         durationMs,
-        selection: {
-          kind: "group",
-          childTurnIndices: item.children.map((c) => c.turnIndex),
-        },
+        selection: item.selection,
       });
-      prevEndMs = lastEnd;
+      advance(startTsMs + durationMs);
     }
   }
 
@@ -661,7 +835,11 @@ export function formatStageModelUsageLabel(
   return effort ? `${model}[${effort}]` : model;
 }
 
-function ModelUsagePopover({ providerUsed }: { providerUsed: StageModelUsage }) {
+function ModelUsagePopover({
+  providerUsed,
+}: {
+  providerUsed: StageModelUsage;
+}) {
   return (
     <>
       <PopoverHeader>Model</PopoverHeader>
@@ -675,7 +853,9 @@ function ModelUsagePopover({ providerUsed }: { providerUsed: StageModelUsage }) 
           </PopoverRow>
         )}
         {providerUsed.reasoning_effort && (
-          <PopoverRow label="Reasoning">{providerUsed.reasoning_effort}</PopoverRow>
+          <PopoverRow label="Reasoning">
+            {providerUsed.reasoning_effort}
+          </PopoverRow>
         )}
         {providerUsed.speed && (
           <PopoverRow label="Speed">{providerUsed.speed}</PopoverRow>
@@ -734,6 +914,12 @@ function oneLine(text: string): string {
   return `${collapsed.slice(0, SUMMARY_MAX_CHARS - 1)}…`;
 }
 
+function nonBlankAssistantContent(
+  turn: Extract<TurnType, { kind: "assistant" }>,
+): string | null {
+  return turn.content.trim() ? turn.content : null;
+}
+
 const TOOL_NAME_DISPLAY: Record<string, string> = {
   read_file: "Read",
   write_file: "Write",
@@ -766,8 +952,18 @@ export function turnSummary(turn: TurnType): string {
     case "interrupt":
     case "pair_user":
     case "pair_system":
-    case "assistant":
       return oneLine(turn.content);
+    case "assistant": {
+      const line = oneLine(nonBlankAssistantContent(turn) ?? "");
+      if (line) return line;
+      // A model response that only requested tools has no text of its own;
+      // describe what it did instead of rendering a blank row.
+      const count = turn.toolCallCount ?? 0;
+      if (count > 0) {
+        return `Requested ${count} ${plural(count, "tool call", "tool calls")}`;
+      }
+      return "Model response contained no text";
+    }
     case "tool":
       return humanizeToolName(turn.toolName);
     case "command":
@@ -808,8 +1004,12 @@ export function searchableText(turn: TurnType): string {
     case "interrupt":
     case "pair_user":
     case "pair_system":
-    case "assistant":
       return turn.content;
+    case "assistant": {
+      // Text-free responses are findable by the copy the thread shows.
+      const content = nonBlankAssistantContent(turn);
+      return content ?? turnSummary(turn);
+    }
     case "tool":
       return `${humanizeToolName(turn.toolName)} ${turn.toolName} ${turn.input} ${turn.result}`;
     case "command":
@@ -829,7 +1029,12 @@ function EventRow({
   onSelect: () => void;
 }) {
   const metric = turnMetric(turn);
-  const MetricIcon = metric == null ? null : turn.kind === "assistant" ? CircleStackIcon : ClockIcon;
+  const MetricIcon =
+    metric == null
+      ? null
+      : turn.kind === "assistant"
+        ? CircleStackIcon
+        : ClockIcon;
   const metricSpan = (
     <span className="inline-flex items-center justify-end gap-1.5 font-mono text-xs tabular-nums text-fg-muted">
       {turn.kind === "tool" && turn.isError && (
@@ -905,7 +1110,8 @@ function ToolGroupRow({
   selected: boolean;
   onSelect: () => void;
 }) {
-  const metric = group.durationMs > 0 ? formatDurationMs(group.durationMs) : null;
+  const metric =
+    group.durationMs > 0 ? formatDurationMs(group.durationMs) : null;
   return (
     <button
       type="button"
@@ -951,6 +1157,8 @@ function EventDetails({
     if (Number.isNaN(ms)) return turn.ts;
     return new Date(ms).toLocaleString();
   })();
+  const assistantContent =
+    turn.kind === "assistant" ? nonBlankAssistantContent(turn) : null;
 
   return (
     <div className="space-y-5">
@@ -964,11 +1172,33 @@ function EventDetails({
         turn.kind === "steer" ||
         turn.kind === "interrupt" ||
         turn.kind === "pair_user" ||
-        turn.kind === "pair_system" ||
-        turn.kind === "assistant") && (
+        turn.kind === "pair_system") && (
         <DetailField label="Content">
           <Markdown content={turn.content} />
         </DetailField>
+      )}
+
+      {turn.kind === "assistant" && (
+        <>
+          <DetailField label="Content">
+            {assistantContent ? (
+              <Markdown content={assistantContent} />
+            ) : (
+              <span className="text-fg-muted">{turnSummary(turn)}</span>
+            )}
+          </DetailField>
+          {turn.toolCallCount != null && turn.toolCallCount > 0 && (
+            <DetailField label="Tool calls" mono>
+              {turn.toolCallCount}
+            </DetailField>
+          )}
+          {(turn.inputTokens > 0 || turn.outputTokens > 0) && (
+            <DetailField label="Tokens" mono>
+              {formatTokenCount(turn.inputTokens)} in ·{" "}
+              {formatTokenCount(turn.outputTokens)} out
+            </DetailField>
+          )}
+        </>
       )}
 
       {turn.kind === "tool" && (
@@ -994,7 +1224,9 @@ function EventDetails({
             {turn.running
               ? "Running…"
               : `exit ${turn.exitCode ?? "?"}${
-                  turn.durationMs ? ` · ${formatDurationMs(turn.durationMs)}` : ""
+                  turn.durationMs
+                    ? ` · ${formatDurationMs(turn.durationMs)}`
+                    : ""
                 }`}
           </DetailField>
           <DetailField label="Script">
@@ -1026,7 +1258,11 @@ function LogStream({
   byteCount: number;
   enabled: boolean;
 }) {
-  const { data, error, isLoading } = useRunStageLog(runId, stageId, enabled && byteCount > 0);
+  const { data, error, isLoading } = useRunStageLog(
+    runId,
+    stageId,
+    enabled && byteCount > 0,
+  );
   const text = useMemo(() => {
     if (!data?.bytes_base64) return "";
     try {
@@ -1036,7 +1272,9 @@ function LogStream({
     }
   }, [data]);
   const truncated =
-    data && data.total_bytes > data.next_offset ? data.total_bytes - data.next_offset : 0;
+    data && data.total_bytes > data.next_offset
+      ? data.total_bytes - data.next_offset
+      : 0;
 
   return (
     <section>
@@ -1050,9 +1288,7 @@ function LogStream({
           </span>
         )}
       </header>
-      <pre
-        className="overflow-x-auto whitespace-pre-wrap rounded-md bg-overlay-strong p-3 font-mono text-xs leading-relaxed text-fg-3"
-      >
+      <pre className="overflow-x-auto whitespace-pre-wrap rounded-md bg-overlay-strong p-3 font-mono text-xs leading-relaxed text-fg-3">
         {byteCount === 0 ? (
           <span className="text-fg-muted">empty</span>
         ) : isLoading && !data ? (
@@ -1065,7 +1301,8 @@ function LogStream({
       </pre>
       {truncated > 0 && (
         <p className="mt-1 text-[11px] text-fg-muted">
-          Showing first {formatBytes(data!.next_offset)} of {formatBytes(data!.total_bytes)}.
+          Showing first {formatBytes(data!.next_offset)} of{" "}
+          {formatBytes(data!.total_bytes)}.
         </p>
       )}
     </section>
@@ -1163,7 +1400,14 @@ function EventDetailsPanel({
   );
 }
 
-const TOOL_INPUT_PREVIEW_KEYS = ["command", "path", "pattern", "url", "query", "script"];
+const TOOL_INPUT_PREVIEW_KEYS = [
+  "command",
+  "path",
+  "pattern",
+  "url",
+  "query",
+  "script",
+];
 
 function toolInputPreview(raw: string): string {
   if (!raw) return "";
@@ -1265,7 +1509,9 @@ function ChatLiveToolLine({ tool }: { tool: PendingToolCall }) {
   return (
     <div className="flex items-center gap-2.5 text-xs">
       <Spinner className="size-3 text-teal-500" />
-      <span className="shrink-0 text-fg-3">{humanizeToolName(tool.toolName)}</span>
+      <span className="shrink-0 text-fg-3">
+        {humanizeToolName(tool.toolName)}
+      </span>
       <span className="min-w-0 truncate font-mono text-[11px] text-fg-muted">
         {toolInputPreview(tool.input)}
       </span>
@@ -1317,7 +1563,9 @@ export function StageChatView({
           case "system":
           case "steer":
           case "pair_user":
-            return <ChatUserCard key={`turn-${turnIndex}`} content={turn.content} />;
+            return (
+              <ChatUserCard key={`turn-${turnIndex}`} content={turn.content} />
+            );
           case "pair_system":
             return (
               <p
@@ -1376,7 +1624,8 @@ function ToolGroupDetails({
   const [expandedIndex, setExpandedIndex] = useState<number | null>(null);
 
   const elapsed = formatElapsed(group.ts, runStart);
-  const totalDuration = group.durationMs > 0 ? formatDurationMs(group.durationMs) : null;
+  const totalDuration =
+    group.durationMs > 0 ? formatDurationMs(group.durationMs) : null;
 
   return (
     <div className="-mx-5 -mt-4">
@@ -1502,7 +1751,9 @@ function EventExportActions({
         disabled={disabled}
         onClick={async () => {
           try {
-            await navigator.clipboard.writeText(JSON.stringify(events, null, 2));
+            await navigator.clipboard.writeText(
+              JSON.stringify(events, null, 2),
+            );
             setCopied(true);
             window.setTimeout(() => setCopied(false), 1200);
           } catch {
@@ -1582,7 +1833,8 @@ function EventsToolbar({
   // Filters apply to: the agent transcript (filter event kinds) and the Debug
   // tab (filter event categories). Specialized renderers (human, parallel,
   // wait, etc.) and the command logs view don't have a filterable list.
-  const showFilters = tab === "debug" || (tab === "primary" && renderer === "agent");
+  const showFilters =
+    tab === "debug" || (tab === "primary" && renderer === "agent");
   const transcriptAllSelected = selectedKinds.length === EVENT_KINDS.length;
   const debugAllSelected =
     selectedDebugCategories.length === 0 ||
@@ -1674,8 +1926,7 @@ function StageActivityBody({
   effectiveTab,
   renderer,
   activity,
-  filteredTurns,
-  displayItems,
+  visibleItems,
   panelSelection,
   onPanelSelectionChange,
   runStart,
@@ -1693,8 +1944,7 @@ function StageActivityBody({
   effectiveTab: EventsTab;
   renderer: StageRenderer;
   activity: StageActivity;
-  filteredTurns: { turn: TurnType; index: number }[];
-  displayItems: DisplayItem[];
+  visibleItems: DisplayItem[];
   panelSelection: PanelSelection | null;
   onPanelSelectionChange: (selection: PanelSelection | null) => void;
   runStart: string | undefined;
@@ -1722,55 +1972,46 @@ function StageActivityBody({
         />
       ) : effectiveTab === "primary" ? (
         renderer === "agent" ? (
-          turns.length > 0 && filteredTurns.length === 0 ? (
+          turns.length > 0 && visibleItems.length === 0 ? (
             <div className="px-2 py-6 text-sm text-fg-muted">
               No events match these filters.
             </div>
           ) : (
-            displayItems.map((item) => {
+            visibleItems.map((item) => {
+              const selection = item.selection;
+              const selectionId = threadSelectionId(selection);
+              const isSelected = threadSelectionsEqual(
+                selection,
+                panelSelection,
+              );
               if (item.kind === "single") {
                 return (
                   <EventRow
-                    key={`turn-${item.turnIndex}`}
+                    key={selectionId}
                     turn={item.turn}
                     runStart={runStart}
-                    selected={
-                      panelSelection?.kind === "single" &&
-                      panelSelection.turnIndex === item.turnIndex
-                    }
-                    onSelect={() =>
-                      onPanelSelectionChange({
-                        kind: "single",
-                        turnIndex: item.turnIndex,
-                      })
-                    }
+                    selected={isSelected}
+                    onSelect={() => onPanelSelectionChange(selection)}
                   />
                 );
               }
-              const childIndices = item.children.map((c) => c.turnIndex);
-              const groupKey = `group-${childIndices.join("-")}`;
-              const isSelected =
-                panelSelection?.kind === "group" &&
-                panelSelection.childTurnIndices.length === childIndices.length &&
-                panelSelection.childTurnIndices.every((v, i) => v === childIndices[i]);
               return (
                 <ToolGroupRow
-                  key={groupKey}
+                  key={selectionId}
                   group={item}
                   runStart={runStart}
                   selected={isSelected}
-                  onSelect={() =>
-                    onPanelSelectionChange({
-                      kind: "group",
-                      childTurnIndices: childIndices,
-                    })
-                  }
+                  onSelect={() => onPanelSelectionChange(selection)}
                 />
               );
             })
           )
         ) : renderer === "command" ? (
-          <CommandLogs runId={runId} stageId={selectedStage.id} turn={commandTurn} />
+          <CommandLogs
+            runId={runId}
+            stageId={selectedStage.id}
+            turn={commandTurn}
+          />
         ) : renderer === "human" ? (
           <HumanQA stage={selectedStage} events={debugEvents} />
         ) : renderer === "conditional" ? (
@@ -1795,7 +2036,9 @@ function StageActivityBody({
           <StageSummary stage={selectedStage} events={debugEvents} />
         )
       ) : effectiveTab === "context" ? (
-        contextData ? <StageContext data={contextData} /> : null
+        contextData ? (
+          <StageContext data={contextData} />
+        ) : null
       ) : debugEvents.length > 0 && filteredDebugEvents.length === 0 ? (
         <div className="px-2 py-6 text-sm text-fg-muted">
           No events match these filters.
@@ -1888,49 +2131,70 @@ function RunStageActivityStage({
     return null;
   }, [effectiveTab, renderer, turns]);
 
-  const [panelSelection, setPanelSelection] = useState<PanelSelection | null>(null);
-  const [openDebugSeq, setOpenDebugSeq] = useState<number | null>(null);
-  const filteredTurns = useMemo<{ turn: TurnType; index: number }[]>(() => {
-    if (!isPrimaryAgent) return [];
-    const kindSet = new Set(selectedKinds);
-    const needle = search.toLowerCase();
-    const out: { turn: TurnType; index: number }[] = [];
-    turns.forEach((turn, i) => {
-      if (!kindSet.has(turn.kind)) return;
-      if (needle && !searchableText(turn).toLowerCase().includes(needle)) return;
-      out.push({ turn, index: i });
-    });
-    return out;
-  }, [isPrimaryAgent, turns, selectedKinds, search]);
-  const displayItems = useMemo(
-    () => (isPrimaryAgent ? groupConsecutiveTools(filteredTurns) : []),
-    [isPrimaryAgent, filteredTurns],
+  const [panelSelection, setPanelSelection] = useState<PanelSelection | null>(
+    null,
   );
-  const threadDnaItems = useMemo(
+  const [openDebugSeq, setOpenDebugSeq] = useState<number | null>(null);
+  // Semantics first, visibility second: grouping and DNA timing are derived
+  // from the complete turn stream, and the kind/search filters only decide
+  // which of those items are shown.
+  const displayItems = useMemo(
+    () =>
+      isPrimaryAgent
+        ? groupConsecutiveTools(turns.map((turn, index) => ({ turn, index })))
+        : [],
+    [isPrimaryAgent, turns],
+  );
+  const visibleItems = useMemo(
+    () =>
+      isPrimaryAgent
+        ? filterDisplayItems(displayItems, selectedKinds, search)
+        : [],
+    [isPrimaryAgent, displayItems, selectedKinds, search],
+  );
+  const visibleCount = useMemo(
+    () => (isPrimaryAgent ? visibleTurnCount(visibleItems) : 0),
+    [isPrimaryAgent, visibleItems],
+  );
+  const allDnaItems = useMemo(
     () => (isPrimaryAgent ? buildThreadDnaItems(displayItems, runStart) : []),
     [isPrimaryAgent, displayItems, runStart],
+  );
+  const threadDnaItems = useMemo(
+    () =>
+      !isPrimaryAgent
+        ? []
+        : visibleItems === displayItems
+          ? allDnaItems
+          : filterThreadDnaItems(allDnaItems, visibleItems),
+    [isPrimaryAgent, allDnaItems, displayItems, visibleItems],
   );
 
   const openTurn =
     isPrimaryAgent && panelSelection?.kind === "single"
-      ? turns[panelSelection.turnIndex] ?? null
+      ? (turns[panelSelection.turnIndex] ?? null)
       : null;
-  const openGroup = useMemo<Extract<DisplayItem, { kind: "group" }> | null>(() => {
+  // Resolve against the complete group list so changing a filter cannot
+  // corrupt or drop the identity of an open selection.
+  const openGroup = useMemo<Extract<
+    DisplayItem,
+    { kind: "group" }
+  > | null>(() => {
     if (!isPrimaryAgent || panelSelection?.kind !== "group") return null;
-    const wanted = panelSelection.childTurnIndices;
     for (const item of displayItems) {
-      if (item.kind !== "group") continue;
-      const matches =
-        item.children.length === wanted.length &&
-        item.children.every((c, i) => c.turnIndex === wanted[i]);
-      if (matches) return item;
+      if (
+        item.kind === "group" &&
+        threadSelectionsEqual(item.selection, panelSelection)
+      ) {
+        return item;
+      }
     }
     return null;
   }, [isPrimaryAgent, displayItems, panelSelection]);
   const openDebugEvent = useMemo<EventEnvelope | null>(
     () =>
       isDebug && openDebugSeq != null
-        ? debugEvents.find((e) => e.seq === openDebugSeq) ?? null
+        ? (debugEvents.find((e) => e.seq === openDebugSeq) ?? null)
         : null,
     [isDebug, debugEvents, openDebugSeq],
   );
@@ -1951,7 +2215,8 @@ function RunStageActivityStage({
       const name = event.event ?? "";
       if (useCategoryFilter && !cats.has(debugCategory(name))) return false;
       if (needle) {
-        const blob = `${name} ${JSON.stringify(event.properties ?? {})}`.toLowerCase();
+        const blob =
+          `${name} ${JSON.stringify(event.properties ?? {})}`.toLowerCase();
         if (!blob.includes(needle)) return false;
       }
       return true;
@@ -1989,7 +2254,7 @@ function RunStageActivityStage({
               onSearchChange={onSearchChange}
               filteredCount={
                 effectiveTab === "primary"
-                  ? filteredTurns.length
+                  ? visibleCount
                   : filteredDebugEvents.length
               }
               totalCount={
@@ -2025,8 +2290,7 @@ function RunStageActivityStage({
           effectiveTab={effectiveTab}
           renderer={renderer}
           activity={activity}
-          filteredTurns={filteredTurns}
-          displayItems={displayItems}
+          visibleItems={visibleItems}
           panelSelection={panelSelection}
           onPanelSelectionChange={setPanelSelection}
           runStart={runStart}
@@ -2124,7 +2388,8 @@ export default function RunStages() {
     [stagesQuery.data],
   );
 
-  const selectedStage = stages.find((s: Stage) => s.id === stageId) ?? stages[0];
+  const selectedStage =
+    stages.find((s: Stage) => s.id === stageId) ?? stages[0];
   const selectedStageId = selectedStage?.id;
   const runStart =
     selectedStage?.startedAt ??
@@ -2157,7 +2422,11 @@ export default function RunStages() {
   return (
     <div className="-mr-4 -mt-3 flex min-h-0 flex-1 sm:-mr-6 lg:-mr-8">
       <div className="min-h-0 shrink-0 overflow-y-auto overflow-x-hidden pr-3 pt-3 pb-[calc(1.5rem+var(--fabro-interview-dock-clearance,0px))]">
-        <StageSidebar stages={stages} runId={id} selectedStageId={selectedStage.id} />
+        <StageSidebar
+          stages={stages}
+          runId={id}
+          selectedStageId={selectedStage.id}
+        />
       </div>
 
       <div className="relative w-px shrink-0">
