@@ -119,16 +119,16 @@ async fn read_run_blob(
 }
 
 async fn load_run_spec(state: &AppState, run_id: &RunId) -> Result<fabro_types::RunSpec, Response> {
-    let run_store = state
+    let cached = state
         .stores
         .runs
-        .open_run_reader(run_id)
+        .get_cached_run(run_id)
         .await
-        .map_err(|_| ApiError::not_found("Run not found.").into_response())?;
-    let run_state = run_store.state().await.map_err(|err| {
-        ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
-    })?;
-    Ok(run_state.spec)
+        .map_err(|err| {
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
+        })?
+        .ok_or_else(|| ApiError::not_found("Run not found.").into_response())?;
+    Ok(cached.projection.spec.clone())
 }
 
 async fn list_run_artifacts(

@@ -131,17 +131,14 @@ async fn load_pull_request_record(
     state: &Arc<AppState>,
     id: &RunId,
 ) -> Result<PullRequestLink, ApiError> {
-    let run_store = state
+    let cached = state
         .stores
         .runs
-        .open_run_reader(id)
+        .get_cached_run(id)
         .await
-        .map_err(|_| ApiError::not_found("Run not found."))?;
-    let run_state = run_store
-        .state()
-        .await
-        .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-    run_state.pull_request.ok_or_else(|| {
+        .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or_else(|| ApiError::not_found("Run not found."))?;
+    cached.projection.pull_request.clone().ok_or_else(|| {
         ApiError::with_code(
             StatusCode::NOT_FOUND,
             format!("No pull request found in store. Create one first with: fabro pr create {id}"),
@@ -297,14 +294,22 @@ async fn create_run_pull_request(
     let Ok(run_store) = state.stores.runs.open_run(&id).await else {
         return ApiError::not_found("Run not found.").into_response();
     };
-    let run_state = match run_store.state().await {
-        Ok(run_state) => run_state,
+    let cached = match state.stores.runs.get_cached_run(&id).await {
+        Ok(Some(cached)) => cached,
+        Ok(None) => {
+            return ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Run projection unavailable.",
+            )
+            .into_response();
+        }
         Err(err) => {
             return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
                 .into_response();
         }
     };
-    let inputs = match RunPrInputs::extract(&run_state, body.force) {
+    let run_state = cached.projection.as_ref();
+    let inputs = match RunPrInputs::extract(run_state, body.force) {
         Ok(inputs) => inputs,
         Err(err) => return err.into_response(),
     };
@@ -343,7 +348,7 @@ async fn create_run_pull_request(
         llm_source: state.llm_source.as_ref(),
         catalog,
         conclusion: Some(inputs.conclusion),
-        run_state: Some(&run_state),
+        run_state: Some(run_state),
     };
     let created_pull_request = match pull_request::maybe_open_pull_request(request).await {
         Ok(Some(created)) => created,
@@ -401,14 +406,21 @@ async fn unlink_run_pull_request(
     let Ok(run_store) = state.stores.runs.open_run(&id).await else {
         return ApiError::not_found("Run not found.").into_response();
     };
-    let run_state = match run_store.state().await {
-        Ok(run_state) => run_state,
+    let cached = match state.stores.runs.get_cached_run(&id).await {
+        Ok(Some(cached)) => cached,
+        Ok(None) => {
+            return ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Run projection unavailable.",
+            )
+            .into_response();
+        }
         Err(err) => {
             return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
                 .into_response();
         }
     };
-    let Some(pull_request) = run_state.pull_request else {
+    let Some(pull_request) = cached.projection.pull_request.clone() else {
         return ApiError::with_code(
             StatusCode::NOT_FOUND,
             format!("No pull request found in store. Create one first with: fabro pr create {id}"),

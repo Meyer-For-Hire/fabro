@@ -171,6 +171,15 @@ impl RunProjectionCache {
             .map(|entry| state.with_children_count(entry))
     }
 
+    pub(crate) async fn last_seq(&self, run_id: &RunId) -> Option<u32> {
+        self.state
+            .lock()
+            .await
+            .entries
+            .get(run_id)
+            .map(|entry| entry.last_seq)
+    }
+
     pub(crate) async fn get_summary(&self, run_id: &RunId, now: DateTime<Utc>) -> Option<Run> {
         let mut entry = {
             let state = self.state.lock().await;

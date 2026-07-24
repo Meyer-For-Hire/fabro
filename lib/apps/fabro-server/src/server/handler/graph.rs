@@ -242,17 +242,17 @@ async fn load_run_dot_source(state: &AppState, id: &RunId) -> Result<String, Res
     let dot_source = if let Some(dot) = live_dot_source.filter(|d| !d.is_empty()) {
         Some(dot)
     } else {
-        match state.stores.runs.open_run_reader(id).await {
-            Ok(run_store) => match run_store.state().await {
-                Ok(run_state) => run_state.spec.graph_source,
-                Err(err) => {
-                    return Err(
-                        ApiError::new(StatusCode::BAD_GATEWAY, err.to_string()).into_response()
-                    );
-                }
-            },
-            Err(_) => return Err(ApiError::not_found("Run not found.").into_response()),
-        }
+        state
+            .stores
+            .runs
+            .get_cached_run(id)
+            .await
+            .map_err(|err| ApiError::new(StatusCode::BAD_GATEWAY, err.to_string()).into_response())?
+            .ok_or_else(|| ApiError::not_found("Run not found.").into_response())?
+            .projection
+            .spec
+            .graph_source
+            .clone()
     };
 
     dot_source

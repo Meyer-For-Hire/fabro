@@ -1195,15 +1195,13 @@ async fn load_projection(
     state: &Arc<AppState>,
     run_id: &RunId,
 ) -> std::result::Result<fabro_store::RunProjection, ApiError> {
-    let reader = state
+    let cached = state
         .store_ref()
-        .open_run_reader(run_id)
+        .get_cached_run(run_id)
         .await
-        .map_err(|_| ApiError::not_found("Run not found."))?;
-    reader
-        .state()
-        .await
-        .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
+        .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or_else(|| ApiError::not_found("Run not found."))?;
+    Ok((*cached.projection).clone())
 }
 
 async fn reconnect_run_sandbox(

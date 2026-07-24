@@ -2686,9 +2686,8 @@ async fn delete_run_internal(
 }
 
 async fn load_durable_run_status(state: &AppState, id: &RunId) -> Option<RunStatus> {
-    let run_store = state.stores.runs.open_run(id).await.ok()?;
-    let projection = run_store.state().await.ok()?;
-    Some(projection.status)
+    let cached = state.stores.runs.get_cached_run(id).await.ok()??;
+    Some(cached.projection.status)
 }
 
 async fn delete_run_sandbox_resource(
@@ -4521,9 +4520,8 @@ async fn append_control_request(
 /// run is currently archived. Returns `None` otherwise (including when the run
 /// doesn't exist — the caller's own not-found handling will surface that).
 async fn reject_if_archived(state: &AppState, run_id: &RunId) -> Option<Response> {
-    let run_store = state.stores.runs.open_run_reader(run_id).await.ok()?;
-    let projection = run_store.state().await.ok()?;
-    projection.archived_at.is_some().then(|| {
+    let cached = state.stores.runs.get_cached_run(run_id).await.ok()??;
+    cached.projection.archived_at.is_some().then(|| {
         ApiError::new(
             StatusCode::CONFLICT,
             operations::archived_rejection_message(run_id),

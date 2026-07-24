@@ -84,12 +84,27 @@ impl RunDatabase {
         shared_projection_cache: Arc<RunProjectionCache>,
         run_summary_store: Arc<OnceLock<Arc<RunSummaryStore>>>,
     ) -> Result<Self> {
-        let event_seq = if read_only {
-            // Readers never append, so they do not need to scan the full event
-            // history to recover the next write sequence.
-            1
-        } else {
-            recover_next_seq(&db, keys::run_events_prefix(&run_id), keys::parse_event_seq).await?
+        let cached_projection = shared_projection_cache.get(&run_id).await;
+        let projection_cache =
+            cached_projection
+                .as_ref()
+                .map_or_else(EventProjectionCache::default, |cached| {
+                    EventProjectionCache {
+                        last_seq: cached.last_seq,
+                        state:    Some((*cached.projection).clone()),
+                    }
+                });
+        let event_seq = match (&cached_projection, read_only) {
+            (Some(cached), _) => cached.last_seq.saturating_add(1),
+            (None, true) => {
+                // Readers never append, so they do not need to scan the full event
+                // history to recover the next write sequence.
+                1
+            }
+            (None, false) => {
+                recover_next_seq(&db, keys::run_events_prefix(&run_id), keys::parse_event_seq)
+                    .await?
+            }
         };
         let (event_tx, _) = broadcast::channel(DEFAULT_EVENT_TAIL_LIMIT.max(16));
         let blob_store = BlobStore::new(Arc::new(db.clone()));
@@ -101,7 +116,7 @@ impl RunDatabase {
                 event_seq: AtomicU32::new(event_seq),
                 close_lock: Mutex::new(()),
                 state_lock: Mutex::new(()),
-                projection_cache: Mutex::new(EventProjectionCache::default()),
+                projection_cache: Mutex::new(projection_cache),
                 shared_projection_cache,
                 run_summary_store,
                 recent_events: Mutex::new(VecDeque::with_capacity(DEFAULT_EVENT_TAIL_LIMIT)),
@@ -368,6 +383,31 @@ impl RunDatabase {
         self.list_events_from_with_limit(1, usize::MAX / 2).await
     }
 
+    /// Returns the newest stored event sequence without reading event bodies
+    /// when a current local or shared projection is available.
+    pub async fn last_event_seq(&self) -> Result<Option<u32>> {
+        let local_last_seq = self.inner.projection_cache.lock().await.last_seq;
+        if local_last_seq > 0 {
+            return Ok(Some(local_last_seq));
+        }
+        if let Some(last_seq) = self
+            .inner
+            .shared_projection_cache
+            .last_seq(&self.inner.run_id)
+            .await
+        {
+            return Ok(Some(last_seq));
+        }
+
+        let next_seq = recover_next_seq(
+            &self.inner.db,
+            keys::run_events_prefix(&self.inner.run_id),
+            keys::parse_event_seq,
+        )
+        .await?;
+        Ok(next_seq.checked_sub(1).filter(|seq| *seq > 0))
+    }
+
     pub async fn list_events_from_with_limit(
         &self,
         start_seq: u32,
@@ -540,9 +580,15 @@ async fn list_events_from<R>(db: &R, run_id: &RunId, start_seq: u32) -> Result<V
 where
     R: DbRead + Sync,
 {
-    let mut iter = db.scan_prefix(keys::run_events_prefix(run_id)).await?;
+    let event_prefix = keys::run_events_prefix(run_id);
+    let mut iter = db
+        .scan(keys::run_event_seq_prefix(run_id, start_seq)..)
+        .await?;
     let mut events = Vec::new();
     while let Some(entry) = iter.next().await? {
+        if !entry.key.starts_with(event_prefix.as_ref()) {
+            break;
+        }
         let key = key_to_string(&entry.key)?;
         let Some(seq) = keys::parse_event_seq(&key) else {
             continue;
@@ -624,9 +670,10 @@ async fn list_events_for_stage_from_with_limit<R>(
 where
     R: DbRead + Sync,
 {
-    // Unbounded scan first: filtering by stage identity with a generic
-    // limit-bounded scan would silently drop matches whenever the stage's
-    // events are sparse late in the event log.
+    // Scan without a storage-level item limit from the requested cursor:
+    // filtering by stage identity with a generic limit-bounded scan would
+    // silently drop matches whenever the stage's events are sparse late in
+    // the event log.
     //
     // We probe just the stage identity fields with a small partial deserialize and
     // only run the full `RunEvent` parse on matches. Most events in a run
@@ -642,9 +689,15 @@ where
 
     let stage_id_string = stage_id.to_string();
     let max_events = limit.saturating_add(1);
-    let mut iter = db.scan_prefix(keys::run_events_prefix(run_id)).await?;
+    let event_prefix = keys::run_events_prefix(run_id);
+    let mut iter = db
+        .scan(keys::run_event_seq_prefix(run_id, start_seq)..)
+        .await?;
     let mut events: Vec<EventEnvelope> = Vec::new();
     while let Some(entry) = iter.next().await? {
+        if !entry.key.starts_with(event_prefix.as_ref()) {
+            break;
+        }
         let key = key_to_string(&entry.key)?;
         let Some(seq) = keys::parse_event_seq(&key) else {
             continue;
@@ -702,9 +755,15 @@ where
 
     let session_id_string = session_id.to_string();
     let max_events = limit.saturating_add(1);
-    let mut iter = db.scan_prefix(keys::run_events_prefix(run_id)).await?;
+    let event_prefix = keys::run_events_prefix(run_id);
+    let mut iter = db
+        .scan(keys::run_event_seq_prefix(run_id, start_seq)..)
+        .await?;
     let mut events = Vec::new();
     while let Some(entry) = iter.next().await? {
+        if !entry.key.starts_with(event_prefix.as_ref()) {
+            break;
+        }
         let key = key_to_string(&entry.key)?;
         let Some(seq) = keys::parse_event_seq(&key) else {
             continue;
@@ -981,6 +1040,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_events_for_stage_seeks_to_start_sequence() {
+        let run = fresh_run().await;
+        let run_id = run.run_id();
+        run.append_event(&stage_prompt_payload(&run_id, 1, Some("alpha")))
+            .await
+            .unwrap();
+        run.append_event(&stage_prompt_payload(&run_id, 2, Some("beta")))
+            .await
+            .unwrap();
+        run.append_event(&stage_prompt_payload(&run_id, 3, Some("alpha")))
+            .await
+            .unwrap();
+        let mut unreadable_earlier_key = keys::run_event_seq_prefix(&run_id, 2).as_ref().to_vec();
+        unreadable_earlier_key.push(0xff);
+        run.inner
+            .db
+            .put(unreadable_earlier_key, b"invalid json")
+            .await
+            .unwrap();
+
+        let events = run
+            .list_events_for_stage_from_with_limit(&StageId::new("alpha", 1), 3, 100)
+            .await
+            .unwrap();
+
+        let seqs: Vec<u32> = events.iter().map(|event| event.seq).collect();
+        assert_eq!(seqs, vec![4]);
+    }
+
+    #[tokio::test]
     async fn list_events_for_stage_walks_past_unrelated_events_for_sparse_matches() {
         let run = fresh_run().await;
         let run_id = run.run_id();
@@ -1086,6 +1175,38 @@ mod tests {
 
         let seqs: Vec<u32> = events.iter().map(|e| e.seq).collect();
         assert_eq!(seqs, vec![3, 5]);
+    }
+
+    #[tokio::test]
+    async fn list_events_for_session_seeks_to_start_sequence() {
+        let run = fresh_run().await;
+        let run_id = run.run_id();
+        let session_id = SessionId::new();
+        let other_session_id = SessionId::new();
+        run.append_event(&session_message_payload(&run_id, 1, session_id))
+            .await
+            .unwrap();
+        run.append_event(&session_message_payload(&run_id, 2, other_session_id))
+            .await
+            .unwrap();
+        run.append_event(&session_message_payload(&run_id, 3, session_id))
+            .await
+            .unwrap();
+        let mut unreadable_earlier_key = keys::run_event_seq_prefix(&run_id, 2).as_ref().to_vec();
+        unreadable_earlier_key.push(0xff);
+        run.inner
+            .db
+            .put(unreadable_earlier_key, b"invalid json")
+            .await
+            .unwrap();
+
+        let events = run
+            .list_events_for_session_from_with_limit(session_id, 3, 100)
+            .await
+            .unwrap();
+
+        let seqs: Vec<u32> = events.iter().map(|event| event.seq).collect();
+        assert_eq!(seqs, vec![4]);
     }
 
     #[tokio::test]

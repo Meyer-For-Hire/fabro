@@ -1109,14 +1109,15 @@ async fn get_run_stage_command_log(
     let Ok(run_store) = state.stores.runs.open_run_reader(&id).await else {
         return ApiError::not_found("Run not found.").into_response();
     };
-    let run_state = match run_store.state().await {
-        Ok(run_state) => run_state,
+    let cached = match state.stores.runs.get_cached_run(&id).await {
+        Ok(Some(cached)) => cached,
+        Ok(None) => return ApiError::not_found("Run not found.").into_response(),
         Err(err) => {
             return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
                 .into_response();
         }
     };
-    let Some(node) = run_state.stage(&stage_id) else {
+    let Some(node) = cached.projection.stage(&stage_id) else {
         return ApiError::not_found("Stage not found.").into_response();
     };
 
