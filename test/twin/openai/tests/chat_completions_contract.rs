@@ -50,7 +50,46 @@ async fn chat_completions_stream_uses_same_canonical_plan() {
 
     assert_eq!(status, 200);
     assert!(joined.contains("\"content\":\"deterministic: stream same plan\""));
+    assert!(!joined.contains("\"usage\""));
     assert!(joined.contains("data: [DONE]"));
+}
+
+#[tokio::test]
+async fn chat_completions_stream_includes_usage_when_requested() {
+    let server = common::spawn_server().await.expect("server should start");
+
+    let (status, chunks) = server
+        .post_chat_stream(json!({
+            "model": "gpt-test",
+            "messages": [{ "role": "user", "content": "stream with usage" }],
+            "stream": true,
+            "stream_options": { "include_usage": true }
+        }))
+        .await;
+
+    assert_eq!(status, 200);
+    let transcript =
+        common::parse_sse_transcript(chunks.join("").as_bytes()).expect("valid SSE transcript");
+    let usage_chunk = transcript
+        .events
+        .iter()
+        .filter(|event| event.data != "[DONE]")
+        .map(|event| {
+            serde_json::from_str::<serde_json::Value>(&event.data).expect("valid JSON chunk")
+        })
+        .find(|chunk| chunk.get("usage").is_some())
+        .expect("trailing usage chunk");
+
+    assert_eq!(usage_chunk["choices"], json!([]));
+    assert_eq!(
+        usage_chunk["usage"],
+        json!({
+            "prompt_tokens": 3,
+            "completion_tokens": 5,
+            "total_tokens": 8
+        })
+    );
+    assert!(transcript.done);
 }
 
 #[tokio::test]

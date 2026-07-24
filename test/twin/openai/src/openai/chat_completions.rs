@@ -43,7 +43,12 @@ pub async fn create_chat_completion(
             }
 
             if request.stream {
-                chat_sse_response(&success.plan, success.transport).into_response()
+                chat_sse_response(
+                    &success.plan,
+                    request.include_stream_usage(),
+                    success.transport,
+                )
+                .into_response()
             } else {
                 Json(success.plan.chat_completions_json()).into_response()
             }

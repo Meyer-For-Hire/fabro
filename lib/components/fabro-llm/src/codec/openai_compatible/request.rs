@@ -177,13 +177,10 @@ mod tests {
             tool_choice:      None,
             response_format:  None,
             stream:           Some(true),
-            stream_options:   Some(StreamOptions {
-                include_usage: true,
-            }),
+            stream_options:   None,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["stream"], true);
-        assert_eq!(json["stream_options"]["include_usage"], true);
 
         let req_no_stream = ApiRequest {
             model:            "test".into(),
@@ -201,44 +198,6 @@ mod tests {
         };
         let json_no_stream = serde_json::to_value(&req_no_stream).unwrap();
         assert!(json_no_stream.get("stream").is_none());
-        assert!(json_no_stream.get("stream_options").is_none());
-    }
-
-    /// Chat Completions only emits the trailing usage chunk when the request
-    /// opts in; without it streamed responses report zero tokens and cost
-    /// estimation silently produces $0.
-    #[test]
-    fn encode_opts_into_streaming_usage_when_streaming() {
-        let request = minimal_request();
-
-        let body = encode_body(&request, "kimi", true);
-
-        assert_eq!(body["stream"], true);
-        assert_eq!(body["stream_options"]["include_usage"], true);
-    }
-
-    #[test]
-    fn encode_omits_stream_options_when_not_streaming() {
-        let request = minimal_request();
-
-        let body = encode_body(&request, "kimi", false);
-
-        assert!(body.get("stream_options").is_none());
-    }
-
-    /// The `provider_options.<name>` merge runs after the body is built, so a
-    /// caller pointed at a gateway that rejects the field can still turn it
-    /// off.
-    #[test]
-    fn provider_options_can_override_stream_options() {
-        let mut request = minimal_request();
-        request.provider_options = Some(serde_json::json!({
-            "kimi": { "stream_options": serde_json::Value::Null }
-        }));
-
-        let body = encode_body(&request, "kimi", true);
-
-        assert_eq!(body["stream_options"], serde_json::Value::Null);
     }
 
     #[test]
