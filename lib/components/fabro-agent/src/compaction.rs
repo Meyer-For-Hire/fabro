@@ -13,6 +13,17 @@ use crate::types::{AgentEvent, Message};
 
 const APPROX_CHARS_PER_TOKEN: usize = 4;
 
+/// Minimum length, in bytes, of a usable compaction summary after trimming.
+///
+/// A summary is traded for many turns of conversation, so anything shorter
+/// than a single source file path
+/// (`lib/components/fabro-agent/src/compaction.rs` is 43 bytes) cannot be
+/// carrying that context forward. The bar is set far below any genuine summary
+/// on purpose: this exists to catch degenerate responses, not to judge summary
+/// quality. A false refusal leaves the context to keep growing, so the check
+/// must never fire on a real summary.
+const MIN_SUMMARY_LEN: usize = 32;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 pub(crate) enum ContextEstimateMethod {
@@ -149,7 +160,25 @@ function names, error messages, and exact values. Omit pleasantries and conversa
         .await
         .map_err(Error::Llm)?;
 
-    let summary_text = response.text();
+    let response_text = response.text();
+    let summary_text = response_text.trim();
+
+    // Refuse to compact on a degenerate summary. `compact_from` discards the
+    // summarized turns irreversibly, so an empty or near-empty summary must not
+    // be traded for them: the preamble below would tell the model a handoff
+    // summary exists while it actually runs with no history at all. Empty
+    // completions are provider-independent — a truncated stream, a reasoning
+    // model that spent its whole budget on reasoning, or a rate-limit edge all
+    // produce one. Returning here leaves the history intact; the caller turns
+    // this into an `AgentEvent::Error` and continues the session.
+    if summary_text.len() < MIN_SUMMARY_LEN {
+        return Err(Error::InvalidState(format!(
+            "compaction summary was empty or too short to replace {preserve_start} turns \
+             ({} bytes, minimum {MIN_SUMMARY_LEN}); history left intact",
+            summary_text.len()
+        )));
+    }
+
     debug!(
         summary_len = summary_text.len(),
         "Compaction summary generated"
@@ -298,6 +327,7 @@ pub fn render_turns_for_summary(turns: &[Message]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::SystemTime;
 
     use fabro_llm::types::{TokenCounts, ToolCall, ToolResult};
@@ -305,7 +335,7 @@ mod tests {
     use super::*;
     use crate::event::Emitter;
     use crate::history::History;
-    use crate::test_support::TestProfile;
+    use crate::test_support::{MockLlmProvider, TestProfile, make_client, text_response};
     use crate::tool_registry::ToolRegistry;
     use crate::types::Message;
 
@@ -569,5 +599,127 @@ mod tests {
         let event = rx.try_recv().unwrap();
         assert!(matches!(event.event, AgentEvent::Warning { details, .. }
                 if details["estimate_method"] == "local_estimate"));
+    }
+
+    /// Run `compact_context` over a fixed four-turn history against a mock
+    /// provider that returns `summary` from the summarization call.
+    async fn compact_with_summary(summary: &str) -> (Result<(), Error>, History, Vec<AgentEvent>) {
+        let mut history = History::default();
+        for index in 0..4 {
+            history.push(Message::User {
+                content:   format!("message {index}"),
+                timestamp: SystemTime::now(),
+            });
+        }
+
+        let provider = Arc::new(MockLlmProvider::new(vec![text_response(summary)]));
+        let client = make_client(provider).await;
+        let profile = TestProfile::new();
+        let file_tracker = FileTracker::default();
+        let emitter = Emitter::new();
+        let mut rx = emitter.subscribe();
+
+        let result = compact_context(
+            &mut history,
+            &client,
+            &profile,
+            &file_tracker,
+            1,
+            ContextEstimate {
+                tokens: 1_000,
+                method: ContextEstimateMethod::LocalEstimate,
+            },
+            &emitter,
+            "sess",
+        )
+        .await;
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event.event);
+        }
+
+        (result, history, events)
+    }
+
+    fn assert_history_untouched(history: &History) {
+        assert_eq!(
+            history.turns().len(),
+            4,
+            "history must not be truncated when the summary is rejected"
+        );
+        assert!(
+            history
+                .turns()
+                .iter()
+                .all(|turn| matches!(turn, Message::User { .. })),
+            "no summary turn should be inserted when the summary is rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_refuses_to_truncate_on_empty_summary() {
+        let (result, history, events) = compact_with_summary("").await;
+
+        let err = result.expect_err("empty summary must not report success");
+        assert!(
+            matches!(&err, Error::InvalidState(message) if message.contains("empty or too short")),
+            "unexpected error: {err}"
+        );
+
+        assert_history_untouched(&history);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::CompactionCompleted { .. })),
+            "CompactionCompleted must not be emitted for a rejected summary"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_refuses_to_truncate_on_whitespace_only_summary() {
+        let (result, history, events) = compact_with_summary("   \n\t  \n ").await;
+
+        let err = result.expect_err("whitespace-only summary must not report success");
+        assert!(
+            matches!(&err, Error::InvalidState(message) if message.contains("empty or too short")),
+            "unexpected error: {err}"
+        );
+
+        assert_history_untouched(&history);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::CompactionCompleted { .. })),
+            "CompactionCompleted must not be emitted for a rejected summary"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_replaces_history_on_normal_summary() {
+        let (result, history, events) = compact_with_summary(
+            "## Goal\nAdd a compaction guard.\n\n## Next Steps\nRun the test suite.",
+        )
+        .await;
+
+        result.expect("a normal summary should compact");
+
+        let summary_turn = history
+            .turns()
+            .iter()
+            .find_map(|turn| match turn {
+                Message::System { content, .. } => Some(content),
+                _ => None,
+            })
+            .expect("compacted history should contain a summary turn");
+        assert!(summary_turn.contains("A different assistant began this task"));
+        assert!(summary_turn.contains("Add a compaction guard."));
+
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::CompactionCompleted { .. })),
+            "CompactionCompleted should be emitted on success"
+        );
     }
 }

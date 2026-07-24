@@ -4690,7 +4690,9 @@ mod tests {
 
             async fn complete(&self, request: &Request) -> Result<Response, LlmError> {
                 *self.captured_complete.lock().unwrap() = Some(request.clone());
-                Ok(text_response("## Goal\nSummary goes here."))
+                Ok(text_response(
+                    "## Goal\nSummary goes here.\n\n## Progress\nRead /src/main.rs.",
+                ))
             }
 
             async fn stream(&self, _request: &Request) -> Result<StreamEventStream, LlmError> {
