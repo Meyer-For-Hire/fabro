@@ -6769,6 +6769,35 @@ async fn list_models_filters_by_provider() {
 }
 
 #[tokio::test]
+async fn list_models_exposes_reasoning_effort_controls() {
+    let app = test_app_with();
+
+    let req = Request::builder()
+        .method("GET")
+        .uri(api("/models?provider=kimi"))
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(req).await.unwrap();
+    let body = response_json!(response, StatusCode::OK).await;
+    let models = body["data"].as_array().unwrap();
+    let kimi_k3 = models
+        .iter()
+        .find(|model| model["id"] == "kimi-k3")
+        .expect("Kimi K3 should be listed");
+    let kimi_k2_5 = models
+        .iter()
+        .find(|model| model["id"] == "kimi-k2.5")
+        .expect("Kimi K2.5 should be listed");
+
+    assert_eq!(
+        kimi_k3["controls"]["reasoning_effort"],
+        json!(["low", "high", "max"])
+    );
+    assert_eq!(kimi_k2_5["controls"]["reasoning_effort"], json!([]));
+}
+
+#[tokio::test]
 async fn list_models_marks_configured_true_when_provider_has_credential_material() {
     let state = test_app_state_with_env_lookup(
         default_test_server_settings(),

@@ -3,10 +3,10 @@ use std::collections::BTreeMap;
 use ::fabro_types::{
     AutomationRef, BilledTokenCounts, BlockedReason, CommandTermination, DiffSummary,
     FailureReason, ForkSourceRef, GitContext, PairId, PairMessageId, PairSystemMessageKind,
-    PairTarget, ParallelBranchId, PendingReason, PermissionLevel, Principal, PullRequestLink,
-    RunBlobId, RunFailure, RunId, RunNoticeLevel, RunPairEndedReason, RunPairFailedReason,
-    RunProvenance, RunRunnableSource, RunTiming, SandboxProviderKind, StageId, StageTiming,
-    SuccessReason, run_event as fabro_types,
+    PairTarget, ParallelBranchId, ParallelBranchResult, PendingReason, PermissionLevel, Principal,
+    PullRequestLink, RunBlobId, RunFailure, RunId, RunNoticeLevel, RunPairEndedReason,
+    RunPairFailedReason, RunProvenance, RunRunnableSource, RunTiming, SandboxProviderKind, StageId,
+    StageOutcome, StageTiming, SuccessReason, run_event as fabro_types,
 };
 use fabro_agent::{AgentEvent, SandboxEvent};
 use fabro_model::{ReasoningEffort, Speed};
@@ -304,7 +304,6 @@ pub enum Event {
         node_id:      String,
         visit:        u32,
         branch_count: usize,
-        join_policy:  String,
     },
     ParallelBranchStarted {
         parallel_group_id:  StageId,
@@ -318,9 +317,7 @@ pub enum Event {
         branch:             String,
         index:              usize,
         duration_ms:        u64,
-        status:             String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        head_sha:           Option<String>,
+        status:             StageOutcome,
     },
     ParallelCompleted {
         node_id:       String,
@@ -329,7 +326,7 @@ pub enum Event {
         success_count: usize,
         failure_count: usize,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        results:       Vec<serde_json::Value>,
+        results:       Vec<ParallelBranchResult>,
     },
     InterviewStarted {
         question_id:     String,
@@ -413,17 +410,6 @@ pub enum Event {
         success:          bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         exec_output_tail: Option<fabro_types::ExecOutputTail>,
-    },
-    GitBranch {
-        branch: String,
-        sha:    String,
-    },
-    GitWorktreeAdd {
-        path:   String,
-        branch: String,
-    },
-    GitWorktreeRemove {
-        path: String,
     },
     GitFetch {
         branch:  String,
@@ -1116,12 +1102,8 @@ impl Event {
                     "Stage retrying"
                 );
             }
-            Self::ParallelStarted {
-                branch_count,
-                join_policy,
-                ..
-            } => {
-                debug!(branch_count, join_policy, "Parallel execution started");
+            Self::ParallelStarted { branch_count, .. } => {
+                debug!(branch_count, "Parallel execution started");
             }
             Self::ParallelBranchStarted { branch, index, .. } => {
                 debug!(branch, index, "Parallel branch started");
@@ -1135,7 +1117,10 @@ impl Event {
             } => {
                 debug!(
                     branch,
-                    index, duration_ms, status, "Parallel branch completed"
+                    index,
+                    duration_ms,
+                    status = %status,
+                    "Parallel branch completed"
                 );
             }
             Self::ParallelCompleted {
@@ -1232,15 +1217,6 @@ impl Event {
                         "Git push failed"
                     );
                 }
-            }
-            Self::GitBranch { branch, sha } => {
-                debug!(branch, sha, "Git branch created");
-            }
-            Self::GitWorktreeAdd { path, branch } => {
-                debug!(path, branch, "Git worktree added");
-            }
-            Self::GitWorktreeRemove { path } => {
-                debug!(path, "Git worktree removed");
             }
             Self::GitFetch { branch, success } => {
                 if *success {

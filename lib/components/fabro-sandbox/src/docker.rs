@@ -1929,22 +1929,6 @@ impl Sandbox for DockerSandbox {
         crate::git_push_via_exec(self, refspec).await
     }
 
-    fn parallel_worktree_path(
-        &self,
-        _run_dir: &std::path::Path,
-        run_id: &str,
-        node_id: &str,
-        key: &str,
-    ) -> String {
-        format!(
-            "{}/.fabro/scratch/{}/parallel/{}/{}",
-            self.working_directory(),
-            run_id,
-            node_id,
-            key
-        )
-    }
-
     fn origin_url(&self) -> Option<&str> {
         if !self.repo_cloned() {
             return None;

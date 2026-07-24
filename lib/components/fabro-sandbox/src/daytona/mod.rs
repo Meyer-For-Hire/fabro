@@ -1311,22 +1311,6 @@ impl Sandbox for DaytonaSandbox {
         crate::git_push_via_exec(self, refspec).await
     }
 
-    fn parallel_worktree_path(
-        &self,
-        _run_dir: &std::path::Path,
-        run_id: &str,
-        node_id: &str,
-        key: &str,
-    ) -> String {
-        format!(
-            "{}/.fabro/scratch/{}/parallel/{}/{}",
-            self.working_directory(),
-            run_id,
-            node_id,
-            key
-        )
-    }
-
     async fn ssh_access_command(&self) -> crate::Result<Option<String>> {
         self.create_ssh_access(Some(60.0)).await.map(Some)
     }

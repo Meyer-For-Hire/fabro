@@ -1592,6 +1592,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn opening_cached_run_does_not_read_older_event_history() {
+        let (object_store, store) = make_store();
+        let run_id = test_run_id("run-1");
+        let run = store.create_run(&run_id).await.unwrap();
+        append_completed(&run, "run-1", dt("2026-03-27T12:00:00Z")).await;
+
+        let reopened = Database::new(object_store, "runs", Duration::from_millis(1), None);
+        reopened.warm_projection_cache().await.unwrap();
+
+        // If opening or projecting the run starts at the beginning, this
+        // unreadable old key makes the operation fail. A hydrated run starts
+        // after the shared projection's last sequence instead.
+        let mut unreadable_old_key = keys::run_event_seq_prefix(&run_id, 2).as_ref().to_vec();
+        unreadable_old_key.push(0xff);
+        reopened
+            .open_db()
+            .await
+            .unwrap()
+            .put(unreadable_old_key, b"invalid json")
+            .await
+            .unwrap();
+
+        let fresh_writer = reopened.open_run(&run_id).await.unwrap();
+        assert_eq!(fresh_writer.last_event_seq().await.unwrap(), Some(5));
+        let state = fresh_writer.state().await.unwrap();
+        assert_eq!(state.status, RunStatus::Succeeded {
+            reason: SuccessReason::Completed,
+        });
+
+        let seq = fresh_writer
+            .append_event(&event_payload(
+                "run-1",
+                "2026-03-27T12:00:05Z",
+                "run.title.updated",
+                &serde_json::json!({ "title": "Renamed completed run" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(seq, 6);
+    }
+
+    #[tokio::test]
     async fn append_event_hydrates_local_projection_cache_for_fresh_writer() {
         let (object_store, store) = make_store();
         let run_id = test_run_id("run-1");

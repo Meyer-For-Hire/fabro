@@ -10051,7 +10051,7 @@ async fn artifact_pointers_rewritten_for_remote_sandbox() {
 }
 
 #[tokio::test]
-async fn downstream_local_execution_materializes_blob_refs_to_runtime_files() {
+async fn downstream_local_execution_resolves_response_blob_refs_as_text() {
     let mut graph = make_graph_with_start_exit("ArtifactMaterializeLocal");
     graph.attrs.insert(
         "goal".to_string(),
@@ -10114,31 +10114,19 @@ async fn downstream_local_execution_materializes_blob_refs_to_runtime_files() {
         .expect("pipeline should succeed");
     assert_eq!(outcome.status, StageOutcome::Succeeded);
 
-    let expected_blob_id = fabro_types::RunBlobId::new(
-        &serde_json::to_vec(&serde_json::json!("x".repeat(150 * 1024)))
-            .expect("large value should serialize"),
-    );
     let captured_value = captured.lock().unwrap().first().cloned().unwrap();
-    let expected_path = RunScratch::new(dir.path())
-        .runtime_dir()
-        .join("blobs")
-        .join(format!("{expected_blob_id}.json"));
-    assert_eq!(
-        captured_value,
-        format!("file://{}", expected_path.display()),
-        "downstream handlers should receive a local file ref"
+    assert_eq!(captured_value, "x".repeat(150 * 1024));
+    assert!(
+        !RunScratch::new(dir.path())
+            .runtime_dir()
+            .join("blobs")
+            .exists(),
+        "textual response values should resolve without file materialization"
     );
-    let artifact_content = std::fs::read_to_string(&expected_path).expect("should read artifact");
-    let artifact_value: serde_json::Value =
-        serde_json::from_str(&artifact_content).expect("should parse artifact JSON");
-    let artifact_str = artifact_value
-        .as_str()
-        .expect("artifact should be a string");
-    assert_eq!(artifact_str.len(), 150 * 1024);
 }
 
 #[tokio::test]
-async fn downstream_remote_execution_materializes_blob_refs_to_sandbox_files() {
+async fn downstream_remote_execution_resolves_response_blob_refs_as_text() {
     let mut graph = make_graph_with_start_exit("ArtifactMaterializeRemote");
     graph.attrs.insert(
         "goal".to_string(),
@@ -10202,27 +10190,11 @@ async fn downstream_remote_execution_materializes_blob_refs_to_sandbox_files() {
         .expect("pipeline should succeed");
     assert_eq!(outcome.status, StageOutcome::Succeeded);
 
-    let expected_blob_id = fabro_types::RunBlobId::new(
-        &serde_json::to_vec(&serde_json::json!("x".repeat(150 * 1024)))
-            .expect("large value should serialize"),
-    );
     let captured_value = captured.lock().unwrap().first().cloned().unwrap();
-    assert_eq!(
-        captured_value,
-        format!("file:///sandbox/.fabro/blobs/{expected_blob_id}.json"),
-        "downstream handlers should receive a sandbox-local file ref"
-    );
-
-    let written = remote_env.written.lock().unwrap();
-    assert_eq!(written.len(), 1, "should materialize the blob once");
-    assert_eq!(
-        written[0].0,
-        format!("/sandbox/.fabro/blobs/{expected_blob_id}.json")
-    );
+    assert_eq!(captured_value, "x".repeat(150 * 1024));
     assert!(
-        written[0].1.len() > 100 * 1024,
-        "written content should be >100KB, got {} bytes",
-        written[0].1.len()
+        remote_env.written.lock().unwrap().is_empty(),
+        "textual response values should resolve without sandbox file materialization"
     );
 }
 
@@ -10361,7 +10333,7 @@ use fabro_workflow::handler::fan_in::FanInHandler;
 use fabro_workflow::handler::parallel::ParallelHandler;
 
 /// A handler that writes a file named `{node_id}.txt` into the sandbox's
-/// working directory. Used to verify git worktree isolation in parallel
+/// working directory. Used to verify shared-checkout writes from parallel
 /// branches.
 struct FileWriterHandler;
 
@@ -10709,18 +10681,13 @@ async fn git_checkpoint_host_skips_metadata_branch_without_writer_prereqs() {
 }
 
 // ---------------------------------------------------------------------------
-// Host e2e: parallel git branching with worktree isolation
+// Host e2e: shared-checkout parallel execution
 // ---------------------------------------------------------------------------
 
-/// End-to-end: parallel branches get isolated worktrees, fan-in fast-forwards
-/// to winner.
-///
-/// Pipeline: start -> fan_out -> {branch_a, branch_b} -> fan_in -> exit
-///
-/// Each branch writes a unique file. After fan-in, only the winner's file
-/// should be present in the main worktree.
+/// End-to-end: parallel branches write to one shared checkout and normal
+/// run-level checkpointing captures all branch changes after the parallel node.
 #[tokio::test]
-async fn parallel_git_branching_host_e2e() {
+async fn parallel_shared_checkout_host_e2e() {
     // 1. Create a temporary git repo with an initial commit
     let repo = tempfile::tempdir().unwrap();
     std::process::Command::new("git")
@@ -10828,10 +10795,7 @@ async fn parallel_git_branching_host_e2e() {
     registry.register("start", Box::new(StartHandler));
     registry.register("exit", Box::new(ExitHandler));
     registry.register("parallel", Box::new(ParallelHandler));
-    registry.register(
-        "parallel.fan_in",
-        Box::new(FanInHandler::new(None)), // heuristic select — picks branch_a (lexical tiebreak)
-    );
+    registry.register("parallel.fan_in", Box::new(FanInHandler::new(None)));
 
     let engine = WorkflowRunner::new(registry, Arc::new(emitter), env);
 
@@ -10865,113 +10829,107 @@ async fn parallel_git_branching_host_e2e() {
         outcome.failure_reason()
     );
 
-    // 6. Verify parallel.results has head_sha for each branch
+    // 6. Verify ordered typed results and that no fan-in selection state exists.
     let checkpoint = load_run_checkpoint(run_dir.path()).expect("checkpoint should load");
     let parallel_results = checkpoint
         .context_values
         .get("parallel.results")
         .expect("parallel.results should be in context");
-    let results_arr = parallel_results.as_array().expect("should be an array");
-    assert_eq!(results_arr.len(), 2, "should have 2 branch results");
-
-    // Both branches should have head_sha
-    let branch_a_result = results_arr
-        .iter()
-        .find(|v| v.get("id").and_then(|v| v.as_str()) == Some("branch_a"))
-        .expect("branch_a result should exist");
-    let branch_b_result = results_arr
-        .iter()
-        .find(|v| v.get("id").and_then(|v| v.as_str()) == Some("branch_b"))
-        .expect("branch_b result should exist");
-
-    let sha_a = branch_a_result
-        .get("head_sha")
-        .and_then(|v| v.as_str())
-        .expect("branch_a should have head_sha");
-    let sha_b = branch_b_result
-        .get("head_sha")
-        .and_then(|v| v.as_str())
-        .expect("branch_b should have head_sha");
-
-    assert_eq!(sha_a.len(), 40, "SHA should be 40 hex chars");
-    assert_eq!(sha_b.len(), 40, "SHA should be 40 hex chars");
-    assert_ne!(sha_a, sha_b, "branch SHAs should differ");
-
-    // 7. Verify fan_in selected a winner and set best_head_sha
-    let best_id = checkpoint
-        .context_values
-        .get("parallel.fan_in.best_id")
-        .and_then(|v| v.as_str().map(String::from))
-        .expect("fan_in should have selected a best_id");
-    let best_head_sha = checkpoint
-        .context_values
-        .get("parallel.fan_in.best_head_sha")
-        .and_then(|v| v.as_str().map(String::from))
-        .expect("fan_in should have set best_head_sha");
-
-    // Heuristic select with both success: lexical tiebreak picks "branch_a"
+    let results: Vec<fabro_types::ParallelBranchResult> =
+        serde_json::from_value(parallel_results.clone()).expect("results should be typed");
     assert_eq!(
-        best_id, "branch_a",
-        "heuristic should pick branch_a (lexical)"
+        results
+            .iter()
+            .map(|result| (result.id.as_str(), result.status))
+            .collect::<Vec<_>>(),
+        [
+            ("branch_a", fabro_types::StageOutcome::Succeeded),
+            ("branch_b", fabro_types::StageOutcome::Succeeded),
+        ]
+    );
+    assert!(
+        results
+            .iter()
+            .all(|result| result.context_updates.is_empty())
+    );
+    assert!(
+        checkpoint
+            .context_values
+            .keys()
+            .all(|key| !key.starts_with("parallel.fan_in."))
     );
 
-    // 8. Verify winner's file is in the main worktree, loser's is NOT
-    let winner_file = worktree_path.join(format!("{best_id}.txt"));
-    assert!(
-        winner_file.exists(),
-        "winner's file ({best_id}.txt) should exist in main worktree after ff-merge"
-    );
-    let winner_content = std::fs::read_to_string(&winner_file).unwrap();
-    assert!(
-        winner_content.contains(&format!("written by {best_id}")),
-        "winner's file should have correct content"
-    );
+    // 7. Both branches wrote into the one shared checkout.
+    for branch in ["branch_a", "branch_b"] {
+        let file = worktree_path.join(format!("{branch}.txt"));
+        assert!(
+            file.exists(),
+            "{branch} output should remain in the checkout"
+        );
+        assert_eq!(
+            std::fs::read_to_string(file).unwrap(),
+            format!("written by {branch}")
+        );
+    }
 
-    let loser_id = if best_id == "branch_a" {
-        "branch_b"
-    } else {
-        "branch_a"
-    };
-    let loser_file = worktree_path.join(format!("{loser_id}.txt"));
-    assert!(
-        !loser_file.exists(),
-        "loser's file ({loser_id}.txt) should NOT exist in main worktree"
-    );
-
-    // 9. Verify the main worktree HEAD matches the winner's head_sha
-    let main_head = {
-        let out = std::process::Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(&worktree_path)
-            .output()
-            .unwrap();
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    };
-    // After fan-in ff-only + engine's own checkpoint commits, HEAD should be a
-    // descendant of best_head_sha.
-    let is_ancestor = std::process::Command::new("git")
-        .args(["merge-base", "--is-ancestor", &best_head_sha, &main_head])
+    // 8. Normal run-level checkpointing captured both files together.
+    let committed_files = std::process::Command::new("git")
+        .args(["ls-tree", "-r", "--name-only", "HEAD"])
         .current_dir(&worktree_path)
         .output()
         .unwrap();
-    assert!(
-        is_ancestor.status.success(),
-        "best_head_sha ({best_head_sha}) should be an ancestor of current HEAD ({main_head})"
-    );
+    assert!(committed_files.status.success());
+    let committed_files = String::from_utf8_lossy(&committed_files.stdout);
+    assert!(committed_files.lines().any(|path| path == "branch_a.txt"));
+    assert!(committed_files.lines().any(|path| path == "branch_b.txt"));
 
-    // 10. Verify parallel branch refs still exist (for debugging)
-    let branch_ref_a = format!("fabro/run/parallel/{run_id}/fan-out/pass1/branch-a");
-    let ref_check = std::process::Command::new("git")
-        .args(["rev-parse", "--verify", &branch_ref_a])
+    // 9. Fabro created no branch-specific refs, commits, or worktrees.
+    let parallel_refs = std::process::Command::new("git")
+        .args([
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/heads/fabro/run/parallel/",
+        ])
         .current_dir(repo.path())
         .output()
         .unwrap();
+    assert!(parallel_refs.status.success());
     assert!(
-        ref_check.status.success(),
-        "parallel branch ref should still exist for debugging"
+        parallel_refs.stdout.is_empty(),
+        "parallel refs must not exist"
     );
 
-    // 11. Verify events
+    let worktrees = std::process::Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(repo.path())
+        .output()
+        .unwrap();
+    assert!(worktrees.status.success());
+    let worktree_count = String::from_utf8_lossy(&worktrees.stdout)
+        .lines()
+        .filter(|line| line.starts_with("worktree "))
+        .count();
+    assert_eq!(
+        worktree_count, 2,
+        "parallel branches must not add worktrees"
+    );
+
+    let commit_count = std::process::Command::new("git")
+        .args(["rev-list", "--count", &format!("{base_sha}..HEAD")])
+        .current_dir(&worktree_path)
+        .output()
+        .unwrap();
+    assert!(commit_count.status.success());
+    let commit_count: usize = String::from_utf8_lossy(&commit_count.stdout)
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        (1..=2).contains(&commit_count),
+        "only run-level parallel/fan-in checkpoints should be committed, got {commit_count}"
+    );
+
+    // 10. Verify lifecycle events without parallel Git/worktree events.
     let events = events.lock().unwrap();
     let parallel_started: Vec<_> = events
         .iter()
@@ -10991,6 +10949,13 @@ async fn parallel_git_branching_host_e2e() {
         parallel_completed.len(),
         1,
         "should have exactly one ParallelCompleted event"
+    );
+    assert!(
+        events.iter().all(|event| !matches!(
+            event.event_name(),
+            "git.branch" | "git.worktree.added" | "git.worktree.removed"
+        )),
+        "parallel execution must not emit Git branch or worktree lifecycle events"
     );
 
     // Cleanup

@@ -20,7 +20,6 @@ use crate::handler::HandlerRegistry;
 use crate::interview_runtime::RunInterviewBlocker;
 use crate::run_metadata::{RunMetadataRuntime, RunMetadataWriterHandle};
 use crate::runtime_store::RunStoreHandle;
-use crate::sandbox_git::GitState;
 use crate::sandbox_git_runtime::SandboxGitRuntime;
 use crate::workflow_bundle::WorkflowBundle;
 
@@ -225,48 +224,29 @@ impl RunServices {
 }
 
 /// Services available only while executing workflow nodes.
+#[derive(Clone)]
 pub struct EngineServices {
-    pub run:              Arc<RunServices>,
-    pub registry:         Arc<HandlerRegistry>,
-    pub interviewer:      Arc<dyn Interviewer>,
-    /// Git state for the current run. Set via `set_git_state` at the start of
-    /// `execute` and read by parallel/fan-in handlers.
-    pub(crate) git_state: std::sync::RwLock<Option<Arc<GitState>>>,
+    pub run:             Arc<RunServices>,
+    pub registry:        Arc<HandlerRegistry>,
+    pub interviewer:     Arc<dyn Interviewer>,
     /// Environment variables from `[sandbox.env]` config.
-    pub base_env:         HashMap<String, String>,
+    pub base_env:        HashMap<String, String>,
     /// GitHub token source used to inject `GITHUB_TOKEN` at the point of use.
-    pub github_token:     Option<Arc<GitHubTokenSource>>,
+    pub github_token:    Option<Arc<GitHubTokenSource>>,
     /// Typed values from `[run.inputs]`, available to prompt templates.
-    pub inputs:           HashMap<String, toml::Value>,
+    pub inputs:          HashMap<String, toml::Value>,
     /// When true, handlers should skip real execution and return simulated
     /// results.
-    pub dry_run:          bool,
+    pub dry_run:         bool,
     /// Manifest path of the current workflow when running from a bundle.
-    pub workflow_path:    Option<ManifestPath>,
+    pub workflow_path:   Option<ManifestPath>,
     /// Bundled workflows available for child-workflow resolution.
-    pub workflow_bundle:  Option<Arc<WorkflowBundle>>,
+    pub workflow_bundle: Option<Arc<WorkflowBundle>>,
 }
 
 impl EngineServices {
     pub async fn env_for_stage(&self) -> anyhow::Result<HashMap<String, String>> {
         resolve_workflow_env(&self.base_env, self.github_token.as_ref()).await
-    }
-
-    /// Read the current git state (if any).
-    pub fn git_state(&self) -> Option<Arc<GitState>> {
-        self.git_state
-            .read()
-            .expect("git_state lock is never poisoned: no code panics while holding this lock")
-            .clone()
-    }
-
-    /// Set the git state for the current run.
-    pub fn set_git_state(&self, state: Option<Arc<GitState>>) {
-        *self
-            .git_state
-            .write()
-            .expect("git_state lock is never poisoned: no code panics while holding this lock") =
-            state;
     }
 
     /// Test-only default: empty registry and cross-phase services.
@@ -343,7 +323,6 @@ impl EngineServices {
             ),
             registry:        Arc::new(HandlerRegistry::new(Box::new(start::StartHandler))),
             interviewer:     Arc::new(fabro_interview::AutoApproveInterviewer::engine()),
-            git_state:       std::sync::RwLock::new(None),
             base_env:        HashMap::new(),
             github_token:    None,
             inputs:          HashMap::new(),

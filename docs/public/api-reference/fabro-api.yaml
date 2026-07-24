@@ -8329,6 +8329,20 @@ components:
           description: Cost per million cached input tokens in USD.
           example: 1.50
 
+    ModelControls:
+      description: Request-control values accepted by a provider/model offering.
+      type: object
+      required:
+        - reasoning_effort
+      properties:
+        reasoning_effort:
+          type: array
+          description: >-
+            Exact reasoning-effort values accepted by this offering. An empty
+            array means the request control is unsupported.
+          items:
+            $ref: "#/components/schemas/ReasoningEffort"
+
     Model:
       description: |
         One provider's offering of an LLM model. The `id` is unique within
@@ -8343,6 +8357,7 @@ components:
         - training
         - knowledge_cutoff
         - features
+        - controls
         - costs
         - estimated_output_tps
         - aliases
@@ -8376,6 +8391,8 @@ components:
           example: "May 2025"
         features:
           $ref: "#/components/schemas/ModelFeatures"
+        controls:
+          $ref: "#/components/schemas/ModelControls"
         costs:
           $ref: "#/components/schemas/ModelCosts"
         estimated_output_tps:
@@ -10540,6 +10557,22 @@ components:
           items:
             $ref: "#/components/schemas/StageContextWindowWarning"
 
+    ParallelBranchResult:
+      description: The outcome and isolated context updates from one parallel branch.
+      type: object
+      required:
+        - id
+        - status
+        - context_updates
+      properties:
+        id:
+          type: string
+        status:
+          $ref: "#/components/schemas/StageOutcome"
+        context_updates:
+          type: object
+          additionalProperties: true
+
     StageProjection:
       description: Observable projection data for one workflow stage execution.
       type: object
@@ -10577,8 +10610,8 @@ components:
         parallel_results:
           type: ["array", "null"]
           items:
-            type: object
-          description: Per-branch result objects produced by a parallel stage.
+            $ref: "#/components/schemas/ParallelBranchResult"
+          description: Ordered per-branch results produced by a parallel stage.
         output:
           type: ["string", "null"]
         output_bytes:

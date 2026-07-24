@@ -517,7 +517,9 @@ impl Default for ModelsCommand {
 
 #[cfg(test)]
 mod tests {
-    use fabro_model::{ModelCosts, ModelFeatures, ModelLimits, ReasoningEffortFeature};
+    use fabro_model::{
+        ModelControls, ModelCosts, ModelFeatures, ModelLimits, ReasoningEffortFeature,
+    };
 
     use super::*;
 
@@ -546,6 +548,7 @@ mod tests {
                 cache_control_breakpoints: false,
                 sampling_params:           true,
             },
+            controls: ModelControls::default(),
             costs: ModelCosts {
                 input_cost_per_mtok:       Some(1.0),
                 output_cost_per_mtok:      Some(2.0),
@@ -581,6 +584,7 @@ mod tests {
                 cache_control_breakpoints: false,
                 sampling_params:           true,
             },
+            controls:             ModelControls::default(),
             costs:                ModelCosts {
                 input_cost_per_mtok:       Some(1.0),
                 output_cost_per_mtok:      Some(2.0),

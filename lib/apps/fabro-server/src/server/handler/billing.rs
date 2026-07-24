@@ -5,9 +5,9 @@ use chrono::{DateTime, Utc};
 use fabro_types::{RunProjection, StageHandler, StageProjection, StageState, StageTiming};
 
 use super::super::{
-    ApiError, AppState, BillingByModel, BillingStageRef, IntoResponse, Json, ListResponse,
-    PaginationParams, Path, Query, RequiredUser, Response, Router, RunBilling, RunBillingStage,
-    RunBillingTotals, RunId, State, StatusCode, get, parse_run_id_path, run_stage_from_stage_id,
+    AppState, BillingByModel, BillingStageRef, IntoResponse, Json, ListResponse, PaginationParams,
+    Path, Query, RequiredUser, Response, Router, RunBilling, RunBillingStage, RunBillingTotals,
+    RunId, State, StatusCode, get, parse_run_id_path, run_stage_from_stage_id,
 };
 
 pub(super) fn routes() -> Router<Arc<AppState>> {
@@ -27,13 +27,9 @@ async fn list_run_stages(
         Err(response) => return response,
     };
 
-    let cached = match state.stores.runs.get_cached_run(&id).await {
-        Ok(Some(cached)) => cached,
-        Ok(None) => return ApiError::not_found("Run not found.").into_response(),
-        Err(err) => {
-            return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
-                .into_response();
-        }
+    let cached = match state.cached_run(&id).await {
+        Ok(cached) => cached,
+        Err(err) => return err.into_response(),
     };
     let projection = cached.projection;
 
@@ -70,13 +66,9 @@ async fn get_run_billing(
     State(state): State<Arc<AppState>>,
     Path(id): Path<RunId>,
 ) -> Response {
-    let cached = match state.stores.runs.get_cached_run(&id).await {
-        Ok(Some(cached)) => cached,
-        Ok(None) => return ApiError::not_found("Run not found.").into_response(),
-        Err(err) => {
-            return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
-                .into_response();
-        }
+    let cached = match state.cached_run(&id).await {
+        Ok(cached) => cached,
+        Err(err) => return err.into_response(),
     };
     let projection = cached.projection;
 

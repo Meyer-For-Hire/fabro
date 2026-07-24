@@ -258,6 +258,54 @@ reasoning = false
     }
 
     #[test]
+    fn validate_rejects_join_policy_on_any_node() {
+        let mut g = minimal_valid_graph();
+
+        let mut fork = Node::new("fork");
+        fork.attrs.insert(
+            "shape".to_string(),
+            AttrValue::String("component".to_string()),
+        );
+        fork.attrs.insert(
+            "join_policy".to_string(),
+            AttrValue::String("wait_all".to_string()),
+        );
+        g.nodes.insert("fork".to_string(), fork);
+
+        let mut custom = Node::new("custom");
+        custom.attrs.insert(
+            "type".to_string(),
+            AttrValue::String("custom.handler".to_string()),
+        );
+        custom.attrs.insert(
+            "join_policy".to_string(),
+            AttrValue::String("first_success".to_string()),
+        );
+        g.nodes.insert("custom".to_string(), custom);
+
+        let diagnostics = validate(&g, &[]);
+        let removed = diagnostics
+            .iter()
+            .filter(|d| d.rule == "join_policy_removed")
+            .collect::<Vec<_>>();
+
+        assert_eq!(removed.len(), 2, "diagnostics: {diagnostics:?}");
+        assert!(removed.iter().all(|d| d.severity == Severity::Error));
+        assert!(
+            removed
+                .iter()
+                .all(|d| d.message.contains("Remove 'join_policy'"))
+        );
+        assert_eq!(
+            removed
+                .iter()
+                .filter_map(|d| d.node_id.as_deref())
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from(["custom", "fork"]),
+        );
+    }
+
+    #[test]
     fn validate_or_raise_fails_for_missing_start() {
         let mut g = Graph::new("test");
         let mut exit = Node::new("exit");

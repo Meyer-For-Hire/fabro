@@ -20,9 +20,9 @@ pub mod types {
     };
     pub use fabro_environment::Environment;
     pub use fabro_model::{
-        CostSource, Model, ModelCosts, ModelFeatures, ModelLimits, ModelRef as BillingModelRef,
-        ModelTestMode, Provider, ReasoningEffort, ReasoningEffortFeature, Speed as BillingSpeed,
-        TokenCounts as CompletionUsage,
+        CostSource, Model, ModelControls, ModelCosts, ModelFeatures, ModelLimits,
+        ModelRef as BillingModelRef, ModelTestMode, Provider, ReasoningEffort,
+        ReasoningEffortFeature, Speed as BillingSpeed, TokenCounts as CompletionUsage,
     };
     pub use fabro_types::run_event::AgentSessionActivatedProps;
     pub use fabro_types::settings::run::McpHttpProtocol;
@@ -52,8 +52,8 @@ pub mod types {
         McpServerReplace as ReplaceMcpServerRequest, McpServerStatus, McpServerView as McpServer,
         McpTransportView, Message, PairId, PairMessageId, PairMessageRecord, PairMessageRequest,
         PairRecord, PairStartRequest, PairStatus, PairTarget, PairTranscriptEntry,
-        PairTranscriptResponse, PendingInterviewRecord, PermissionLevel, PreRunPushOutcome,
-        Principal, PullRequest, PullRequestDetails, PullRequestDetailsStatus,
+        PairTranscriptResponse, ParallelBranchResult, PendingInterviewRecord, PermissionLevel,
+        PreRunPushOutcome, Principal, PullRequest, PullRequestDetails, PullRequestDetailsStatus,
         PullRequestDetailsUnavailableReason, PullRequestLink, PullRequestMeta, PullRequestResponse,
         QuestionType, RepositoryRef, Role, Run, RunApproval, RunApprovalState, RunClientProvenance,
         RunEvent, RunEventDetailContentKind, RunEventDetailResponse, RunFailure,
