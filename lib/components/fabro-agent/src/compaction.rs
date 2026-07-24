@@ -2,6 +2,7 @@ use std::fmt::Write;
 
 use fabro_llm::client::Client;
 use fabro_llm::types::{Message as LlmMessage, Request};
+use fabro_model::Model;
 use tracing::debug;
 
 use crate::agent_profile::AgentProfile;
@@ -12,6 +13,15 @@ use crate::history::History;
 use crate::types::{AgentEvent, Message};
 
 const APPROX_CHARS_PER_TOKEN: usize = 4;
+
+/// Output budget for the visible summary text itself.
+const SUMMARY_MAX_TOKENS: i64 = 4096;
+
+/// Extra output budget for models that reason on every request. `max_tokens`
+/// bounds reasoning *plus* visible output, so a reasoning model handed only
+/// `SUMMARY_MAX_TOKENS` can spend the whole budget thinking and return a
+/// successful response with empty content — a silently empty summary.
+const REASONING_HEADROOM_TOKENS: i64 = 16_384;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
@@ -122,6 +132,8 @@ function names, error messages, and exact values. Omit pleasantries and conversa
 {file_ops_section}"
     );
 
+    let max_tokens = summary_max_tokens(provider_profile.catalog_model());
+
     let summary_request = Request {
         model:            provider_profile.model().to_string(),
         messages:         vec![
@@ -136,7 +148,7 @@ function names, error messages, and exact values. Omit pleasantries and conversa
         response_format:  None,
         temperature:      None,
         top_p:            None,
-        max_tokens:       Some(4096),
+        max_tokens:       Some(max_tokens),
         stop_sequences:   None,
         reasoning_effort: None,
         speed:            None,
@@ -152,7 +164,7 @@ function names, error messages, and exact values. Omit pleasantries and conversa
     let summary_text = response.text();
     debug!(
         summary_len = summary_text.len(),
-        "Compaction summary generated"
+        max_tokens, "Compaction summary generated"
     );
     let summary_content = format!(
         "A different assistant began this task and produced the following summary. \
@@ -170,6 +182,28 @@ Build on their progress — do not repeat completed steps.\n\n{summary_text}"
     });
 
     Ok(())
+}
+
+/// Output budget for the summarization request.
+///
+/// Compaction runs against the session's own model, so a reasoning session
+/// summarizes with reasoning enabled and the budget has to cover the thinking
+/// as well as the summary. Models that reason unconditionally get headroom on
+/// top of the summary allowance, capped at the model's own `max_output`.
+///
+/// A model only reasons here when its endpoint reasons without being asked:
+/// `always_adaptive` models think natively, and `levels` models get thinking
+/// enabled by default (adaptive thinking injected by the Anthropic codec, the
+/// provider's default effort on OpenAI-style routes). Compaction never sends a
+/// `reasoning_effort`, so models without an effort feature stay non-reasoning
+/// on this path and keep the plain summary budget.
+fn summary_max_tokens(model: Option<&Model>) -> i64 {
+    let Some(model) = model.filter(|m| m.supports_reasoning_effort()) else {
+        return SUMMARY_MAX_TOKENS;
+    };
+
+    let budget = SUMMARY_MAX_TOKENS.saturating_add(REASONING_HEADROOM_TOKENS);
+    model.max_output().map_or(budget, |limit| budget.min(limit))
 }
 
 pub(crate) fn estimate_active_context_usage(
@@ -301,6 +335,10 @@ mod tests {
     use std::time::SystemTime;
 
     use fabro_llm::types::{TokenCounts, ToolCall, ToolResult};
+    use fabro_model::{
+        Catalog, ModelControls, ModelCosts, ModelFeatures, ModelId, ModelLimits, ProviderId,
+        ReasoningEffortFeature,
+    };
 
     use super::*;
     use crate::event::Emitter;
@@ -308,6 +346,101 @@ mod tests {
     use crate::test_support::TestProfile;
     use crate::tool_registry::ToolRegistry;
     use crate::types::Message;
+
+    fn anthropic_model(id: &str) -> &'static Model {
+        Catalog::builtin()
+            .get_on_provider(&ProviderId::anthropic(), id)
+            .unwrap_or_else(|| panic!("{id} missing from builtin catalog"))
+    }
+
+    /// A model that reasons unconditionally but caps output below the budget
+    /// compaction would otherwise ask for.
+    fn small_output_reasoning_model(max_output: i64) -> Model {
+        Model {
+            id:                   ModelId::new("small-output-reasoner"),
+            provider:             ProviderId::anthropic(),
+            family:               "test".into(),
+            display_name:         "Small Output Reasoner".into(),
+            limits:               ModelLimits {
+                context_window: 200_000,
+                max_output:     Some(max_output),
+            },
+            training:             None,
+            knowledge_cutoff:     None,
+            features:             ModelFeatures {
+                tools:                     true,
+                vision:                    false,
+                reasoning:                 true,
+                reasoning_effort:          ReasoningEffortFeature::AlwaysAdaptive,
+                prompt_cache:              false,
+                cache_control_breakpoints: false,
+                sampling_params:           false,
+            },
+            controls:             ModelControls::default(),
+            costs:                ModelCosts {
+                input_cost_per_mtok:       None,
+                output_cost_per_mtok:      None,
+                cache_input_cost_per_mtok: None,
+            },
+            estimated_output_tps: None,
+            aliases:              vec![],
+            default:              false,
+            small_default:        false,
+            configured:           false,
+        }
+    }
+
+    #[test]
+    fn summary_budget_without_catalog_model_is_summary_allowance() {
+        assert_eq!(summary_max_tokens(None), 4096);
+        // The default agent test profile has no catalog behind it.
+        assert_eq!(summary_max_tokens(TestProfile::new().catalog_model()), 4096);
+    }
+
+    #[test]
+    fn summary_budget_for_non_reasoning_model_is_summary_allowance() {
+        // claude-haiku-4-5: reasoning = false.
+        assert_eq!(
+            summary_max_tokens(Some(anthropic_model("claude-haiku-4-5"))),
+            4096
+        );
+    }
+
+    #[test]
+    fn summary_budget_for_model_without_effort_feature_is_summary_allowance() {
+        // claude-sonnet-4-5 reasons only when a request asks for it, and
+        // compaction never sends a reasoning effort.
+        let model = anthropic_model("claude-sonnet-4-5");
+        assert!(model.supports_reasoning());
+        assert!(!model.supports_reasoning_effort());
+        assert_eq!(summary_max_tokens(Some(model)), 4096);
+    }
+
+    #[test]
+    fn summary_budget_for_always_adaptive_model_adds_reasoning_headroom() {
+        let model = anthropic_model("claude-fable-5");
+        assert_eq!(
+            model.features.reasoning_effort,
+            ReasoningEffortFeature::AlwaysAdaptive
+        );
+        assert_eq!(summary_max_tokens(Some(model)), 4096 + 16_384);
+    }
+
+    #[test]
+    fn summary_budget_for_effort_levels_model_adds_reasoning_headroom() {
+        let model = anthropic_model("claude-opus-5");
+        assert_eq!(
+            model.features.reasoning_effort,
+            ReasoningEffortFeature::Levels
+        );
+        assert_eq!(summary_max_tokens(Some(model)), 4096 + 16_384);
+    }
+
+    #[test]
+    fn summary_budget_never_exceeds_model_max_output() {
+        let model = small_output_reasoning_model(8_192);
+        assert_eq!(summary_max_tokens(Some(&model)), 8_192);
+    }
 
     #[test]
     fn render_turns_produces_labeled_text() {
