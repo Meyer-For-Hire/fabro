@@ -1,6 +1,9 @@
 use std::fmt::{self, Write};
+use std::ops::Range;
 
 use fabro_types::{RunBlobId, RunId, SessionId};
+
+pub(crate) const MAX_EVENT_SEQ: u32 = 999_999;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct SlateKey(String);
@@ -20,6 +23,13 @@ impl SlateKey {
 
     pub(crate) fn into_prefix(mut self) -> Self {
         self.0.push(Self::SEP);
+        self
+    }
+
+    /// Exclusive end bound of this key's prefix keyspace: every key under
+    /// `self.into_prefix()` sorts below it and no other key sorts between.
+    fn into_prefix_end(mut self) -> Self {
+        self.0.push('\u{1}');
         self
     }
 
@@ -52,6 +62,10 @@ pub(crate) fn run_events_prefix(run_id: &RunId) -> SlateKey {
         .into_prefix()
 }
 
+// Sequence keys zero-pad `seq` to six digits so lexicographic key order
+// matches numeric seq order through `MAX_EVENT_SEQ`. Seek-based event listing
+// (`run_events_range`) depends on this invariant, so event allocation rejects
+// larger sequences.
 pub(crate) fn run_event_key(run_id: &RunId, seq: u32, epoch_ms: i64) -> SlateKey {
     SlateKey::new("runs")
         .with(run_id)
@@ -64,6 +78,17 @@ pub(crate) fn run_event_seq_prefix(run_id: &RunId, seq: u32) -> SlateKey {
         .with(run_id)
         .with("events")
         .with(format!("{seq:06}-"))
+}
+
+/// Scan range covering the run's event keys from `start_seq` to the end of
+/// the run's event namespace, so seek-based listing never touches keys of
+/// other runs or namespaces.
+pub(crate) fn run_events_range(run_id: &RunId, start_seq: u32) -> Range<SlateKey> {
+    let end = SlateKey::new("runs")
+        .with(run_id)
+        .with("events")
+        .into_prefix_end();
+    run_event_seq_prefix(run_id, start_seq)..end
 }
 
 pub(crate) fn blobs_prefix() -> SlateKey {
@@ -150,6 +175,24 @@ mod tests {
         let key = run_event_key(&run_id, 7, 123);
         let leaf = SlateKey::segments(key.as_str()).last().unwrap();
         assert_eq!(leaf, "000007-123");
+    }
+
+    #[test]
+    fn run_events_range_bounds_the_event_namespace() {
+        let run_id: RunId = "01JT56VE4Z5NZ814GZN2JZD65A".parse().unwrap();
+        let range = run_events_range(&run_id, 2);
+        let contains = |key: &SlateKey| {
+            range.start.as_ref() <= key.as_ref() && key.as_ref() < range.end.as_ref()
+        };
+
+        assert!(!contains(&run_event_key(&run_id, 1, 123)));
+        assert!(contains(&run_event_key(&run_id, 2, 123)));
+        assert!(contains(&run_event_key(&run_id, MAX_EVENT_SEQ, 123)));
+        // Sibling namespaces of the same run sort outside the range.
+        assert!(!contains(&SlateKey::new("runs").with(run_id).with("state")));
+        assert!(!contains(
+            &session_by_id_key(&fabro_types::SessionId::new())
+        ));
     }
 
     #[test]

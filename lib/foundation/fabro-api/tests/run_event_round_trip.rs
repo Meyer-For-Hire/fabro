@@ -251,6 +251,65 @@ fn run_event_round_trips_stage_started() {
 }
 
 #[test]
+fn run_event_round_trips_parallel_public_contracts() {
+    assert_run_event_round_trip(json!({
+        "id": "evt_parallel_started",
+        "ts": "2026-04-29T12:02:00Z",
+        "run_id": fixtures::RUN_1,
+        "event": "parallel.started",
+        "node_id": "fanout",
+        "node_label": "Fanout",
+        "parallel_group_id": "fanout@2",
+        "properties": {
+            "visit": 2,
+            "branch_count": 2
+        }
+    }));
+    assert_run_event_round_trip(json!({
+        "id": "evt_parallel_branch_completed",
+        "ts": "2026-04-29T12:02:01Z",
+        "run_id": fixtures::RUN_1,
+        "event": "parallel.branch.completed",
+        "node_id": "review_api",
+        "node_label": "Review API",
+        "parallel_group_id": "fanout@2",
+        "parallel_branch_id": "fanout@2:0",
+        "properties": {
+            "index": 0,
+            "duration_ms": 1000,
+            "status": "succeeded"
+        }
+    }));
+    assert_run_event_round_trip(json!({
+        "id": "evt_parallel_completed",
+        "ts": "2026-04-29T12:02:02Z",
+        "run_id": fixtures::RUN_1,
+        "event": "parallel.completed",
+        "node_id": "fanout",
+        "node_label": "Fanout",
+        "parallel_group_id": "fanout@2",
+        "properties": {
+            "visit": 2,
+            "duration_ms": 2000,
+            "success_count": 1,
+            "failure_count": 1,
+            "results": [
+                {
+                    "id": "review_api",
+                    "status": "succeeded",
+                    "context_updates": {"response.review_api": "looks good"}
+                },
+                {
+                    "id": "review_ux",
+                    "status": "failed",
+                    "context_updates": {}
+                }
+            ]
+        }
+    }));
+}
+
+#[test]
 fn run_event_round_trips_agent_tool_started() {
     let value = json!({
         "id": "evt_tool_started",

@@ -14,7 +14,28 @@
 
 
 
+/**
+ * Five disjoint token buckets for one completion. `input_tokens` excludes cache reads and writes, while `output_tokens` excludes reasoning tokens when the provider reports them separately.
+ */
 export interface CompletionUsage {
+    /**
+     * Number of uncached input tokens consumed.
+     */
     'input_tokens': number;
+    /**
+     * Number of non-reasoning output tokens generated.
+     */
     'output_tokens': number;
+    /**
+     * Number of separately reported reasoning tokens.
+     */
+    'reasoning_tokens': number;
+    /**
+     * Number of input tokens served from a provider cache.
+     */
+    'cache_read_tokens': number;
+    /**
+     * Number of input tokens written to a provider cache.
+     */
+    'cache_write_tokens': number;
 }

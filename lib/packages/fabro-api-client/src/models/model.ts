@@ -15,6 +15,9 @@
 
 // May contain unused imports in some cases
 // @ts-ignore
+import type { ModelControls } from './model-controls';
+// May contain unused imports in some cases
+// @ts-ignore
 import type { ModelCosts } from './model-costs';
 // May contain unused imports in some cases
 // @ts-ignore
@@ -53,6 +56,7 @@ export interface Model {
      */
     'knowledge_cutoff': string | null;
     'features': ModelFeatures;
+    'controls': ModelControls;
     'costs': ModelCosts;
     /**
      * Estimated output tokens per second.

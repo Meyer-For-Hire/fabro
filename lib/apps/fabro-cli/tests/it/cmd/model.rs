@@ -108,6 +108,9 @@ fn list_with_filters_renders_server_models_table() {
                                 "vision": false,
                                 "reasoning": false
                             },
+                            "controls": {
+                                "reasoning_effort": []
+                            },
                             "costs": {
                                 "input_cost_per_mtok": 1.2,
                                 "output_cost_per_mtok": 3.4,
@@ -133,6 +136,9 @@ fn list_with_filters_renders_server_models_table() {
                                 "tools": false,
                                 "vision": true,
                                 "reasoning": true
+                            },
+                            "controls": {
+                                "reasoning_effort": []
                             },
                             "costs": {
                                 "input_cost_per_mtok": null,
@@ -206,6 +212,9 @@ fn list_uses_configured_server_target_without_server_flag() {
                             "vision": false,
                             "reasoning": false
                         },
+                        "controls": {
+                            "reasoning_effort": []
+                        },
                         "costs": {
                             "input_cost_per_mtok": 1.0,
                             "output_cost_per_mtok": 2.0,
@@ -259,6 +268,9 @@ fn list_uses_fabro_config_for_machine_settings() {
                             "tools": true,
                             "vision": false,
                             "reasoning": false
+                        },
+                        "controls": {
+                            "reasoning_effort": []
                         },
                         "costs": {
                             "input_cost_per_mtok": 1.0,

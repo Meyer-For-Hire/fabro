@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use fabro_types::run_event::{
@@ -26,7 +27,9 @@ use crate::{Error, EventEnvelope, Result};
 #[derive(Debug, Clone, Default)]
 pub(crate) struct EventProjectionCache {
     pub last_seq: u32,
-    pub state:    Option<RunProjection>,
+    // Arc-shared with the shared projection cache so opening a run does not
+    // deep-copy the projection; mutated copy-on-write via `Arc::make_mut`.
+    pub state:    Option<Arc<RunProjection>>,
 }
 
 pub trait RunProjectionReducer {
@@ -548,13 +551,10 @@ impl RunProjectionReducer for RunProjection {
                 )?;
             }
             EventBody::ParallelCompleted(props) => {
-                let parallel_results = serde_json::to_value(&props.results).map_err(|err| {
-                    Error::InvalidEvent(format!("invalid parallel.completed payload: {err}"))
-                })?;
                 let Some(stage) = stage_at_stored_or_current_visit(self, stored, event.seq) else {
                     return Ok(());
                 };
-                stage.parallel_results = Some(parallel_results);
+                stage.parallel_results = Some(props.results.clone());
             }
             EventBody::ParallelBranchStarted(props) => {
                 // Branches bypass the engine's StageStarted/StageCompleted
@@ -582,21 +582,17 @@ impl RunProjectionReducer for RunProjection {
                 // A branch never emits its own StageCompleted, so finalize it
                 // here; otherwise the stage spins Running forever after the run
                 // (and the fan-in) is done.
-                let outcome =
-                    StageOutcome::from_str(&props.status).unwrap_or(StageOutcome::Failed {
-                        retry_requested: false,
-                    });
                 let Some(stage) = stage_at_stored_or_current_visit(self, stored, event.seq) else {
                     return Ok(());
                 };
                 stage.completion = Some(StageCompletion {
-                    outcome,
-                    notes: None,
+                    outcome:        props.status,
+                    notes:          None,
                     failure_reason: None,
-                    timestamp: ts,
+                    timestamp:      ts,
                 });
                 stage.timing = Some(fabro_types::StageTiming::wall_only(props.duration_ms));
-                stage.state = StageState::from(outcome);
+                stage.state = StageState::from(props.status);
                 stage.agent_control = AgentControlState::Running;
             }
             EventBody::TodoCreated(props) => {
@@ -2172,8 +2168,7 @@ mod tests {
                 EventBody::ParallelBranchCompleted(ParallelBranchCompletedProps {
                     index:       0,
                     duration_ms: 1234,
-                    status:      "succeeded".to_string(),
-                    head_sha:    None,
+                    status:      StageOutcome::Succeeded,
                 }),
                 branch.clone(),
             ))
@@ -2210,8 +2205,9 @@ mod tests {
                 EventBody::ParallelBranchCompleted(ParallelBranchCompletedProps {
                     index:       0,
                     duration_ms: 500,
-                    status:      "failed".to_string(),
-                    head_sha:    None,
+                    status:      StageOutcome::Failed {
+                        retry_requested: false,
+                    },
                 }),
                 branch.clone(),
             ))

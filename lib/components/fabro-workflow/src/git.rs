@@ -74,60 +74,6 @@ pub fn head_sha(repo: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// Create a new branch at HEAD without checking it out.
-pub fn create_branch(repo: &Path, name: &str) -> Result<()> {
-    let output = git_cmd(repo)
-        .args(["branch", "--force", name, "HEAD"])
-        .output()
-        .map_err(|e| Error::engine_with_source("git branch failed", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(git_error(format!("git branch failed: {stderr}")));
-    }
-
-    Ok(())
-}
-
-/// Add a git worktree for the given branch at `path`.
-pub fn add_worktree(repo: &Path, path: &Path, branch: &str) -> Result<()> {
-    let output = git_cmd(repo)
-        .args(["worktree", "add"])
-        .arg(path)
-        .arg(branch)
-        .output()
-        .map_err(|e| Error::engine_with_source("git worktree add failed", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(git_error(format!("git worktree add failed: {stderr}")));
-    }
-
-    Ok(())
-}
-
-/// Remove a git worktree.
-pub fn remove_worktree(repo: &Path, path: &Path) -> Result<()> {
-    let output = git_cmd(repo)
-        .args(["worktree", "remove", "--force"])
-        .arg(path)
-        .output()
-        .map_err(|e| Error::engine_with_source("git worktree remove failed", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(git_error(format!("git worktree remove failed: {stderr}")));
-    }
-
-    Ok(())
-}
-
-/// Remove any stale worktree at `path` (best-effort), then add a fresh one.
-pub fn replace_worktree(repo: &Path, path: &Path, branch: &str) -> Result<()> {
-    let _ = remove_worktree(repo, path);
-    add_worktree(repo, path, branch)
-}
-
 /// Run a `git push` command and check for success.
 fn run_git_push(cmd: &mut Command) -> Result<()> {
     let output = cmd
@@ -313,23 +259,6 @@ pub fn sync_status(repo: &Path, remote: &str, branch: Option<&str>) -> GitSyncSt
     }
 }
 
-/// Sanitize a string for use as a git ref component.
-/// Lowercases, replaces non-alphanumeric chars with dashes, collapses runs.
-pub fn sanitize_ref_component(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut prev_dash = false;
-    for c in s.chars() {
-        if c.is_ascii_alphanumeric() {
-            result.push(c.to_ascii_lowercase());
-            prev_dash = false;
-        } else if !prev_dash {
-            result.push('-');
-            prev_dash = true;
-        }
-    }
-    result.trim_matches('-').to_string()
-}
-
 /// Filenames allowed in per-node directories on the shadow branch.
 #[cfg(test)]
 #[expect(
@@ -414,39 +343,6 @@ mod tests {
         let sha = head_sha(dir.path()).unwrap();
         assert_eq!(sha.len(), 40);
         assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
-    }
-
-    #[test]
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "This synchronous test verifies git branch listing against the real git CLI."
-    )]
-    fn create_branch_and_list() {
-        let dir = tempfile::tempdir().unwrap();
-        init_repo(dir.path());
-        create_branch(dir.path(), "test-branch").unwrap();
-
-        let output = Command::new("git")
-            .args(["branch", "--list", "test-branch"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("test-branch"));
-    }
-
-    #[test]
-    fn add_and_remove_worktree() {
-        let dir = tempfile::tempdir().unwrap();
-        init_repo(dir.path());
-        create_branch(dir.path(), "wt-branch").unwrap();
-
-        let wt_path = dir.path().join("my-worktree");
-        add_worktree(dir.path(), &wt_path, "wt-branch").unwrap();
-        assert!(wt_path.join(".git").exists());
-
-        remove_worktree(dir.path(), &wt_path).unwrap();
-        assert!(!wt_path.exists());
     }
 
     #[tokio::test]
@@ -550,7 +446,11 @@ mod tests {
             duration_ms:   100,
             success_count: 1,
             failure_count: 0,
-            results:       vec![serde_json::json!({"id": "a"})],
+            results:       vec![fabro_types::ParallelBranchResult {
+                id:              "a".to_string(),
+                status:          fabro_types::StageOutcome::Succeeded,
+                context_updates: std::collections::BTreeMap::new(),
+            }],
         })
         .await
         .unwrap();
@@ -588,44 +488,6 @@ mod tests {
         assert!(paths.contains(&"stages/001-work@2/script_invocation.json"));
         assert!(paths.contains(&"stages/001-work@2/script_timing.json"));
         assert!(paths.contains(&"stages/001-work@2/parallel_results.json"));
-    }
-
-    #[test]
-    fn sanitize_ref_component_lowercases() {
-        assert_eq!(sanitize_ref_component("Hello"), "hello");
-    }
-
-    #[test]
-    fn sanitize_ref_component_replaces_special_chars() {
-        assert_eq!(sanitize_ref_component("a/b:c d"), "a-b-c-d");
-    }
-
-    #[test]
-    fn sanitize_ref_component_collapses_consecutive_dashes() {
-        assert_eq!(sanitize_ref_component("a///b"), "a-b");
-    }
-
-    #[test]
-    fn sanitize_ref_component_trims_leading_trailing_dashes() {
-        assert_eq!(sanitize_ref_component("--abc--"), "abc");
-    }
-
-    #[test]
-    fn sanitize_ref_component_mixed() {
-        assert_eq!(sanitize_ref_component("My Node!@#123"), "my-node-123");
-    }
-
-    #[test]
-    fn replace_worktree_on_clean_path() {
-        let dir = tempfile::tempdir().unwrap();
-        init_repo(dir.path());
-        create_branch(dir.path(), "rw-branch").unwrap();
-
-        let wt_path = dir.path().join("rw-worktree");
-        replace_worktree(dir.path(), &wt_path, "rw-branch").unwrap();
-        assert!(wt_path.join(".git").exists());
-
-        remove_worktree(dir.path(), &wt_path).unwrap();
     }
 
     #[test]

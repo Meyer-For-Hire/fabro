@@ -1,59 +1,45 @@
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::Path;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use async_trait::async_trait;
-use fabro_agent::{Sandbox, WorktreeOptions, WorktreeSandbox};
 use fabro_graphviz::graph::{AttrValue, Graph, Node};
 use fabro_hooks::{HookContext, HookEvent};
-use fabro_types::{ParallelBranchId, RunId, StageId};
+use fabro_types::{ParallelBranchId, ParallelBranchResult, StageId, StageOutcome};
+use futures::FutureExt;
 use tokio::sync::Semaphore;
+use tokio::task::JoinHandle;
 
 use super::{EngineServices, Handler};
-use crate::context::{Context, ParallelBranchPreamble, WorkflowContext, keys};
+use crate::context::{Context, ParallelBranchPreamble, WorkflowContext, context_diff_public, keys};
 use crate::error::Error;
-use crate::event::{Event, RunNoticeCode, RunNoticeLevel, StageScope};
-use crate::git::sanitize_ref_component;
+use crate::event::{Emitter, Event, RunNoticeCode, RunNoticeLevel, StageScope};
 use crate::hook_context::set_hook_node;
-use crate::millis_u64;
-use crate::outcome::{FailureCategory, FailureDetail, Outcome, OutcomeExt, StageOutcome};
+use crate::outcome::{FailureCategory, FailureDetail, Outcome, OutcomeExt};
 use crate::run_dir::visit_from_context;
-use crate::sandbox_git::{
-    GIT_REMOTE, checked_git_checkpoint, git_merge_ff_only, git_remove_worktree,
-};
+use crate::{artifact, millis_u64};
 
 /// Fans out execution to multiple branches concurrently.
-/// Each branch gets an isolated context clone and runs independently.
+/// Each branch gets an isolated context fork and shares the run sandbox.
 pub struct ParallelHandler;
 
-/// Parse join policy from node attributes.
-#[derive(Debug, Clone)]
-enum JoinPolicy {
-    WaitAll,
-    FirstSuccess,
-}
-
-impl std::fmt::Display for JoinPolicy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::WaitAll => write!(f, "wait_all"),
-            Self::FirstSuccess => write!(f, "first_success"),
-        }
-    }
-}
-
-fn parse_join_policy(raw: &str) -> JoinPolicy {
-    if raw == "first_success" {
-        return JoinPolicy::FirstSuccess;
-    }
-    JoinPolicy::WaitAll
-}
-
 struct BranchResult {
-    id:            String,
-    outcome:       Outcome,
-    head_sha:      Option<String>,
-    worktree_path: Option<PathBuf>,
+    result:  ParallelBranchResult,
+    outcome: Outcome,
+}
+
+struct BranchDispatch {
+    index:     usize,
+    target_id: String,
+    branch_id: ParallelBranchId,
+    /// Scope reserved by the branch task right before its
+    /// `ParallelBranchStarted` becomes observable. Empty when the branch was
+    /// cancelled or failed before starting — no events exist to pair a
+    /// completion with, and emitting one under a guessed ordinal would
+    /// resurrect a prior execution's stage.
+    scope:     Arc<OnceLock<StageScope>>,
+    handle:    JoinHandle<Result<BranchResult, Error>>,
 }
 
 /// Parse the per-branch preamble stash produced by `FidelityLifecycle`.
@@ -91,58 +77,7 @@ impl Handler for ParallelHandler {
         run_dir: &Path,
         services: &EngineServices,
     ) -> Result<Outcome, Error> {
-        let branches = graph.outgoing_edges(&node.id);
-        if branches.is_empty() {
-            return Ok(Outcome::fail_classify("No branches for parallel node"));
-        }
-
-        // Dispatch each branch child via dispatch_handler (which will call simulate)
-        let mut branch_results: Vec<BranchResult> = Vec::new();
-        for edge in &branches {
-            let target_id = &edge.to;
-            if let Some(target_node) = graph.nodes.get(target_id) {
-                let handler = services.registry.resolve(target_node);
-                let branch_context = context.fork();
-                let outcome = super::dispatch_handler(
-                    handler,
-                    target_node,
-                    &branch_context,
-                    graph,
-                    run_dir,
-                    services,
-                )
-                .await?;
-                branch_results.push(BranchResult {
-                    id: target_id.clone(),
-                    outcome,
-                    head_sha: None,
-                    worktree_path: None,
-                });
-            }
-        }
-
-        let total = branch_results.len();
-        context.set(keys::PARALLEL_BRANCH_COUNT, serde_json::json!(total));
-
-        let results_json: Vec<serde_json::Value> = branch_results
-            .iter()
-            .map(|r| {
-                serde_json::json!({
-                    "id": r.id,
-                    "status": r.outcome.status.to_string(),
-                })
-            })
-            .collect();
-        context.set(keys::PARALLEL_RESULTS, serde_json::json!(results_json));
-
-        let join_node = find_join_node(&branch_results, graph);
-
-        let mut outcome = Outcome::simulated(&node.id);
-        outcome.notes = Some(format!(
-            "[Simulated] Parallel node dispatched {total} branches"
-        ));
-        outcome.jump_to_node = join_node;
-        Ok(outcome)
+        run_branches(node, context, graph, run_dir, services, true).await
     }
 
     async fn execute(
@@ -153,611 +88,448 @@ impl Handler for ParallelHandler {
         run_dir: &Path,
         services: &EngineServices,
     ) -> Result<Outcome, Error> {
-        // Build per-branch sandboxes (sequentially for git setup)
-        struct BranchSetup {
-            target_id:          String,
-            branch_index:       usize,
-            parallel_branch_id: ParallelBranchId,
-            branch_context:     Context,
-            sandbox:            Arc<dyn Sandbox>,
-            worktree_path:      Option<PathBuf>,
-        }
+        run_branches(node, context, graph, run_dir, services, false).await
+    }
+}
 
-        let parallel_start = Instant::now();
-        let branches = graph.outgoing_edges(&node.id);
-        if branches.is_empty() {
-            return Ok(Outcome::fail_classify("No branches for parallel node"));
-        }
+async fn run_branches(
+    node: &Node,
+    context: &Context,
+    graph: &Graph,
+    run_dir: &Path,
+    services: &EngineServices,
+    simulated: bool,
+) -> Result<Outcome, Error> {
+    let parallel_start = Instant::now();
+    let branches = graph.outgoing_edges(&node.id);
 
-        let join_policy = parse_join_policy(
-            node.attrs
-                .get("join_policy")
-                .and_then(|v| v.as_str())
-                .unwrap_or("wait_all"),
+    let parallel_stage_scope = StageScope::for_handler(context, &node.id);
+    let parallel_group_id = StageId::new(node.id.clone(), parallel_stage_scope.visit);
+    services.run.emitter.emit_scoped(
+        &Event::ParallelStarted {
+            node_id:      node.id.clone(),
+            visit:        parallel_stage_scope.visit,
+            branch_count: branches.len(),
+        },
+        &parallel_stage_scope,
+    );
+    emit_parallel_hook(services, context, graph, node, HookEvent::ParallelStart).await?;
+
+    let max_parallel = node
+        .attrs
+        .get("max_parallel")
+        .and_then(AttrValue::as_i64)
+        .unwrap_or(4);
+    let max_parallel = usize::try_from(max_parallel).unwrap_or(4).max(1);
+    let semaphore = Arc::new(Semaphore::new(max_parallel));
+    let shared_graph = Arc::new(graph.clone());
+    let branch_graph_visit = u32::try_from(visit_from_context(context)).unwrap_or(u32::MAX);
+
+    let branch_preambles = parse_branch_preambles(
+        context.get(keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES),
+        branches.len(),
+    );
+    // Clear the stash before snapshotting so branch contexts never carry the
+    // outer array — a nested parallel branch target must not misread it as
+    // its own. The write-back diff also clears it on the run state.
+    context.set(
+        keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES,
+        serde_json::Value::Null,
+    );
+    let parent_snapshot = Arc::new(context.snapshot());
+
+    let mut dispatches = Vec::with_capacity(branches.len());
+    for (branch_index, edge) in branches.iter().enumerate() {
+        let target_id = edge.to.clone();
+        let parallel_branch_id = ParallelBranchId::new(
+            parallel_group_id.clone(),
+            u32::try_from(branch_index).unwrap_or(u32::MAX),
         );
-
-        let parallel_stage_scope = StageScope::for_handler(context, &node.id);
-        let parallel_group_id = StageId::new(node.id.clone(), parallel_stage_scope.visit);
-
-        services.run.emitter.emit_scoped(
-            &Event::ParallelStarted {
-                node_id:      node.id.clone(),
-                visit:        parallel_stage_scope.visit,
-                branch_count: branches.len(),
-                join_policy:  join_policy.to_string(),
-            },
-            &parallel_stage_scope,
+        let branch_context = Context::from_values(parent_snapshot.as_ref().clone());
+        branch_context.set(
+            keys::INTERNAL_PARALLEL_GROUP_ID,
+            serde_json::Value::String(parallel_group_id.to_string()),
         );
+        branch_context.set(
+            keys::INTERNAL_PARALLEL_BRANCH_ID,
+            serde_json::Value::String(parallel_branch_id.to_string()),
+        );
+        if let Some(entry) = branch_preambles
+            .as_ref()
+            .and_then(|entries| entries.get(branch_index))
+            .and_then(Option::as_ref)
         {
-            let run_id = context
-                .run_id()
-                .parse::<RunId>()
-                .map_err(|err| Error::handler_with_source("invalid internal run_id", err))?;
-            let mut hook_ctx =
-                HookContext::new(HookEvent::ParallelStart, run_id, graph.name.clone());
-            set_hook_node(&mut hook_ctx, node);
-            let _ = services.run.run_hooks(&hook_ctx).await;
-        }
-        let max_parallel = node
-            .attrs
-            .get("max_parallel")
-            .and_then(AttrValue::as_i64)
-            .unwrap_or(4);
-        let max_parallel = usize::try_from(max_parallel).unwrap_or(4).max(1);
-
-        let semaphore = Arc::new(Semaphore::new(max_parallel));
-        let git_state = services.git_state();
-        let branch_graph_visit = u32::try_from(visit_from_context(context)).unwrap_or(u32::MAX);
-
-        // --- Git isolation: checkpoint "parallel base" before fan-out ---
-        let base_sha: Option<String> = if let Some(ref gs) = git_state {
-            let result = checked_git_checkpoint(
-                &services.run.sandbox_git,
-                &*services.run.sandbox,
-                &gs.run_id.to_string(),
-                &node.id,
-                "parallel_base",
-                0,
-                None,
-                &gs.checkpoint,
-                &gs.git_author,
-            )
-            .await;
-            match result {
-                Ok(sha) => Some(sha),
-                Err(e) if e.to_string() == "sandbox git unavailable" => {
-                    return Err(Error::handler_with_source("sandbox git unavailable", e));
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %fabro_sandbox::display_for_log(&e),
-                        "parallel base checkpoint failed"
-                    );
-                    services.run.emitter.notice_with_tail(
-                        RunNoticeLevel::Warn,
-                        RunNoticeCode::ParallelBaseCheckpointFailed,
-                        format!("Could not checkpoint base state before parallel branches: {e}"),
-                        fabro_sandbox::default_redacted_output_tail(&e),
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        let branch_preambles = parse_branch_preambles(
-            context.get(keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES),
-            branches.len(),
-        );
-        // Clear the stash before forking so branch contexts never carry the
-        // outer array — a nested parallel branch target must not misread it as
-        // its own. The write-back diff also clears it on the run state.
-        context.set(
-            keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES,
-            serde_json::Value::Null,
-        );
-        let mut branch_setups: Vec<BranchSetup> = Vec::new();
-        for (branch_index, edge) in branches.iter().enumerate() {
-            let target_id = edge.to.clone();
-            let branch_context = context.fork();
-            let parallel_branch_id = ParallelBranchId::new(
-                parallel_group_id.clone(),
-                u32::try_from(branch_index).unwrap_or(u32::MAX),
+            branch_context.set(
+                keys::CURRENT_PREAMBLE,
+                serde_json::Value::String(entry.preamble.clone()),
             );
             branch_context.set(
-                keys::CURRENT_NODE,
-                serde_json::Value::String(target_id.clone()),
+                keys::INTERNAL_FIDELITY,
+                serde_json::Value::String(entry.fidelity.to_string()),
             );
-            branch_context.set(
-                keys::INTERNAL_PARALLEL_GROUP_ID,
-                serde_json::Value::String(parallel_group_id.to_string()),
-            );
-            branch_context.set(
-                keys::INTERNAL_PARALLEL_BRANCH_ID,
-                serde_json::Value::String(parallel_branch_id.to_string()),
-            );
-            if let Some(entry) = branch_preambles
-                .as_ref()
-                .and_then(|entries| entries.get(branch_index))
-                .and_then(Option::as_ref)
-            {
-                branch_context.set(
-                    keys::CURRENT_PREAMBLE,
-                    serde_json::Value::String(entry.preamble.clone()),
-                );
-                branch_context.set(
-                    keys::INTERNAL_FIDELITY,
-                    serde_json::Value::String(entry.fidelity.to_string()),
-                );
-            }
-
-            let (branch_sandbox, worktree_path): (Arc<dyn Sandbox>, Option<PathBuf>) = if let (
-                Some(ref gs),
-                Some(ref bsha),
-            ) =
-                (&git_state, &base_sha)
-            {
-                let branch_key = &target_id;
-                // `pass{N}` derives from the parent's execution ordinal so a
-                // resumed fan-out does not recreate the prior dispatch's
-                // branch names.
-                let branch_name = format!(
-                    "fabro/run/parallel/{}/{}/pass{}/{}",
-                    gs.run_id,
-                    sanitize_ref_component(&node.id),
-                    parallel_stage_scope.visit,
-                    sanitize_ref_component(branch_key),
-                );
-
-                // Compute worktree path (each sandbox type knows its own path scheme)
-                let wt_path_str = services.run.sandbox.parallel_worktree_path(
-                    run_dir,
-                    &gs.run_id.to_string(),
-                    &node.id,
-                    branch_key,
-                );
-                tracing::debug!(branch = %branch_name, path = %wt_path_str, "Creating worktree for parallel branch");
-
-                // Set up worktree via WorktreeSandbox
-                let wt_config = WorktreeOptions {
-                    branch_name:          branch_name.clone(),
-                    base_sha:             bsha.clone(),
-                    worktree_path:        wt_path_str.clone(),
-                    skip_branch_creation: false,
-                    setup_intent:         None,
-                };
-                let mut wt_sandbox =
-                    WorktreeSandbox::new(Arc::clone(&services.run.sandbox), wt_config);
-                wt_sandbox
-                    .set_event_callback(Arc::clone(&services.run.emitter).worktree_callback());
-                wt_sandbox
-                    .initialize()
-                    .await
-                    .map_err(|e| Error::handler_with_source("worktree setup failed", e))?;
-
-                branch_context.set(keys::INTERNAL_WORK_DIR, serde_json::json!(&wt_path_str));
-
-                let wt_path = PathBuf::from(&wt_path_str);
-                let env: Arc<dyn Sandbox> = Arc::new(wt_sandbox);
-                (env, Some(wt_path))
-            } else {
-                (Arc::clone(&services.run.sandbox), None)
-            };
-
-            branch_setups.push(BranchSetup {
-                target_id,
-                branch_index,
-                parallel_branch_id,
-                branch_context,
-                sandbox: branch_sandbox,
-                worktree_path,
-            });
         }
 
-        // --- Fan out: concurrent execution ---
-        let mut handles = Vec::new();
-        for setup in branch_setups {
-            let parent_run = Arc::clone(&services.run);
-            let registry = Arc::clone(&services.registry);
-            let interviewer = Arc::clone(&services.interviewer);
-            let base_env = services.base_env.clone();
-            let github_token = services.github_token.clone();
-            let inputs = services.inputs.clone();
-            let dry_run = services.dry_run;
-            let workflow_path = services.workflow_path.clone();
-            let workflow_bundle = services.workflow_bundle.clone();
-            let graph = graph.clone();
-            let run_dir = run_dir.to_path_buf();
-            let sem = Arc::clone(&semaphore);
-            let has_git = git_state.is_some();
-            let run_id = git_state.as_ref().map(|gs| gs.run_id);
-            let git_author = git_state
-                .as_ref()
-                .map(|gs| gs.git_author.clone())
-                .unwrap_or_default();
-            let checkpoint = git_state
-                .as_ref()
-                .map(|gs| gs.checkpoint.clone())
-                .unwrap_or_default();
-            let group_id = parallel_group_id.clone();
+        let mut branch_services = services.clone();
+        branch_services.dry_run = simulated || services.dry_run;
+        let parent_snapshot = Arc::clone(&parent_snapshot);
+        let graph = Arc::clone(&shared_graph);
+        let run_dir = run_dir.to_path_buf();
+        let semaphore = Arc::clone(&semaphore);
+        let group_id = parallel_group_id.clone();
+        let reserved_scope = Arc::new(OnceLock::new());
 
-            let handle = tokio::spawn(async move {
-                let _permit = sem
-                    .acquire()
-                    .await
-                    .map_err(|e| Error::handler_with_source("semaphore error", e))?;
-
-                // Only reserve once the branch is ready to become observable.
-                // This avoids consuming an execution identity for worktree
-                // setup failures or branches still waiting on the semaphore.
-                let execution = parent_run
-                    .stage_executions
-                    .reserve(&setup.target_id, branch_graph_visit);
-                setup.branch_context.set(
-                    keys::INTERNAL_STAGE_EXECUTION_ORDINAL,
-                    serde_json::json!(execution.stage_id.visit()),
-                );
-                let branch_scope = StageScope::for_parallel_branch(
-                    setup.target_id.clone(),
-                    execution.stage_id.visit(),
-                    group_id.clone(),
-                    setup.parallel_branch_id.clone(),
-                );
-                parent_run.emitter.emit_scoped(
-                    &Event::ParallelBranchStarted {
-                        parallel_group_id:     group_id.clone(),
-                        parallel_branch_id:    setup.parallel_branch_id.clone(),
-                        branch:                setup.target_id.clone(),
-                        index:                 setup.branch_index,
-                        graph_visit:           Some(execution.graph_visit),
-                        resumed_from_stage_id: execution.resumed_from.clone(),
-                    },
-                    &branch_scope,
-                );
+        dispatches.push(BranchDispatch {
+            index:     branch_index,
+            target_id: target_id.clone(),
+            branch_id: parallel_branch_id.clone(),
+            scope:     Arc::clone(&reserved_scope),
+            handle:    tokio::spawn(async move {
                 let branch_start = Instant::now();
-
-                let Some(target_node) = graph.nodes.get(&setup.target_id) else {
-                    let outcome = Outcome::fail_classify(format!(
-                        "branch target node not found: {}",
-                        setup.target_id
-                    ));
-                    parent_run.emitter.emit_scoped(
-                        &Event::ParallelBranchCompleted {
-                            parallel_group_id:  group_id.clone(),
-                            parallel_branch_id: setup.parallel_branch_id.clone(),
-                            branch:             setup.target_id.clone(),
-                            index:              setup.branch_index,
-                            duration_ms:        millis_u64(branch_start.elapsed()),
-                            status:             "failed".to_string(),
-                            head_sha:           None,
+                let task = async {
+                    let permit = semaphore.acquire();
+                    tokio::pin!(permit);
+                    let cancel_token = branch_services.run.cancel_token();
+                    let _permit = tokio::select! {
+                        biased;
+                        () = cancel_token.cancelled() => {
+                            return Err(Error::Cancelled);
+                        }
+                        permit = &mut permit => permit
+                            .map_err(|err| Error::handler_with_source("semaphore error", err))?,
+                    };
+                    // Only reserve once the branch is ready to become
+                    // observable, so a branch cancelled while waiting on the
+                    // semaphore never consumes an execution identity.
+                    let execution = branch_services
+                        .run
+                        .stage_executions
+                        .reserve(&target_id, branch_graph_visit);
+                    branch_context.set(
+                        keys::CURRENT_NODE,
+                        serde_json::Value::String(target_id.clone()),
+                    );
+                    branch_context.set(
+                        keys::INTERNAL_STAGE_EXECUTION_ORDINAL,
+                        serde_json::json!(execution.stage_id.visit()),
+                    );
+                    let branch_scope = reserved_scope
+                        .get_or_init(|| {
+                            StageScope::for_parallel_branch(
+                                target_id.clone(),
+                                execution.stage_id.visit(),
+                                group_id.clone(),
+                                parallel_branch_id.clone(),
+                            )
+                        })
+                        .clone();
+                    branch_services.run.emitter.emit_scoped(
+                        &Event::ParallelBranchStarted {
+                            parallel_group_id:     group_id.clone(),
+                            parallel_branch_id:    parallel_branch_id.clone(),
+                            branch:                target_id.clone(),
+                            index:                 branch_index,
+                            graph_visit:           Some(execution.graph_visit),
+                            resumed_from_stage_id: execution.resumed_from.clone(),
                         },
                         &branch_scope,
                     );
-                    return Ok(BranchResult {
-                        id: setup.target_id.clone(),
-                        outcome,
-                        head_sha: None,
-                        worktree_path: setup.worktree_path,
-                    });
-                };
 
-                let branch_services = EngineServices {
-                    run: parent_run.with_sandbox(Arc::clone(&setup.sandbox)),
-                    registry: Arc::clone(&registry),
-                    interviewer,
-                    git_state: std::sync::RwLock::new(None),
-                    base_env: base_env.clone(),
-                    github_token: github_token.clone(),
-                    inputs: inputs.clone(),
-                    dry_run,
-                    workflow_path,
-                    workflow_bundle,
-                };
-                let handler = registry.resolve(target_node);
-                let outcome = super::dispatch_handler(
-                    handler,
-                    target_node,
-                    &setup.branch_context,
-                    &graph,
-                    &run_dir,
-                    &branch_services,
-                )
-                .await?;
-
-                // Checkpoint commit after branch execution (capture head_sha)
-                let head_sha = if has_git {
-                    let rid =
-                        run_id.map_or_else(|| "unknown".to_string(), |run_id| run_id.to_string());
-                    let nid = &setup.target_id;
-                    let status_str = outcome.status.to_string();
-                    // Use exec_command to commit and capture HEAD in the branch worktree
-                    let git_r = GIT_REMOTE;
-                    let add_cmd = format!("{git_r} add -A");
-                    let add_result = setup
-                        .sandbox
-                        .exec_command(&add_cmd, checkpoint.commit_timeout_ms, None, None, None)
-                        .await;
-                    if add_result
-                        .as_ref()
-                        .is_ok_and(fabro_sandbox::ExecResult::is_success)
-                    {
-                        let msg = format!("fabro({rid}): {nid} ({status_str})");
-                        let commit_cmd = parallel_branch_commit_cmd(
-                            git_r,
-                            &git_author.name,
-                            &git_author.email,
-                            &msg,
-                            checkpoint.skip_git_hooks,
-                        );
-                        let _ = setup
-                            .sandbox
-                            .exec_command(
-                                &commit_cmd,
-                                checkpoint.commit_timeout_ms,
-                                None,
-                                None,
-                                None,
+                    let outcome = match graph.nodes.get(&target_id) {
+                        Some(target_node) => {
+                            let handler = branch_services.registry.resolve(target_node);
+                            match super::dispatch_handler(
+                                handler,
+                                target_node,
+                                &branch_context,
+                                &graph,
+                                &run_dir,
+                                &branch_services,
                             )
-                            .await;
-                    }
-                    let sha_cmd = format!("{git_r} rev-parse HEAD");
-                    let sha_result = setup
-                        .sandbox
-                        .exec_command(&sha_cmd, 10_000, None, None, None)
-                        .await;
-                    match sha_result {
-                        Ok(r) if r.is_success() => {
-                            let sha = r.stdout.trim().to_string();
-                            parent_run.emitter.emit_scoped(
-                                &Event::GitCommit {
-                                    node_id: Some(setup.target_id.clone()),
-                                    sha:     sha.clone(),
-                                },
-                                &branch_scope,
-                            );
-                            Some(sha)
+                            .await
+                            {
+                                Ok(outcome) => outcome,
+                                Err(Error::Cancelled) => return Err(Error::Cancelled),
+                                Err(err) => err.to_fail_outcome(),
+                            }
                         }
-                        _ => None,
-                    }
-                } else {
-                    None
+                        None => Outcome::fail_classify(format!(
+                            "branch target node not found: {target_id}"
+                        )),
+                    };
+
+                    let context_updates = branch_context_updates(
+                        &parent_snapshot,
+                        branch_context.snapshot(),
+                        &outcome.context_updates,
+                    );
+                    let result = ParallelBranchResult {
+                        id: target_id.clone(),
+                        status: outcome.status,
+                        context_updates,
+                    };
+                    emit_branch_completed(
+                        &branch_services.run.emitter,
+                        &branch_scope,
+                        group_id.clone(),
+                        parallel_branch_id.clone(),
+                        branch_index,
+                        millis_u64(branch_start.elapsed()),
+                        outcome.status,
+                    );
+                    Ok::<BranchResult, Error>(BranchResult { result, outcome })
                 };
 
-                parent_run.emitter.emit_scoped(
-                    &Event::ParallelBranchCompleted {
-                        parallel_group_id:  group_id.clone(),
-                        parallel_branch_id: setup.parallel_branch_id.clone(),
-                        branch:             setup.target_id.clone(),
-                        index:              setup.branch_index,
-                        duration_ms:        millis_u64(branch_start.elapsed()),
-                        status:             outcome.status.to_string(),
-                        head_sha:           head_sha.clone(),
-                    },
-                    &branch_scope,
+                match std::panic::AssertUnwindSafe(task).catch_unwind().await {
+                    Ok(result) => result,
+                    Err(payload) => {
+                        let result =
+                            failed_branch_result(&target_id, super::format_panic_message(&payload));
+                        if let Some(scope) = reserved_scope.get() {
+                            emit_branch_completed(
+                                &branch_services.run.emitter,
+                                scope,
+                                group_id,
+                                parallel_branch_id,
+                                branch_index,
+                                millis_u64(branch_start.elapsed()),
+                                result.outcome.status,
+                            );
+                        }
+                        Ok(result)
+                    }
+                }
+            }),
+        });
+    }
+
+    // Awaiting in dispatch order keeps `results` aligned with the node's
+    // outgoing-edge order regardless of branch completion order.
+    let mut results = Vec::with_capacity(dispatches.len());
+    let mut cancelled = false;
+    for dispatch in dispatches {
+        let (result, emit_completion) = match dispatch.handle.await {
+            Ok(Ok(result)) => (result, false),
+            Ok(Err(Error::Cancelled)) => {
+                cancelled = true;
+                (
+                    failed_branch_result(&dispatch.target_id, "branch cancelled"),
+                    true,
+                )
+            }
+            Ok(Err(err)) => (
+                failed_branch_result(&dispatch.target_id, err.to_string()),
+                true,
+            ),
+            Err(join_err) => (
+                failed_branch_result(&dispatch.target_id, format!("task join error: {join_err}")),
+                true,
+            ),
+        };
+        if emit_completion {
+            if let Some(scope) = dispatch.scope.get() {
+                emit_branch_completed(
+                    &services.run.emitter,
+                    scope,
+                    parallel_group_id.clone(),
+                    dispatch.branch_id,
+                    dispatch.index,
+                    0,
+                    result.outcome.status,
                 );
-
-                Ok::<BranchResult, Error>(BranchResult {
-                    id: setup.target_id,
-                    outcome,
-                    head_sha,
-                    worktree_path: setup.worktree_path,
-                })
-            });
-            handles.push(handle);
-        }
-
-        // Collect results
-        let mut results: Vec<BranchResult> = Vec::new();
-        let mut handles = handles.into_iter();
-        while let Some(handle) = handles.next() {
-            match handle.await {
-                Ok(Ok(result)) => {
-                    results.push(result);
-                }
-                Ok(Err(Error::Cancelled)) => {
-                    for handle in handles {
-                        handle.abort();
-                    }
-                    return Err(Error::Cancelled);
-                }
-                Ok(Err(e)) => {
-                    results.push(BranchResult {
-                        id:            String::new(),
-                        outcome:       e.to_fail_outcome(),
-                        head_sha:      None,
-                        worktree_path: None,
-                    });
-                }
-                Err(join_err) => {
-                    results.push(BranchResult {
-                        id:            String::new(),
-                        outcome:       Outcome::fail_classify(format!(
-                            "task join error: {join_err}"
-                        )),
-                        head_sha:      None,
-                        worktree_path: None,
-                    });
-                }
             }
         }
-
-        // --- Git isolation: clean up worktrees, then ff-merge winner ---
-        if git_state.is_some() {
-            // Clean up worktrees first
-            for result in &results {
-                if let Some(ref wt_path) = result.worktree_path {
-                    let wt_str = wt_path.to_string_lossy().into_owned();
-                    git_remove_worktree(&*services.run.sandbox, &wt_str).await;
-                    services
-                        .run
-                        .emitter
-                        .emit(&Event::GitWorktreeRemove { path: wt_str });
-                }
-            }
-
-            // Fast-forward main branch to first successful branch (lexically sorted).
-            // This must happen here — before the engine creates its own checkpoint commit
-            // on the main branch — so that subsequent commits are descendants of the
-            // winner.
-            let mut successful: Vec<_> = results
-                .iter()
-                .filter(|r| r.outcome.status == StageOutcome::Succeeded && r.head_sha.is_some())
-                .collect();
-            successful.sort_by(|a, b| a.id.cmp(&b.id));
-            if let Some(winner) = successful.first() {
-                if let Some(sha) = winner.head_sha.as_ref() {
-                    git_merge_ff_only(&*services.run.sandbox, sha).await;
-                }
-            }
+        if result.outcome.failure_category() == Some(FailureCategory::Canceled) {
+            cancelled = true;
         }
-
-        // Count successes and failures
-        let success_count = results
-            .iter()
-            .filter(|r| r.outcome.status == StageOutcome::Succeeded)
-            .count();
-        let fail_count = results
-            .iter()
-            .filter(|r| r.outcome.status.is_failure())
-            .count();
-        let total = results.len();
-
-        // Store results as JSON in context for downstream fan-in
-        let results_json: Vec<serde_json::Value> = results
-            .iter()
-            .map(|r| {
-                let mut entry = serde_json::json!({
-                    "id": r.id,
-                    "status": r.outcome.status.to_string(),
-                });
-                if let Some(ref sha) = r.head_sha {
-                    entry["head_sha"] = serde_json::json!(sha);
-                }
-                entry
-            })
-            .collect();
-        context.set(keys::PARALLEL_RESULTS, serde_json::json!(results_json));
-        context.set(keys::PARALLEL_BRANCH_COUNT, serde_json::json!(total));
-
-        services.run.emitter.emit_scoped(
-            &Event::ParallelCompleted {
-                node_id: node.id.clone(),
-                visit: parallel_stage_scope.visit,
-                duration_ms: millis_u64(parallel_start.elapsed()),
-                success_count,
-                failure_count: fail_count,
-                results: results_json.clone(),
-            },
-            &parallel_stage_scope,
-        );
-        {
-            let run_id = context
-                .run_id()
-                .parse::<RunId>()
-                .map_err(|err| Error::handler_with_source("invalid internal run_id", err))?;
-            let mut hook_ctx =
-                HookContext::new(HookEvent::ParallelComplete, run_id, graph.name.clone());
-            set_hook_node(&mut hook_ctx, node);
-            let _ = services.run.run_hooks(&hook_ctx).await;
-        }
-
-        // Evaluate join policy
-        let status = match join_policy {
-            JoinPolicy::WaitAll => {
-                if fail_count == 0 {
-                    StageOutcome::Succeeded
-                } else {
-                    StageOutcome::PartiallySucceeded
-                }
-            }
-            JoinPolicy::FirstSuccess => {
-                if success_count > 0 {
-                    StageOutcome::Succeeded
-                } else {
-                    StageOutcome::Failed {
-                        retry_requested: false,
-                    }
-                }
-            }
-        };
-
-        // Find the join/convergence node: follow each branch's outgoing edges
-        // and find the common downstream target (typically the fan-in node).
-        let join_node = find_join_node(&results, graph);
-
-        let is_fail = status.is_failure();
-        let mut outcome = Outcome {
-            status,
-            notes: Some(format!(
-                "Parallel node dispatched {total} branches ({success_count} succeeded, {fail_count} failed)"
-            )),
-            failure: if is_fail {
-                Some(FailureDetail::new(
-                    format!("Join policy not satisfied: {success_count}/{total} succeeded"),
-                    FailureCategory::Deterministic,
-                ))
-            } else {
-                None
-            },
-            jump_to_node: if is_fail { None } else { join_node },
-            ..Outcome::success()
-        };
-
-        if is_fail {
-            outcome.suggested_next_ids.clear();
-        }
-
-        Ok(outcome)
+        results.push(result);
     }
-}
-
-/// Find the convergence (join/fan-in) node by following each branch's outgoing
-/// edges and finding the first node reachable from all branches.
-fn find_join_node(results: &[BranchResult], graph: &Graph) -> Option<String> {
-    if results.is_empty() {
-        return None;
+    if cancelled {
+        return Err(Error::Cancelled);
     }
 
-    // Collect outgoing targets for each branch
-    let mut target_sets: Vec<std::collections::HashSet<String>> = Vec::new();
-    for result in results {
-        let targets: std::collections::HashSet<String> = graph
-            .outgoing_edges(&result.id)
-            .into_iter()
-            .map(|e| e.to.clone())
-            .collect();
-        target_sets.push(targets);
-    }
-
-    // Find the intersection — nodes reachable from ALL branches
-    let first = target_sets.first()?;
-    let common: std::collections::HashSet<&String> = first
+    let success_count = results
         .iter()
-        .filter(|id| target_sets.iter().all(|set| set.contains(*id)))
-        .collect();
+        .filter(|branch| branch.outcome.status == StageOutcome::Succeeded)
+        .count();
+    let failure_count = results
+        .iter()
+        .filter(|branch| branch.outcome.status.is_failure())
+        .count();
+    let total = results.len();
+    let status = aggregate_status(&results);
+    let is_failure = status.is_failure();
+    let jump_to_node = if is_failure {
+        None
+    } else {
+        find_join_node(&results, graph)
+    };
 
-    // Return the first common target (lexically sorted for determinism)
-    let mut common_sorted: Vec<&String> = common.into_iter().collect();
-    common_sorted.sort();
-    common_sorted.first().map(|id| (*id).clone())
+    let mut typed_results = results
+        .into_iter()
+        .map(|branch| branch.result)
+        .collect::<Vec<_>>();
+    // Offload large leaves before the results reach the event log and
+    // projection: the artifact lifecycle's offload pass runs only after the
+    // handler returns, too late for the `parallel.completed` payload.
+    if let Err(err) =
+        artifact::offload_parallel_branch_updates(&mut typed_results, &services.run.run_store).await
+    {
+        services.run.emitter.notice(
+            RunNoticeLevel::Warn,
+            RunNoticeCode::ArtifactOffloadFailed,
+            format!("[node: {}] parallel result offload failed: {err}", node.id),
+        );
+    }
+    let results_value = serde_json::to_value(&typed_results)
+        .map_err(|err| Error::handler_with_source("parallel result serialization failed", err))?;
+    let context_updates = HashMap::from([
+        (keys::PARALLEL_RESULTS.to_string(), results_value),
+        (
+            keys::PARALLEL_BRANCH_COUNT.to_string(),
+            serde_json::json!(total),
+        ),
+    ]);
+
+    services.run.emitter.emit_scoped(
+        &Event::ParallelCompleted {
+            node_id: node.id.clone(),
+            visit: parallel_stage_scope.visit,
+            duration_ms: millis_u64(parallel_start.elapsed()),
+            success_count,
+            failure_count,
+            results: typed_results,
+        },
+        &parallel_stage_scope,
+    );
+    emit_parallel_hook(services, context, graph, node, HookEvent::ParallelComplete).await?;
+
+    let prefix = if simulated { "[Simulated] " } else { "" };
+    let mut outcome = Outcome {
+        status,
+        notes: Some(format!(
+            "{prefix}Parallel node dispatched {total} branches ({success_count} succeeded, {failure_count} failed)"
+        )),
+        failure: is_failure.then(|| {
+            FailureDetail::new(
+                "All parallel branches failed",
+                FailureCategory::Deterministic,
+            )
+        }),
+        jump_to_node,
+        context_updates,
+        ..Outcome::success()
+    };
+    if is_failure {
+        outcome.suggested_next_ids.clear();
+    }
+    Ok(outcome)
 }
 
-/// Build the parallel-branch checkpoint commit command. Appends
-/// `--no-verify` when `skip_git_hooks` is true so the commit bypasses the
-/// repository's local Git commit hooks (e.g. `pre-commit`, `commit-msg`).
-fn parallel_branch_commit_cmd(
-    git_remote: &str,
-    author_name: &str,
-    author_email: &str,
-    message: &str,
-    skip_git_hooks: bool,
-) -> String {
-    let no_verify = if skip_git_hooks { " --no-verify" } else { "" };
-    let name = fabro_sandbox::shell_quote(&format!("user.name={author_name}"));
-    let email = fabro_sandbox::shell_quote(&format!("user.email={author_email}"));
-    let msg = fabro_sandbox::shell_quote(message);
-    format!("{git_remote} -c {name} -c {email} commit --allow-empty{no_verify} -m {msg}")
+async fn emit_parallel_hook(
+    services: &EngineServices,
+    context: &Context,
+    graph: &Graph,
+    node: &Node,
+    hook_event: HookEvent,
+) -> Result<(), Error> {
+    let run_id = context.parsed_run_id()?;
+    let mut hook_context = HookContext::new(hook_event, run_id, graph.name.clone());
+    set_hook_node(&mut hook_context, node);
+    let _ = services.run.run_hooks(&hook_context).await;
+    Ok(())
+}
+
+fn branch_context_updates(
+    before: &HashMap<String, serde_json::Value>,
+    after: HashMap<String, serde_json::Value>,
+    outcome_updates: &HashMap<String, serde_json::Value>,
+) -> BTreeMap<String, serde_json::Value> {
+    let mut updates = outcome_updates
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<BTreeMap<_, _>>();
+    updates.extend(context_diff_public(before, after));
+    updates
+}
+
+/// Emit `ParallelBranchCompleted` for the branch that `scope` identifies;
+/// `scope.node_id` is the branch target by construction
+/// ([`StageScope::for_parallel_branch`]).
+fn emit_branch_completed(
+    emitter: &Emitter,
+    scope: &StageScope,
+    parallel_group_id: StageId,
+    parallel_branch_id: ParallelBranchId,
+    index: usize,
+    duration_ms: u64,
+    status: StageOutcome,
+) {
+    emitter.emit_scoped(
+        &Event::ParallelBranchCompleted {
+            parallel_group_id,
+            parallel_branch_id,
+            branch: scope.node_id.clone(),
+            index,
+            duration_ms,
+            status,
+        },
+        scope,
+    );
+}
+
+fn failed_branch_result(id: &str, reason: impl Into<String>) -> BranchResult {
+    let outcome = Outcome::fail_classify(reason);
+    BranchResult {
+        result: ParallelBranchResult {
+            id:              id.to_string(),
+            status:          outcome.status,
+            context_updates: BTreeMap::new(),
+        },
+        outcome,
+    }
+}
+
+fn aggregate_status(results: &[BranchResult]) -> StageOutcome {
+    if results.is_empty() {
+        StageOutcome::PartiallySucceeded
+    } else if results
+        .iter()
+        .all(|result| result.outcome.status == StageOutcome::Succeeded)
+    {
+        StageOutcome::Succeeded
+    } else if results
+        .iter()
+        .all(|result| result.outcome.status.is_failure())
+    {
+        StageOutcome::Failed {
+            retry_requested: false,
+        }
+    } else {
+        StageOutcome::PartiallySucceeded
+    }
+}
+
+/// Find the convergence node by finding a common direct target of every branch.
+fn find_join_node(results: &[BranchResult], graph: &Graph) -> Option<String> {
+    let first_result = results.first()?;
+    let first_targets = graph
+        .outgoing_edges(&first_result.result.id)
+        .into_iter()
+        .map(|edge| edge.to.clone())
+        .collect::<HashSet<_>>();
+    let mut common = first_targets
+        .into_iter()
+        .filter(|target| {
+            results.iter().skip(1).all(|result| {
+                graph
+                    .outgoing_edges(&result.result.id)
+                    .into_iter()
+                    .any(|edge| &edge.to == target)
+            })
+        })
+        .collect::<Vec<_>>();
+    common.sort();
+    common.into_iter().next()
 }
 
 #[cfg(test)]
@@ -797,7 +569,7 @@ mod tests {
                 graph:            serde_json::to_value(fabro_types::Graph::new("test")).unwrap(),
                 workflow_source:  None,
                 workflow_config:  None,
-                labels:           std::collections::BTreeMap::default(),
+                labels:           BTreeMap::default(),
                 run_dir:          "/tmp".to_string(),
                 source_directory: None,
                 workflow_slug:    None,
@@ -819,10 +591,29 @@ mod tests {
     fn test_context() -> Context {
         let context = Context::new();
         context.set(
-            crate::context::keys::INTERNAL_RUN_ID,
+            keys::INTERNAL_RUN_ID,
             serde_json::json!(fixtures::RUN_1.to_string()),
         );
         context
+    }
+
+    fn parallel_graph() -> (Node, Graph) {
+        let mut node = Node::new("par");
+        node.attrs.insert(
+            "shape".to_string(),
+            AttrValue::String("component".to_string()),
+        );
+        let mut graph = Graph::new("test");
+        graph.nodes.insert("par".to_string(), node.clone());
+        graph
+            .nodes
+            .insert("branch_a".to_string(), Node::new("branch_a"));
+        graph
+            .nodes
+            .insert("branch_b".to_string(), Node::new("branch_b"));
+        graph.edges.push(Edge::new("par", "branch_a"));
+        graph.edges.push(Edge::new("par", "branch_b"));
+        (node, graph)
     }
 
     #[derive(Clone, Debug, PartialEq)]
@@ -1006,73 +797,76 @@ mod tests {
 
     #[tokio::test]
     async fn parallel_handler_no_branches() {
-        let services = make_services();
-        let node = Node::new("par");
-        let context = test_context();
-        let graph = Graph::new("test");
-        let run_dir = Path::new("/tmp/test");
-
         let outcome = ParallelHandler
-            .execute(&node, &context, &graph, run_dir, &services)
+            .execute(
+                &Node::new("par"),
+                &test_context(),
+                &Graph::new("test"),
+                Path::new("/tmp/test"),
+                &make_services(),
+            )
             .await
             .unwrap();
-        assert_eq!(outcome.status, StageOutcome::Failed {
-            retry_requested: false,
-        });
+        assert_eq!(outcome.status, StageOutcome::PartiallySucceeded);
+        assert_eq!(
+            outcome.context_updates[keys::PARALLEL_RESULTS],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            outcome.context_updates[keys::PARALLEL_BRANCH_COUNT],
+            serde_json::json!(0)
+        );
     }
 
     #[tokio::test]
-    async fn parallel_handler_with_branches() {
+    async fn parallel_handler_returns_typed_ordered_results() {
         let store = test_store();
         let run_store = store.create_run(&fixtures::RUN_1).await.unwrap();
         seed_created(&run_store).await;
-        let mut services = EngineServices::test_default();
+        let mut services = make_services();
         services.run = services
             .run
             .with_emitter(Arc::new(crate::event::Emitter::new(fixtures::RUN_1)))
             .with_run_store(run_store.clone().into());
         let logger = crate::event::StoreProgressLogger::new(run_store.clone());
         logger.register(services.run.emitter.as_ref());
-        let mut node = Node::new("par");
-        node.attrs.insert(
-            "shape".to_string(),
-            AttrValue::String("component".to_string()),
-        );
+        let (node, graph) = parallel_graph();
         let context = test_context();
         context.set(keys::INTERNAL_NODE_VISIT_COUNT, serde_json::json!(2));
-        let mut graph = Graph::new("test");
-        graph.nodes.insert("par".to_string(), node.clone());
-        graph
-            .nodes
-            .insert("branch_a".to_string(), Node::new("branch_a"));
-        graph
-            .nodes
-            .insert("branch_b".to_string(), Node::new("branch_b"));
-        graph.edges.push(Edge::new("par", "branch_a"));
-        graph.edges.push(Edge::new("par", "branch_b"));
 
-        let tmp = tempfile::tempdir().unwrap();
         let outcome = ParallelHandler
-            .execute(&node, &context, &graph, tmp.path(), &services)
+            .execute(&node, &context, &graph, Path::new("/tmp/test"), &services)
             .await
             .unwrap();
         logger.flush().await;
 
         assert_eq!(outcome.status, StageOutcome::Succeeded);
-        assert!(outcome.notes.as_deref().unwrap().contains("2 branches"));
-
-        // Check context was set
-        let results = context.get(keys::PARALLEL_RESULTS);
-        assert!(results.is_some());
-
-        let state = run_store.state().await.unwrap();
-        let node_state = state.stage(&StageId::new("par", 2)).unwrap();
-        let parsed = node_state.parallel_results.as_ref().unwrap();
-        assert!(
-            parsed.is_array(),
-            "parallel_results.json should be a JSON array"
+        let results: Vec<ParallelBranchResult> =
+            serde_json::from_value(outcome.context_updates[keys::PARALLEL_RESULTS].clone())
+                .unwrap();
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.id.as_str())
+                .collect::<Vec<_>>(),
+            ["branch_a", "branch_b"]
         );
-        assert_eq!(parsed.as_array().unwrap().len(), 2);
+        assert!(
+            results
+                .iter()
+                .all(|result| result.status == StageOutcome::Succeeded)
+        );
+        let state = run_store.state().await.unwrap();
+        assert_eq!(
+            state
+                .stage(&StageId::new("par", 2))
+                .unwrap()
+                .parallel_results
+                .as_ref()
+                .unwrap()
+                .len(),
+            2
+        );
         for branch in ["branch_a", "branch_b"] {
             assert_eq!(
                 state
@@ -1085,163 +879,95 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parallel_handler_stores_results_in_run_store() {
-        let store = test_store();
-        let run_store = store.create_run(&fixtures::RUN_1).await.unwrap();
-        seed_created(&run_store).await;
-        let mut services = EngineServices::test_default();
-        services.run = services
-            .run
-            .with_emitter(Arc::new(crate::event::Emitter::new(fixtures::RUN_1)))
-            .with_run_store(run_store.clone().into());
-        let logger = crate::event::StoreProgressLogger::new(run_store.clone());
-        logger.register(services.run.emitter.as_ref());
-        let mut node = Node::new("par");
-        node.attrs.insert(
-            "shape".to_string(),
-            AttrValue::String("component".to_string()),
-        );
+    async fn parallel_handler_simulate_returns_results_as_outcome_updates() {
+        let (node, graph) = parallel_graph();
         let context = test_context();
-        let mut graph = Graph::new("test");
-        graph.nodes.insert("par".to_string(), node.clone());
-        graph
-            .nodes
-            .insert("branch_a".to_string(), Node::new("branch_a"));
-        graph
-            .nodes
-            .insert("branch_b".to_string(), Node::new("branch_b"));
-        graph.edges.push(Edge::new("par", "branch_a"));
-        graph.edges.push(Edge::new("par", "branch_b"));
-
-        let tmp = tempfile::tempdir().unwrap();
-        ParallelHandler
-            .execute(&node, &context, &graph, tmp.path(), &services)
-            .await
-            .unwrap();
-        logger.flush().await;
-
-        let state = run_store.state().await.unwrap();
-        let node_state = state.stage(&fabro_store::StageId::new("par", 1)).unwrap();
-        let results = node_state.parallel_results.as_ref().unwrap();
-        assert!(results.is_array());
-        assert_eq!(results.as_array().unwrap().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn parallel_handler_first_success_policy() {
-        let services = make_services();
-        let mut node = Node::new("par");
-        node.attrs.insert(
-            "join_policy".to_string(),
-            AttrValue::String("first_success".to_string()),
-        );
-        let context = test_context();
-        let mut graph = Graph::new("test");
-        graph.nodes.insert("par".to_string(), node.clone());
-        graph
-            .nodes
-            .insert("branch_a".to_string(), Node::new("branch_a"));
-        graph.edges.push(Edge::new("par", "branch_a"));
-
-        let run_dir = Path::new("/tmp/test");
         let outcome = ParallelHandler
-            .execute(&node, &context, &graph, run_dir, &services)
-            .await
-            .unwrap();
-
-        assert_eq!(outcome.status, StageOutcome::Succeeded);
-    }
-
-    #[test]
-    fn join_policy_display() {
-        assert_eq!(JoinPolicy::WaitAll.to_string(), "wait_all");
-        assert_eq!(JoinPolicy::FirstSuccess.to_string(), "first_success");
-    }
-
-    #[test]
-    fn parse_join_policy_variants() {
-        assert!(matches!(parse_join_policy("wait_all"), JoinPolicy::WaitAll));
-        assert!(matches!(
-            parse_join_policy("first_success"),
-            JoinPolicy::FirstSuccess
-        ));
-        // Invalid falls back to WaitAll
-        assert!(matches!(parse_join_policy("invalid"), JoinPolicy::WaitAll));
-    }
-
-    #[tokio::test]
-    async fn parallel_handler_simulate() {
-        let services = make_services();
-        let mut node = Node::new("par");
-        node.attrs.insert(
-            "shape".to_string(),
-            AttrValue::String("component".to_string()),
-        );
-        let context = test_context();
-        let mut graph = Graph::new("test");
-        graph.nodes.insert("par".to_string(), node.clone());
-        graph
-            .nodes
-            .insert("branch_a".to_string(), Node::new("branch_a"));
-        graph
-            .nodes
-            .insert("branch_b".to_string(), Node::new("branch_b"));
-        // Add a fan_in node reachable from both branches
-        graph
-            .nodes
-            .insert("fan_in".to_string(), Node::new("fan_in"));
-        graph.edges.push(Edge::new("par", "branch_a"));
-        graph.edges.push(Edge::new("par", "branch_b"));
-        graph.edges.push(Edge::new("branch_a", "fan_in"));
-        graph.edges.push(Edge::new("branch_b", "fan_in"));
-
-        let run_dir = Path::new("/tmp/test");
-        let mut dry_services = services;
-        dry_services.dry_run = true;
-
-        let outcome = ParallelHandler
-            .simulate(&node, &context, &graph, run_dir, &dry_services)
+            .simulate(
+                &node,
+                &context,
+                &graph,
+                Path::new("/tmp/test"),
+                &make_services(),
+            )
             .await
             .unwrap();
 
         assert_eq!(outcome.status, StageOutcome::Succeeded);
         assert!(outcome.notes.as_deref().unwrap().contains("[Simulated]"));
-        assert!(outcome.notes.as_deref().unwrap().contains("2 branches"));
-        assert_eq!(outcome.jump_to_node, Some("fan_in".to_string()));
-
-        let branch_count = context.get(keys::PARALLEL_BRANCH_COUNT);
-        assert_eq!(branch_count, Some(serde_json::json!(2)));
+        assert_eq!(
+            outcome.context_updates[keys::PARALLEL_BRANCH_COUNT],
+            serde_json::json!(2)
+        );
     }
 
     #[test]
-    fn parallel_branch_commit_cmd_includes_no_verify_when_skip_hooks_enabled() {
-        let cmd = super::parallel_branch_commit_cmd(
-            super::GIT_REMOTE,
-            "Fabro",
-            "fabro@example.com",
-            "fabro(r1): branch_a (succeeded)",
-            true,
+    fn aggregate_status_follows_parallel_truth_table() {
+        let success = |index: usize| BranchResult {
+            result:  ParallelBranchResult {
+                id:              format!("branch_{index}"),
+                status:          StageOutcome::Succeeded,
+                context_updates: BTreeMap::new(),
+            },
+            outcome: Outcome::success(),
+        };
+        let failure = |index: usize| failed_branch_result(&format!("branch_{index}"), "failed");
+        let partial = |index: usize| BranchResult {
+            result:  ParallelBranchResult {
+                id:              format!("branch_{index}"),
+                status:          StageOutcome::PartiallySucceeded,
+                context_updates: BTreeMap::new(),
+            },
+            outcome: Outcome {
+                status: StageOutcome::PartiallySucceeded,
+                ..Outcome::success()
+            },
+        };
+
+        assert_eq!(aggregate_status(&[]), StageOutcome::PartiallySucceeded);
+        assert_eq!(
+            aggregate_status(&[success(0), success(1)]),
+            StageOutcome::Succeeded
         );
-        assert!(
-            cmd.contains("--no-verify"),
-            "expected --no-verify when skip_git_hooks=true; got {cmd:?}"
+        assert!(aggregate_status(&[failure(0), failure(1)]).is_failure());
+        assert_eq!(
+            aggregate_status(&[success(0), failure(1)]),
+            StageOutcome::PartiallySucceeded
         );
-        assert!(cmd.contains("commit --allow-empty"));
+        assert_eq!(
+            aggregate_status(&[success(0), partial(1)]),
+            StageOutcome::PartiallySucceeded
+        );
+        assert_eq!(
+            aggregate_status(&[failure(0), partial(1)]),
+            StageOutcome::PartiallySucceeded
+        );
     }
 
     #[test]
-    fn parallel_branch_commit_cmd_omits_no_verify_when_skip_hooks_disabled() {
-        let cmd = super::parallel_branch_commit_cmd(
-            super::GIT_REMOTE,
-            "Fabro",
-            "fabro@example.com",
-            "fabro(r1): branch_a (succeeded)",
-            false,
+    fn branch_context_updates_include_failed_outcome_updates_without_internal_keys() {
+        let before = HashMap::from([("shared".to_string(), serde_json::json!("parent"))]);
+        let after = HashMap::from([
+            ("shared".to_string(), serde_json::json!("branch")),
+            (
+                keys::INTERNAL_WORK_DIR.to_string(),
+                serde_json::json!("/workspace"),
+            ),
+        ]);
+        let outcome = HashMap::from([(
+            keys::COMMAND_OUTPUT.to_string(),
+            serde_json::json!({"stdout": "failure output"}),
+        )]);
+
+        assert_eq!(
+            branch_context_updates(&before, after, &outcome),
+            BTreeMap::from([
+                (
+                    keys::COMMAND_OUTPUT.to_string(),
+                    serde_json::json!({"stdout": "failure output"})
+                ),
+                ("shared".to_string(), serde_json::json!("branch")),
+            ])
         );
-        assert!(
-            !cmd.contains("--no-verify"),
-            "expected no --no-verify when skip_git_hooks=false; got {cmd:?}"
-        );
-        assert!(cmd.contains("commit --allow-empty"));
     }
 }

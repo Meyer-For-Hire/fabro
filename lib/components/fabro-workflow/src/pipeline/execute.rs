@@ -17,7 +17,6 @@ use crate::lifecycle::WorkflowLifecycle;
 use crate::node_handler::WorkflowNodeHandler;
 use crate::outcome::Outcome;
 use crate::records::Checkpoint;
-use crate::sandbox_git::GitState;
 
 fn seed_context_from_checkpoint(checkpoint: Option<&Checkpoint>) -> Context {
     let context = Context::new();
@@ -54,19 +53,6 @@ pub async fn execute(init: Initialized) -> Executed {
     let start = Instant::now();
     let graph_arc = Arc::new(graph.clone());
     let wf_graph = WorkflowGraph(Arc::clone(&graph_arc));
-
-    let git_state = run_options.git.as_ref().and_then(|git| {
-        let base_sha = git.base_sha.clone()?;
-        Some(Arc::new(GitState {
-            run_id: run_options.run_id,
-            base_sha,
-            run_branch: git.run_branch.clone(),
-            meta_branch: git.meta_branch.clone(),
-            checkpoint: run_options.checkpoint().clone(),
-            git_author: run_options.git_author(),
-        }))
-    });
-    engine.set_git_state(git_state);
 
     let handler = Arc::new(WorkflowNodeHandler {
         services: Arc::clone(&engine),

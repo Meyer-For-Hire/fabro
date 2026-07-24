@@ -51,7 +51,6 @@ use crate::run_files::{list_run_commits, list_run_files};
 use crate::run_manifest;
 use crate::run_selector::{ResolveRunError, resolve_run_by_selector};
 use crate::run_title_generation::{self, GenerateTitleInput, TitlePromptInput, WorkflowSummary};
-use crate::server_secrets::LlmClientResult;
 #[cfg(any(test, feature = "test-support"))]
 use crate::test_support as server_test_support;
 
@@ -591,17 +590,8 @@ pub(crate) async fn create_run_from_manifest(
     // and ask-fabro-readiness) and the LLM client itself (for the spawned
     // title-generation task). `ready_llm_provider_ids` would otherwise call
     // `resolve_llm_client` a second time and discard the client.
-    let llm_client_for_title = match state.resolve_llm_client().await {
-        Ok(result) => Some(result),
-        Err(err) => {
-            tracing::warn!(error = ?err, "Failed to resolve LLM client while creating run");
-            None
-        }
-    };
-    let ready_provider_ids = llm_client_for_title
-        .as_ref()
-        .map(LlmClientResult::provider_ids)
-        .unwrap_or_default();
+    let (llm_result, ready_provider_ids) = state.resolve_llm_client_with_ready_ids().await;
+    let llm_client_for_title = llm_result.ok();
     let run_materialization_provider_ids = {
         #[cfg(any(test, feature = "test-support"))]
         {
@@ -835,10 +825,12 @@ async fn run_preflight(
         return ApiError::bad_request(format!("Run config variable interpolation failed: {err}"))
             .into_response();
     }
-    let mut validated = match run_manifest::validate_prepared_manifest_with_vars(
+    let (llm_result, ready_providers) = state.resolve_llm_client_with_ready_ids().await;
+    let mut validated = match run_manifest::validate_prepared_manifest_for_preflight(
         &prepared,
         state.catalog(),
         vars,
+        &ready_providers,
     ) {
         Ok(validated) => validated,
         Err(WorkflowError::Parse(_)) => {
@@ -847,13 +839,14 @@ async fn run_preflight(
         Err(err) => return ApiError::bad_request(err.to_string()).into_response(),
     };
     validated.promote_template_undefined_variables_to_errors();
-    let response = match run_manifest::run_preflight(&state, &prepared, &validated).await {
-        Ok((response, _ok)) => response,
-        Err(err) => {
-            return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
-                .into_response();
-        }
-    };
+    let response =
+        match run_manifest::run_preflight(&state, &prepared, &validated, llm_result).await {
+            Ok((response, _ok)) => response,
+            Err(err) => {
+                return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+                    .into_response();
+            }
+        };
     (StatusCode::OK, Json(response)).into_response()
 }
 
@@ -942,13 +935,9 @@ async fn get_run_settings(
         Ok(id) => id,
         Err(response) => return response,
     };
-    let cached = match state.stores.runs.get_cached_run(&id).await {
-        Ok(Some(cached)) => cached,
-        Ok(None) => return ApiError::not_found("Run not found.").into_response(),
-        Err(err) => {
-            return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
-                .into_response();
-        }
+    let cached = match state.cached_run(&id).await {
+        Ok(cached) => cached,
+        Err(err) => return err.into_response(),
     };
     (
         StatusCode::OK,
@@ -961,8 +950,8 @@ async fn get_questions(
     RequireRunManagementTarget(id, _actor): RequireRunManagementTarget,
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    match state.stores.runs.get_cached_run(&id).await {
-        Ok(Some(cached)) => {
+    match state.cached_run(&id).await {
+        Ok(cached) => {
             let questions = cached
                 .projection
                 .pending_interviews
@@ -971,10 +960,7 @@ async fn get_questions(
                 .collect::<Vec<_>>();
             (StatusCode::OK, Json(ListResponse::new(questions))).into_response()
         }
-        Ok(None) => ApiError::not_found("Run not found.").into_response(),
-        Err(err) => {
-            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
-        }
+        Err(err) => err.into_response(),
     }
 }
 
@@ -1006,12 +992,9 @@ async fn get_run_state(
     RequireRunManagementTarget(id, _actor): RequireRunManagementTarget,
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    match state.stores.runs.get_cached_run(&id).await {
-        Ok(Some(cached)) => Json((*cached.projection).clone()).into_response(),
-        Ok(None) => ApiError::not_found("Run not found.").into_response(),
-        Err(err) => {
-            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
-        }
+    match state.cached_run(&id).await {
+        Ok(cached) => Json(&*cached.projection).into_response(),
+        Err(err) => err.into_response(),
     }
 }
 
@@ -1046,13 +1029,9 @@ async fn get_run_stage_context_window(
         Ok(stage_id) => stage_id,
         Err(response) => return response,
     };
-    let cached = match state.stores.runs.get_cached_run(&id).await {
-        Ok(Some(cached)) => cached,
-        Ok(None) => return ApiError::not_found("Run not found.").into_response(),
-        Err(err) => {
-            return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
-                .into_response();
-        }
+    let cached = match state.cached_run(&id).await {
+        Ok(cached) => cached,
+        Err(err) => return err.into_response(),
     };
     let Some(stage) = cached.projection.stage(&stage_id) else {
         return ApiError::not_found("Stage not found.").into_response();
@@ -1106,17 +1085,11 @@ async fn get_run_stage_command_log(
         return ApiError::bad_request("limit must be greater than 0").into_response();
     }
     let limit = query.limit.min(MAX_COMMAND_LOG_LIMIT);
-    let Ok(run_store) = state.stores.runs.open_run_reader(&id).await else {
-        return ApiError::not_found("Run not found.").into_response();
+    let cached = match state.cached_run(&id).await {
+        Ok(cached) => cached,
+        Err(err) => return err.into_response(),
     };
-    let run_state = match run_store.state().await {
-        Ok(run_state) => run_state,
-        Err(err) => {
-            return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
-                .into_response();
-        }
-    };
-    let Some(node) = run_state.stage(&stage_id) else {
+    let Some(node) = cached.projection.stage(&stage_id) else {
         return ApiError::not_found("Stage not found.").into_response();
     };
 
@@ -1152,7 +1125,14 @@ async fn get_run_stage_command_log(
     }
 
     if let Some(cas_ref) = cas_ref {
-        let text = match read_json_string_blob(&run_store.clone().into(), &cas_ref).await {
+        let run_store = match state.stores.runs.open_run_reader(&id).await {
+            Ok(run_store) => run_store,
+            Err(err) => {
+                return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+                    .into_response();
+            }
+        };
+        let text = match read_json_string_blob(&run_store.into(), &cas_ref).await {
             Ok(Some(text)) => text,
             Ok(None) => String::new(),
             Err(err) => {

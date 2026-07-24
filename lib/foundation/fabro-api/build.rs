@@ -350,6 +350,11 @@ fn main() {
         ("AgentControlState", "fabro_types::AgentControlState", &[]),
         ("CommandTermination", "fabro_types::CommandTermination", &[]),
         ("StageModelUsage", "fabro_types::StageModelUsage", &[]),
+        (
+            "ParallelBranchResult",
+            "fabro_types::ParallelBranchResult",
+            &[],
+        ),
         ("StageProjection", "fabro_types::StageProjection", &[]),
         ("PermissionLevel", "fabro_types::PermissionLevel", &[]),
         (
@@ -462,6 +467,7 @@ fn main() {
             "fabro_types::PendingInterviewRecord",
             &[],
         ),
+        ("CompletionUsage", "fabro_model::TokenCounts", &[]),
         ("BilledTokenCounts", "fabro_types::BilledTokenCounts", &[]),
         ("BillingModelRef", "fabro_model::ModelRef", &[]),
         ("BillingSpeed", "fabro_model::Speed", &[]),
@@ -479,6 +485,7 @@ fn main() {
         ),
         ("ReasoningEffort", "fabro_model::ReasoningEffort", &[]),
         ("ModelFeatures", "fabro_model::ModelFeatures", &[]),
+        ("ModelControls", "fabro_model::ModelControls", &[]),
         ("ModelCosts", "fabro_model::ModelCosts", &[]),
         ("ModelTestMode", "fabro_model::ModelTestMode", &[]),
         ("RunProjection", "fabro_types::RunProjection", &[]),

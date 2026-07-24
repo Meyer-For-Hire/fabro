@@ -375,12 +375,10 @@ fn event_body_from_event(event: &Event) -> EventBody {
         Event::ParallelStarted {
             visit,
             branch_count,
-            join_policy,
             ..
         } => EventBody::ParallelStarted(fabro_types::ParallelStartedProps {
             visit:        *visit,
             branch_count: *branch_count,
-            join_policy:  join_policy.clone(),
         }),
         Event::ParallelBranchStarted {
             index,
@@ -396,13 +394,11 @@ fn event_body_from_event(event: &Event) -> EventBody {
             index,
             duration_ms,
             status,
-            head_sha,
             ..
         } => EventBody::ParallelBranchCompleted(fabro_types::ParallelBranchCompletedProps {
             index:       *index,
             duration_ms: *duration_ms,
-            status:      status.clone(),
-            head_sha:    head_sha.clone(),
+            status:      *status,
         }),
         Event::ParallelCompleted {
             visit,
@@ -529,19 +525,6 @@ fn event_body_from_event(event: &Event) -> EventBody {
             success:          *success,
             exec_output_tail: exec_output_tail.clone(),
         }),
-        Event::GitBranch { branch, sha } => EventBody::GitBranch(fabro_types::GitBranchProps {
-            branch: branch.clone(),
-            sha:    sha.clone(),
-        }),
-        Event::GitWorktreeAdd { path, branch } => {
-            EventBody::GitWorktreeAdd(fabro_types::GitWorktreeAddProps {
-                path:   path.clone(),
-                branch: branch.clone(),
-            })
-        }
-        Event::GitWorktreeRemove { path } => {
-            EventBody::GitWorktreeRemove(fabro_types::GitWorktreeRemoveProps { path: path.clone() })
-        }
         Event::GitFetch { branch, success } => EventBody::GitFetch(fabro_types::GitFetchProps {
             branch:  branch.clone(),
             success: *success,
@@ -1731,15 +1714,96 @@ mod tests {
     }
 
     #[test]
-    fn parallel_started_populates_parallel_group_id() {
+    fn parallel_started_populates_group_id_and_public_properties() {
         let stored = to_run_event(&fixtures::RUN_1, &Event::ParallelStarted {
             node_id:      "fanout".to_string(),
             visit:        2,
             branch_count: 3,
-            join_policy:  "wait_all".to_string(),
         });
         assert_eq!(stored.parallel_group_id, Some(StageId::new("fanout", 2)));
         assert!(stored.parallel_branch_id.is_none());
+        assert_eq!(
+            stored.properties().unwrap(),
+            serde_json::json!({
+                "visit": 2,
+                "branch_count": 3,
+            })
+        );
+    }
+
+    #[test]
+    fn parallel_branch_completed_public_properties() {
+        let group_id = StageId::new("fanout", 2);
+        let stored = to_run_event(&fixtures::RUN_1, &Event::ParallelBranchCompleted {
+            parallel_group_id:  group_id.clone(),
+            parallel_branch_id: ParallelBranchId::new(group_id, 1),
+            branch:             "review".to_string(),
+            index:              1,
+            duration_ms:        42,
+            status:             StageOutcome::Succeeded,
+        });
+
+        assert_eq!(
+            stored.properties().unwrap(),
+            serde_json::json!({
+                "index": 1,
+                "duration_ms": 42,
+                "status": "succeeded",
+            })
+        );
+    }
+
+    #[test]
+    fn parallel_completed_exposes_typed_results_in_input_order() {
+        let stored = to_run_event(&fixtures::RUN_1, &Event::ParallelCompleted {
+            node_id:       "fanout".to_string(),
+            visit:         2,
+            duration_ms:   84,
+            success_count: 1,
+            failure_count: 1,
+            results:       vec![
+                ::fabro_types::ParallelBranchResult {
+                    id:              "review_api".to_string(),
+                    status:          StageOutcome::Succeeded,
+                    context_updates: BTreeMap::from([(
+                        "response.review_api".to_string(),
+                        serde_json::json!("looks good"),
+                    )]),
+                },
+                ::fabro_types::ParallelBranchResult {
+                    id:              "review_ux".to_string(),
+                    status:          StageOutcome::Failed {
+                        retry_requested: false,
+                    },
+                    context_updates: BTreeMap::from([(
+                        "response.review_ux".to_string(),
+                        serde_json::json!("needs work"),
+                    )]),
+                },
+            ],
+        });
+
+        assert_eq!(
+            stored.properties().unwrap(),
+            serde_json::json!({
+                "visit": 2,
+                "duration_ms": 84,
+                "success_count": 1,
+                "failure_count": 1,
+                "results": [
+                    {
+                        "id": "review_api",
+                        "status": "succeeded",
+                        "context_updates": {"response.review_api": "looks good"},
+                    },
+                    {
+                        "id": "review_ux",
+                        "status": "failed",
+                        "context_updates": {"response.review_ux": "needs work"},
+                    },
+                ],
+            })
+        );
     }
 
     #[test]

@@ -3,7 +3,6 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use ::fabro_types::{ExecOutputTail, RunEvent, RunId, RunNoticeCode, RunNoticeLevel};
 use chrono::Utc;
-use fabro_agent::{WorktreeEvent, WorktreeEventCallback};
 
 use super::Event;
 use super::convert::to_run_event_at;
@@ -138,22 +137,6 @@ impl Emitter {
     /// workflow run start).
     pub fn touch(&self) {
         self.last_event_at.store(epoch_millis(), Ordering::Relaxed);
-    }
-
-    /// Build a [`WorktreeEventCallback`] that forwards worktree lifecycle
-    /// events as [`Event`]s on this emitter.
-    pub fn worktree_callback(self: Arc<Self>) -> WorktreeEventCallback {
-        Arc::new(move |event| match event {
-            WorktreeEvent::BranchCreated { branch, sha } => {
-                self.emit(&Event::GitBranch { branch, sha });
-            }
-            WorktreeEvent::WorktreeAdded { path, branch } => {
-                self.emit(&Event::GitWorktreeAdd { path, branch });
-            }
-            WorktreeEvent::WorktreeRemoved { path } => {
-                self.emit(&Event::GitWorktreeRemove { path });
-            }
-        })
     }
 }
 

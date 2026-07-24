@@ -4,7 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use fabro_agent::Sandbox;
 use fabro_graphviz::graph::{Graph, Node};
-use fabro_types::{RunId, StageModelUsage, StageTiming};
+use fabro_types::{StageModelUsage, StageTiming};
 pub(crate) use structured_output::extract_status_fields;
 use tokio_util::sync::CancellationToken;
 
@@ -286,10 +286,7 @@ impl Handler for AgentHandler {
 
         // 3. Call LLM backend (agent loop)
         let thread_id = context.thread_id();
-        let run_id = context
-            .run_id()
-            .parse::<RunId>()
-            .map_err(|err| Error::handler_with_source("invalid internal run_id", err))?;
+        let run_id = context.parsed_run_id()?;
         let tool_hooks: Option<Arc<dyn fabro_agent::ToolHookCallback>> =
             services.run.hook_runner.as_ref().map(|hr| {
                 Arc::new(fabro_hooks::WorkflowToolHookCallback {

@@ -85,8 +85,8 @@ use fabro_slack::threads::ThreadRegistry;
 use fabro_slack::{blocks as slack_blocks, connection as slack_connection};
 use fabro_static::EnvVars;
 use fabro_store::{
-    ArtifactKey, ArtifactStore, Database, EventEnvelope, EventPayload, NodeArtifact,
-    PendingInterviewRecord, RunSummaryStore, StageArtifactEntry, StageId,
+    ArtifactKey, ArtifactStore, CachedRunProjection, Database, EventEnvelope, EventPayload,
+    NodeArtifact, PendingInterviewRecord, RunSummaryStore, StageArtifactEntry, StageId,
 };
 #[cfg(test)]
 use fabro_types::BlockedReason;
@@ -1422,14 +1422,26 @@ impl AppState {
         self.llm_source.configured_providers(catalog.as_ref()).await
     }
 
-    pub(crate) async fn ready_llm_provider_ids(&self) -> Vec<ProviderId> {
-        match self.resolve_llm_client().await {
-            Ok(result) => result.provider_ids(),
-            Err(err) => {
-                warn!(error = ?err, "Failed to resolve LLM client while checking ready providers");
-                Vec::new()
-            }
+    /// Resolve the LLM client once and derive the ready provider IDs from it,
+    /// logging a warning when resolution fails. Callers that need both values
+    /// must use this instead of `ready_llm_provider_ids` so the client is not
+    /// resolved twice.
+    pub(crate) async fn resolve_llm_client_with_ready_ids(
+        &self,
+    ) -> (anyhow::Result<LlmClientResult>, Vec<ProviderId>) {
+        let llm_result = self.resolve_llm_client().await;
+        if let Err(err) = &llm_result {
+            warn!(error = ?err, "Failed to resolve LLM client while checking ready providers");
         }
+        let ready_provider_ids = llm_result
+            .as_ref()
+            .map(LlmClientResult::provider_ids)
+            .unwrap_or_default();
+        (llm_result, ready_provider_ids)
+    }
+
+    pub(crate) async fn ready_llm_provider_ids(&self) -> Vec<ProviderId> {
+        self.resolve_llm_client_with_ready_ids().await.1
     }
 
     pub(crate) async fn decorate_run_summary(&self, run: fabro_types::Run) -> fabro_types::Run {
@@ -1495,6 +1507,18 @@ impl AppState {
     /// without cross-module state coupling on the `AppState` field layout.
     pub(crate) fn store_ref(&self) -> &Arc<Database> {
         &self.stores.runs
+    }
+
+    /// Current cached projection for `run_id`, with the standard HTTP error
+    /// mapping: storage failures become 500s and a missing run becomes the
+    /// canonical 404.
+    pub(crate) async fn cached_run(&self, run_id: &RunId) -> Result<CachedRunProjection, ApiError> {
+        self.stores
+            .runs
+            .get_cached_run(run_id)
+            .await
+            .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+            .ok_or_else(|| ApiError::not_found("Run not found."))
     }
 
     pub(crate) fn session_runtimes(&self) -> &SessionRuntimeManager {
@@ -2663,9 +2687,8 @@ async fn delete_run_internal(
 }
 
 async fn load_durable_run_status(state: &AppState, id: &RunId) -> Option<RunStatus> {
-    let run_store = state.stores.runs.open_run(id).await.ok()?;
-    let projection = run_store.state().await.ok()?;
-    Some(projection.status)
+    let cached = state.cached_run(id).await.ok()?;
+    Some(cached.projection.status)
 }
 
 async fn delete_run_sandbox_resource(
@@ -3714,15 +3737,10 @@ async fn load_pending_interview(
     run_id: RunId,
     qid: &str,
 ) -> Result<LoadedPendingInterview, Response> {
-    let cached = match state.stores.runs.get_cached_run(&run_id).await {
-        Ok(Some(cached)) => cached,
-        Ok(None) => return Err(ApiError::not_found("Run not found.").into_response()),
-        Err(err) => {
-            return Err(
-                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
-            );
-        }
-    };
+    let cached = state
+        .cached_run(&run_id)
+        .await
+        .map_err(IntoResponse::into_response)?;
     let Some(record) = cached.projection.pending_interviews.get(qid) else {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
@@ -4498,9 +4516,8 @@ async fn append_control_request(
 /// run is currently archived. Returns `None` otherwise (including when the run
 /// doesn't exist — the caller's own not-found handling will surface that).
 async fn reject_if_archived(state: &AppState, run_id: &RunId) -> Option<Response> {
-    let run_store = state.stores.runs.open_run_reader(run_id).await.ok()?;
-    let projection = run_store.state().await.ok()?;
-    projection.archived_at.is_some().then(|| {
+    let cached = state.cached_run(run_id).await.ok()?;
+    cached.projection.archived_at.is_some().then(|| {
         ApiError::new(
             StatusCode::CONFLICT,
             operations::archived_rejection_message(run_id),

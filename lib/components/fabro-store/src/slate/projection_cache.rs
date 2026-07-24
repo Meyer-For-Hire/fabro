@@ -171,6 +171,20 @@ impl RunProjectionCache {
             .map(|entry| state.with_children_count(entry))
     }
 
+    /// Projection and last sequence for `run_id`, without the summary clone
+    /// and children count that `get` computes under the cache mutex.
+    pub(crate) async fn projection_snapshot(
+        &self,
+        run_id: &RunId,
+    ) -> Option<(Arc<RunProjection>, u32)> {
+        self.state
+            .lock()
+            .await
+            .entries
+            .get(run_id)
+            .map(|entry| (Arc::clone(&entry.projection), entry.last_seq))
+    }
+
     pub(crate) async fn get_summary(&self, run_id: &RunId, now: DateTime<Utc>) -> Option<Run> {
         let mut entry = {
             let state = self.state.lock().await;

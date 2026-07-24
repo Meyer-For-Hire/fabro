@@ -22,7 +22,7 @@ pub use rewind::{RewindInput, RewindOutcome, rewind};
 pub use source::WorkflowInput;
 pub use start::{StartServices, Started, start};
 pub use timeline::{ForkTarget, RunTimeline, TimelineEntry, build_timeline, timeline};
-pub use validate::{ValidateInput, validate};
+pub use validate::{ValidateInput, validate, validate_with_ready_providers};
 
 pub use crate::pipeline::{LlmSpec, SandboxEnvSpec};
 pub use crate::transforms::RenderMode;

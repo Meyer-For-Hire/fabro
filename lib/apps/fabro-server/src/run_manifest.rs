@@ -34,14 +34,15 @@ use fabro_types::{
 use fabro_util::check_report::{CheckDetail, CheckReport, CheckResult, CheckSection, CheckStatus};
 use fabro_validate::Severity;
 use fabro_workflow::Error as WorkflowError;
-use fabro_workflow::operations::{CreateRunInput, ValidateInput, WorkflowInput, validate};
+use fabro_workflow::operations::{
+    CreateRunInput, ValidateInput, WorkflowInput, validate, validate_with_ready_providers,
+};
 use fabro_workflow::pipeline::Validated;
-use fabro_workflow::run_materialization::materialize_run;
+use fabro_workflow::run_materialization::materialize_run_with_ready_providers;
 use fabro_workflow::workflow_bundle::{BundledWorkflow, ParsedWorkflowConfig, WorkflowBundle};
 use futures_util::stream::{self, StreamExt};
 use tokio::process::Command;
 use tokio::time;
-use tracing::warn;
 
 use crate::interp::process_env_var;
 use crate::server::AppState;
@@ -196,14 +197,34 @@ pub(crate) fn validate_prepared_manifest_with_vars(
     catalog: Arc<Catalog>,
     vars: HashMap<String, String>,
 ) -> Result<Validated, WorkflowError> {
-    validate(ValidateInput {
+    validate(manifest_validate_input(prepared, catalog, vars))
+}
+
+pub(crate) fn validate_prepared_manifest_for_preflight(
+    prepared: &PreparedManifest,
+    catalog: Arc<Catalog>,
+    vars: HashMap<String, String>,
+    ready_providers: &[ProviderId],
+) -> Result<Validated, WorkflowError> {
+    validate_with_ready_providers(
+        manifest_validate_input(prepared, catalog, vars),
+        ready_providers,
+    )
+}
+
+fn manifest_validate_input(
+    prepared: &PreparedManifest,
+    catalog: Arc<Catalog>,
+    vars: HashMap<String, String>,
+) -> ValidateInput {
+    ValidateInput {
         workflow: WorkflowInput::Bundled(prepared.workflow_input.clone()),
         settings: prepared.settings.clone(),
         vars,
         cwd: prepared.cwd.clone(),
         custom_transforms: Vec::new(),
         catalog,
-    })
+    }
 }
 
 pub(crate) fn create_run_input(
@@ -238,8 +259,10 @@ pub(crate) async fn run_preflight(
     state: &AppState,
     prepared: &PreparedManifest,
     validated: &Validated,
+    llm_result: Result<LlmClientResult>,
 ) -> Result<(types::PreflightResponse, bool)> {
-    let (report, checks_ok) = build_preflight_report(state, prepared, validated).await?;
+    let (report, checks_ok) =
+        build_preflight_report(state, prepared, validated, llm_result).await?;
     let preflight_ok = !validated.has_errors() && checks_ok;
     Ok((
         preflight_response(
@@ -458,6 +481,7 @@ async fn build_preflight_report(
     state: &AppState,
     prepared: &PreparedManifest,
     validated: &Validated,
+    llm_result: Result<LlmClientResult>,
 ) -> Result<(CheckReport, bool)> {
     let graph = validated.graph();
     let mut checks = base_preflight_checks(prepared, graph);
@@ -475,22 +499,23 @@ async fn build_preflight_report(
     }
 
     let catalog = state.catalog();
-    let llm_result = state.resolve_llm_client().await;
-    if let Err(err) = &llm_result {
-        warn!(error = ?err, "Failed to resolve LLM client while checking ready providers");
-    }
-    // Preflight is credential-independent static validation. Materialize
-    // against every enabled catalog provider so aliases and defaults can be
-    // inspected even when the corresponding adapter is not currently ready;
-    // `run_llm_check` below reports actual credential/registration readiness.
-    let enabled_providers = catalog.all_provider_ids().into_iter().collect::<Vec<_>>();
-    let materialized = materialize_run(
+    let ready_providers = llm_result
+        .as_ref()
+        .map(LlmClientResult::provider_ids)
+        .unwrap_or_default();
+    let materialized = materialize_run_with_ready_providers(
         prepared.settings.clone(),
         graph,
         catalog.as_ref(),
-        &enabled_providers,
+        &ready_providers,
     )?;
     let resolved_run = materialized.run;
+    let (Some(run_model), Some(run_provider)) = (
+        resolved_run.model.name.as_deref(),
+        resolved_run.model.provider.as_deref(),
+    ) else {
+        bail!("materialized run is missing a resolved model or provider");
+    };
     let server_settings = state.server_settings();
     let github_integration = &server_settings.server.integrations.github;
     let sandbox_provider = effective_sandbox_provider(&resolved_run);
@@ -553,7 +578,8 @@ async fn build_preflight_report(
     let llm_ok = run_llm_check(
         &mut checks,
         graph,
-        &resolved_run,
+        run_model,
+        run_provider,
         catalog.as_ref(),
         llm_result,
     )
@@ -1029,17 +1055,11 @@ struct PendingModelProbe {
 async fn run_llm_check(
     checks: &mut Vec<CheckResult>,
     graph: &Graph,
-    settings: &RunNamespace,
+    model: &str,
+    default_provider: &str,
     catalog: &Catalog,
     llm_result: Result<LlmClientResult>,
 ) -> bool {
-    let model = settings
-        .model
-        .name
-        .as_deref()
-        .unwrap_or_else(|| catalog.default_for_configured_ids(&[]).id.as_str());
-    let provider = settings.model.provider.as_deref();
-    let default_provider = provider.unwrap_or("anthropic");
     let mut model_providers = std::collections::BTreeSet::new();
     let mut has_llm_nodes = false;
 
@@ -1050,24 +1070,7 @@ async fn run_llm_check(
         has_llm_nodes = true;
         let node_model = node.model().unwrap_or(model);
         let node_provider = node.provider().unwrap_or(default_provider);
-        let resolved = if node.provider().is_some() {
-            catalog.get_on_provider(&ProviderId::new(node_provider), node_model)
-        } else {
-            catalog
-                .select(node_model, None, &catalog.all_provider_ids())
-                .ok()
-        };
-        let (resolved_model, resolved_provider) = if let Some(info) = resolved {
-            (info.id.to_string(), info.provider.to_string())
-        } else {
-            (node_model.to_string(), node_provider.to_string())
-        };
-        let final_provider = if node.provider().is_some() {
-            node_provider.to_string()
-        } else {
-            resolved_provider
-        };
-        model_providers.insert((resolved_model, final_provider));
+        model_providers.insert((node_model.to_string(), node_provider.to_string()));
     }
 
     if !has_llm_nodes {
@@ -1375,6 +1378,7 @@ fn report_to_api(report: &CheckReport) -> types::PreflightCheckReport {
 mod tests {
     use fabro_model::ProviderId;
     use fabro_model::catalog::LlmCatalogSettings;
+    use fabro_workflow::run_materialization::materialize_run;
 
     use super::*;
 
@@ -1468,6 +1472,100 @@ mod tests {
 
     fn test_catalog() -> Arc<Catalog> {
         Arc::new(Catalog::from_builtin().unwrap())
+    }
+
+    fn openai_compatible_completion(model: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": "chatcmpl_preflight",
+            "object": "chat.completion",
+            "created": 1_700_000_000,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "OK"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        })
+    }
+
+    fn ready_kimi_and_openrouter_state(
+        server: &httpmock::MockServer,
+    ) -> Arc<crate::server::AppState> {
+        let kimi_url = server.url("/kimi/v1");
+        let openrouter_url = server.url("/openrouter/v1");
+        let llm_catalog_settings: LlmCatalogSettings = toml::from_str(&format!(
+            r#"
+[providers.kimi]
+base_url = "{kimi_url}"
+
+[providers.openrouter]
+base_url = "{openrouter_url}"
+enabled = true
+"#
+        ))
+        .expect("catalog overrides should parse");
+
+        crate::test_support::TestAppStateBuilder::new()
+            .llm_catalog_settings(llm_catalog_settings)
+            .vault_entries([
+                (EnvVars::KIMI_API_KEY, "test-kimi-key"),
+                (EnvVars::OPENROUTER_API_KEY, "test-openrouter-key"),
+            ])
+            .build()
+    }
+
+    async fn preflight_for_model(
+        state: &Arc<crate::server::AppState>,
+        model: &str,
+    ) -> (types::PreflightResponse, bool) {
+        let llm_result = state.resolve_llm_client().await;
+        let mut ready_providers = llm_result
+            .as_ref()
+            .map(LlmClientResult::provider_ids)
+            .unwrap_or_default();
+        ready_providers.sort();
+        assert_eq!(ready_providers, vec![
+            ProviderId::new("kimi"),
+            ProviderId::new("openrouter")
+        ]);
+
+        let mut manifest = minimal_manifest();
+        manifest.workflows.get_mut("workflow.fabro").unwrap().source = format!(
+            r#"
+digraph Demo {{
+    start [shape=Mdiamond]
+    exit  [shape=Msquare]
+    work  [prompt="Do work", model="{model}"]
+    start -> work -> exit
+}}
+"#
+        );
+        let prepared = prepare_manifest(
+            &manifest_run_defaults(Some(&default_settings_fixture())),
+            &manifest,
+        )
+        .unwrap();
+        let validated = validate_prepared_manifest_for_preflight(
+            &prepared,
+            state.catalog(),
+            HashMap::new(),
+            &ready_providers,
+        )
+        .unwrap();
+
+        run_preflight(state.as_ref(), &prepared, &validated, llm_result)
+            .await
+            .unwrap()
+    }
+
+    async fn resolve_and_run_preflight(
+        state: &AppState,
+        prepared: &PreparedManifest,
+        validated: &Validated,
+    ) -> Result<(types::PreflightResponse, bool)> {
+        let llm_result = state.resolve_llm_client().await;
+        run_preflight(state, prepared, validated, llm_result).await
     }
 
     fn manifest_workflow() -> types::ManifestWorkflow {
@@ -2099,7 +2197,7 @@ name = "Control Plane"
 
         assert!(validated.has_errors());
 
-        let (response, ok) = run_preflight(state.as_ref(), &prepared, &validated)
+        let (response, ok) = resolve_and_run_preflight(state.as_ref(), &prepared, &validated)
             .await
             .unwrap();
 
@@ -2143,7 +2241,7 @@ issues = "read"
         let validated = validate_prepared_manifest(&prepared, test_catalog()).unwrap();
         assert!(!validated.has_errors());
 
-        let (response, _ok) = run_preflight(state.as_ref(), &prepared, &validated)
+        let (response, _ok) = resolve_and_run_preflight(state.as_ref(), &prepared, &validated)
             .await
             .unwrap();
 
@@ -2194,7 +2292,7 @@ id = "local"
 
         assert!(!validated.has_errors());
 
-        let (response, ok) = run_preflight(state.as_ref(), &prepared, &validated)
+        let (response, ok) = resolve_and_run_preflight(state.as_ref(), &prepared, &validated)
             .await
             .unwrap();
 
@@ -2301,7 +2399,7 @@ id = "daytona"
         .unwrap();
         let validated = validate_prepared_manifest(&prepared, test_catalog()).unwrap();
 
-        let (response, _ok) = run_preflight(state.as_ref(), &prepared, &validated)
+        let (response, _ok) = resolve_and_run_preflight(state.as_ref(), &prepared, &validated)
             .await
             .unwrap();
 
@@ -2369,7 +2467,7 @@ digraph Demo {
         .unwrap();
         let validated = validate_prepared_manifest(&prepared, test_catalog()).unwrap();
 
-        let (response, ok) = run_preflight(state.as_ref(), &prepared, &validated)
+        let (response, ok) = resolve_and_run_preflight(state.as_ref(), &prepared, &validated)
             .await
             .unwrap();
 
@@ -2388,6 +2486,80 @@ digraph Demo {
                 .contains("Rate limited by openai: quota limited")
         );
         assert!(response_mock.calls_async().await >= 1);
+    }
+
+    #[tokio::test]
+    async fn preflight_uses_ready_providers_for_known_shared_alias() {
+        let server = httpmock::MockServer::start_async().await;
+        let openrouter_probe = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/openrouter/v1/chat/completions")
+                    .header("authorization", "Bearer test-openrouter-key")
+                    .json_body_includes(r#"{"model":"anthropic/claude-fable-5"}"#);
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(openai_compatible_completion("anthropic/claude-fable-5"));
+            })
+            .await;
+        let state = ready_kimi_and_openrouter_state(&server);
+
+        let (response, _ok) = preflight_for_model(&state, "claude-fable").await;
+
+        let llm_check = response.checks.sections[0]
+            .checks
+            .iter()
+            .find(|check| check.name == "LLM" && check.summary == "claude-fable-5")
+            .expect("preflight should include Claude Fable");
+        assert_eq!(
+            llm_check
+                .details
+                .iter()
+                .map(|detail| detail.text.as_str())
+                .find(|detail| detail.starts_with("Provider: ")),
+            Some("Provider: openrouter")
+        );
+        assert_eq!(llm_check.status, types::PreflightCheckResultStatus::Pass);
+        openrouter_probe.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn preflight_uses_ready_providers_for_unknown_unqualified_model() {
+        let server = httpmock::MockServer::start_async().await;
+        let kimi_probe = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/kimi/v1/chat/completions")
+                    .header("authorization", "Bearer test-kimi-key")
+                    .json_body_includes(r#"{"model":"provider-private-preview"}"#);
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(openai_compatible_completion("provider-private-preview"));
+            })
+            .await;
+        let state = ready_kimi_and_openrouter_state(&server);
+
+        let (response, _ok) = preflight_for_model(&state, "provider-private-preview").await;
+
+        assert!(response.workflow.diagnostics.iter().any(|diagnostic| {
+            diagnostic.rule == "node_model_known"
+                && diagnostic.message.contains("provider-private-preview")
+        }));
+        let llm_check = response.checks.sections[0]
+            .checks
+            .iter()
+            .find(|check| check.name == "LLM" && check.summary == "provider-private-preview")
+            .expect("preflight should include the unknown passthrough model");
+        assert_eq!(
+            llm_check
+                .details
+                .iter()
+                .map(|detail| detail.text.as_str())
+                .find(|detail| detail.starts_with("Provider: ")),
+            Some("Provider: kimi")
+        );
+        assert_eq!(llm_check.status, types::PreflightCheckResultStatus::Pass);
+        kimi_probe.assert_async().await;
     }
 
     #[test]
@@ -2466,9 +2638,21 @@ digraph Demo {
             &manifest,
         )
         .unwrap();
-        let validated = validate_prepared_manifest(&prepared, state.catalog()).unwrap();
+        let llm_result = state.resolve_llm_client().await;
+        let ready_providers = llm_result
+            .as_ref()
+            .map(LlmClientResult::provider_ids)
+            .unwrap_or_default();
+        assert!(ready_providers.is_empty());
+        let validated = validate_prepared_manifest_for_preflight(
+            &prepared,
+            state.catalog(),
+            HashMap::new(),
+            &ready_providers,
+        )
+        .unwrap();
 
-        let (response, ok) = run_preflight(state.as_ref(), &prepared, &validated)
+        let (response, ok) = run_preflight(state.as_ref(), &prepared, &validated, llm_result)
             .await
             .unwrap();
 
