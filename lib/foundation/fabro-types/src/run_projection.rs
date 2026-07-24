@@ -351,8 +351,13 @@ pub struct StageProjection {
     pub usage:             BilledTokenCounts,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model:             Option<ModelRef>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub todos:             Option<TodoListProjection>,
+    /// Todo/task list owned by the stage's root agent session.
+    ///
+    /// OpenAI child sessions own separate per-session plans and do not appear
+    /// here. Anthropic task lists are root-scoped and shared with child
+    /// sessions, so child mutations of that shared list do appear here.
+    #[serde(default, rename = "todos", skip_serializing_if = "Option::is_none")]
+    pub root_agent_todos:  Option<TodoListProjection>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subagents:         Vec<SubAgentProjection>,
     #[serde(default, skip_serializing_if = "SkillsProjection::is_empty")]
@@ -439,7 +444,7 @@ impl StageProjection {
             timing: None,
             usage: BilledTokenCounts::default(),
             model: None,
-            todos: None,
+            root_agent_todos: None,
             subagents: Vec::new(),
             skills: SkillsProjection::default(),
             permission_level: None,
