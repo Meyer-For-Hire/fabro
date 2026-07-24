@@ -29,9 +29,9 @@ const ARTIFACT_POINTER_PREFIX: &str = "file://";
 /// and replaced with a `"blob://sha256/{blob_id}"` reference.
 /// Small values are left untouched.
 ///
-/// `parallel.results` is offloaded leaf-wise instead of as one value so it
-/// stays a structured array that fan-in prompts, projections, and the UI can
-/// read without hydrating the whole payload.
+/// `parallel.results` is offloaded at each branch context-update boundary
+/// instead of as one value so it stays a structured array that fan-in prompts,
+/// projections, and the UI can read without hydrating the whole payload.
 ///
 /// # Errors
 ///
@@ -42,7 +42,7 @@ pub async fn offload_large_values(
 ) -> Result<()> {
     for (key, value) in updates {
         if key == context::keys::PARALLEL_RESULTS {
-            offload_large_leaves(value, run_store).await?;
+            offload_parallel_result_updates(value, run_store).await?;
         } else {
             offload_value(value, run_store).await?;
         }
@@ -50,8 +50,9 @@ pub async fn offload_large_values(
     Ok(())
 }
 
-/// Offload large leaves of typed parallel branch results before they are
-/// emitted through `parallel.completed` and stored in projections.
+/// Offload large context-update values from typed parallel branch results
+/// before they are emitted through `parallel.completed` and stored in
+/// projections.
 ///
 /// # Errors
 ///
@@ -62,34 +63,31 @@ pub async fn offload_parallel_branch_updates(
 ) -> Result<()> {
     for result in results.iter_mut() {
         for value in result.context_updates.values_mut() {
-            offload_large_leaves(value, run_store).await?;
+            offload_value(value, run_store).await?;
         }
     }
     Ok(())
 }
 
-fn offload_large_leaves<'a>(
-    value: &'a mut Value,
-    run_store: &'a RunStoreHandle,
-) -> BoxFuture<'a, Result<()>> {
-    Box::pin(async move {
-        match value {
-            Value::Array(items) => {
-                for item in items {
-                    offload_large_leaves(item, run_store).await?;
-                }
-            }
-            Value::Object(map) => {
-                for item in map.values_mut() {
-                    offload_large_leaves(item, run_store).await?;
-                }
-            }
-            Value::String(_) | Value::Null | Value::Bool(_) | Value::Number(_) => {
-                offload_value(value, run_store).await?;
-            }
+async fn offload_parallel_result_updates(
+    value: &mut Value,
+    run_store: &RunStoreHandle,
+) -> Result<()> {
+    let Some(results) = value.as_array_mut() else {
+        return Ok(());
+    };
+    for result in results {
+        let Some(context_updates) = result
+            .get_mut("context_updates")
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        for value in context_updates.values_mut() {
+            offload_value(value, run_store).await?;
         }
-        Ok(())
-    })
+    }
+    Ok(())
 }
 
 async fn offload_value(value: &mut Value, run_store: &RunStoreHandle) -> Result<()> {
@@ -364,14 +362,13 @@ fn resolve_execution_value<'a>(
             }
             Value::Object(map) => {
                 for (child_key, item) in map.iter_mut() {
-                    resolve_execution_value(
-                        Some(child_key.as_str()),
-                        item,
-                        run_store,
-                        env,
-                        run_dir,
-                    )
-                    .await?;
+                    let child_context_key = if key.is_some_and(is_text_context_key) {
+                        key
+                    } else {
+                        Some(child_key.as_str())
+                    };
+                    resolve_execution_value(child_context_key, item, run_store, env, run_dir)
+                        .await?;
                 }
             }
             Value::Null | Value::Bool(_) | Value::Number(_) => {}
@@ -556,23 +553,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn offload_preserves_parallel_results_and_replaces_only_large_leaves() {
+    async fn offload_preserves_parallel_results_and_replaces_large_context_updates() {
         let run_store = make_run_store("parallel-result-artifact-offload").await;
         let large_response = "r".repeat(BLOB_OFFLOAD_THRESHOLD + 1);
         let large_output = "o".repeat(BLOB_OFFLOAD_THRESHOLD + 1);
+        let large_report = Value::Array(vec![
+            Value::String("small".to_string());
+            BLOB_OFFLOAD_THRESHOLD / 4
+        ]);
+        let expected_report_blob = RunBlobId::new(&serde_json::to_vec(&large_report).unwrap());
+        let mut typed_results = vec![ParallelBranchResult {
+            id:              "branch_a".to_string(),
+            status:          fabro_types::StageOutcome::Succeeded,
+            context_updates: std::collections::BTreeMap::from([
+                (
+                    "response.branch_a".to_string(),
+                    serde_json::json!(large_response),
+                ),
+                (
+                    context::keys::COMMAND_OUTPUT.to_string(),
+                    serde_json::json!(large_output),
+                ),
+                ("report".to_string(), large_report.clone()),
+                ("small".to_string(), serde_json::json!("kept inline")),
+            ]),
+        }];
+
+        offload_parallel_branch_updates(&mut typed_results, &run_store.clone().into())
+            .await
+            .unwrap();
         let mut updates = HashMap::from([(
             context::keys::PARALLEL_RESULTS.to_string(),
-            serde_json::json!([{
-                "id": "branch_a",
-                "status": "failed",
-                "context_updates": {
-                    "response.branch_a": large_response,
-                    "command.output": large_output,
-                    "small": "kept inline",
-                }
-            }]),
+            serde_json::to_value(typed_results).unwrap(),
         )]);
 
+        // The ordinary lifecycle pass must preserve the typed result structure
+        // and the values already offloaded before the completion event.
         offload_large_values(&mut updates, &run_store.clone().into())
             .await
             .unwrap();
@@ -592,6 +608,19 @@ mod tests {
             branch_updates[context::keys::COMMAND_OUTPUT]
                 .as_str()
                 .is_some_and(|value| fabro_types::parse_blob_ref(value).is_some())
+        );
+        assert_eq!(
+            branch_updates["report"],
+            serde_json::json!(format_blob_ref(&expected_report_blob))
+        );
+        let stored_report = run_store
+            .read_blob(&expected_report_blob)
+            .await
+            .unwrap()
+            .expect("structured report blob should exist");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&stored_report).unwrap(),
+            large_report
         );
         assert_eq!(branch_updates["small"], serde_json::json!("kept inline"));
     }
@@ -642,6 +671,10 @@ mod tests {
                 "status": "succeeded",
                 "context_updates": {
                     "response.branch_a": fabro_types::format_blob_ref(&response_blob),
+                    "response.nested": {
+                        "text": fabro_types::format_blob_ref(&response_blob),
+                        "items": [fabro_types::format_blob_ref(&output_blob)],
+                    },
                     "command.output": fabro_types::format_blob_ref(&output_blob),
                     "report": fabro_types::format_blob_ref(&unrelated_blob),
                 }
@@ -657,6 +690,14 @@ mod tests {
 
         let updates = &resolved[context::keys::PARALLEL_RESULTS][0]["context_updates"];
         assert_eq!(updates["response.branch_a"], serde_json::json!(response));
+        assert_eq!(
+            updates["response.nested"]["text"],
+            serde_json::json!(response)
+        );
+        assert_eq!(
+            updates["response.nested"]["items"][0],
+            serde_json::json!(output)
+        );
         assert_eq!(
             updates[context::keys::COMMAND_OUTPUT],
             serde_json::json!(output)

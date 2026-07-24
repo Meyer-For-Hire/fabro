@@ -83,9 +83,9 @@ The parallel stage outcome is:
 
 ## 4. Artifacts and downstream context
 
-Large context values use the normal artifact store. Offloading recursively
-replaces oversized leaf values while retaining the object and array structure
-of `parallel.results`.
+Large context values use the normal artifact store. Offloading replaces
+oversized values within each branch's `context_updates` while retaining the
+outer object and array structure of `parallel.results`.
 
 When Fabro constructs execution or prompt context, it resolves nested textual
 blob references under `response.*` and `command.output`, including those keys
