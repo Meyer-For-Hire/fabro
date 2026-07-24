@@ -381,14 +381,7 @@ fn schedule_worker_cancel_escalation(state: Arc<AppState>, run_id: RunId, worker
             let Some(run) = runs.get_mut(&run_id) else {
                 return;
             };
-            let matches_watchdog = run.cancel_escalation_worker.as_ref() == Some(&worker_ref);
-            let should_escalate = matches_watchdog
-                && !run.status.is_terminal()
-                && run.worker_ref.as_ref() == Some(&worker_ref);
-            if matches_watchdog && !should_escalate {
-                run.cancel_escalation_worker = None;
-            }
-            should_escalate
+            run.escalation_still_current(&worker_ref)
         };
         if !should_escalate {
             tracing::debug!(
@@ -401,11 +394,8 @@ fn schedule_worker_cancel_escalation(state: Arc<AppState>, run_id: RunId, worker
         }
         if !state.worker_runtime.is_alive(&worker_ref).await {
             let mut runs = state.runs.lock().expect("runs lock poisoned");
-            if let Some(run) = runs
-                .get_mut(&run_id)
-                .filter(|run| run.cancel_escalation_worker.as_ref() == Some(&worker_ref))
-            {
-                run.cancel_escalation_worker = None;
+            if let Some(run) = runs.get_mut(&run_id) {
+                run.clear_escalation_for(&worker_ref);
             }
             tracing::debug!(
                 run_id = %run_id,
@@ -420,14 +410,7 @@ fn schedule_worker_cancel_escalation(state: Arc<AppState>, run_id: RunId, worker
             let Some(run) = runs.get_mut(&run_id) else {
                 return;
             };
-            let matches_watchdog = run.cancel_escalation_worker.as_ref() == Some(&worker_ref);
-            let still_current = matches_watchdog
-                && !run.status.is_terminal()
-                && run.worker_ref.as_ref() == Some(&worker_ref);
-            if matches_watchdog && !still_current {
-                run.cancel_escalation_worker = None;
-            }
-            still_current
+            run.escalation_still_current(&worker_ref)
         };
         if !still_current {
             tracing::debug!(
@@ -449,11 +432,8 @@ fn schedule_worker_cancel_escalation(state: Arc<AppState>, run_id: RunId, worker
         );
         state.worker_runtime.force_stop(&worker_ref).await;
         let mut runs = state.runs.lock().expect("runs lock poisoned");
-        if let Some(run) = runs
-            .get_mut(&run_id)
-            .filter(|run| run.cancel_escalation_worker.as_ref() == Some(&worker_ref))
-        {
-            run.cancel_escalation_worker = None;
+        if let Some(run) = runs.get_mut(&run_id) {
+            run.clear_escalation_for(&worker_ref);
         }
     });
 }

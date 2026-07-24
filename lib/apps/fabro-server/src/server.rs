@@ -288,6 +288,28 @@ struct ManagedRun {
     execution_mode: RunExecutionMode,
 }
 
+impl ManagedRun {
+    /// True if cancellation should still escalate to `worker_ref`; clears a
+    /// stale escalation marker as a side effect.
+    fn escalation_still_current(&mut self, worker_ref: &WorkerRef) -> bool {
+        let matches_watchdog = self.cancel_escalation_worker.as_ref() == Some(worker_ref);
+        let still_current = matches_watchdog
+            && !self.status.is_terminal()
+            && self.worker_ref.as_ref() == Some(worker_ref);
+        if matches_watchdog && !still_current {
+            self.cancel_escalation_worker = None;
+        }
+        still_current
+    }
+
+    /// Clears the escalation marker if it is still owned by `worker_ref`.
+    fn clear_escalation_for(&mut self, worker_ref: &WorkerRef) {
+        if self.cancel_escalation_worker.as_ref() == Some(worker_ref) {
+            self.cancel_escalation_worker = None;
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum RunExecutionMode {
     Start,

@@ -9,6 +9,7 @@ import {
   useMatches,
   useNavigate,
 } from "react-router";
+import { AgentControlState } from "@qltysh/fabro-api-client";
 
 import { type SteerBarHandle } from "../components/steer-bar";
 import { ErrorState } from "../components/state";
@@ -107,7 +108,7 @@ export default function RunDetail({ params }: { params: { id: string } }) {
   const childrenCount = runQuery.data?.children_count ?? null;
   const hasSandbox = runHasSandbox(runStateQuery.data);
   const waitingForSteer = Object.values(runStateQuery.data?.stages ?? {}).some(
-    (stage) => stage.agent_control === "waiting_for_steer",
+    (stage) => stage.agent_control === AgentControlState.WAITING_FOR_STEER,
   );
   const tabs = buildRunDetailTabs({
     hasSandbox,

@@ -36,8 +36,7 @@ export function RowActionsMenu({ run }: { run: RunWithStatus }) {
   const { mutate } = useSWRConfig();
   const { push } = useToast();
   const [pendingAction, setPendingAction] = useState<LifecycleAction | "delete" | null>(null);
-  const [optimisticCancellationRunId, setOptimisticCancellationRunId] =
-    useState<string | null>(null);
+  const [optimisticallyCancelled, setOptimisticallyCancelled] = useState(false);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [idCopied, setIdCopied] = useState(false);
 
@@ -52,7 +51,7 @@ export function RowActionsMenu({ run }: { run: RunWithStatus }) {
   const cancellationPending = isCancellationPendingState(
     status,
     run.pendingControl,
-    pendingAction === "cancel" || optimisticCancellationRunId === run.id,
+    pendingAction === "cancel" || optimisticallyCancelled,
   );
   const pending = pendingAction !== null || cancellationPending;
 
@@ -69,7 +68,7 @@ export function RowActionsMenu({ run }: { run: RunWithStatus }) {
     try {
       const result = await action();
       if (label === "cancel") {
-        setOptimisticCancellationRunId(run.id);
+        setOptimisticallyCancelled(true);
       }
       push({
         message:
