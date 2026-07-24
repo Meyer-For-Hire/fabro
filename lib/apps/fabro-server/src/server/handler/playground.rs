@@ -169,8 +169,7 @@ async fn create_playground_chat(
         Ok(s) => s,
         Err(e) => {
             error!(error = ?e, "playground: LLM stream call failed");
-            return ApiError::new(StatusCode::BAD_GATEWAY, format!("LLM error: {e}"))
-                .into_response();
+            return ApiError::from(e).into_response();
         }
     };
 

@@ -127,10 +127,7 @@ async fn create_completion(
         // Streaming path: forward all StreamEvents as SSE
         let stream_result = match client.stream(&request).await {
             Ok(s) => s,
-            Err(e) => {
-                return ApiError::new(StatusCode::BAD_GATEWAY, format!("LLM error: {e}"))
-                    .into_response();
-            }
+            Err(error) => return ApiError::from(error).into_response(),
         };
 
         llm_sse::stream_response(stream_result, state.shutdown_token())
@@ -177,8 +174,7 @@ async fn create_completion(
                     })
                     .into_response()
                 }
-                Err(e) => ApiError::new(StatusCode::BAD_GATEWAY, format!("LLM error: {e}"))
-                    .into_response(),
+                Err(error) => ApiError::from(error).into_response(),
             }
         } else {
             match client.complete(&request).await {
@@ -197,8 +193,7 @@ async fn create_completion(
                     })
                     .into_response()
                 }
-                Err(e) => ApiError::new(StatusCode::BAD_GATEWAY, format!("LLM error: {e}"))
-                    .into_response(),
+                Err(error) => ApiError::from(error).into_response(),
             }
         }
     }
