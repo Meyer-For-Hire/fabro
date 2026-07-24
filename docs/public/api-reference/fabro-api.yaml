@@ -10059,6 +10059,11 @@ components:
         (signatures, item IDs, encrypted or redacted payloads) never appears
         here.
       type: object
+      anyOf:
+        - required:
+            - summary
+        - required:
+            - trace
       properties:
         summary:
           type: string

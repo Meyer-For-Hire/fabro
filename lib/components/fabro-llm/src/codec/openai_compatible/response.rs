@@ -13,22 +13,23 @@ pub(super) fn decode_response(
     ctx: &CodecCtx<'_>,
     rate_limit: Option<RateLimitInfo>,
 ) -> Result<Response, Error> {
-    let api_resp: ApiResponse = serde_json::from_str(body)
+    let mut api_resp: ApiResponse = serde_json::from_str(body)
         .map_err(|e| Error::network(format!("failed to parse response: {e}"), e))?;
 
-    let choice = api_resp.choices.first().ok_or_else(|| Error::Provider {
-        kind:   ProviderErrorKind::Server,
-        detail: Box::new(ProviderErrorDetail::new(
-            "no choices in response",
-            ctx.provider_name,
-        )),
-    })?;
+    let choice = api_resp
+        .choices
+        .first_mut()
+        .ok_or_else(|| Error::Provider {
+            kind:   ProviderErrorKind::Server,
+            detail: Box::new(ProviderErrorDetail::new(
+                "no choices in response",
+                ctx.provider_name,
+            )),
+        })?;
 
     let mut content_parts = Vec::new();
-    if let Some(payload) = &choice.message.reasoning_details {
-        let mut details = ReasoningDetails::default();
-        details.push_payload(payload);
-        content_parts.extend(details.into_content_part());
+    if let Some(payload) = choice.message.reasoning_details.take() {
+        content_parts.extend(ReasoningDetails::from_complete_payload(payload).into_content_part());
     }
     if let Some(reasoning) = choice.message.reasoning() {
         if !reasoning.is_empty() {

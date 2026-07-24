@@ -390,8 +390,8 @@ data: {\"type\":\"text_delta\",\"delta\":\" world\",\"text_id\":null}\n\
 
         assert_eq!(response.text(), "Hello there!");
         let reasoning = response.reasoning_output().expect("reasoning present");
-        assert_eq!(reasoning.summary.as_deref(), Some("weighed both"));
-        assert_eq!(reasoning.trace.as_deref(), Some("step one"));
+        assert_eq!(reasoning.summary(), Some("weighed both"));
+        assert_eq!(reasoning.trace(), Some("step one"));
     }
 
     #[tokio::test]

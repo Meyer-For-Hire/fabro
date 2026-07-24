@@ -3967,10 +3967,10 @@ mod tests {
         session.process_input("What is 2+2?").await.unwrap();
 
         let reasoning = collect_message_reasoning(&mut rx);
-        assert_eq!(reasoning, vec![Some(ReasoningOutput {
-            summary: Some("the user wants 2+2".to_string()),
-            trace:   Some("2+2 is 4".to_string()),
-        })]);
+        assert_eq!(reasoning, vec![Some(ReasoningOutput::new(
+            "the user wants 2+2",
+            "2+2 is 4",
+        ))]);
     }
 
     #[tokio::test]
@@ -3996,10 +3996,7 @@ mod tests {
 
         let reasoning = collect_message_reasoning(&mut rx);
         assert_eq!(reasoning, vec![
-            Some(ReasoningOutput {
-                summary: Some("call the tool".to_string()),
-                trace:   None,
-            }),
+            Some(ReasoningOutput::from_summary("call the tool")),
             None,
         ]);
     }
@@ -4029,10 +4026,10 @@ mod tests {
 
         assert_eq!(provider.call_index.load(Ordering::SeqCst), 2);
         let reasoning = collect_message_reasoning(&mut rx);
-        assert_eq!(reasoning, vec![Some(ReasoningOutput {
-            summary: Some("final summary".to_string()),
-            trace:   Some("final trace".to_string()),
-        })]);
+        assert_eq!(reasoning, vec![Some(ReasoningOutput::new(
+            "final summary",
+            "final trace"
+        ))]);
     }
 
     #[tokio::test(start_paused = true)]

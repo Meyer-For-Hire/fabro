@@ -56,7 +56,7 @@ impl StreamState {
     }
 
     /// Process a parsed SSE chunk and return events to emit, if any.
-    fn process_chunk(&mut self, chunk: &StreamChunk) -> Option<Vec<StreamEvent>> {
+    fn process_chunk(&mut self, mut chunk: StreamChunk) -> Option<Vec<StreamEvent>> {
         // Capture response metadata from the first chunk.
         if let Some(id) = &chunk.id {
             if self.response_id.is_empty() {
@@ -76,8 +76,8 @@ impl StreamState {
             self.cost_usd = usage.cost.or(self.cost_usd);
         }
 
-        let choices = chunk.choices.as_ref()?;
-        let choice = choices.first()?;
+        let choices = chunk.choices.as_mut()?;
+        let choice = choices.first_mut()?;
 
         let mut events = Vec::new();
 
@@ -86,7 +86,7 @@ impl StreamState {
             self.finish_reason = map_finish_reason(Some(reason.as_str()));
         }
 
-        let delta = choice.delta.as_ref()?;
+        let delta = choice.delta.as_mut()?;
 
         // Accumulate reasoning/thinking content (Kimi, etc.).
         if let Some(reasoning) = delta.reasoning() {
@@ -96,8 +96,8 @@ impl StreamState {
         }
 
         // Accumulate structured reasoning detail fragments in wire order.
-        if let Some(payload) = &delta.reasoning_details {
-            self.reasoning_details.push_payload(payload);
+        if let Some(payload) = delta.reasoning_details.take() {
+            self.reasoning_details.push_stream_payload(payload);
         }
 
         // Handle text content delta.
@@ -258,7 +258,7 @@ impl StreamDecoder for StreamState {
         let chunk: StreamChunk = serde_json::from_str(ev.data)
             .map_err(|e| Error::stream_error(format!("failed to parse SSE chunk: {e}"), e))?;
 
-        Ok(self.process_chunk(&chunk).unwrap_or_default())
+        Ok(self.process_chunk(chunk).unwrap_or_default())
     }
 
     fn finish(&mut self) -> Vec<StreamEvent> {
@@ -369,7 +369,7 @@ mod tests {
         let chunk1: StreamChunk = serde_json::from_str(
             r#"{"id":"c1","model":"m1","choices":[{"delta":{"content":"Hello"},"finish_reason":null}]}"#,
         ).unwrap();
-        let events1 = state.process_chunk(&chunk1).unwrap();
+        let events1 = state.process_chunk(chunk1).unwrap();
         assert_eq!(events1.len(), 2);
         assert!(matches!(events1[0], StreamEvent::TextStart { .. }));
         assert!(matches!(events1[1], StreamEvent::TextDelta { .. }));
@@ -377,7 +377,7 @@ mod tests {
         let chunk2: StreamChunk = serde_json::from_str(
             r#"{"id":"c1","model":"m1","choices":[{"delta":{"content":" world"},"finish_reason":null}]}"#,
         ).unwrap();
-        let events2 = state.process_chunk(&chunk2).unwrap();
+        let events2 = state.process_chunk(chunk2).unwrap();
         assert_eq!(events2.len(), 1);
         assert!(matches!(events2[0], StreamEvent::TextDelta { .. }));
 
@@ -391,14 +391,14 @@ mod tests {
         let chunk1: StreamChunk = serde_json::from_str(
             r#"{"id":"c1","model":"m1","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"fn1","arguments":"{\"k"}}]},"finish_reason":null}]}"#,
         ).unwrap();
-        let events1 = state.process_chunk(&chunk1).unwrap();
+        let events1 = state.process_chunk(chunk1).unwrap();
         assert_eq!(events1.len(), 1);
         assert!(matches!(events1[0], StreamEvent::ToolCallStart { .. }));
 
         let chunk2: StreamChunk = serde_json::from_str(
             r#"{"id":"c1","model":"m1","choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ey\"}"}}]},"finish_reason":null}]}"#,
         ).unwrap();
-        let events2 = state.process_chunk(&chunk2).unwrap();
+        let events2 = state.process_chunk(chunk2).unwrap();
         assert_eq!(events2.len(), 1);
         assert!(matches!(events2[0], StreamEvent::ToolCallDelta { .. }));
 

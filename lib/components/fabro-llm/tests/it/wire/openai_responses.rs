@@ -490,8 +490,8 @@ async fn decode_reasoning_item_normalizes_summary_and_trace() {
     .await;
 
     let reasoning = response.reasoning_output().expect("reasoning present");
-    assert_eq!(reasoning.summary.as_deref(), Some("Adding two numbers."));
-    assert_eq!(reasoning.trace.as_deref(), Some("2 plus 2 is 4."));
+    assert_eq!(reasoning.summary(), Some("Adding two numbers."));
+    assert_eq!(reasoning.trace(), Some("2 plus 2 is 4."));
 
     let normalized = serde_json::to_string(&reasoning).unwrap();
     assert!(!normalized.contains("gAAAAAopaque"));

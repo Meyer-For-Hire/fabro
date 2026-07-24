@@ -96,10 +96,10 @@ mod tests {
                 cost_source:     None,
                 tool_call_count: 0,
                 context_window:  None,
-                reasoning:       Some(ReasoningOutput {
-                    summary: Some(format!("the key is {secret}")),
-                    trace:   Some(format!("reading {secret} from the env")),
-                }),
+                reasoning:       Some(ReasoningOutput::new(
+                    format!("the key is {secret}"),
+                    format!("reading {secret} from the env"),
+                )),
             },
             session_id:        Some("ses_agent".to_string()),
             parent_session_id: None,

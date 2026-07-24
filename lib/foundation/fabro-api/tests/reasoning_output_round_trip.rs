@@ -19,14 +19,8 @@ fn reasoning_output_matches_openapi_json_shape() {
     });
 
     let output: ReasoningOutput = serde_json::from_value(value.clone()).unwrap();
-    assert_eq!(
-        output.summary.as_deref(),
-        Some("inspect the conversion first")
-    );
-    assert_eq!(
-        output.trace.as_deref(),
-        Some("read convert.rs, then the sink")
-    );
+    assert_eq!(output.summary(), Some("inspect the conversion first"));
+    assert_eq!(output.trace(), Some("read convert.rs, then the sink"));
     assert_eq!(serde_json::to_value(&output).unwrap(), value);
 
     let api_output: ApiReasoningOutput = serde_json::from_value(value).unwrap();
@@ -37,7 +31,7 @@ fn reasoning_output_matches_openapi_json_shape() {
 fn reasoning_output_members_are_individually_optional() {
     let summary_only: ReasoningOutput =
         serde_json::from_value(json!({"summary": "only a summary"})).unwrap();
-    assert!(summary_only.trace.is_none());
+    assert!(summary_only.trace().is_none());
     assert_eq!(
         serde_json::to_value(&summary_only).unwrap(),
         json!({"summary": "only a summary"})
@@ -45,11 +39,17 @@ fn reasoning_output_members_are_individually_optional() {
 
     let trace_only: ReasoningOutput =
         serde_json::from_value(json!({"trace": "only a trace"})).unwrap();
-    assert!(trace_only.summary.is_none());
+    assert!(trace_only.summary().is_none());
     assert_eq!(
         serde_json::to_value(&trace_only).unwrap(),
         json!({"trace": "only a trace"})
     );
+}
+
+#[test]
+fn reasoning_output_rejects_an_empty_object() {
+    let error = serde_json::from_value::<ApiReasoningOutput>(json!({})).unwrap_err();
+    assert!(error.to_string().contains("requires a summary or trace"));
 }
 
 #[test]
@@ -75,8 +75,8 @@ fn agent_message_props_reasoning_is_optional_on_the_wire() {
     with["reasoning"] = json!({"summary": "checked the parser", "trace": "step one"});
     let props: ApiAgentMessageProps = serde_json::from_value(with).unwrap();
     let reasoning = props.reasoning.as_ref().unwrap();
-    assert_eq!(reasoning.summary.as_deref(), Some("checked the parser"));
-    assert_eq!(reasoning.trace.as_deref(), Some("step one"));
+    assert_eq!(reasoning.summary(), Some("checked the parser"));
+    assert_eq!(reasoning.trace(), Some("step one"));
     assert_eq!(
         serde_json::to_value(&props).unwrap()["reasoning"],
         json!({"summary": "checked the parser", "trace": "step one"})

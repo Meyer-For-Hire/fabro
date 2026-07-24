@@ -330,10 +330,10 @@ mod tests {
                 cost_source:     None,
                 tool_call_count: 1,
                 context_window:  None,
-                reasoning:       Some(::fabro_types::ReasoningOutput {
-                    summary: Some("inspect the sink first".to_string()),
-                    trace:   Some("write the line, then read it back".to_string()),
-                }),
+                reasoning:       Some(::fabro_types::ReasoningOutput::new(
+                    "inspect the sink first",
+                    "write the line, then read it back",
+                )),
             },
             session_id:        Some("ses_agent".to_string()),
             parent_session_id: None,

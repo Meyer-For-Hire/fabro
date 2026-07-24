@@ -15408,10 +15408,10 @@ async fn attach_stream_replays_agent_message_reasoning() {
                 cost_source:     None,
                 tool_call_count: 1,
                 context_window:  None,
-                reasoning:       Some(fabro_types::ReasoningOutput {
-                    summary: Some("inspect the sink first".to_string()),
-                    trace:   Some("read events.rs, then attach".to_string()),
-                }),
+                reasoning:       Some(fabro_types::ReasoningOutput::new(
+                    "inspect the sink first",
+                    "read events.rs, then attach",
+                )),
             },
             session_id:        Some("session-1".to_string()),
             parent_session_id: None,

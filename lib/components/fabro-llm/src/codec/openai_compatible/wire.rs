@@ -156,25 +156,44 @@ pub(super) struct ReasoningDetails {
 }
 
 impl ReasoningDetails {
-    /// Absorb one `reasoning_details` payload.
+    /// Preserve a complete-response `reasoning_details` payload.
     ///
     /// Providers document an array of detail objects; a lone object is
-    /// accepted as a single entry. Scalars carry nothing replayable and are
-    /// dropped. Streaming deltas repeat the same logical detail across
-    /// chunks, so a fragment that continues the previous entry is coalesced
-    /// into it rather than becoming a separate block.
-    pub(super) fn push_payload(&mut self, payload: &serde_json::Value) {
+    /// accepted as a single entry. Complete entries retain their received
+    /// order and shape; scalars carry nothing replayable and are dropped.
+    pub(super) fn from_complete_payload(payload: serde_json::Value) -> Self {
+        let entries = match payload {
+            serde_json::Value::Array(entries) => entries
+                .into_iter()
+                .filter(serde_json::Value::is_object)
+                .collect(),
+            payload @ serde_json::Value::Object(_) => vec![payload],
+            _ => Vec::new(),
+        };
+        Self { entries }
+    }
+
+    /// Absorb one streamed `reasoning_details` payload.
+    ///
+    /// Fragments carrying the same `type` and `index` are coalesced even when
+    /// other logical details appear between them. First-seen detail order is
+    /// retained.
+    pub(super) fn push_stream_payload(&mut self, payload: serde_json::Value) {
         let incoming = match payload {
-            serde_json::Value::Array(entries) => entries.clone(),
-            serde_json::Value::Object(_) => vec![payload.clone()],
+            serde_json::Value::Array(entries) => entries,
+            payload @ serde_json::Value::Object(_) => vec![payload],
             _ => Vec::new(),
         };
         for entry in incoming {
             if !entry.is_object() {
                 continue;
             }
-            match self.entries.last_mut() {
-                Some(last) if continues_detail(last, &entry) => merge_detail_fragment(last, &entry),
+            match self
+                .entries
+                .iter_mut()
+                .find(|existing| continues_detail(existing, &entry))
+            {
+                Some(existing) => merge_detail_fragment(existing, entry),
                 _ => self.entries.push(entry),
             }
         }
@@ -198,20 +217,23 @@ const DETAIL_TEXT_MEMBERS: [&str; 3] = ["text", "summary", "data"];
 /// Aggregators tag each logical detail with a stable `type` and `index`;
 /// fragment streams that omit `index` are matched on `type` alone.
 fn continues_detail(last: &serde_json::Value, entry: &serde_json::Value) -> bool {
-    last.get("type") == entry.get("type") && last.get("index") == entry.get("index")
+    let Some(entry_type) = entry.get("type") else {
+        return false;
+    };
+    last.get("type") == Some(entry_type) && last.get("index") == entry.get("index")
 }
 
 /// Append `entry`'s text fragments onto `last` and fill in members `last`
 /// has not seen yet.
-fn merge_detail_fragment(last: &mut serde_json::Value, entry: &serde_json::Value) {
-    let Some(entry_members) = entry.as_object() else {
+fn merge_detail_fragment(last: &mut serde_json::Value, entry: serde_json::Value) {
+    let serde_json::Value::Object(entry_members) = entry else {
         return;
     };
     let Some(last_members) = last.as_object_mut() else {
         return;
     };
     for (key, value) in entry_members {
-        match last_members.get_mut(key) {
+        match last_members.get_mut(&key) {
             Some(serde_json::Value::String(existing))
                 if DETAIL_TEXT_MEMBERS.contains(&key.as_str()) =>
             {
@@ -221,7 +243,7 @@ fn merge_detail_fragment(last: &mut serde_json::Value, entry: &serde_json::Value
             }
             Some(_) => {}
             None => {
-                last_members.insert(key.clone(), value.clone());
+                last_members.insert(key, value);
             }
         }
     }

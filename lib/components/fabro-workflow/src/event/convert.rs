@@ -2391,10 +2391,10 @@ mod tests {
                 cost_source:     None,
                 tool_call_count: 1,
                 context_window:  None,
-                reasoning:       Some(::fabro_types::ReasoningOutput {
-                    summary: Some("inspect the conversion first".to_string()),
-                    trace:   Some("read convert.rs, then the sink".to_string()),
-                }),
+                reasoning:       Some(::fabro_types::ReasoningOutput::new(
+                    "inspect the conversion first",
+                    "read convert.rs, then the sink",
+                )),
             },
             session_id:        Some("ses_agent".to_string()),
             parent_session_id: None,
@@ -2405,14 +2405,8 @@ mod tests {
             panic!("expected agent message body");
         };
         let reasoning = message.reasoning.as_ref().expect("reasoning copied");
-        assert_eq!(
-            reasoning.summary.as_deref(),
-            Some("inspect the conversion first")
-        );
-        assert_eq!(
-            reasoning.trace.as_deref(),
-            Some("read convert.rs, then the sink")
-        );
+        assert_eq!(reasoning.summary(), Some("inspect the conversion first"));
+        assert_eq!(reasoning.trace(), Some("read convert.rs, then the sink"));
 
         let value = stored.to_value().unwrap();
         assert_eq!(value["event"], "agent.message");

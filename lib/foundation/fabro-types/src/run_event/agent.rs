@@ -428,10 +428,10 @@ mod tests {
             visit:           1,
             message:         None,
             context_window:  None,
-            reasoning:       Some(ReasoningOutput {
-                summary: Some("inspect the implementation first".to_string()),
-                trace:   Some("read convert.rs, then the sink".to_string()),
-            }),
+            reasoning:       Some(ReasoningOutput::new(
+                "inspect the implementation first",
+                "read convert.rs, then the sink",
+            )),
         };
         let v = serde_json::to_value(&props).unwrap();
         assert_eq!(

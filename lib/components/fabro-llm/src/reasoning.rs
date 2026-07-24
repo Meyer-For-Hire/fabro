@@ -18,60 +18,50 @@ use fabro_types::{ContentPart, ReasoningOutput};
 /// this module.
 const BLOCK_SEPARATOR: &str = "\n\n";
 
-/// Detail types whose payload is opaque and must never reach the public
-/// normalized fields.
-fn is_opaque_detail_type(detail_type: &str) -> bool {
-    detail_type.contains("encrypted") || detail_type.contains("redacted")
-}
-
 /// Readable blocks collected per normalized field.
 ///
 /// Explicit blocks come from a channel with documented reasoning semantics.
 /// Fallback blocks come from flattened provider strings, which aggregators
-/// commonly duplicate alongside a structured channel; they only fill a
-/// summary that no explicit block produced.
+/// commonly duplicate alongside a structured channel. They only fill a trace
+/// that no explicit trace produced.
 #[derive(Default)]
-struct Blocks {
-    explicit_summary: Vec<String>,
-    explicit_trace:   Vec<String>,
-    fallback_summary: Vec<String>,
+struct Blocks<'a> {
+    explicit_summary: Vec<&'a str>,
+    explicit_trace:   Vec<&'a str>,
+    fallback_trace:   Vec<&'a str>,
 }
 
-impl Blocks {
+impl Blocks<'_> {
     fn into_output(self) -> Option<ReasoningOutput> {
-        let summary =
-            join_blocks(&self.explicit_summary).or_else(|| join_blocks(&self.fallback_summary));
-        let trace = join_blocks(&self.explicit_trace);
-        let output = ReasoningOutput { summary, trace };
-        (!output.is_empty()).then_some(output)
+        let summary = join_blocks(&self.explicit_summary);
+        let trace = join_blocks(&self.explicit_trace)
+            .or_else(|| join_blocks(&self.fallback_trace))
+            .filter(|trace| summary.as_ref() != Some(trace));
+
+        match (summary, trace) {
+            (Some(summary), Some(trace)) => Some(ReasoningOutput::new(summary, trace)),
+            (Some(summary), None) => Some(ReasoningOutput::from_summary(summary)),
+            (None, Some(trace)) => Some(ReasoningOutput::from_trace(trace)),
+            (None, None) => None,
+        }
     }
 }
 
 /// Join complete blocks in provider order, dropping empty and
 /// whitespace-only fragments. Retained text is never trimmed or rewritten.
-fn join_blocks(blocks: &[String]) -> Option<String> {
-    let joined = blocks
-        .iter()
-        .filter(|block| !block.trim().is_empty())
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .join(BLOCK_SEPARATOR);
-    (!joined.is_empty()).then_some(joined)
+fn join_blocks(blocks: &[&str]) -> Option<String> {
+    (!blocks.is_empty()).then(|| blocks.join(BLOCK_SEPARATOR))
 }
 
-/// Read a text-bearing member, preferring the member the provider's
-/// documented semantics name and accepting the other readable spelling.
-fn readable_member(entry: &serde_json::Value, preferred: &str) -> Option<String> {
-    let other = if preferred == "text" {
-        "summary"
-    } else {
-        "text"
-    };
-    entry
-        .get(preferred)
-        .and_then(serde_json::Value::as_str)
-        .or_else(|| entry.get(other).and_then(serde_json::Value::as_str))
-        .map(str::to_string)
+fn push_block<'a>(blocks: &mut Vec<&'a str>, block: &'a str) {
+    if !block.trim().is_empty() {
+        blocks.push(block);
+    }
+}
+
+/// Read a text-bearing member with the provider's documented semantics.
+fn readable_member<'a>(entry: &'a serde_json::Value, member: &str) -> Option<&'a str> {
+    entry.get(member).and_then(serde_json::Value::as_str)
 }
 
 /// Extract readable text from an OpenAI Responses `reasoning` output item.
@@ -79,13 +69,13 @@ fn readable_member(entry: &serde_json::Value, preferred: &str) -> Option<String>
 /// `summary[].text` is the model-authored summary; `content[]` entries typed
 /// `reasoning_text` are the verbatim trace. `encrypted_content`, `id`, and
 /// `status` are opaque and ignored.
-fn collect_openai_reasoning_item(item: &serde_json::Value, blocks: &mut Blocks) {
+fn collect_openai_reasoning_item<'a>(item: &'a serde_json::Value, blocks: &mut Blocks<'a>) {
     if let Some(entries) = item.get("summary").and_then(serde_json::Value::as_array) {
         for entry in entries {
             if let Some(text) = entry.as_str() {
-                blocks.explicit_summary.push(text.to_string());
+                push_block(&mut blocks.explicit_summary, text);
             } else if let Some(text) = entry.get("text").and_then(serde_json::Value::as_str) {
-                blocks.explicit_summary.push(text.to_string());
+                push_block(&mut blocks.explicit_summary, text);
             }
         }
     }
@@ -99,18 +89,14 @@ fn collect_openai_reasoning_item(item: &serde_json::Value, blocks: &mut Blocks) 
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default();
             if entry_type == "reasoning_text" {
-                blocks.explicit_trace.push(text.to_string());
-            } else if !is_opaque_detail_type(entry_type) {
-                // Readable text from the reasoning channel that carries no
-                // recognized classification is treated as a summary.
-                blocks.explicit_summary.push(text.to_string());
+                push_block(&mut blocks.explicit_trace, text);
             }
         }
     }
 }
 
 /// Extract readable text from OpenAI-compatible `reasoning_details` entries.
-fn collect_reasoning_details(details: &serde_json::Value, blocks: &mut Blocks) {
+fn collect_reasoning_details<'a>(details: &'a serde_json::Value, blocks: &mut Blocks<'a>) {
     let Some(entries) = details.as_array() else {
         return;
     };
@@ -119,23 +105,18 @@ fn collect_reasoning_details(details: &serde_json::Value, blocks: &mut Blocks) {
             .get("type")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
-        if is_opaque_detail_type(detail_type) {
-            continue;
-        }
         match detail_type {
             "reasoning.text" => {
                 if let Some(text) = readable_member(entry, "text") {
-                    blocks.explicit_trace.push(text);
+                    push_block(&mut blocks.explicit_trace, text);
                 }
             }
-            // Documented summaries and unknown detail variants both come
-            // from an established reasoning channel, so a readable member
-            // is kept as a summary either way.
-            _ => {
+            "reasoning.summary" => {
                 if let Some(text) = readable_member(entry, "summary") {
-                    blocks.explicit_summary.push(text);
+                    push_block(&mut blocks.explicit_summary, text);
                 }
             }
+            _ => {}
         }
     }
 }
@@ -149,7 +130,7 @@ pub(crate) fn normalize(content: &[ContentPart]) -> Option<ReasoningOutput> {
     for part in content {
         match part {
             ContentPart::Thinking(thinking) if !thinking.redacted => {
-                blocks.fallback_summary.push(thinking.text.clone());
+                push_block(&mut blocks.fallback_trace, &thinking.text);
             }
             ContentPart::Other { kind, data } if kind == ContentPart::OPENAI_REASONING => {
                 collect_openai_reasoning_item(data, &mut blocks);
@@ -195,10 +176,10 @@ mod tests {
     }
 
     #[test]
-    fn non_redacted_thinking_becomes_a_summary() {
+    fn non_redacted_thinking_becomes_a_trace() {
         let output = normalize(&[thinking("weighing the options")]).unwrap();
-        assert_eq!(output.summary.as_deref(), Some("weighing the options"));
-        assert!(output.trace.is_none());
+        assert!(output.summary().is_none());
+        assert_eq!(output.trace(), Some("weighing the options"));
     }
 
     #[test]
@@ -221,8 +202,8 @@ mod tests {
             "content": [{"type": "reasoning_text", "text": "step one"}],
         }))])
         .unwrap();
-        assert_eq!(output.summary.as_deref(), Some("inspect first"));
-        assert_eq!(output.trace.as_deref(), Some("step one"));
+        assert_eq!(output.summary(), Some("inspect first"));
+        assert_eq!(output.trace(), Some("step one"));
     }
 
     #[test]
@@ -234,7 +215,17 @@ mod tests {
             ],
         }))])
         .unwrap();
-        assert_eq!(output.summary.as_deref(), Some("first\n\nsecond"));
+        assert_eq!(output.summary(), Some("first\n\nsecond"));
+    }
+
+    #[test]
+    fn unknown_responses_content_types_remain_opaque() {
+        assert!(
+            normalize(&[openai_reasoning(json!({
+                "content": [{"type": "reasoning_future", "text": "not classified"}],
+            }))])
+            .is_none()
+        );
     }
 
     #[test]
@@ -244,8 +235,8 @@ mod tests {
             {"type": "reasoning.text", "text": "read convert.rs", "signature": "sig"},
         ]))])
         .unwrap();
-        assert_eq!(output.summary.as_deref(), Some("checked the parser"));
-        assert_eq!(output.trace.as_deref(), Some("read convert.rs"));
+        assert_eq!(output.summary(), Some("checked the parser"));
+        assert_eq!(output.trace(), Some("read convert.rs"));
     }
 
     #[test]
@@ -255,8 +246,8 @@ mod tests {
             {"type": "reasoning.summary", "summary": "visible"},
         ])),])
         .unwrap();
-        assert_eq!(output.summary.as_deref(), Some("visible"));
-        assert!(output.trace.is_none());
+        assert_eq!(output.summary(), Some("visible"));
+        assert!(output.trace().is_none());
     }
 
     #[test]
@@ -270,12 +261,13 @@ mod tests {
     }
 
     #[test]
-    fn unknown_detail_variants_are_treated_as_summary() {
-        let output = normalize(&[reasoning_details(json!([
-            {"type": "reasoning.future", "text": "new channel"},
-        ]))])
-        .unwrap();
-        assert_eq!(output.summary.as_deref(), Some("new channel"));
+    fn unknown_detail_variants_remain_opaque() {
+        assert!(
+            normalize(&[reasoning_details(json!([
+                {"type": "reasoning.future", "text": "new channel"},
+            ]))])
+            .is_none()
+        );
     }
 
     #[test]
@@ -300,19 +292,32 @@ mod tests {
             thinking("checked the parser"),
         ])
         .unwrap();
-        assert_eq!(output.summary.as_deref(), Some("checked the parser"));
-        assert!(output.trace.is_none());
+        assert_eq!(output.summary(), Some("checked the parser"));
+        assert!(output.trace().is_none());
     }
 
     #[test]
-    fn trace_only_detail_lets_the_fallback_fill_the_summary() {
+    fn structured_trace_takes_precedence_over_flattened_trace() {
         let output = normalize(&[
             reasoning_details(json!([{"type": "reasoning.text", "text": "verbatim"}])),
             thinking("flattened"),
         ])
         .unwrap();
-        assert_eq!(output.summary.as_deref(), Some("flattened"));
-        assert_eq!(output.trace.as_deref(), Some("verbatim"));
+        assert!(output.summary().is_none());
+        assert_eq!(output.trace(), Some("verbatim"));
+    }
+
+    #[test]
+    fn structured_summary_keeps_a_distinct_flattened_trace() {
+        let output = normalize(&[
+            reasoning_details(json!([
+                {"type": "reasoning.summary", "summary": "short summary"},
+            ])),
+            thinking("full verbatim trace"),
+        ])
+        .unwrap();
+        assert_eq!(output.summary(), Some("short summary"));
+        assert_eq!(output.trace(), Some("full verbatim trace"));
     }
 
     #[test]
@@ -323,7 +328,7 @@ mod tests {
     #[test]
     fn non_empty_text_is_preserved_verbatim() {
         let output = normalize(&[thinking("  indented thought\n")]).unwrap();
-        assert_eq!(output.summary.as_deref(), Some("  indented thought\n"));
+        assert_eq!(output.trace(), Some("  indented thought\n"));
     }
 
     #[test]

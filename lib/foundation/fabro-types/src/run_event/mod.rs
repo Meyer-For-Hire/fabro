@@ -2214,10 +2214,10 @@ mod tests {
             visit:           1,
             message:         None,
             context_window:  None,
-            reasoning:       Some(crate::ReasoningOutput {
-                summary: Some("inspect the implementation first".to_string()),
-                trace:   Some("read convert.rs, then the sink".to_string()),
-            }),
+            reasoning:       Some(crate::ReasoningOutput::new(
+                "inspect the implementation first",
+                "read convert.rs, then the sink",
+            )),
         });
 
         let value = serde_json::to_value(&body).unwrap();
