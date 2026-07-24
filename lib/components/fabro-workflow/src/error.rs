@@ -38,6 +38,7 @@ pub fn classify_sdk_error(err: &LlmError) -> FailureCategory {
         LlmError::Interrupt { .. } => FailureCategory::Canceled,
         LlmError::InvalidToolCall { .. }
         | LlmError::NoObjectGenerated { .. }
+        | LlmError::InvalidRequest { .. }
         | LlmError::Configuration { .. }
         | LlmError::UnsupportedToolChoice { .. } => FailureCategory::Deterministic,
     }

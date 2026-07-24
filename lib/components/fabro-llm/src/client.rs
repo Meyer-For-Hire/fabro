@@ -410,12 +410,11 @@ impl Client {
 
         if let Some(effort) = request.reasoning_effort {
             if !settings.controls.reasoning_effort.contains(&effort) {
-                return Err(Error::Configuration {
+                return Err(Error::InvalidRequest {
                     message: format!(
                         "model '{model_id}' does not support reasoning_effort '{effort}'; allowed values: {}",
                         format_control_values(&settings.controls.reasoning_effort),
                     ),
-                    source:  None,
                 });
             }
         }
@@ -439,7 +438,8 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Returns `Error::Configuration` if no provider is specified or
+    /// Returns `Error::InvalidRequest` when a catalog-declared request control
+    /// is unsupported, `Error::Configuration` if no provider is specified or
     /// registered, or any provider/middleware error encountered during the
     /// request.
     pub async fn complete(&self, request: &Request) -> Result<Response, Error> {
@@ -475,7 +475,8 @@ impl Client {
     ///
     /// # Errors
     ///
-    /// Returns `Error::Configuration` if no provider is specified or
+    /// Returns `Error::InvalidRequest` when a catalog-declared request control
+    /// is unsupported, `Error::Configuration` if no provider is specified or
     /// registered, or any provider/middleware error encountered during the
     /// request.
     pub async fn stream(&self, request: &Request) -> Result<StreamEventStream, Error> {
@@ -1481,9 +1482,8 @@ output_cost_per_mtok = 20.0
 
         assert!(matches!(
             err,
-            Error::Configuration {
+            Error::InvalidRequest {
                 ref message,
-                ..
             } if message.contains("model 'kimi-k2.5' does not support reasoning_effort 'high'")
         ));
     }

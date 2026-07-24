@@ -26,6 +26,17 @@ fn finish_reason_to_api_stop_reason(reason: &FinishReason) -> String {
     }
 }
 
+fn llm_error_response(error: fabro_llm::Error) -> Response {
+    match error {
+        fabro_llm::Error::InvalidRequest { message } => {
+            ApiError::bad_request(message).into_response()
+        }
+        error => {
+            ApiError::new(StatusCode::BAD_GATEWAY, format!("LLM error: {error}")).into_response()
+        }
+    }
+}
+
 async fn create_completion(
     _auth: RequiredUser,
     State(state): State<Arc<AppState>>,
@@ -127,10 +138,7 @@ async fn create_completion(
         // Streaming path: forward all StreamEvents as SSE
         let stream_result = match client.stream(&request).await {
             Ok(s) => s,
-            Err(e) => {
-                return ApiError::new(StatusCode::BAD_GATEWAY, format!("LLM error: {e}"))
-                    .into_response();
-            }
+            Err(error) => return llm_error_response(error),
         };
 
         llm_sse::stream_response(stream_result, state.shutdown_token())
@@ -179,8 +187,7 @@ async fn create_completion(
                     })
                     .into_response()
                 }
-                Err(e) => ApiError::new(StatusCode::BAD_GATEWAY, format!("LLM error: {e}"))
-                    .into_response(),
+                Err(error) => llm_error_response(error),
             }
         } else {
             match client.complete(&request).await {
@@ -202,8 +209,7 @@ async fn create_completion(
                     })
                     .into_response()
                 }
-                Err(e) => ApiError::new(StatusCode::BAD_GATEWAY, format!("LLM error: {e}"))
-                    .into_response(),
+                Err(error) => llm_error_response(error),
             }
         }
     }
