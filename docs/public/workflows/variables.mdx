@@ -7,14 +7,15 @@ Fabro renders `{{ ... }}` templates in exactly two workflow attributes: the grap
 
 ## Template context
 
-Goal and prompt templates can reference:
+Goal templates can reference inputs and server-managed variables. Prompt templates receive those values plus the rendered workflow goal:
 
 | Expression | Resolves to |
 |---|---|
-| `{{ goal }}` | The workflow goal |
+| `{{ goal }}` | The rendered workflow goal (prompts only; a goal cannot reference itself) |
 | `{{ inputs.name }}` | A value from `[run.inputs]`, optionally overridden by CLI input flags |
+| `{{ vars.NAME }}` | A server-managed variable snapshotted when the run is created |
 
-Environment variables are **not** available in goal or prompt templates. Use `{{ env.NAME }}` only in config strings and HTTP hook headers.
+Environment variables and secrets are **not** available in goal or prompt templates. Use `{{ env.NAME }}` and `{{ secrets.NAME }}` only in the configuration fields that support run-boundary interpolation.
 
 ## Run config inputs
 
@@ -68,7 +69,7 @@ Use server-managed variables for non-sensitive values that should be shared acro
 fabro variable set DEPLOY_ENV staging --description "Deployment target"
 ```
 
-Run configuration strings can reference these values with `{{ vars.NAME }}`:
+Run configuration strings, graph goals, and node prompts can reference these values with `{{ vars.NAME }}`:
 
 ```toml title="workflow.toml"
 _version = 1
@@ -77,7 +78,18 @@ _version = 1
 goal = "Deploy {{ vars.DEPLOY_ENV }}"
 ```
 
+```dot title="deploy.fabro"
+digraph Deploy {
+    graph [goal="Deploy to {{ vars.DEPLOY_ENV }}"]
+    deploy [prompt="Deploy the requested release to {{ vars.DEPLOY_ENV }}."]
+}
+```
+
 Variables are intentionally readable: `fabro variable list` and `fabro variable get DEPLOY_ENV` show stored values. Do not store tokens, API keys, or credentials as variables; use `fabro secret set` for sensitive values.
+
+Server-managed variables are stored in the shared SQLite database. When upgrading from file-backed storage, Fabro imports `<storage_root>/variables.json` once; existing SQLite rows win on name conflicts. After a successful import, the source file is renamed to `variables.json.imported-<timestamp>.bak`.
+
+The server snapshots the variable store when it creates the run. Changing a variable later does not rewrite that run's rendered goal, imported prompts, or `@file` prompt and goal contents.
 
 ## `goal`
 
@@ -93,13 +105,16 @@ digraph Example {
 
 That prompt becomes `Create a plan for: Implement the login feature`.
 
+A graph goal cannot contain `{{ goal }}` because that would reference itself. `fabro validate` reports `goal_self_reference` as an error; put the reusable text in an input or server-managed variable instead.
+
 ## Expansion timing
 
 Fabro keeps workflow structure static and renders workflow templates once:
 
 1. Fabro parses the root DOT and imported `.fabro` files without rendering them.
 2. Literal `import`, `@file`, graph-goal file, and child-workflow references are resolved.
-3. The graph `goal` and node `prompt` attributes are rendered with the `{ goal, inputs }` context.
+3. The graph `goal` is rendered with the `{ inputs, vars }` context.
+4. Node `prompt` attributes are rendered with the `{ goal, inputs, vars }` context.
 
 Templates are not supported in graph syntax, node IDs, edge structure, `import` paths, `@file` paths, child workflow paths, other file references, or any attribute besides `prompt` and `goal`.
 
@@ -107,7 +122,7 @@ Fabro renders the graph `goal` first and stores the rendered value back onto the
 
 ## Undefined variables
 
-Fabro renders undefined workflow variables as empty text and records a `template_undefined_variable` diagnostic. `fabro validate` reports that diagnostic as a warning so you can validate workflow structure before all inputs are known. Run-style commands such as `fabro run`, `fabro create`, and preflight promote the same diagnostic to an error before proceeding.
+Fabro renders undefined workflow variables as empty text and records a `template_undefined_variable` diagnostic. `fabro validate` reports that diagnostic as a warning so you can validate workflow structure before all inputs are known. Offline validation does not read a server's variable store, so `{{ vars.* }}` references also warn there. Run-style commands such as `fabro run`, `fabro create`, and preflight use the server snapshot and promote any still-undefined reference to an error before proceeding.
 
 ## Template includes
 

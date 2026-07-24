@@ -186,16 +186,19 @@ Ordered list of steps to run before the workflow starts. Use this to clone repos
 script = "pip install -r requirements.txt"
 
 [[run.prepare.steps]]
-script = "npm install"
+command = ["npm", "install"]
+env = { NPM_TOKEN = "{{ secrets.NPM_TOKEN }}" }
 ```
 
 | Field | Description |
 |---|---|
-| `script` | Shell-evaluated command (runs through `sh -c`). |
-| `command` | Argv-style command, mutually exclusive with `script`. |
-| `env` | Additional environment variables for this step. |
+| `script` | Shell-evaluated command (runs through `sh -c`). Supports `{{ vars.* }}`, `{{ env.* }}`, and `{{ secrets.* }}` interpolation. |
+| `command` | Argv-style command, mutually exclusive with `script`. Each resolved element is shell-quoted as one argument. |
+| `env` | Additional environment variables for this step. Values support the same interpolation as `script` and `command`. |
 
 Each step must exit with status 0. If any step fails, the run aborts before the workflow starts. Prepare steps replace across layers — the higher-precedence layer wins wholesale.
+
+Fabro substitutes `{{ vars.* }}` when the server creates the run, then resolves `{{ env.* }}` from the worker process and `{{ secrets.* }}` from token entries in the server vault immediately before the worker executes the steps. Worker-time environment and secret expressions remain in the persisted run definition; resolved secret values are not persisted. A missing environment variable, missing secret, or non-token secret aborts startup with the affected step and token named in the error.
 
 ### `[run.clone]`
 
@@ -292,23 +295,25 @@ When `provider = "local"`, Fabro runs directly in the resolved working
 directory. If you want local isolation, create or enter a separate clone or Git
 worktree yourself.
 
-Environment variable values can be literal strings or host environment
-references using `{{ env.VARNAME }}` syntax:
+Environment variable values can combine literal text with server variables, worker environment variables, and token secrets:
 
 ```toml title="run.toml"
 [environments.ci.env]
-API_KEY = "{{ env.MY_API_KEY }}"
+API_KEY = "{{ secrets.SERVICE_API_KEY }}"
 NODE_ENV = "production"
 SERVICE_URL = "https://api.{{ env.REGION }}.example.com"
+RELEASE_CHANNEL = "{{ vars.RELEASE_CHANNEL }}"
 ```
 
 | Syntax | Description |
 |---|---|
 | `"literal"` | Static value passed as-is |
-| `"{{ env.VARNAME }}"` | Whole-value reference resolved from the host environment at consumption time |
-| `"prefix-{{ env.X }}-suffix"` | Substring interpolation; multiple tokens per string are supported |
+| `"{{ vars.NAME }}"` | Server-managed variable substituted when the run is created |
+| `"{{ env.VARNAME }}"` | Worker process environment value resolved when the run starts |
+| `"{{ secrets.NAME }}"` | Token secret resolved from the server vault when the run starts |
+| `"prefix-{{ env.X }}-suffix"` | Substring interpolation; multiple supported tokens per string are allowed |
 
-Missing host variables produce a hard error pointing at the specific field and unresolved token.
+Missing or non-token secret references fail closed before sandbox startup. For backward compatibility, an environment value that references only a missing `{{ env.* }}` value is passed through in source form; use preflight or prepare-step interpolation when an absent worker variable must be a hard error.
 
 ### `[run.integrations.github.permissions]`
 
@@ -448,8 +453,17 @@ startup_timeout = "60s"
 tool_timeout = "2m"
 ```
 
+To reuse a definition from the server-managed MCP catalog, reference its ID instead of defining an inline transport:
+
+```toml title="run.toml"
+[run.agent.mcps.sentry]
+id = "sentry"
+```
+
 | Field | Description | Default |
 |---|---|---|
+| `id` | Server-managed MCP definition to use. Cannot be combined with inline transport fields. | — |
+| `enabled` | Set `false` to leave this inline server or catalog reference disabled. | `true` |
 | `type` | Transport type: `"stdio"`, `"http"`, or `"sandbox"`. | — |
 | `script` | (stdio, sandbox) Shell-evaluated startup command, mutually exclusive with `command`. | — |
 | `command` | (stdio, sandbox) Argv array: executable + arguments. | — |
@@ -459,6 +473,8 @@ tool_timeout = "2m"
 | `headers` | (http) Optional HTTP headers for authentication. | `{}` |
 | `startup_timeout` | Max duration for server startup + MCP handshake (e.g. `"10s"`, `"1m"`). | `"10s"` |
 | `tool_timeout` | Max duration for a single tool call. | `"60s"` |
+
+Inline transport commands, URLs, env values, and headers support `{{ vars.* }}`, `{{ env.* }}`, and `{{ secrets.* }}` interpolation. As with prepare steps, server variables resolve at run creation and worker env/token secrets resolve at launch; missing values fail closed. See [MCP runtime interpolation](/agents/mcp#runtime-interpolation) for the standalone `fabro exec` difference.
 
 The `sandbox` transport runs the MCP server inside the workflow's sandbox. This is useful for tools that need access to the sandbox environment, such as browser automation with Playwright. See [MCP](/agents/mcp#sandbox) for details.
 
