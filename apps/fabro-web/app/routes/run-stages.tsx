@@ -17,7 +17,8 @@ import {
   EventSearchInput,
   MultiSelectFilter,
   ThreadDnaStrip,
-  threadSelectionKey,
+  threadSelectionId,
+  threadSelectionsEqual,
 } from "../components/event-debug";
 import {
   debugCategory,
@@ -60,6 +61,7 @@ import {
   formatDurationMs,
   formatTokenCount,
 } from "../lib/format";
+import { plural } from "../lib/plural";
 import {
   useRun,
   useRunEventsList,
@@ -389,22 +391,34 @@ export function eventsToActivity(events: EventEnvelope[], stageId: string): Turn
 }
 
 type ToolTurn = Extract<TurnType, { kind: "tool" }>;
+type ToolGroupChild = { turn: ToolTurn; turnIndex: number };
+type ToolGroupChildren = readonly [
+  ToolGroupChild,
+  ToolGroupChild,
+  ...ToolGroupChild[],
+];
 
 export type DisplayItem =
-  | { kind: "single"; turn: TurnType; turnIndex: number }
+  | {
+      kind: "single";
+      turn: TurnType;
+      turnIndex: number;
+      selection: Extract<ThreadDnaSelection, { kind: "single" }>;
+    }
   | {
       kind: "group";
       toolName: string;
       ts: string;
       durationMs: number;
-      children: { turn: ToolTurn; turnIndex: number }[];
+      children: ToolGroupChildren;
+      selection: Extract<ThreadDnaSelection, { kind: "group" }>;
     };
 
 // A group's elapsed time is the wall-clock envelope of its children —
 // earliest start to latest end — not the sum of their durations. Parallel
 // calls overlap, and completion order is not always start order, so neither
 // the summed duration nor the last array element is the right answer.
-export function toolGroupBounds(children: { turn: ToolTurn }[]): {
+function toolGroupBounds(children: ToolGroupChildren): {
   ts: string;
   durationMs: number;
 } {
@@ -429,13 +443,37 @@ export function toolGroupBounds(children: { turn: ToolTurn }[]): {
   return { ts: earliestTs, durationMs: Math.max(0, latestEnd - earliestStart) };
 }
 
-export function displayItemSelection(item: DisplayItem): ThreadDnaSelection {
-  return item.kind === "single"
-    ? { kind: "single", turnIndex: item.turnIndex }
-    : {
-        kind: "group",
-        childTurnIndices: item.children.map((child) => child.turnIndex),
-      };
+function singleDisplayItem(turn: TurnType, turnIndex: number): DisplayItem {
+  return {
+    kind: "single",
+    turn,
+    turnIndex,
+    selection: { kind: "single", turnIndex },
+  };
+}
+
+function toolGroupDisplayItem(
+  first: ToolGroupChild,
+  second: ToolGroupChild,
+  rest: ToolGroupChild[],
+): Extract<DisplayItem, { kind: "group" }> {
+  const children: ToolGroupChildren = [first, second, ...rest];
+  const bounds = toolGroupBounds(children);
+  return {
+    kind: "group",
+    toolName: first.turn.toolName,
+    ts: bounds.ts,
+    durationMs: bounds.durationMs,
+    children,
+    selection: {
+      kind: "group",
+      childTurnIndices: [
+        first.turnIndex,
+        second.turnIndex,
+        ...rest.map((child) => child.turnIndex),
+      ],
+    },
+  };
 }
 
 // Grouping runs over the complete turn stream, never a filtered one: any
@@ -448,20 +486,14 @@ export function groupConsecutiveTools(
   let buf: { turn: ToolTurn; turnIndex: number }[] = [];
 
   function flush() {
-    if (buf.length === 0) return;
-    if (buf.length === 1) {
-      out.push({ kind: "single", turn: buf[0].turn, turnIndex: buf[0].turnIndex });
-    } else {
-      const bounds = toolGroupBounds(buf);
-      out.push({
-        kind: "group",
-        toolName: buf[0].turn.toolName,
-        ts: bounds.ts,
-        durationMs: bounds.durationMs,
-        children: buf,
-      });
-    }
+    const [first, second, ...rest] = buf;
     buf = [];
+    if (!first) return;
+    out.push(
+      second
+        ? toolGroupDisplayItem(first, second, rest)
+        : singleDisplayItem(first.turn, first.turnIndex),
+    );
   }
 
   for (const { turn, index } of turns) {
@@ -474,7 +506,7 @@ export function groupConsecutiveTools(
     if (groupable) {
       buf.push({ turn, turnIndex: index });
     } else {
-      out.push({ kind: "single", turn, turnIndex: index });
+      out.push(singleDisplayItem(turn, index));
     }
   }
   flush();
@@ -491,6 +523,14 @@ export function filterDisplayItems(
   selectedKinds: readonly EventKind[],
   search: string,
 ): DisplayItem[] {
+  if (
+    search.length === 0 &&
+    selectedKinds.length === EVENT_KINDS.length &&
+    EVENT_KINDS.every((kind) => selectedKinds.includes(kind))
+  ) {
+    return items;
+  }
+
   const kinds = new Set<string>(selectedKinds);
   const needle = search.toLowerCase();
   const matchesSearch = (turn: TurnType) =>
@@ -508,6 +548,18 @@ export function visibleTurnCount(items: DisplayItem[]): number {
   return items.reduce(
     (total, item) => total + (item.kind === "single" ? 1 : item.children.length),
     0,
+  );
+}
+
+export function filterThreadDnaItems(
+  items: ThreadDnaItem[],
+  visibleItems: DisplayItem[],
+): ThreadDnaItem[] {
+  const visibleIds = new Set(
+    visibleItems.map((item) => threadSelectionId(item.selection)),
+  );
+  return items.filter((item) =>
+    visibleIds.has(threadSelectionId(item.selection)),
   );
 }
 
@@ -555,7 +607,7 @@ export function buildThreadDnaItems(
       const turn = item.turn;
       const tsMs = Date.parse(turn.ts);
       if (Number.isNaN(tsMs)) continue;
-      const selection = displayItemSelection(item);
+      const selection = item.selection;
 
       switch (turn.kind) {
         case "system":
@@ -664,7 +716,7 @@ export function buildThreadDnaItems(
         label: `${humanizeToolName(item.toolName)} ×${item.children.length}`,
         startMs: Math.max(0, startTsMs - anchorMs),
         durationMs,
-        selection: displayItemSelection(item),
+        selection: item.selection,
       });
       advance(startTsMs + durationMs);
     }
@@ -755,6 +807,12 @@ function oneLine(text: string): string {
   return `${collapsed.slice(0, SUMMARY_MAX_CHARS - 1)}…`;
 }
 
+function nonBlankAssistantContent(
+  turn: Extract<TurnType, { kind: "assistant" }>,
+): string | null {
+  return turn.content.trim() ? turn.content : null;
+}
+
 const TOOL_NAME_DISPLAY: Record<string, string> = {
   read_file: "Read",
   write_file: "Write",
@@ -789,13 +847,13 @@ export function turnSummary(turn: TurnType): string {
     case "pair_system":
       return oneLine(turn.content);
     case "assistant": {
-      const line = oneLine(turn.content);
+      const line = oneLine(nonBlankAssistantContent(turn) ?? "");
       if (line) return line;
       // A model response that only requested tools has no text of its own;
       // describe what it did instead of rendering a blank row.
       const count = turn.toolCallCount ?? 0;
       if (count > 0) {
-        return `Requested ${count} tool call${count === 1 ? "" : "s"}`;
+        return `Requested ${count} ${plural(count, "tool call", "tool calls")}`;
       }
       return "Model response contained no text";
     }
@@ -840,9 +898,11 @@ export function searchableText(turn: TurnType): string {
     case "pair_user":
     case "pair_system":
       return turn.content;
-    case "assistant":
+    case "assistant": {
       // Text-free responses are findable by the copy the thread shows.
-      return turn.content || turnSummary(turn);
+      const content = nonBlankAssistantContent(turn);
+      return content ?? turnSummary(turn);
+    }
     case "tool":
       return `${humanizeToolName(turn.toolName)} ${turn.toolName} ${turn.input} ${turn.result}`;
     case "command":
@@ -984,6 +1044,8 @@ function EventDetails({
     if (Number.isNaN(ms)) return turn.ts;
     return new Date(ms).toLocaleString();
   })();
+  const assistantContent =
+    turn.kind === "assistant" ? nonBlankAssistantContent(turn) : null;
 
   return (
     <div className="space-y-5">
@@ -1006,8 +1068,8 @@ function EventDetails({
       {turn.kind === "assistant" && (
         <>
           <DetailField label="Content">
-            {turn.content ? (
-              <Markdown content={turn.content} />
+            {assistantContent ? (
+              <Markdown content={assistantContent} />
             ) : (
               <span className="text-fg-muted">{turnSummary(turn)}</span>
             )}
@@ -1629,43 +1691,30 @@ function StageActivityBody({
             </div>
           ) : (
             visibleItems.map((item) => {
+              const selection = item.selection;
+              const selectionId = threadSelectionId(selection);
+              const isSelected = threadSelectionsEqual(
+                selection,
+                panelSelection,
+              );
               if (item.kind === "single") {
                 return (
                   <EventRow
-                    key={`turn-${item.turnIndex}`}
+                    key={selectionId}
                     turn={item.turn}
                     runStart={runStart}
-                    selected={
-                      panelSelection?.kind === "single" &&
-                      panelSelection.turnIndex === item.turnIndex
-                    }
-                    onSelect={() =>
-                      onPanelSelectionChange({
-                        kind: "single",
-                        turnIndex: item.turnIndex,
-                      })
-                    }
+                    selected={isSelected}
+                    onSelect={() => onPanelSelectionChange(selection)}
                   />
                 );
               }
-              const childIndices = item.children.map((c) => c.turnIndex);
-              const groupKey = `group-${childIndices.join("-")}`;
-              const isSelected =
-                panelSelection?.kind === "group" &&
-                panelSelection.childTurnIndices.length === childIndices.length &&
-                panelSelection.childTurnIndices.every((v, i) => v === childIndices[i]);
               return (
                 <ToolGroupRow
-                  key={groupKey}
+                  key={selectionId}
                   group={item}
                   runStart={runStart}
                   selected={isSelected}
-                  onSelect={() =>
-                    onPanelSelectionChange({
-                      kind: "group",
-                      childTurnIndices: childIndices,
-                    })
-                  }
+                  onSelect={() => onPanelSelectionChange(selection)}
                 />
               );
             })
@@ -1776,19 +1825,21 @@ function RunStageActivityStage({
     () => filterDisplayItems(displayItems, selectedKinds, search),
     [displayItems, selectedKinds, search],
   );
+  const visibleCount = useMemo(
+    () => visibleTurnCount(visibleItems),
+    [visibleItems],
+  );
   const allDnaItems = useMemo(
     () => buildThreadDnaItems(displayItems, runStart),
     [displayItems, runStart],
   );
-  const threadDnaItems = useMemo(() => {
-    if (visibleItems.length === displayItems.length) return allDnaItems;
-    const visibleKeys = new Set(
-      visibleItems.map((item) => threadSelectionKey(displayItemSelection(item))),
-    );
-    return allDnaItems.filter((item) =>
-      visibleKeys.has(threadSelectionKey(item.selection)),
-    );
-  }, [allDnaItems, displayItems, visibleItems]);
+  const threadDnaItems = useMemo(
+    () =>
+      visibleItems === displayItems
+        ? allDnaItems
+        : filterThreadDnaItems(allDnaItems, visibleItems),
+    [allDnaItems, displayItems, visibleItems],
+  );
 
   const openTurn =
     panelSelection?.kind === "single" ? turns[panelSelection.turnIndex] ?? null : null;
@@ -1796,13 +1847,13 @@ function RunStageActivityStage({
   // corrupt or drop the identity of an open selection.
   const openGroup = useMemo<Extract<DisplayItem, { kind: "group" }> | null>(() => {
     if (panelSelection?.kind !== "group") return null;
-    const wanted = panelSelection.childTurnIndices;
     for (const item of displayItems) {
-      if (item.kind !== "group") continue;
-      const matches =
-        item.children.length === wanted.length &&
-        item.children.every((c, i) => c.turnIndex === wanted[i]);
-      if (matches) return item;
+      if (
+        item.kind === "group" &&
+        threadSelectionsEqual(item.selection, panelSelection)
+      ) {
+        return item;
+      }
     }
     return null;
   }, [displayItems, panelSelection]);
@@ -1884,7 +1935,7 @@ function RunStageActivityStage({
               onSearchChange={onSearchChange}
               filteredCount={
                 effectiveTab === "primary"
-                  ? visibleTurnCount(visibleItems)
+                  ? visibleCount
                   : filteredDebugEvents.length
               }
               totalCount={

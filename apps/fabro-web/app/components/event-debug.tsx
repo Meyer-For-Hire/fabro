@@ -443,7 +443,10 @@ const THREAD_CATEGORY_COLOR: Record<ThreadCategory, string> = {
 
 export type ThreadDnaSelection =
   | { kind: "single"; turnIndex: number }
-  | { kind: "group"; childTurnIndices: number[] };
+  | {
+      kind: "group";
+      childTurnIndices: readonly [number, number, ...number[]];
+    };
 
 export interface ThreadDnaItem {
   category: ThreadCategory;
@@ -456,13 +459,15 @@ export interface ThreadDnaItem {
 const INSTANT_MARKER_PX = 4;
 const MIN_DURATION_PX = 3;
 
-export function threadSelectionKey(s: ThreadDnaSelection): string {
-  return s.kind === "single"
-    ? `s:${s.turnIndex}`
-    : `g:${s.childTurnIndices.join(",")}`;
+export function threadSelectionId(selection: ThreadDnaSelection): number {
+  const turnIndex =
+    selection.kind === "single"
+      ? selection.turnIndex
+      : selection.childTurnIndices[0];
+  return turnIndex * 2 + (selection.kind === "group" ? 1 : 0);
 }
 
-function selectionsEqual(
+export function threadSelectionsEqual(
   a: ThreadDnaSelection,
   b: ThreadDnaSelection | null,
 ): boolean {
@@ -504,19 +509,19 @@ export function ThreadDnaStrip({
   selection: ThreadDnaSelection | null;
   onSelect: (s: ThreadDnaSelection) => void;
 }) {
-  const [hover, setHover] = useState<{ key: string; rect: DOMRect } | null>(
+  const [hover, setHover] = useState<{ id: number; rect: DOMRect } | null>(
     null,
   );
   const visibleItems = useMemo(
     () => sampleStripItems(items, STRIP_MAX_MARKERS, (item) =>
-      selectionsEqual(item.selection, selection)
+      threadSelectionsEqual(item.selection, selection)
     ),
     [items, selection],
   );
-  const visibleItemByKey = useMemo(
+  const visibleItemById = useMemo(
     () =>
       new Map(
-        visibleItems.map((item) => [threadSelectionKey(item.selection), item]),
+        visibleItems.map((item) => [threadSelectionId(item.selection), item]),
       ),
     [visibleItems],
   );
@@ -542,7 +547,7 @@ export function ThreadDnaStrip({
 
   const hoveredItem =
     hover != null
-      ? visibleItemByKey.get(hover.key) ?? null
+      ? visibleItemById.get(hover.id) ?? null
       : null;
 
   return (
@@ -552,10 +557,10 @@ export function ThreadDnaStrip({
     >
       <div className="relative h-full">
         {visibleItems.map((item) => {
-          const key = threadSelectionKey(item.selection);
+          const id = threadSelectionId(item.selection);
           const isInstant = item.durationMs <= 0;
-          const isSelected = selectionsEqual(item.selection, selection);
-          const isHovered = hover?.key === key;
+          const isSelected = threadSelectionsEqual(item.selection, selection);
+          const isHovered = hover?.id === id;
           const leftPct = (item.startMs / totalMs) * 100;
           const baseColor = THREAD_CATEGORY_COLOR[item.category];
 
@@ -585,18 +590,18 @@ export function ThreadDnaStrip({
 
           return (
             <button
-              key={key}
+              key={id}
               type="button"
               aria-label={`${THREAD_CATEGORY_LABEL[item.category]} · ${item.label}`}
               aria-pressed={isSelected}
               onMouseEnter={(e) =>
                 setHover({
-                  key,
+                  id,
                   rect: e.currentTarget.getBoundingClientRect(),
                 })
               }
               onMouseLeave={() =>
-                setHover((cur) => (cur?.key === key ? null : cur))
+                setHover((cur) => (cur?.id === id ? null : cur))
               }
               onClick={() => onSelect(item.selection)}
               className="absolute cursor-pointer rounded-[2px] border-0 p-0 transition-all duration-100 ease-out"

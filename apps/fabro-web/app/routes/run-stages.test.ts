@@ -3,11 +3,11 @@ import type { EventEnvelope } from "@qltysh/fabro-api-client";
 
 import {
   buildThreadDnaItems,
-  displayItemSelection,
   EVENT_KINDS,
   eventsTabLabel,
   eventsToActivity,
   filterDisplayItems,
+  filterThreadDnaItems,
   formatStageModelUsageLabel,
   groupConsecutiveTools,
   searchableText,
@@ -17,7 +17,7 @@ import {
   type DisplayItem,
   type EventKind,
 } from "./run-stages";
-import { threadSelectionKey } from "../components/event-debug";
+import { threadSelectionId } from "../components/event-debug";
 
 function envelope(seq: number, partial: Partial<EventEnvelope>): EventEnvelope {
   return {
@@ -28,6 +28,26 @@ function envelope(seq: number, partial: Partial<EventEnvelope>): EventEnvelope {
     event: "stage.prompt",
     ...partial,
   } as EventEnvelope;
+}
+
+function expectToolGroup(
+  item: DisplayItem | undefined,
+): Extract<DisplayItem, { kind: "group" }> {
+  expect(item?.kind).toBe("group");
+  if (item?.kind !== "group") {
+    throw new Error("expected a tool group");
+  }
+  return item;
+}
+
+function expectSingleItem(
+  item: DisplayItem | undefined,
+): Extract<DisplayItem, { kind: "single" }> {
+  expect(item?.kind).toBe("single");
+  if (item?.kind !== "single") {
+    throw new Error("expected a single display item");
+  }
+  return item;
 }
 
 describe("eventsToActivity", () => {
@@ -507,7 +527,12 @@ describe("groupConsecutiveTools", () => {
   test("single tool turn becomes a single, not a group", () => {
     const t = tool({ ts: "2026-04-09T12:00:00Z", toolName: "shell", durationMs: 100 });
     expect(groupConsecutiveTools([entry(t, 0)])).toEqual([
-      { kind: "single", turn: t, turnIndex: 0 },
+      {
+        kind: "single",
+        turn: t,
+        turnIndex: 0,
+        selection: { kind: "single", turnIndex: 0 },
+      },
     ]);
   });
 
@@ -525,6 +550,7 @@ describe("groupConsecutiveTools", () => {
           { turn: a, turnIndex: 0 },
           { turn: b, turnIndex: 1 },
         ],
+        selection: { kind: "group", childTurnIndices: [0, 1] },
       },
     ]);
   });
@@ -540,15 +566,12 @@ describe("groupConsecutiveTools", () => {
     const filtered = turns.map((t, i) => entry(t, i));
     const result = groupConsecutiveTools(filtered);
     expect(result).toHaveLength(1);
-    const item = result[0];
-    expect(item.kind).toBe("group");
-    if (item.kind === "group") {
-      expect(item.ts).toBe("2026-04-09T12:00:00Z");
-      // last child starts at 4s and runs 5s → ends at 9s. The summed 15s is
-      // not elapsed time; overlapping calls would double-count.
-      expect(item.durationMs).toBe(9000);
-      expect(item.children.map((c) => c.turnIndex)).toEqual([0, 1, 2, 3, 4]);
-    }
+    const item = expectToolGroup(result[0]);
+    expect(item.ts).toBe("2026-04-09T12:00:00Z");
+    // last child starts at 4s and runs 5s → ends at 9s. The summed 15s is
+    // not elapsed time; overlapping calls would double-count.
+    expect(item.durationMs).toBe(9000);
+    expect(item.children.map((c) => c.turnIndex)).toEqual([0, 1, 2, 3, 4]);
   });
 
   test("group bounds ignore array order and use the earliest start / latest end", () => {
@@ -558,12 +581,10 @@ describe("groupConsecutiveTools", () => {
     const early = tool({ ts: "2026-04-09T12:00:02Z", toolName: "shell", durationMs: 500 });
     const result = groupConsecutiveTools([entry(late, 0), entry(early, 1)]);
     expect(result).toHaveLength(1);
-    const item = result[0];
-    if (item.kind === "group") {
-      expect(item.ts).toBe("2026-04-09T12:00:02Z");
-      // earliest start 2s, latest end 5s + 4s = 9s → 7s elapsed.
-      expect(item.durationMs).toBe(7000);
-    }
+    const item = expectToolGroup(result[0]);
+    expect(item.ts).toBe("2026-04-09T12:00:02Z");
+    // earliest start 2s, latest end 5s + 4s = 9s → 7s elapsed.
+    expect(item.durationMs).toBe(7000);
   });
 
   test("parallel children collapse to their overlapping wall-clock span", () => {
@@ -571,23 +592,18 @@ describe("groupConsecutiveTools", () => {
     const b = tool({ ts: "2026-04-09T12:00:00Z", toolName: "shell", durationMs: 2000 });
     const c = tool({ ts: "2026-04-09T12:00:00Z", toolName: "shell", durationMs: 1000 });
     const result = groupConsecutiveTools([entry(a, 0), entry(b, 1), entry(c, 2)]);
-    const item = result[0];
-    if (item.kind === "group") {
-      // Three calls issued together: elapsed is the slowest, not the sum.
-      expect(item.durationMs).toBe(3000);
-    }
+    const item = expectToolGroup(result[0]);
+    // Three calls issued together: elapsed is the slowest, not the sum.
+    expect(item.durationMs).toBe(3000);
   });
 
   test("a group of unparseable timestamps falls back to zero elapsed", () => {
     const a = tool({ ts: "not-a-timestamp", toolName: "shell", durationMs: 10 });
     const b = tool({ ts: "also-bad", toolName: "shell", durationMs: 10 });
     const result = groupConsecutiveTools([entry(a, 0), entry(b, 1)]);
-    const item = result[0];
-    expect(item.kind).toBe("group");
-    if (item.kind === "group") {
-      expect(item.ts).toBe("not-a-timestamp");
-      expect(item.durationMs).toBe(0);
-    }
+    const item = expectToolGroup(result[0]);
+    expect(item.ts).toBe("not-a-timestamp");
+    expect(item.durationMs).toBe(0);
   });
 
   test("a different tool between same-tool calls breaks the group boundary", () => {
@@ -604,15 +620,13 @@ describe("groupConsecutiveTools", () => {
       entry(e, 4),
     ]);
     expect(result.map((r) => r.kind)).toEqual(["group", "single", "group"]);
-    if (result[0].kind === "group") {
-      expect(result[0].children.map((c) => c.turnIndex)).toEqual([0, 1]);
-    }
-    if (result[1].kind === "single") {
-      expect(result[1].turnIndex).toBe(2);
-    }
-    if (result[2].kind === "group") {
-      expect(result[2].children.map((c) => c.turnIndex)).toEqual([3, 4]);
-    }
+    expect(expectToolGroup(result[0]).children.map((c) => c.turnIndex)).toEqual([
+      0, 1,
+    ]);
+    expect(expectSingleItem(result[1]).turnIndex).toBe(2);
+    expect(expectToolGroup(result[2]).children.map((c) => c.turnIndex)).toEqual([
+      3, 4,
+    ]);
   });
 
   test("an errored tool call is never grouped and breaks the run", () => {
@@ -627,12 +641,10 @@ describe("groupConsecutiveTools", () => {
       entry(d, 3),
     ]);
     expect(result.map((r) => r.kind)).toEqual(["single", "single", "group"]);
-    if (result[1].kind === "single") {
-      expect(result[1].turn).toBe(errored);
-    }
-    if (result[2].kind === "group") {
-      expect(result[2].children.map((c) => c.turnIndex)).toEqual([2, 3]);
-    }
+    expect(expectSingleItem(result[1]).turn).toBe(errored);
+    expect(expectToolGroup(result[2]).children.map((c) => c.turnIndex)).toEqual([
+      2, 3,
+    ]);
   });
 
   test("non-tool turns flush the buffer correctly", () => {
@@ -654,12 +666,10 @@ describe("groupConsecutiveTools", () => {
       entry(c, 3),
     ]);
     expect(result.map((r) => r.kind)).toEqual(["group", "single", "single"]);
-    if (result[0].kind === "group") {
-      expect(result[0].children.map((c) => c.turnIndex)).toEqual([0, 1]);
-    }
-    if (result[2].kind === "single") {
-      expect(result[2].turnIndex).toBe(3);
-    }
+    expect(expectToolGroup(result[0]).children.map((c) => c.turnIndex)).toEqual([
+      0, 1,
+    ]);
+    expect(expectSingleItem(result[2]).turnIndex).toBe(3);
   });
 });
 
@@ -718,6 +728,7 @@ describe("buildThreadDnaItems", () => {
       kind: "single" as const,
       turnIndex,
       turn: { kind: "system" as const, ts, content },
+      selection: { kind: "single" as const, turnIndex },
     };
   }
 
@@ -733,6 +744,7 @@ describe("buildThreadDnaItems", () => {
         outputTokens: 0,
         toolCallCount: null,
       },
+      selection: { kind: "single" as const, turnIndex },
     };
   }
 
@@ -754,6 +766,7 @@ describe("buildThreadDnaItems", () => {
         isError: false,
         durationMs,
       },
+      selection: { kind: "single" as const, turnIndex },
     };
   }
 
@@ -762,6 +775,7 @@ describe("buildThreadDnaItems", () => {
       kind: "single" as const,
       turnIndex,
       turn: { kind: "steer" as const, ts, content: "do this" },
+      selection: { kind: "single" as const, turnIndex },
     };
   }
 
@@ -861,9 +875,7 @@ describe("buildThreadDnaItems", () => {
       { turn: late, index: 0 },
       { turn: early, index: 1 },
     ]);
-    const group = grouped[0];
-    expect(group.kind).toBe("group");
-    if (group.kind !== "group") return;
+    const group = expectToolGroup(grouped[0]);
 
     // span = 12s + 2s − 10s = 4s, not the summed 3s and not children[0]'s ts.
     expect(group.ts).toBe("2026-04-09T12:00:10Z");
@@ -951,12 +963,15 @@ describe("tool-call-only agent responses", () => {
     };
     const withOneTool = { ...withTools, toolCallCount: 1 };
     const withoutCount = { ...withTools, toolCallCount: null };
+    const whitespaceOnly = { ...withTools, content: " \n\t" };
 
     expect(turnSummary(withTools)).toBe("Requested 3 tool calls");
     expect(turnSummary(withOneTool)).toBe("Requested 1 tool call");
     expect(turnSummary(withoutCount)).toBe("Model response contained no text");
+    expect(turnSummary(whitespaceOnly)).toBe("Requested 3 tool calls");
 
     expect(searchableText(withTools)).toContain("Requested 3 tool calls");
+    expect(searchableText(whitespaceOnly)).toContain("Requested 3 tool calls");
     // Text-bearing responses keep searching their own content.
     expect(searchableText({ ...withTools, content: "all done" })).toBe("all done");
   });
@@ -1052,12 +1067,8 @@ describe("tool batch boundaries", () => {
     search: string,
   ) {
     const all = buildThreadDnaItems(items, RUN_START);
-    const visible = new Set(
-      filterDisplayItems(items, kinds, search).map((item) =>
-        threadSelectionKey(displayItemSelection(item)),
-      ),
-    );
-    return all.filter((item) => visible.has(threadSelectionKey(item.selection)));
+    const visible = filterDisplayItems(items, kinds, search);
+    return filterThreadDnaItems(all, visible);
   }
 
   function groupSizes(items: DisplayItem[]): (number | "single")[] {
@@ -1075,6 +1086,11 @@ describe("tool batch boundaries", () => {
     expect(items.some((item) => item.kind === "group" && item.children.length > 2)).toBe(
       false,
     );
+  });
+
+  test("the default visibility pass reuses the grouped item list", () => {
+    const items = reproItems();
+    expect(filterDisplayItems(items, EVENT_KINDS, "")).toBe(items);
   });
 
   test("batches survive excluding Agent with the kind filter", () => {
@@ -1095,16 +1111,13 @@ describe("tool batch boundaries", () => {
     const visible = filterDisplayItems(items, EVENT_KINDS, "alpha");
 
     expect(visible).toHaveLength(1);
-    const only = visible[0];
-    expect(only.kind).toBe("group");
-    if (only.kind === "group") {
-      // "bravo" never matched the search but stays in the group for context.
-      expect(only.children).toHaveLength(2);
-      expect(only.children.map((c) => JSON.parse(c.turn.input).command)).toEqual([
-        "alpha",
-        "bravo",
-      ]);
-    }
+    const only = expectToolGroup(visible[0]);
+    // "bravo" never matched the search but stays in the group for context.
+    expect(only.children).toHaveLength(2);
+    expect(only.children.map((c) => JSON.parse(c.turn.input).command)).toEqual([
+      "alpha",
+      "bravo",
+    ]);
   });
 
   test("DNA charges the long gaps to Agent and keeps every tool batch sub-second", () => {
@@ -1157,17 +1170,16 @@ describe("tool batch boundaries", () => {
     const items = reproItems();
     const bars = buildThreadDnaItems(items, RUN_START);
 
-    expect(bars.map((b) => threadSelectionKey(b.selection))).toEqual(
-      items.map((item) => threadSelectionKey(displayItemSelection(item))),
+    expect(bars.map((b) => threadSelectionId(b.selection))).toEqual(
+      items.map((item) => threadSelectionId(item.selection)),
     );
 
-    const group = items.find((item) => item.kind === "group");
-    expect(group).toBeDefined();
-    if (group?.kind === "group") {
-      expect(displayItemSelection(group)).toEqual({
-        kind: "group",
-        childTurnIndices: group.children.map((c) => c.turnIndex),
-      });
-    }
+    const group = expectToolGroup(
+      items.find((item) => item.kind === "group"),
+    );
+    expect(group.selection).toEqual({
+      kind: "group",
+      childTurnIndices: group.children.map((c) => c.turnIndex),
+    });
   });
 });
