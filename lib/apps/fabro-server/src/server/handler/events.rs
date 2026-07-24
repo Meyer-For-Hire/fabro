@@ -30,6 +30,14 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         .route("/runs/{id}/attach", get(attach_run_events))
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum EventSequenceOrder {
+    #[default]
+    Asc,
+    Desc,
+}
+
 #[derive(serde::Deserialize)]
 pub(crate) struct EventListParams {
     #[serde(default)]
@@ -45,6 +53,43 @@ impl EventListParams {
 
     pub(crate) fn limit(&self) -> usize {
         self.limit.unwrap_or(100).clamp(1, 1000)
+    }
+}
+
+/// Query parameters for `/runs/{id}/events` only. Descending pagination via
+/// `before_seq` + `order` is not part of the shared `EventListParams`
+/// contract used by the session, stage, and pair transcript endpoints.
+#[derive(serde::Deserialize)]
+struct RunEventListParams {
+    #[serde(default)]
+    since_seq:  Option<u32>,
+    #[serde(default)]
+    before_seq: Option<u32>,
+    #[serde(default)]
+    order:      EventSequenceOrder,
+    #[serde(default)]
+    limit:      Option<usize>,
+}
+
+impl RunEventListParams {
+    fn since_seq(&self) -> u32 {
+        self.since_seq.unwrap_or(1).max(1)
+    }
+
+    fn limit(&self) -> usize {
+        self.limit.unwrap_or(100).clamp(1, 1000)
+    }
+
+    fn cursor_error(&self) -> Option<&'static str> {
+        match self.order {
+            EventSequenceOrder::Asc if self.before_seq.is_some() => {
+                Some("before_seq requires order=desc.")
+            }
+            EventSequenceOrder::Desc if self.since_seq.is_some() => {
+                Some("since_seq cannot be combined with order=desc; use before_seq instead.")
+            }
+            _ => None,
+        }
     }
 }
 
@@ -200,31 +245,44 @@ async fn append_run_event(
 async fn list_run_events(
     RequireRunManagementTarget(id, _actor): RequireRunManagementTarget,
     State(state): State<Arc<AppState>>,
-    Query(params): Query<EventListParams>,
+    Query(params): Query<RunEventListParams>,
 ) -> Response {
-    let since_seq = params.since_seq();
+    if let Some(detail) = params.cursor_error() {
+        return ApiError::bad_request(detail).into_response();
+    }
+
     let limit = params.limit();
     match state.stores.runs.open_run_reader(&id).await {
-        Ok(run_store) => match run_store
-            .list_events_from_with_limit(since_seq, limit)
-            .await
-        {
-            Ok(mut events) => {
-                let has_more = events.len() > limit;
-                events.truncate(limit);
-                Json(PaginatedEventList {
-                    data: events,
-                    meta: PaginationMeta {
-                        has_more,
-                        total: None,
-                    },
-                })
-                .into_response()
+        Ok(run_store) => {
+            let events = match params.order {
+                EventSequenceOrder::Asc => {
+                    run_store
+                        .list_events_from_with_limit(params.since_seq(), limit)
+                        .await
+                }
+                EventSequenceOrder::Desc => {
+                    run_store
+                        .list_events_before_with_limit(params.before_seq, limit)
+                        .await
+                }
+            };
+            match events {
+                Ok(mut events) => {
+                    let has_more = events.len() > limit;
+                    events.truncate(limit);
+                    Json(PaginatedEventList {
+                        data: events,
+                        meta: PaginationMeta {
+                            has_more,
+                            total: None,
+                        },
+                    })
+                    .into_response()
+                }
+                Err(err) => ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+                    .into_response(),
             }
-            Err(err) => {
-                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
-            }
-        },
+        }
         Err(_) => ApiError::not_found("Run not found.").into_response(),
     }
 }
