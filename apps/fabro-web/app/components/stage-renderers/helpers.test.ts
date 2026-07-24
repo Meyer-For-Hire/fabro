@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { EventEnvelope } from "@qltysh/fabro-api-client";
 
+import { makeEventEnvelope } from "../../lib/test-utils";
 import {
   extractStageContext,
   parseHumanInterviewPairs,
@@ -8,21 +9,10 @@ import {
   parseReducerTranscript,
 } from "./helpers";
 
-function envelope(seq: number, partial: Partial<EventEnvelope>): EventEnvelope {
-  return {
-    seq,
-    id: `evt-${seq}`,
-    ts: `2026-04-09T12:00:0${seq}Z`,
-    run_id: "run-1",
-    event: "stage.prompt",
-    ...partial,
-  } as EventEnvelope;
-}
-
 describe("parseHumanInterviewPairs", () => {
   test("pairs interview.started with interview.completed by question_id", () => {
     const events: EventEnvelope[] = [
-      envelope(1, {
+      makeEventEnvelope(1, {
         event: "interview.started",
         properties: {
           question_id: "q-1",
@@ -35,7 +25,7 @@ describe("parseHumanInterviewPairs", () => {
           allow_freeform: false,
         },
       }),
-      envelope(2, {
+      makeEventEnvelope(2, {
         event: "interview.completed",
         properties: {
           question_id: "q-1",
@@ -65,7 +55,7 @@ describe("parseHumanInterviewPairs", () => {
 
   test("leaves resolution null for unanswered (still pending) questions", () => {
     const events: EventEnvelope[] = [
-      envelope(1, {
+      makeEventEnvelope(1, {
         event: "interview.started",
         properties: {
           question_id: "q-1",
@@ -80,7 +70,7 @@ describe("parseHumanInterviewPairs", () => {
 
   test("preserves option description and preview metadata from started events", () => {
     const events: EventEnvelope[] = [
-      envelope(1, {
+      makeEventEnvelope(1, {
         event: "interview.started",
         properties: {
           question_id: "q-1",
@@ -110,19 +100,19 @@ describe("parseHumanInterviewPairs", () => {
 
   test("captures timeout and interrupted resolutions", () => {
     const events: EventEnvelope[] = [
-      envelope(1, {
+      makeEventEnvelope(1, {
         event: "interview.started",
         properties: { question_id: "q-1", question: "?", question_type: "freeform" },
       }),
-      envelope(2, {
+      makeEventEnvelope(2, {
         event: "interview.timeout",
         properties: { question_id: "q-1", duration_ms: 30000 },
       }),
-      envelope(3, {
+      makeEventEnvelope(3, {
         event: "interview.started",
         properties: { question_id: "q-2", question: "?", question_type: "freeform" },
       }),
-      envelope(4, {
+      makeEventEnvelope(4, {
         event: "interview.interrupted",
         properties: {
           question_id: "q-2",
@@ -145,11 +135,11 @@ describe("parseHumanInterviewPairs", () => {
 describe("parseParallelOverview", () => {
   test("rolls up branch_count and status-only results", () => {
     const events: EventEnvelope[] = [
-      envelope(1, {
+      makeEventEnvelope(1, {
         event: "parallel.started",
         properties: { branch_count: 3 },
       }),
-      envelope(2, {
+      makeEventEnvelope(2, {
         event: "parallel.completed",
         properties: {
           duration_ms: 12000,
@@ -182,21 +172,9 @@ describe("parseParallelOverview", () => {
       failureCount: 1,
       durationMs: 12000,
       results: [
-        {
-          id: "branch-a",
-          status: "succeeded",
-          context_updates: { "response.branch-a": "A" },
-        },
-        {
-          id: "branch-b",
-          status: "succeeded",
-          context_updates: { "command.output": { stdout: "B" } },
-        },
-        {
-          id: "branch-c",
-          status: "failed",
-          context_updates: { "response.branch-c": "C" },
-        },
+        { id: "branch-a", status: "succeeded" },
+        { id: "branch-b", status: "succeeded" },
+        { id: "branch-c", status: "failed" },
       ],
       isComplete: true,
     });
@@ -204,7 +182,7 @@ describe("parseParallelOverview", () => {
 
   test("reports in-flight when only the started event is present", () => {
     const events: EventEnvelope[] = [
-      envelope(1, {
+      makeEventEnvelope(1, {
         event: "parallel.started",
         properties: { branch_count: 4 },
       }),
@@ -223,7 +201,7 @@ describe("parseReducerTranscript", () => {
 
   test("parses the standard prompt transcript when a reducer ran", () => {
     const events: EventEnvelope[] = [
-      envelope(1, {
+      makeEventEnvelope(1, {
         event: "stage.prompt",
         properties: {
           mode: "prompt",
@@ -231,7 +209,7 @@ describe("parseReducerTranscript", () => {
           model: "claude-sonnet-4-6",
         },
       }),
-      envelope(2, {
+      makeEventEnvelope(2, {
         event: "prompt.completed",
         properties: {
           response: "The branch results are joined.",
@@ -251,11 +229,11 @@ describe("parseReducerTranscript", () => {
 
   test("uses normal prompt mode for the reducer transcript", () => {
     const events: EventEnvelope[] = [
-      envelope(1, {
+      makeEventEnvelope(1, {
         event: "stage.prompt",
         properties: { mode: "prompt", text: "Standard reducer" },
       }),
-      envelope(2, {
+      makeEventEnvelope(2, {
         event: "prompt.completed",
         properties: { response: "Standard response" },
       }),
@@ -268,7 +246,7 @@ describe("parseReducerTranscript", () => {
 describe("extractStageContext", () => {
   test("keeps author-set keys and drops engine bookkeeping keys", () => {
     const events: EventEnvelope[] = [
-      envelope(1, {
+      makeEventEnvelope(1, {
         event: "stage.completed",
         properties: {
           context_updates: {
@@ -296,7 +274,7 @@ describe("extractStageContext", () => {
 
   test("extracts routing hints from preferred_label and suggested_next_ids", () => {
     const events: EventEnvelope[] = [
-      envelope(1, {
+      makeEventEnvelope(1, {
         event: "stage.completed",
         properties: {
           preferred_label: "approve",
@@ -312,7 +290,7 @@ describe("extractStageContext", () => {
 
   test("returns null when the stage only wrote engine keys", () => {
     const events: EventEnvelope[] = [
-      envelope(1, {
+      makeEventEnvelope(1, {
         event: "stage.completed",
         properties: {
           context_updates: { last_stage: "implement", "command.output": "blob:x" },

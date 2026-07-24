@@ -12,9 +12,9 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
 use super::{EngineServices, Handler};
-use crate::context::{Context, ParallelBranchPreamble, WorkflowContext, context_diff, keys};
+use crate::context::{Context, ParallelBranchPreamble, WorkflowContext, context_diff_public, keys};
 use crate::error::Error;
-use crate::event::{Event, RunNoticeCode, RunNoticeLevel, StageScope};
+use crate::event::{Emitter, Event, RunNoticeCode, RunNoticeLevel, StageScope};
 use crate::hook_context::set_hook_node;
 use crate::outcome::{FailureCategory, FailureDetail, Outcome, OutcomeExt};
 use crate::{artifact, millis_u64};
@@ -238,16 +238,14 @@ async fn run_branches(
                         status: outcome.status,
                         context_updates,
                     };
-                    branch_services.run.emitter.emit_scoped(
-                        &Event::ParallelBranchCompleted {
-                            parallel_group_id:  group_id.clone(),
-                            parallel_branch_id: parallel_branch_id.clone(),
-                            branch:             target_id.clone(),
-                            index:              branch_index,
-                            duration_ms:        millis_u64(branch_start.elapsed()),
-                            status:             result.status,
-                        },
+                    emit_branch_completed(
+                        &branch_services.run.emitter,
                         &branch_scope,
+                        group_id.clone(),
+                        parallel_branch_id.clone(),
+                        branch_index,
+                        millis_u64(branch_start.elapsed()),
+                        outcome.status,
                     );
                     Ok::<BranchResult, Error>(BranchResult { result, outcome })
                 };
@@ -257,16 +255,14 @@ async fn run_branches(
                     Err(payload) => {
                         let result =
                             failed_branch_result(&target_id, super::format_panic_message(&payload));
-                        branch_services.run.emitter.emit_scoped(
-                            &Event::ParallelBranchCompleted {
-                                parallel_group_id: group_id,
-                                parallel_branch_id,
-                                branch: target_id,
-                                index: branch_index,
-                                duration_ms: millis_u64(branch_start.elapsed()),
-                                status: result.result.status,
-                            },
+                        emit_branch_completed(
+                            &branch_services.run.emitter,
                             &branch_scope,
+                            group_id,
+                            parallel_branch_id,
+                            branch_index,
+                            millis_u64(branch_start.elapsed()),
+                            result.outcome.status,
                         );
                         Ok(result)
                     }
@@ -299,16 +295,14 @@ async fn run_branches(
             ),
         };
         if emit_completion {
-            services.run.emitter.emit_scoped(
-                &Event::ParallelBranchCompleted {
-                    parallel_group_id:  parallel_group_id.clone(),
-                    parallel_branch_id: dispatch.branch_id,
-                    branch:             dispatch.target_id,
-                    index:              dispatch.index,
-                    duration_ms:        0,
-                    status:             result.result.status,
-                },
+            emit_branch_completed(
+                &services.run.emitter,
                 &dispatch.scope,
+                parallel_group_id.clone(),
+                dispatch.branch_id,
+                dispatch.index,
+                0,
+                result.outcome.status,
             );
         }
         if result.outcome.failure_category() == Some(FailureCategory::Canceled) {
@@ -421,12 +415,33 @@ fn branch_context_updates(
         .iter()
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect::<BTreeMap<_, _>>();
-    updates.extend(
-        context_diff(before, after)
-            .into_iter()
-            .filter(|(key, _)| !keys::is_engine_internal_key(key)),
-    );
+    updates.extend(context_diff_public(before, after));
     updates
+}
+
+/// Emit `ParallelBranchCompleted` for the branch that `scope` identifies;
+/// `scope.node_id` is the branch target by construction
+/// ([`StageScope::for_parallel_branch`]).
+fn emit_branch_completed(
+    emitter: &Emitter,
+    scope: &StageScope,
+    parallel_group_id: StageId,
+    parallel_branch_id: ParallelBranchId,
+    index: usize,
+    duration_ms: u64,
+    status: StageOutcome,
+) {
+    emitter.emit_scoped(
+        &Event::ParallelBranchCompleted {
+            parallel_group_id,
+            parallel_branch_id,
+            branch: scope.node_id.clone(),
+            index,
+            duration_ms,
+            status,
+        },
+        scope,
+    );
 }
 
 fn failed_branch_result(id: &str, reason: impl Into<String>) -> BranchResult {

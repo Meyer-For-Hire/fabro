@@ -159,6 +159,19 @@ pub(crate) fn context_diff(
         .collect()
 }
 
+/// [`context_diff`] restricted to user-visible keys: the diff that should
+/// propagate outside the executing scope (to a parent workflow or across a
+/// parallel fork), with engine-internal keys removed.
+pub(crate) fn context_diff_public(
+    before: &HashMap<String, serde_json::Value>,
+    after: HashMap<String, serde_json::Value>,
+) -> HashMap<String, serde_json::Value> {
+    context_diff(before, after)
+        .into_iter()
+        .filter(|(key, _)| !keys::is_engine_internal_key(key))
+        .collect()
+}
+
 /// One entry of the [`keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES`] stash.
 ///
 /// The stash is a JSON array indexed by the parallel node's outgoing-edge
@@ -254,6 +267,70 @@ mod tests {
     fn get_missing_key() {
         let ctx = Context::new();
         assert_eq!(ctx.get("missing"), None);
+    }
+
+    #[test]
+    fn context_diff_detects_additions() {
+        let before = HashMap::new();
+        let mut after = HashMap::new();
+        after.insert("key".to_string(), serde_json::json!("value"));
+        let diff = context_diff(&before, after);
+        assert_eq!(diff.len(), 1);
+        assert_eq!(diff.get("key"), Some(&serde_json::json!("value")));
+    }
+
+    #[test]
+    fn context_diff_detects_changes() {
+        let mut before = HashMap::new();
+        before.insert("key".to_string(), serde_json::json!("old"));
+        let mut after = HashMap::new();
+        after.insert("key".to_string(), serde_json::json!("new"));
+        let diff = context_diff(&before, after);
+        assert_eq!(diff.len(), 1);
+        assert_eq!(diff.get("key"), Some(&serde_json::json!("new")));
+    }
+
+    #[test]
+    fn context_diff_ignores_unchanged() {
+        let mut before = HashMap::new();
+        before.insert("key".to_string(), serde_json::json!("same"));
+        let mut after = HashMap::new();
+        after.insert("key".to_string(), serde_json::json!("same"));
+        let diff = context_diff(&before, after);
+        assert!(diff.is_empty());
+    }
+
+    #[test]
+    fn context_diff_ignores_deletions() {
+        let mut before = HashMap::new();
+        before.insert("removed".to_string(), serde_json::json!("gone"));
+        let after = HashMap::new();
+        let diff = context_diff(&before, after);
+        assert!(diff.is_empty());
+    }
+
+    #[test]
+    fn context_diff_public_excludes_engine_internal_keys() {
+        let before = HashMap::new();
+        let mut after = HashMap::new();
+        after.insert("graph.goal".to_string(), serde_json::json!("child goal"));
+        after.insert(
+            "internal.run_id".to_string(),
+            serde_json::json!("child-run"),
+        );
+        after.insert(
+            "thread.main.current_node".to_string(),
+            serde_json::json!("exit"),
+        );
+        after.insert("current_node".to_string(), serde_json::json!("exit"));
+        after.insert("response.plan".to_string(), serde_json::json!("the plan"));
+        after.insert("review.result".to_string(), serde_json::json!("approved"));
+
+        let filtered = context_diff_public(&before, after);
+
+        assert_eq!(filtered.len(), 2);
+        assert!(filtered.contains_key("response.plan"));
+        assert!(filtered.contains_key("review.result"));
     }
 
     #[test]

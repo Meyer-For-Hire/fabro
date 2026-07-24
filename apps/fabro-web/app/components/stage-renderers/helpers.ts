@@ -1,7 +1,5 @@
 import { StageOutcome } from "@qltysh/fabro-api-client";
-import type { EventEnvelope, ParallelBranchResult } from "@qltysh/fabro-api-client";
-
-export type { ParallelBranchResult };
+import type { EventEnvelope } from "@qltysh/fabro-api-client";
 
 import { getArray, getNumber, getObject, getString, type UnknownRecord } from "../../lib/unknown";
 
@@ -146,12 +144,18 @@ export function parseHumanInterviewPairs(events: EventEnvelope[]): HumanIntervie
   return Array.from(pairs.values()).sort((a, b) => a.question.ts.localeCompare(b.question.ts));
 }
 
+/** Identity and outcome of one branch, parsed from `parallel.completed`. */
+export interface ParallelBranchSummary {
+  id: string;
+  status: StageOutcome;
+}
+
 export interface ParallelOverview {
   branchCount: number | null;
   successCount: number | null;
   failureCount: number | null;
   durationMs: number | null;
-  results: ParallelBranchResult[];
+  results: ParallelBranchSummary[];
   isComplete: boolean;
 }
 
@@ -165,7 +169,7 @@ export function parseParallelOverview(events: EventEnvelope[]): ParallelOverview
   let successCount: number | null = null;
   let failureCount: number | null = null;
   let durationMs: number | null = null;
-  let results: ParallelBranchResult[] = [];
+  let results: ParallelBranchSummary[] = [];
   let isComplete = false;
 
   for (const event of events) {
@@ -184,15 +188,10 @@ export function parseParallelOverview(events: EventEnvelope[]): ParallelOverview
           if (!record) return null;
           const id = getString(record, "id");
           const status = asStageOutcome(getString(record, "status"));
-          const contextUpdates = getObject(record, "context_updates");
-          if (!id || !status || !contextUpdates) return null;
-          return {
-            id,
-            status,
-            context_updates: contextUpdates,
-          } satisfies ParallelBranchResult;
+          if (!id || !status) return null;
+          return { id, status } satisfies ParallelBranchSummary;
         })
-        .filter((r): r is ParallelBranchResult => r != null);
+        .filter((r): r is ParallelBranchSummary => r != null);
       if (branchCount == null) branchCount = results.length;
     }
   }

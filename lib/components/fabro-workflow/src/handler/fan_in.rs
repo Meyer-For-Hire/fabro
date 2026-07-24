@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use fabro_graphviz::graph::{Graph, Node};
+use fabro_types::ParallelBranchResult;
 
 use super::agent::CodergenBackend;
 use super::prompt::PromptHandler;
@@ -90,22 +91,12 @@ impl Handler for FanInHandler {
     }
 }
 
-/// Validate that `parallel.results` exists and has the typed shape without
-/// cloning the (potentially hydrated) branch payloads into a full
-/// [`ParallelBranchResult`] vec that would go unused.
+/// Validate that `parallel.results` exists and has the typed shape.
 fn validated_branch_count(context: &Context) -> Result<usize, Error> {
-    #[derive(serde::Deserialize)]
-    struct BranchShape {
-        #[expect(dead_code, reason = "deserialized only to validate the shape")]
-        id:     String,
-        #[expect(dead_code, reason = "deserialized only to validate the shape")]
-        status: fabro_types::StageOutcome,
-    }
-
     let value = context
         .get(keys::PARALLEL_RESULTS)
         .ok_or_else(|| Error::handler("No parallel results to join"))?;
-    let results: Vec<BranchShape> = serde_json::from_value(value)
+    let results: Vec<ParallelBranchResult> = serde_json::from_value(value)
         .map_err(|err| Error::handler_with_source("Invalid parallel results", err))?;
     Ok(results.len())
 }
