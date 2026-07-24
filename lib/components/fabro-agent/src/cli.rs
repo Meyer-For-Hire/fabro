@@ -1073,12 +1073,13 @@ mod tests {
                     max_output:     None,
                 }),
                 features: Some(SettingsModelFeatures {
-                    tools:            Some(true),
-                    vision:           Some(false),
-                    reasoning:        Some(false),
-                    reasoning_effort: None,
-                    prompt_cache:     None,
-                    sampling_params:  None,
+                    tools:                     Some(true),
+                    vision:                    Some(false),
+                    reasoning:                 Some(false),
+                    reasoning_effort:          None,
+                    prompt_cache:              None,
+                    cache_control_breakpoints: None,
+                    sampling_params:           None,
                 }),
                 ..ModelCatalogSettings::default()
             });
@@ -1158,12 +1159,13 @@ mod tests {
                     max_output:     None,
                 }),
                 features: Some(SettingsModelFeatures {
-                    tools:            Some(true),
-                    vision:           Some(false),
-                    reasoning:        Some(false),
-                    reasoning_effort: None,
-                    prompt_cache:     None,
-                    sampling_params:  None,
+                    tools:                     Some(true),
+                    vision:                    Some(false),
+                    reasoning:                 Some(false),
+                    reasoning_effort:          None,
+                    prompt_cache:              None,
+                    cache_control_breakpoints: None,
+                    sampling_params:           None,
                 }),
                 ..ModelCatalogSettings::default()
             });

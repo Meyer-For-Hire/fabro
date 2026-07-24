@@ -683,3 +683,26 @@ async fn gemini_multi_turn_cache() {
     let adapter = GeminiAdapter::new(api_key);
     run_multi_turn_cache_test(&adapter, "gemini-2.5-flash", 0.5, Some(0.0)).await;
 }
+
+/// Prompt caching for Claude routed through OpenRouter: the catalog row opts
+/// into explicit `cache_control` breakpoints, and OpenRouter must forward
+/// them to Anthropic for cache reads to appear. Guards the end-to-end
+/// passthrough the wire tests can't see.
+#[fabro_macros::e2e_test(live("OPENROUTER_API_KEY"))]
+async fn openrouter_claude_multi_turn_cache() {
+    let api_key =
+        std::env::var(EnvVars::OPENROUTER_API_KEY).expect("OPENROUTER_API_KEY must be set");
+    let overrides: LlmCatalogSettings = toml::from_str(
+        r"
+[providers.openrouter]
+enabled = true
+",
+    )
+    .expect("OpenRouter catalog override should parse");
+    let catalog = Catalog::from_builtin_with_overrides(&overrides)
+        .expect("enabled OpenRouter catalog should build");
+    let adapter = OpenAiCompatibleAdapter::new(api_key, "https://openrouter.ai/api/v1")
+        .with_name("openrouter")
+        .with_catalog(Arc::new(catalog));
+    run_multi_turn_cache_test(&adapter, "claude-haiku-4-5", 0.5, Some(0.0)).await;
+}

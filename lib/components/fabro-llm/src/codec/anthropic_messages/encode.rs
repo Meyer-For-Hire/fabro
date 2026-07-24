@@ -8,7 +8,8 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 
 use super::SYNTHETIC_TOOL_NAME;
-use super::wire::{ApiMessage, ApiRequest, ApiToolDef, CacheControl, CountTokensRequest};
+use super::wire::{ApiMessage, ApiRequest, ApiToolDef, CountTokensRequest};
+use crate::codec::cache::{self, CacheControl};
 use crate::codec::{AnthropicVersion, CodecCtx, EncodedRequest, extract_system_prompt};
 use crate::types::{
     ContentPart, Message, ReasoningEffort, ReasoningEffortFeature, Request, ResponseFormatType,
@@ -48,7 +49,7 @@ pub(super) fn encode_count_tokens(ctx: &CodecCtx<'_>) -> EncodedRequest {
 /// hasn't opted out.
 fn auto_cache(ctx: &CodecCtx<'_>) -> bool {
     ctx.model.is_some_and(|m| m.features.prompt_cache)
-        && is_auto_cache_enabled(ctx.request.provider_options.as_ref())
+        && cache::auto_cache_enabled(ctx.request.provider_options.as_ref(), "anthropic")
 }
 
 fn build_headers(ctx: &CodecCtx<'_>) -> Vec<(String, String)> {
@@ -441,12 +442,6 @@ fn effort_to_budget_tokens(effort: ReasoningEffort, max_tokens: i64) -> i64 {
     budget.max(1024)
 }
 
-fn is_auto_cache_enabled(provider_options: Option<&serde_json::Value>) -> bool {
-    anthropic_option(provider_options, "auto_cache")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true)
-}
-
 fn system_with_cache_control(system: &str) -> serde_json::Value {
     serde_json::json!([{
         "type": "text",
@@ -462,18 +457,10 @@ fn apply_cache_control_to_last_tool(tools: &mut [ApiToolDef]) {
 }
 
 fn apply_cache_control_to_conversation_prefix(messages: &mut [ApiMessage]) {
-    let user_indices: Vec<usize> = messages
-        .iter()
-        .enumerate()
-        .filter(|(_, m)| m.role == "user")
-        .map(|(i, _)| i)
-        .collect();
-
-    if user_indices.len() < 2 {
+    let user_turns: Vec<bool> = messages.iter().map(|m| m.role == "user").collect();
+    let Some(target_idx) = cache::conversation_breakpoint_index(&user_turns) else {
         return;
-    }
-
-    let target_idx = user_indices[user_indices.len() - 2];
+    };
     if let Some(serde_json::Value::Object(map)) = messages[target_idx].content.last_mut() {
         map.insert(
             "cache_control".to_string(),
@@ -649,37 +636,6 @@ reasoning = true
             .iter()
             .find(|(key, _)| key == name)
             .map(|(_, value)| value.as_str())
-    }
-
-    // --- auto_cache ----------------------------------------------------------
-
-    #[test]
-    fn auto_cache_enabled_by_default() {
-        assert!(is_auto_cache_enabled(None));
-    }
-
-    #[test]
-    fn auto_cache_enabled_when_true() {
-        let opts = serde_json::json!({"anthropic": {"auto_cache": true}});
-        assert!(is_auto_cache_enabled(Some(&opts)));
-    }
-
-    #[test]
-    fn auto_cache_disabled_when_false() {
-        let opts = serde_json::json!({"anthropic": {"auto_cache": false}});
-        assert!(!is_auto_cache_enabled(Some(&opts)));
-    }
-
-    #[test]
-    fn auto_cache_enabled_when_key_missing() {
-        let opts = serde_json::json!({"anthropic": {}});
-        assert!(is_auto_cache_enabled(Some(&opts)));
-    }
-
-    #[test]
-    fn auto_cache_enabled_when_anthropic_missing() {
-        let opts = serde_json::json!({"openai": {}});
-        assert!(is_auto_cache_enabled(Some(&opts)));
     }
 
     // --- prompt-cache helpers ------------------------------------------------

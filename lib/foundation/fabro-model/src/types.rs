@@ -41,21 +41,28 @@ fn default_true() -> bool {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelFeatures {
-    pub tools:            bool,
-    pub vision:           bool,
-    pub reasoning:        bool,
+    pub tools:                     bool,
+    pub vision:                    bool,
+    pub reasoning:                 bool,
     /// Whether this model endpoint supports a native reasoning-effort
     /// parameter. User-facing allowed effort values live in catalog controls.
     #[serde(default)]
-    pub reasoning_effort: ReasoningEffortFeature,
+    pub reasoning_effort:          ReasoningEffortFeature,
     /// Whether this model endpoint supports prompt caching annotations.
     #[serde(default)]
-    pub prompt_cache:     bool,
+    pub prompt_cache:              bool,
+    /// Whether the endpoint only caches when the request marks the cacheable
+    /// prefix with Anthropic-style `cache_control` breakpoints. Set on
+    /// OpenAI-compatible routes fronting Anthropic models (e.g. Claude via
+    /// OpenRouter); dialects whose caching mechanism is implied (native
+    /// Anthropic, Bedrock) ignore it.
+    #[serde(default)]
+    pub cache_control_breakpoints: bool,
     /// Whether the model endpoint accepts classic sampling parameters
     /// (`temperature`, `top_p`). Models with always-on adaptive behavior
     /// reject them.
     #[serde(default = "default_true")]
-    pub sampling_params:  bool,
+    pub sampling_params:           bool,
 }
 
 impl ModelFeatures {
@@ -221,12 +228,13 @@ mod tests {
             training:             Some("training".to_string()),
             knowledge_cutoff:     Some("knowledge-cutoff".to_string()),
             features:             ModelFeatures {
-                tools:            true,
-                vision:           true,
-                reasoning:        true,
-                reasoning_effort: ReasoningEffortFeature::Levels,
-                prompt_cache:     true,
-                sampling_params:  true,
+                tools:                     true,
+                vision:                    true,
+                reasoning:                 true,
+                reasoning_effort:          ReasoningEffortFeature::Levels,
+                prompt_cache:              true,
+                cache_control_breakpoints: false,
+                sampling_params:           true,
             },
             costs:                ModelCosts {
                 input_cost_per_mtok:       Some(1.0),

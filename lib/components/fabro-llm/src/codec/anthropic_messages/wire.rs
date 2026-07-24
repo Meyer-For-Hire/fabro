@@ -1,5 +1,7 @@
 //! Serde types mirroring the Anthropic Messages wire shapes.
 
+use crate::codec::cache::CacheControl;
+
 #[derive(serde::Serialize)]
 pub(super) struct ApiRequest {
     pub model:          String,
@@ -75,21 +77,6 @@ pub(super) struct ApiToolDef {
     pub input_schema:  serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_control: Option<CacheControl>,
-}
-
-/// Anthropic `cache_control` annotation.
-#[derive(serde::Serialize, Clone)]
-pub(super) struct CacheControl {
-    #[serde(rename = "type")]
-    pub kind: String,
-}
-
-impl CacheControl {
-    pub(super) fn ephemeral() -> Self {
-        Self {
-            kind: "ephemeral".to_string(),
-        }
-    }
 }
 
 // --- Response types ---

@@ -1,6 +1,6 @@
 //! Pure mapping between canonical types and the Chat Completions wire shapes.
 
-use super::wire::{ChatFunction, ChatMessage, ChatToolCall};
+use super::wire::{ChatContent, ChatFunction, ChatMessage, ChatToolCall};
 use crate::error::Error;
 use crate::types::{
     ContentPart, CostSource, FinishReason, Message, Request, ResponseFormat, ResponseFormatType,
@@ -67,7 +67,7 @@ pub(super) fn translate_messages(messages: &[Message]) -> Vec<ChatMessage> {
                                 .map_or_else(|| tr.content.to_string(), str::to_string);
                             Some(ChatMessage {
                                 role:              "tool".to_string(),
-                                content:           Some(output),
+                                content:           Some(ChatContent::Text(output)),
                                 reasoning_content: None,
                                 tool_call_id:      Some(tr.tool_call_id.clone()),
                                 tool_calls:        None,
@@ -109,7 +109,11 @@ pub(super) fn translate_messages(messages: &[Message]) -> Vec<ChatMessage> {
             }
 
             let text = content_text_with_fallbacks(&msg.content);
-            let content = if text.is_empty() { None } else { Some(text) };
+            let content = if text.is_empty() {
+                None
+            } else {
+                Some(ChatContent::Text(text))
+            };
             let tool_calls = if tool_calls.is_empty() {
                 None
             } else {
@@ -276,7 +280,10 @@ mod tests {
         };
         let translated = translate_messages(&[msg]);
         assert_eq!(
-            translated[0].content.as_deref(),
+            translated[0]
+                .content
+                .as_ref()
+                .and_then(ChatContent::as_text),
             Some("Let me check the weather")
         );
         let tool_calls = translated[0].tool_calls.as_ref().unwrap();
@@ -318,7 +325,13 @@ mod tests {
         let msg = Message::user("Hello");
         let translated = translate_messages(&[msg]);
         assert_eq!(translated[0].role, "user");
-        assert_eq!(translated[0].content.as_deref(), Some("Hello"));
+        assert_eq!(
+            translated[0]
+                .content
+                .as_ref()
+                .and_then(ChatContent::as_text),
+            Some("Hello")
+        );
         assert!(translated[0].tool_calls.is_none());
     }
 
@@ -359,7 +372,10 @@ mod tests {
         };
         let translated = translate_messages(&[msg]);
         assert_eq!(
-            translated[0].content.as_deref(),
+            translated[0]
+                .content
+                .as_ref()
+                .and_then(ChatContent::as_text),
             Some("[Audio content not supported by this provider]")
         );
     }
@@ -379,7 +395,10 @@ mod tests {
         };
         let translated = translate_messages(&[msg]);
         assert_eq!(
-            translated[0].content.as_deref(),
+            translated[0]
+                .content
+                .as_ref()
+                .and_then(ChatContent::as_text),
             Some("[Document 'report.pdf': content type not supported by this provider]")
         );
     }
@@ -399,7 +418,10 @@ mod tests {
         };
         let translated = translate_messages(&[msg]);
         assert_eq!(
-            translated[0].content.as_deref(),
+            translated[0]
+                .content
+                .as_ref()
+                .and_then(ChatContent::as_text),
             Some("[Document content not supported by this provider]")
         );
     }
@@ -421,7 +443,10 @@ mod tests {
         };
         let translated = translate_messages(&[msg]);
         assert_eq!(
-            translated[0].content.as_deref(),
+            translated[0]
+                .content
+                .as_ref()
+                .and_then(ChatContent::as_text),
             Some("Check this: [Audio content not supported by this provider]")
         );
     }

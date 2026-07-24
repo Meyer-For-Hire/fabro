@@ -12,6 +12,7 @@
 
 pub(crate) mod anthropic_messages;
 pub(crate) mod bedrock_converse;
+pub(crate) mod cache;
 pub(crate) mod gemini_generate;
 pub(crate) mod openai_compatible;
 pub(crate) mod openai_responses;
@@ -38,11 +39,14 @@ pub(crate) fn split_inclusive_token_total(total: i64, detail: i64) -> (i64, i64)
 
 /// Merge `provider_options.<provider_name>` fields into an encoded request
 /// body. Used by codecs whose provider-options namespace is adapter-name keyed
-/// rather than a single fixed provider.
+/// rather than a single fixed provider. `known_keys` are control keys the
+/// codec consumed itself (e.g. `auto_cache`); they are not re-merged into the
+/// body.
 pub(crate) fn merge_named_provider_options(
     body: &mut serde_json::Value,
     provider_options: Option<&serde_json::Value>,
     provider_name: &str,
+    known_keys: &[&str],
 ) {
     let Some(opts) = provider_options.and_then(|opts| opts.get(provider_name)) else {
         return;
@@ -55,6 +59,9 @@ pub(crate) fn merge_named_provider_options(
     };
 
     for (key, value) in opts_map {
+        if known_keys.contains(&key.as_str()) {
+            continue;
+        }
         body_map.insert(key.clone(), value.clone());
     }
 }
