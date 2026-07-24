@@ -14,7 +14,7 @@ credentials = ["env:FIREWORKS_API_KEY", "vault:FIREWORKS_API_KEY"]
 # [llm.providers.fireworks]
 # enabled = true
 #
-# Then run `fabro provider login fireworks` to store the API key,
+# Then run `fabro provider login --provider fireworks` to store the API key,
 # or set the FIREWORKS_API_KEY environment variable.
 #
 # api_id values use Fireworks account-scoped paths; dots in upstream model
