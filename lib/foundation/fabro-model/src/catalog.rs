@@ -3386,6 +3386,215 @@ enabled = true
     }
 
     #[test]
+    fn builtin_fireworks_provider_is_opt_in() {
+        let fireworks = ProviderId::new("fireworks");
+        let builtin = Catalog::builtin();
+
+        assert!(builtin.provider(&fireworks).is_none());
+        assert!(builtin.list(Some(&fireworks)).is_empty());
+
+        let catalog = Catalog::from_builtin_with_overrides(&minimal_settings(
+            r"
+[providers.fireworks]
+enabled = true
+",
+        ))
+        .expect("enabled Fireworks override should build from the built-in provider settings");
+
+        let provider = catalog
+            .provider(&fireworks)
+            .expect("enabled Fireworks provider should be present");
+        assert_eq!(provider.adapter, AdapterKind::OpenAiCompatible);
+        assert_eq!(provider.codec, CodecKind::OpenAiCompatible);
+        assert_eq!(
+            provider.base_url.as_deref(),
+            Some("https://api.fireworks.ai/inference/v1")
+        );
+        assert_eq!(provider.billing_policy, BillingPolicy::OpenAi);
+        assert_eq!(provider.priority, 30);
+        assert_eq!(provider.auth.as_ref().unwrap().credentials, vec![
+            CredentialRef::Env("FIREWORKS_API_KEY".to_string()),
+            CredentialRef::Vault("FIREWORKS_API_KEY".to_string()),
+        ]);
+
+        assert_eq!(
+            catalog
+                .default_for_provider(&fireworks)
+                .map(|model| model.id.as_str()),
+            Some("kimi-k2.7-code")
+        );
+        assert_eq!(
+            catalog
+                .probe_for_provider(&fireworks)
+                .map(|model| model.id.as_str()),
+            Some("gpt-oss-20b")
+        );
+    }
+
+    #[test]
+    fn builtin_fireworks_models_when_enabled() {
+        let fireworks = ProviderId::new("fireworks");
+        let catalog = Catalog::from_builtin_with_overrides(&minimal_settings(
+            r"
+[providers.fireworks]
+enabled = true
+",
+        ))
+        .expect("enabled Fireworks override should build from the built-in provider settings");
+
+        // (id, api_id, context_window, max_output, input, output, cache_read)
+        let expected = [
+            (
+                "kimi-k2.7-code",
+                "accounts/fireworks/models/kimi-k2p7-code",
+                262_144,
+                32_768,
+                0.95,
+                4.0,
+                0.19,
+            ),
+            (
+                "kimi-k2.6",
+                "accounts/fireworks/models/kimi-k2p6",
+                262_144,
+                16_384,
+                0.95,
+                4.0,
+                0.16,
+            ),
+            (
+                "deepseek-v4-pro",
+                "accounts/fireworks/models/deepseek-v4-pro",
+                1_048_576,
+                16_384,
+                1.74,
+                3.48,
+                0.145,
+            ),
+            (
+                "deepseek-v4-flash",
+                "accounts/fireworks/models/deepseek-v4-flash",
+                1_048_576,
+                16_384,
+                0.14,
+                0.28,
+                0.028,
+            ),
+            (
+                "glm-5.2",
+                "accounts/fireworks/models/glm-5p2",
+                1_048_576,
+                131_072,
+                1.4,
+                4.4,
+                0.14,
+            ),
+            (
+                "minimax-m2.7",
+                "accounts/fireworks/models/minimax-m2p7",
+                196_608,
+                16_384,
+                0.3,
+                1.2,
+                0.059,
+            ),
+            (
+                "qwen3.7-plus",
+                "accounts/fireworks/models/qwen3p7-plus",
+                262_144,
+                16_384,
+                0.4,
+                1.6,
+                0.08,
+            ),
+            (
+                "gpt-oss-120b",
+                "accounts/fireworks/models/gpt-oss-120b",
+                131_072,
+                32_768,
+                0.15,
+                0.6,
+                0.015,
+            ),
+            (
+                "gpt-oss-20b",
+                "accounts/fireworks/models/gpt-oss-20b",
+                131_072,
+                32_768,
+                0.07,
+                0.3,
+                0.035,
+            ),
+        ];
+
+        let mut model_ids: Vec<&str> = catalog
+            .list(Some(&fireworks))
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect();
+        model_ids.sort_unstable();
+        let mut expected_ids: Vec<&str> = expected.iter().map(|row| row.0).collect();
+        expected_ids.sort_unstable();
+        assert_eq!(
+            model_ids, expected_ids,
+            "expected rows must cover every Fireworks model"
+        );
+
+        for (id, api_id, context, max_output, input, output, cache_read) in expected {
+            let model = catalog
+                .get_on_provider(&fireworks, id)
+                .unwrap_or_else(|| panic!("Fireworks model '{id}' should be present"));
+            assert_eq!(model.limits.context_window, context, "{id}");
+            assert_eq!(model.limits.max_output, Some(max_output), "{id}");
+            assert!(model.features.tools, "{id}");
+            assert!(model.features.prompt_cache, "{id}");
+            assert_eq!(model.costs.input_cost_per_mtok, Some(input), "{id}");
+            assert_eq!(model.costs.output_cost_per_mtok, Some(output), "{id}");
+            assert_eq!(
+                model.costs.cache_input_cost_per_mtok,
+                Some(cache_read),
+                "{id}"
+            );
+
+            let settings = catalog
+                .model_settings_on_provider(&fireworks, id)
+                .unwrap_or_else(|| panic!("Fireworks settings for '{id}' should be present"));
+            assert_eq!(settings.api_id, api_id, "{id}");
+            assert_eq!(settings.billing_policy, BillingPolicy::OpenAi, "{id}");
+        }
+    }
+
+    #[test]
+    fn builtin_fireworks_shared_slugs_are_portable_with_openrouter() {
+        let catalog = Catalog::from_builtin_with_overrides(&minimal_settings(
+            r"
+[providers.fireworks]
+enabled = true
+
+[providers.openrouter]
+enabled = true
+",
+        ))
+        .expect("enabled Fireworks and OpenRouter overrides should build");
+
+        for provider in [ProviderId::new("fireworks"), ProviderId::new("openrouter")] {
+            for id in [
+                "kimi-k2.6",
+                "deepseek-v4-pro",
+                "deepseek-v4-flash",
+                "glm-5.2",
+                "minimax-m2.7",
+            ] {
+                let model = catalog
+                    .get_on_provider(&provider, id)
+                    .unwrap_or_else(|| panic!("'{id}' should resolve on provider '{provider}'"));
+                assert_eq!(model.id, id, "{provider}/{id}");
+                assert_eq!(model.provider, provider, "{provider}/{id}");
+            }
+        }
+    }
+
+    #[test]
     fn builtin_ollama_provider_is_opt_in() {
         let ollama = ProviderId::new("ollama");
         let builtin = Catalog::builtin();
