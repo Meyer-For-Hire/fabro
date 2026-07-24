@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use fabro_types::run_event::{
@@ -26,7 +27,9 @@ use crate::{Error, EventEnvelope, Result};
 #[derive(Debug, Clone, Default)]
 pub(crate) struct EventProjectionCache {
     pub last_seq: u32,
-    pub state:    Option<RunProjection>,
+    // Arc-shared with the shared projection cache so opening a run does not
+    // deep-copy the projection; mutated copy-on-write via `Arc::make_mut`.
+    pub state:    Option<Arc<RunProjection>>,
 }
 
 pub trait RunProjectionReducer {

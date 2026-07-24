@@ -952,14 +952,9 @@ async fn load_run_sandbox_instance(
     run_id: &RunId,
 ) -> Result<fabro_types::RunSandboxInstance, Response> {
     let cached = state
-        .stores
-        .runs
-        .get_cached_run(run_id)
+        .cached_run(run_id)
         .await
-        .map_err(|err| {
-            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
-        })?
-        .ok_or_else(|| ApiError::not_found("Run not found.").into_response())?;
+        .map_err(IntoResponse::into_response)?;
     cached
         .projection
         .sandbox

@@ -1194,14 +1194,8 @@ fn to_sha_wrapper(sha: &str) -> RunFilesMetaToSha {
 async fn load_projection(
     state: &Arc<AppState>,
     run_id: &RunId,
-) -> std::result::Result<fabro_store::RunProjection, ApiError> {
-    let cached = state
-        .store_ref()
-        .get_cached_run(run_id)
-        .await
-        .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
-        .ok_or_else(|| ApiError::not_found("Run not found."))?;
-    Ok((*cached.projection).clone())
+) -> std::result::Result<Arc<fabro_store::RunProjection>, ApiError> {
+    Ok(state.cached_run(run_id).await?.projection)
 }
 
 async fn reconnect_run_sandbox(

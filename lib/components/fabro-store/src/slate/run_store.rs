@@ -6,7 +6,7 @@ use bytes::Bytes;
 use chrono::Utc;
 use fabro_types::{RunBlobId, RunEvent, RunId, SessionId};
 use futures::Stream;
-use slatedb::{Db, DbRead};
+use slatedb::{Db, DbIterator, DbRead};
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{error, warn};
@@ -84,18 +84,16 @@ impl RunDatabase {
         shared_projection_cache: Arc<RunProjectionCache>,
         run_summary_store: Arc<OnceLock<Arc<RunSummaryStore>>>,
     ) -> Result<Self> {
-        let cached_projection = shared_projection_cache.get(&run_id).await;
-        let projection_cache =
-            cached_projection
-                .as_ref()
-                .map_or_else(EventProjectionCache::default, |cached| {
-                    EventProjectionCache {
-                        last_seq: cached.last_seq,
-                        state:    Some((*cached.projection).clone()),
-                    }
-                });
+        let cached_projection = shared_projection_cache.projection_snapshot(&run_id).await;
+        let projection_cache = cached_projection.as_ref().map_or_else(
+            EventProjectionCache::default,
+            |(projection, last_seq)| EventProjectionCache {
+                last_seq: *last_seq,
+                state:    Some(Arc::clone(projection)),
+            },
+        );
         let event_seq = match (&cached_projection, read_only) {
-            (Some(cached), _) => cached.last_seq.saturating_add(1),
+            (Some((_, last_seq)), _) => last_seq.saturating_add(1),
             (None, true) => {
                 // Readers never append, so they do not need to scan the full event
                 // history to recover the next write sequence.
@@ -187,12 +185,12 @@ impl RunDatabase {
         )))
     }
 
-    async fn projected_state(&self) -> Result<RunProjection> {
+    async fn projected_state(&self) -> Result<Arc<RunProjection>> {
         let _state_guard = self.inner.state_lock.lock().await;
         self.projected_state_locked().await
     }
 
-    async fn projected_state_locked(&self) -> Result<RunProjection> {
+    async fn projected_state_locked(&self) -> Result<Arc<RunProjection>> {
         let next_seq = {
             let cache = self.inner.projection_cache.lock().await;
             cache.last_seq.saturating_add(1)
@@ -249,7 +247,7 @@ impl RunDatabase {
 
         let state = RunProjection::apply_events(&events)?;
         let mut projection_cache = self.inner.projection_cache.lock().await;
-        projection_cache.state = Some(state);
+        projection_cache.state = Some(Arc::new(state));
         projection_cache.last_seq = last_seq;
         Ok(())
     }
@@ -384,19 +382,11 @@ impl RunDatabase {
     }
 
     /// Returns the newest stored event sequence without reading event bodies
-    /// when a current local or shared projection is available.
+    /// when a current projection is available.
     pub async fn last_event_seq(&self) -> Result<Option<u32>> {
         let local_last_seq = self.inner.projection_cache.lock().await.last_seq;
         if local_last_seq > 0 {
             return Ok(Some(local_last_seq));
-        }
-        if let Some(last_seq) = self
-            .inner
-            .shared_projection_cache
-            .last_seq(&self.inner.run_id)
-            .await
-        {
-            return Ok(Some(last_seq));
         }
 
         let next_seq = recover_next_seq(
@@ -426,11 +416,10 @@ impl RunDatabase {
     /// Returns up to `limit + 1` events for the given stage visit,
     /// starting at `start_seq`. The `+1` lets callers compute `has_more`.
     ///
-    /// Implementation note: scans the unbounded run-event prefix and
-    /// filters by stage identity *before* applying `limit`, so a stage with
-    /// matches sparsely scattered late in the event log still returns its
-    /// full slice (no premature truncation from a generic `limit`-bounded
-    /// scan).
+    /// Implementation note: filters by stage identity *before* applying
+    /// `limit`, so a stage with matches sparsely scattered late in the event
+    /// log still returns its full slice (no premature truncation from a
+    /// generic `limit`-bounded scan).
     pub async fn list_events_for_stage_from_with_limit(
         &self,
         stage_id: &StageId,
@@ -541,18 +530,20 @@ impl RunDatabase {
     }
 
     pub async fn state(&self) -> Result<RunProjection> {
-        self.projected_state().await
+        Ok(Arc::unwrap_or_clone(self.projected_state().await?))
     }
 }
 
 fn apply_cached_projection_event(
-    state: &mut Option<RunProjection>,
+    state: &mut Option<Arc<RunProjection>>,
     event: &EventEnvelope,
 ) -> Result<()> {
     if let Some(projection) = state {
-        projection.apply_event(event)?;
+        Arc::make_mut(projection).apply_event(event)?;
     } else {
-        *state = Some(RunProjection::apply_events(std::slice::from_ref(event))?);
+        *state = Some(Arc::new(RunProjection::apply_events(
+            std::slice::from_ref(event),
+        )?));
     }
     Ok(())
 }
@@ -576,31 +567,55 @@ where
     Ok(max_seq.saturating_add(1).max(1))
 }
 
+/// Cursor over a run's stored events starting at `start_seq`, yielding raw
+/// `(seq, payload)` entries in ascending sequence order (event keys embed a
+/// zero-padded sequence, so key order matches sequence order).
+struct EventScan {
+    iter:         DbIterator,
+    event_prefix: keys::SlateKey,
+    start_seq:    u32,
+}
+
+impl EventScan {
+    async fn seek<R>(db: &R, run_id: &RunId, start_seq: u32) -> Result<Self>
+    where
+        R: DbRead + Sync,
+    {
+        let iter = db
+            .scan(keys::run_event_seq_prefix(run_id, start_seq)..)
+            .await?;
+        Ok(Self {
+            iter,
+            event_prefix: keys::run_events_prefix(run_id),
+            start_seq,
+        })
+    }
+
+    async fn next(&mut self) -> Result<Option<(u32, Bytes)>> {
+        while let Some(entry) = self.iter.next().await? {
+            if !entry.key.starts_with(self.event_prefix.as_ref()) {
+                return Ok(None);
+            }
+            let key = key_to_string(&entry.key)?;
+            let Some(seq) = keys::parse_event_seq(&key) else {
+                continue;
+            };
+            if seq < self.start_seq {
+                continue;
+            }
+            return Ok(Some((seq, entry.value)));
+        }
+        Ok(None)
+    }
+}
+
 async fn list_events_from<R>(db: &R, run_id: &RunId, start_seq: u32) -> Result<Vec<EventEnvelope>>
 where
     R: DbRead + Sync,
 {
-    let event_prefix = keys::run_events_prefix(run_id);
-    let mut iter = db
-        .scan(keys::run_event_seq_prefix(run_id, start_seq)..)
-        .await?;
-    let mut events = Vec::new();
-    while let Some(entry) = iter.next().await? {
-        if !entry.key.starts_with(event_prefix.as_ref()) {
-            break;
-        }
-        let key = key_to_string(&entry.key)?;
-        let Some(seq) = keys::parse_event_seq(&key) else {
-            continue;
-        };
-        if seq < start_seq {
-            continue;
-        }
-        events.push(EventEnvelope {
-            seq,
-            event: serde_json::from_slice(&entry.value)?,
-        });
-    }
+    let mut events = list_events_from_with_limit(db, run_id, start_seq, usize::MAX / 2).await?;
+    // Key order matches sequence order only through the 6-digit zero padding
+    // in event keys; this keeps full-history replays correct past it.
     events.sort_by_key(|event| event.seq);
     Ok(events)
 }
@@ -614,31 +629,18 @@ async fn list_events_from_with_limit<R>(
 where
     R: DbRead + Sync,
 {
-    let event_prefix = keys::run_events_prefix(run_id);
     let max_events = limit.saturating_add(1);
-    // Seek to the page cursor and decode only the requested page plus the
-    // sentinel used to compute `has_more`.
-    let mut iter = db
-        .scan(keys::run_event_seq_prefix(run_id, start_seq)..)
-        .await?;
+    // Decode only the requested page plus the sentinel used to compute
+    // `has_more`.
+    let mut scan = EventScan::seek(db, run_id, start_seq).await?;
     let mut events = Vec::new();
     while events.len() < max_events {
-        let Some(entry) = iter.next().await? else {
+        let Some((seq, value)) = scan.next().await? else {
             break;
         };
-        if !entry.key.starts_with(event_prefix.as_ref()) {
-            break;
-        }
-        let key = key_to_string(&entry.key)?;
-        let Some(seq) = keys::parse_event_seq(&key) else {
-            continue;
-        };
-        if seq < start_seq {
-            continue;
-        }
         events.push(EventEnvelope {
             seq,
-            event: serde_json::from_slice(&entry.value)?,
+            event: serde_json::from_slice(&value)?,
         });
     }
     Ok(events)
@@ -670,10 +672,9 @@ async fn list_events_for_stage_from_with_limit<R>(
 where
     R: DbRead + Sync,
 {
-    // Scan without a storage-level item limit from the requested cursor:
-    // filtering by stage identity with a generic limit-bounded scan would
-    // silently drop matches whenever the stage's events are sparse late in
-    // the event log.
+    // Filter by stage identity *before* applying `limit`: a generic
+    // limit-bounded scan would silently drop matches whenever the stage's
+    // events are sparse late in the event log.
     //
     // We probe just the stage identity fields with a small partial deserialize and
     // only run the full `RunEvent` parse on matches. Most events in a run
@@ -689,23 +690,13 @@ where
 
     let stage_id_string = stage_id.to_string();
     let max_events = limit.saturating_add(1);
-    let event_prefix = keys::run_events_prefix(run_id);
-    let mut iter = db
-        .scan(keys::run_event_seq_prefix(run_id, start_seq)..)
-        .await?;
-    let mut events: Vec<EventEnvelope> = Vec::new();
-    while let Some(entry) = iter.next().await? {
-        if !entry.key.starts_with(event_prefix.as_ref()) {
+    let mut scan = EventScan::seek(db, run_id, start_seq).await?;
+    let mut events = Vec::new();
+    while events.len() < max_events {
+        let Some((seq, value)) = scan.next().await? else {
             break;
-        }
-        let key = key_to_string(&entry.key)?;
-        let Some(seq) = keys::parse_event_seq(&key) else {
-            continue;
         };
-        if seq < start_seq {
-            continue;
-        }
-        let probe: StageIdProbe = serde_json::from_slice(&entry.value)?;
+        let probe: StageIdProbe = serde_json::from_slice(&value)?;
         let matches_stage_id = probe.stage_id == Some(stage_id_string.as_str());
         let matches_legacy_node_id = probe.stage_id.is_none()
             && stage_id.visit() == 1
@@ -713,25 +704,9 @@ where
         if !matches_stage_id && !matches_legacy_node_id {
             continue;
         }
-        let event: RunEvent = serde_json::from_slice(&entry.value)?;
-        let envelope = EventEnvelope { seq, event };
-        if events.len() < max_events {
-            events.push(envelope);
-            continue;
-        }
-
-        if let Some((max_index, max_seq)) = events
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, existing)| existing.seq)
-            .map(|(index, existing)| (index, existing.seq))
-        {
-            if seq < max_seq {
-                events[max_index] = envelope;
-            }
-        }
+        let event: RunEvent = serde_json::from_slice(&value)?;
+        events.push(EventEnvelope { seq, event });
     }
-    events.sort_by_key(|event| event.seq);
     Ok(events)
 }
 
@@ -755,24 +730,13 @@ where
 
     let session_id_string = session_id.to_string();
     let max_events = limit.saturating_add(1);
-    let event_prefix = keys::run_events_prefix(run_id);
-    let mut iter = db
-        .scan(keys::run_event_seq_prefix(run_id, start_seq)..)
-        .await?;
+    let mut scan = EventScan::seek(db, run_id, start_seq).await?;
     let mut events = Vec::new();
-    while let Some(entry) = iter.next().await? {
-        if !entry.key.starts_with(event_prefix.as_ref()) {
+    while events.len() < max_events {
+        let Some((seq, value)) = scan.next().await? else {
             break;
-        }
-        let key = key_to_string(&entry.key)?;
-        let Some(seq) = keys::parse_event_seq(&key) else {
-            continue;
         };
-        if seq < start_seq {
-            continue;
-        }
-
-        let probe: SessionEventProbe = serde_json::from_slice(&entry.value)?;
+        let probe: SessionEventProbe = serde_json::from_slice(&value)?;
         if probe.session_id != Some(session_id_string.as_str())
             || !probe
                 .event_name
@@ -781,12 +745,9 @@ where
             continue;
         }
 
-        let event: RunEvent = serde_json::from_slice(&entry.value)?;
+        let event: RunEvent = serde_json::from_slice(&value)?;
         if event.body.is_run_session_event() {
             events.push(EventEnvelope { seq, event });
-            if events.len() >= max_events {
-                break;
-            }
         }
     }
     Ok(events)

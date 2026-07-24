@@ -243,12 +243,9 @@ async fn load_run_dot_source(state: &AppState, id: &RunId) -> Result<String, Res
         Some(dot)
     } else {
         state
-            .stores
-            .runs
-            .get_cached_run(id)
+            .cached_run(id)
             .await
-            .map_err(|err| ApiError::new(StatusCode::BAD_GATEWAY, err.to_string()).into_response())?
-            .ok_or_else(|| ApiError::not_found("Run not found.").into_response())?
+            .map_err(IntoResponse::into_response)?
             .projection
             .spec
             .graph_source

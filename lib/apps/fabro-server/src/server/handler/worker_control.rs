@@ -35,13 +35,9 @@ async fn worker_control_stream(
     Query(query): Query<WorkerControlStreamQuery>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let cached = match state.stores.runs.get_cached_run(&id).await {
-        Ok(Some(cached)) => cached,
-        Ok(None) => return ApiError::not_found("Run not found.").into_response(),
-        Err(err) => {
-            return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
-                .into_response();
-        }
+    let cached = match state.cached_run(&id).await {
+        Ok(cached) => cached,
+        Err(err) => return err.into_response(),
     };
     if cached.projection.archived_at.is_some() {
         return ApiError::new(StatusCode::CONFLICT, "Run is archived.").into_response();

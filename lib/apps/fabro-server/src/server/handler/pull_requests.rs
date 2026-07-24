@@ -131,13 +131,7 @@ async fn load_pull_request_record(
     state: &Arc<AppState>,
     id: &RunId,
 ) -> Result<PullRequestLink, ApiError> {
-    let cached = state
-        .stores
-        .runs
-        .get_cached_run(id)
-        .await
-        .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
-        .ok_or_else(|| ApiError::not_found("Run not found."))?;
+    let cached = state.cached_run(id).await?;
     cached.projection.pull_request.clone().ok_or_else(|| {
         ApiError::with_code(
             StatusCode::NOT_FOUND,
@@ -294,19 +288,9 @@ async fn create_run_pull_request(
     let Ok(run_store) = state.stores.runs.open_run(&id).await else {
         return ApiError::not_found("Run not found.").into_response();
     };
-    let cached = match state.stores.runs.get_cached_run(&id).await {
-        Ok(Some(cached)) => cached,
-        Ok(None) => {
-            return ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Run projection unavailable.",
-            )
-            .into_response();
-        }
-        Err(err) => {
-            return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
-                .into_response();
-        }
+    let cached = match state.cached_run(&id).await {
+        Ok(cached) => cached,
+        Err(err) => return err.into_response(),
     };
     let run_state = cached.projection.as_ref();
     let inputs = match RunPrInputs::extract(run_state, body.force) {
@@ -406,19 +390,9 @@ async fn unlink_run_pull_request(
     let Ok(run_store) = state.stores.runs.open_run(&id).await else {
         return ApiError::not_found("Run not found.").into_response();
     };
-    let cached = match state.stores.runs.get_cached_run(&id).await {
-        Ok(Some(cached)) => cached,
-        Ok(None) => {
-            return ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Run projection unavailable.",
-            )
-            .into_response();
-        }
-        Err(err) => {
-            return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
-                .into_response();
-        }
+    let cached = match state.cached_run(&id).await {
+        Ok(cached) => cached,
+        Err(err) => return err.into_response(),
     };
     let Some(pull_request) = cached.projection.pull_request.clone() else {
         return ApiError::with_code(

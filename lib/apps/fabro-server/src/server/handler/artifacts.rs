@@ -68,15 +68,12 @@ async fn get_checkpoint(
         Ok(id) => id,
         Err(response) => return response,
     };
-    match state.stores.runs.get_cached_run(&id).await {
-        Ok(Some(cached)) => match cached.projection.current_checkpoint() {
+    match state.cached_run(&id).await {
+        Ok(cached) => match cached.projection.current_checkpoint() {
             Some(cp) => (StatusCode::OK, Json(cp.clone())).into_response(),
             None => (StatusCode::OK, Json(serde_json::json!(null))).into_response(),
         },
-        Ok(None) => ApiError::not_found("Run not found.").into_response(),
-        Err(err) => {
-            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
-        }
+        Err(err) => err.into_response(),
     }
 }
 
@@ -118,17 +115,12 @@ async fn read_run_blob(
     }
 }
 
-async fn load_run_spec(state: &AppState, run_id: &RunId) -> Result<fabro_types::RunSpec, Response> {
-    let cached = state
-        .stores
-        .runs
-        .get_cached_run(run_id)
+async fn ensure_run_exists(state: &AppState, run_id: &RunId) -> Result<(), Response> {
+    state
+        .cached_run(run_id)
         .await
-        .map_err(|err| {
-            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
-        })?
-        .ok_or_else(|| ApiError::not_found("Run not found.").into_response())?;
-    Ok(cached.projection.spec.clone())
+        .map(|_| ())
+        .map_err(IntoResponse::into_response)
 }
 
 async fn list_run_artifacts(
@@ -140,7 +132,7 @@ async fn list_run_artifacts(
         Ok(id) => id,
         Err(response) => return response,
     };
-    if let Err(response) = load_run_spec(state.as_ref(), &id).await {
+    if let Err(response) = ensure_run_exists(state.as_ref(), &id).await {
         return response;
     }
 
@@ -186,7 +178,7 @@ async fn list_stage_artifacts(
         Ok(stage_id) => stage_id,
         Err(response) => return response,
     };
-    if let Err(response) = load_run_spec(state.as_ref(), &id).await {
+    if let Err(response) = ensure_run_exists(state.as_ref(), &id).await {
         return response;
     }
 
@@ -568,7 +560,7 @@ async fn put_stage_artifact(
     if let Some(response) = reject_if_archived(state.as_ref(), &id).await {
         return response;
     }
-    if let Err(response) = load_run_spec(state.as_ref(), &id).await.map(|_| ()) {
+    if let Err(response) = ensure_run_exists(state.as_ref(), &id).await {
         return response;
     }
     let retry = match required_query_param(params.retry.as_ref(), "retry") {
@@ -636,7 +628,7 @@ async fn get_stage_artifact(
         Ok(path) => path,
         Err(response) => return response,
     };
-    if let Err(response) = load_run_spec(state.as_ref(), &id).await {
+    if let Err(response) = ensure_run_exists(state.as_ref(), &id).await {
         return response;
     }
 
