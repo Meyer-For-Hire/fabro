@@ -1340,6 +1340,8 @@ pub(crate) fn run_stage_from_stage_id(
     started_at: Option<chrono::DateTime<chrono::Utc>>,
     handler: StageHandler,
     provider_used: Option<StageModelUsage>,
+    graph_visit: Option<u32>,
+    resumed_from_stage_id: Option<&StageId>,
 ) -> RunStage {
     RunStage {
         id: stage_id.to_string(),
@@ -1352,6 +1354,8 @@ pub(crate) fn run_stage_from_stage_id(
             .expect("StageId stores a non-zero visit"),
         provider_used,
         started_at,
+        graph_visit: graph_visit.and_then(std::num::NonZeroU32::new),
+        resumed_from_stage_id: resumed_from_stage_id.map(StageId::to_string),
     }
 }
 

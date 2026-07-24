@@ -18,6 +18,7 @@ use crate::context::{Context, WorkflowContext};
 use crate::event::{Emitter, Event, StageScope};
 use crate::graph::{WorkflowGraph, WorkflowNode};
 use crate::outcome::{BilledModelUsage, FailureCategory, FailureDetail, Outcome, StageOutcome};
+use crate::stage_execution::StageExecutionTracker;
 use crate::{artifact, context};
 
 type WfRunState = ExecutionState<Option<BilledModelUsage>>;
@@ -46,6 +47,8 @@ pub(crate) struct EventLifecycle {
     /// EventLifecycle when emitting CheckpointCompleted).
     pub checkpoint_git_result: Arc<Mutex<Option<GitCheckpointResult>>>,
     pub circuit_breaker:       Arc<CircuitBreakerLifecycle>,
+    /// Run-scoped stage execution allocator shared with `RunServices`.
+    pub stage_executions:      StageExecutionTracker,
 }
 
 fn snapshot_failure_signatures(
@@ -107,11 +110,22 @@ pub(super) fn stage_visit(state: &WfRunState, node_id: &str) -> u32 {
     u32::try_from(visits).unwrap_or(u32::MAX)
 }
 
-pub(crate) fn stage_scope_for(state: &WfRunState, node_id: &str) -> StageScope {
+/// Build the emission scope for a node from its active stage execution.
+/// Falls back to the graph visit for direct unit-test call sites that emit
+/// without a reservation; the two are equal for a first execution.
+pub(crate) fn stage_scope_for(
+    stage_executions: &StageExecutionTracker,
+    state: &WfRunState,
+    node_id: &str,
+) -> StageScope {
+    let visit = stage_executions.active(node_id).map_or_else(
+        || stage_visit(state, node_id),
+        |execution| execution.ordinal,
+    );
     StageScope {
-        node_id:            node_id.to_string(),
-        visit:              stage_visit(state, node_id),
-        parallel_group_id:  state.context.parallel_group_id(),
+        node_id: node_id.to_string(),
+        visit,
+        parallel_group_id: state.context.parallel_group_id(),
         parallel_branch_id: state.context.parallel_branch_id(),
     }
 }
@@ -160,17 +174,24 @@ impl RunLifecycle<WorkflowGraph> for EventLifecycle {
         }
         let gv = node.inner();
         let stage_index = state.stage_index;
-        let scope = stage_scope_for(state, &gv.id);
+        // Terminal nodes bypass `before_node`/`before_attempt`, so their
+        // synthetic paired events reserve an execution here.
+        let execution = self
+            .stage_executions
+            .reserve(&gv.id, stage_visit(state, &gv.id));
+        let scope = stage_scope_for(&self.stage_executions, state, &gv.id);
         let (loop_failure_signatures, restart_failure_signatures) =
             snapshot_failure_signatures(&self.circuit_breaker);
         self.emitter.emit_scoped(
             &Event::StageStarted {
-                node_id:      gv.id.clone(),
-                name:         gv.label().to_string(),
-                index:        stage_index,
-                handler_type: gv.handler_type().unwrap_or_default().to_string(),
-                attempt:      1,
-                max_attempts: 1,
+                node_id:               gv.id.clone(),
+                name:                  gv.label().to_string(),
+                index:                 stage_index,
+                handler_type:          gv.handler_type().unwrap_or_default().to_string(),
+                attempt:               1,
+                max_attempts:          1,
+                graph_visit:           Some(execution.graph_visit),
+                resumed_from_stage_id: execution.resumed_from,
             },
             &scope,
         );
@@ -210,15 +231,21 @@ impl RunLifecycle<WorkflowGraph> for EventLifecycle {
         state: &WfRunState,
     ) -> CoreResult<NodeDecision<Option<BilledModelUsage>>> {
         let gv = ctx.node.inner();
-        let scope = stage_scope_for(state, &gv.id);
+        let execution = self.stage_executions.active(&gv.id);
+        let scope = stage_scope_for(&self.stage_executions, state, &gv.id);
+        let graph_visit = execution
+            .as_ref()
+            .map_or_else(|| stage_visit(state, &gv.id), |e| e.graph_visit);
         self.emitter.emit_scoped(
             &Event::StageStarted {
-                node_id:      gv.id.clone(),
-                name:         gv.label().to_string(),
-                index:        state.stage_index,
-                handler_type: gv.handler_type().unwrap_or_default().to_string(),
-                attempt:      ctx.attempt as usize,
-                max_attempts: ctx.max_attempts as usize,
+                node_id:               gv.id.clone(),
+                name:                  gv.label().to_string(),
+                index:                 state.stage_index,
+                handler_type:          gv.handler_type().unwrap_or_default().to_string(),
+                attempt:               ctx.attempt as usize,
+                max_attempts:          ctx.max_attempts as usize,
+                graph_visit:           Some(graph_visit),
+                resumed_from_stage_id: execution.and_then(|e| e.resumed_from),
             },
             &scope,
         );
@@ -234,7 +261,7 @@ impl RunLifecycle<WorkflowGraph> for EventLifecycle {
             let gv = ctx.node.inner();
             let outcome = &ctx.result.outcome;
             let stage_index = state.stage_index;
-            let scope = stage_scope_for(state, &gv.id);
+            let scope = stage_scope_for(&self.stage_executions, state, &gv.id);
 
             let timing = node_result_timing(ctx.result);
             let failure = outcome.failure.clone().unwrap_or_else(|| {
@@ -283,7 +310,7 @@ impl RunLifecycle<WorkflowGraph> for EventLifecycle {
         }
         let gv = node.inner();
         let stage_index = state.stage_index;
-        let scope = stage_scope_for(state, &gv.id);
+        let scope = stage_scope_for(&self.stage_executions, state, &gv.id);
         let timing = node_result_timing(result);
         let (loop_failure_signatures, restart_failure_signatures) =
             snapshot_failure_signatures(&self.circuit_breaker);
@@ -400,7 +427,11 @@ impl RunLifecycle<WorkflowGraph> for EventLifecycle {
         node_outcomes.insert(node.id().to_string(), result.outcome.clone());
         artifact::normalize_durable_outcomes(&mut node_outcomes);
 
-        let scope = stage_scope_for(state, node.id());
+        let execution = self.stage_executions.active(node.id());
+        let scope = stage_scope_for(&self.stage_executions, state, node.id());
+        let graph_visit = execution
+            .as_ref()
+            .map_or_else(|| stage_visit(state, node.id()), |e| e.graph_visit);
         self.emitter.emit_scoped(
             &Event::CheckpointCompleted {
                 node_id: node.id().to_string(),
@@ -425,6 +456,8 @@ impl RunLifecycle<WorkflowGraph> for EventLifecycle {
                     .collect::<BTreeMap<_, _>>(),
                 diff,
                 diff_summary,
+                graph_visit: Some(graph_visit),
+                resumed_from_stage_id: execution.and_then(|e| e.resumed_from),
             },
             &scope,
         );

@@ -170,10 +170,12 @@ mod tests {
     fn event_name_matches_new_dot_notation() {
         assert_eq!(
             event_name(&Event::ParallelBranchStarted {
-                parallel_group_id:  StageId::new("plan", 1),
-                parallel_branch_id: ParallelBranchId::new(StageId::new("plan", 1), 0),
-                branch:             "fork".to_string(),
-                index:              0,
+                graph_visit:           None,
+                resumed_from_stage_id: None,
+                parallel_group_id:     StageId::new("plan", 1),
+                parallel_branch_id:    ParallelBranchId::new(StageId::new("plan", 1), 0),
+                branch:                "fork".to_string(),
+                index:                 0,
             }),
             "parallel.branch.started"
         );

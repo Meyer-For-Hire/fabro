@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::ExecOutputTail;
-use crate::{CommandTermination, PullRequestLink};
+use crate::{CommandTermination, PullRequestLink, StageId};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct InterviewOption {
@@ -23,7 +23,15 @@ pub struct ParallelStartedProps {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ParallelBranchStartedProps {
-    pub index: usize,
+    pub index:                 usize,
+    /// Graph visit of the branch target for this dispatch. The envelope
+    /// `stage_id` ordinal counts executions, so a resumed fan-out's branches
+    /// keep visit metadata even though their ordinals advanced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_visit:           Option<u32>,
+    /// Prior branch execution this one resumes from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed_from_stage_id: Option<StageId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -44,6 +44,7 @@ use crate::run_options::RunOptions;
 use crate::runtime_store::RunStoreHandle;
 use crate::sandbox_git_runtime::SandboxGitRuntime;
 use crate::services::RunLocations;
+use crate::stage_execution::StageExecutionTracker;
 
 type WfRunState = ExecutionState<Option<BilledModelUsage>>;
 type WfNodeResult = NodeResult<Option<BilledModelUsage>>;
@@ -70,6 +71,8 @@ pub(crate) struct WorkflowLifecycle {
     /// True when constructed with a checkpoint; cleared after first
     /// on_run_start. Gates context seeding on initial resume.
     is_initial_resume:     AtomicBool,
+    /// Run-scoped stage execution allocator shared with `RunServices`.
+    stage_executions:      StageExecutionTracker,
     // Config needed for context seeding
     graph:                 Arc<GvGraph>,
     run_id:                RunId,
@@ -97,6 +100,7 @@ impl WorkflowLifecycle {
         is_resume: bool,
         on_node: crate::OnNodeCallback,
         run_control: Option<Arc<RunControlState>>,
+        stage_executions: StageExecutionTracker,
     ) -> Self {
         let restarted_from: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
         let loop_restart_signature_limit = graph.loop_restart_signature_limit();
@@ -133,6 +137,7 @@ impl WorkflowLifecycle {
             goal:                  (!graph.goal().is_empty()).then(|| graph.goal().to_string()),
             checkpoint_git_result: Arc::clone(&checkpoint_git_result),
             circuit_breaker:       Arc::clone(&circuit_breaker),
+            stage_executions:      stage_executions.clone(),
         };
 
         let hook = HookLifecycle {
@@ -164,6 +169,7 @@ impl WorkflowLifecycle {
             start_node_id,
             checkpoint_git_result: Arc::clone(&checkpoint_git_result),
             last_git_sha,
+            stage_executions: stage_executions.clone(),
         };
 
         let artifact = ArtifactLifecycle::new(
@@ -173,6 +179,7 @@ impl WorkflowLifecycle {
             run_options.run_id,
             run_options.artifact_globs(),
             artifact_sink,
+            stage_executions.clone(),
         );
 
         Self {
@@ -189,6 +196,7 @@ impl WorkflowLifecycle {
             restarted_from,
             checkpoint_git_result,
             is_initial_resume: AtomicBool::new(is_resume),
+            stage_executions,
             graph,
             run_id: run_options.run_id,
             sandbox_work_dir: run_branch_sandbox_work_dir,
@@ -275,6 +283,15 @@ impl RunLifecycle<WorkflowGraph> for WorkflowLifecycle {
         if let Some(on_node) = &self.on_node {
             on_node(node.id());
         }
+        // Node boundary: clear the prior execution scope so the next
+        // observable attempt reserves a fresh ordinal. No reservation happens
+        // here — a hook block or process exit before any stage-scoped event
+        // must not consume an ordinal.
+        self.stage_executions.begin_node(node.id());
+        state.context.set(
+            context::keys::INTERNAL_STAGE_EXECUTION_ORDINAL,
+            serde_json::Value::Null,
+        );
         self.fidelity.before_node(node, state).await
     }
 
@@ -288,6 +305,16 @@ impl RunLifecycle<WorkflowGraph> for WorkflowLifecycle {
             NodeDecision::Continue => {}
             decision => return Ok(decision),
         }
+        // Reserve the stage execution once per handler invocation: the first
+        // attempt allocates the ordinal and automatic retries reuse it.
+        let node_id = ctx.node.id();
+        let execution = self
+            .stage_executions
+            .ensure(node_id, event::stage_visit(state, node_id));
+        state.context.set(
+            context::keys::INTERNAL_STAGE_EXECUTION_ORDINAL,
+            serde_json::json!(execution.ordinal),
+        );
         // Event emission
         self.event.before_attempt(ctx, state).await?;
         // Record epoch AFTER hook+event (engine.rs:968→1006)
@@ -410,6 +437,17 @@ impl RunLifecycle<WorkflowGraph> for WorkflowLifecycle {
         next_node_id: Option<&str>,
         state: &WfRunState,
     ) -> CoreResult<()> {
+        // A StageStart hook can skip before any attempt reserved an execution
+        // scope. Ensure one exists so Git metadata-snapshot events and the
+        // `checkpoint.completed` envelope attach to a concrete execution;
+        // an existing reservation from the attempt path is reused as-is.
+        let execution = self
+            .stage_executions
+            .ensure(node.id(), event::stage_visit(state, node.id()));
+        state.context.set(
+            context::keys::INTERNAL_STAGE_EXECUTION_ORDINAL,
+            serde_json::json!(execution.ordinal),
+        );
         self.git
             .on_checkpoint(node, result, next_node_id, state)
             .await?;

@@ -17,10 +17,10 @@ use crate::git::sanitize_ref_component;
 use crate::hook_context::set_hook_node;
 use crate::millis_u64;
 use crate::outcome::{FailureCategory, FailureDetail, Outcome, OutcomeExt, StageOutcome};
-use crate::run_dir::visit_from_context;
 use crate::sandbox_git::{
     GIT_REMOTE, checked_git_checkpoint, git_merge_ff_only, git_remove_worktree,
 };
+use crate::stage_execution::StageExecution;
 
 /// Fans out execution to multiple branches concurrently.
 /// Each branch gets an isolated context clone and runs independently.
@@ -161,6 +161,9 @@ impl Handler for ParallelHandler {
             branch_context:     Context,
             sandbox:            Arc<dyn Sandbox>,
             worktree_path:      Option<PathBuf>,
+            /// Child stage execution reserved through the run's shared
+            /// tracker, so a resumed fan-out gets fresh branch identities.
+            execution:          StageExecution,
         }
 
         let parallel_start = Instant::now();
@@ -264,6 +267,19 @@ impl Handler for ParallelHandler {
                 parallel_group_id.clone(),
                 u32::try_from(branch_index).unwrap_or(u32::MAX),
             );
+            // Reserve the child's stage execution through the shared tracker
+            // and seed the branch context with its explicit stage scope, so
+            // branch lifecycle events and nested handler events agree on the
+            // child's identity instead of inheriting the fork's.
+            let execution = services.run.stage_executions.reserve(&target_id, 1);
+            branch_context.set(
+                keys::CURRENT_NODE,
+                serde_json::Value::String(target_id.clone()),
+            );
+            branch_context.set(
+                keys::INTERNAL_STAGE_EXECUTION_ORDINAL,
+                serde_json::json!(execution.ordinal),
+            );
             branch_context.set(
                 keys::INTERNAL_PARALLEL_GROUP_ID,
                 serde_json::Value::String(parallel_group_id.to_string()),
@@ -294,12 +310,14 @@ impl Handler for ParallelHandler {
                 (&git_state, &base_sha)
             {
                 let branch_key = &target_id;
-                let visit = visit_from_context(&branch_context);
+                // `pass{N}` derives from the parent's execution ordinal so a
+                // resumed fan-out does not recreate the cancelled attempt's
+                // branch names.
                 let branch_name = format!(
                     "fabro/run/parallel/{}/{}/pass{}/{}",
                     gs.run_id,
                     sanitize_ref_component(&node.id),
-                    visit,
+                    parallel_stage_scope.visit,
                     sanitize_ref_component(branch_key),
                 );
 
@@ -345,6 +363,7 @@ impl Handler for ParallelHandler {
                 branch_context,
                 sandbox: branch_sandbox,
                 worktree_path,
+                execution,
             });
         }
 
@@ -376,7 +395,7 @@ impl Handler for ParallelHandler {
             let group_id = parallel_group_id.clone();
             let branch_scope = StageScope::for_parallel_branch(
                 setup.target_id.clone(),
-                1,
+                setup.execution.ordinal,
                 group_id.clone(),
                 setup.parallel_branch_id.clone(),
             );
@@ -389,10 +408,12 @@ impl Handler for ParallelHandler {
 
                 parent_run.emitter.emit_scoped(
                     &Event::ParallelBranchStarted {
-                        parallel_group_id:  group_id.clone(),
-                        parallel_branch_id: setup.parallel_branch_id.clone(),
-                        branch:             setup.target_id.clone(),
-                        index:              setup.branch_index,
+                        parallel_group_id:     group_id.clone(),
+                        parallel_branch_id:    setup.parallel_branch_id.clone(),
+                        branch:                setup.target_id.clone(),
+                        index:                 setup.branch_index,
+                        graph_visit:           Some(setup.execution.graph_visit),
+                        resumed_from_stage_id: setup.execution.resumed_from.clone(),
                     },
                     &branch_scope,
                 );

@@ -329,6 +329,7 @@ pub mod runtime_store;
 pub mod sandbox_git;
 pub(crate) mod sandbox_git_runtime;
 pub mod services;
+pub mod stage_execution;
 mod stage_scope;
 pub mod static_reference;
 pub mod steering_hub;

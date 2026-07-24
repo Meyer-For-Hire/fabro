@@ -25,6 +25,7 @@ use crate::sandbox_git::{
     checked_git_checkpoint, git_diff, list_diff_numstat, summarize_diff_numstat,
 };
 use crate::sandbox_git_runtime::SandboxGitRuntime;
+use crate::stage_execution::StageExecutionTracker;
 
 type WfRunState = ExecutionState<Option<BilledModelUsage>>;
 type WfNodeResult = NodeResult<Option<BilledModelUsage>>;
@@ -88,6 +89,8 @@ pub(crate) struct GitLifecycle {
     // Cross-lifecycle data (shared with EventLifecycle)
     pub checkpoint_git_result: Arc<Mutex<Option<GitCheckpointResult>>>,
     pub last_git_sha:          Arc<Mutex<Option<String>>>,
+    /// Run-scoped stage execution allocator shared with `RunServices`.
+    pub stage_executions:      StageExecutionTracker,
 }
 
 #[async_trait]
@@ -197,7 +200,7 @@ impl RunLifecycle<WorkflowGraph> for GitLifecycle {
             } else {
                 let phase = MetadataSnapshotPhase::Checkpoint;
                 let started = Instant::now();
-                let scope = stage_scope_for(state, node_id);
+                let scope = stage_scope_for(&self.stage_executions, state, node_id);
                 self.emit_metadata_snapshot_started(phase, &meta_branch, Some(&scope));
                 match self.run_store.state().await {
                     Ok(mut projection) => {
@@ -401,7 +404,7 @@ impl RunLifecycle<WorkflowGraph> for GitLifecycle {
                 let exec_output_tail = fabro_sandbox::default_redacted_output_tail(&e);
                 let error = e.to_string();
                 // Emit CheckpointFailed and return error
-                let scope = stage_scope_for(state, node_id);
+                let scope = stage_scope_for(&self.stage_executions, state, node_id);
                 self.emitter.emit_scoped(
                     &Event::CheckpointFailed {
                         node_id: node_id.to_string(),
@@ -788,6 +791,7 @@ mod tests {
         metadata_writer: Option<RunMetadataWriterHandle>,
     ) -> GitLifecycle {
         GitLifecycle {
+            stage_executions: StageExecutionTracker::default(),
             sandbox: Arc::new(fabro_agent::LocalSandbox::new(repo.to_path_buf())),
             emitter,
             run_id: fixtures::RUN_1,
@@ -1262,6 +1266,7 @@ mod tests {
             Arc::new(SandboxGitRuntime::new()),
             Arc::clone(&lifecycle.metadata_runtime),
             lifecycle.metadata_writer.clone(),
+            crate::stage_execution::StageExecutionTracker::default(),
         );
         let conclusion = Conclusion {
             timestamp:            chrono::Utc::now(),

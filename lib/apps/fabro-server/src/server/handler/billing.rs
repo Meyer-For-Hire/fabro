@@ -58,6 +58,8 @@ async fn list_run_stages(
                 stage.started_at,
                 handler,
                 stage.provider_used.clone(),
+                stage.graph_visit,
+                stage.resumed_from_stage_id.as_ref(),
             )
         })
         .collect::<Vec<_>>();

@@ -295,12 +295,16 @@ fn event_body_from_event(event: &Event) -> EventBody {
             handler_type,
             attempt,
             max_attempts,
+            graph_visit,
+            resumed_from_stage_id,
             ..
         } => EventBody::StageStarted(fabro_types::StageStartedProps {
-            index:        *index,
+            index: *index,
             handler_type: handler_type.clone(),
-            attempt:      *attempt,
+            attempt: *attempt,
             max_attempts: *max_attempts,
+            graph_visit: *graph_visit,
+            resumed_from_stage_id: resumed_from_stage_id.clone(),
         }),
         Event::StageCompleted {
             index,
@@ -378,11 +382,16 @@ fn event_body_from_event(event: &Event) -> EventBody {
             branch_count: *branch_count,
             join_policy:  join_policy.clone(),
         }),
-        Event::ParallelBranchStarted { index, .. } => {
-            EventBody::ParallelBranchStarted(fabro_types::ParallelBranchStartedProps {
-                index: *index,
-            })
-        }
+        Event::ParallelBranchStarted {
+            index,
+            graph_visit,
+            resumed_from_stage_id,
+            ..
+        } => EventBody::ParallelBranchStarted(fabro_types::ParallelBranchStartedProps {
+            index: *index,
+            graph_visit: *graph_visit,
+            resumed_from_stage_id: resumed_from_stage_id.clone(),
+        }),
         Event::ParallelBranchCompleted {
             index,
             duration_ms,
@@ -480,6 +489,8 @@ fn event_body_from_event(event: &Event) -> EventBody {
             node_visits,
             diff,
             diff_summary,
+            graph_visit,
+            resumed_from_stage_id,
             ..
         } => EventBody::CheckpointCompleted(fabro_types::CheckpointCompletedProps {
             status: status.clone(),
@@ -495,6 +506,8 @@ fn event_body_from_event(event: &Event) -> EventBody {
             node_visits: node_visits.clone(),
             diff: diff.clone(),
             diff_summary: *diff_summary,
+            graph_visit: *graph_visit,
+            resumed_from_stage_id: resumed_from_stage_id.clone(),
         }),
         Event::CheckpointFailed {
             error,
@@ -1693,12 +1706,14 @@ mod tests {
         let stored = to_run_event_at(
             &fixtures::RUN_1,
             &Event::StageStarted {
-                node_id:      "review".to_string(),
-                name:         "review".to_string(),
-                index:        1,
-                handler_type: "agent".to_string(),
-                attempt:      1,
-                max_attempts: 1,
+                graph_visit:           None,
+                resumed_from_stage_id: None,
+                node_id:               "review".to_string(),
+                name:                  "review".to_string(),
+                index:                 1,
+                handler_type:          "agent".to_string(),
+                attempt:               1,
+                max_attempts:          1,
             },
             Utc::now(),
             Some(&StageScope {
@@ -1730,10 +1745,12 @@ mod tests {
     #[test]
     fn parallel_branch_started_populates_group_and_branch_ids() {
         let stored = to_run_event(&fixtures::RUN_1, &Event::ParallelBranchStarted {
-            parallel_group_id:  StageId::new("fanout", 2),
-            parallel_branch_id: ParallelBranchId::new(StageId::new("fanout", 2), 1),
-            branch:             "review".to_string(),
-            index:              1,
+            graph_visit:           None,
+            resumed_from_stage_id: None,
+            parallel_group_id:     StageId::new("fanout", 2),
+            parallel_branch_id:    ParallelBranchId::new(StageId::new("fanout", 2), 1),
+            branch:                "review".to_string(),
+            index:                 1,
         });
         assert_eq!(stored.parallel_group_id, Some(StageId::new("fanout", 2)));
         assert_eq!(

@@ -5,14 +5,25 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::ExecOutputTail;
-use crate::{BilledModelUsage, DiffSummary, FailureDetail, Outcome, StageOutcome, StageTiming};
+use crate::{
+    BilledModelUsage, DiffSummary, FailureDetail, Outcome, StageId, StageOutcome, StageTiming,
+};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StageStartedProps {
-    pub index:        usize,
-    pub handler_type: String,
-    pub attempt:      usize,
-    pub max_attempts: usize,
+    pub index:                 usize,
+    pub handler_type:          String,
+    pub attempt:               usize,
+    pub max_attempts:          usize,
+    /// Graph visit that produced this stage execution. The envelope
+    /// `stage_id` ordinal counts executions, which diverges from the graph
+    /// visit when a cancelled or crashed invocation is reexecuted after
+    /// resume. Absent on events written before stage execution identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_visit:           Option<u32>,
+    /// Prior execution this one resumes from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed_from_stage_id: Option<StageId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -123,6 +134,12 @@ pub struct CheckpointCompletedProps {
     pub diff: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff_summary: Option<DiffSummary>,
+    /// Graph visit of the checkpointed stage execution; used when this
+    /// checkpoint is the event that first materializes a skipped stage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_visit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed_from_stage_id: Option<StageId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -22,6 +22,7 @@ use crate::run_metadata::{RunMetadataRuntime, RunMetadataWriterHandle};
 use crate::runtime_store::RunStoreHandle;
 use crate::sandbox_git::GitState;
 use crate::sandbox_git_runtime::SandboxGitRuntime;
+use crate::stage_execution::StageExecutionTracker;
 use crate::workflow_bundle::WorkflowBundle;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -107,6 +108,9 @@ pub struct RunServices {
     pub(crate) metadata_runtime:  Arc<RunMetadataRuntime>,
     pub(crate) metadata_writer:   Option<RunMetadataWriterHandle>,
     pub(crate) interview_blocker: Arc<RunInterviewBlocker>,
+    /// Run-scoped stage execution allocator, shared between the core
+    /// lifecycle and direct-dispatch handlers such as parallel branches.
+    pub(crate) stage_executions:  StageExecutionTracker,
 }
 
 impl RunServices {
@@ -125,6 +129,7 @@ impl RunServices {
         sandbox_git: Arc<SandboxGitRuntime>,
         metadata_runtime: Arc<RunMetadataRuntime>,
         metadata_writer: Option<RunMetadataWriterHandle>,
+        stage_executions: StageExecutionTracker,
     ) -> Arc<Self> {
         Arc::new(Self {
             run_store,
@@ -141,6 +146,7 @@ impl RunServices {
             metadata_runtime,
             metadata_writer,
             interview_blocker: Arc::new(RunInterviewBlocker::new()),
+            stage_executions,
         })
     }
 
@@ -340,6 +346,7 @@ impl EngineServices {
                 Arc::new(SandboxGitRuntime::new()),
                 Arc::new(RunMetadataRuntime::new()),
                 None,
+                StageExecutionTracker::default(),
             ),
             registry:        Arc::new(HandlerRegistry::new(Box::new(start::StartHandler))),
             interviewer:     Arc::new(fabro_interview::AutoApproveInterviewer::engine()),

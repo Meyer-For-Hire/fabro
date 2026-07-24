@@ -299,6 +299,8 @@ mod tests {
         .await
         .unwrap();
         event::append_event(&source_store, &source_run_id, &Event::CheckpointCompleted {
+            graph_visit: None,
+            resumed_from_stage_id: None,
             node_id: "work".to_string(),
             status: "succeeded".to_string(),
             current_node: "work".to_string(),

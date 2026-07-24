@@ -1,11 +1,28 @@
 use fabro_types::{ParallelBranchId, StageId};
 
-use crate::context::{Context as WfContext, WorkflowContext};
+use crate::context::{Context as WfContext, WorkflowContext, keys};
 use crate::run_dir::visit_from_context;
+
+/// Read the stage execution ordinal seeded by the workflow lifecycle (or a
+/// parallel branch dispatch). `None` when the current node has not reserved an
+/// execution yet — direct-handler call sites (tests, etc.) that skip the full
+/// lifecycle fall back to the graph visit, which equals the ordinal for a
+/// first execution.
+fn execution_ordinal_from_context(context: &WfContext) -> Option<u32> {
+    context
+        .get(keys::INTERNAL_STAGE_EXECUTION_ORDINAL)
+        .and_then(|value| value.as_u64())
+        .map(|ordinal| u32::try_from(ordinal).unwrap_or(u32::MAX))
+}
 
 /// Stage-level scope threaded through event emission to populate
 /// `stage_id` / `parallel_group_id` / `parallel_branch_id` on events
 /// that happen inside a concrete stage execution.
+///
+/// `visit` is the 1-based stage execution ordinal — the numeric component of
+/// the external `StageId`. It matches the graph visit for a first execution
+/// and diverges when a cancelled or crashed invocation is reexecuted after
+/// resume.
 #[derive(Clone, Debug)]
 pub struct StageScope {
     pub node_id:            String,
@@ -15,13 +32,15 @@ pub struct StageScope {
 }
 
 impl StageScope {
-    /// Build a scope from the given node id, sourcing visit count and parallel
-    /// ids from the current context.
+    /// Build a scope from the given node id, sourcing the execution ordinal
+    /// and parallel ids from the current context.
     pub fn from_context(context: &WfContext, node_id: impl Into<String>) -> Self {
+        let visit = execution_ordinal_from_context(context)
+            .unwrap_or_else(|| u32::try_from(visit_from_context(context)).unwrap_or(u32::MAX));
         Self {
-            node_id:            node_id.into(),
-            visit:              u32::try_from(visit_from_context(context)).unwrap_or(u32::MAX),
-            parallel_group_id:  context.parallel_group_id(),
+            node_id: node_id.into(),
+            visit,
+            parallel_group_id: context.parallel_group_id(),
             parallel_branch_id: context.parallel_branch_id(),
         }
     }
@@ -40,11 +59,10 @@ impl StageScope {
     /// handler (`ParallelBranchStarted`, `ParallelBranchCompleted`, and the
     /// pre-dispatch `GitCommit` for the branch worktree).
     ///
-    /// `target_visit` is the visit count of `target_node_id` for this
-    /// particular branch dispatch. The parallel handler currently passes
-    /// `1` because branches haven't been re-entered yet at the point of
-    /// scope construction; a future change that loops a parallel node
-    /// must pass the actual visit so envelope `stage_id`s stay accurate.
+    /// `target_visit` is the branch target's stage execution ordinal for this
+    /// particular dispatch, reserved through the run's shared
+    /// `StageExecutionTracker` so a resumed fan-out gets a fresh child
+    /// identity instead of overwriting the cancelled attempt's.
     #[must_use]
     pub fn for_parallel_branch(
         target_node_id: impl Into<String>,

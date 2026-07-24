@@ -91,6 +91,7 @@ pub async fn execute(init: Initialized) -> Executed {
         checkpoint.is_some(),
         on_node,
         run_control,
+        engine.run.stage_executions.clone(),
     );
 
     if let Some(ref cp) = checkpoint {

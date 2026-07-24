@@ -224,35 +224,46 @@ impl RunProjectionReducer for RunProjection {
             }
             EventBody::CheckpointCompleted(props) => {
                 let checkpoint = checkpoint_from_props(props, ts);
-                if let Some(node_id) = stored.node_id.as_deref() {
-                    let visit = checkpoint
-                        .node_visits
-                        .get(node_id)
-                        .and_then(|visit| u32::try_from(*visit).ok())
-                        .unwrap_or(1);
-                    if let Some(diff) = props.diff.clone() {
-                        self.stage_entry(node_id, visit, first_event_seq(event.seq))
-                            .diff = Some(diff);
+                if let Some(stage_id) = stored.stage_id.clone() {
+                    // Envelope-first: the diff and any skipped-stage synthesis
+                    // attach to the exact execution recorded on the event.
+                    // Historical `node_outcomes` must not create or collide
+                    // with a newer execution ordinal.
+                    apply_checkpoint_to_stage(self, &stage_id, props, &checkpoint, event.seq, ts);
+                } else {
+                    // Legacy fallback for events without a stored stage id:
+                    // resolve the visit from the checkpointed `node_visits`
+                    // and synthesize skipped stages from historical outcomes.
+                    if let Some(node_id) = stored.node_id.as_deref() {
+                        let visit = checkpoint
+                            .node_visits
+                            .get(node_id)
+                            .and_then(|visit| u32::try_from(*visit).ok())
+                            .unwrap_or(1);
+                        if let Some(diff) = props.diff.clone() {
+                            self.stage_entry(node_id, visit, first_event_seq(event.seq))
+                                .diff = Some(diff);
+                        }
                     }
-                }
-                for (node_id, outcome) in &checkpoint.node_outcomes {
-                    if outcome.status != StageOutcome::Skipped {
-                        continue;
+                    for (node_id, outcome) in &checkpoint.node_outcomes {
+                        if outcome.status != StageOutcome::Skipped {
+                            continue;
+                        }
+                        let visit = checkpoint
+                            .node_visits
+                            .get(node_id)
+                            .and_then(|visit| u32::try_from(*visit).ok())
+                            .unwrap_or(1);
+                        if self
+                            .stage(&fabro_types::StageId::new(node_id, visit))
+                            .is_some()
+                        {
+                            continue;
+                        }
+                        let stage = self.stage_entry(node_id, visit, first_event_seq(event.seq));
+                        stage.completion = Some(stage_completion_from_outcome(outcome, ts));
+                        stage.state = StageState::Skipped;
                     }
-                    let visit = checkpoint
-                        .node_visits
-                        .get(node_id)
-                        .and_then(|visit| u32::try_from(*visit).ok())
-                        .unwrap_or(1);
-                    if self
-                        .stage(&fabro_types::StageId::new(node_id, visit))
-                        .is_some()
-                    {
-                        continue;
-                    }
-                    let stage = self.stage_entry(node_id, visit, first_event_seq(event.seq));
-                    stage.completion = Some(stage_completion_from_outcome(outcome, ts));
-                    stage.state = StageState::Skipped;
                 }
                 self.checkpoints.push(CheckpointRecord {
                     seq: event.seq,
@@ -337,6 +348,11 @@ impl RunProjectionReducer for RunProjection {
                 let Some(stage_id) = stored.stage_id.as_ref() else {
                     return Ok(());
                 };
+                // A `stage.started` for a new `StageId` creates a new
+                // projection, so an older execution's terminal projection
+                // stays immutable. `begin_attempt` on an existing entry
+                // remains the compatibility path for automatic retries and
+                // legacy histories that repeat one `StageId`.
                 let stage = self.stage_entry(
                     stage_id.node_id(),
                     stage_id.visit(),
@@ -346,6 +362,14 @@ impl RunProjectionReducer for RunProjection {
                     ts,
                     StageHandler::from_handler_type(Some(&props.handler_type)),
                 );
+                if props.graph_visit.is_some() {
+                    stage.graph_visit = props.graph_visit;
+                }
+                if props.resumed_from_stage_id.is_some() {
+                    stage
+                        .resumed_from_stage_id
+                        .clone_from(&props.resumed_from_stage_id);
+                }
             }
             EventBody::StageRetrying(_) => {
                 let Some(stage) = stage_at_stored_or_current_visit(self, stored, event.seq) else {
@@ -537,7 +561,7 @@ impl RunProjectionReducer for RunProjection {
                 };
                 stage.parallel_results = Some(parallel_results);
             }
-            EventBody::ParallelBranchStarted(_) => {
+            EventBody::ParallelBranchStarted(props) => {
                 // Branches bypass the engine's StageStarted/StageCompleted
                 // lifecycle. Seed started_at so the branch stage drives a live
                 // wall-clock timer while it runs (the entry is created Running).
@@ -546,6 +570,14 @@ impl RunProjectionReducer for RunProjection {
                 };
                 if stage.started_at.is_none() {
                     stage.started_at = Some(ts);
+                }
+                if props.graph_visit.is_some() {
+                    stage.graph_visit = props.graph_visit;
+                }
+                if props.resumed_from_stage_id.is_some() {
+                    stage
+                        .resumed_from_stage_id
+                        .clone_from(&props.resumed_from_stage_id);
                 }
                 stage.state = StageState::Running;
             }
@@ -949,6 +981,50 @@ fn stage_at_stored_or_current_visit<'a>(
         return Some(stage_at_stored_stage_id(state, stage_id, seq));
     }
     stage_at_current_visit(state, stored, seq)
+}
+
+/// Apply a `checkpoint.completed` event to the exact execution named by the
+/// envelope `StageId`: attach the checkpoint diff, and for a skipped
+/// checkpoint finalize that execution as `Skipped`. A synthetic skipped
+/// projection is created only for a first-attempt skip that never
+/// materialized a stage; an existing non-terminal (e.g. `Retrying`)
+/// projection keeps its identity and becomes terminal, while an older
+/// terminal execution stays immutable.
+fn apply_checkpoint_to_stage(
+    state: &mut RunProjection,
+    stage_id: &StageId,
+    props: &CheckpointCompletedProps,
+    checkpoint: &Checkpoint,
+    seq: u32,
+    ts: DateTime<Utc>,
+) {
+    let node_id = stage_id.node_id();
+    let skipped_completion = checkpoint
+        .node_outcomes
+        .get(node_id)
+        .filter(|outcome| outcome.status == StageOutcome::Skipped)
+        .map(|outcome| stage_completion_from_outcome(outcome, ts));
+    if props.diff.is_none() && skipped_completion.is_none() {
+        return;
+    }
+
+    let is_new = state.stage(stage_id).is_none();
+    let stage = state.stage_entry(node_id, stage_id.visit(), first_event_seq(seq));
+    if is_new {
+        stage.graph_visit = props.graph_visit;
+        stage
+            .resumed_from_stage_id
+            .clone_from(&props.resumed_from_stage_id);
+    }
+    if let Some(diff) = props.diff.clone() {
+        stage.diff = Some(diff);
+    }
+    if let Some(completion) = skipped_completion {
+        if !stage.state.is_terminal() {
+            stage.completion = Some(completion);
+            stage.state = StageState::Skipped;
+        }
+    }
 }
 
 fn stage_at_completed_visit<'a>(
@@ -2012,10 +2088,12 @@ mod tests {
             .apply_event(&test_stage_event(
                 3,
                 EventBody::StageStarted(StageStartedProps {
-                    index:        0,
-                    handler_type: "agent".to_string(),
-                    attempt:      1,
-                    max_attempts: 1,
+                    graph_visit:           None,
+                    resumed_from_stage_id: None,
+                    index:                 0,
+                    handler_type:          "agent".to_string(),
+                    attempt:               1,
+                    max_attempts:          1,
                 }),
                 stage_id.clone(),
             ))
@@ -2034,10 +2112,12 @@ mod tests {
             .apply_event(&test_stage_event(
                 3,
                 EventBody::StageStarted(StageStartedProps {
-                    index:        0,
-                    handler_type: "agent".to_string(),
-                    attempt:      1,
-                    max_attempts: 1,
+                    graph_visit:           None,
+                    resumed_from_stage_id: None,
+                    index:                 0,
+                    handler_type:          "agent".to_string(),
+                    attempt:               1,
+                    max_attempts:          1,
                 }),
                 stage_id.clone(),
             ))
@@ -2077,7 +2157,11 @@ mod tests {
             .apply_event(&test_stage_event_at(
                 3,
                 "2026-04-07T12:00:00Z",
-                EventBody::ParallelBranchStarted(ParallelBranchStartedProps { index: 0 }),
+                EventBody::ParallelBranchStarted(ParallelBranchStartedProps {
+                    index:                 0,
+                    graph_visit:           None,
+                    resumed_from_stage_id: None,
+                }),
                 branch.clone(),
             ))
             .unwrap();
@@ -2115,7 +2199,11 @@ mod tests {
         state
             .apply_event(&test_stage_event(
                 3,
-                EventBody::ParallelBranchStarted(ParallelBranchStartedProps { index: 0 }),
+                EventBody::ParallelBranchStarted(ParallelBranchStartedProps {
+                    index:                 0,
+                    graph_visit:           None,
+                    resumed_from_stage_id: None,
+                }),
                 branch.clone(),
             ))
             .unwrap();
@@ -2148,10 +2236,12 @@ mod tests {
             .apply_event(&test_stage_event(
                 3,
                 EventBody::StageStarted(StageStartedProps {
-                    index:        0,
-                    handler_type: "agent".to_string(),
-                    attempt:      1,
-                    max_attempts: 1,
+                    graph_visit:           None,
+                    resumed_from_stage_id: None,
+                    index:                 0,
+                    handler_type:          "agent".to_string(),
+                    attempt:               1,
+                    max_attempts:          1,
                 }),
                 stage_id.clone(),
             ))
@@ -2404,10 +2494,12 @@ mod tests {
             .apply_event(&test_stage_event(
                 2,
                 EventBody::StageStarted(StageStartedProps {
-                    index:        0,
-                    handler_type: "agent".to_string(),
-                    attempt:      1,
-                    max_attempts: 1,
+                    graph_visit:           None,
+                    resumed_from_stage_id: None,
+                    index:                 0,
+                    handler_type:          "agent".to_string(),
+                    attempt:               1,
+                    max_attempts:          1,
                 }),
                 stage_id.clone(),
             ))
@@ -2575,6 +2667,8 @@ mod tests {
             .apply_event(&test_event(
                 5,
                 EventBody::CheckpointCompleted(CheckpointCompletedProps {
+                    graph_visit: None,
+                    resumed_from_stage_id: None,
                     status: "running".to_string(),
                     current_node: "next".to_string(),
                     completed_nodes: vec!["skip_me".to_string()],
@@ -3831,10 +3925,12 @@ mod tests {
 
     fn started_props() -> StageStartedProps {
         StageStartedProps {
-            index:        0,
-            handler_type: "agent".to_string(),
-            attempt:      1,
-            max_attempts: 3,
+            graph_visit:           None,
+            resumed_from_stage_id: None,
+            index:                 0,
+            handler_type:          "agent".to_string(),
+            attempt:               1,
+            max_attempts:          3,
         }
     }
 
@@ -4332,6 +4428,418 @@ mod tests {
             stage.timing,
             Some(fabro_types::StageTiming::wall_only(5_000))
         );
+    }
+
+    #[test]
+    fn stage_started_records_execution_identity_metadata() {
+        let mut state = running_projection();
+        let stage_id = StageId::new("work", 2);
+
+        state
+            .apply_event(&test_stage_event(
+                4,
+                EventBody::StageStarted(StageStartedProps {
+                    graph_visit: Some(1),
+                    resumed_from_stage_id: Some(StageId::new("work", 1)),
+                    ..started_props()
+                }),
+                stage_id.clone(),
+            ))
+            .unwrap();
+
+        let stage = state.stage(&stage_id).unwrap();
+        assert_eq!(stage.graph_visit, Some(1));
+        assert_eq!(stage.resumed_from_stage_id, Some(StageId::new("work", 1)));
+    }
+
+    #[test]
+    fn retry_stage_started_preserves_execution_identity_metadata() {
+        let mut state = running_projection();
+        let stage_id = StageId::new("work", 2);
+
+        state
+            .apply_event(&test_stage_event(
+                4,
+                EventBody::StageStarted(StageStartedProps {
+                    graph_visit: Some(1),
+                    resumed_from_stage_id: Some(StageId::new("work", 1)),
+                    ..started_props()
+                }),
+                stage_id.clone(),
+            ))
+            .unwrap();
+        // A legacy-shaped retry event for the same StageId omits the identity
+        // fields; the projection keeps the first attempt's metadata.
+        state
+            .apply_event(&test_stage_event(
+                5,
+                EventBody::StageStarted(StageStartedProps {
+                    attempt: 2,
+                    ..started_props()
+                }),
+                stage_id.clone(),
+            ))
+            .unwrap();
+
+        let stage = state.stage(&stage_id).unwrap();
+        assert_eq!(stage.graph_visit, Some(1));
+        assert_eq!(stage.resumed_from_stage_id, Some(StageId::new("work", 1)));
+    }
+
+    #[test]
+    fn cancelled_execution_stays_immutable_when_resumed_execution_starts() {
+        let mut state = running_projection();
+        let first = StageId::new("work", 1);
+        let second = StageId::new("work", 2);
+
+        state
+            .apply_event(&test_stage_event_at(
+                4,
+                "2026-04-07T12:00:00Z",
+                EventBody::StageStarted(started_props()),
+                first.clone(),
+            ))
+            .unwrap();
+        state
+            .apply_event(&test_raw_event_at(
+                5,
+                "2026-04-07T12:00:05Z",
+                "run.failed",
+                &serde_json::to_value(run_failed_props(FailureReason::Cancelled)).unwrap(),
+                None,
+            ))
+            .unwrap();
+        state
+            .apply_event(&test_raw_event(
+                6,
+                "run.start_requested",
+                &json!({ "resume": true }),
+                None,
+            ))
+            .unwrap();
+        state
+            .apply_event(&test_raw_event(
+                7,
+                "run.runnable",
+                &json!({ "source": "start_requested" }),
+                None,
+            ))
+            .unwrap();
+        state
+            .apply_event(&test_raw_event(8, "run.starting", &json!({}), None))
+            .unwrap();
+        state
+            .apply_event(&test_raw_event(9, "run.running", &json!({}), None))
+            .unwrap();
+        state
+            .apply_event(&test_stage_event(
+                10,
+                EventBody::StageStarted(StageStartedProps {
+                    graph_visit: Some(1),
+                    resumed_from_stage_id: Some(first.clone()),
+                    ..started_props()
+                }),
+                second.clone(),
+            ))
+            .unwrap();
+
+        // The cancelled execution keeps its terminal projection untouched...
+        let cancelled = state.stage(&first).unwrap();
+        assert_eq!(cancelled.state, StageState::Cancelled);
+        assert_eq!(
+            cancelled.timing,
+            Some(fabro_types::StageTiming::wall_only(5_000))
+        );
+        // ...while the reexecution runs as a distinct stage linked back to it.
+        let resumed = state.stage(&second).unwrap();
+        assert_eq!(resumed.state, StageState::Running);
+        assert_eq!(resumed.graph_visit, Some(1));
+        assert_eq!(resumed.resumed_from_stage_id, Some(first));
+    }
+
+    #[test]
+    fn run_failed_after_resume_preserves_earlier_terminal_executions() {
+        let mut state = running_projection();
+        let done = StageId::new("verify", 1);
+        let active = StageId::new("work", 2);
+
+        state
+            .apply_event(&test_stage_event_at(
+                4,
+                "2026-04-07T12:00:00Z",
+                EventBody::StageStarted(started_props()),
+                done.clone(),
+            ))
+            .unwrap();
+        state
+            .apply_event(&test_stage_event_at(
+                5,
+                "2026-04-07T12:00:03Z",
+                EventBody::StageCompleted(completed_props(3_000, StageOutcome::Succeeded)),
+                done.clone(),
+            ))
+            .unwrap();
+        state
+            .apply_event(&test_stage_event_at(
+                6,
+                "2026-04-07T12:00:04Z",
+                EventBody::StageStarted(started_props()),
+                active.clone(),
+            ))
+            .unwrap();
+        state
+            .apply_event(&test_raw_event_at(
+                7,
+                "2026-04-07T12:00:09Z",
+                "run.failed",
+                &serde_json::to_value(run_failed_props(FailureReason::Cancelled)).unwrap(),
+                None,
+            ))
+            .unwrap();
+
+        let terminal = state.stage(&done).unwrap();
+        assert_eq!(terminal.state, StageState::Succeeded);
+        assert_eq!(
+            terminal.timing,
+            Some(fabro_types::StageTiming::wall_only(3_000))
+        );
+        assert_eq!(state.stage(&active).unwrap().state, StageState::Cancelled);
+    }
+
+    #[test]
+    fn checkpoint_completed_targets_envelope_stage_id_after_ordinal_divergence() {
+        let mut state = running_projection();
+        let execution = StageId::new("work", 2);
+
+        state
+            .apply_event(&test_stage_event(
+                4,
+                EventBody::StageStarted(StageStartedProps {
+                    graph_visit: Some(1),
+                    ..started_props()
+                }),
+                execution.clone(),
+            ))
+            .unwrap();
+        // Checkpointed graph state still says visit 1 for `work`, and carries
+        // a historical skipped outcome for another node. Neither may create
+        // or mutate a projection at a stale ordinal.
+        state
+            .apply_event(&test_stage_event(
+                5,
+                EventBody::CheckpointCompleted(CheckpointCompletedProps {
+                    graph_visit: Some(1),
+                    resumed_from_stage_id: None,
+                    status: "success".to_string(),
+                    current_node: "work".to_string(),
+                    completed_nodes: vec!["old_skip".to_string(), "work".to_string()],
+                    node_retries: BTreeMap::new(),
+                    context_values: BTreeMap::new(),
+                    node_outcomes: BTreeMap::from([(
+                        "old_skip".to_string(),
+                        Outcome::skipped("historical skip"),
+                    )]),
+                    next_node_id: None,
+                    git_commit_sha: None,
+                    loop_failure_signatures: BTreeMap::new(),
+                    restart_failure_signatures: BTreeMap::new(),
+                    node_visits: BTreeMap::from([
+                        ("work".to_string(), 1usize),
+                        ("old_skip".to_string(), 1usize),
+                    ]),
+                    diff: Some("diff for work@2".to_string()),
+                    diff_summary: None,
+                }),
+                execution.clone(),
+            ))
+            .unwrap();
+
+        assert_eq!(
+            state.stage(&execution).unwrap().diff.as_deref(),
+            Some("diff for work@2")
+        );
+        assert!(state.stage(&StageId::new("work", 1)).is_none());
+        assert!(state.stage(&StageId::new("old_skip", 1)).is_none());
+    }
+
+    #[test]
+    fn skipped_checkpoint_with_stage_id_creates_synthetic_execution() {
+        let mut state = running_projection();
+        let execution = StageId::new("gate", 3);
+
+        // First-attempt StageStart-hook skip: no stage.started was emitted,
+        // the checkpoint is the first stage-scoped event for this execution.
+        state
+            .apply_event(&test_stage_event(
+                4,
+                EventBody::CheckpointCompleted(CheckpointCompletedProps {
+                    graph_visit: Some(2),
+                    resumed_from_stage_id: Some(StageId::new("gate", 2)),
+                    status: "skipped".to_string(),
+                    current_node: "gate".to_string(),
+                    completed_nodes: vec!["gate".to_string()],
+                    node_retries: BTreeMap::new(),
+                    context_values: BTreeMap::new(),
+                    node_outcomes: BTreeMap::from([(
+                        "gate".to_string(),
+                        Outcome::skipped("skipped by StageStart hook"),
+                    )]),
+                    next_node_id: None,
+                    git_commit_sha: None,
+                    loop_failure_signatures: BTreeMap::new(),
+                    restart_failure_signatures: BTreeMap::new(),
+                    node_visits: BTreeMap::from([("gate".to_string(), 2usize)]),
+                    diff: None,
+                    diff_summary: None,
+                }),
+                execution.clone(),
+            ))
+            .unwrap();
+
+        let stage = state.stage(&execution).unwrap();
+        assert_eq!(stage.state, StageState::Skipped);
+        assert_eq!(stage.graph_visit, Some(2));
+        assert_eq!(stage.resumed_from_stage_id, Some(StageId::new("gate", 2)));
+        assert_eq!(
+            stage.completion.as_ref().unwrap().notes.as_deref(),
+            Some("skipped by StageStart hook")
+        );
+    }
+
+    #[test]
+    fn skipped_checkpoint_finalizes_existing_retrying_execution() {
+        let mut state = running_projection();
+        let execution = StageId::new("gate", 1);
+
+        state
+            .apply_event(&test_stage_event(
+                4,
+                EventBody::StageStarted(started_props()),
+                execution.clone(),
+            ))
+            .unwrap();
+        state
+            .apply_event(&test_stage_event(
+                5,
+                EventBody::StageRetrying(StageRetryingProps {
+                    index:        0,
+                    attempt:      2,
+                    max_attempts: 3,
+                    delay_ms:     0,
+                }),
+                execution.clone(),
+            ))
+            .unwrap();
+        assert_eq!(state.stage(&execution).unwrap().state, StageState::Retrying);
+
+        // StageStart hook skipped the retry; the checkpoint finalizes the
+        // existing execution instead of allocating a new projection.
+        state
+            .apply_event(&test_stage_event(
+                6,
+                EventBody::CheckpointCompleted(CheckpointCompletedProps {
+                    graph_visit: Some(1),
+                    resumed_from_stage_id: None,
+                    status: "skipped".to_string(),
+                    current_node: "gate".to_string(),
+                    completed_nodes: vec!["gate".to_string()],
+                    node_retries: BTreeMap::new(),
+                    context_values: BTreeMap::new(),
+                    node_outcomes: BTreeMap::from([(
+                        "gate".to_string(),
+                        Outcome::skipped("skipped on retry"),
+                    )]),
+                    next_node_id: None,
+                    git_commit_sha: None,
+                    loop_failure_signatures: BTreeMap::new(),
+                    restart_failure_signatures: BTreeMap::new(),
+                    node_visits: BTreeMap::from([("gate".to_string(), 1usize)]),
+                    diff: None,
+                    diff_summary: None,
+                }),
+                execution.clone(),
+            ))
+            .unwrap();
+
+        let stage = state.stage(&execution).unwrap();
+        assert_eq!(stage.state, StageState::Skipped);
+        assert_eq!(stage.first_event_seq, first_event_seq(4));
+        assert!(state.stage(&StageId::new("gate", 2)).is_none());
+    }
+
+    #[test]
+    fn skipped_checkpoint_never_reopens_an_older_terminal_execution() {
+        let mut state = running_projection();
+        let execution = StageId::new("gate", 1);
+
+        state
+            .apply_event(&test_stage_event(
+                4,
+                EventBody::StageStarted(started_props()),
+                execution.clone(),
+            ))
+            .unwrap();
+        state
+            .apply_event(&test_stage_event(
+                5,
+                EventBody::StageCompleted(completed_props(2_000, StageOutcome::Succeeded)),
+                execution.clone(),
+            ))
+            .unwrap();
+        state
+            .apply_event(&test_stage_event(
+                6,
+                EventBody::CheckpointCompleted(CheckpointCompletedProps {
+                    graph_visit: Some(1),
+                    resumed_from_stage_id: None,
+                    status: "skipped".to_string(),
+                    current_node: "gate".to_string(),
+                    completed_nodes: vec!["gate".to_string()],
+                    node_retries: BTreeMap::new(),
+                    context_values: BTreeMap::new(),
+                    node_outcomes: BTreeMap::from([(
+                        "gate".to_string(),
+                        Outcome::skipped("late skip"),
+                    )]),
+                    next_node_id: None,
+                    git_commit_sha: None,
+                    loop_failure_signatures: BTreeMap::new(),
+                    restart_failure_signatures: BTreeMap::new(),
+                    node_visits: BTreeMap::from([("gate".to_string(), 1usize)]),
+                    diff: None,
+                    diff_summary: None,
+                }),
+                execution.clone(),
+            ))
+            .unwrap();
+
+        let stage = state.stage(&execution).unwrap();
+        assert_eq!(stage.state, StageState::Succeeded);
+        assert_eq!(
+            stage.completion.as_ref().unwrap().outcome,
+            StageOutcome::Succeeded
+        );
+    }
+
+    #[test]
+    fn legacy_stage_started_payload_without_identity_fields_deserializes() {
+        let event = test_raw_event(
+            4,
+            "stage.started",
+            &json!({
+                "index": 0,
+                "handler_type": "agent",
+                "attempt": 1,
+                "max_attempts": 3
+            }),
+            Some("work"),
+        );
+
+        let EventBody::StageStarted(props) = &event.event.body else {
+            panic!("expected stage.started body");
+        };
+        assert_eq!(props.graph_visit, None);
+        assert_eq!(props.resumed_from_stage_id, None);
     }
 
     #[test]

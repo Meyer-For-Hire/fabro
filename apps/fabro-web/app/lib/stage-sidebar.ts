@@ -14,8 +14,17 @@ export interface Stage {
   handler: StageHandler;
   status: StageState;
   duration: string;
-  nodeId: string;
+  /** 1-based stage execution ordinal — the numeric component of `id`. */
   visit: number;
+  nodeId: string;
+  /**
+   * How many times workflow control entered this node. Differs from `visit`
+   * when a cancelled or crashed execution was reexecuted after resume; null
+   * for stages recorded before execution identity was tracked.
+   */
+  graphVisit: number | null;
+  /** StageId of the prior execution this stage resumes from, if any. */
+  resumedFromStageId: string | null;
   startedAt: string | null;
   providerUsed: StageModelUsage | null;
 }
@@ -85,6 +94,8 @@ export function mapRunStagesToSidebarStages(
       handler: stage.handler,
       nodeId: stage.node_id,
       visit: stage.visit,
+      graphVisit: stage.graph_visit ?? null,
+      resumedFromStageId: stage.resumed_from_stage_id ?? null,
       status: stage.status,
       duration: stage.wall_time_ms != null
         ? formatDurationMs(stage.wall_time_ms)

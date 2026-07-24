@@ -33,6 +33,7 @@ use crate::sandbox_git_runtime::SandboxGitRuntime;
 use crate::services::{
     EngineServices, FabroRunToolServices, RunLocations, RunServices, WorkflowToolEnvProvider,
 };
+use crate::stage_execution::StageExecutionTracker;
 use crate::steering_hub::SteeringHub;
 
 type BuiltSandboxEnv = (HashMap<String, String>, Option<Arc<GitHubTokenSource>>);
@@ -619,6 +620,7 @@ pub async fn initialize(
         sandbox_git,
         metadata_runtime,
         metadata_writer,
+        StageExecutionTracker::seeded(options.stage_executions),
     );
     let engine = Arc::new(EngineServices {
         run: Arc::clone(&run_services),
@@ -825,6 +827,7 @@ mod tests {
         });
 
         let result = initialize(persisted, InitOptions {
+            stage_executions:  crate::stage_execution::StageExecutionSeed::default(),
             run_store:         {
                 let store = memory_store();
                 let inner = store.create_run(&test_run_id()).await.unwrap();
@@ -906,6 +909,7 @@ mod tests {
         let emitter = Arc::new(crate::event::Emitter::new(test_run_id()));
 
         let initialized = initialize(persisted, InitOptions {
+            stage_executions:  crate::stage_execution::StageExecutionSeed::default(),
             run_store:         {
                 let store = memory_store();
                 let inner = store.create_run(&test_run_id()).await.unwrap();
@@ -1131,6 +1135,7 @@ mod tests {
         let store = memory_store();
         let run_store = store.create_run(&test_run_id()).await.unwrap();
         let initialized = initialize(test_persisted(graph, source, &run_dir), InitOptions {
+            stage_executions:  crate::stage_execution::StageExecutionSeed::default(),
             run_store:         run_store.into(),
             dry_run:           false,
             emitter:           emitter.clone(),
@@ -1226,6 +1231,7 @@ mod tests {
         store_logger.register(&emitter);
 
         let initialized = initialize(persisted, InitOptions {
+            stage_executions:  crate::stage_execution::StageExecutionSeed::default(),
             run_store:         run_store.into(),
             dry_run:           false,
             emitter:           emitter.clone(),
@@ -1364,6 +1370,7 @@ mod tests {
 
         let emitter = Arc::new(crate::event::Emitter::new(test_run_id()));
         let result = initialize(persisted, InitOptions {
+            stage_executions: crate::stage_execution::StageExecutionSeed::default(),
             run_store: {
                 let store = memory_store();
                 let inner = store.create_run(&test_run_id()).await.unwrap();

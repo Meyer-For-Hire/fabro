@@ -1388,6 +1388,8 @@ mod runs {
                 None,
                 StageHandler::Command,
                 None,
+                None,
+                None,
             ),
             run_stage_from_stage_id(
                 &StageId::new("propose-changes", 1),
@@ -1396,6 +1398,8 @@ mod runs {
                 Some(154_000),
                 None,
                 StageHandler::Agent,
+                None,
+                None,
                 None,
             ),
             run_stage_from_stage_id(
@@ -1406,6 +1410,8 @@ mod runs {
                 None,
                 StageHandler::Agent,
                 None,
+                None,
+                None,
             ),
             run_stage_from_stage_id(
                 &StageId::new("apply-changes", 1),
@@ -1415,6 +1421,8 @@ mod runs {
                 None,
                 StageHandler::Command,
                 None,
+                None,
+                None,
             ),
             run_stage_from_stage_id(
                 &StageId::new("apply-changes", 2),
@@ -1423,6 +1431,8 @@ mod runs {
                 None,
                 None,
                 StageHandler::Command,
+                None,
+                None,
                 None,
             ),
         ]

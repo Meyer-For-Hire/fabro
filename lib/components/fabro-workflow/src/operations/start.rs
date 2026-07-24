@@ -48,6 +48,7 @@ use crate::run_options::{GitCheckpointOptions, LifecycleOptions, RunOptions, Set
 use crate::run_status::{FailureReason, RunStatus};
 use crate::runtime_store::RunStoreHandle;
 use crate::services::FabroRunToolServices;
+use crate::stage_execution::StageExecutionSeed;
 use crate::steering_hub::SteeringHub;
 #[cfg(feature = "test-support")]
 use crate::test_support as workflow_test_support;
@@ -169,12 +170,19 @@ pub async fn start(run_dir: &Path, services: StartServices) -> Result<Started, E
         .map_err(|err| Error::engine(err.to_string()))?;
     }
 
-    Box::pin(execute_persisted_run(run_dir, None, services)).await
+    Box::pin(execute_persisted_run(
+        run_dir,
+        None,
+        StageExecutionSeed::default(),
+        services,
+    ))
+    .await
 }
 
 pub(super) async fn execute_persisted_run(
     run_dir: &Path,
     checkpoint: Option<Checkpoint>,
+    stage_executions: StageExecutionSeed,
     services: StartServices,
 ) -> Result<Started, Error> {
     let cancel_token = services.cancel_token.clone();
@@ -261,7 +269,7 @@ pub(super) async fn execute_persisted_run(
         cancel_token,
     );
     let run_start = Instant::now();
-    let started = Box::pin(session.run(persisted, checkpoint)).await;
+    let started = Box::pin(session.run(persisted, checkpoint, stage_executions)).await;
 
     match started {
         Ok(started) => {
@@ -797,6 +805,7 @@ impl RunSession {
         self,
         persisted: Persisted,
         checkpoint: Option<Checkpoint>,
+        stage_executions: StageExecutionSeed,
     ) -> Result<Started, Error> {
         let on_node = self.on_node.clone();
 
@@ -879,6 +888,7 @@ impl RunSession {
             run_control: self.run_control,
             checkpoint,
             seed_context: self.seed_context,
+            stage_executions,
             fabro_run_tools: self.fabro_run_tools,
         };
         let mut initialized = Box::pin(pipeline::initialize(persisted, init_options)).await?;
@@ -2125,6 +2135,8 @@ reasoning = false
                 {
                     injected.store(true, Ordering::SeqCst);
                     emitter_for_injection.emit(&Event::CheckpointCompleted {
+                        graph_visit: None,
+                        resumed_from_stage_id: None,
                         node_id: "start".to_string(),
                         status: "succeeded".to_string(),
                         current_node: "start".to_string(),
@@ -2508,6 +2520,8 @@ reasoning = false
             &store.open_run(&fixtures::RUN_1).await.unwrap(),
             &services.run_id,
             &Event::CheckpointCompleted {
+                graph_visit: None,
+                resumed_from_stage_id: None,
                 node_id: checkpoint.current_node.clone(),
                 status: checkpoint
                     .node_outcomes
@@ -2606,6 +2620,8 @@ reasoning = false
         };
         let run_store = store.open_run(&fixtures::RUN_1).await.unwrap();
         crate::event::append_event(&run_store, &fixtures::RUN_1, &Event::CheckpointCompleted {
+            graph_visit: None,
+            resumed_from_stage_id: None,
             node_id: checkpoint.current_node.clone(),
             status: "succeeded".to_string(),
             current_node: checkpoint.current_node.clone(),

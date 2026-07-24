@@ -26,6 +26,7 @@ use crate::run_control::RunControlState;
 use crate::run_options::{GitCheckpointOptions, LifecycleOptions, RunOptions};
 use crate::runtime_store::RunStoreHandle;
 use crate::services::{EngineServices, FabroRunToolServices, RunServices};
+use crate::stage_execution::StageExecutionSeed;
 use crate::steering_hub::SteeringHub;
 use crate::transforms::{RenderMode, Transform};
 use crate::workflow_bundle::WorkflowBundle;
@@ -270,6 +271,10 @@ pub struct InitOptions {
     pub run_control:       Option<Arc<RunControlState>>,
     pub checkpoint:        Option<Checkpoint>,
     pub seed_context:      Option<Context>,
+    /// Allocator seed for stage execution ordinals. Empty for a fresh run;
+    /// resume passes projection-derived high-water marks and provenance so a
+    /// reexecuted in-flight node gets a new `StageId` ordinal.
+    pub stage_executions:  StageExecutionSeed,
     pub fabro_run_tools:   Option<FabroRunToolServices>,
 }
 

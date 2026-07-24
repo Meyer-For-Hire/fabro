@@ -244,12 +244,22 @@ pub enum Event {
         exec_output_tail: Option<fabro_types::ExecOutputTail>,
     },
     StageStarted {
-        node_id:      String,
-        name:         String,
-        index:        usize,
-        handler_type: String,
-        attempt:      usize,
-        max_attempts: usize,
+        node_id:               String,
+        name:                  String,
+        index:                 usize,
+        handler_type:          String,
+        attempt:               usize,
+        max_attempts:          usize,
+        /// Graph visit that produced this stage execution. Diverges from the
+        /// envelope `StageId` ordinal when a cancelled or crashed invocation
+        /// is reexecuted after resume.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        graph_visit:           Option<u32>,
+        /// Prior execution this one resumes from, for the first execution
+        /// reserved after a resume when the node had an observable
+        /// post-checkpoint execution.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resumed_from_stage_id: Option<StageId>,
     },
     StageCompleted {
         node_id: String,
@@ -307,10 +317,14 @@ pub enum Event {
         join_policy:  String,
     },
     ParallelBranchStarted {
-        parallel_group_id:  StageId,
-        parallel_branch_id: ParallelBranchId,
-        branch:             String,
-        index:              usize,
+        parallel_group_id:     StageId,
+        parallel_branch_id:    ParallelBranchId,
+        branch:                String,
+        index:                 usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        graph_visit:           Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resumed_from_stage_id: Option<StageId>,
     },
     ParallelBranchCompleted {
         parallel_group_id:  StageId,
@@ -396,6 +410,12 @@ pub enum Event {
         diff: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         diff_summary: Option<DiffSummary>,
+        /// Graph visit of the checkpointed stage execution; used when this
+        /// checkpoint is the event that first materializes a skipped stage.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        graph_visit: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resumed_from_stage_id: Option<StageId>,
     },
     CheckpointFailed {
         node_id:          String,

@@ -4090,12 +4090,14 @@ async fn create_durable_run_with_events(
 
 fn stage_started_event(node_id: &str, handler_type: &str) -> workflow_event::Event {
     workflow_event::Event::StageStarted {
-        node_id:      node_id.to_string(),
-        name:         node_id.to_string(),
-        index:        1,
-        handler_type: handler_type.to_string(),
-        attempt:      1,
-        max_attempts: 1,
+        graph_visit:           None,
+        resumed_from_stage_id: None,
+        node_id:               node_id.to_string(),
+        name:                  node_id.to_string(),
+        index:                 1,
+        handler_type:          handler_type.to_string(),
+        attempt:               1,
+        max_attempts:          1,
     }
 }
 
@@ -4938,12 +4940,14 @@ async fn list_run_stages_projects_retrying_until_completion() {
         "setup",
         1,
         &workflow_event::Event::StageStarted {
-            node_id:      "setup".to_string(),
-            name:         "Setup".to_string(),
-            index:        0,
-            handler_type: "command".to_string(),
-            attempt:      1,
-            max_attempts: 1,
+            graph_visit:           None,
+            resumed_from_stage_id: None,
+            node_id:               "setup".to_string(),
+            name:                  "Setup".to_string(),
+            index:                 0,
+            handler_type:          "command".to_string(),
+            attempt:               1,
+            max_attempts:          1,
         },
     )
     .await;
@@ -4982,12 +4986,14 @@ async fn list_run_stages_projects_retrying_until_completion() {
         "work",
         1,
         &workflow_event::Event::StageStarted {
-            node_id:      "work".to_string(),
-            name:         "Work".to_string(),
-            index:        1,
-            handler_type: "command".to_string(),
-            attempt:      1,
-            max_attempts: 3,
+            graph_visit:           None,
+            resumed_from_stage_id: None,
+            node_id:               "work".to_string(),
+            name:                  "Work".to_string(),
+            index:                 1,
+            handler_type:          "command".to_string(),
+            attempt:               1,
+            max_attempts:          3,
         },
     )
     .await;
@@ -5103,12 +5109,14 @@ async fn list_run_stages_projects_running_stage_as_cancelled_after_cancelled_run
         "work",
         1,
         &workflow_event::Event::StageStarted {
-            node_id:      "work".to_string(),
-            name:         "Work".to_string(),
-            index:        1,
-            handler_type: "agent".to_string(),
-            attempt:      1,
-            max_attempts: 1,
+            graph_visit:           None,
+            resumed_from_stage_id: None,
+            node_id:               "work".to_string(),
+            name:                  "Work".to_string(),
+            index:                 1,
+            handler_type:          "agent".to_string(),
+            attempt:               1,
+            max_attempts:          1,
         },
     )
     .await;
@@ -5174,12 +5182,14 @@ async fn list_run_stages_includes_stage_model_usage() {
         "prompt",
         1,
         &workflow_event::Event::StageStarted {
-            node_id:      "prompt".to_string(),
-            name:         "Prompt".to_string(),
-            index:        0,
-            handler_type: "prompt".to_string(),
-            attempt:      1,
-            max_attempts: 1,
+            graph_visit:           None,
+            resumed_from_stage_id: None,
+            node_id:               "prompt".to_string(),
+            name:                  "Prompt".to_string(),
+            index:                 0,
+            handler_type:          "prompt".to_string(),
+            attempt:               1,
+            max_attempts:          1,
         },
     )
     .await;
@@ -5294,12 +5304,14 @@ async fn list_run_stages_distinguishes_visits() {
         "verify",
         1,
         &workflow_event::Event::StageStarted {
-            node_id:      "verify".to_string(),
-            name:         "Verify".to_string(),
-            index:        1,
-            handler_type: "command".to_string(),
-            attempt:      1,
-            max_attempts: 1,
+            graph_visit:           None,
+            resumed_from_stage_id: None,
+            node_id:               "verify".to_string(),
+            name:                  "Verify".to_string(),
+            index:                 1,
+            handler_type:          "command".to_string(),
+            attempt:               1,
+            max_attempts:          1,
         },
     )
     .await;
@@ -5340,12 +5352,14 @@ async fn list_run_stages_distinguishes_visits() {
         "verify",
         2,
         &workflow_event::Event::StageStarted {
-            node_id:      "verify".to_string(),
-            name:         "Verify".to_string(),
-            index:        1,
-            handler_type: "command".to_string(),
-            attempt:      1,
-            max_attempts: 1,
+            graph_visit:           None,
+            resumed_from_stage_id: None,
+            node_id:               "verify".to_string(),
+            name:                  "Verify".to_string(),
+            index:                 1,
+            handler_type:          "command".to_string(),
+            attempt:               1,
+            max_attempts:          1,
         },
     )
     .await;
@@ -5382,6 +5396,110 @@ async fn list_run_stages_distinguishes_visits() {
 
     // Old `dot_id` field must be gone.
     assert!(first.get("dot_id").is_none(), "dot_id should be removed");
+}
+
+#[tokio::test]
+async fn list_run_stages_exposes_execution_identity_for_resumed_stage() {
+    let state = test_app_state_with_isolated_storage();
+    let app = crate::test_support::build_test_router(Arc::clone(&state));
+    let run_id = RunId::new();
+    let mut graph = Graph::new("test");
+    let mut work = Node::new("work");
+    work.attrs
+        .insert("type".to_string(), AttrValue::String("agent".to_string()));
+    graph.nodes.insert("work".to_string(), work);
+
+    create_durable_run_with_events(&state, run_id, &[
+        workflow_event::Event::RunCreated {
+            run_id,
+            title: None,
+            settings: serde_json::to_value(fabro_types::WorkflowSettings::default()).unwrap(),
+            graph: serde_json::to_value(&graph).unwrap(),
+            workflow_source: None,
+            workflow_config: None,
+            labels: std::collections::BTreeMap::default(),
+            run_dir: String::new(),
+            source_directory: None,
+            workflow_slug: Some("test".to_string()),
+            automation: None,
+            db_prefix: None,
+            provenance: test_support::test_run_provenance(),
+            manifest_blob: None,
+            git: None,
+            fork_source_ref: None,
+            retried_from: None,
+            parent_id: None,
+            web_url: None,
+        },
+        workflow_event::Event::RunStarting,
+        workflow_event::Event::RunRunning,
+    ])
+    .await;
+
+    // Legacy-shaped first execution without identity metadata.
+    append_scoped_stage_event(
+        &state,
+        run_id,
+        "work",
+        1,
+        &workflow_event::Event::StageStarted {
+            graph_visit:           None,
+            resumed_from_stage_id: None,
+            node_id:               "work".to_string(),
+            name:                  "Work".to_string(),
+            index:                 1,
+            handler_type:          "agent".to_string(),
+            attempt:               1,
+            max_attempts:          1,
+        },
+    )
+    .await;
+    // Reexecution after cancel/resume: same graph visit, next ordinal.
+    append_scoped_stage_event(
+        &state,
+        run_id,
+        "work",
+        2,
+        &workflow_event::Event::StageStarted {
+            graph_visit:           Some(1),
+            resumed_from_stage_id: Some(fabro_types::StageId::new("work", 1)),
+            node_id:               "work".to_string(),
+            name:                  "Work".to_string(),
+            index:                 1,
+            handler_type:          "agent".to_string(),
+            attempt:               1,
+            max_attempts:          1,
+        },
+    )
+    .await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(api(&format!("/runs/{run_id}/stages")))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = response_json!(response, StatusCode::OK).await;
+
+    let first = stage_entry(&body, "work@1");
+    assert!(
+        first.get("graph_visit").is_none(),
+        "legacy stage should omit graph_visit"
+    );
+    assert!(
+        first.get("resumed_from_stage_id").is_none(),
+        "legacy stage should omit resumed_from_stage_id"
+    );
+
+    let second = stage_entry(&body, "work@2");
+    assert_eq!(second["visit"], 2);
+    assert_eq!(second["graph_visit"], 1);
+    assert_eq!(second["resumed_from_stage_id"], "work@1");
 }
 
 /// `checkpoint.completed_nodes` records every visit, so a looped node appears
@@ -5471,6 +5589,8 @@ async fn run_billing_dedups_retried_nodes_and_sums_their_durations() {
         &run_store,
         &run_id,
         &workflow_event::Event::CheckpointCompleted {
+            graph_visit: None,
+            resumed_from_stage_id: None,
             node_id: "verify".to_string(),
             status: "running".to_string(),
             current_node: "verify".to_string(),
@@ -5600,6 +5720,8 @@ async fn run_billing_sums_usage_across_retry_visits_and_uses_latest_model() {
         &run_store,
         &run_id,
         &workflow_event::Event::CheckpointCompleted {
+            graph_visit: None,
+            resumed_from_stage_id: None,
             node_id: "verify".to_string(),
             status: "running".to_string(),
             current_node: "verify".to_string(),
@@ -5689,12 +5811,14 @@ async fn list_run_stages_shows_retrying_after_failed_event() {
         "work",
         1,
         &workflow_event::Event::StageStarted {
-            node_id:      "work".to_string(),
-            name:         "Work".to_string(),
-            index:        0,
-            handler_type: "command".to_string(),
-            attempt:      1,
-            max_attempts: 3,
+            graph_visit:           None,
+            resumed_from_stage_id: None,
+            node_id:               "work".to_string(),
+            name:                  "Work".to_string(),
+            index:                 0,
+            handler_type:          "command".to_string(),
+            attempt:               1,
+            max_attempts:          3,
         },
     )
     .await;
@@ -5767,12 +5891,14 @@ async fn list_run_stages_shows_retrying_when_failed_will_retry() {
         "work",
         1,
         &workflow_event::Event::StageStarted {
-            node_id:      "work".to_string(),
-            name:         "Work".to_string(),
-            index:        0,
-            handler_type: "command".to_string(),
-            attempt:      1,
-            max_attempts: 3,
+            graph_visit:           None,
+            resumed_from_stage_id: None,
+            node_id:               "work".to_string(),
+            name:                  "Work".to_string(),
+            index:                 0,
+            handler_type:          "command".to_string(),
+            attempt:               1,
+            max_attempts:          3,
         },
     )
     .await;
@@ -5824,12 +5950,14 @@ async fn run_billing_retried_node_then_succeeded_emits_one_row_with_final_attemp
         workflow_event::Event::RunStarting,
         workflow_event::Event::RunRunning,
         workflow_event::Event::StageStarted {
-            node_id:      "work".to_string(),
-            name:         "Work".to_string(),
-            index:        0,
-            handler_type: "command".to_string(),
-            attempt:      1,
-            max_attempts: 3,
+            graph_visit:           None,
+            resumed_from_stage_id: None,
+            node_id:               "work".to_string(),
+            name:                  "Work".to_string(),
+            index:                 0,
+            handler_type:          "command".to_string(),
+            attempt:               1,
+            max_attempts:          3,
         },
         workflow_event::Event::StageFailed {
             node_id:    "work".to_string(),
@@ -5850,12 +5978,14 @@ async fn run_billing_retried_node_then_succeeded_emits_one_row_with_final_attemp
             delay_ms:     0,
         },
         workflow_event::Event::StageStarted {
-            node_id:      "work".to_string(),
-            name:         "Work".to_string(),
-            index:        0,
-            handler_type: "command".to_string(),
-            attempt:      2,
-            max_attempts: 3,
+            graph_visit:           None,
+            resumed_from_stage_id: None,
+            node_id:               "work".to_string(),
+            name:                  "Work".to_string(),
+            index:                 0,
+            handler_type:          "command".to_string(),
+            attempt:               2,
+            max_attempts:          3,
         },
         workflow_event::Event::StageCompleted {
             node_id: "work".to_string(),
@@ -5910,12 +6040,14 @@ async fn run_billing_retried_node_then_succeeded_emits_one_row_with_final_attemp
 
 fn revisit_test_started(node_id: &str) -> workflow_event::Event {
     workflow_event::Event::StageStarted {
-        node_id:      node_id.to_string(),
-        name:         node_id.to_string(),
-        index:        0,
-        handler_type: "command".to_string(),
-        attempt:      1,
-        max_attempts: 1,
+        graph_visit:           None,
+        resumed_from_stage_id: None,
+        node_id:               node_id.to_string(),
+        name:                  node_id.to_string(),
+        index:                 0,
+        handler_type:          "command".to_string(),
+        attempt:               1,
+        max_attempts:          1,
     }
 }
 
@@ -8140,12 +8272,14 @@ async fn get_run_stage_command_log_returns_scratch_slice() {
             definition_blob: None,
         },
         workflow_event::Event::StageStarted {
-            node_id:      "script_node".to_string(),
-            name:         "Script".to_string(),
-            index:        1,
-            handler_type: "command".to_string(),
-            attempt:      1,
-            max_attempts: 1,
+            graph_visit:           None,
+            resumed_from_stage_id: None,
+            node_id:               "script_node".to_string(),
+            name:                  "Script".to_string(),
+            index:                 1,
+            handler_type:          "command".to_string(),
+            attempt:               1,
+            max_attempts:          1,
         },
         workflow_event::Event::CommandStarted {
             node_id:    "script_node".to_string(),
@@ -8207,12 +8341,14 @@ async fn get_run_stage_command_log_returns_cas_slice() {
             definition_blob: None,
         },
         workflow_event::Event::StageStarted {
-            node_id:      "script_node".to_string(),
-            name:         "Script".to_string(),
-            index:        1,
-            handler_type: "command".to_string(),
-            attempt:      1,
-            max_attempts: 1,
+            graph_visit:           None,
+            resumed_from_stage_id: None,
+            node_id:               "script_node".to_string(),
+            name:                  "Script".to_string(),
+            index:                 1,
+            handler_type:          "command".to_string(),
+            attempt:               1,
+            max_attempts:          1,
         },
         workflow_event::Event::CommandCompleted {
             node_id:        "script_node".to_string(),
@@ -8271,12 +8407,14 @@ async fn get_run_stage_command_log_prefers_scratch_when_cas_ref_exists() {
             definition_blob: None,
         },
         workflow_event::Event::StageStarted {
-            node_id:      "script_node".to_string(),
-            name:         "Script".to_string(),
-            index:        1,
-            handler_type: "command".to_string(),
-            attempt:      1,
-            max_attempts: 1,
+            graph_visit:           None,
+            resumed_from_stage_id: None,
+            node_id:               "script_node".to_string(),
+            name:                  "Script".to_string(),
+            index:                 1,
+            handler_type:          "command".to_string(),
+            attempt:               1,
+            max_attempts:          1,
         },
         workflow_event::Event::CommandCompleted {
             node_id:        "script_node".to_string(),
@@ -9462,12 +9600,14 @@ async fn cache_backed_run_endpoints_reflect_events_appended_after_warmup() {
         "review",
         1,
         &workflow_event::Event::StageStarted {
-            node_id:      "review".to_string(),
-            name:         "Review".to_string(),
-            index:        0,
-            handler_type: "human".to_string(),
-            attempt:      1,
-            max_attempts: 1,
+            graph_visit:           None,
+            resumed_from_stage_id: None,
+            node_id:               "review".to_string(),
+            name:                  "Review".to_string(),
+            index:                 0,
+            handler_type:          "human".to_string(),
+            attempt:               1,
+            max_attempts:          1,
         },
     )
     .await;
@@ -11408,6 +11548,8 @@ async fn resume_cancelled_run_with_checkpoint_transitions_to_runnable() {
         workflow_event::Event::RunStarting,
         workflow_event::Event::RunRunning,
         workflow_event::Event::CheckpointCompleted {
+            graph_visit: None,
+            resumed_from_stage_id: None,
             node_id: checkpoint.current_node.clone(),
             status: "succeeded".to_string(),
             current_node: checkpoint.current_node.clone(),

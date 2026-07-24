@@ -510,12 +510,14 @@ mod tests {
 
     fn stage_started(node_id: &str, name: &str) -> Event {
         Event::StageStarted {
-            node_id:      node_id.into(),
-            name:         name.into(),
-            index:        0,
-            handler_type: String::new(),
-            attempt:      1,
-            max_attempts: 1,
+            graph_visit:           None,
+            resumed_from_stage_id: None,
+            node_id:               node_id.into(),
+            name:                  name.into(),
+            index:                 0,
+            handler_type:          String::new(),
+            attempt:               1,
+            max_attempts:          1,
         }
     }
 
@@ -592,10 +594,12 @@ mod tests {
         assert_eq!(ui.stage.parallel_parent.as_deref(), Some("fork1"));
 
         emit(&mut ui, Event::ParallelBranchStarted {
-            parallel_group_id:  StageId::new("fork1", 1),
-            parallel_branch_id: ParallelBranchId::new(StageId::new("fork1", 1), 0),
-            branch:             "security".into(),
-            index:              0,
+            graph_visit:           None,
+            resumed_from_stage_id: None,
+            parallel_group_id:     StageId::new("fork1", 1),
+            parallel_branch_id:    ParallelBranchId::new(StageId::new("fork1", 1), 0),
+            branch:                "security".into(),
+            index:                 0,
         });
         let stage = &ui.stage.active_stages["fork1"];
         assert_eq!(stage.tool_calls.len(), 1);
@@ -633,10 +637,12 @@ mod tests {
             join_policy:  "wait_all".into(),
         });
         emit(&mut ui, Event::ParallelBranchStarted {
-            parallel_group_id:  StageId::new("fork1", 1),
-            parallel_branch_id: ParallelBranchId::new(StageId::new("fork1", 1), 0),
-            branch:             "security".into(),
-            index:              0,
+            graph_visit:           None,
+            resumed_from_stage_id: None,
+            parallel_group_id:     StageId::new("fork1", 1),
+            parallel_branch_id:    ParallelBranchId::new(StageId::new("fork1", 1), 0),
+            branch:                "security".into(),
+            index:                 0,
         });
 
         let stage = &ui.stage.active_stages["fork1"];
@@ -1249,10 +1255,12 @@ mod tests {
             join_policy:  "wait_all".into(),
         });
         emit(&mut ui, Event::ParallelBranchStarted {
-            parallel_group_id:  StageId::new("fork1", 1),
-            parallel_branch_id: ParallelBranchId::new(StageId::new("fork1", 1), 0),
-            branch:             "security".into(),
-            index:              0,
+            graph_visit:           None,
+            resumed_from_stage_id: None,
+            parallel_group_id:     StageId::new("fork1", 1),
+            parallel_branch_id:    ParallelBranchId::new(StageId::new("fork1", 1), 0),
+            branch:                "security".into(),
+            index:                 0,
         });
         emit(&mut ui, Event::ParallelBranchCompleted {
             parallel_group_id:  StageId::new("fork1", 1),
@@ -1282,12 +1290,14 @@ mod tests {
         let stage_started = serde_json::to_string(&to_run_event_at(
             &fixtures::RUN_1,
             &Event::StageStarted {
-                node_id:      "code".into(),
-                name:         "Code".into(),
-                index:        0,
-                handler_type: "agent".into(),
-                attempt:      1,
-                max_attempts: 1,
+                graph_visit:           None,
+                resumed_from_stage_id: None,
+                node_id:               "code".into(),
+                name:                  "Code".into(),
+                index:                 0,
+                handler_type:          "agent".into(),
+                attempt:               1,
+                max_attempts:          1,
             },
             started_ts,
             None,

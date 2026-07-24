@@ -12435,8 +12435,29 @@ components:
           type: integer
           format: uint32
           minimum: 1
-          description: 1-based visit count; bumped each time the workflow re-enters this node.
+          description: >-
+            1-based stage execution ordinal, the numeric component of `id`. It
+            increments each time the node produces a new observable execution:
+            graph re-entry (loops) and reexecution after cancel or crash
+            recovery. Automatic in-place retries do not increment it.
           example: 2
+        graph_visit:
+          type: ["integer", "null"]
+          format: uint32
+          minimum: 1
+          description: >-
+            1-based count of how many times workflow control entered this node
+            (drives `max_visits`). Differs from `visit` when a cancelled or
+            crashed execution was reexecuted after resume. Absent for stages
+            recorded before execution identity was tracked.
+          example: 1
+        resumed_from_stage_id:
+          type: ["string", "null"]
+          description: >-
+            StageId of the prior cancelled or interrupted execution this stage
+            resumes from, when the run was resumed after that execution became
+            observable.
+          example: verify@1
         provider_used:
           oneOf:
             - $ref: "#/components/schemas/StageModelUsage"

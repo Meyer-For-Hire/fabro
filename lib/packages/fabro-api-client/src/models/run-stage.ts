@@ -46,9 +46,17 @@ export interface RunStage {
      */
     'node_id': string;
     /**
-     * 1-based visit count; bumped each time the workflow re-enters this node.
+     * 1-based stage execution ordinal, the numeric component of `id`. It increments each time the node produces a new observable execution: graph re-entry (loops) and reexecution after cancel or crash recovery. Automatic in-place retries do not increment it.
      */
     'visit': number;
+    /**
+     * 1-based count of how many times workflow control entered this node (drives `max_visits`). Differs from `visit` when a cancelled or crashed execution was reexecuted after resume. Absent for stages recorded before execution identity was tracked.
+     */
+    'graph_visit'?: number | null;
+    /**
+     * StageId of the prior cancelled or interrupted execution this stage resumes from, when the run was resumed after that execution became observable.
+     */
+    'resumed_from_stage_id'?: string | null;
     'provider_used'?: StageModelUsage | null;
     /**
      * Wall-clock time the latest attempt of this stage started, if known.
