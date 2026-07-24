@@ -1101,6 +1101,31 @@ impl Catalog {
         }
     }
 
+    /// Resolve a selection against a preferred provider snapshot, falling back
+    /// to every provider in the catalog only when the preferred set cannot
+    /// supply the requested provider or model.
+    ///
+    /// This is useful for readiness checks: ready providers remain preferred,
+    /// while a catalog-only offering can still be selected so the caller can
+    /// report why its provider is unavailable. Semantic failures such as an
+    /// unknown provider do not fall back.
+    pub fn resolve_selection_with_catalog_fallback(
+        &self,
+        selector: Option<&str>,
+        explicit_provider: Option<&ProviderId>,
+        preferred_providers: &HashSet<ProviderId>,
+    ) -> Result<SelectedModel, ModelSelectionError> {
+        match self.resolve_selection(selector, explicit_provider, preferred_providers) {
+            Ok(selected) => Ok(selected),
+            Err(
+                ModelSelectionError::ProviderUnavailable { .. }
+                | ModelSelectionError::NoEligibleOffering { .. }
+                | ModelSelectionError::NoDefaultModel { .. },
+            ) => self.resolve_selection(selector, explicit_provider, &self.all_provider_ids()),
+            Err(error) => Err(error),
+        }
+    }
+
     #[must_use]
     pub fn is_model_selector(&self, selector: &str) -> bool {
         self.candidate_indices(selector).is_some()
@@ -4046,6 +4071,30 @@ adapter = "openai_compatible"
             Err(ModelSelectionError::ProviderUnavailable { provider })
                 if provider == ProviderId::new("openrouter")
         ));
+    }
+
+    #[test]
+    fn selection_fallback_preserves_ready_preference_per_request() {
+        let catalog = portable_model_catalog();
+        let openai = ProviderId::openai();
+        let openrouter = ProviderId::new("openrouter");
+        let ready = HashSet::from([openrouter.clone()]);
+
+        let shared = catalog
+            .resolve_selection_with_catalog_fallback(Some("portable"), None, &ready)
+            .unwrap();
+        assert_eq!(shared.provider, openrouter);
+
+        let pinned = catalog
+            .resolve_selection_with_catalog_fallback(Some("portable"), Some(&openai), &ready)
+            .unwrap();
+        assert_eq!(pinned.provider, openai);
+
+        let unknown = catalog
+            .resolve_selection_with_catalog_fallback(Some("provider-private-preview"), None, &ready)
+            .unwrap();
+        assert_eq!(unknown.provider, ProviderId::new("openrouter"));
+        assert_eq!(unknown.model, "provider-private-preview");
     }
 
     #[test]
