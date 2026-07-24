@@ -1470,6 +1470,81 @@ mod tests {
         Arc::new(Catalog::from_builtin().unwrap())
     }
 
+    fn openai_compatible_completion(model: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": "chatcmpl_preflight",
+            "object": "chat.completion",
+            "created": 1_700_000_000,
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "OK"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        })
+    }
+
+    fn ready_kimi_and_openrouter_state(
+        server: &httpmock::MockServer,
+    ) -> Arc<crate::server::AppState> {
+        let kimi_url = server.url("/kimi/v1");
+        let openrouter_url = server.url("/openrouter/v1");
+        let llm_catalog_settings: LlmCatalogSettings = toml::from_str(&format!(
+            r#"
+[providers.kimi]
+base_url = "{kimi_url}"
+
+[providers.openrouter]
+base_url = "{openrouter_url}"
+enabled = true
+"#
+        ))
+        .expect("catalog overrides should parse");
+
+        crate::test_support::TestAppStateBuilder::new()
+            .llm_catalog_settings(llm_catalog_settings)
+            .vault_entries([
+                (EnvVars::KIMI_API_KEY, "test-kimi-key"),
+                (EnvVars::OPENROUTER_API_KEY, "test-openrouter-key"),
+            ])
+            .build()
+    }
+
+    async fn preflight_for_model(
+        state: &Arc<crate::server::AppState>,
+        model: &str,
+    ) -> (types::PreflightResponse, bool) {
+        let mut ready_providers = state.ready_llm_provider_ids().await;
+        ready_providers.sort();
+        assert_eq!(ready_providers, vec![
+            ProviderId::new("kimi"),
+            ProviderId::new("openrouter")
+        ]);
+
+        let mut manifest = minimal_manifest();
+        manifest.workflows.get_mut("workflow.fabro").unwrap().source = format!(
+            r#"
+digraph Demo {{
+    start [shape=Mdiamond]
+    exit  [shape=Msquare]
+    work  [prompt="Do work", model="{model}"]
+    start -> work -> exit
+}}
+"#
+        );
+        let prepared = prepare_manifest(
+            &manifest_run_defaults(Some(&default_settings_fixture())),
+            &manifest,
+        )
+        .unwrap();
+        let validated = validate_prepared_manifest(&prepared, state.catalog()).unwrap();
+
+        run_preflight(state.as_ref(), &prepared, &validated)
+            .await
+            .unwrap()
+    }
+
     fn manifest_workflow() -> types::ManifestWorkflow {
         types::ManifestWorkflow {
             config: None,
@@ -2388,6 +2463,80 @@ digraph Demo {
                 .contains("Rate limited by openai: quota limited")
         );
         assert!(response_mock.calls_async().await >= 1);
+    }
+
+    #[tokio::test]
+    async fn preflight_uses_ready_providers_for_known_shared_alias() {
+        let server = httpmock::MockServer::start_async().await;
+        let openrouter_probe = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/openrouter/v1/chat/completions")
+                    .header("authorization", "Bearer test-openrouter-key")
+                    .json_body_includes(r#"{"model":"anthropic/claude-fable-5"}"#);
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(openai_compatible_completion("anthropic/claude-fable-5"));
+            })
+            .await;
+        let state = ready_kimi_and_openrouter_state(&server);
+
+        let (response, _ok) = preflight_for_model(&state, "claude-fable").await;
+
+        let llm_check = response.checks.sections[0]
+            .checks
+            .iter()
+            .find(|check| check.name == "LLM" && check.summary == "claude-fable-5")
+            .expect("preflight should include Claude Fable");
+        assert_eq!(
+            llm_check
+                .details
+                .iter()
+                .map(|detail| detail.text.as_str())
+                .find(|detail| detail.starts_with("Provider: ")),
+            Some("Provider: openrouter")
+        );
+        assert_eq!(llm_check.status, types::PreflightCheckResultStatus::Pass);
+        openrouter_probe.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn preflight_uses_ready_providers_for_unknown_unqualified_model() {
+        let server = httpmock::MockServer::start_async().await;
+        let kimi_probe = server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/kimi/v1/chat/completions")
+                    .header("authorization", "Bearer test-kimi-key")
+                    .json_body_includes(r#"{"model":"provider-private-preview"}"#);
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(openai_compatible_completion("provider-private-preview"));
+            })
+            .await;
+        let state = ready_kimi_and_openrouter_state(&server);
+
+        let (response, _ok) = preflight_for_model(&state, "provider-private-preview").await;
+
+        assert!(response.workflow.diagnostics.iter().any(|diagnostic| {
+            diagnostic.rule == "node_model_known"
+                && diagnostic.message.contains("provider-private-preview")
+        }));
+        let llm_check = response.checks.sections[0]
+            .checks
+            .iter()
+            .find(|check| check.name == "LLM" && check.summary == "provider-private-preview")
+            .expect("preflight should include the unknown passthrough model");
+        assert_eq!(
+            llm_check
+                .details
+                .iter()
+                .map(|detail| detail.text.as_str())
+                .find(|detail| detail.starts_with("Provider: ")),
+            Some("Provider: kimi")
+        );
+        assert_eq!(llm_check.status, types::PreflightCheckResultStatus::Pass);
+        kimi_probe.assert_async().await;
     }
 
     #[test]
