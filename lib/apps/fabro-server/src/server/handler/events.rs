@@ -59,14 +59,6 @@ impl EventListParams {
         self.limit.unwrap_or(100).clamp(1, 1000)
     }
 
-    fn before_seq(&self) -> Option<u32> {
-        self.before_seq.map(|seq| seq.max(1))
-    }
-
-    fn order(&self) -> EventSequenceOrder {
-        self.order
-    }
-
     fn cursor_error(&self) -> Option<&'static str> {
         match self.order {
             EventSequenceOrder::Asc if self.before_seq.is_some() => {
@@ -238,19 +230,18 @@ async fn list_run_events(
         return ApiError::bad_request(detail).into_response();
     }
 
-    let since_seq = params.since_seq();
     let limit = params.limit();
     match state.stores.runs.open_run_reader(&id).await {
         Ok(run_store) => {
-            let events = match params.order() {
+            let events = match params.order {
                 EventSequenceOrder::Asc => {
                     run_store
-                        .list_events_from_with_limit(since_seq, limit)
+                        .list_events_from_with_limit(params.since_seq(), limit)
                         .await
                 }
                 EventSequenceOrder::Desc => {
                     run_store
-                        .list_events_before_with_limit(params.before_seq(), limit)
+                        .list_events_before_with_limit(params.before_seq, limit)
                         .await
                 }
             };

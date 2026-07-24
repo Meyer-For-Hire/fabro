@@ -44,6 +44,10 @@ pub(crate) async fn run(
 
     let events = match (args.tail, since_cutoff.is_none()) {
         (Some(tail), true) => {
+            // With --tail 0 --follow, fetch one event anyway so `last_seq`
+            // seeds the follow cursor at the true latest event instead of
+            // replaying the whole history; `apply_filters` drops it from
+            // the printed output.
             let tail = if args.follow { tail.max(1) } else { tail };
             client.list_run_events_tail(&run_id, tail).await
         }

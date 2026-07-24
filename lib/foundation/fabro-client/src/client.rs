@@ -1534,28 +1534,14 @@ impl Client {
         let mut all_events = Vec::new();
 
         loop {
-            let response = self
-                .send_api(|client| async move {
-                    let mut request = client.list_run_events().id(run_id.to_string());
-                    if let Some(seq) = next_since_seq.and_then(non_zero_u64_from_u32) {
-                        request = request.since_seq(seq);
-                    }
-                    if let Some(limit) = limit.and_then(non_zero_u64_from_usize) {
-                        request = request.limit(limit);
-                    }
-                    request.send().await
-                })
-                .await?;
-            let parsed = response.into_inner();
-            let page_events = parsed
-                .data
-                .into_iter()
-                .map(convert_type::<_, EventEnvelope>)
-                .collect::<Result<Vec<EventEnvelope>>>()?;
+            let page = EventPageCursor::Ascending {
+                since_seq: next_since_seq,
+            };
+            let (page_events, has_more) = self.fetch_run_events_page(run_id, page, limit).await?;
             let next_page_since_seq = page_events.last().map(|event| event.seq.saturating_add(1));
             all_events.extend(page_events);
 
-            if limit.is_some() || !parsed.meta.has_more || next_page_since_seq.is_none() {
+            if limit.is_some() || !has_more || next_page_since_seq.is_none() {
                 break;
             }
             next_since_seq = next_page_since_seq;
@@ -1579,52 +1565,34 @@ impl Client {
         let fetch_target = max_events.max(2);
         let mut before_seq = None;
         let mut descending_events: Vec<EventEnvelope> = Vec::new();
-        while descending_events.len() < fetch_target {
+        loop {
             let remaining = fetch_target - descending_events.len();
-            let response = self
-                .send_api(|client| async move {
-                    let mut request = client
-                        .list_run_events()
-                        .id(run_id.to_string())
-                        .order(types::ListRunEventsOrder::Desc)
-                        .limit(remaining.min(1000) as u64);
-                    if let Some(seq) = before_seq.and_then(non_zero_u64_from_u32) {
-                        request = request.before_seq(seq);
-                    }
-                    request.send().await
-                })
+            let (page_events, has_more) = self
+                .fetch_run_events_page(
+                    run_id,
+                    EventPageCursor::Descending { before_seq },
+                    Some(remaining),
+                )
                 .await?;
-            let parsed = response.into_inner();
-            let page_events = parsed
-                .data
-                .into_iter()
-                .map(convert_type::<_, EventEnvelope>)
-                .collect::<Result<Vec<EventEnvelope>>>()?;
 
-            let page_is_descending = page_events
-                .windows(2)
-                .all(|events| events[0].seq > events[1].seq);
-            let continues_descending = descending_events
+            let keeps_descending = descending_events
                 .last()
-                .zip(page_events.first())
-                .is_none_or(|(previous, next)| previous.seq > next.seq);
-            if !page_is_descending || !continues_descending {
+                .into_iter()
+                .chain(&page_events)
+                .is_sorted_by(|previous, next| previous.seq > next.seq);
+            if !keeps_descending {
+                // An older server ignored the order parameter and returned
+                // ascending history; fetch everything and slice the tail.
                 let mut events = self.list_run_events(run_id, None, None).await?;
                 let tail_start = events.len().saturating_sub(max_events);
                 return Ok(events.split_off(tail_start));
             }
 
-            let next_before_seq = page_events.last().map(|event| event.seq);
-            let had_events = !page_events.is_empty();
+            before_seq = page_events.last().map(|event| event.seq);
             descending_events.extend(page_events);
-            if descending_events.len() >= fetch_target
-                || !parsed.meta.has_more
-                || !had_events
-                || next_before_seq.is_none()
-            {
+            if descending_events.len() >= fetch_target || !has_more || before_seq.is_none() {
                 break;
             }
-            before_seq = next_before_seq;
         }
 
         descending_events.reverse();
@@ -1646,34 +1614,60 @@ impl Client {
         let mut all_events = Vec::new();
         while all_events.len() < max_events {
             let remaining = max_events - all_events.len();
-            let response = self
-                .send_api(|client| async move {
-                    let mut request = client
-                        .list_run_events()
-                        .id(run_id.to_string())
-                        .limit(remaining.min(1000) as u64);
-                    if let Some(seq) = next_since_seq.and_then(non_zero_u64_from_u32) {
-                        request = request.since_seq(seq);
-                    }
-                    request.send().await
-                })
+            let page = EventPageCursor::Ascending {
+                since_seq: next_since_seq,
+            };
+            let (page_events, has_more) = self
+                .fetch_run_events_page(run_id, page, Some(remaining))
                 .await?;
-            let parsed = response.into_inner();
-            let page_events = parsed
-                .data
-                .into_iter()
-                .map(convert_type::<_, EventEnvelope>)
-                .collect::<Result<Vec<EventEnvelope>>>()?;
             let next_page_since_seq = page_events.last().map(|event| event.seq.saturating_add(1));
             all_events.extend(page_events);
 
-            if !parsed.meta.has_more || next_page_since_seq.is_none() {
+            if !has_more || next_page_since_seq.is_none() {
                 break;
             }
             next_since_seq = next_page_since_seq;
         }
 
         Ok(all_events)
+    }
+
+    async fn fetch_run_events_page(
+        &self,
+        run_id: &RunId,
+        cursor: EventPageCursor,
+        limit: Option<usize>,
+    ) -> Result<(Vec<EventEnvelope>, bool)> {
+        let response = self
+            .send_api(|client| async move {
+                let mut request = client.list_run_events().id(run_id.to_string());
+                match cursor {
+                    EventPageCursor::Ascending { since_seq } => {
+                        if let Some(seq) = since_seq.and_then(non_zero_u64_from_u32) {
+                            request = request.since_seq(seq);
+                        }
+                    }
+                    EventPageCursor::Descending { before_seq } => {
+                        request = request.order(types::ListRunEventsOrder::Desc);
+                        if let Some(seq) = before_seq.and_then(non_zero_u64_from_u32) {
+                            request = request.before_seq(seq);
+                        }
+                    }
+                }
+                let page_limit = limit.map(|limit| limit.min(1000));
+                if let Some(limit) = page_limit.and_then(non_zero_u64_from_usize) {
+                    request = request.limit(limit);
+                }
+                request.send().await
+            })
+            .await?;
+        let parsed = response.into_inner();
+        let events = parsed
+            .data
+            .into_iter()
+            .map(convert_type::<_, EventEnvelope>)
+            .collect::<Result<Vec<EventEnvelope>>>()?;
+        Ok((events, parsed.meta.has_more))
     }
 
     pub async fn attach_run_events(
@@ -2151,6 +2145,12 @@ pub fn apply_bearer_token_auth(
             .context("invalid bearer token header value")?,
     );
     Ok(builder.default_headers(headers))
+}
+
+#[derive(Clone, Copy)]
+enum EventPageCursor {
+    Ascending { since_seq: Option<u32> },
+    Descending { before_seq: Option<u32> },
 }
 
 fn non_zero_u64_from_u32(value: u32) -> Option<NonZeroU64> {

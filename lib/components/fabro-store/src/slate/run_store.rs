@@ -85,8 +85,10 @@ impl RunDatabase {
         run_summary_store: Arc<OnceLock<Arc<RunSummaryStore>>>,
     ) -> Result<Self> {
         let event_seq = if read_only {
-            // Readers never append, so they do not need to scan the full event
-            // history to recover the next write sequence.
+            // Placeholder: readers never append (append_event_envelope
+            // rejects read-only handles, and reader inners are never cached
+            // in active_runs), so skip the full event history scan that
+            // recovers the next write sequence.
             1
         } else {
             recover_next_seq(&db, keys::run_events_prefix(&run_id), keys::parse_event_seq).await?
@@ -387,31 +389,11 @@ impl RunDatabase {
         before_seq: Option<u32>,
         limit: usize,
     ) -> Result<Vec<EventEnvelope>> {
-        let latest_seq = match self
-            .inner
-            .shared_projection_cache
-            .last_seq(&self.inner.run_id)
-            .await
-        {
-            Some(seq) => seq,
-            None => recover_next_seq(
-                &self.inner.db,
-                keys::run_events_prefix(&self.inner.run_id),
-                keys::parse_event_seq,
-            )
-            .await?
-            .saturating_sub(1),
+        let end_seq = match before_seq {
+            Some(seq) => u64::from(seq),
+            None => u64::from(self.latest_event_seq().await?) + 1,
         };
-        if latest_seq == 0 {
-            return Ok(Vec::new());
-        }
-
-        let latest_exclusive = u64::from(latest_seq) + 1;
-        let end_seq = before_seq
-            .map_or(latest_exclusive, u64::from)
-            .min(latest_exclusive)
-            .max(1);
-        if end_seq == 1 {
+        if end_seq <= 1 {
             return Ok(Vec::new());
         }
 
@@ -429,6 +411,27 @@ impl RunDatabase {
         .await?;
         events.reverse();
         Ok(events)
+    }
+
+    /// Latest appended event sequence, or 0 when the run has no events.
+    /// Served from the projection cache when warm; otherwise recovered by
+    /// scanning the event history.
+    async fn latest_event_seq(&self) -> Result<u32> {
+        match self
+            .inner
+            .shared_projection_cache
+            .last_seq(&self.inner.run_id)
+            .await
+        {
+            Some(seq) => Ok(seq),
+            None => Ok(recover_next_seq(
+                &self.inner.db,
+                keys::run_events_prefix(&self.inner.run_id),
+                keys::parse_event_seq,
+            )
+            .await?
+            .saturating_sub(1)),
+        }
     }
 
     pub async fn get_event(&self, seq: u32) -> Result<Option<EventEnvelope>> {
