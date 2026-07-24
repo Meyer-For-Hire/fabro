@@ -88,6 +88,7 @@ pub struct ModelCosts {
 pub struct ModelControls {
     /// Exact reasoning-effort values accepted by this provider/model offering.
     /// An empty list means the request control is unsupported.
+    #[serde(default)]
     pub reasoning_effort: Vec<ReasoningEffort>,
 }
 
@@ -101,6 +102,9 @@ pub struct Model {
     pub training:             Option<String>,
     pub knowledge_cutoff:     Option<String>,
     pub features:             ModelFeatures,
+    /// Required in API responses; defaulted on deserialization so newer
+    /// clients tolerate older servers that predate this field.
+    #[serde(default)]
     pub controls:             ModelControls,
     pub costs:                ModelCosts,
     pub estimated_output_tps: Option<f64>,
