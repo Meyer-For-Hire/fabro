@@ -171,7 +171,8 @@ impl From<Error> for ApiError {
 }
 
 /// LLM errors split at the HTTP boundary: request-validation failures are the
-/// caller's fault (400); everything else is an upstream failure (502).
+/// caller's fault (400); non-validation LLM failures, including provider,
+/// middleware, and local configuration failures, return 502.
 impl From<fabro_llm::Error> for ApiError {
     fn from(err: fabro_llm::Error) -> Self {
         match err {
