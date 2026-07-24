@@ -548,6 +548,63 @@ async fn openrouter_poolside_laguna_complete() {
     assert_eq!(response.cost_source, Some(CostSource::Authoritative));
 }
 
+#[fabro_macros::e2e_test(live("FIREWORKS_API_KEY"))]
+async fn fireworks_complete() {
+    let api_key = std::env::var(EnvVars::FIREWORKS_API_KEY).expect("FIREWORKS_API_KEY must be set");
+    let adapter = OpenAiCompatibleAdapter::new(api_key, "https://api.fireworks.ai/inference/v1")
+        .with_name("fireworks");
+    // gpt-oss models spend reasoning tokens before the final text, so the
+    // completion budget must cover both.
+    let request = Request {
+        max_tokens: Some(2048),
+        ..make_request("accounts/fireworks/models/gpt-oss-20b")
+    };
+    let response = adapter.complete(&request).await.unwrap();
+
+    assert!(
+        !response.text().is_empty(),
+        "response text should not be empty"
+    );
+    assert!(response.usage.input_tokens > 0);
+    assert!(response.usage.output_tokens > 0);
+    assert_eq!(response.provider, "fireworks");
+}
+
+#[fabro_macros::e2e_test(live("FIREWORKS_API_KEY"))]
+async fn fireworks_kimi_k2_7_code_deep_tool_round_trip() {
+    let api_key = std::env::var(EnvVars::FIREWORKS_API_KEY).expect("FIREWORKS_API_KEY must be set");
+    let provider = ProviderId::new("fireworks");
+    let mut settings = LlmCatalogSettings::default();
+    settings
+        .providers
+        .insert(provider.to_string(), ProviderCatalogSettings {
+            enabled: Some(true),
+            ..ProviderCatalogSettings::default()
+        });
+    let catalog = Arc::new(
+        Catalog::from_builtin_with_overrides(&settings)
+            .expect("enabled Fireworks catalog should build"),
+    );
+    let credential = ApiCredential::from_api_key(provider, api_key, &catalog)
+        .expect("Fireworks credential should resolve from the catalog");
+    let client = Arc::new(
+        Client::from_credentials(vec![credential], Arc::clone(&catalog))
+            .await
+            .expect("Fireworks client should build from the catalog"),
+    );
+    let model = catalog
+        .get_on_provider(&ProviderId::new("fireworks"), "kimi-k2.7-code")
+        .expect("Fireworks Kimi K2.7 Code should be present");
+
+    let outcome = run_model_test(model, ModelTestMode::Deep, client).await;
+    assert_eq!(
+        outcome.status,
+        ModelTestStatus::Ok,
+        "Fireworks Kimi K2.7 Code deep test failed: {:?}",
+        outcome.error_message
+    );
+}
+
 #[fabro_macros::e2e_test(live("OPENROUTER_API_KEY"))]
 async fn openrouter_kimi_k3_deep_tool_round_trip() {
     let api_key =
