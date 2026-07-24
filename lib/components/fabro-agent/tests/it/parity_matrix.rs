@@ -18,8 +18,8 @@ use fabro_llm::client::Client;
 use fabro_llm::provider::ProviderAdapter;
 use fabro_llm::providers::{OpenAiAdapter, OpenAiCompatibleAdapter};
 use fabro_model::catalog::{LlmCatalogSettings, ProviderCatalogSettings};
-use fabro_model::{AgentProfileKind, Catalog, ModelHandle, ProviderId};
-use fabro_test::{TwinScenario, TwinScenarios, TwinToolCall, twin_openai};
+use fabro_model::{Catalog, ModelHandle, ProviderId};
+use fabro_test::{EnvVars, TwinScenario, TwinScenarios, TwinToolCall, twin_openai};
 
 type Provider = ProviderId;
 
@@ -54,15 +54,6 @@ fn build_summarizer(provider: &Provider, client: &Client) -> WebFetchSummarizer 
     }
 }
 
-fn profile_kind(provider: &Provider) -> AgentProfileKind {
-    match provider.as_str() {
-        ProviderId::ANTHROPIC => AgentProfileKind::Anthropic,
-        ProviderId::GEMINI => AgentProfileKind::Gemini,
-        ProviderId::OPENAI | "kimi" | "zai" | "minimax" | "inception" => AgentProfileKind::OpenAi,
-        other => panic!("unexpected provider {other}"),
-    }
-}
-
 fn profile_builder(
     provider: &Provider,
     model: &str,
@@ -71,7 +62,12 @@ fn profile_builder(
 ) -> AgentProfileBuilder {
     let summarizer = Some(build_summarizer(provider, client));
     let catalog = Arc::new(Catalog::from_builtin().expect("default catalog should build"));
-    AgentProfileBuilder::new(profile_kind(provider), provider.clone(), model, catalog)
+    // Ask the catalog rather than keeping a provider->profile list in the test,
+    // so adding a provider to the catalog cannot silently skip this matrix.
+    let profile_kind = catalog
+        .effective_agent_profile(provider, Some(model))
+        .unwrap_or_else(|| panic!("no agent profile for provider {provider:?} in catalog"));
+    AgentProfileBuilder::new(profile_kind, provider.clone(), model, Arc::clone(&catalog))
         .with_web_fetch_summarizer(summarizer)
         .with_tool_secrets(tool_secrets)
 }
@@ -85,7 +81,7 @@ async fn make_session(
 ) -> Session {
     let client = make_client(&provider, twin.as_ref()).await;
     let profile_builder = profile_builder(&provider, model, &client, tool_secrets);
-    let mut profile = profile_builder.clone().build();
+    let mut profile = profile_builder.build();
     let env = Arc::new(LocalSandbox::new(cwd.to_path_buf()));
 
     // Register subagent tools so spawn_agent / wait / send_input / close_agent are
@@ -95,7 +91,7 @@ async fn make_session(
     let factory_cwd = cwd.to_path_buf();
     let factory_profile_builder = profile_builder;
     let factory: SessionFactory = Arc::new(move || {
-        let sub_profile: Arc<dyn AgentProfile> = Arc::from(factory_profile_builder.clone().build());
+        let sub_profile: Arc<dyn AgentProfile> = Arc::from(factory_profile_builder.build());
         let sub_env = Arc::new(LocalSandbox::new(factory_cwd.clone()));
         Session::new(
             factory_client.clone(),
@@ -195,6 +191,17 @@ fn make_openai_compatible_twin_session(
 
 macro_rules! provider_test {
     ($scenario:ident, $provider:expr, $model:expr, $prefix:ident, keys = [$($key:expr),+ $(,)?]) => {
+        provider_test!(
+            $scenario, $provider, $model, $prefix,
+            keys = [$($key),+],
+            secrets = ToolSecrets::default()
+        );
+    };
+    (
+        $scenario:ident, $provider:expr, $model:expr, $prefix:ident,
+        keys = [$($key:expr),+ $(,)?],
+        secrets = $secrets:expr
+    ) => {
         paste::paste! {
             #[fabro_macros::e2e_test($(live($key)),+)]
             async fn [<$prefix _ $scenario>]() {
@@ -203,7 +210,7 @@ macro_rules! provider_test {
                     $provider,
                     $model,
                     tmp.path(),
-                    ToolSecrets::default(),
+                    $secrets,
                     None,
                 ).await;
                 session.initialize().await.unwrap();
@@ -213,24 +220,21 @@ macro_rules! provider_test {
     };
 }
 
+/// `web_search` is only registered when a Brave key is configured, so these
+/// scenarios must supply one rather than relying on ambient env.
 macro_rules! web_search_provider_test {
     ($provider:expr, $model:expr, $prefix:ident, keys = [$($key:expr),+ $(,)?]) => {
-        paste::paste! {
-            #[fabro_macros::e2e_test($(live($key)),+)]
-            async fn [<$prefix _web_search>]() {
-                let tmp = tempfile::tempdir().expect("failed to create tempdir");
-                let tool_secrets = ToolSecrets {
-                    brave_search_api_key: Some(
-                        std::env::var("BRAVE_SEARCH_API_KEY")
-                            .expect("BRAVE_SEARCH_API_KEY must be set for web-search tests"),
+        provider_test!(
+            web_search, $provider, $model, $prefix,
+            keys = [$($key),+],
+            secrets = ToolSecrets {
+                brave_search_api_key: Some(
+                    std::env::var(EnvVars::BRAVE_SEARCH_API_KEY).expect(
+                        "BRAVE_SEARCH_API_KEY must be set for web-search tests",
                     ),
-                };
-                let mut session =
-                    make_session($provider, $model, tmp.path(), tool_secrets, None).await;
-                session.initialize().await.unwrap();
-                scenario_web_search(&mut session, tmp.path()).await;
+                ),
             }
-        }
+        );
     };
 }
 

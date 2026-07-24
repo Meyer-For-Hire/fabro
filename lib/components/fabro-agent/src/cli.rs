@@ -547,7 +547,7 @@ pub async fn run_with_args_and_client_and_catalog(
         client.clone(),
     )))
     .with_tool_secrets(tool_secrets);
-    let mut profile = profile_builder.clone().build();
+    let mut profile = profile_builder.build();
 
     // Build sandbox
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -583,7 +583,7 @@ pub async fn run_with_args_and_client_and_catalog(
     let factory_hooks = config.tool_hooks.clone();
     let factory_permission_level = config.permission_level;
     let factory: SessionFactory = Arc::new(move || {
-        let child_profile = factory_profile_builder.clone().build();
+        let child_profile = factory_profile_builder.build();
         let child_profile: Arc<dyn AgentProfile> = Arc::from(child_profile);
         Session::new(
             factory_client.clone(),

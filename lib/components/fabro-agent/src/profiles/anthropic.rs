@@ -13,24 +13,27 @@ use crate::todo_tools::{
     make_task_create_tool, make_task_get_tool, make_task_list_tool, make_task_update_tool,
 };
 use crate::tool_registry::ToolRegistry;
-use crate::tools::{WebFetchSummarizer, make_edit_file_tool, register_core_tools};
+use crate::tools::{
+    WEB_SEARCH_TOOL_NAME, WebFetchSummarizer, make_edit_file_tool, register_core_tools,
+};
 
 pub struct AnthropicProfile {
     base: BaseProfile,
 }
 
 fn anthropic_core_prompt(has_spawn_agent: bool, has_web_search: bool) -> String {
+    let using_tools = using_tools_section(has_web_search);
     let mut sections = vec![
-        intro_section().to_string(),
-        system_section().to_string(),
-        "{env_block}".to_string(),
-        doing_tasks_section().to_string(),
-        executing_actions_section().to_string(),
-        using_tools_section(has_web_search),
-        session_specific_guidance_section(has_spawn_agent).to_string(),
-        communicating_with_user_section().to_string(),
-        tone_and_style_section().to_string(),
-        coding_best_practices_section().to_string(),
+        intro_section(),
+        system_section(),
+        "{env_block}",
+        doing_tasks_section(),
+        executing_actions_section(),
+        using_tools.as_str(),
+        session_specific_guidance_section(has_spawn_agent),
+        communicating_with_user_section(),
+        tone_and_style_section(),
+        coding_best_practices_section(),
     ];
     sections.retain(|section| !section.is_empty());
     sections.join("\n\n")
@@ -180,16 +183,8 @@ in the project. Keep changes minimal and focused on the task."
 impl AnthropicProfile {
     #[must_use]
     pub fn new(model: impl Into<String>) -> Self {
-        Self::with_summarizer(model, None)
-    }
-
-    #[must_use]
-    pub fn with_summarizer(
-        model: impl Into<String>,
-        summarizer: Option<WebFetchSummarizer>,
-    ) -> Self {
         let options = NativeToolOptions::for_profile(AgentProfileKind::Anthropic);
-        Self::with_native_tools(model, &options, summarizer)
+        Self::with_native_tools(model, &options, None)
     }
 
     pub(crate) fn with_native_tools(
@@ -267,7 +262,7 @@ impl AgentProfile for AnthropicProfile {
         skills: &[Skill],
     ) -> String {
         let has_spawn_agent = self.base.registry.get("spawn_agent").is_some();
-        let has_web_search = self.base.registry.get("web_search").is_some();
+        let has_web_search = self.base.registry.get(WEB_SEARCH_TOOL_NAME).is_some();
         let core_prompt = anthropic_core_prompt(has_spawn_agent, has_web_search);
 
         assemble_system_prompt(

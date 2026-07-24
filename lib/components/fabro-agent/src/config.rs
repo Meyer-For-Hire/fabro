@@ -126,11 +126,19 @@ pub struct NativeToolOptions {
 
 impl NativeToolOptions {
     pub(crate) fn for_profile(profile_kind: AgentProfileKind) -> Self {
-        let mut options = Self::default();
-        if profile_kind == AgentProfileKind::Anthropic {
-            options.default_command_timeout_ms = 120_000;
+        let defaults = Self::default();
+        // Matched exhaustively so a new profile kind has to state its answer
+        // rather than silently inheriting the default timeout.
+        let default_command_timeout_ms = match profile_kind {
+            AgentProfileKind::Anthropic => 120_000,
+            AgentProfileKind::OpenAi | AgentProfileKind::Gemini => {
+                defaults.default_command_timeout_ms
+            }
+        };
+        Self {
+            default_command_timeout_ms,
+            ..defaults
         }
-        options
     }
 }
 

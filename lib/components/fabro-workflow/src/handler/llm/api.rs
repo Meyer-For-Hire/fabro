@@ -818,7 +818,7 @@ impl AgentApiBackend {
             Arc::clone(&catalog),
         )
         .with_tool_secrets(tool_secrets);
-        let mut profile = profile_builder.clone().build();
+        let mut profile = profile_builder.build();
 
         let config = SessionOptions {
             max_tokens: node.max_tokens(),
@@ -846,7 +846,7 @@ impl AgentApiBackend {
         let factory_fabro_run_tools = fabro_run_tools.clone();
         let factory_permission_level = config.permission_level;
         let factory: SessionFactory = Arc::new(move || {
-            let mut child_profile = factory_profile_builder.clone().build();
+            let mut child_profile = factory_profile_builder.build();
             if let Some(services) = factory_fabro_run_tools.clone() {
                 register_fabro_run_tools(child_profile.tool_registry_mut(), &services);
             }

@@ -10,8 +10,8 @@ use crate::sandbox::Sandbox;
 use crate::skills::Skill;
 use crate::tool_registry::ToolRegistry;
 use crate::tools::{
-    WebFetchSummarizer, make_edit_file_tool, make_list_dir_tool, make_read_many_files_tool,
-    register_core_tools,
+    WEB_SEARCH_TOOL_NAME, WebFetchSummarizer, make_edit_file_tool, make_list_dir_tool,
+    make_read_many_files_tool, register_core_tools,
 };
 
 pub struct GeminiProfile {
@@ -21,16 +21,8 @@ pub struct GeminiProfile {
 impl GeminiProfile {
     #[must_use]
     pub fn new(model: impl Into<String>) -> Self {
-        Self::with_summarizer(model, None)
-    }
-
-    #[must_use]
-    pub fn with_summarizer(
-        model: impl Into<String>,
-        summarizer: Option<WebFetchSummarizer>,
-    ) -> Self {
         let options = NativeToolOptions::for_profile(AgentProfileKind::Gemini);
-        Self::with_native_tools(model, &options, summarizer)
+        Self::with_native_tools(model, &options, None)
     }
 
     pub(crate) fn with_native_tools(
@@ -103,7 +95,7 @@ impl AgentProfile for GeminiProfile {
         user_instructions: Option<&str>,
         skills: &[Skill],
     ) -> String {
-        let web_search_guidance = if self.base.registry.get("web_search").is_some() {
+        let web_search_guidance = if self.base.registry.get(WEB_SEARCH_TOOL_NAME).is_some() {
             "## web_search
 Search the web for information.
 
@@ -111,8 +103,7 @@ Search the web for information.
         } else {
             ""
         };
-        let core_prompt = format!(
-            "\
+        let core_prompt = "\
 You are Gemini CLI, an interactive CLI agent specializing in software engineering tasks \
 including solving bugs, adding new functionality, refactoring code, and explaining code. \
 Your primary goal is to help users safely and effectively.
@@ -144,7 +135,7 @@ still providing the best answer you can.
 files individually.
 - If you need to read multiple ranges in a file, do so in parallel.
 
-{{env_block}}
+{env_block}
 
 # Development Lifecycle
 
@@ -201,7 +192,7 @@ Find files by name pattern. Results sorted by modification time.
 ## list_dir
 List directory contents with depth control.
 
-{web_search_guidance}## web_fetch
+{web_search_section}## web_fetch
 Fetch content from a URL and optionally summarize it. Pass a prompt to extract specific \
 information instead of returning the full page.
 
@@ -225,7 +216,7 @@ These are foundational mandates that take precedence over defaults in this promp
 
 Write clean, maintainable code. Handle errors appropriately. Follow existing code conventions \
 in the project."
-        );
+            .replace("{web_search_section}", web_search_guidance);
 
         assemble_system_prompt(
             &core_prompt,

@@ -15,7 +15,7 @@ use fabro_agent::profiles::assemble_system_prompt;
 use fabro_agent::tool_registry::ToolRegistry;
 use fabro_agent::{
     AgentEvent, AgentProfile, AgentProfileBuilder, Error as AgentError, Session, SessionEvent,
-    SessionOptions, ToolSecrets, WebFetchSummarizer,
+    SessionOptions, WebFetchSummarizer,
 };
 use fabro_api::types::{
     CreateRunSessionRequest, PaginatedEventList, PaginationMeta, SubmitTurnRequest,
@@ -731,20 +731,16 @@ async fn build_agent_session(
         .await
         .map_err(AskFabroBuildError::SandboxUnavailable)?;
     let sandbox: Arc<dyn fabro_agent::Sandbox> = Arc::from(sandbox);
-    let brave_search_api_key = state
-        .vault_secret(EnvVars::BRAVE_SEARCH_API_KEY)
-        .await
-        .map_err(|err| AskFabroBuildError::Agent(anyhow::Error::new(err)))?;
     let summarizer = WebFetchSummarizer {
         client:   llm_result.client.clone(),
         model_id: summarizer_model_id(&provider_id, profile_kind, &catalog, &model),
     };
+    // No tool secrets: `AskFabroToolAccessPolicy` denies `web_search`, and both
+    // `tools()` and the prompt are filtered through that policy, so a Brave key
+    // here would only register a tool this session can never call.
     let mut profile =
         AgentProfileBuilder::new(profile_kind, provider_id, &model, Arc::clone(&catalog))
             .with_web_fetch_summarizer(Some(summarizer))
-            .with_tool_secrets(ToolSecrets {
-                brave_search_api_key,
-            })
             .build();
 
     // Give the Ask Fabro agent access to read-only run-inspection tools scoped

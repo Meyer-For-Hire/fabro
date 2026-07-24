@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use fabro_agent::{AgentProfile, AnthropicProfile, GeminiProfile, OpenAiProfile};
-use fabro_model::{Catalog, ProviderId};
+use fabro_agent::{AgentProfile, AgentProfileBuilder};
+use fabro_model::Catalog;
 
 #[test]
 fn profile_context_window_matches_catalog_for_default_models() {
@@ -15,22 +15,13 @@ fn profile_context_window_matches_catalog_for_default_models() {
         let context_window = usize::try_from(catalog_info.context_window())
             .expect("catalog context window should be non-negative and fit in usize");
 
-        let profile: Box<dyn AgentProfile> = match provider.agent_profile {
-            fabro_model::AgentProfileKind::OpenAi if provider.id == ProviderId::openai() => {
-                Box::new(OpenAiProfile::new(model.as_str()).with_catalog(Arc::clone(&catalog)))
-            }
-            fabro_model::AgentProfileKind::OpenAi => Box::new(
-                OpenAiProfile::new(model.as_str())
-                    .with_provider_id(provider.id.clone())
-                    .with_catalog(Arc::clone(&catalog)),
-            ),
-            fabro_model::AgentProfileKind::Gemini => {
-                Box::new(GeminiProfile::new(model.as_str()).with_catalog(Arc::clone(&catalog)))
-            }
-            fabro_model::AgentProfileKind::Anthropic => {
-                Box::new(AnthropicProfile::new(model.as_str()).with_catalog(Arc::clone(&catalog)))
-            }
-        };
+        let profile: Box<dyn AgentProfile> = AgentProfileBuilder::new(
+            provider.agent_profile,
+            provider.id.clone(),
+            model.as_str(),
+            Arc::clone(&catalog),
+        )
+        .build();
 
         assert_eq!(
             profile.context_window_size(),

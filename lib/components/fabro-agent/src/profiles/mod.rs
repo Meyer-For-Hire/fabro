@@ -20,8 +20,9 @@ use crate::tools::WebFetchSummarizer;
 /// Builds a provider profile and its native tools from one configuration.
 ///
 /// Native tool options must be supplied before [`Self::build`] because their
-/// values are captured by tool executors during profile construction. Clone a
-/// configured builder when root and child sessions must expose the same tools.
+/// values are captured by tool executors during profile construction.
+/// [`Self::build`] borrows, so one configured builder can outfit both a root
+/// session and every child session it spawns with an identical tool set.
 #[derive(Clone)]
 pub struct AgentProfileBuilder {
     profile_kind:        AgentProfileKind,
@@ -57,51 +58,31 @@ impl AgentProfileBuilder {
     }
 
     #[must_use]
-    pub fn with_command_timeouts(
-        mut self,
-        default_command_timeout_ms: u64,
-        max_command_timeout_ms: u64,
-    ) -> Self {
-        self.native_tool_options.default_command_timeout_ms = default_command_timeout_ms;
-        self.native_tool_options.max_command_timeout_ms = max_command_timeout_ms;
-        self
-    }
-
-    #[must_use]
     pub fn with_web_fetch_summarizer(mut self, summarizer: Option<WebFetchSummarizer>) -> Self {
         self.summarizer = summarizer;
         self
     }
 
     #[must_use]
-    pub fn build(self) -> Box<dyn AgentProfile> {
+    pub fn build(&self) -> Box<dyn AgentProfile> {
+        let model = self.model.as_str();
+        let options = &self.native_tool_options;
+        let summarizer = self.summarizer.clone();
         match self.profile_kind {
             AgentProfileKind::OpenAi => Box::new(
-                OpenAiProfile::with_native_tools(
-                    self.model,
-                    &self.native_tool_options,
-                    self.summarizer,
-                )
-                .with_provider_id(self.provider_id)
-                .with_catalog(self.catalog),
+                OpenAiProfile::with_native_tools(model, options, summarizer)
+                    .with_provider_id(self.provider_id.clone())
+                    .with_catalog(Arc::clone(&self.catalog)),
             ),
             AgentProfileKind::Gemini => Box::new(
-                GeminiProfile::with_native_tools(
-                    self.model,
-                    &self.native_tool_options,
-                    self.summarizer,
-                )
-                .with_provider_id(self.provider_id)
-                .with_catalog(self.catalog),
+                GeminiProfile::with_native_tools(model, options, summarizer)
+                    .with_provider_id(self.provider_id.clone())
+                    .with_catalog(Arc::clone(&self.catalog)),
             ),
             AgentProfileKind::Anthropic => Box::new(
-                AnthropicProfile::with_native_tools(
-                    self.model,
-                    &self.native_tool_options,
-                    self.summarizer,
-                )
-                .with_provider_id(self.provider_id)
-                .with_catalog(self.catalog),
+                AnthropicProfile::with_native_tools(model, options, summarizer)
+                    .with_provider_id(self.provider_id.clone())
+                    .with_catalog(Arc::clone(&self.catalog)),
             ),
         }
     }
@@ -215,6 +196,7 @@ pub fn build_env_context_block_with(env: &dyn Sandbox, ctx: &EnvContext) -> Stri
 mod tests {
     use super::*;
     use crate::test_support::MockSandbox;
+    use crate::tools::WEB_SEARCH_TOOL_NAME;
 
     #[test]
     fn env_context_block_contains_platform() {
@@ -279,7 +261,7 @@ mod tests {
             .build();
             assert_eq!(profile.profile_kind(), profile_kind);
             assert_eq!(profile.provider_id(), provider_id);
-            assert!(profile.tool_registry().get("web_search").is_none());
+            assert!(profile.tool_registry().get(WEB_SEARCH_TOOL_NAME).is_none());
             let prompt = profile.build_system_prompt(&env, &EnvContext::default(), &[], None, &[]);
             assert!(
                 !prompt.contains("web_search"),
@@ -294,13 +276,16 @@ mod tests {
             )
             .with_tool_secrets(ToolSecrets {
                 brave_search_api_key: Some("configured-key".to_string()),
-            })
-            .with_command_timeouts(20_000, 600_000);
-            for configured in [
-                configured_builder.clone().build(),
-                configured_builder.build(),
-            ] {
-                assert!(configured.tool_registry().get("web_search").is_some());
+            });
+            // Built twice: one configured builder must outfit both a root
+            // session and the child sessions it spawns.
+            for configured in [configured_builder.build(), configured_builder.build()] {
+                assert!(
+                    configured
+                        .tool_registry()
+                        .get(WEB_SEARCH_TOOL_NAME)
+                        .is_some()
+                );
                 let prompt =
                     configured.build_system_prompt(&env, &EnvContext::default(), &[], None, &[]);
                 assert!(

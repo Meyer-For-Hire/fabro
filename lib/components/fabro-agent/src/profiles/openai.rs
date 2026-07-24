@@ -38,16 +38,8 @@ pub struct OpenAiProfile {
 impl OpenAiProfile {
     #[must_use]
     pub fn new(model: impl Into<String>) -> Self {
-        Self::with_summarizer(model, None)
-    }
-
-    #[must_use]
-    pub fn with_summarizer(
-        model: impl Into<String>,
-        summarizer: Option<WebFetchSummarizer>,
-    ) -> Self {
         let options = NativeToolOptions::for_profile(AgentProfileKind::OpenAi);
-        Self::with_native_tools(model, &options, summarizer)
+        Self::with_native_tools(model, &options, None)
     }
 
     pub(crate) fn with_native_tools(
@@ -196,7 +188,12 @@ The `old_string` must match exactly and be unique unless `replace_all` is true; 
 surrounding context to make the match unique and preserve the existing indentation.",
                 ),
             };
-        let web_search_guidance = if self.base.registry.get("web_search").is_some() {
+        let web_search_guidance = if self
+            .base
+            .registry
+            .get(tools::WEB_SEARCH_TOOL_NAME)
+            .is_some()
+        {
             "## web_search
 Search the web using Brave Search. Returns titles, URLs, and descriptions.
 

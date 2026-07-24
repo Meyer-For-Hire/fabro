@@ -46,6 +46,11 @@ fn html_to_markdown(text: &str) -> String {
     converter.convert(text).unwrap_or_else(|_| text.to_string())
 }
 
+/// Name of the Brave-backed web search tool. Profiles look this up in their own
+/// registry to decide whether to advertise web search in the system prompt, so
+/// availability and prompt guidance cannot drift apart.
+pub const WEB_SEARCH_TOOL_NAME: &str = "web_search";
+
 /// Registers the core tools shared by all provider profiles: `read_file`,
 /// `write_file`, `shell`, `grep`, `glob`, and `web_fetch`. `web_search` is
 /// included when a Brave Search API key is configured.
@@ -522,7 +527,7 @@ fn make_web_search_tool_with_api_key(api_key: String) -> RegisteredTool {
 
     RegisteredTool {
         definition: ToolDefinition {
-            name:        "web_search".into(),
+            name:        WEB_SEARCH_TOOL_NAME.into(),
             description: "Search the web using Brave Search when current external information is needed. Returns result titles, URLs, and descriptions; use web_fetch for a specific URL.".into(),
             parameters:  serde_json::json!({
                 "type": "object",
