@@ -26,6 +26,16 @@ pub(super) struct ApiRequest {
     pub response_format:  Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream:           Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options:   Option<StreamOptions>,
+}
+
+/// Streaming options. Chat Completions only emits the trailing usage chunk
+/// when the request opts in, so without this a streamed response reports zero
+/// tokens and costs are estimated at $0.
+#[derive(serde::Serialize)]
+pub(super) struct StreamOptions {
+    pub include_usage: bool,
 }
 
 #[derive(serde::Serialize)]

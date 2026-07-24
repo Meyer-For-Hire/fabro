@@ -812,7 +812,8 @@ async fn stream_text_happy_path_capture() -> (WireCapture, Vec<serde_json::Value
     stream_capture(&base_request(MODEL), &sse).await
 }
 
-/// The captured request pins the stream flag on the wire.
+/// The captured request pins the streaming request shape, including the usage
+/// opt-in required for the trailing usage chunk.
 #[tokio::test]
 async fn stream_text_happy_path_request() {
     let (capture, _) = stream_text_happy_path_capture().await;

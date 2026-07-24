@@ -236,7 +236,11 @@ pub fn responses_sse_response(plan: &ResponsePlan, transport: TransportOptions) 
     stream_response(events, transport)
 }
 
-pub fn chat_sse_response(plan: &ResponsePlan, transport: TransportOptions) -> Response<Body> {
+pub fn chat_sse_response(
+    plan: &ResponsePlan,
+    include_usage: bool,
+    transport: TransportOptions,
+) -> Response<Body> {
     let mut events = Vec::new();
     let content = plan.chat_content();
     events.push(chat_chunk(&json!({
@@ -321,6 +325,16 @@ pub fn chat_sse_response(plan: &ResponsePlan, transport: TransportOptions) -> Re
                 "finish_reason": if plan.tool_calls.is_empty() { "stop" } else { "tool_calls" },
             }]
         })));
+        if include_usage {
+            events.push(chat_chunk(&json!({
+                "id": format!("chatcmpl_{}", plan.id),
+                "object": "chat.completion.chunk",
+                "created": plan.created,
+                "model": plan.model,
+                "choices": [],
+                "usage": plan.usage.chat_completions_json(),
+            })));
+        }
         events.push("data: [DONE]\n\n".to_owned());
     }
 

@@ -534,13 +534,27 @@ pub struct ChatCompletionsRequest {
     pub max_tokens:      Option<i64>,
     #[serde(default)]
     pub stream:          bool,
+    stream_options:      Option<ChatStreamOptions>,
     pub tools:           Option<Vec<Value>>,
     pub tool_choice:     Option<Value>,
     pub response_format: Option<ChatResponseFormat>,
     pub stop:            Option<Value>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChatStreamOptions {
+    #[serde(default)]
+    include_usage: bool,
+}
+
 impl ChatCompletionsRequest {
+    pub fn include_stream_usage(&self) -> bool {
+        self.stream_options
+            .as_ref()
+            .is_some_and(|options| options.include_usage)
+    }
+
     pub fn extract_user_text(&self) -> String {
         let pieces: Vec<String> = self
             .messages
