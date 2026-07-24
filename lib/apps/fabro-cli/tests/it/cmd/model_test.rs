@@ -42,6 +42,9 @@ fn model_json(id: &str, provider: &str, configured: bool) -> serde_json::Value {
             "vision": false,
             "reasoning": false
         },
+        "controls": {
+            "reasoning_effort": []
+        },
         "costs": {
             "input_cost_per_mtok": 1.0,
             "output_cost_per_mtok": 2.0,

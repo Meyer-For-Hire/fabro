@@ -1,6 +1,6 @@
 use std::any::{TypeId, type_name};
 
-use fabro_api::types::Model as ApiModel;
+use fabro_api::types::{Model as ApiModel, ModelControls as ApiModelControls};
 use fabro_model::{
     Model, ModelControls, ModelCosts, ModelFeatures, ModelLimits, ProviderId, ReasoningEffort,
     ReasoningEffortFeature,
@@ -9,6 +9,7 @@ use fabro_model::{
 #[test]
 fn model_reuses_canonical_type() {
     assert_same_type::<ApiModel, Model>();
+    assert_same_type::<ApiModelControls, ModelControls>();
 }
 
 #[test]

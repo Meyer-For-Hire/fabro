@@ -84,11 +84,10 @@ pub struct ModelCosts {
     pub cache_input_cost_per_mtok: Option<f64>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModelControls {
     /// Exact reasoning-effort values accepted by this provider/model offering.
     /// An empty list means the request control is unsupported.
-    #[serde(default)]
     pub reasoning_effort: Vec<ReasoningEffort>,
 }
 
@@ -102,7 +101,6 @@ pub struct Model {
     pub training:             Option<String>,
     pub knowledge_cutoff:     Option<String>,
     pub features:             ModelFeatures,
-    #[serde(default)]
     pub controls:             ModelControls,
     pub costs:                ModelCosts,
     pub estimated_output_tps: Option<f64>,

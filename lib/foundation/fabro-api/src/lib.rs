@@ -20,8 +20,9 @@ pub mod types {
     };
     pub use fabro_environment::Environment;
     pub use fabro_model::{
-        CostSource, Model, ModelCosts, ModelFeatures, ModelLimits, ModelRef as BillingModelRef,
-        ModelTestMode, Provider, ReasoningEffort, ReasoningEffortFeature, Speed as BillingSpeed,
+        CostSource, Model, ModelControls, ModelCosts, ModelFeatures, ModelLimits,
+        ModelRef as BillingModelRef, ModelTestMode, Provider, ReasoningEffort,
+        ReasoningEffortFeature, Speed as BillingSpeed,
     };
     pub use fabro_types::run_event::AgentSessionActivatedProps;
     pub use fabro_types::settings::run::McpHttpProtocol;

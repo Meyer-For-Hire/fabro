@@ -478,6 +478,7 @@ fn main() {
         ),
         ("ReasoningEffort", "fabro_model::ReasoningEffort", &[]),
         ("ModelFeatures", "fabro_model::ModelFeatures", &[]),
+        ("ModelControls", "fabro_model::ModelControls", &[]),
         ("ModelCosts", "fabro_model::ModelCosts", &[]),
         ("ModelTestMode", "fabro_model::ModelTestMode", &[]),
         ("RunProjection", "fabro_types::RunProjection", &[]),
