@@ -9829,6 +9829,97 @@ async fn list_run_events_returns_paginated_json() {
 }
 
 #[tokio::test]
+async fn list_run_events_descends_from_latest_with_exclusive_cursor() {
+    let state = test_app_state();
+    let app = crate::test_support::build_test_router(Arc::clone(&state));
+    let run_id = RunId::new();
+    create_durable_run_with_events(&state, run_id, &[
+        workflow_event::Event::RunRunnable {
+            source: fabro_types::RunRunnableSource::StartRequested,
+            actor:  None,
+        },
+        workflow_event::Event::RunStarting,
+        workflow_event::Event::RunRunning,
+    ])
+    .await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(api(&format!("/runs/{run_id}/events?order=desc&limit=2")))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = response_json!(response, StatusCode::OK).await;
+    let seqs = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["seq"].as_u64().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(seqs, vec![4, 3]);
+    assert_eq!(body["meta"]["has_more"], true);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(api(&format!(
+                    "/runs/{run_id}/events?order=desc&before_seq=3&limit=2"
+                )))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = response_json!(response, StatusCode::OK).await;
+    let seqs = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["seq"].as_u64().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(seqs, vec![2, 1]);
+    assert_eq!(body["meta"]["has_more"], false);
+}
+
+#[tokio::test]
+async fn list_run_events_rejects_cursor_for_opposite_order() {
+    let app = crate::test_support::build_test_router(test_app_state());
+    let run_id = RunId::new();
+    let cases = [
+        (
+            format!("/runs/{run_id}/events?order=desc&since_seq=2"),
+            "since_seq cannot be combined with order=desc; use before_seq instead.",
+        ),
+        (
+            format!("/runs/{run_id}/events?before_seq=2"),
+            "before_seq requires order=desc.",
+        ),
+    ];
+
+    for (path, expected_detail) in cases {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(api(&path))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response_json!(response, StatusCode::BAD_REQUEST).await;
+        assert_eq!(body["errors"][0]["detail"], expected_detail);
+    }
+}
+
+#[tokio::test]
 async fn append_run_event_rejects_run_id_mismatch() {
     let state = test_app_state();
     let app = crate::test_support::build_test_router(Arc::clone(&state));

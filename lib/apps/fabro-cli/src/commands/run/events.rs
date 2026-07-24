@@ -42,10 +42,14 @@ pub(crate) async fn run(
         None => None,
     };
 
-    let events = client
-        .list_run_events(&run_id, None, None)
-        .await
-        .context("Failed to list server-backed run events")?;
+    let events = match (args.tail, since_cutoff.is_none()) {
+        (Some(tail), true) => {
+            let tail = if args.follow { tail.max(1) } else { tail };
+            client.list_run_events_tail(&run_id, tail).await
+        }
+        _ => client.list_run_events(&run_id, None, None).await,
+    }
+    .context("Failed to list server-backed run events")?;
     let last_seq = events.last().map_or(0, |event| event.seq);
     let all_lines = events
         .iter()

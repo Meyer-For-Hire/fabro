@@ -472,15 +472,17 @@ export const RunInternalsApiAxiosParamCreator = function (configuration?: Config
             };
         },
         /**
-         * Returns a paginated JSON list of stored run events.
+         * Returns a paginated JSON list of stored run events. Ascending order uses `since_seq` as an inclusive cursor. Descending order uses `before_seq` as an exclusive cursor and starts at the newest event when `before_seq` is omitted.
          * @summary List Run Events
          * @param {string} id Unique run identifier (ULID).
          * @param {number} [sinceSeq] First event sequence number to include.
          * @param {number} [limit] Maximum number of events to return.
+         * @param {number} [beforeSeq] Exclusive upper event sequence cursor for descending order. Omit on the first descending request to start from the newest event.
+         * @param {ListRunEventsOrderEnum} [order] Event sequence order. &#x60;since_seq&#x60; is valid only with &#x60;asc&#x60;; &#x60;before_seq&#x60; is valid only with &#x60;desc&#x60;.
          * @param {*} [options] Override http request option.
          * @throws {RequiredError}
          */
-        listRunEvents: async (id: string, sinceSeq?: number, limit?: number, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
+        listRunEvents: async (id: string, sinceSeq?: number, limit?: number, beforeSeq?: number, order?: ListRunEventsOrderEnum, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
             // verify required parameter 'id' is not null or undefined
             assertParamExists('listRunEvents', 'id', id)
             const localVarPath = `/api/v1/runs/{id}/events`
@@ -508,6 +510,14 @@ export const RunInternalsApiAxiosParamCreator = function (configuration?: Config
 
             if (limit !== undefined) {
                 localVarQueryParameter['limit'] = limit;
+            }
+
+            if (beforeSeq !== undefined) {
+                localVarQueryParameter['before_seq'] = beforeSeq;
+            }
+
+            if (order !== undefined) {
+                localVarQueryParameter['order'] = order;
             }
 
             localVarHeaderParameter['Accept'] = 'application/json';
@@ -1037,16 +1047,18 @@ export const RunInternalsApiFp = function(configuration?: Configuration) {
             return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
         },
         /**
-         * Returns a paginated JSON list of stored run events.
+         * Returns a paginated JSON list of stored run events. Ascending order uses `since_seq` as an inclusive cursor. Descending order uses `before_seq` as an exclusive cursor and starts at the newest event when `before_seq` is omitted.
          * @summary List Run Events
          * @param {string} id Unique run identifier (ULID).
          * @param {number} [sinceSeq] First event sequence number to include.
          * @param {number} [limit] Maximum number of events to return.
+         * @param {number} [beforeSeq] Exclusive upper event sequence cursor for descending order. Omit on the first descending request to start from the newest event.
+         * @param {ListRunEventsOrderEnum} [order] Event sequence order. &#x60;since_seq&#x60; is valid only with &#x60;asc&#x60;; &#x60;before_seq&#x60; is valid only with &#x60;desc&#x60;.
          * @param {*} [options] Override http request option.
          * @throws {RequiredError}
          */
-        async listRunEvents(id: string, sinceSeq?: number, limit?: number, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<PaginatedEventList>> {
-            const localVarAxiosArgs = await localVarAxiosParamCreator.listRunEvents(id, sinceSeq, limit, options);
+        async listRunEvents(id: string, sinceSeq?: number, limit?: number, beforeSeq?: number, order?: ListRunEventsOrderEnum, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<PaginatedEventList>> {
+            const localVarAxiosArgs = await localVarAxiosParamCreator.listRunEvents(id, sinceSeq, limit, beforeSeq, order, options);
             const localVarOperationServerIndex = configuration?.serverIndex ?? 0;
             const localVarOperationServerBasePath = operationServerMap['RunInternalsApi.listRunEvents']?.[localVarOperationServerIndex]?.url;
             return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
@@ -1278,16 +1290,18 @@ export const RunInternalsApiFactory = function (configuration?: Configuration, b
             return localVarFp.listRunArtifacts(id, options).then((request) => request(axios, basePath));
         },
         /**
-         * Returns a paginated JSON list of stored run events.
+         * Returns a paginated JSON list of stored run events. Ascending order uses `since_seq` as an inclusive cursor. Descending order uses `before_seq` as an exclusive cursor and starts at the newest event when `before_seq` is omitted.
          * @summary List Run Events
          * @param {string} id Unique run identifier (ULID).
          * @param {number} [sinceSeq] First event sequence number to include.
          * @param {number} [limit] Maximum number of events to return.
+         * @param {number} [beforeSeq] Exclusive upper event sequence cursor for descending order. Omit on the first descending request to start from the newest event.
+         * @param {ListRunEventsOrderEnum} [order] Event sequence order. &#x60;since_seq&#x60; is valid only with &#x60;asc&#x60;; &#x60;before_seq&#x60; is valid only with &#x60;desc&#x60;.
          * @param {*} [options] Override http request option.
          * @throws {RequiredError}
          */
-        listRunEvents(id: string, sinceSeq?: number, limit?: number, options?: RawAxiosRequestConfig): AxiosPromise<PaginatedEventList> {
-            return localVarFp.listRunEvents(id, sinceSeq, limit, options).then((request) => request(axios, basePath));
+        listRunEvents(id: string, sinceSeq?: number, limit?: number, beforeSeq?: number, order?: ListRunEventsOrderEnum, options?: RawAxiosRequestConfig): AxiosPromise<PaginatedEventList> {
+            return localVarFp.listRunEvents(id, sinceSeq, limit, beforeSeq, order, options).then((request) => request(axios, basePath));
         },
         /**
          * Returns the ordered list of stages in a run\'s workflow graph with their current status and timing. Stages are bounded by the workflow graph size, typically fewer than 20.
@@ -1499,16 +1513,18 @@ export class RunInternalsApi extends BaseAPI {
     }
 
     /**
-     * Returns a paginated JSON list of stored run events.
+     * Returns a paginated JSON list of stored run events. Ascending order uses `since_seq` as an inclusive cursor. Descending order uses `before_seq` as an exclusive cursor and starts at the newest event when `before_seq` is omitted.
      * @summary List Run Events
      * @param {string} id Unique run identifier (ULID).
      * @param {number} [sinceSeq] First event sequence number to include.
      * @param {number} [limit] Maximum number of events to return.
+     * @param {number} [beforeSeq] Exclusive upper event sequence cursor for descending order. Omit on the first descending request to start from the newest event.
+     * @param {ListRunEventsOrderEnum} [order] Event sequence order. &#x60;since_seq&#x60; is valid only with &#x60;asc&#x60;; &#x60;before_seq&#x60; is valid only with &#x60;desc&#x60;.
      * @param {*} [options] Override http request option.
      * @throws {RequiredError}
      */
-    public listRunEvents(id: string, sinceSeq?: number, limit?: number, options?: RawAxiosRequestConfig) {
-        return RunInternalsApiFp(this.configuration).listRunEvents(id, sinceSeq, limit, options).then((request) => request(this.axios, this.basePath));
+    public listRunEvents(id: string, sinceSeq?: number, limit?: number, beforeSeq?: number, order?: ListRunEventsOrderEnum, options?: RawAxiosRequestConfig) {
+        return RunInternalsApiFp(this.configuration).listRunEvents(id, sinceSeq, limit, beforeSeq, order, options).then((request) => request(this.axios, this.basePath));
     }
 
     /**
@@ -1611,3 +1627,9 @@ export class RunInternalsApi extends BaseAPI {
         return RunInternalsApiFp(this.configuration).writeRunBlob(id, body, options).then((request) => request(this.axios, this.basePath));
     }
 }
+
+export const ListRunEventsOrderEnum = {
+    ASC: 'asc',
+    DESC: 'desc'
+} as const;
+export type ListRunEventsOrderEnum = typeof ListRunEventsOrderEnum[keyof typeof ListRunEventsOrderEnum];

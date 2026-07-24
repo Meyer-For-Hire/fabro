@@ -379,6 +379,58 @@ impl RunDatabase {
         list_events_from_with_limit(&self.inner.db, &self.inner.run_id, start_seq, limit).await
     }
 
+    /// Returns up to `limit + 1` events immediately before `before_seq` in
+    /// descending sequence order. Omitting `before_seq` starts at the newest
+    /// event. The extra item lets callers compute `has_more`.
+    pub async fn list_events_before_with_limit(
+        &self,
+        before_seq: Option<u32>,
+        limit: usize,
+    ) -> Result<Vec<EventEnvelope>> {
+        let latest_seq = match self
+            .inner
+            .shared_projection_cache
+            .last_seq(&self.inner.run_id)
+            .await
+        {
+            Some(seq) => seq,
+            None => recover_next_seq(
+                &self.inner.db,
+                keys::run_events_prefix(&self.inner.run_id),
+                keys::parse_event_seq,
+            )
+            .await?
+            .saturating_sub(1),
+        };
+        if latest_seq == 0 {
+            return Ok(Vec::new());
+        }
+
+        let latest_exclusive = u64::from(latest_seq) + 1;
+        let end_seq = before_seq
+            .map_or(latest_exclusive, u64::from)
+            .min(latest_exclusive)
+            .max(1);
+        if end_seq == 1 {
+            return Ok(Vec::new());
+        }
+
+        let window_size = u64::try_from(limit.saturating_add(1)).unwrap_or(u64::MAX);
+        let start_seq =
+            u32::try_from(end_seq.saturating_sub(window_size).max(1)).unwrap_or(u32::MAX);
+        let end_seq = u32::try_from(end_seq).ok();
+        let mut events = list_events_in_range_with_limit(
+            &self.inner.db,
+            &self.inner.run_id,
+            start_seq,
+            end_seq,
+            limit,
+        )
+        .await?;
+        events.reverse();
+        Ok(events)
+    }
+
     pub async fn get_event(&self, seq: u32) -> Result<Option<EventEnvelope>> {
         get_event(&self.inner.db, &self.inner.run_id, seq).await
     }
@@ -568,13 +620,35 @@ async fn list_events_from_with_limit<R>(
 where
     R: DbRead + Sync,
 {
+    list_events_in_range_with_limit(db, run_id, start_seq, None, limit).await
+}
+
+async fn list_events_in_range_with_limit<R>(
+    db: &R,
+    run_id: &RunId,
+    start_seq: u32,
+    end_seq: Option<u32>,
+    limit: usize,
+) -> Result<Vec<EventEnvelope>>
+where
+    R: DbRead + Sync,
+{
+    if end_seq.is_some_and(|end_seq| end_seq <= start_seq) {
+        return Ok(Vec::new());
+    }
+
     let event_prefix = keys::run_events_prefix(run_id);
     let max_events = limit.saturating_add(1);
     // Seek to the page cursor and decode only the requested page plus the
     // sentinel used to compute `has_more`.
-    let mut iter = db
-        .scan(keys::run_event_seq_prefix(run_id, start_seq)..)
-        .await?;
+    let start_key = keys::run_event_seq_prefix(run_id, start_seq);
+    let mut iter = match end_seq {
+        Some(end_seq) => {
+            let end_key = keys::run_event_seq_prefix(run_id, end_seq);
+            db.scan(start_key..end_key).await?
+        }
+        None => db.scan(start_key..).await?,
+    };
     let mut events = Vec::new();
     while events.len() < max_events {
         let Some(entry) = iter.next().await? else {
@@ -914,6 +988,65 @@ mod tests {
 
         let seqs: Vec<u32> = events.iter().map(|event| event.seq).collect();
         assert_eq!(seqs, vec![3]);
+    }
+
+    #[tokio::test]
+    async fn list_events_before_with_limit_returns_newest_events_and_sentinel() {
+        let run = fresh_run().await;
+        let run_id = run.run_id();
+        for idx in 1..=5 {
+            run.append_event(&stage_prompt_payload(&run_id, idx, Some("alpha")))
+                .await
+                .unwrap();
+        }
+
+        let events = run.list_events_before_with_limit(None, 2).await.unwrap();
+
+        let seqs: Vec<u32> = events.iter().map(|event| event.seq).collect();
+        assert_eq!(seqs, vec![6, 5, 4]);
+    }
+
+    #[tokio::test]
+    async fn list_events_before_with_limit_does_not_read_older_history() {
+        let run = fresh_run().await;
+        let run_id = run.run_id();
+        for idx in 1..=5 {
+            run.append_event(&stage_prompt_payload(&run_id, idx, Some("alpha")))
+                .await
+                .unwrap();
+        }
+        run.inner
+            .db
+            .put(keys::run_event_key(&run_id, 2, 0), b"invalid json")
+            .await
+            .unwrap();
+
+        let events = run.list_events_before_with_limit(None, 2).await.unwrap();
+
+        let seqs: Vec<u32> = events.iter().map(|event| event.seq).collect();
+        assert_eq!(seqs, vec![6, 5, 4]);
+    }
+
+    #[tokio::test]
+    async fn list_events_before_with_limit_uses_exclusive_cursor() {
+        let run = fresh_run().await;
+        let run_id = run.run_id();
+        for idx in 1..=5 {
+            run.append_event(&stage_prompt_payload(&run_id, idx, Some("alpha")))
+                .await
+                .unwrap();
+        }
+
+        let events = run.list_events_before_with_limit(Some(5), 2).await.unwrap();
+
+        let seqs: Vec<u32> = events.iter().map(|event| event.seq).collect();
+        assert_eq!(seqs, vec![4, 3, 2]);
+        assert!(
+            run.list_events_before_with_limit(Some(1), 2)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

@@ -2838,11 +2838,17 @@ paths:
       operationId: listRunEvents
       tags: [Run Internals]
       summary: List Run Events
-      description: Returns a paginated JSON list of stored run events.
+      description: |
+        Returns a paginated JSON list of stored run events. Ascending order
+        uses `since_seq` as an inclusive cursor. Descending order uses
+        `before_seq` as an exclusive cursor and starts at the newest event
+        when `before_seq` is omitted.
       parameters:
         - $ref: "#/components/parameters/RunId"
         - $ref: "#/components/parameters/SinceSeq"
         - $ref: "#/components/parameters/EventLimit"
+        - $ref: "#/components/parameters/BeforeSeq"
+        - $ref: "#/components/parameters/EventOrder"
       responses:
         "200":
           description: Paginated list of run events
@@ -2850,6 +2856,15 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/PaginatedEventList"
+        "400":
+          description: Invalid cursor and order combination
+          headers:
+            x-request-id:
+              $ref: "#/components/headers/XRequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "404":
           description: Run not found
           headers:
@@ -5852,6 +5867,31 @@ components:
         minimum: 1
         default: 1
       example: 42
+
+    BeforeSeq:
+      name: before_seq
+      in: query
+      required: false
+      description: |
+        Exclusive upper event sequence cursor for descending order. Omit on
+        the first descending request to start from the newest event.
+      schema:
+        type: integer
+        minimum: 1
+      example: 42
+
+    EventOrder:
+      name: order
+      in: query
+      required: false
+      description: |
+        Event sequence order. `since_seq` is valid only with `asc`;
+        `before_seq` is valid only with `desc`.
+      schema:
+        type: string
+        enum: [asc, desc]
+        default: asc
+      example: desc
 
     EventLimit:
       name: limit
