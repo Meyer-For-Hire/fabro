@@ -622,6 +622,7 @@ fn resolve_start_llm(
         &eligible,
         settings.model.name.as_deref(),
         settings.model.provider.as_deref(),
+        false,
     )?;
     let fallback_chain =
         resolve_fallback_chain(catalog, &provider_id, &model, &settings.model, &eligible)?;

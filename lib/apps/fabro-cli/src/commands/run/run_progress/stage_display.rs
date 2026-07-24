@@ -244,7 +244,7 @@ impl StageDisplay {
         renderer: &ProgressRenderer,
         branch: &str,
         duration_ms: u64,
-        status: &str,
+        status: StageOutcome,
     ) {
         let Some(parent_id) = self.parallel_parent.clone() else {
             return;
@@ -261,7 +261,7 @@ impl StageDisplay {
             return;
         };
 
-        let succeeded = matches!(status, "succeeded" | "partially_succeeded");
+        let succeeded = status.is_successful();
         entry.status = if succeeded {
             ToolCallStatus::Succeeded
         } else {

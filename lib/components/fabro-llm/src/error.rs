@@ -95,6 +95,9 @@ pub enum Error {
     #[error("No object generated: {message}")]
     NoObjectGenerated { message: String },
 
+    #[error("Invalid request: {message}")]
+    InvalidRequest { message: String },
+
     #[error("Configuration error: {message}")]
     Configuration {
         message: String,
@@ -164,6 +167,7 @@ impl Error {
             Self::InvalidToolCall { .. }
             | Self::NoObjectGenerated { .. }
             | Self::Interrupt { .. }
+            | Self::InvalidRequest { .. }
             | Self::Configuration { .. }
             | Self::UnsupportedToolChoice { .. }
             | Self::RequestTimeout { .. } => false,
@@ -265,6 +269,9 @@ impl Error {
             }
             Self::NoObjectGenerated { .. } => {
                 format!("api_deterministic|{provider}|no_object")
+            }
+            Self::InvalidRequest { .. } => {
+                format!("api_deterministic|{provider}|invalid_request")
             }
             Self::UnsupportedToolChoice { .. } => {
                 format!("api_deterministic|{provider}|unsupported_tool_choice")
@@ -805,6 +812,14 @@ mod tests {
             source:  None,
         };
         assert_eq!(err.to_string(), "Configuration error: no provider");
+
+        let err = Error::InvalidRequest {
+            message: "unsupported reasoning effort".into(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "Invalid request: unsupported reasoning effort"
+        );
     }
 
     #[test]
@@ -997,6 +1012,13 @@ mod tests {
         );
 
         assert!(
+            !Error::InvalidRequest {
+                message: "bad".into(),
+            }
+            .failover_eligible()
+        );
+
+        assert!(
             !Error::UnsupportedToolChoice {
                 message: "nope".into(),
             }
@@ -1145,6 +1167,13 @@ mod tests {
             }
             .failure_signature_hint(),
             "api_deterministic|unknown|no_object"
+        );
+        assert_eq!(
+            Error::InvalidRequest {
+                message: "bad".into(),
+            }
+            .failure_signature_hint(),
+            "api_deterministic|unknown|invalid_request"
         );
         assert_eq!(
             Error::UnsupportedToolChoice {

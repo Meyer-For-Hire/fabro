@@ -4,6 +4,5 @@
 pub use fabro_sandbox::{
     CommandOutputCallback, DirEntry, ExecResult, ExecStreamingResult, GrepOptions, RefreshOutcome,
     Sandbox, SandboxEvent, SandboxEventCallback, StderrCollector, StdioProcess, StdioProcessHandle,
-    StdioProcessTermination, WorktreeEvent, WorktreeEventCallback, WorktreeOptions,
-    WorktreeSandbox, delegate_sandbox, format_lines_numbered, shell_quote,
+    StdioProcessTermination, delegate_sandbox, format_lines_numbered, shell_quote,
 };

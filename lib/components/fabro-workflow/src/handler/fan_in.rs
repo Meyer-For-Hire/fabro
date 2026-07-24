@@ -2,665 +2,253 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use fabro_agent::Sandbox;
 use fabro_graphviz::graph::{Graph, Node};
-use fabro_types::{StageModelUsage, StageTiming};
-use tokio_util::sync::CancellationToken;
+use fabro_types::ParallelBranchResult;
 
-use super::agent::{CodergenBackend, CodergenResult, CodergenRunRequest};
+use super::agent::CodergenBackend;
+use super::prompt::PromptHandler;
 use super::{EngineServices, Handler};
 use crate::context::{Context, keys};
 use crate::error::Error;
-use crate::event::{Emitter, Event, StageScope};
-use crate::outcome::{Outcome, OutcomeExt};
-use crate::sandbox_git::git_merge_ff_only;
+use crate::event::Emitter;
+use crate::outcome::Outcome;
 
-/// Consolidates results from a preceding parallel node and selects the best
-/// candidate.
+/// Joins results from a preceding parallel node.
+///
+/// Promptless fan-in nodes are barriers. Prompted fan-in nodes use the same
+/// execution path as standard prompt stages and synthesize the full ordered
+/// branch result set without selecting workspace state.
 pub struct FanInHandler {
-    backend: Option<Box<dyn CodergenBackend>>,
+    prompt_handler: PromptHandler,
 }
 
 impl FanInHandler {
     #[must_use]
     pub fn new(backend: Option<Box<dyn CodergenBackend>>) -> Self {
-        Self { backend }
+        Self {
+            prompt_handler: PromptHandler::new(backend),
+        }
+    }
+}
+
+impl FanInHandler {
+    async fn run_join(
+        &self,
+        node: &Node,
+        context: &Context,
+        graph: &Graph,
+        run_dir: &Path,
+        services: &EngineServices,
+        simulated: bool,
+    ) -> Result<Outcome, Error> {
+        let branch_count = validated_branch_count(context)?;
+        if node
+            .prompt()
+            .is_some_and(|prompt| !prompt.trim().is_empty())
+        {
+            return if simulated {
+                self.prompt_handler
+                    .simulate(node, context, graph, run_dir, services)
+                    .await
+            } else {
+                self.prompt_handler
+                    .execute(node, context, graph, run_dir, services)
+                    .await
+            };
+        }
+        Ok(joined_outcome(branch_count, simulated))
     }
 }
 
 #[async_trait]
 impl Handler for FanInHandler {
     async fn shutdown(&self, emitter: &Arc<Emitter>) {
-        if let Some(backend) = self.backend.as_ref() {
-            backend.shutdown(emitter).await;
-        }
+        self.prompt_handler.shutdown(emitter).await;
     }
 
     async fn simulate(
         &self,
         node: &Node,
         context: &Context,
-        _graph: &Graph,
-        _run_dir: &Path,
-        _services: &EngineServices,
+        graph: &Graph,
+        run_dir: &Path,
+        services: &EngineServices,
     ) -> Result<Outcome, Error> {
-        let results = context.get(keys::PARALLEL_RESULTS);
-        let Some(results) = results else {
-            return Ok(Outcome::fail_deterministic(
-                "No parallel results to evaluate",
-            ));
-        };
-
-        let best = heuristic_select(&results);
-
-        let mut outcome = Outcome::simulated(&node.id);
-        outcome.context_updates.insert(
-            keys::PARALLEL_FAN_IN_BEST_ID.to_string(),
-            serde_json::json!(best.id),
-        );
-        outcome.context_updates.insert(
-            keys::PARALLEL_FAN_IN_BEST_OUTCOME.to_string(),
-            serde_json::json!(best.status),
-        );
-        // Override the generic simulated notes with handler-specific detail.
-        outcome.notes = Some(format!("[Simulated] Selected best candidate: {}", best.id));
-        Ok(outcome)
+        self.run_join(node, context, graph, run_dir, services, true)
+            .await
     }
 
     async fn execute(
         &self,
         node: &Node,
         context: &Context,
-        _graph: &Graph,
+        graph: &Graph,
         run_dir: &Path,
         services: &EngineServices,
     ) -> Result<Outcome, Error> {
-        let results = context.get(keys::PARALLEL_RESULTS);
-        let Some(results) = results else {
-            return Ok(Outcome::fail_deterministic(
-                "No parallel results to evaluate",
-            ));
-        };
+        self.run_join(node, context, graph, run_dir, services, false)
+            .await
+    }
+}
 
-        let prompt = node.prompt().filter(|p| !p.is_empty());
+/// Validate that `parallel.results` exists and has the typed shape.
+fn validated_branch_count(context: &Context) -> Result<usize, Error> {
+    let value = context
+        .get(keys::PARALLEL_RESULTS)
+        .ok_or_else(|| Error::handler("No parallel results to join"))?;
+    let results: Vec<ParallelBranchResult> = serde_json::from_value(value)
+        .map_err(|err| Error::handler_with_source("Invalid parallel results", err))?;
+    Ok(results.len())
+}
 
-        let best = if let (Some(prompt_text), Some(backend)) = (prompt, &self.backend) {
-            llm_evaluate(
-                backend.as_ref(),
-                prompt_text,
-                &results,
-                context,
-                run_dir,
-                &node.id,
-                &services.run.emitter,
-                &services.run.sandbox,
-                services.run.cancel_token(),
-            )
-            .await?
+fn joined_outcome(branch_count: usize, simulated: bool) -> Outcome {
+    let mut outcome = Outcome::success();
+    let prefix = if simulated { "[Simulated] " } else { "" };
+    outcome.notes = Some(format!(
+        "{prefix}Joined {branch_count} parallel {}",
+        if branch_count == 1 {
+            "branch"
         } else {
-            heuristic_select(&results)
-        };
-
-        // Check if all candidates failed — if so, return fail
-        let all_failed = if best.status == "failed" {
-            let empty_vec = vec![];
-            let arr = results.as_array().unwrap_or(&empty_vec);
-            arr.iter()
-                .all(|v| v.get("status").and_then(|v| v.as_str()).unwrap_or("failed") == "failed")
-        } else {
-            false
-        };
-
-        if all_failed {
-            let mut outcome = Outcome::fail_deterministic("all candidates failed");
-            outcome.timing = Some(best.timing);
-            return Ok(outcome);
+            "branches"
         }
-
-        // --- Fast-forward to winner's HEAD when git isolation is active ---
-        let best_head_sha = {
-            let empty_vec = vec![];
-            let arr = results.as_array().unwrap_or(&empty_vec);
-            arr.iter()
-                .find(|v| v.get("id").and_then(|v| v.as_str()) == Some(&best.id))
-                .and_then(|v| v.get("head_sha").and_then(|v| v.as_str()).map(String::from))
-        };
-
-        if let (Some(ref sha), Some(_)) = (&best_head_sha, services.git_state()) {
-            git_merge_ff_only(&*services.run.sandbox, sha).await;
-        }
-
-        let mut outcome = Outcome::success();
-        outcome.context_updates.insert(
-            keys::PARALLEL_FAN_IN_BEST_ID.to_string(),
-            serde_json::json!(best.id),
-        );
-        outcome.context_updates.insert(
-            keys::PARALLEL_FAN_IN_BEST_OUTCOME.to_string(),
-            serde_json::json!(best.status),
-        );
-        if let Some(ref sha) = best_head_sha {
-            outcome.context_updates.insert(
-                keys::PARALLEL_FAN_IN_BEST_HEAD_SHA.to_string(),
-                serde_json::json!(sha),
-            );
-        }
-        outcome.notes = Some(format!("Selected best candidate: {}", best.id));
-        outcome.timing = Some(best.timing);
-
-        Ok(outcome)
-    }
-}
-
-struct Candidate {
-    id:     String,
-    status: String,
-    score:  f64,
-    timing: StageTiming,
-}
-
-fn status_rank(status: &str) -> u32 {
-    match status {
-        "succeeded" => 0,
-        "partially_succeeded" => 1,
-        "failed" => 2,
-        _ => 4,
-    }
-}
-
-fn heuristic_select(results: &serde_json::Value) -> Candidate {
-    let empty_vec = vec![];
-    let arr = results.as_array().unwrap_or(&empty_vec);
-    if arr.is_empty() {
-        return Candidate {
-            id:     "unknown".to_string(),
-            status: "failed".to_string(),
-            score:  0.0,
-            timing: StageTiming::default(),
-        };
-    }
-
-    let mut candidates: Vec<Candidate> = arr
-        .iter()
-        .map(|v| Candidate {
-            id:     v
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
-                .to_string(),
-            status: v
-                .get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("failed")
-                .to_string(),
-            score:  v
-                .get("score")
-                .and_then(serde_json::Value::as_f64)
-                .unwrap_or(0.0),
-            timing: StageTiming::default(),
-        })
-        .collect();
-
-    candidates.sort_by(|a, b| {
-        let rank_cmp = status_rank(&a.status).cmp(&status_rank(&b.status));
-        if rank_cmp != std::cmp::Ordering::Equal {
-            return rank_cmp;
-        }
-        // Higher score is better, so reverse the comparison
-        let score_cmp = b
-            .score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal);
-        if score_cmp != std::cmp::Ordering::Equal {
-            return score_cmp;
-        }
-        a.id.cmp(&b.id)
-    });
-
-    candidates.into_iter().next().unwrap_or_else(|| Candidate {
-        id:     "unknown".to_string(),
-        status: "failed".to_string(),
-        score:  0.0,
-        timing: StageTiming::default(),
-    })
-}
-
-/// Use an LLM backend to evaluate and rank parallel branch results.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "Fan-in evaluation passes prompt, results, context, and runtime handles separately."
-)]
-async fn llm_evaluate(
-    backend: &dyn CodergenBackend,
-    prompt: &str,
-    results: &serde_json::Value,
-    context: &Context,
-    _run_dir: &Path,
-    node_id: &str,
-    emitter: &Arc<Emitter>,
-    sandbox: &Arc<dyn Sandbox>,
-    cancel_token: CancellationToken,
-) -> Result<Candidate, Error> {
-    let results_text =
-        serde_json::to_string_pretty(results).unwrap_or_else(|_| results.to_string());
-
-    let full_prompt = format!(
-        "{prompt}\n\nParallel branch results:\n{results_text}\n\n\
-         Respond with the ID of the best candidate."
-    );
-
-    let stage_scope = StageScope::for_handler(context, node_id);
-
-    emitter.emit_scoped(
-        &Event::Prompt {
-            stage:            node_id.to_string(),
-            visit:            stage_scope.visit,
-            text:             full_prompt.clone(),
-            mode:             Some(StageModelUsage::MODE_FAN_IN.to_string()),
-            provider:         None,
-            model:            None,
-            reasoning_effort: None,
-            speed:            None,
-        },
-        &stage_scope,
-    );
-
-    // Build a synthetic node for the backend call
-    let eval_node = Node::new("fan_in_eval");
-
-    // Fan-in evaluation runs outside a thread context, so pass None
-    match backend
-        .run(CodergenRunRequest {
-            node: &eval_node,
-            prompt: &full_prompt,
-            context,
-            thread_id: None,
-            emitter,
-            sandbox,
-            tool_hooks: None,
-            cancel_token,
-            agent_tool_runtime: fabro_agent::AgentToolRuntime::default(),
-        })
-        .await
-    {
-        Ok(CodergenResult::Full(outcome)) => {
-            let timing = outcome.timing.unwrap_or_default();
-            // If the backend returned a full Outcome, extract best_id from context_updates
-            let best_id = outcome
-                .context_updates
-                .get(keys::PARALLEL_FAN_IN_BEST_ID)
-                .and_then(|v| v.as_str())
-                .map(String::from)
-                .or_else(|| outcome.notes.clone())
-                .unwrap_or_else(|| "unknown".to_string());
-            let response_text =
-                serde_json::to_string_pretty(&outcome).unwrap_or_else(|_| "{}".to_string());
-            emitter.emit_scoped(
-                &Event::PromptCompleted {
-                    node_id:  node_id.to_string(),
-                    response: response_text.clone(),
-                    model:    String::new(),
-                    provider: String::new(),
-                    billing:  None,
-                },
-                &stage_scope,
-            );
-            Ok(Candidate {
-                id: best_id,
-                status: outcome.status.to_string(),
-                score: 0.0,
-                timing,
-            })
-        }
-        Ok(CodergenResult::Text { text, timing, .. }) => {
-            emitter.emit_scoped(
-                &Event::PromptCompleted {
-                    node_id:  node_id.to_string(),
-                    response: text.clone(),
-                    model:    String::new(),
-                    provider: String::new(),
-                    billing:  None,
-                },
-                &stage_scope,
-            );
-
-            // The LLM responded with text; try to find a matching candidate ID
-            let text = text.trim().to_string();
-            let empty_vec = vec![];
-            let arr = results.as_array().unwrap_or(&empty_vec);
-
-            // Check if the response text matches any candidate ID
-            for v in arr {
-                if let Some(id) = v.get("id").and_then(|v| v.as_str()) {
-                    if text.contains(id) {
-                        let status = v
-                            .get("status")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("succeeded")
-                            .to_string();
-                        let score = v
-                            .get("score")
-                            .and_then(serde_json::Value::as_f64)
-                            .unwrap_or(0.0);
-                        return Ok(Candidate {
-                            id: id.to_string(),
-                            status,
-                            score,
-                            timing,
-                        });
-                    }
-                }
-            }
-
-            // No match found; fall back to heuristic
-            let mut fallback = heuristic_select(results);
-            fallback.timing = timing;
-            Ok(fallback)
-        }
-        Err(_) => {
-            // LLM call failed; fall back to heuristic
-            Ok(heuristic_select(results))
-        }
-    }
+    ));
+    outcome
 }
 
 #[cfg(test)]
 mod tests {
+    use fabro_graphviz::graph::AttrValue;
+    use fabro_types::StageTiming;
+    use tempfile::TempDir;
+
     use super::*;
+    use crate::handler::agent::{CodergenResult, CodergenRunRequest, OneShotRequest};
     use crate::outcome::StageOutcome;
 
     fn make_services() -> EngineServices {
         EngineServices::test_default()
     }
 
-    #[tokio::test]
-    async fn fan_in_no_results() {
-        let handler = FanInHandler::new(None);
-        let node = Node::new("fan_in");
-        let context = Context::new();
-        let graph = Graph::new("test");
-        let run_dir = Path::new("/tmp/test");
-
-        let outcome = handler
-            .execute(&node, &context, &graph, run_dir, &make_services())
-            .await
-            .unwrap();
-        assert_eq!(outcome.status, StageOutcome::Failed {
-            retry_requested: false,
-        });
-    }
-
-    #[tokio::test]
-    async fn fan_in_selects_best() {
-        let handler = FanInHandler::new(None);
-        let node = Node::new("fan_in");
+    fn context_with_results() -> Context {
         let context = Context::new();
         context.set(
             keys::PARALLEL_RESULTS,
             serde_json::json!([
-                {"id": "branch_a", "status": "failed"},
-                {"id": "branch_b", "status": "succeeded"},
+                {
+                    "id": "branch_a",
+                    "status": "failed",
+                    "context_updates": {"command.output": "failure details"}
+                },
+                {
+                    "id": "branch_b",
+                    "status": "succeeded",
+                    "context_updates": {"response.branch_b": "complete response"}
+                }
             ]),
         );
-        let graph = Graph::new("test");
-        let run_dir = Path::new("/tmp/test");
+        context
+    }
 
-        let outcome = handler
-            .execute(&node, &context, &graph, run_dir, &make_services())
+    #[tokio::test]
+    async fn promptless_fan_in_is_a_noop_barrier() {
+        let outcome = FanInHandler::new(None)
+            .execute(
+                &Node::new("fan_in"),
+                &context_with_results(),
+                &Graph::new("test"),
+                Path::new("/tmp/test"),
+                &make_services(),
+            )
             .await
             .unwrap();
+
         assert_eq!(outcome.status, StageOutcome::Succeeded);
-        assert_eq!(
-            outcome.context_updates.get(keys::PARALLEL_FAN_IN_BEST_ID),
-            Some(&serde_json::json!("branch_b"))
-        );
+        assert_eq!(outcome.notes.as_deref(), Some("Joined 2 parallel branches"));
+        assert!(outcome.context_updates.is_empty());
     }
 
     #[tokio::test]
-    async fn fan_in_lexical_tiebreak() {
-        let handler = FanInHandler::new(None);
-        let node = Node::new("fan_in");
+    async fn fan_in_requires_typed_parallel_results() {
         let context = Context::new();
-        context.set(
-            keys::PARALLEL_RESULTS,
-            serde_json::json!([
-                {"id": "c", "status": "succeeded"},
-                {"id": "a", "status": "succeeded"},
-                {"id": "b", "status": "succeeded"},
-            ]),
-        );
-        let graph = Graph::new("test");
-        let run_dir = Path::new("/tmp/test");
+        let missing = FanInHandler::new(None)
+            .execute(
+                &Node::new("fan_in"),
+                &context,
+                &Graph::new("test"),
+                Path::new("/tmp/test"),
+                &make_services(),
+            )
+            .await;
+        assert!(missing.is_err());
 
-        let outcome = handler
-            .execute(&node, &context, &graph, run_dir, &make_services())
-            .await
-            .unwrap();
-        assert_eq!(
-            outcome.context_updates.get(keys::PARALLEL_FAN_IN_BEST_ID),
-            Some(&serde_json::json!("a"))
-        );
-    }
-
-    #[test]
-    fn status_rank_ordering() {
-        assert!(status_rank("succeeded") < status_rank("partially_succeeded"));
-        assert!(status_rank("partially_succeeded") < status_rank("failed"));
-        assert!(status_rank("failed") < status_rank("unknown"));
+        context.set(keys::PARALLEL_RESULTS, serde_json::json!([{"id": "a"}]));
+        let invalid = FanInHandler::new(None)
+            .execute(
+                &Node::new("fan_in"),
+                &context,
+                &Graph::new("test"),
+                Path::new("/tmp/test"),
+                &make_services(),
+            )
+            .await;
+        assert!(invalid.is_err());
     }
 
     #[tokio::test]
-    async fn fan_in_no_backend_ignores_prompt() {
-        // When there's a prompt but no backend, it should fall back to heuristic
-        let handler = FanInHandler::new(None);
-        let mut node = Node::new("fan_in");
-        node.attrs.insert(
-            "prompt".to_string(),
-            fabro_graphviz::graph::AttrValue::String("Pick the best branch".to_string()),
-        );
-        let context = Context::new();
-        context.set(
-            keys::PARALLEL_RESULTS,
-            serde_json::json!([
-                {"id": "branch_a", "status": "succeeded"},
-                {"id": "branch_b", "status": "failed"},
-            ]),
-        );
-        let graph = Graph::new("test");
-        let run_dir = Path::new("/tmp/test");
-
-        let outcome = handler
-            .execute(&node, &context, &graph, run_dir, &make_services())
-            .await
-            .unwrap();
-        assert_eq!(outcome.status, StageOutcome::Succeeded);
-        // Should still pick branch_a via heuristic (success beats fail)
-        assert_eq!(
-            outcome.context_updates.get(keys::PARALLEL_FAN_IN_BEST_ID),
-            Some(&serde_json::json!("branch_a"))
-        );
-    }
-
-    #[tokio::test]
-    async fn fan_in_with_backend_llm_eval() {
-        use tempfile::TempDir;
-
-        use crate::handler::agent::{CodergenBackend, CodergenRunRequest};
-
-        struct MockBackend;
+    async fn prompted_fan_in_uses_standard_prompt_response_fields() {
+        struct ReducerBackend;
 
         #[async_trait]
-        impl CodergenBackend for MockBackend {
+        impl CodergenBackend for ReducerBackend {
             async fn run(&self, _request: CodergenRunRequest<'_>) -> Result<CodergenResult, Error> {
-                // Return text that contains the ID "branch_b"
+                panic!("prompted fan-in must use one_shot like a standard prompt")
+            }
+
+            async fn one_shot(&self, request: OneShotRequest<'_>) -> Result<CodergenResult, Error> {
+                assert!(request.prompt.contains("Synthesize every result"));
                 Ok(CodergenResult::Text {
-                    text:              "The best candidate is branch_b".to_string(),
+                    text:              "combined result".to_string(),
                     usage:             None,
                     files_touched:     Vec::new(),
                     last_file_touched: None,
-                    timing:            StageTiming::default(),
+                    timing:            StageTiming::new(0, 20, 30),
                 })
             }
         }
 
-        let handler = FanInHandler::new(Some(Box::new(MockBackend)));
+        let handler = FanInHandler::new(Some(Box::new(ReducerBackend)));
         let mut node = Node::new("fan_in");
         node.attrs.insert(
             "prompt".to_string(),
-            fabro_graphviz::graph::AttrValue::String("Pick the best branch".to_string()),
+            AttrValue::String("Synthesize every result".to_string()),
         );
-        let context = Context::new();
-        context.set(
-            keys::PARALLEL_RESULTS,
-            serde_json::json!([
-                {"id": "branch_a", "status": "succeeded"},
-                {"id": "branch_b", "status": "succeeded"},
-            ]),
-        );
-        let graph = Graph::new("test");
-        let tmp = TempDir::new().unwrap();
-
+        let run_dir = TempDir::new().unwrap();
         let outcome = handler
-            .execute(&node, &context, &graph, tmp.path(), &make_services())
+            .execute(
+                &node,
+                &context_with_results(),
+                &Graph::new("test"),
+                run_dir.path(),
+                &make_services(),
+            )
             .await
             .unwrap();
+
         assert_eq!(outcome.status, StageOutcome::Succeeded);
-        // LLM chose branch_b
         assert_eq!(
-            outcome.context_updates.get(keys::PARALLEL_FAN_IN_BEST_ID),
-            Some(&serde_json::json!("branch_b"))
+            outcome.context_updates.get(&keys::response_key("fan_in")),
+            Some(&serde_json::json!("combined result"))
         );
-    }
-
-    #[tokio::test]
-    async fn fan_in_with_backend_copies_llm_timing_to_outcome() {
-        use tempfile::TempDir;
-
-        use crate::handler::agent::{CodergenBackend, CodergenRunRequest};
-
-        struct TimingBackend;
-
-        #[async_trait]
-        impl CodergenBackend for TimingBackend {
-            async fn run(&self, _request: CodergenRunRequest<'_>) -> Result<CodergenResult, Error> {
-                Ok(CodergenResult::Text {
-                    text:              "branch_b".to_string(),
-                    usage:             None,
-                    files_touched:     Vec::new(),
-                    last_file_touched: None,
-                    timing:            StageTiming::new(0, 200, 300),
-                })
-            }
-        }
-
-        let handler = FanInHandler::new(Some(Box::new(TimingBackend)));
-        let mut node = Node::new("fan_in");
-        node.attrs.insert(
-            "prompt".to_string(),
-            fabro_graphviz::graph::AttrValue::String("Pick the best branch".to_string()),
+        assert_eq!(
+            outcome.context_updates.get(keys::LAST_RESPONSE),
+            Some(&serde_json::json!("combined result"))
         );
-        let context = Context::new();
-        context.set(
-            keys::PARALLEL_RESULTS,
-            serde_json::json!([
-                {"id": "branch_a", "status": "succeeded"},
-                {"id": "branch_b", "status": "succeeded"},
-            ]),
-        );
-        let graph = Graph::new("test");
-        let tmp = TempDir::new().unwrap();
-
-        let outcome = handler
-            .execute(&node, &context, &graph, tmp.path(), &make_services())
-            .await
-            .unwrap();
-
-        assert_eq!(outcome.timing, Some(StageTiming::new(0, 200, 300)));
-    }
-
-    #[tokio::test]
-    async fn fan_in_all_fail_returns_fail() {
-        let handler = FanInHandler::new(None);
-        let node = Node::new("fan_in");
-        let context = Context::new();
-        context.set(
-            keys::PARALLEL_RESULTS,
-            serde_json::json!([
-                {"id": "branch_a", "status": "failed"},
-                {"id": "branch_b", "status": "failed"},
-                {"id": "branch_c", "status": "failed"},
-            ]),
-        );
-        let graph = Graph::new("test");
-        let run_dir = Path::new("/tmp/test");
-
-        let outcome = handler
-            .execute(&node, &context, &graph, run_dir, &make_services())
-            .await
-            .unwrap();
-        assert_eq!(outcome.status, StageOutcome::Failed {
-            retry_requested: false,
-        });
+        assert_eq!(outcome.timing, Some(StageTiming::new(0, 20, 30)));
         assert!(
             outcome
-                .failure_reason()
-                .unwrap()
-                .contains("all candidates failed")
-        );
-    }
-
-    #[tokio::test]
-    async fn fan_in_score_tiebreak() {
-        let handler = FanInHandler::new(None);
-        let node = Node::new("fan_in");
-        let context = Context::new();
-        context.set(
-            keys::PARALLEL_RESULTS,
-            serde_json::json!([
-                {"id": "branch_a", "status": "succeeded", "score": 0.5},
-                {"id": "branch_b", "status": "succeeded", "score": 0.9},
-                {"id": "branch_c", "status": "succeeded", "score": 0.7},
-            ]),
-        );
-        let graph = Graph::new("test");
-        let run_dir = Path::new("/tmp/test");
-
-        let outcome = handler
-            .execute(&node, &context, &graph, run_dir, &make_services())
-            .await
-            .unwrap();
-        assert_eq!(outcome.status, StageOutcome::Succeeded);
-        // branch_b has highest score
-        assert_eq!(
-            outcome.context_updates.get(keys::PARALLEL_FAN_IN_BEST_ID),
-            Some(&serde_json::json!("branch_b"))
-        );
-    }
-
-    #[tokio::test]
-    async fn fan_in_simulate_uses_heuristic() {
-        let handler = FanInHandler::new(None);
-        let node = Node::new("fan_in");
-        let context = Context::new();
-        context.set(
-            keys::PARALLEL_RESULTS,
-            serde_json::json!([
-                {"id": "branch_a", "status": "failed"},
-                {"id": "branch_b", "status": "succeeded"},
-            ]),
-        );
-        let graph = Graph::new("test");
-        let run_dir = Path::new("/tmp/test");
-
-        let outcome = handler
-            .simulate(&node, &context, &graph, run_dir, &make_services())
-            .await
-            .unwrap();
-        assert_eq!(outcome.status, StageOutcome::Succeeded);
-        assert!(outcome.notes.as_deref().unwrap().contains("[Simulated]"));
-        assert_eq!(
-            outcome.context_updates.get(keys::PARALLEL_FAN_IN_BEST_ID),
-            Some(&serde_json::json!("branch_b"))
+                .context_updates
+                .keys()
+                .all(|key| !key.starts_with("parallel.fan_in.best_"))
         );
     }
 }

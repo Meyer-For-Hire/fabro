@@ -75,7 +75,6 @@ impl StageModelUsage {
     pub const MODE_PROMPT: &'static str = "prompt";
     pub const MODE_AGENT: &'static str = "agent";
     pub const MODE_ACP: &'static str = "acp";
-    pub const MODE_FAN_IN: &'static str = "fan_in";
 
     /// Build the usage record from a `stage.prompt` event, returning `None`
     /// when the event carried no model metadata.
@@ -328,7 +327,7 @@ pub struct StageProjection {
     pub diff:              Option<String>,
     pub script_invocation: Option<serde_json::Value>,
     pub script_timing:     Option<serde_json::Value>,
-    pub parallel_results:  Option<serde_json::Value>,
+    pub parallel_results:  Option<Vec<crate::ParallelBranchResult>>,
     pub output:            Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_bytes:      Option<u64>,

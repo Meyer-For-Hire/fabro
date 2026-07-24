@@ -140,7 +140,7 @@ Nodes with `shape=hexagon` or `type="human"` pause execution for human input. Ou
 
 ### Parallel Execution
 
-Nodes with `shape=component` fan out to branches concurrently. Configurable join policies: `wait_all` (default), `first_success`.
+Nodes with `shape=component` fan out to branches concurrently. Branches receive isolated context forks, share the same sandbox checkout, and always finish before the workflow continues. Use `max_parallel` to limit concurrency; concurrent workspace writes are user-managed.
 
 ### Checkpoints and Resume
 

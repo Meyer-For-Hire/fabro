@@ -19,6 +19,7 @@ pub mod manifest_path;
 pub mod mcp_store;
 pub mod outcome;
 pub mod pair;
+pub mod parallel;
 pub mod principal;
 pub mod pull_request;
 pub mod repository;
@@ -93,6 +94,7 @@ pub use pair::{
     PairTranscriptWarning, RunEventDetailContent, RunEventDetailContentKind,
     RunEventDetailEnvelope, RunEventDetailResponse, RunPairStatusResponse,
 };
+pub use parallel::ParallelBranchResult;
 pub use principal::{AuthMethod, Principal, SystemActorKind, UserPrincipal};
 pub use pull_request::{
     CheckRun, CheckRunStatus, PullRequest, PullRequestDetails, PullRequestDetailsStatus,

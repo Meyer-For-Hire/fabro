@@ -8,8 +8,8 @@ use fabro_api::types::{
     AgentToolSource as ApiAgentToolSource, AgentToolSummary as ApiAgentToolSummary,
     AgentToolsAvailableProps as ApiAgentToolsAvailableProps,
     McpServerProjection as ApiMcpServerProjection, McpServerStatus as ApiMcpServerStatus,
-    PermissionLevel as ApiPermissionLevel, SkillsProjection as ApiSkillsProjection,
-    StageContextWindow as ApiStageContextWindow,
+    ParallelBranchResult as ApiParallelBranchResult, PermissionLevel as ApiPermissionLevel,
+    SkillsProjection as ApiSkillsProjection, StageContextWindow as ApiStageContextWindow,
     StageContextWindowBreakdownItem as ApiStageContextWindowBreakdownItem,
     StageContextWindowCategory as ApiStageContextWindowCategory,
     StageContextWindowCountMethod as ApiStageContextWindowCountMethod,
@@ -23,8 +23,8 @@ use fabro_api::types::{
 use fabro_types::{
     ActivatedSkill, AgentControlState, AgentMcpToolSummary, AgentSkillActivationSource,
     AgentSkillSummary, AgentToolCategory, AgentToolSource, AgentToolSummary,
-    AgentToolsAvailableProps, McpServerProjection, McpServerStatus, PermissionLevel,
-    SkillsProjection, StageContextWindow, StageContextWindowBreakdownItem,
+    AgentToolsAvailableProps, McpServerProjection, McpServerStatus, ParallelBranchResult,
+    PermissionLevel, SkillsProjection, StageContextWindow, StageContextWindowBreakdownItem,
     StageContextWindowCategory, StageContextWindowCountMethod, StageContextWindowProjection,
     StageContextWindowStaleness, StageContextWindowUnavailableReason, StageContextWindowWarning,
     StageProjection, SubAgentProjection, SubAgentStatus, TodoListKind, TodoListProjection,
@@ -39,6 +39,7 @@ fn stage_projection_reuses_canonical_type() {
 #[test]
 fn stage_projection_reuses_nested_agent_state_types() {
     assert_same_type::<ApiAgentControlState, AgentControlState>();
+    assert_same_type::<ApiParallelBranchResult, ParallelBranchResult>();
     assert_same_type::<ApiTodoListProjection, TodoListProjection>();
     assert_same_type::<ApiSubAgentProjection, SubAgentProjection>();
     assert_same_type::<ApiSubAgentStatus, SubAgentStatus>();
@@ -87,7 +88,21 @@ fn stage_projection_round_trips_representative_json() {
         "diff": "diff --git a/file b/file",
         "script_invocation": { "command": "cargo test" },
         "script_timing": { "duration_ms": 42 },
-        "parallel_results": [{ "branch": 0, "status": "succeeded" }],
+        "parallel_results": [
+            {
+                "id": "review_api",
+                "status": "succeeded",
+                "context_updates": {
+                    "response.review_api": "looks good",
+                    "score": 0.95
+                }
+            },
+            {
+                "id": "review_ux",
+                "status": "failed",
+                "context_updates": {}
+            }
+        ],
         "output": "ok",
         "termination": "exited",
         "started_at": "2026-04-29T12:34:00Z",

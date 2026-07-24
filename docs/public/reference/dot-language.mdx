@@ -252,8 +252,7 @@ audit [
 
 | Attribute | Type | Description |
 |---|---|---|
-| `join_policy` | String | When the merge can proceed: `wait_all` (default), `first_success` |
-| `max_parallel` | Integer | Maximum concurrent branches (default: 4) |
+| `max_parallel` | Integer | Maximum concurrent branches (default: 4). The node always waits for every branch. |
 
 For the first node in each branch, `fidelity` resolves from the fork-to-branch edge, then the branch node; without either, the fork preamble is inherited unchanged. Branch-specific preambles are rendered before fan-out from the fork's context snapshot. Concurrent branches cannot share sessions, so explicit branch `full` becomes `summary:high`, and branch-level `thread_id` is inert.
 

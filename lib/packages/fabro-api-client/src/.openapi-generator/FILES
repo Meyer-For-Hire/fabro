@@ -226,6 +226,7 @@ models/mcp-transport.ts
 models/merge-method.ts
 models/merge-run-pull-request-request.ts
 models/merge-run-pull-request-response.ts
+models/model-controls.ts
 models/model-costs.ts
 models/model-features.ts
 models/model-limits.ts
@@ -266,6 +267,7 @@ models/pair-transcript-system-message.ts
 models/pair-transcript-tool-call.ts
 models/pair-transcript-user-message.ts
 models/pair-transcript-warning.ts
+models/parallel-branch-result.ts
 models/pending-interview-record.ts
 models/pending-reason.ts
 models/permission-level.ts

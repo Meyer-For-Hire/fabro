@@ -1,6 +1,13 @@
+import { StageOutcome } from "@qltysh/fabro-api-client";
 import type { EventEnvelope } from "@qltysh/fabro-api-client";
 
 import { getArray, getNumber, getObject, getString, type UnknownRecord } from "../../lib/unknown";
+
+const STAGE_OUTCOMES: ReadonlySet<string> = new Set(Object.values(StageOutcome));
+
+function asStageOutcome(value: string | undefined): StageOutcome | null {
+  return value !== undefined && STAGE_OUTCOMES.has(value) ? (value as StageOutcome) : null;
+}
 
 export interface InterviewOption {
   key: string;
@@ -137,19 +144,18 @@ export function parseHumanInterviewPairs(events: EventEnvelope[]): HumanIntervie
   return Array.from(pairs.values()).sort((a, b) => a.question.ts.localeCompare(b.question.ts));
 }
 
-export interface ParallelBranchResult {
+/** Identity and outcome of one branch, parsed from `parallel.completed`. */
+export interface ParallelBranchSummary {
   id: string;
-  status: string;
-  headSha: string | null;
+  status: StageOutcome;
 }
 
 export interface ParallelOverview {
   branchCount: number | null;
-  joinPolicy: string | null;
   successCount: number | null;
   failureCount: number | null;
   durationMs: number | null;
-  results: ParallelBranchResult[];
+  results: ParallelBranchSummary[];
   isComplete: boolean;
 }
 
@@ -160,18 +166,16 @@ export interface ParallelOverview {
  */
 export function parseParallelOverview(events: EventEnvelope[]): ParallelOverview {
   let branchCount: number | null = null;
-  let joinPolicy: string | null = null;
   let successCount: number | null = null;
   let failureCount: number | null = null;
   let durationMs: number | null = null;
-  let results: ParallelBranchResult[] = [];
+  let results: ParallelBranchSummary[] = [];
   let isComplete = false;
 
   for (const event of events) {
     const props: UnknownRecord = event.properties ?? {};
     if (event.event === "parallel.started") {
       branchCount = getNumber(props, "branch_count") ?? branchCount;
-      joinPolicy = getString(props, "join_policy") ?? joinPolicy;
     } else if (event.event === "parallel.completed") {
       isComplete = true;
       successCount = getNumber(props, "success_count") ?? successCount;
@@ -182,20 +186,18 @@ export function parseParallelOverview(events: EventEnvelope[]): ParallelOverview
         .map((entry) => {
           const record = entry && typeof entry === "object" ? (entry as UnknownRecord) : null;
           if (!record) return null;
-          return {
-            id: getString(record, "id") ?? "",
-            status: getString(record, "status") ?? "unknown",
-            headSha: getString(record, "head_sha") ?? null,
-          } satisfies ParallelBranchResult;
+          const id = getString(record, "id");
+          const status = asStageOutcome(getString(record, "status"));
+          if (!id || !status) return null;
+          return { id, status } satisfies ParallelBranchSummary;
         })
-        .filter((r): r is ParallelBranchResult => r != null && r.id !== "");
+        .filter((r): r is ParallelBranchSummary => r != null);
       if (branchCount == null) branchCount = results.length;
     }
   }
 
   return {
     branchCount,
-    joinPolicy,
     successCount,
     failureCount,
     durationMs,
@@ -204,59 +206,39 @@ export function parseParallelOverview(events: EventEnvelope[]): ParallelOverview
   };
 }
 
-export interface FanInOutcome {
-  selectedId: string | null;
-  hasReducerTranscript: boolean;
-  reducerModel: string | null;
+export interface ReducerTranscript {
+  prompt: string;
+  response: string;
+  model: string | null;
+  inputTokens: number;
+  outputTokens: number;
 }
 
-const FAN_IN_NOTES_RE = /Selected best candidate:\s*(.+?)\s*$/;
+/** Extract the standard prompt/response transcript emitted by an optional fan-in reducer. */
+export function parseReducerTranscript(events: EventEnvelope[]): ReducerTranscript | null {
+  let prompt = "";
+  let response = "";
+  let model: string | null = null;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let hasReducer = false;
 
-/**
- * Derive the fan-in winner from the `parallel.completed`-style notes string,
- * and report whether reducer LLM events were emitted (so the UI knows to show
- * the embedded transcript).
- */
-export function parseFanInOutcome(events: EventEnvelope[], notes: string | null): FanInOutcome {
-  const match = notes ? FAN_IN_NOTES_RE.exec(notes) : null;
-  let hasReducerTranscript = false;
-  let reducerModel: string | null = null;
   for (const event of events) {
+    const props: UnknownRecord = event.properties ?? {};
     if (event.event === "stage.prompt") {
-      const mode = getString(event.properties ?? {}, "mode");
-      if (mode === "fan_in") {
-        hasReducerTranscript = true;
-        const model = getString(event.properties ?? {}, "model");
-        if (model) reducerModel = model;
-      }
-    }
-    if (event.event === "prompt.completed") {
-      hasReducerTranscript = true;
+      prompt = getString(props, "text") ?? prompt;
+      model = getString(props, "model") ?? model;
+      hasReducer = true;
+    } else if (event.event === "prompt.completed" && hasReducer) {
+      response = getString(props, "response") ?? response;
+      model = getString(props, "model") ?? model;
+      const billing = getObject(props, "billing") ?? {};
+      inputTokens = getNumber(billing, "input_tokens") ?? inputTokens;
+      outputTokens = getNumber(billing, "output_tokens") ?? outputTokens;
     }
   }
-  return {
-    selectedId: match ? match[1].trim() : null,
-    hasReducerTranscript,
-    reducerModel,
-  };
-}
 
-function asUnknownRecord(value: unknown): UnknownRecord | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  return value as UnknownRecord;
-}
-
-/**
- * Extract `notes` from the `stage.completed` event scoped to this stage.
- * Returns null when the stage hasn't finished yet or when notes are absent.
- */
-export function extractStageNotes(events: EventEnvelope[]): string | null {
-  for (const event of events) {
-    if (event.event !== "stage.completed") continue;
-    const notes = getString(event.properties ?? {}, "notes");
-    if (notes) return notes;
-  }
-  return null;
+  return hasReducer ? { prompt, response, model, inputTokens, outputTokens } : null;
 }
 
 export interface StageContextData {

@@ -161,11 +161,23 @@ impl From<Error> for ApiError {
             Error::BadGateway(msg) => Self::new(StatusCode::BAD_GATEWAY, msg),
             Error::Workflow(err) => Self::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
             Error::Agent(err) => Self::new(StatusCode::BAD_GATEWAY, err.to_string()),
-            Error::Llm(err) => Self::new(StatusCode::BAD_GATEWAY, err.to_string()),
+            Error::Llm(err) => Self::from(err),
             Error::Store(err) => Self::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
             Error::Config(err) => Self::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
             Error::Vault(err) => Self::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
             Error::Internal(msg) => Self::new(StatusCode::INTERNAL_SERVER_ERROR, msg),
+        }
+    }
+}
+
+/// LLM errors split at the HTTP boundary: request-validation failures are the
+/// caller's fault (400); non-validation LLM failures, including provider,
+/// middleware, and local configuration failures, return 502.
+impl From<fabro_llm::Error> for ApiError {
+    fn from(err: fabro_llm::Error) -> Self {
+        match err {
+            fabro_llm::Error::InvalidRequest { message } => Self::bad_request(message),
+            err => Self::new(StatusCode::BAD_GATEWAY, format!("LLM error: {err}")),
         }
     }
 }

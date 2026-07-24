@@ -38,6 +38,7 @@ pub fn classify_sdk_error(err: &LlmError) -> FailureCategory {
         LlmError::Interrupt { .. } => FailureCategory::Canceled,
         LlmError::InvalidToolCall { .. }
         | LlmError::NoObjectGenerated { .. }
+        | LlmError::InvalidRequest { .. }
         | LlmError::Configuration { .. }
         | LlmError::UnsupportedToolChoice { .. } => FailureCategory::Deterministic,
     }
@@ -1218,6 +1219,14 @@ mod tests {
     fn classify_sdk_invalid_tool_call() {
         let err = SdkError::InvalidToolCall {
             message: "bad tool".into(),
+        };
+        assert_eq!(classify_sdk_error(&err), FailureCategory::Deterministic);
+    }
+
+    #[test]
+    fn classify_sdk_invalid_request() {
+        let err = SdkError::InvalidRequest {
+            message: "unsupported reasoning effort".into(),
         };
         assert_eq!(classify_sdk_error(&err), FailureCategory::Deterministic);
     }

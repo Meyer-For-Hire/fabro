@@ -22,8 +22,6 @@ pub mod details;
 
 pub mod reconnect;
 
-pub mod worktree;
-
 pub mod terminal;
 
 pub mod local;
@@ -62,4 +60,3 @@ pub use sandbox::{
 };
 pub use sandbox_spec::SandboxSpec;
 pub use terminal::{TerminalSession, TerminalSize, open_terminal_for_run};
-pub use worktree::{WorktreeEvent, WorktreeEventCallback, WorktreeOptions, WorktreeSandbox};
