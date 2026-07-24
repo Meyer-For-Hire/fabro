@@ -1,0 +1,779 @@
+use std::convert::TryFrom;
+
+use chrono::{DateTime, Utc};
+use fabro_types::{BilledModelUsage, EventBody, RunEvent};
+use fabro_util::error;
+use fabro_workflow::event::RunNoticeLevel;
+use serde_json::Value;
+
+#[derive(Debug, Clone)]
+pub(super) struct ProgressUsage {
+    pub(super) input_tokens:  u64,
+    pub(super) output_tokens: u64,
+    pub(super) cost:          Option<f64>,
+}
+
+impl ProgressUsage {
+    pub(super) fn from_stage_usage(usage: &BilledModelUsage) -> Option<Self> {
+        let tokens = usage.tokens();
+        Some(Self {
+            input_tokens:  u64::try_from(tokens.input_tokens).ok()?,
+            output_tokens: u64::try_from(tokens.billable_output_tokens()).ok()?,
+            cost:          usage.total_usd_micros.map(|cost| cost as f64 / 1_000_000.0),
+        })
+    }
+
+    pub(super) fn total_tokens(&self) -> u64 {
+        self.input_tokens.saturating_add(self.output_tokens)
+    }
+
+    pub(super) fn display_cost(&self) -> Option<f64> {
+        self.cost
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) enum ProgressEvent {
+    RunCreated {
+        web_url: Option<String>,
+    },
+    WorkflowStarted {
+        worktree_dir: Option<String>,
+        base_branch:  Option<String>,
+        base_sha:     Option<String>,
+    },
+    WorkingDirectorySet {
+        working_directory: String,
+    },
+    SandboxInitializing {
+        provider: String,
+    },
+    SandboxReady {
+        provider:    String,
+        duration_ms: u64,
+        name:        Option<String>,
+        cpu:         Option<f64>,
+        memory:      Option<f64>,
+        url:         Option<String>,
+    },
+    SandboxFailed {
+        provider: String,
+        error:    String,
+    },
+    SnapshotPulling {
+        name: String,
+    },
+    SnapshotCreating {
+        name: String,
+    },
+    SnapshotReady {
+        name:        String,
+        duration_ms: u64,
+    },
+    SnapshotFailed {
+        name:  String,
+        error: String,
+    },
+    SshAccessReady {
+        ssh_command: String,
+    },
+    SetupStarted {
+        command_count: u64,
+    },
+    SetupCompleted {
+        duration_ms: u64,
+    },
+    SetupCommandCompleted {
+        command:       String,
+        command_index: u64,
+        exit_code:     i64,
+        duration_ms:   u64,
+    },
+    CliEnsureStarted {
+        cli_name: String,
+    },
+    CliEnsureCompleted {
+        cli_name:          String,
+        already_installed: bool,
+        duration_ms:       u64,
+    },
+    CliEnsureFailed {
+        cli_name: String,
+    },
+    StageStarted {
+        node_id: String,
+        name:    String,
+        script:  Option<String>,
+    },
+    StageCompleted {
+        node_id: String,
+        name:    String,
+        timing:  fabro_types::StageTiming,
+        status:  String,
+        usage:   Option<ProgressUsage>,
+    },
+    StageFailed {
+        node_id: String,
+        name:    String,
+        error:   String,
+    },
+    StageRetrying {
+        name:         String,
+        attempt:      u64,
+        max_attempts: u64,
+        delay_ms:     u64,
+    },
+    ParallelStarted,
+    ParallelBranchStarted {
+        branch: String,
+    },
+    ParallelBranchCompleted {
+        branch:      String,
+        duration_ms: u64,
+        status:      fabro_types::StageOutcome,
+    },
+    ParallelCompleted,
+    AssistantMessage {
+        stage_node_id: String,
+        model:         String,
+    },
+    ToolCallStarted {
+        stage_node_id: String,
+        tool_name:     String,
+        tool_call_id:  String,
+        arguments:     Value,
+        timestamp:     Option<DateTime<Utc>>,
+    },
+    ToolCallCompleted {
+        stage_node_id: String,
+        tool_call_id:  String,
+        is_error:      bool,
+        duration_ms:   Option<u64>,
+        timestamp:     Option<DateTime<Utc>>,
+    },
+    ContextWindowWarning {
+        stage_node_id: String,
+        usage_percent: u64,
+    },
+    CompactionStarted {
+        stage_node_id: String,
+    },
+    CompactionCompleted {
+        stage_node_id:        String,
+        original_turn_count:  u64,
+        preserved_turn_count: u64,
+        tracked_file_count:   u64,
+    },
+    LlmRetry {
+        stage_node_id: String,
+        model:         String,
+        attempt:       u64,
+        delay_ms:      u64,
+        error:         String,
+    },
+    SubagentSpawned {
+        stage_node_id: String,
+        agent_id:      String,
+        task:          String,
+    },
+    SubagentCompleted {
+        stage_node_id: String,
+        agent_id:      String,
+        success:       bool,
+        turns_used:    u64,
+    },
+    EdgeSelected {
+        from_node: String,
+        to_node:   String,
+        label:     Option<String>,
+        condition: Option<String>,
+    },
+    LoopRestart {
+        from_node: String,
+        to_node:   String,
+    },
+    MetadataSnapshotFailed {
+        phase:        String,
+        failure_kind: String,
+        error:        String,
+    },
+    RunNotice {
+        level:   RunNoticeLevel,
+        code:    String,
+        message: String,
+    },
+    PullRequestCreated {
+        pr_url: String,
+        draft:  bool,
+    },
+    PullRequestFailed {
+        error: String,
+    },
+}
+
+pub(super) fn from_run_event(stored: &RunEvent) -> Option<ProgressEvent> {
+    let node_id = stored.node_id.clone().unwrap_or_else(|| "?".to_string());
+    let node_label = stored.node_label.clone().unwrap_or_else(|| node_id.clone());
+
+    match &stored.body {
+        EventBody::RunCreated(props) => Some(ProgressEvent::RunCreated {
+            web_url: props.web_url.clone(),
+        }),
+        EventBody::RunStarted(props) => Some(ProgressEvent::WorkflowStarted {
+            worktree_dir: props.worktree_dir.clone(),
+            base_branch:  props.base_branch.clone(),
+            base_sha:     props.base_sha.clone(),
+        }),
+        EventBody::SandboxInitialized(props) => Some(ProgressEvent::WorkingDirectorySet {
+            working_directory: props.working_directory.clone(),
+        }),
+        EventBody::SandboxInitializing(props) => Some(ProgressEvent::SandboxInitializing {
+            provider: props.provider.clone(),
+        }),
+        EventBody::SandboxReady(props) => Some(ProgressEvent::SandboxReady {
+            provider:    props.provider.clone(),
+            duration_ms: props.duration_ms,
+            name:        props.name.clone(),
+            cpu:         props.cpu,
+            memory:      props.memory,
+            url:         props.url.clone(),
+        }),
+        EventBody::SandboxFailed(props) => Some(ProgressEvent::SandboxFailed {
+            provider: props.provider.clone(),
+            error:    props.error.clone(),
+        }),
+        EventBody::SnapshotPulling(props) => Some(ProgressEvent::SnapshotPulling {
+            name: props.name.clone(),
+        }),
+        EventBody::SnapshotCreating(props) => Some(ProgressEvent::SnapshotCreating {
+            name: props.name.clone(),
+        }),
+        EventBody::SnapshotReady(props) => Some(ProgressEvent::SnapshotReady {
+            name:        props.name.clone(),
+            duration_ms: props.duration_ms,
+        }),
+        EventBody::SnapshotFailed(props) => Some(ProgressEvent::SnapshotFailed {
+            name:  props.name.clone(),
+            error: props.error.clone(),
+        }),
+        EventBody::SshAccessReady(props) => Some(ProgressEvent::SshAccessReady {
+            ssh_command: props.ssh_command.clone(),
+        }),
+        EventBody::SetupStarted(props) => Some(ProgressEvent::SetupStarted {
+            command_count: props.command_count as u64,
+        }),
+        EventBody::SetupCompleted(props) => Some(ProgressEvent::SetupCompleted {
+            duration_ms: props.duration_ms,
+        }),
+        EventBody::SetupCommandCompleted(props) => Some(ProgressEvent::SetupCommandCompleted {
+            command:       props.command.clone(),
+            command_index: props.index as u64,
+            exit_code:     i64::from(props.exit_code),
+            duration_ms:   props.duration_ms,
+        }),
+        EventBody::CliEnsureStarted(props) => Some(ProgressEvent::CliEnsureStarted {
+            cli_name: props.cli_name.clone(),
+        }),
+        EventBody::CliEnsureCompleted(props) => Some(ProgressEvent::CliEnsureCompleted {
+            cli_name:          props.cli_name.clone(),
+            already_installed: props.already_installed,
+            duration_ms:       props.duration_ms,
+        }),
+        EventBody::CliEnsureFailed(props) => Some(ProgressEvent::CliEnsureFailed {
+            cli_name: props.cli_name.clone(),
+        }),
+        EventBody::StageStarted(_) => Some(ProgressEvent::StageStarted {
+            node_id,
+            name: node_label,
+            script: None,
+        }),
+        EventBody::StageCompleted(props) => Some(ProgressEvent::StageCompleted {
+            node_id,
+            name: node_label,
+            timing: props.timing,
+            status: props.status.to_string(),
+            usage: props
+                .billing
+                .as_ref()
+                .and_then(ProgressUsage::from_stage_usage),
+        }),
+        EventBody::StageFailed(props) => Some(ProgressEvent::StageFailed {
+            node_id,
+            name: node_label,
+            error: props.failure.as_ref().map_or_else(
+                || "unknown error".to_string(),
+                |failure| error::render_compact_with_causes(&failure.message, &failure.causes),
+            ),
+        }),
+        EventBody::StageRetrying(props) => Some(ProgressEvent::StageRetrying {
+            name:         node_label,
+            attempt:      props.attempt as u64,
+            max_attempts: props.max_attempts as u64,
+            delay_ms:     props.delay_ms,
+        }),
+        EventBody::ParallelStarted(_) => Some(ProgressEvent::ParallelStarted),
+        EventBody::ParallelBranchStarted(_) => {
+            Some(ProgressEvent::ParallelBranchStarted { branch: node_id })
+        }
+        EventBody::ParallelBranchCompleted(props) => Some(ProgressEvent::ParallelBranchCompleted {
+            branch:      node_id,
+            duration_ms: props.duration_ms,
+            status:      props.status,
+        }),
+        EventBody::ParallelCompleted(_) => Some(ProgressEvent::ParallelCompleted),
+        EventBody::AgentMessage(props) => Some(ProgressEvent::AssistantMessage {
+            stage_node_id: node_id,
+            model:         props.model.model_id.to_string(),
+        }),
+        EventBody::AgentToolStarted(props) => Some(ProgressEvent::ToolCallStarted {
+            stage_node_id: node_id,
+            tool_name:     props.tool_name.clone(),
+            tool_call_id:  props.tool_call_id.clone(),
+            arguments:     props.arguments.clone(),
+            timestamp:     Some(stored.ts),
+        }),
+        EventBody::AgentToolCompleted(props) => Some(ProgressEvent::ToolCallCompleted {
+            stage_node_id: node_id,
+            tool_call_id:  props.tool_call_id.clone(),
+            is_error:      props.is_error,
+            duration_ms:   None,
+            timestamp:     Some(stored.ts),
+        }),
+        EventBody::AgentWarning(props) if props.kind == "context_window" => {
+            let usage_percent = props
+                .details
+                .as_object()
+                .and_then(|details| details.get("usage_percent"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            Some(ProgressEvent::ContextWindowWarning {
+                stage_node_id: node_id,
+                usage_percent,
+            })
+        }
+        EventBody::AgentCompactionStarted(_) => Some(ProgressEvent::CompactionStarted {
+            stage_node_id: node_id,
+        }),
+        EventBody::AgentCompactionCompleted(props) => Some(ProgressEvent::CompactionCompleted {
+            stage_node_id:        node_id,
+            original_turn_count:  props.original_turn_count as u64,
+            preserved_turn_count: props.preserved_turn_count as u64,
+            tracked_file_count:   props.tracked_file_count as u64,
+        }),
+        EventBody::AgentLlmRetry(props) => {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "Retry delays are represented as small non-negative millisecond values."
+            )]
+            let delay_ms = (props.delay_secs * 1000.0) as u64;
+            Some(ProgressEvent::LlmRetry {
+                stage_node_id: node_id,
+                model: props.model.clone(),
+                attempt: props.attempt as u64,
+                delay_ms,
+                error: display_value(&props.error).unwrap_or_else(|| "unknown error".to_string()),
+            })
+        }
+        EventBody::AgentSubSpawned(props) => Some(ProgressEvent::SubagentSpawned {
+            stage_node_id: node_id,
+            agent_id:      props.agent_id.clone(),
+            task:          props.task.clone(),
+        }),
+        EventBody::AgentSubCompleted(props) => Some(ProgressEvent::SubagentCompleted {
+            stage_node_id: node_id,
+            agent_id:      props.agent_id.clone(),
+            success:       props.success,
+            turns_used:    props.turns_used as u64,
+        }),
+        EventBody::EdgeSelected(props) => Some(ProgressEvent::EdgeSelected {
+            from_node: props.from_node.clone(),
+            to_node:   props.to_node.clone(),
+            label:     props.label.clone(),
+            condition: props.condition.clone(),
+        }),
+        EventBody::LoopRestart(props) => Some(ProgressEvent::LoopRestart {
+            from_node: props.from_node.clone(),
+            to_node:   props.to_node.clone(),
+        }),
+        EventBody::MetadataSnapshotFailed(props) => Some(ProgressEvent::MetadataSnapshotFailed {
+            phase:        props.phase.to_string(),
+            failure_kind: props.failure_kind.to_string(),
+            error:        props.error.clone(),
+        }),
+        EventBody::RunNotice(props) => Some(ProgressEvent::RunNotice {
+            level:   props.level,
+            code:    props.code.clone(),
+            message: props.message.clone(),
+        }),
+        EventBody::PullRequestCreated(props) => Some(ProgressEvent::PullRequestCreated {
+            pr_url: props.pr_url.clone(),
+            draft:  props.draft,
+        }),
+        EventBody::PullRequestFailed(props) => Some(ProgressEvent::PullRequestFailed {
+            error: props.error.clone(),
+        }),
+        _ => None,
+    }
+}
+
+pub(super) fn from_json_line(line: &str) -> Option<ProgressEvent> {
+    let stored = RunEvent::from_json_str(line).ok()?;
+    from_run_event(&stored)
+}
+
+fn display_value(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::String(value) => Some(value.clone()),
+        Value::Object(map) => map
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| {
+                map.get("detail")
+                    .and_then(Value::as_object)
+                    .and_then(|detail| detail.get("message"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .or_else(|| {
+                map.get("data")
+                    .and_then(Value::as_object)
+                    .and_then(|detail| detail.get("message"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .or_else(|| map.get("data").and_then(Value::as_str).map(str::to_owned))
+            .or_else(|| Some(value.to_string())),
+        _ => Some(value.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use fabro_agent::AgentEvent;
+    use fabro_types::{MetadataSnapshotFailureKind, MetadataSnapshotPhase, fixtures};
+    use fabro_workflow::event::{Event, RunNoticeCode, to_run_event};
+
+    use super::*;
+
+    #[test]
+    fn parse_edge_selected() {
+        let stored = to_run_event(&fixtures::RUN_1, &Event::EdgeSelected {
+            from_node:          "a".into(),
+            to_node:            "b".into(),
+            label:              Some("yes".into()),
+            condition:          None,
+            reason:             "condition".into(),
+            preferred_label:    None,
+            suggested_next_ids: Vec::new(),
+            stage_status:       "succeeded".into(),
+            is_jump:            false,
+        });
+
+        let event = from_run_event(&stored).unwrap();
+        assert!(matches!(
+            event,
+            ProgressEvent::EdgeSelected {
+                from_node,
+                to_node,
+                label,
+                ..
+            } if from_node == "a" && to_node == "b" && label.as_deref() == Some("yes")
+        ));
+    }
+
+    #[test]
+    fn round_trip_stage_completed() {
+        let event = Event::StageCompleted {
+            node_id: "plan".into(),
+            name: "Plan".into(),
+            index: 0,
+            timing: fabro_types::StageTiming::wall_only(5000),
+            status: "succeeded".into(),
+            preferred_label: None,
+            suggested_next_ids: Vec::new(),
+            billing: None,
+            failure: None,
+            notes: None,
+            files_touched: Vec::new(),
+            context_updates: None,
+            jump_to_node: None,
+            context_values: None,
+            node_visits: None,
+            loop_failure_signatures: None,
+            restart_failure_signatures: None,
+            response: None,
+            attempt: 1,
+            max_attempts: 1,
+        };
+
+        let stored = to_run_event(&fixtures::RUN_1, &event);
+        let parsed = from_run_event(&stored).unwrap();
+        assert!(matches!(
+            parsed,
+            ProgressEvent::StageCompleted {
+                node_id,
+                name,
+                timing,
+                ..
+            } if node_id == "plan" && name == "Plan" && timing.wall_time_ms == 5000
+        ));
+    }
+
+    #[test]
+    fn round_trip_agent_tool_call() {
+        let event = Event::Agent {
+            stage:             "code".into(),
+            visit:             1,
+            event:             AgentEvent::ToolCallStarted {
+                tool_name:    "read_file".into(),
+                tool_call_id: "tc1".into(),
+                arguments:    serde_json::json!({"path": "src/main.rs"}),
+            },
+            session_id:        None,
+            parent_session_id: None,
+            tool_call_id:      None,
+        };
+
+        let stored = to_run_event(&fixtures::RUN_1, &event);
+        let parsed = from_run_event(&stored).unwrap();
+        assert!(matches!(
+            parsed,
+            ProgressEvent::ToolCallStarted {
+                stage_node_id,
+                tool_name,
+                tool_call_id,
+                ..
+            } if stage_node_id == "code" && tool_name == "read_file" && tool_call_id == "tc1"
+        ));
+    }
+
+    #[test]
+    fn round_trip_pull_request_created_without_stage_scope() {
+        let event = Event::PullRequestCreated {
+            pr_url:      "https://github.com/acme/widgets/pull/42".into(),
+            pr_number:   42,
+            owner:       "acme".into(),
+            repo:        "widgets".into(),
+            base_branch: "main".into(),
+            head_branch: "fabro/run/42".into(),
+            title:       "Ship the server-side PR".into(),
+            draft:       true,
+        };
+
+        let stored = to_run_event(&fixtures::RUN_1, &event);
+        assert!(stored.node_id.is_none());
+        assert!(stored.stage_id.is_none());
+
+        let parsed = from_run_event(&stored).unwrap();
+        assert!(matches!(
+            parsed,
+            ProgressEvent::PullRequestCreated { pr_url, draft }
+                if pr_url == "https://github.com/acme/widgets/pull/42" && draft
+        ));
+    }
+
+    #[test]
+    fn parse_tool_call_timestamps_from_jsonl() {
+        let started = from_json_line(
+            &serde_json::json!({
+                "id": "evt_1",
+                "ts": "2026-03-30T12:00:00.000Z",
+                "run_id": fixtures::RUN_1.to_string(),
+                "event": "agent.tool.started",
+                "node_id": "code",
+                "node_label": "code",
+                "properties": {
+                    "tool_name": "read_file",
+                    "tool_call_id": "tc1",
+                    "arguments": {"path": "src/main.rs"},
+                    "visit": 1
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let completed = from_json_line(
+            &serde_json::json!({
+                "id": "evt_2",
+                "ts": "2026-03-30T12:00:00.500Z",
+                "run_id": fixtures::RUN_1.to_string(),
+                "event": "agent.tool.completed",
+                "node_id": "code",
+                "node_label": "code",
+                "properties": {
+                    "tool_name": "read_file",
+                    "tool_call_id": "tc1",
+                    "output": {"ok": true},
+                    "is_error": false,
+                    "visit": 1
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            started,
+            ProgressEvent::ToolCallStarted {
+                timestamp: Some(timestamp),
+                ..
+            } if timestamp == DateTime::parse_from_rfc3339("2026-03-30T12:00:00.000Z")
+                .unwrap()
+                .with_timezone(&Utc)
+        ));
+        assert!(matches!(
+            completed,
+            ProgressEvent::ToolCallCompleted {
+                duration_ms: None,
+                timestamp: Some(timestamp),
+                ..
+            } if timestamp == DateTime::parse_from_rfc3339("2026-03-30T12:00:00.500Z")
+                .unwrap()
+                .with_timezone(&Utc)
+        ));
+    }
+
+    #[test]
+    fn round_trip_sandbox_ready() {
+        let event = Event::Sandbox {
+            event: fabro_agent::SandboxEvent::Ready {
+                provider:    "daytona".into(),
+                duration_ms: 2500,
+                name:        Some("sandbox-1".into()),
+                cpu:         Some(4.0),
+                memory:      Some(8.0),
+                url:         Some("https://example.test".into()),
+            },
+        };
+
+        let stored = to_run_event(&fixtures::RUN_1, &event);
+        let parsed = from_run_event(&stored).unwrap();
+        assert!(matches!(
+            parsed,
+            ProgressEvent::SandboxReady {
+                provider,
+                duration_ms,
+                name,
+                ..
+            } if provider == "daytona" && duration_ms == 2500 && name.as_deref() == Some("sandbox-1")
+        ));
+    }
+
+    #[test]
+    fn round_trip_sandbox_failed() {
+        let event = Event::Sandbox {
+            event: fabro_agent::SandboxEvent::InitializeFailed {
+                provider:    "docker".into(),
+                error:       "pull failed".into(),
+                causes:      Vec::new(),
+                duration_ms: 900,
+            },
+        };
+
+        let stored = to_run_event(&fixtures::RUN_1, &event);
+        let parsed = from_run_event(&stored).unwrap();
+        assert!(matches!(
+            parsed,
+            ProgressEvent::SandboxFailed { provider, error }
+                if provider == "docker" && error == "pull failed"
+        ));
+    }
+
+    #[test]
+    fn round_trip_snapshot_lifecycle_events() {
+        let pulling = to_run_event(&fixtures::RUN_1, &Event::Sandbox {
+            event: fabro_agent::SandboxEvent::SnapshotPulling {
+                name: "buildpack-deps:noble".into(),
+            },
+        });
+        let creating = to_run_event(&fixtures::RUN_1, &Event::Sandbox {
+            event: fabro_agent::SandboxEvent::SnapshotCreating {
+                name: "fabro-v9".into(),
+            },
+        });
+        let ready = to_run_event(&fixtures::RUN_1, &Event::Sandbox {
+            event: fabro_agent::SandboxEvent::SnapshotReady {
+                name:        "buildpack-deps:noble".into(),
+                duration_ms: 1200,
+            },
+        });
+        let failed = to_run_event(&fixtures::RUN_1, &Event::Sandbox {
+            event: fabro_agent::SandboxEvent::SnapshotFailed {
+                name:   "fabro-v9".into(),
+                error:  "build failed".into(),
+                causes: Vec::new(),
+            },
+        });
+
+        assert!(matches!(
+            from_run_event(&pulling).unwrap(),
+            ProgressEvent::SnapshotPulling { name } if name == "buildpack-deps:noble"
+        ));
+        assert!(matches!(
+            from_run_event(&creating).unwrap(),
+            ProgressEvent::SnapshotCreating { name } if name == "fabro-v9"
+        ));
+        assert!(matches!(
+            from_run_event(&ready).unwrap(),
+            ProgressEvent::SnapshotReady { name, duration_ms }
+                if name == "buildpack-deps:noble" && duration_ms == 1200
+        ));
+        assert!(matches!(
+            from_run_event(&failed).unwrap(),
+            ProgressEvent::SnapshotFailed { name, error }
+                if name == "fabro-v9" && error == "build failed"
+        ));
+    }
+
+    #[test]
+    fn round_trip_run_notice() {
+        let event = Event::RunNotice {
+            level:            RunNoticeLevel::Warn,
+            code:             RunNoticeCode::SandboxCleanupFailed.to_string(),
+            message:          "sandbox cleanup failed".into(),
+            exec_output_tail: None,
+        };
+        let expected_code = RunNoticeCode::SandboxCleanupFailed.to_string();
+
+        let stored = to_run_event(&fixtures::RUN_1, &event);
+        let parsed = from_run_event(&stored).unwrap();
+        assert!(matches!(
+            parsed,
+            ProgressEvent::RunNotice {
+                level: RunNoticeLevel::Warn,
+                code,
+                message,
+            } if code == expected_code && message == "sandbox cleanup failed"
+        ));
+    }
+
+    #[test]
+    fn round_trip_metadata_snapshot_failed() {
+        let event = Event::MetadataSnapshotFailed {
+            phase:            MetadataSnapshotPhase::Finalize,
+            branch:           "fabro/meta".into(),
+            duration_ms:      900,
+            failure_kind:     MetadataSnapshotFailureKind::Push,
+            error:            "push rejected".into(),
+            causes:           vec!["remote rejected".into()],
+            commit_sha:       Some("abc123".into()),
+            entry_count:      Some(2),
+            bytes:            Some(42),
+            exec_output_tail: None,
+        };
+
+        let stored = to_run_event(&fixtures::RUN_1, &event);
+        let parsed = from_run_event(&stored).unwrap();
+        assert!(matches!(
+            parsed,
+            ProgressEvent::MetadataSnapshotFailed {
+                phase,
+                failure_kind,
+                error,
+            } if phase == "finalize" && failure_kind == "push" && error == "push rejected"
+        ));
+    }
+}

@@ -1,0 +1,1435 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Instant;
+
+use fabro_dump::RunDump;
+use fabro_hooks::{HookContext, HookEvent};
+use fabro_types::run_event::{MetadataSnapshotFailureKind, MetadataSnapshotPhase};
+use fabro_types::{BilledTokenCounts, DiffSummary, EventBody, RunFailure, RunProjection};
+use fabro_util::error::collect_causes;
+use fabro_util::time::elapsed_ms;
+
+use super::types::{Concluded, Executed, FinalizeOptions};
+use crate::error::{Error, run_failure_from_error, run_failure_from_outcome_failure};
+use crate::event::{Event, RunNoticeCode, RunNoticeLevel};
+use crate::outcome::{Outcome, StageOutcome};
+use crate::records::{Checkpoint, Conclusion, StageSummary};
+use crate::run_metadata::MetadataSnapshot;
+use crate::run_options::RunOptions;
+use crate::run_status::{FailureReason, RunStatus, SuccessReason};
+use crate::runtime_store::RunStoreHandle;
+use crate::sandbox_git::{git_diff_with_timeout, list_diff_numstat, summarize_diff_numstat};
+use crate::services::RunServices;
+use crate::{ProjectionBillingRollup, billing_rollup_from_projection};
+
+pub fn classify_engine_result(
+    engine_result: &Result<Outcome, Error>,
+) -> (StageOutcome, Option<RunFailure>, RunStatus) {
+    match engine_result {
+        Ok(outcome) => {
+            let status = outcome.status;
+            let failure = outcome.failure.as_ref().map(|failure| {
+                run_failure_from_outcome_failure(failure, FailureReason::WorkflowError)
+            });
+            let run_status = match status {
+                StageOutcome::Succeeded | StageOutcome::Skipped => RunStatus::Succeeded {
+                    reason: SuccessReason::Completed,
+                },
+                StageOutcome::PartiallySucceeded => RunStatus::Succeeded {
+                    reason: SuccessReason::PartialSuccess,
+                },
+                StageOutcome::Failed { .. } => RunStatus::Failed {
+                    reason: FailureReason::WorkflowError,
+                },
+            };
+            (status, failure, run_status)
+        }
+        Err(Error::Cancelled) => (
+            StageOutcome::Failed {
+                retry_requested: false,
+            },
+            Some(run_failure_from_error(
+                &Error::Cancelled,
+                FailureReason::Cancelled,
+            )),
+            RunStatus::Failed {
+                reason: FailureReason::Cancelled,
+            },
+        ),
+        Err(err) => (
+            StageOutcome::Failed {
+                retry_requested: false,
+            },
+            Some(run_failure_from_error(err, FailureReason::WorkflowError)),
+            RunStatus::Failed {
+                reason: FailureReason::WorkflowError,
+            },
+        ),
+    }
+}
+
+pub(crate) async fn build_conclusion_from_store(
+    run_store: &RunStoreHandle,
+    status: StageOutcome,
+    failure: Option<RunFailure>,
+    run_wall_time_ms: u64,
+    final_git_commit_sha: Option<String>,
+) -> Conclusion {
+    let projection = run_store.state().await.ok();
+    let projection_order = projection
+        .as_ref()
+        .map(stage_projection_order)
+        .unwrap_or_default();
+    let projection_billing = projection
+        .as_ref()
+        .map(|projection| billing_rollup_from_projection(projection, None))
+        .unwrap_or_default();
+    let checkpoint = projection
+        .as_ref()
+        .and_then(|state| state.current_checkpoint());
+
+    build_conclusion_from_parts(
+        checkpoint,
+        &projection_billing,
+        &projection_order,
+        status,
+        failure,
+        run_wall_time_ms,
+        final_git_commit_sha,
+    )
+}
+
+fn build_conclusion_from_parts(
+    checkpoint: Option<&Checkpoint>,
+    projection_billing: &ProjectionBillingRollup,
+    projection_order: &HashMap<String, u32>,
+    status: StageOutcome,
+    failure: Option<RunFailure>,
+    run_wall_time_ms: u64,
+    final_git_commit_sha: Option<String>,
+) -> Conclusion {
+    // Looping workflows revisit nodes; `completed_nodes` accumulates duplicates
+    // while the other checkpoint maps are keyed by node_id. Dedupe to one row
+    // per node so the stages table matches the deduped billing total.
+    let (stages, total_retries) = if let Some(cp) = checkpoint {
+        let billing_by_node = projection_billing
+            .stages
+            .iter()
+            .map(|stage| (stage.node_id.as_str(), stage))
+            .collect::<HashMap<_, _>>();
+        let mut stage_rows = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut retries_sum: u32 = 0;
+        let mut stage_order = Vec::new();
+
+        for (original_checkpoint_order, node_id) in cp.completed_nodes.iter().enumerate() {
+            if !seen.insert(node_id.as_str()) {
+                continue;
+            }
+            stage_order.push((original_checkpoint_order, node_id.as_str()));
+        }
+        let mut extra_node_outcomes = cp
+            .node_outcomes
+            .keys()
+            .filter(|node_id| !seen.contains(node_id.as_str()))
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        extra_node_outcomes.sort_unstable();
+        let extra_offset = stage_order.len();
+        for (extra_index, node_id) in extra_node_outcomes.into_iter().enumerate() {
+            seen.insert(node_id);
+            stage_order.push((extra_offset + extra_index, node_id));
+        }
+
+        for (original_checkpoint_order, node_id) in stage_order {
+            let retries = cp
+                .node_retries
+                .get(node_id)
+                .copied()
+                .unwrap_or(1)
+                .saturating_sub(1);
+            retries_sum += retries;
+            let billing = billing_by_node.get(node_id);
+
+            let summary = StageSummary {
+                stage_id: node_id.to_string(),
+                stage_label: node_id.to_string(),
+                timing: billing
+                    .map_or_else(fabro_types::StageTiming::default, |stage| stage.timing),
+                billing_usd_micros: billing.and_then(|stage| stage.billing.total_usd_micros),
+                retries,
+            };
+            stage_rows.push((
+                projection_order.get(node_id).copied().unwrap_or(u32::MAX),
+                original_checkpoint_order,
+                summary,
+            ));
+        }
+        stage_rows.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.2.stage_id.cmp(&right.2.stage_id))
+        });
+        let stages = stage_rows
+            .into_iter()
+            .map(|(_, _, summary)| summary)
+            .collect();
+        (stages, retries_sum)
+    } else {
+        (vec![], 0)
+    };
+
+    Conclusion {
+        timestamp: chrono::Utc::now(),
+        status,
+        timing: projection_billing.timing.with_wall_time(run_wall_time_ms),
+        failure,
+        final_git_commit_sha,
+        stages,
+        billing: projection_billing.billing_if_present(),
+        total_retries,
+        diff: fabro_types::RunDiff::default(),
+    }
+}
+
+fn stage_projection_order(state: &RunProjection) -> HashMap<String, u32> {
+    let mut order = HashMap::new();
+    for (stage_id, stage) in state.iter_stages() {
+        order
+            .entry(stage_id.node_id().to_string())
+            .and_modify(|first_seq: &mut u32| {
+                *first_seq = (*first_seq).min(stage.first_event_seq.get());
+            })
+            .or_insert_with(|| stage.first_event_seq.get());
+    }
+    order
+}
+
+/// `conclusion` is injected because the terminal event hasn't been emitted
+/// yet — the run store's `projection.conclusion` is still `None` at this point.
+pub async fn write_finalize_commit(
+    run_options: &RunOptions,
+    services: &RunServices,
+    conclusion: &Conclusion,
+) {
+    if services.metadata_runtime.metadata_degraded() {
+        return;
+    }
+    let Some(writer) = services.metadata_writer.as_ref() else {
+        return;
+    };
+    let Some(meta_branch) = run_options
+        .git
+        .as_ref()
+        .and_then(|git| git.meta_branch.as_deref())
+    else {
+        return;
+    };
+
+    let phase = MetadataSnapshotPhase::Finalize;
+    let started = Instant::now();
+    emit_metadata_snapshot_started(services, phase, meta_branch);
+
+    let mut projection = match services.run_store.state().await {
+        Ok(state) => state,
+        Err(err) => {
+            let message = format!("failed to load run state for final metadata snapshot: {err}");
+            emit_metadata_snapshot_failed(
+                services,
+                phase,
+                meta_branch,
+                started,
+                MetadataSnapshotFailureKind::LoadState,
+                message.clone(),
+                collect_causes(err.as_ref()),
+                None,
+                None,
+                None,
+            );
+            emit_metadata_warning(
+                services,
+                RunNoticeCode::CheckpointMetadataWriteFailed,
+                message,
+            );
+            return;
+        }
+    };
+    projection.conclusion = Some(conclusion.clone());
+    let dump = match RunDump::from_projection(&projection) {
+        Ok(dump) => dump,
+        Err(err) => {
+            let message = format!("failed to build run dump for final metadata snapshot: {err}");
+            emit_metadata_snapshot_failed(
+                services,
+                phase,
+                meta_branch,
+                started,
+                MetadataSnapshotFailureKind::Write,
+                message.clone(),
+                collect_causes(err.as_ref()),
+                None,
+                None,
+                None,
+            );
+            emit_metadata_warning(
+                services,
+                RunNoticeCode::CheckpointMetadataWriteFailed,
+                message,
+            );
+            return;
+        }
+    };
+    match writer.write_snapshot(&dump, "finalize run").await {
+        Ok(snapshot) => {
+            if let Some(detail) = snapshot.push_error.as_deref() {
+                let message =
+                    format!("failed to push metadata ref refs/heads/{meta_branch}: {detail}");
+                emit_metadata_snapshot_failed(
+                    services,
+                    phase,
+                    meta_branch,
+                    started,
+                    MetadataSnapshotFailureKind::Push,
+                    message.clone(),
+                    Vec::new(),
+                    Some(snapshot.commit_sha.clone()),
+                    Some(snapshot.entry_count),
+                    Some(snapshot.bytes),
+                );
+                emit_metadata_warning(
+                    services,
+                    RunNoticeCode::CheckpointMetadataPushFailed,
+                    message,
+                );
+            } else {
+                emit_metadata_snapshot_completed(services, phase, meta_branch, started, &snapshot);
+            }
+        }
+        Err(err) => {
+            let message = format!("failed to write final checkpoint metadata: {err}");
+            emit_metadata_snapshot_failed(
+                services,
+                phase,
+                meta_branch,
+                started,
+                MetadataSnapshotFailureKind::Write,
+                message.clone(),
+                collect_causes(&err),
+                None,
+                None,
+                None,
+            );
+            emit_metadata_warning(
+                services,
+                RunNoticeCode::CheckpointMetadataWriteFailed,
+                message,
+            );
+        }
+    }
+}
+
+fn emit_metadata_snapshot_started(
+    services: &RunServices,
+    phase: MetadataSnapshotPhase,
+    branch: &str,
+) {
+    services.emitter.emit(&Event::MetadataSnapshotStarted {
+        phase,
+        branch: branch.to_string(),
+    });
+}
+
+fn emit_metadata_snapshot_completed(
+    services: &RunServices,
+    phase: MetadataSnapshotPhase,
+    branch: &str,
+    started: Instant,
+    snapshot: &MetadataSnapshot,
+) {
+    services.emitter.emit(&Event::MetadataSnapshotCompleted {
+        phase,
+        branch: branch.to_string(),
+        duration_ms: elapsed_ms(started),
+        entry_count: snapshot.entry_count,
+        bytes: snapshot.bytes,
+        commit_sha: snapshot.commit_sha.clone(),
+    });
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Metadata failure event carries the full event contract explicitly."
+)]
+fn emit_metadata_snapshot_failed(
+    services: &RunServices,
+    phase: MetadataSnapshotPhase,
+    branch: &str,
+    started: Instant,
+    failure_kind: MetadataSnapshotFailureKind,
+    error: String,
+    causes: Vec<String>,
+    commit_sha: Option<String>,
+    entry_count: Option<usize>,
+    bytes: Option<u64>,
+) {
+    services.emitter.emit(&Event::MetadataSnapshotFailed {
+        phase,
+        branch: branch.to_string(),
+        duration_ms: elapsed_ms(started),
+        failure_kind,
+        error,
+        causes,
+        commit_sha,
+        entry_count,
+        bytes,
+        exec_output_tail: None,
+    });
+}
+
+fn emit_metadata_warning(services: &RunServices, code: RunNoticeCode, message: String) {
+    if services.metadata_runtime.mark_metadata_degraded() {
+        services.emitter.notice(RunNoticeLevel::Warn, code, message);
+    }
+}
+
+/// Failed and cancelled runs use a shorter diff timeout so a corrupted
+/// workspace can't stall downstream consumers waiting on the terminal event.
+async fn compute_final_patch(
+    run_options: &RunOptions,
+    services: &RunServices,
+    status: StageOutcome,
+) -> (Option<String>, Option<DiffSummary>) {
+    let Some(base_sha) = run_options.git.as_ref().and_then(|g| g.base_sha.clone()) else {
+        return (None, None);
+    };
+    let timeout_ms = match status {
+        StageOutcome::Succeeded | StageOutcome::PartiallySucceeded => 30_000,
+        _ => 10_000,
+    };
+    let to_sha = "HEAD";
+    let (patch_result, numstat_result) = tokio::join!(
+        git_diff_with_timeout(&*services.sandbox, &base_sha, timeout_ms),
+        list_diff_numstat(&*services.sandbox, &base_sha, to_sha),
+    );
+    let final_patch = match patch_result {
+        Ok(patch) if !patch.is_empty() => Some(patch),
+        Ok(_) => None,
+        Err(err) => {
+            services.emitter.notice(
+                RunNoticeLevel::Warn,
+                RunNoticeCode::GitDiffFailed,
+                format!("final diff failed: {err}"),
+            );
+            None
+        }
+    };
+    let diff_summary = match numstat_result {
+        Ok(numstat) => Some(summarize_diff_numstat(&numstat)),
+        Err(err) => {
+            services.emitter.notice(
+                RunNoticeLevel::Warn,
+                RunNoticeCode::GitDiffFailed,
+                format!("final diff stats failed: {err}"),
+            );
+            None
+        }
+    };
+    (final_patch, diff_summary)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn billing_from_projection(projection: &RunProjection) -> Option<BilledTokenCounts> {
+    billing_rollup_from_projection(projection, None).billing_if_present()
+}
+
+pub(crate) fn build_terminal_event(
+    outcome: &Result<Outcome, Error>,
+    timing: fabro_types::RunTiming,
+    artifact_count: usize,
+    final_git_commit_sha: Option<String>,
+    final_patch: Option<String>,
+    diff_summary: Option<DiffSummary>,
+    billing: Option<BilledTokenCounts>,
+) -> Event {
+    let outcome_status = outcome.as_ref().map_or(
+        StageOutcome::Failed {
+            retry_requested: false,
+        },
+        |o| o.status,
+    );
+
+    if outcome_status == StageOutcome::Succeeded
+        || outcome_status == StageOutcome::PartiallySucceeded
+    {
+        let total_usd_micros = billing.as_ref().and_then(|b| b.total_usd_micros);
+        return Event::WorkflowRunCompleted {
+            timing,
+            artifact_count,
+            status: outcome_status.to_string(),
+            reason: match outcome_status {
+                StageOutcome::PartiallySucceeded => SuccessReason::PartialSuccess,
+                _ => SuccessReason::Completed,
+            },
+            total_usd_micros,
+            final_git_commit_sha,
+            final_patch,
+            diff_summary,
+            billing,
+        };
+    }
+
+    let failure = match outcome {
+        Err(Error::Cancelled) => {
+            run_failure_from_error(&Error::Cancelled, FailureReason::Cancelled)
+        }
+        Err(err) => run_failure_from_error(err, FailureReason::WorkflowError),
+        Ok(outcome) => {
+            if let Some(failure) = outcome.failure.as_ref() {
+                run_failure_from_outcome_failure(failure, FailureReason::WorkflowError)
+            } else {
+                let fallback = Error::engine("run failed");
+                run_failure_from_error(&fallback, FailureReason::WorkflowError)
+            }
+        }
+    };
+    Event::WorkflowRunFailed {
+        failure,
+        timing,
+        final_git_commit_sha,
+        final_patch,
+        diff_summary,
+        billing,
+    }
+}
+
+async fn stop_sandbox_on_terminal(
+    services: &RunServices,
+    run_id: &fabro_types::RunId,
+    workflow_name: &str,
+    stop_on_terminal: bool,
+) -> fabro_sandbox::Result<()> {
+    let hook_ctx = HookContext::new(
+        HookEvent::SandboxCleanup,
+        *run_id,
+        workflow_name.to_string(),
+    );
+    let _ = services.run_hooks(&hook_ctx).await;
+    if stop_on_terminal {
+        services.sandbox.stop().await?;
+    }
+    Ok(())
+}
+
+/// FINALIZE phase: build conclusion, write the meta branch, emit the terminal
+/// `WorkflowRunCompleted`/`WorkflowRunFailed` event.
+///
+/// The terminal event is emitted here (not from `on_run_end`) so observers
+/// can't act on "done" before the meta branch writes are flushed.
+///
+/// # Errors
+///
+/// Returns `Error` if persisting terminal state fails.
+pub async fn finalize(executed: Executed, options: &FinalizeOptions) -> Result<Concluded, Error> {
+    let Executed {
+        graph,
+        outcome,
+        run_options,
+        wall_time_ms,
+        final_context: _,
+        engine,
+        model: _,
+    } = executed;
+    let services = Arc::clone(&engine.run);
+
+    let (final_status, failure_reason, _run_status) = classify_engine_result(&outcome);
+
+    let events = services.run_store.list_events().await.unwrap_or_default();
+    let artifact_count = events
+        .iter()
+        .filter(|envelope| matches!(envelope.event.body, EventBody::ArtifactCaptured(_)))
+        .count();
+    let projection = services.run_store.state().await.ok();
+    let projection_order = projection
+        .as_ref()
+        .map(stage_projection_order)
+        .unwrap_or_default();
+    let projection_billing = projection
+        .as_ref()
+        .map(|projection| billing_rollup_from_projection(projection, None))
+        .unwrap_or_default();
+    let checkpoint = projection
+        .as_ref()
+        .and_then(|state| state.current_checkpoint());
+    let conclusion = build_conclusion_from_parts(
+        checkpoint,
+        &projection_billing,
+        &projection_order,
+        final_status,
+        failure_reason,
+        wall_time_ms,
+        options.last_git_sha.clone(),
+    );
+
+    let ((final_patch, diff_summary), ()) = tokio::join!(
+        compute_final_patch(&run_options, &services, final_status),
+        write_finalize_commit(&run_options, &services, &conclusion),
+    );
+
+    if services.metadata_runtime.metadata_degraded() {
+        services.emitter.notice(
+            RunNoticeLevel::Warn,
+            RunNoticeCode::CheckpointMetadataDegraded,
+            "checkpoint metadata archive writes were degraded for this run".to_string(),
+        );
+    }
+
+    let terminal_event = build_terminal_event(
+        &outcome,
+        conclusion.timing,
+        artifact_count,
+        options.last_git_sha.clone(),
+        final_patch,
+        diff_summary,
+        conclusion.billing.clone(),
+    );
+    services.emitter.emit(&terminal_event);
+
+    if options.preserve_sandbox {
+        let info = services.sandbox.sandbox_info();
+        let message = if info.is_empty() {
+            "sandbox preserved".to_string()
+        } else {
+            format!("sandbox preserved: {info}")
+        };
+        services.emitter.notice(
+            RunNoticeLevel::Info,
+            RunNoticeCode::SandboxPreserved,
+            message,
+        );
+    }
+    if let Err(e) = stop_sandbox_on_terminal(
+        &services,
+        &options.run_id,
+        &options.workflow_name,
+        options.stop_on_terminal,
+    )
+    .await
+    {
+        tracing::warn!(error = %fabro_sandbox::display_for_log(&e), "Sandbox stop failed");
+        let exec_output_tail = fabro_sandbox::default_redacted_output_tail(&e);
+        services.emitter.notice_with_tail(
+            RunNoticeLevel::Warn,
+            RunNoticeCode::SandboxCleanupFailed,
+            format!("sandbox stop failed: {}", e.display_with_causes()),
+            exec_output_tail,
+        );
+    }
+
+    Ok(Concluded {
+        outcome,
+        conclusion,
+        graph,
+        run_options,
+        services,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use fabro_graphviz::graph::Graph;
+    use fabro_model::Catalog;
+    use fabro_sandbox::test_support::MockSandbox;
+    use fabro_store::{Database, EventEnvelope, RunDatabase, RunProjection};
+    use fabro_types::run_event::{MetadataSnapshotFailureKind, MetadataSnapshotPhase};
+    use fabro_types::{
+        BilledTokenCounts, EventBody, RunBlobId, RunEvent, RunId, RunSpec, StageCompletion,
+        WorkflowSettings, first_event_seq, fixtures, test_support,
+    };
+    use object_store::memory::InMemory;
+
+    use super::*;
+    use crate::context::Context;
+    use crate::event::{Emitter, StoreProgressLogger, append_event};
+    use crate::run_metadata::{RunMetadataRuntime, RunMetadataWriterHandle};
+    use crate::run_options::{GitCheckpointOptions, RunOptions};
+    use crate::runtime_store::{RunStoreBackend, RunStoreHandle};
+    use crate::sandbox_git_runtime::SandboxGitRuntime;
+    use crate::services::EngineServices;
+
+    fn test_run_id() -> RunId {
+        fixtures::RUN_1
+    }
+
+    fn test_run_options(run_dir: &std::path::Path) -> RunOptions {
+        RunOptions {
+            settings:         WorkflowSettings::default(),
+            run_dir:          run_dir.to_path_buf(),
+            cancel_token:     tokio_util::sync::CancellationToken::new(),
+            run_id:           test_run_id(),
+            labels:           HashMap::new(),
+            workflow_slug:    None,
+            github_app:       None,
+            pre_run_git:      None,
+            fork_source_ref:  None,
+            base_branch:      None,
+            display_base_sha: None,
+            git:              None,
+        }
+    }
+
+    fn test_git_run_options(run_dir: &std::path::Path, meta_branch: &str) -> RunOptions {
+        let mut options = test_run_options(run_dir);
+        options.git = Some(GitCheckpointOptions {
+            base_sha:    None,
+            run_branch:  None,
+            meta_branch: Some(meta_branch.to_string()),
+        });
+        options
+    }
+
+    fn test_executed(
+        graph: Graph,
+        outcome: Result<Outcome, Error>,
+        run_options: RunOptions,
+        wall_time_ms: u64,
+        services: Arc<RunServices>,
+    ) -> Executed {
+        let mut engine = EngineServices::test_default();
+        engine.run = services;
+        Executed {
+            graph,
+            outcome,
+            run_options,
+            wall_time_ms,
+            final_context: Context::new(),
+            engine: Arc::new(engine),
+            model: "test-model".to_string(),
+        }
+    }
+
+    fn test_store() -> Arc<Database> {
+        Arc::new(Database::new(
+            Arc::new(InMemory::new()),
+            "",
+            Duration::from_millis(1),
+            None,
+        ))
+    }
+
+    async fn seeded_run_store() -> RunDatabase {
+        let run_store = test_store().create_run(&test_run_id()).await.unwrap();
+        append_event(&run_store, &test_run_id(), &Event::RunCreated {
+            run_id:           test_run_id(),
+            title:            None,
+            settings:         serde_json::to_value(WorkflowSettings::default()).unwrap(),
+            graph:            serde_json::to_value(fabro_types::Graph::new("metadata")).unwrap(),
+            workflow_source:  None,
+            workflow_config:  None,
+            labels:           std::collections::BTreeMap::new(),
+            run_dir:          "/tmp/run".to_string(),
+            source_directory: Some("/tmp/project".to_string()),
+            workflow_slug:    Some("metadata".to_string()),
+            automation:       None,
+            db_prefix:        None,
+            provenance:       test_support::test_run_provenance(),
+            manifest_blob:    None,
+            git:              None,
+            fork_source_ref:  None,
+            retried_from:     None,
+            parent_id:        None,
+            web_url:          None,
+        })
+        .await
+        .unwrap();
+        run_store
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "metadata event tests use synchronous git commands to set up temporary repositories"
+    )]
+    fn init_git_repo(repo: &Path) {
+        let init = std::process::Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(init.status.success());
+        for (key, value) in [("user.name", "Test"), ("user.email", "test@test.com")] {
+            let config = std::process::Command::new("git")
+                .args(["config", key, value])
+                .current_dir(repo)
+                .output()
+                .unwrap();
+            assert!(config.status.success());
+        }
+        let commit = std::process::Command::new("git")
+            .args(["commit", "--allow-empty", "-m", "initial"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(commit.status.success());
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "metadata event tests use synchronous git commands to set up temporary repositories"
+    )]
+    fn git_commit_all(repo: &Path, msg: &str) -> String {
+        let add = std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(add.status.success());
+        let commit = std::process::Command::new("git")
+            .args(["commit", "-m", msg])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(
+            commit.status.success(),
+            "git commit failed: {}",
+            String::from_utf8_lossy(&commit.stderr)
+        );
+        let rev_parse = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(rev_parse.status.success());
+        String::from_utf8(rev_parse.stdout)
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    fn record_events(emitter: &Arc<Emitter>) -> Arc<std::sync::Mutex<Vec<RunEvent>>> {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = Arc::clone(&events);
+        emitter.on_event(move |event| {
+            captured.lock().unwrap().push(event.clone());
+        });
+        events
+    }
+
+    fn checkpoint_with(
+        completed_nodes: Vec<&str>,
+        node_outcomes: HashMap<String, Outcome>,
+    ) -> Checkpoint {
+        Checkpoint {
+            timestamp: chrono::Utc::now(),
+            current_node: completed_nodes
+                .last()
+                .copied()
+                .unwrap_or("start")
+                .to_string(),
+            completed_nodes: completed_nodes.into_iter().map(str::to_string).collect(),
+            node_retries: HashMap::new(),
+            context_values: HashMap::new(),
+            node_outcomes,
+            next_node_id: None,
+            git_commit_sha: None,
+            loop_failure_signatures: HashMap::new(),
+            restart_failure_signatures: HashMap::new(),
+            node_visits: HashMap::new(),
+        }
+    }
+
+    fn test_projection() -> RunProjection {
+        RunProjection::new(
+            "Test run".to_string(),
+            RunSpec {
+                run_id:           test_run_id(),
+                settings:         WorkflowSettings::default(),
+                graph:            Graph::new("test"),
+                graph_source:     None,
+                workflow_slug:    None,
+                automation:       None,
+                source_directory: None,
+                labels:           HashMap::new(),
+                provenance:       test_support::test_run_provenance(),
+                manifest_blob:    None,
+                definition_blob:  None,
+                git:              None,
+                fork_source_ref:  None,
+            },
+            chrono::Utc::now(),
+        )
+    }
+
+    use crate::test_support::test_usage;
+
+    #[test]
+    fn conclusion_stage_order_follows_projection_first_event_order() {
+        let mut projection = test_projection();
+        projection.stage_entry("zebra", 1, first_event_seq(1));
+        projection.stage_entry("apple", 1, first_event_seq(2));
+        let projection_order = stage_projection_order(&projection);
+        let checkpoint = checkpoint_with(
+            vec!["apple", "zebra"],
+            HashMap::from([
+                ("apple".to_string(), Outcome::success()),
+                ("zebra".to_string(), Outcome::success()),
+            ]),
+        );
+
+        let conclusion = build_conclusion_from_parts(
+            Some(&checkpoint),
+            &ProjectionBillingRollup::default(),
+            &projection_order,
+            StageOutcome::Succeeded,
+            None,
+            10,
+            None,
+        );
+
+        let stage_ids = conclusion
+            .stages
+            .iter()
+            .map(|stage| stage.stage_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(stage_ids, vec!["zebra", "apple"]);
+    }
+
+    #[test]
+    fn conclusion_includes_skipped_stage_from_projection_checkpoint_fallback() {
+        let mut projection = test_projection();
+        projection.stage_entry("skipped", 1, first_event_seq(4));
+        projection.stage_entry("finished", 1, first_event_seq(5));
+        let projection_order = stage_projection_order(&projection);
+        let checkpoint = checkpoint_with(
+            vec!["finished"],
+            HashMap::from([
+                ("finished".to_string(), Outcome::success()),
+                (
+                    "skipped".to_string(),
+                    Outcome::skipped("condition was false"),
+                ),
+            ]),
+        );
+
+        let conclusion = build_conclusion_from_parts(
+            Some(&checkpoint),
+            &ProjectionBillingRollup::default(),
+            &projection_order,
+            StageOutcome::Succeeded,
+            None,
+            10,
+            None,
+        );
+
+        let stage_ids = conclusion
+            .stages
+            .iter()
+            .map(|stage| stage.stage_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(stage_ids, vec!["skipped", "finished"]);
+    }
+
+    #[test]
+    fn conclusion_billing_sums_retry_visit_usage_from_projection() {
+        let mut projection = test_projection();
+        let failed_usage = test_usage("gpt-old", 100, 10);
+        let success_usage = test_usage("gpt-new", 200, 20);
+        let failed = projection.stage_entry("verify", 1, first_event_seq(1));
+        failed.timing = Some(fabro_types::StageTiming::wall_only(1200));
+        failed.usage = BilledTokenCounts::from_billed_usage(std::slice::from_ref(&failed_usage));
+        failed.model = Some(failed_usage.model().clone());
+        failed.completion = Some(StageCompletion {
+            outcome:        StageOutcome::Failed {
+                retry_requested: true,
+            },
+            notes:          None,
+            failure_reason: Some("try again".to_string()),
+            timestamp:      chrono::Utc::now(),
+        });
+        let succeeded = projection.stage_entry("verify", 2, first_event_seq(2));
+        succeeded.timing = Some(fabro_types::StageTiming::wall_only(800));
+        succeeded.usage =
+            BilledTokenCounts::from_billed_usage(std::slice::from_ref(&success_usage));
+        succeeded.model = Some(success_usage.model().clone());
+        succeeded.completion = Some(StageCompletion {
+            outcome:        StageOutcome::Succeeded,
+            notes:          None,
+            failure_reason: None,
+            timestamp:      chrono::Utc::now(),
+        });
+
+        let projection_order = stage_projection_order(&projection);
+        let projection_billing = billing_rollup_from_projection(&projection, None);
+        let mut latest_outcome = Outcome::success();
+        latest_outcome.usage = Some(success_usage);
+        latest_outcome.timing = Some(fabro_types::StageTiming::wall_only(800));
+        let mut checkpoint = checkpoint_with(
+            vec!["verify", "verify"],
+            HashMap::from([("verify".to_string(), latest_outcome)]),
+        );
+        checkpoint.node_retries.insert("verify".to_string(), 2);
+
+        let conclusion = build_conclusion_from_parts(
+            Some(&checkpoint),
+            &projection_billing,
+            &projection_order,
+            StageOutcome::Succeeded,
+            None,
+            10,
+            None,
+        );
+
+        assert_eq!(conclusion.billing.as_ref().unwrap().input_tokens, 300);
+        assert_eq!(conclusion.billing.as_ref().unwrap().output_tokens, 30);
+        assert_eq!(
+            conclusion.billing.as_ref().unwrap().total_usd_micros,
+            Some(330)
+        );
+        assert_eq!(conclusion.stages.len(), 1);
+        assert_eq!(conclusion.stages[0].stage_id, "verify");
+        assert_eq!(conclusion.stages[0].timing.wall_time_ms, 2000);
+        assert_eq!(conclusion.stages[0].billing_usd_micros, Some(330));
+        assert_eq!(conclusion.stages[0].retries, 1);
+    }
+
+    fn test_services(
+        run_store: RunStoreHandle,
+        emitter: Arc<Emitter>,
+        sandbox: Arc<dyn fabro_agent::Sandbox>,
+        metadata_runtime: Arc<RunMetadataRuntime>,
+        metadata_writer: Option<RunMetadataWriterHandle>,
+    ) -> Arc<RunServices> {
+        let locations = crate::services::RunLocations::for_sandbox(
+            None,
+            sandbox.as_ref(),
+            Path::new(".").to_path_buf(),
+        );
+        RunServices::new(
+            run_store,
+            emitter,
+            sandbox,
+            None,
+            locations,
+            tokio_util::sync::CancellationToken::new(),
+            fabro_model::ProviderId::anthropic(),
+            "claude-sonnet-4-6".to_string(),
+            Arc::new(fabro_auth::EnvCredentialSource::new()),
+            Arc::new(Catalog::from_builtin().expect("default catalog should build")),
+            Arc::new(SandboxGitRuntime::new()),
+            metadata_runtime,
+            metadata_writer,
+        )
+    }
+
+    #[tokio::test]
+    async fn finalize_persists_conclusion_in_projection() {
+        let temp = tempfile::tempdir().unwrap();
+        let run_dir = temp.path().join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let inner_store = test_store().create_run(&test_run_id()).await.unwrap();
+        let run_store = inner_store;
+        let emitter = Arc::new(Emitter::new(test_run_id()));
+        let store_logger = StoreProgressLogger::new(run_store.clone());
+        store_logger.register(&emitter);
+        let sandbox: Arc<dyn fabro_agent::Sandbox> = Arc::new(fabro_agent::LocalSandbox::new(
+            std::env::current_dir().unwrap(),
+        ));
+        let locations =
+            crate::services::RunLocations::for_sandbox(None, sandbox.as_ref(), run_dir.clone());
+        let services = RunServices::new(
+            run_store.clone().into(),
+            Arc::clone(&emitter),
+            sandbox,
+            None,
+            locations,
+            tokio_util::sync::CancellationToken::new(),
+            fabro_model::ProviderId::anthropic(),
+            "claude-sonnet-4-6".to_string(),
+            Arc::new(fabro_auth::EnvCredentialSource::new()),
+            Arc::new(Catalog::from_builtin().expect("default catalog should build")),
+            Arc::new(SandboxGitRuntime::new()),
+            Arc::new(RunMetadataRuntime::new()),
+            None,
+        );
+        let executed = test_executed(
+            Graph::new("test"),
+            Ok(Outcome::success()),
+            test_run_options(&run_dir),
+            5,
+            services,
+        );
+
+        let concluded = finalize(executed, &FinalizeOptions {
+            run_dir:          run_dir.clone(),
+            run_id:           test_run_id(),
+            workflow_name:    "test".to_string(),
+            preserve_sandbox: true,
+            stop_on_terminal: true,
+            last_git_sha:     None,
+        })
+        .await
+        .unwrap();
+        store_logger.flush().await;
+
+        assert_eq!(concluded.conclusion.status, StageOutcome::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn finalize_metadata_snapshot_success_emits_started_completed_unscoped() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_git_repo(repo_dir.path());
+        let branch = "fabro/metadata/run";
+        let run_store = seeded_run_store().await;
+        let handle = RunStoreHandle::local(run_store.clone());
+        let conclusion = Conclusion {
+            timestamp:            chrono::Utc::now(),
+            status:               StageOutcome::Succeeded,
+            timing:               fabro_types::RunTiming::wall_only(10),
+            failure:              None,
+            final_git_commit_sha: None,
+            stages:               Vec::new(),
+            billing:              None,
+            total_retries:        0,
+            diff:                 fabro_types::RunDiff::default(),
+        };
+        let emitter = Arc::new(Emitter::new(test_run_id()));
+        let events = record_events(&emitter);
+        let services = test_services(
+            handle,
+            emitter,
+            Arc::new(fabro_agent::LocalSandbox::new(
+                repo_dir.path().to_path_buf(),
+            )),
+            Arc::new(RunMetadataRuntime::new()),
+            Some(RunMetadataWriterHandle::new_for_test_repo(
+                repo_dir.path(),
+                branch,
+            )),
+        );
+        let run_options = test_git_run_options(repo_dir.path(), branch);
+
+        write_finalize_commit(&run_options, &services, &conclusion).await;
+
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_name(), "metadata.snapshot.started");
+        assert_eq!(events[1].event_name(), "metadata.snapshot.completed");
+        assert!(events[0].node_id.is_none());
+        match &events[1].body {
+            EventBody::MetadataSnapshotCompleted(props) => {
+                assert_eq!(props.phase, MetadataSnapshotPhase::Finalize);
+                assert_eq!(props.branch, branch);
+                assert!(!props.commit_sha.is_empty());
+            }
+            other => panic!("expected metadata completed event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn finalize_metadata_load_state_failure_emits_failed_before_notice() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_git_repo(repo_dir.path());
+        let emitter = Arc::new(Emitter::new(test_run_id()));
+        let events = record_events(&emitter);
+        let services = test_services(
+            RunStoreHandle::new(Arc::new(FailingStateStore)),
+            emitter,
+            Arc::new(fabro_agent::LocalSandbox::new(
+                repo_dir.path().to_path_buf(),
+            )),
+            Arc::new(RunMetadataRuntime::new()),
+            Some(RunMetadataWriterHandle::new_for_test_repo(
+                repo_dir.path(),
+                "fabro/metadata/run",
+            )),
+        );
+        let run_options = test_git_run_options(repo_dir.path(), "fabro/metadata/run");
+        let conclusion = Conclusion {
+            timestamp:            chrono::Utc::now(),
+            status:               StageOutcome::Succeeded,
+            timing:               fabro_types::RunTiming::wall_only(10),
+            failure:              None,
+            final_git_commit_sha: None,
+            stages:               Vec::new(),
+            billing:              None,
+            total_retries:        0,
+            diff:                 fabro_types::RunDiff::default(),
+        };
+
+        write_finalize_commit(&run_options, &services, &conclusion).await;
+
+        let events = events.lock().unwrap();
+        let names = events.iter().map(RunEvent::event_name).collect::<Vec<_>>();
+        assert_eq!(names, vec![
+            "metadata.snapshot.started",
+            "metadata.snapshot.failed",
+            "run.notice",
+        ]);
+        match &events[1].body {
+            EventBody::MetadataSnapshotFailed(props) => {
+                assert_eq!(props.phase, MetadataSnapshotPhase::Finalize);
+                assert_eq!(props.failure_kind, MetadataSnapshotFailureKind::LoadState);
+            }
+            other => panic!("expected metadata failed event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn degraded_metadata_runtime_skips_finalize_metadata_events() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_git_repo(repo_dir.path());
+        let run_store = seeded_run_store().await;
+        let emitter = Arc::new(Emitter::new(test_run_id()));
+        let events = record_events(&emitter);
+        let runtime = Arc::new(RunMetadataRuntime::new());
+        runtime.mark_metadata_degraded();
+        let services = test_services(
+            RunStoreHandle::local(run_store),
+            emitter,
+            Arc::new(fabro_agent::LocalSandbox::new(
+                repo_dir.path().to_path_buf(),
+            )),
+            runtime,
+            Some(RunMetadataWriterHandle::new_for_test_repo(
+                repo_dir.path(),
+                "fabro/metadata/run",
+            )),
+        );
+        let run_options = test_git_run_options(repo_dir.path(), "fabro/metadata/run");
+        let conclusion = Conclusion {
+            timestamp:            chrono::Utc::now(),
+            status:               StageOutcome::Succeeded,
+            timing:               fabro_types::RunTiming::wall_only(10),
+            failure:              None,
+            final_git_commit_sha: None,
+            stages:               Vec::new(),
+            billing:              None,
+            total_retries:        0,
+            diff:                 fabro_types::RunDiff::default(),
+        };
+
+        write_finalize_commit(&run_options, &services, &conclusion).await;
+
+        assert!(events.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn finalize_emits_metadata_snapshot_before_run_completed() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_git_repo(repo_dir.path());
+        let run_store = seeded_run_store().await;
+        let emitter = Arc::new(Emitter::new(test_run_id()));
+        let events = record_events(&emitter);
+        let services = test_services(
+            RunStoreHandle::local(run_store),
+            Arc::clone(&emitter),
+            Arc::new(fabro_agent::LocalSandbox::new(
+                repo_dir.path().to_path_buf(),
+            )),
+            Arc::new(RunMetadataRuntime::new()),
+            Some(RunMetadataWriterHandle::new_for_test_repo(
+                repo_dir.path(),
+                "fabro/metadata/run",
+            )),
+        );
+        let executed = test_executed(
+            Graph::new("test"),
+            Ok(Outcome::success()),
+            test_git_run_options(repo_dir.path(), "fabro/metadata/run"),
+            5,
+            services,
+        );
+
+        finalize(executed, &FinalizeOptions {
+            run_dir:          repo_dir.path().to_path_buf(),
+            run_id:           test_run_id(),
+            workflow_name:    "test".to_string(),
+            preserve_sandbox: false,
+            stop_on_terminal: true,
+            last_git_sha:     None,
+        })
+        .await
+        .unwrap();
+
+        let names = events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|event| event.event_name().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec![
+            "metadata.snapshot.started",
+            "metadata.snapshot.completed",
+            "run.completed",
+        ]);
+    }
+
+    #[tokio::test]
+    async fn finalize_stops_sandbox_on_terminal_without_deleting() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let sandbox = Arc::new(MockSandbox::linux());
+        let services = test_services(
+            RunStoreHandle::local(seeded_run_store().await),
+            Arc::new(Emitter::new(test_run_id())),
+            sandbox.clone(),
+            Arc::new(RunMetadataRuntime::new()),
+            None,
+        );
+        let executed = test_executed(
+            Graph::new("test"),
+            Ok(Outcome::success()),
+            test_run_options(repo_dir.path()),
+            5,
+            services,
+        );
+
+        finalize(executed, &FinalizeOptions {
+            run_dir:          repo_dir.path().to_path_buf(),
+            run_id:           test_run_id(),
+            workflow_name:    "test".to_string(),
+            preserve_sandbox: false,
+            stop_on_terminal: true,
+            last_git_sha:     None,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(sandbox.stop_count(), 1);
+        assert_eq!(sandbox.delete_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn finalize_leaves_sandbox_running_when_stop_on_terminal_is_false() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let sandbox = Arc::new(MockSandbox::linux());
+        let services = test_services(
+            RunStoreHandle::local(seeded_run_store().await),
+            Arc::new(Emitter::new(test_run_id())),
+            sandbox.clone(),
+            Arc::new(RunMetadataRuntime::new()),
+            None,
+        );
+        let executed = test_executed(
+            Graph::new("test"),
+            Ok(Outcome::success()),
+            test_run_options(repo_dir.path()),
+            5,
+            services,
+        );
+
+        finalize(executed, &FinalizeOptions {
+            run_dir:          repo_dir.path().to_path_buf(),
+            run_id:           test_run_id(),
+            workflow_name:    "test".to_string(),
+            preserve_sandbox: false,
+            stop_on_terminal: false,
+            last_git_sha:     None,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(sandbox.stop_count(), 0);
+        assert_eq!(sandbox.delete_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn finalize_terminal_event_includes_diff_summary() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo = repo_dir.path();
+        init_git_repo(repo);
+        tokio::fs::write(repo.join("notes.txt"), "one\n")
+            .await
+            .unwrap();
+        let base = git_commit_all(repo, "base");
+        tokio::fs::write(repo.join("notes.txt"), "one\ntwo\nthree\n")
+            .await
+            .unwrap();
+        let head = git_commit_all(repo, "head");
+
+        let run_store = seeded_run_store().await;
+        let emitter = Arc::new(Emitter::new(test_run_id()));
+        let events = record_events(&emitter);
+        let services = test_services(
+            RunStoreHandle::local(run_store),
+            Arc::clone(&emitter),
+            Arc::new(fabro_agent::LocalSandbox::new(repo.to_path_buf())),
+            Arc::new(RunMetadataRuntime::new()),
+            None,
+        );
+        let mut run_options = test_git_run_options(repo, "fabro/metadata/run");
+        run_options.git = Some(GitCheckpointOptions {
+            base_sha:    Some(base),
+            run_branch:  None,
+            meta_branch: None,
+        });
+        let executed = test_executed(
+            Graph::new("test"),
+            Ok(Outcome::success()),
+            run_options,
+            5,
+            services,
+        );
+
+        finalize(executed, &FinalizeOptions {
+            run_dir:          repo.to_path_buf(),
+            run_id:           test_run_id(),
+            workflow_name:    "test".to_string(),
+            preserve_sandbox: true,
+            stop_on_terminal: true,
+            last_git_sha:     Some(head),
+        })
+        .await
+        .unwrap();
+
+        let events = events.lock().unwrap();
+        let run_completed = events
+            .iter()
+            .find(|event| event.event_name() == "run.completed")
+            .expect("run.completed event");
+        let properties = run_completed.properties().unwrap();
+        assert_eq!(
+            properties["diff_summary"],
+            serde_json::json!({
+                "files_changed": 1,
+                "additions": 2,
+                "deletions": 0
+            })
+        );
+    }
+
+    struct FailingStateStore;
+
+    #[async_trait]
+    impl RunStoreBackend for FailingStateStore {
+        async fn load_state(&self) -> Result<RunProjection> {
+            Err(anyhow::anyhow!("state unavailable"))
+        }
+
+        async fn list_events(&self) -> Result<Vec<EventEnvelope>> {
+            Ok(Vec::new())
+        }
+
+        async fn append_run_event(&self, _event: &RunEvent) -> Result<()> {
+            Ok(())
+        }
+
+        async fn write_blob(&self, data: &[u8]) -> Result<RunBlobId> {
+            Ok(RunBlobId::new(data))
+        }
+
+        async fn read_blob(&self, _id: &RunBlobId) -> Result<Option<Bytes>> {
+            Ok(None)
+        }
+
+        async fn read_run_log(&self) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+    }
+}

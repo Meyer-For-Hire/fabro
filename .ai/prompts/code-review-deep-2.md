@@ -19,7 +19,7 @@ Output a report with all the bugs using this format:
       <severity>important OR nit</severity>
       <pre_existing>yes OR no</pre_existing>
       <location>
-         <file>lib/crates/fabro-cli/src/commands/resume.rs</file>
+         <file>lib/apps/fabro-cli/src/commands/resume.rs</file>
          <start_line>115</start_line>
          <end_line>115</end_line>
       </location>
@@ -51,7 +51,7 @@ Here is a real-world example:
     <severity>important</severity>
     <pre_existing>no</pre_existing>
     <location>
-        <file>lib/crates/fabro-cli/src/commands/resume.rs</file>
+        <file>lib/apps/fabro-cli/src/commands/resume.rs</file>
         <start_line>208</start_line>
         <end_line>208</end_line>
     </location>

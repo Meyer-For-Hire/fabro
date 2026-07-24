@@ -48,9 +48,9 @@ That envelope is stronger than most comparator systems. It gives Fabro stable to
 Relevant current Fabro sources:
 
 - `docs-internal/events-strategy.md`
-- `lib/crates/fabro-workflow/src/event.rs`
-- `lib/crates/fabro-types/src/run_event/mod.rs`
-- `lib/crates/fabro-agent/src/types.rs`
+- `lib/components/fabro-workflow/src/event.rs`
+- `lib/foundation/fabro-types/src/run_event/mod.rs`
+- `lib/components/fabro-agent/src/types.rs`
 
 ## Comparison Matrix
 

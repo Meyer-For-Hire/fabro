@@ -17,7 +17,11 @@
 export interface CreateRunSessionRequest {
     'title'?: string;
     /**
-     * Catalog model ID or alias, or provider-qualified provider/model reference. Stored as the canonical catalog model ID.
+     * Catalog model ID or alias. The server selects among ready providers and stores the canonical model ID.
      */
     'model'?: string;
+    /**
+     * Optional provider pin. Provider-qualified model references remain accepted for compatibility.
+     */
+    'provider'?: string;
 }

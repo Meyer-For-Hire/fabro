@@ -66,7 +66,7 @@ JSON objects without recognized fields are ignored.
 
 ### Validated routing output
 
-Set `output_schema="routing"` on an agent or prompt node to require Fabro's built-in routing directive schema:
+Set `output_schema="routing"` on an agent, prompt, or command node to require Fabro's built-in routing directive schema:
 
 ```dot
 review [
@@ -81,7 +81,9 @@ With `output_schema="routing"`, the routing JSON must be an object with at least
 
 Validated routing uses the same reverse scan as normal routing extraction: Fabro validates the last parsable JSON object that contains a recognized routing field. If a routing object is present but malformed or has invalid field types, Fabro repairs that response instead of falling through to a file fallback.
 
-Fabro repairs invalid structured output inside the same LLM context before failing the node. For prompt nodes, Fabro appends the invalid assistant response and a corrective user message to the same message list. For agent nodes using the API backend, Fabro sends the corrective message to the same live agent session. `output_retries` controls these repair turns and defaults to `2`; `output_retries=0` validates once and fails without a repair turn. Negative values are treated as `0`. These repair turns are separate from workflow `max_retries` and do not consume node retry attempts.
+Fabro repairs invalid structured output inside the same LLM context before failing an agent or prompt node. For prompt nodes, Fabro appends the invalid assistant response and a corrective user message to the same message list. For agent nodes using the API backend, Fabro sends the corrective message to the same live agent session. `output_retries` controls these repair turns and defaults to `2`; `output_retries=0` validates once and fails without a repair turn. Negative values are treated as `0`. These repair turns are separate from workflow `max_retries` and do not consume node retry attempts.
+
+Command nodes instead validate only after an exit-code-`0` script, applying the same reverse scan to merged stdout and stderr. Print the intended JSON object last. Invalid output fails deterministically without a repair turn, command retry, or `status.json` fallback; `output_retries`, `retry_policy`, and `max_retries` do not retry the validation failure. Nonzero exits keep their normal command failure behavior without schema validation.
 
 ### Routing fallback sources
 
@@ -95,7 +97,9 @@ Agent nodes can provide routing directives through fallback files. Fabro checks 
 
 This fallback chain applies to normal routing extraction and to `output_schema="routing"`. For validated routing, Fabro only advances to the next source when the current source has no JSON object or no object with recognized routing fields. If the current source contains malformed routing JSON or valid JSON with wrong routing field types, validation fails and Fabro starts the repair loop instead.
 
-Prompt nodes do not use file fallbacks; they validate or extract routing directives from the response text only.
+The last-file fallback only reads `.json` and `.md` files (case-insensitive), and the routing JSON must be the final JSON object in the file, with only whitespace after it. Fabro ignores other file types and routing JSON followed by any other content. These restrictions do not apply to the dedicated `status.json` fallback.
+
+Prompt nodes do not use file fallbacks; they validate or extract routing directives from the response text only. Command nodes likewise have no file fallback and validate only their merged stdout and stderr.
 
 If no source provides routing directives, the transition falls through to condition matching, unconditional edges, or weight-based tiebreaking as described in [Transitions](/workflows/transitions).
 
@@ -119,7 +123,7 @@ review -> approve [label="Approve"]
 
 ## Custom structured outputs
 
-Agent and prompt nodes can also validate their final JSON object against a JSON Schema file:
+Agent, prompt, and command nodes can also validate their final JSON object against a JSON Schema file:
 
 ```dot
 audit [
@@ -130,9 +134,9 @@ audit [
 ]
 ```
 
-`output_schema="@path/to/schema.json"` uses the same workflow file-reference rules as prompt files: the schema is loaded relative to the workflow file and inlined before execution. The final JSON object in the LLM response is validated with `jsonschema`.
+`output_schema="@path/to/schema.json"` uses the same workflow file-reference rules as prompt files: the schema is loaded relative to the workflow file and inlined before execution. The final JSON object in the LLM response, or in a successful command's merged stdout and stderr, is validated with `jsonschema`.
 
-Custom schema validation only reads the response text. It does not fall back to `status.json` or the last file touched by the agent.
+Custom schema validation only reads response or command output text. It does not fall back to `status.json` or the last file touched by the agent.
 
 When custom schema validation succeeds, Fabro stores the parsed JSON value in context at:
 
@@ -140,12 +144,12 @@ When custom schema validation succeeds, Fabro stores the parsed JSON value in co
 |---|---|
 | `output.{node_id}` | The parsed JSON object that matched the custom schema |
 
-For example, node `audit` writes its parsed custom output to `output.audit`. Fabro still stores the raw response text at `response.audit`.
+For example, node `audit` writes its parsed custom output to `output.audit`. Fabro still stores raw LLM response text at `response.audit`; command output remains available through `command.output`.
 
-If custom schema validation fails, Fabro sends concise validation feedback to the same prompt conversation or agent session and asks for corrected JSON. After `output_retries` repair turns are exhausted, the node fails terminally with `output schema validation failed after N repair attempt(s)`.
+If custom schema validation fails for an agent or prompt node, Fabro sends concise validation feedback to the same prompt conversation or agent session and asks for corrected JSON. After `output_retries` repair turns are exhausted, the node fails terminally with `output schema validation failed after N repair attempt(s)`. A command node instead fails deterministically after its first validation, without a repair turn or command retry.
 
 <Note>
-Structured output validation currently applies to agent and prompt nodes. `backend="acp"` does not support `output_schema` in this release. Custom schemas update `output.{node_id}`; routing schemas update routing fields and `context_updates` instead.
+Structured output validation applies to agent, prompt, and command nodes. `backend="acp"` does not support `output_schema` in this release. Custom schemas update `output.{node_id}`; routing schemas update routing fields and merge `context_updates` as flat context keys that edge conditions can read. Edge conditions cannot traverse the custom `output.{node_id}` object.
 </Note>
 
 ## Output logging

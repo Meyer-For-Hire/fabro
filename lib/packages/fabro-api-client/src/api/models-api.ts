@@ -43,7 +43,7 @@ import type { ProviderTestList } from '../models';
 export const ModelsApiAxiosParamCreator = function (configuration?: Configuration) {
     return {
         /**
-         * Returns a paginated list of available LLM models from the built-in catalog.
+         * Returns one row per provider/model offering from the catalog. Model IDs are unique within a provider; `(provider, id)` is the resource identity.
          * @summary List Models
          * @param {string} [provider] Filter models by provider ID. Unknown provider IDs return an empty result set.
          * @param {string} [query] Case-insensitive substring search across &#x60;id&#x60;, &#x60;display_name&#x60;, and &#x60;aliases&#x60;.
@@ -137,12 +137,13 @@ export const ModelsApiAxiosParamCreator = function (configuration?: Configuratio
         /**
          * Tests a model by sending a simple prompt and reporting pass/fail.
          * @summary Test Model
-         * @param {string} id The model identifier.
+         * @param {string} id The canonical model ID or an alias.
+         * @param {string} [provider] Pin the test to this provider\&#39;s offering. When omitted, the server selects among ready providers by catalog priority.
          * @param {ModelTestMode} [mode] Test mode for the single-model test endpoint. Defaults to &#x60;basic&#x60;.
          * @param {*} [options] Override http request option.
          * @throws {RequiredError}
          */
-        testModel: async (id: string, mode?: ModelTestMode, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
+        testModel: async (id: string, provider?: string, mode?: ModelTestMode, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
             // verify required parameter 'id' is not null or undefined
             assertParamExists('testModel', 'id', id)
             const localVarPath = `/api/v1/models/{id}/test`
@@ -163,6 +164,10 @@ export const ModelsApiAxiosParamCreator = function (configuration?: Configuratio
             // authentication BearerAuth required
             // http bearer authentication required
             await setBearerAuthToObject(localVarHeaderParameter, configuration)
+
+            if (provider !== undefined) {
+                localVarQueryParameter['provider'] = provider;
+            }
 
             if (mode !== undefined) {
                 localVarQueryParameter['mode'] = mode;
@@ -270,7 +275,7 @@ export const ModelsApiFp = function(configuration?: Configuration) {
     const localVarAxiosParamCreator = ModelsApiAxiosParamCreator(configuration)
     return {
         /**
-         * Returns a paginated list of available LLM models from the built-in catalog.
+         * Returns one row per provider/model offering from the catalog. Model IDs are unique within a provider; `(provider, id)` is the resource identity.
          * @summary List Models
          * @param {string} [provider] Filter models by provider ID. Unknown provider IDs return an empty result set.
          * @param {string} [query] Case-insensitive substring search across &#x60;id&#x60;, &#x60;display_name&#x60;, and &#x60;aliases&#x60;.
@@ -300,13 +305,14 @@ export const ModelsApiFp = function(configuration?: Configuration) {
         /**
          * Tests a model by sending a simple prompt and reporting pass/fail.
          * @summary Test Model
-         * @param {string} id The model identifier.
+         * @param {string} id The canonical model ID or an alias.
+         * @param {string} [provider] Pin the test to this provider\&#39;s offering. When omitted, the server selects among ready providers by catalog priority.
          * @param {ModelTestMode} [mode] Test mode for the single-model test endpoint. Defaults to &#x60;basic&#x60;.
          * @param {*} [options] Override http request option.
          * @throws {RequiredError}
          */
-        async testModel(id: string, mode?: ModelTestMode, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<ModelTestResult>> {
-            const localVarAxiosArgs = await localVarAxiosParamCreator.testModel(id, mode, options);
+        async testModel(id: string, provider?: string, mode?: ModelTestMode, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<ModelTestResult>> {
+            const localVarAxiosArgs = await localVarAxiosParamCreator.testModel(id, provider, mode, options);
             const localVarOperationServerIndex = configuration?.serverIndex ?? 0;
             const localVarOperationServerBasePath = operationServerMap['ModelsApi.testModel']?.[localVarOperationServerIndex]?.url;
             return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
@@ -347,7 +353,7 @@ export const ModelsApiFactory = function (configuration?: Configuration, basePat
     const localVarFp = ModelsApiFp(configuration)
     return {
         /**
-         * Returns a paginated list of available LLM models from the built-in catalog.
+         * Returns one row per provider/model offering from the catalog. Model IDs are unique within a provider; `(provider, id)` is the resource identity.
          * @summary List Models
          * @param {string} [provider] Filter models by provider ID. Unknown provider IDs return an empty result set.
          * @param {string} [query] Case-insensitive substring search across &#x60;id&#x60;, &#x60;display_name&#x60;, and &#x60;aliases&#x60;.
@@ -371,13 +377,25 @@ export const ModelsApiFactory = function (configuration?: Configuration, basePat
         /**
          * Tests a model by sending a simple prompt and reporting pass/fail.
          * @summary Test Model
-         * @param {string} id The model identifier.
+         * @param {string} id The canonical model ID or an alias.
+         * @param {string} [provider] Pin the test to this provider\&#39;s offering. When omitted, the server selects among ready providers by catalog priority.
          * @param {ModelTestMode} [mode] Test mode for the single-model test endpoint. Defaults to &#x60;basic&#x60;.
          * @param {*} [options] Override http request option.
          * @throws {RequiredError}
          */
-        testModel(id: string, mode?: ModelTestMode, options?: RawAxiosRequestConfig): AxiosPromise<ModelTestResult> {
-            return localVarFp.testModel(id, mode, options).then((request) => request(axios, basePath));
+        testModel(id: string, provider?: string, mode?: ModelTestMode, options?: RawAxiosRequestConfig): AxiosPromise<ModelTestResult> {
+            return localVarFp.testModel(id, provider, mode, options).then((request) => request(axios, basePath));
+        },
+        /**
+         * Validates an LLM provider API key against the server\'s effective catalog without persisting it.
+         * @summary Test Provider Credentials
+         * @param {string} provider The provider identifier.
+         * @param {ProviderCredentialTestRequest} providerCredentialTestRequest
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        testProviderCredentials(provider: string, providerCredentialTestRequest: ProviderCredentialTestRequest, options?: RawAxiosRequestConfig): AxiosPromise<ProviderCredentialTestResponse> {
+            return localVarFp.testProviderCredentials(provider, providerCredentialTestRequest, options).then((request) => request(axios, basePath));
         },
         /**
          * Validates an LLM provider API key against the server\'s effective catalog without persisting it.
@@ -407,7 +425,7 @@ export const ModelsApiFactory = function (configuration?: Configuration, basePat
  */
 export class ModelsApi extends BaseAPI {
     /**
-     * Returns a paginated list of available LLM models from the built-in catalog.
+     * Returns one row per provider/model offering from the catalog. Model IDs are unique within a provider; `(provider, id)` is the resource identity.
      * @summary List Models
      * @param {string} [provider] Filter models by provider ID. Unknown provider IDs return an empty result set.
      * @param {string} [query] Case-insensitive substring search across &#x60;id&#x60;, &#x60;display_name&#x60;, and &#x60;aliases&#x60;.
@@ -433,13 +451,26 @@ export class ModelsApi extends BaseAPI {
     /**
      * Tests a model by sending a simple prompt and reporting pass/fail.
      * @summary Test Model
-     * @param {string} id The model identifier.
+     * @param {string} id The canonical model ID or an alias.
+     * @param {string} [provider] Pin the test to this provider\&#39;s offering. When omitted, the server selects among ready providers by catalog priority.
      * @param {ModelTestMode} [mode] Test mode for the single-model test endpoint. Defaults to &#x60;basic&#x60;.
      * @param {*} [options] Override http request option.
      * @throws {RequiredError}
      */
-    public testModel(id: string, mode?: ModelTestMode, options?: RawAxiosRequestConfig) {
-        return ModelsApiFp(this.configuration).testModel(id, mode, options).then((request) => request(this.axios, this.basePath));
+    public testModel(id: string, provider?: string, mode?: ModelTestMode, options?: RawAxiosRequestConfig) {
+        return ModelsApiFp(this.configuration).testModel(id, provider, mode, options).then((request) => request(this.axios, this.basePath));
+    }
+
+    /**
+     * Validates an LLM provider API key against the server\'s effective catalog without persisting it.
+     * @summary Test Provider Credentials
+     * @param {string} provider The provider identifier.
+     * @param {ProviderCredentialTestRequest} providerCredentialTestRequest
+     * @param {*} [options] Override http request option.
+     * @throws {RequiredError}
+     */
+    public testProviderCredentials(provider: string, providerCredentialTestRequest: ProviderCredentialTestRequest, options?: RawAxiosRequestConfig) {
+        return ModelsApiFp(this.configuration).testProviderCredentials(provider, providerCredentialTestRequest, options).then((request) => request(this.axios, this.basePath));
     }
 
     /**

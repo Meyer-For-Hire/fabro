@@ -5,8 +5,8 @@ This document maps the files that still live under a run scratch directory. Dura
 Scope:
 - Scratch root: `~/.fabro/scratch/YYYYMMDD-{run_id}/`
 - This covers local run files only
-- Persistent store keys live in `lib/crates/fabro-store/src/keys.rs`
-- Artifact object-store keys live in `lib/crates/fabro-store/src/artifact_store.rs`
+- Persistent store keys live in `lib/components/fabro-store/src/keys.rs`
+- Artifact object-store keys live in `lib/components/fabro-store/src/artifact_store.rs`
 
 There is no `_init.json` anymore. Run existence in the database is determined by stored run events, and local scratch directories are managed separately under `scratch/`.
 

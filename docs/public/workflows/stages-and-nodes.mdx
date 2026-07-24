@@ -171,6 +171,8 @@ fork -> quality
 
 Because the checkout is shared, file changes from one branch are immediately visible to the others. Concurrent writes can race or overwrite each other. Fabro does not isolate branch files, lock paths, detect conflicts, or warn about overlapping writes. Design branches to be read-only or assign each branch disjoint files and directories when deterministic workspace changes matter.
 
+For each branch's first node, fidelity resolves from the fork-to-branch edge, then the branch node; otherwise it inherits the fork preamble unchanged. Fabro renders branch-specific preambles before fan-out from the fork snapshot. Branch-level `full` degrades to `summary:high` because concurrent branches cannot share sessions, and `thread_id` on a branch node or fork-to-branch edge is inert.
+
 ### Merge (fan-in)
 
 **Shape:** `tripleoctagon`

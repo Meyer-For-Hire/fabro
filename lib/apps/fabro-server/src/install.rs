@@ -1,0 +1,2742 @@
+use std::collections::HashMap;
+use std::convert::Infallible;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+
+use anyhow::{Context as _, anyhow, bail};
+use axum::extract::{OriginalUri, Query, Request, State};
+use axum::http::{HeaderMap, Method, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post, put};
+use axum::{Json, Router, middleware};
+use base64::Engine as _;
+use base64::engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD};
+use fabro_config::Storage;
+use fabro_config::bind::{Bind, BindRequest};
+use fabro_config::envfile::{EnvFileRemoval, EnvFileUpdate};
+use fabro_install::{
+    GITHUB_APP_VAULT_KEYS, GITHUB_INSTALL_SECRET_KEYS, InstallListenConfig, InstallPersistencePlan,
+    InstallSandboxSelection, OBJECT_STORE_ACCESS_KEY_ID_ENV, OBJECT_STORE_SECRET_ACCESS_KEY_ENV,
+    PendingSettingsWrite, SecretStoreWrite, merge_server_settings,
+    prepare_dev_token_write_for_install, seed_default_environment_in_storage,
+    write_github_app_settings, write_object_store_settings, write_sandbox_settings,
+    write_token_settings,
+};
+use fabro_llm::client::Client as LlmClient;
+use fabro_llm::generate::{GenerateParams, generate};
+use fabro_model::catalog::CatalogProvider;
+use fabro_model::{Catalog, ProviderId};
+use fabro_sandbox::daytona;
+use fabro_static::EnvVars;
+use fabro_store::ArtifactStore;
+use fabro_types::ServerSettings;
+use fabro_types::settings::run::EnvironmentProvider;
+use fabro_types::settings::server::ObjectStoreSettings;
+use fabro_types::settings::{is_wildcard_host, validate_public_url_with_label};
+use fabro_util::version::FABRO_VERSION;
+use fabro_util::{Home, session_secret};
+use fabro_vault::SecretType as VaultSecretType;
+use object_store::aws::resolve_bucket_region;
+use object_store::path::Path as ObjectStorePath;
+use object_store::{ClientOptions, RetryConfig};
+use serde::{Deserialize, Serialize};
+use tokio::net::{TcpListener, UnixListener};
+use tokio::sync::watch;
+use tokio::time::{sleep, timeout};
+use tower::service_fn;
+use tracing::{error, info, warn};
+use zeroize::Zeroizing;
+
+use crate::error::ApiError;
+use crate::serve::{self, DEFAULT_TCP_PORT};
+use crate::server_secrets::{ServerSecrets, process_env_snapshot};
+use crate::{security_headers, server, static_files};
+
+#[derive(Clone)]
+pub struct InstallAppState {
+    install_token:      Arc<str>,
+    pending_install:    Arc<Mutex<PendingInstall>>,
+    storage_dir:        Arc<Path>,
+    config_path:        Arc<Path>,
+    home:               Option<Home>,
+    install_listen:     Arc<Mutex<InstallListenConfig>>,
+    first_operator:     Arc<Mutex<Option<InstallOperatorFingerprint>>>,
+    finish_in_progress: Arc<AtomicBool>,
+    upstreams:          InstallUpstreamConfig,
+    static_asset_root:  Option<Arc<Path>>,
+    on_finish:          Option<Arc<dyn Fn() + Send + Sync>>,
+    finish_hook:        Option<InstallFinishHook>,
+}
+
+pub struct InstallFinishInfo {
+    pub canonical_url: String,
+    pub dev_token:     Option<String>,
+}
+
+pub type InstallFinishHook = Arc<dyn Fn(&InstallFinishInfo) -> anyhow::Result<()> + Send + Sync>;
+
+#[derive(Clone, Debug, Default)]
+struct InstallUpstreamConfig {
+    provider_base_urls:      HashMap<ProviderId, String>,
+    github_api_base_url:     Option<String>,
+    daytona_api_base_url:    Option<String>,
+    daytona_organization_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InstallOperatorFingerprint {
+    user_agent: Option<String>,
+    remote_ip:  Option<String>,
+}
+
+pub const DEFAULT_INSTALL_GITHUB_API_BASE_URL: &str = "https://api.github.com";
+const DEFAULT_INSTALL_TCP_LISTEN_ADDRESS: &str = "127.0.0.1:32276";
+const REDACTED_SECRET_VALUE: &str = "[REDACTED]";
+const VALIDATION_TIMEOUT: Duration = Duration::from_secs(20);
+const VALIDATION_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+static INSTALL_CATALOG: LazyLock<Arc<Catalog>> = LazyLock::new(|| {
+    Arc::new(Catalog::from_builtin().expect("embedded install model catalog should be valid"))
+});
+
+impl InstallAppState {
+    #[must_use]
+    pub fn new(token: String, storage_dir: &Path, config_path: &Path) -> Self {
+        Self {
+            install_token:      Arc::from(token),
+            pending_install:    Arc::new(Mutex::new(PendingInstall::default())),
+            storage_dir:        Arc::from(storage_dir),
+            config_path:        Arc::from(config_path),
+            home:               None,
+            install_listen:     Arc::new(Mutex::new(InstallListenConfig::Tcp(
+                DEFAULT_INSTALL_TCP_LISTEN_ADDRESS.to_string(),
+            ))),
+            first_operator:     Arc::new(Mutex::new(None)),
+            finish_in_progress: Arc::new(AtomicBool::new(false)),
+            upstreams:          InstallUpstreamConfig::default(),
+            static_asset_root:  None,
+            on_finish:          None,
+            finish_hook:        None,
+        }
+    }
+
+    #[must_use]
+    pub fn for_test(token: &str) -> Self {
+        let temp_root = std::env::temp_dir().join("fabro-install-test");
+        Self::for_test_with_paths(token, &temp_root, &temp_root.join("settings.toml"))
+    }
+
+    #[must_use]
+    #[expect(
+        unsafe_code,
+        reason = "test-only: set FABRO_TEST_IN_MEMORY_STORE to a constant so install tests \
+                  don't hang on real S3; parallel tests race on the same value"
+    )]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test-only: forces the in-memory object store for install tests so they \
+                  don't contact real S3"
+    )]
+    pub fn for_test_with_paths(token: &str, storage_dir: &Path, config_path: &Path) -> Self {
+        // Install-flow tests verify persistence and redaction, not S3
+        // reachability. Force the in-memory object store shortcut so
+        // /install/finish can't hang on an unreachable bucket.
+        unsafe {
+            std::env::set_var(EnvVars::FABRO_TEST_IN_MEMORY_STORE, "1");
+        }
+        Self {
+            install_token:      Arc::from(token),
+            pending_install:    Arc::new(Mutex::new(PendingInstall::default())),
+            storage_dir:        Arc::from(storage_dir),
+            config_path:        Arc::from(config_path),
+            home:               None,
+            install_listen:     Arc::new(Mutex::new(InstallListenConfig::Tcp(
+                DEFAULT_INSTALL_TCP_LISTEN_ADDRESS.to_string(),
+            ))),
+            first_operator:     Arc::new(Mutex::new(None)),
+            finish_in_progress: Arc::new(AtomicBool::new(false)),
+            upstreams:          InstallUpstreamConfig::default(),
+            static_asset_root:  None,
+            on_finish:          None,
+            finish_hook:        None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_finish_callback(self, on_finish: Arc<dyn Fn() + Send + Sync>) -> Self {
+        Self {
+            on_finish: Some(on_finish),
+            ..self
+        }
+    }
+
+    #[must_use]
+    pub fn with_finish_hook(self, finish_hook: InstallFinishHook) -> Self {
+        Self {
+            finish_hook: Some(finish_hook),
+            ..self
+        }
+    }
+
+    #[must_use]
+    pub fn with_home(mut self, home: Home) -> Self {
+        self.home = Some(home);
+        self
+    }
+
+    #[must_use]
+    pub fn with_static_asset_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.static_asset_root = Some(Arc::from(root.into()));
+        self
+    }
+
+    #[must_use]
+    pub fn with_provider_base_url(
+        mut self,
+        provider: impl Into<ProviderId>,
+        base_url: impl Into<String>,
+    ) -> Self {
+        self.upstreams
+            .provider_base_urls
+            .insert(provider.into(), base_url.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_github_api_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.upstreams.github_api_base_url = Some(base_url.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_daytona_api_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.upstreams.daytona_api_base_url = Some(base_url.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_daytona_organization_id(mut self, organization_id: impl Into<String>) -> Self {
+        self.upstreams.daytona_organization_id = Some(organization_id.into());
+        self
+    }
+
+    fn set_install_bind(&self, bind: &Bind) {
+        *lock_unpoisoned(&self.install_listen, "install listen") = install_listen_config(bind);
+    }
+
+    fn install_listen_config(&self) -> InstallListenConfig {
+        lock_unpoisoned(&self.install_listen, "install listen").clone()
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct InstallTokenQuery {
+    token: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PendingInstall {
+    llm:                Option<LlmProvidersInput>,
+    server:             Option<ServerConfigInput>,
+    object_store:       Option<InstallObjectStoreState>,
+    sandbox:            Option<InstallSandboxState>,
+    github:             Option<GithubInstallState>,
+    pending_github_app: Option<PendingGithubApp>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct LlmProvidersInput {
+    providers: Vec<LlmProviderInput>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct LlmProviderInput {
+    provider: ProviderId,
+    api_key:  String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ServerConfigInput {
+    canonical_url: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, strum::IntoStaticStr)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+enum InstallObjectStoreProvider {
+    Local,
+    S3,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, strum::IntoStaticStr)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+enum InstallObjectStoreCredentialMode {
+    Runtime,
+    AccessKey,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct InstallObjectStoreInput {
+    provider:          InstallObjectStoreProvider,
+    root:              Option<String>,
+    bucket:            Option<String>,
+    region:            Option<String>,
+    credential_mode:   Option<InstallObjectStoreCredentialMode>,
+    access_key_id:     Option<String>,
+    secret_access_key: Option<String>,
+}
+
+#[derive(Clone)]
+struct InstallSecret(Zeroizing<String>);
+
+impl InstallSecret {
+    fn new(value: impl Into<String>) -> Self {
+        Self(Zeroizing::new(value.into()))
+    }
+
+    fn expose_secret(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for InstallSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(REDACTED_SECRET_VALUE)
+    }
+}
+
+impl std::fmt::Display for InstallSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(REDACTED_SECRET_VALUE)
+    }
+}
+
+impl Serialize for InstallSecret {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(REDACTED_SECRET_VALUE)
+    }
+}
+
+#[derive(Clone)]
+struct InstallAwsCredentialPair {
+    access_key_id:     InstallSecret,
+    secret_access_key: InstallSecret,
+}
+
+impl InstallAwsCredentialPair {
+    fn new(access_key_id: impl Into<String>, secret_access_key: impl Into<String>) -> Self {
+        Self {
+            access_key_id:     InstallSecret::new(access_key_id),
+            secret_access_key: InstallSecret::new(secret_access_key),
+        }
+    }
+}
+
+impl std::fmt::Debug for InstallAwsCredentialPair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InstallAwsCredentialPair")
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &self.secret_access_key)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug)]
+enum InstallObjectStoreState {
+    Local {
+        root: String,
+    },
+    S3 {
+        bucket:             String,
+        region:             String,
+        credential_mode:    InstallObjectStoreCredentialMode,
+        manual_credentials: Option<InstallAwsCredentialPair>,
+    },
+}
+
+impl InstallObjectStoreState {
+    fn as_session_value(&self) -> serde_json::Value {
+        match self {
+            Self::Local { root } => serde_json::json!({
+                "provider": "local",
+                "root": root,
+            }),
+            Self::S3 {
+                bucket,
+                region,
+                credential_mode,
+                manual_credentials,
+            } => serde_json::json!({
+                "provider": "s3",
+                "bucket": bucket,
+                "region": region,
+                "credential_mode": <&'static str>::from(*credential_mode),
+                "manual_credentials_saved": matches!(
+                    credential_mode,
+                    InstallObjectStoreCredentialMode::AccessKey
+                ) && manual_credentials.is_some(),
+            }),
+        }
+    }
+
+    fn to_persistence_selection(&self) -> fabro_install::InstallObjectStoreSelection {
+        match self {
+            Self::Local { root } => {
+                fabro_install::InstallObjectStoreSelection::Local { root: root.clone() }
+            }
+            Self::S3 {
+                bucket,
+                region,
+                credential_mode,
+                manual_credentials,
+            } => fabro_install::InstallObjectStoreSelection::S3 {
+                bucket:            bucket.clone(),
+                region:            region.clone(),
+                credential_mode:   match credential_mode {
+                    InstallObjectStoreCredentialMode::Runtime => {
+                        fabro_install::InstallObjectStoreCredentialMode::Runtime
+                    }
+                    InstallObjectStoreCredentialMode::AccessKey => {
+                        fabro_install::InstallObjectStoreCredentialMode::AccessKey
+                    }
+                },
+                access_key_id:     manual_credentials
+                    .as_ref()
+                    .map(|credentials| credentials.access_key_id.expose_secret().to_string()),
+                secret_access_key: manual_credentials
+                    .as_ref()
+                    .map(|credentials| credentials.secret_access_key.expose_secret().to_string()),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, strum::IntoStaticStr)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+enum InstallSandboxProvider {
+    Docker,
+    Daytona,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct InstallSandboxInput {
+    provider:    InstallSandboxProvider,
+    api_key:     Option<String>,
+    allow_local: Option<bool>,
+}
+
+#[derive(Clone, Debug)]
+enum InstallSandboxProviderState {
+    Docker,
+    Daytona { api_key: InstallSecret },
+}
+
+#[derive(Clone, Debug)]
+struct InstallSandboxState {
+    provider:    InstallSandboxProviderState,
+    allow_local: bool,
+}
+
+impl InstallSandboxState {
+    fn as_session_value(&self) -> serde_json::Value {
+        match &self.provider {
+            InstallSandboxProviderState::Docker => serde_json::json!({
+                "provider": "docker",
+                "allow_local": self.allow_local,
+            }),
+            InstallSandboxProviderState::Daytona { .. } => serde_json::json!({
+                "provider": "daytona",
+                "api_key_saved": true,
+                "allow_local": self.allow_local,
+            }),
+        }
+    }
+
+    fn to_persistence_selection(&self) -> InstallSandboxSelection {
+        match &self.provider {
+            InstallSandboxProviderState::Docker => InstallSandboxSelection::Docker,
+            InstallSandboxProviderState::Daytona { .. } => InstallSandboxSelection::Daytona,
+        }
+    }
+
+    fn to_environment_provider(&self) -> EnvironmentProvider {
+        match &self.provider {
+            InstallSandboxProviderState::Docker => EnvironmentProvider::Docker,
+            InstallSandboxProviderState::Daytona { .. } => EnvironmentProvider::Daytona,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct GithubTokenInput {
+    token:    String,
+    username: String,
+}
+
+#[derive(Clone, Debug)]
+enum GithubInstallState {
+    Token(GithubTokenInput),
+    App(GithubAppInstall),
+}
+
+#[derive(Clone, Debug)]
+struct PendingGithubApp {
+    state:            String,
+    owner:            GitHubAppOwner,
+    app_name:         String,
+    allowed_username: String,
+    expires_at:       Instant,
+}
+
+#[derive(Clone, Debug)]
+struct GithubAppInstall {
+    owner:            GitHubAppOwner,
+    app_name:         String,
+    allowed_username: String,
+    app_id:           String,
+    slug:             String,
+    client_id:        String,
+    client_secret:    String,
+    webhook_secret:   Option<String>,
+    pem:              String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct InstallLlmTestInput {
+    provider: ProviderId,
+    api_key:  String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct GithubTokenTestInput {
+    token: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct GithubAppManifestInput {
+    owner:            GithubAppOwnerInput,
+    app_name:         String,
+    allowed_username: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct GithubAppOwnerInput {
+    kind: GithubAppOwnerKind,
+    slug: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum GithubAppOwnerKind {
+    Personal,
+    Org,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct GithubAppRedirectQuery {
+    code:  Option<String>,
+    state: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct GithubUserResponse {
+    login: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct GitHubAppManifestConversion {
+    id:             i64,
+    slug:           String,
+    client_id:      String,
+    client_secret:  String,
+    webhook_secret: Option<String>,
+    pem:            String,
+}
+
+#[derive(Clone, Debug)]
+enum GitHubAppOwner {
+    Personal,
+    Organization(String),
+}
+
+impl GitHubAppOwner {
+    fn manifest_form_action(&self) -> String {
+        match self {
+            Self::Personal => "https://github.com/settings/apps/new".to_string(),
+            Self::Organization(org) => {
+                format!("https://github.com/organizations/{org}/settings/apps/new")
+            }
+        }
+    }
+
+    fn as_session_value(&self) -> serde_json::Value {
+        match self {
+            Self::Personal => serde_json::json!({ "kind": "personal" }),
+            Self::Organization(org) => serde_json::json!({ "kind": "org", "slug": org }),
+        }
+    }
+}
+
+impl TryFrom<GithubAppOwnerInput> for GitHubAppOwner {
+    type Error = String;
+
+    fn try_from(value: GithubAppOwnerInput) -> Result<Self, Self::Error> {
+        match value.kind {
+            GithubAppOwnerKind::Personal => Ok(Self::Personal),
+            GithubAppOwnerKind::Org => {
+                let slug = value.slug.unwrap_or_default();
+                let trimmed = slug.trim();
+                if trimmed.is_empty() {
+                    return Err("organization owner requires a non-empty slug".to_string());
+                }
+                Ok(Self::Organization(trimmed.to_string()))
+            }
+        }
+    }
+}
+
+pub fn build_install_router(state: InstallAppState) -> Router {
+    let static_asset_root = state.static_asset_root.clone();
+
+    Router::new()
+        .route("/health", get(health))
+        .route("/install/session", get(get_install_session))
+        .route("/install/llm/test", post(post_install_llm_test))
+        .route(
+            "/install/llm",
+            get(render_install_shell).put(put_install_llm),
+        )
+        .route(
+            "/install/server",
+            get(render_install_shell).put(put_install_server),
+        )
+        .route(
+            "/install/object-store/test",
+            post(post_install_object_store_test),
+        )
+        .route(
+            "/install/object-store",
+            get(render_install_shell).put(put_install_object_store),
+        )
+        .route("/install/sandbox/test", post(post_install_sandbox_test))
+        .route(
+            "/install/sandbox",
+            get(render_install_shell).put(put_install_sandbox),
+        )
+        .route(
+            "/install/github/token/test",
+            post(post_install_github_token_test),
+        )
+        .route("/install/github/token", put(put_install_github_token))
+        .route(
+            "/install/github/app/manifest",
+            post(post_install_github_app_manifest),
+        )
+        .route(
+            "/install/github/app/redirect",
+            get(get_install_github_app_redirect),
+        )
+        .route("/install/finish", post(post_install_finish))
+        .with_state(state)
+        .fallback_service(service_fn(move |req: Request| {
+            let static_asset_root = static_asset_root.clone();
+            async move {
+                let path = req.uri().path().to_string();
+                if path.starts_with("/api/") {
+                    Ok::<_, Infallible>(StatusCode::NOT_FOUND.into_response())
+                } else if matches!(req.method(), &Method::GET | &Method::HEAD) {
+                    let headers = req.headers().clone();
+                    Ok::<_, Infallible>(
+                        static_files::serve_install_with_asset_root(
+                            &path,
+                            &headers,
+                            static_asset_root.as_deref(),
+                            false,
+                        )
+                        .await,
+                    )
+                } else {
+                    Ok::<_, Infallible>(StatusCode::NOT_FOUND.into_response())
+                }
+            }
+        }))
+        // Install mode serves the same multi-megabyte SPA bundle as the main
+        // router; a first-run setup over a slow link needs compression just
+        // as much.
+        .layer(server::compression_layer())
+        .layer(middleware::from_fn(security_headers::layer))
+}
+
+struct InstallFinishGuard {
+    flag:    Arc<AtomicBool>,
+    release: bool,
+}
+
+impl InstallFinishGuard {
+    fn try_acquire(flag: Arc<AtomicBool>) -> Option<Self> {
+        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        Some(Self {
+            flag,
+            release: true,
+        })
+    }
+
+    fn disarm(mut self) {
+        self.release = false;
+    }
+}
+
+impl Drop for InstallFinishGuard {
+    fn drop(&mut self) {
+        if self.release {
+            self.flag.store(false, Ordering::Release);
+        }
+    }
+}
+
+pub async fn serve_install_command<F>(
+    bind_request: BindRequest,
+    state: InstallAppState,
+    on_ready: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(&Bind) -> anyhow::Result<()>,
+{
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let finish_callback: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        let _ = shutdown_tx.send(true);
+    });
+    let bound_listener = bind_install_listener(&bind_request).await?;
+    state.set_install_bind(&bound_listener.bind);
+    let state = state.with_finish_callback(finish_callback);
+    let router = build_install_router(state);
+    let bind = bound_listener.bind.clone();
+    on_ready(&bind)?;
+
+    match bound_listener.listener {
+        BoundInstallListener::Unix(listener) => {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()))
+                .await?;
+        }
+        BoundInstallListener::Tcp(listener) => {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()))
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
+fn lock_unpoisoned<'a, T>(mutex: &'a Mutex<T>, label: &'static str) -> MutexGuard<'a, T> {
+    mutex.lock().unwrap_or_else(|poisoned| {
+        error!(lock = label, "recovering from poisoned install lock");
+        poisoned.into_inner()
+    })
+}
+
+fn install_listen_config(bind: &Bind) -> InstallListenConfig {
+    match bind {
+        Bind::Tcp(address) => InstallListenConfig::Tcp(address.to_string()),
+        Bind::Unix(path) => InstallListenConfig::Unix(path.clone()),
+    }
+}
+
+async fn health() -> Response {
+    Json(serde_json::json!({
+        "status": "ok",
+        "mode": "install",
+    }))
+    .into_response()
+}
+
+async fn get_install_session(
+    State(state): State<InstallAppState>,
+    headers: HeaderMap,
+    Query(query): Query<InstallTokenQuery>,
+) -> Response {
+    if !token_is_valid(&state, &headers, query.token.as_deref()) {
+        return ApiError::new(StatusCode::UNAUTHORIZED, "invalid install token").into_response();
+    }
+    observe_operator(&state, &headers);
+
+    let pending_install = lock_unpoisoned(&state.pending_install, "install session").clone();
+
+    Json(serde_json::json!({
+        "completed_steps": completed_steps(&pending_install),
+        "llm": redacted_llm(&pending_install),
+        "server": pending_install.server,
+        "object_store": redacted_object_store(&pending_install),
+        "sandbox": redacted_sandbox(&pending_install),
+        "github": redacted_github(&pending_install),
+        "prefill": {
+            "canonical_url": detect_canonical_url(&headers),
+            "object_store_local_root": default_local_object_store_root(&state),
+        }
+    }))
+    .into_response()
+}
+
+async fn post_install_llm_test(
+    State(state): State<InstallAppState>,
+    headers: HeaderMap,
+    Query(query): Query<InstallTokenQuery>,
+    Json(input): Json<InstallLlmTestInput>,
+) -> Response {
+    if let Some(response) = require_valid_token(&state, &headers, query.token.as_deref()) {
+        return response;
+    }
+    observe_operator(&state, &headers);
+
+    if let Err(error) = install_catalog_provider(&input.provider) {
+        return install_error_response(StatusCode::UNPROCESSABLE_ENTITY, error);
+    }
+
+    if input.api_key.trim().is_empty() {
+        return install_error_response(StatusCode::UNPROCESSABLE_ENTITY, "api_key is required");
+    }
+    match validate_llm_provider(&state, &input).await {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(err) => {
+            warn!(provider = %input.provider, error = ?err, "install LLM validation failed");
+            install_error_response(StatusCode::UNPROCESSABLE_ENTITY, err.to_string())
+        }
+    }
+}
+
+async fn put_install_llm(
+    State(state): State<InstallAppState>,
+    headers: HeaderMap,
+    Query(query): Query<InstallTokenQuery>,
+    Json(input): Json<LlmProvidersInput>,
+) -> Response {
+    if let Some(response) = require_valid_token(&state, &headers, query.token.as_deref()) {
+        return response;
+    }
+    observe_operator(&state, &headers);
+
+    // An empty providers list is an explicit skip: the LLM step is recorded as
+    // completed with zero credentials. `/install/finish` still requires the
+    // step to be present, just not populated.
+    for provider in &input.providers {
+        if let Err(error) = install_catalog_provider(&provider.provider) {
+            return install_error_response(StatusCode::UNPROCESSABLE_ENTITY, error);
+        }
+        if provider.api_key.trim().is_empty() {
+            return install_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("api_key is required for {}", provider.provider),
+            );
+        }
+    }
+
+    lock_unpoisoned(&state.pending_install, "install session").llm = Some(input);
+    info!(step = "llm", "install step completed");
+    StatusCode::NO_CONTENT.into_response()
+}
+
+fn install_catalog_provider(provider: &ProviderId) -> Result<&'static CatalogProvider, String> {
+    let catalog_provider = INSTALL_CATALOG
+        .provider(provider)
+        .ok_or_else(|| format!("provider '{provider}' is not configured in the model catalog"))?;
+    if catalog_provider.auth.is_some() {
+        Ok(catalog_provider)
+    } else {
+        Err(format!(
+            "provider '{}' does not define an API-key credential path",
+            catalog_provider.id
+        ))
+    }
+}
+
+fn provider_secret_name(provider: &ProviderId) -> Result<String, String> {
+    install_catalog_provider(provider)?;
+    INSTALL_CATALOG
+        .provider_vault_secret_name(provider)
+        .map(str::to_string)
+        .ok_or_else(|| format!("provider '{provider}' does not define a vault credential path"))
+}
+
+async fn put_install_server(
+    State(state): State<InstallAppState>,
+    headers: HeaderMap,
+    Query(query): Query<InstallTokenQuery>,
+    Json(mut input): Json<ServerConfigInput>,
+) -> Response {
+    if let Some(response) = require_valid_token(&state, &headers, query.token.as_deref()) {
+        return response;
+    }
+    observe_operator(&state, &headers);
+
+    let canonical_url = input.canonical_url.trim();
+    if canonical_url.is_empty() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": "canonical_url is required" })),
+        )
+            .into_response();
+    }
+
+    let canonical_url = match validate_public_url_with_label(canonical_url, "canonical_url") {
+        Ok(value) => value,
+        Err(err) => return install_error_response(StatusCode::UNPROCESSABLE_ENTITY, err),
+    };
+    input.canonical_url = canonical_url;
+
+    lock_unpoisoned(&state.pending_install, "install session").server = Some(input);
+    info!(step = "server", "install step completed");
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn post_install_object_store_test(
+    State(state): State<InstallAppState>,
+    headers: HeaderMap,
+    Query(query): Query<InstallTokenQuery>,
+    Json(input): Json<InstallObjectStoreInput>,
+) -> Response {
+    if let Some(response) = require_valid_token(&state, &headers, query.token.as_deref()) {
+        return response;
+    }
+    observe_operator(&state, &headers);
+
+    let selection = {
+        let pending_install = lock_unpoisoned(&state.pending_install, "install session");
+        match resolve_install_object_store_state(
+            pending_install.object_store.as_ref(),
+            input,
+            &default_local_object_store_root(&state),
+        ) {
+            Ok(selection) => selection,
+            Err(err) => return install_error_response(StatusCode::UNPROCESSABLE_ENTITY, err),
+        }
+    };
+
+    match validate_install_object_store_selection(&state, &selection).await {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(err) => {
+            warn!(error = ?err, "install object store validation failed");
+            install_error_response(StatusCode::UNPROCESSABLE_ENTITY, err.to_string())
+        }
+    }
+}
+
+async fn put_install_object_store(
+    State(state): State<InstallAppState>,
+    headers: HeaderMap,
+    Query(query): Query<InstallTokenQuery>,
+    Json(input): Json<InstallObjectStoreInput>,
+) -> Response {
+    if let Some(response) = require_valid_token(&state, &headers, query.token.as_deref()) {
+        return response;
+    }
+    observe_operator(&state, &headers);
+
+    let mut pending_install = lock_unpoisoned(&state.pending_install, "install session");
+    let selection = match resolve_install_object_store_state(
+        pending_install.object_store.as_ref(),
+        input,
+        &default_local_object_store_root(&state),
+    ) {
+        Ok(selection) => selection,
+        Err(err) => return install_error_response(StatusCode::UNPROCESSABLE_ENTITY, err),
+    };
+
+    pending_install.object_store = Some(selection);
+    info!(step = "object_store", "install step completed");
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn post_install_sandbox_test(
+    State(state): State<InstallAppState>,
+    headers: HeaderMap,
+    Query(query): Query<InstallTokenQuery>,
+    Json(input): Json<InstallSandboxInput>,
+) -> Response {
+    if let Some(response) = require_valid_token(&state, &headers, query.token.as_deref()) {
+        return response;
+    }
+    observe_operator(&state, &headers);
+
+    let api_key = {
+        let pending_install = lock_unpoisoned(&state.pending_install, "install session");
+        match resolve_install_sandbox_state(pending_install.sandbox.as_ref(), input) {
+            Ok(InstallSandboxState {
+                provider: InstallSandboxProviderState::Docker,
+                ..
+            }) => {
+                return Json(serde_json::json!({ "ok": true })).into_response();
+            }
+            Ok(InstallSandboxState {
+                provider: InstallSandboxProviderState::Daytona { api_key },
+                ..
+            }) => api_key.expose_secret().to_string(),
+            Err(err) => return install_error_response(StatusCode::UNPROCESSABLE_ENTITY, err),
+        }
+    };
+
+    match check_install_daytona_api_key(&state, api_key).await {
+        Ok(check) if check.ok() => Json(serde_json::json!({ "ok": true })).into_response(),
+        Ok(check) => {
+            warn!(
+                missing = %check.missing_display(),
+                "install sandbox scopes insufficient"
+            );
+            install_error_response(StatusCode::UNPROCESSABLE_ENTITY, check.missing_message())
+        }
+        Err(err) => {
+            warn!(error = %err, "install sandbox validation failed");
+            install_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("daytona credential validation failed: {err}"),
+            )
+        }
+    }
+}
+
+async fn check_install_daytona_api_key(
+    state: &InstallAppState,
+    api_key: String,
+) -> anyhow::Result<daytona::DaytonaKeyCheck> {
+    let base_url = state
+        .upstreams
+        .daytona_api_base_url
+        .as_deref()
+        .unwrap_or(daytona::DEFAULT_DAYTONA_API_URL);
+    let organization_id = state.upstreams.daytona_organization_id.as_deref();
+    let http_client = fabro_http::http_client().context("failed to build HTTP client")?;
+    daytona::check_daytona_api_key_with(base_url, organization_id, api_key, http_client).await
+}
+
+async fn put_install_sandbox(
+    State(state): State<InstallAppState>,
+    headers: HeaderMap,
+    Query(query): Query<InstallTokenQuery>,
+    Json(input): Json<InstallSandboxInput>,
+) -> Response {
+    if let Some(response) = require_valid_token(&state, &headers, query.token.as_deref()) {
+        return response;
+    }
+    observe_operator(&state, &headers);
+
+    let mut pending_install = lock_unpoisoned(&state.pending_install, "install session");
+    let selection = match resolve_install_sandbox_state(pending_install.sandbox.as_ref(), input) {
+        Ok(selection) => selection,
+        Err(err) => return install_error_response(StatusCode::UNPROCESSABLE_ENTITY, err),
+    };
+
+    pending_install.sandbox = Some(selection);
+    info!(step = "sandbox", "install step completed");
+    StatusCode::NO_CONTENT.into_response()
+}
+
+fn trim_install_field(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn default_local_object_store_root(state: &InstallAppState) -> String {
+    state
+        .storage_dir
+        .as_ref()
+        .join("objects")
+        .display()
+        .to_string()
+}
+
+fn resolve_install_sandbox_state(
+    current: Option<&InstallSandboxState>,
+    input: InstallSandboxInput,
+) -> Result<InstallSandboxState, String> {
+    // Local sandboxes are allowed by default unless the wizard unchecked the box.
+    let allow_local = input.allow_local.unwrap_or(true);
+    let provider = match input.provider {
+        InstallSandboxProvider::Docker => InstallSandboxProviderState::Docker,
+        InstallSandboxProvider::Daytona => {
+            let api_key = match trim_install_field(input.api_key) {
+                Some(value) => InstallSecret::new(value),
+                None => match current.map(|state| &state.provider) {
+                    Some(InstallSandboxProviderState::Daytona { api_key }) => {
+                        InstallSecret::new(api_key.expose_secret())
+                    }
+                    _ => return Err("api_key is required for daytona".to_string()),
+                },
+            };
+            InstallSandboxProviderState::Daytona { api_key }
+        }
+    };
+    Ok(InstallSandboxState {
+        provider,
+        allow_local,
+    })
+}
+
+fn resolve_install_object_store_state(
+    current: Option<&InstallObjectStoreState>,
+    input: InstallObjectStoreInput,
+    default_local_root: &str,
+) -> Result<InstallObjectStoreState, String> {
+    let root = trim_install_field(input.root);
+    let bucket = trim_install_field(input.bucket);
+    let region = trim_install_field(input.region);
+    let access_key_id = trim_install_field(input.access_key_id);
+    let secret_access_key = trim_install_field(input.secret_access_key);
+
+    match input.provider {
+        InstallObjectStoreProvider::Local => {
+            if bucket.is_some()
+                || region.is_some()
+                || input.credential_mode.is_some()
+                || access_key_id.is_some()
+                || secret_access_key.is_some()
+            {
+                return Err(
+                    "Local disk does not accept S3 bucket, region, or AWS credential fields."
+                        .to_string(),
+                );
+            }
+            let root = root
+                .or_else(|| match current {
+                    Some(InstallObjectStoreState::Local { root }) => Some(root.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| default_local_root.to_string());
+            Ok(InstallObjectStoreState::Local { root })
+        }
+        InstallObjectStoreProvider::S3 => {
+            let bucket = bucket.ok_or_else(|| "Bucket is required.".to_string())?;
+            let region = region
+                .ok_or_else(|| "Region is required. Use a value like us-east-1.".to_string())?;
+            let credential_mode = input
+                .credential_mode
+                .ok_or_else(|| "Choose how Fabro should authenticate to AWS.".to_string())?;
+            let manual_credentials = match credential_mode {
+                InstallObjectStoreCredentialMode::Runtime => {
+                    if access_key_id.is_some() || secret_access_key.is_some() {
+                        return Err(
+                            "AWS access key fields are only allowed when using manual AWS access key credentials."
+                                .to_string(),
+                        );
+                    }
+                    None
+                }
+                InstallObjectStoreCredentialMode::AccessKey => Some(resolve_s3_manual_credentials(
+                    access_key_id,
+                    secret_access_key,
+                    current,
+                )?),
+            };
+
+            Ok(InstallObjectStoreState::S3 {
+                bucket,
+                region,
+                credential_mode,
+                manual_credentials,
+            })
+        }
+    }
+}
+
+fn resolve_s3_manual_credentials(
+    access_key_id: Option<String>,
+    secret_access_key: Option<String>,
+    current: Option<&InstallObjectStoreState>,
+) -> Result<InstallAwsCredentialPair, String> {
+    match (access_key_id, secret_access_key) {
+        (Some(access_key_id), Some(secret_access_key)) => Ok(InstallAwsCredentialPair::new(
+            access_key_id,
+            secret_access_key,
+        )),
+        (None, None) => current
+            .and_then(|state| match state {
+                InstallObjectStoreState::S3 {
+                    credential_mode: InstallObjectStoreCredentialMode::AccessKey,
+                    manual_credentials,
+                    ..
+                } => manual_credentials.clone(),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                "Enter both AWS access key fields or switch to runtime credentials.".to_string()
+            }),
+        (Some(_), None) | (None, Some(_)) => {
+            Err("Enter both AWS access key fields or switch to runtime credentials.".to_string())
+        }
+    }
+}
+
+fn object_store_validation_settings(
+    selection: &InstallObjectStoreState,
+) -> Option<ObjectStoreSettings> {
+    match selection {
+        InstallObjectStoreState::Local { .. } => None,
+        InstallObjectStoreState::S3 { bucket, region, .. } => Some(ObjectStoreSettings::S3 {
+            bucket:     bucket.clone(),
+            region:     region.clone(),
+            endpoint:   None,
+            path_style: false,
+        }),
+    }
+}
+
+fn install_object_store_lookup<'a>(
+    server_secrets: &'a ServerSecrets,
+    manual_credentials: Option<&'a InstallAwsCredentialPair>,
+) -> impl Fn(&str) -> Option<String> + 'a {
+    move |name| match (manual_credentials, name) {
+        (Some(credentials), OBJECT_STORE_ACCESS_KEY_ID_ENV) => {
+            Some(credentials.access_key_id.expose_secret().to_string())
+        }
+        (Some(credentials), OBJECT_STORE_SECRET_ACCESS_KEY_ENV) => {
+            Some(credentials.secret_access_key.expose_secret().to_string())
+        }
+        (Some(_), EnvVars::AWS_SESSION_TOKEN) => None,
+        _ => server_secrets.get(name),
+    }
+}
+
+async fn validate_install_object_store_selection(
+    state: &InstallAppState,
+    selection: &InstallObjectStoreState,
+) -> anyhow::Result<()> {
+    let Some(settings) = object_store_validation_settings(selection) else {
+        return Ok(());
+    };
+
+    let (bucket, region, manual_credentials) = match selection {
+        InstallObjectStoreState::Local { .. } => return Ok(()),
+        InstallObjectStoreState::S3 {
+            bucket,
+            region,
+            credential_mode: _,
+            manual_credentials,
+        } => (
+            bucket.as_str(),
+            region.as_str(),
+            manual_credentials.as_ref(),
+        ),
+    };
+
+    let client_options = ClientOptions::new()
+        .with_connect_timeout(VALIDATION_CONNECT_TIMEOUT)
+        .with_timeout(VALIDATION_TIMEOUT);
+    match timeout(
+        VALIDATION_TIMEOUT,
+        resolve_bucket_region(bucket, &client_options),
+    )
+    .await
+    {
+        Ok(Ok(actual_region)) if actual_region != region => {
+            bail!(
+                "Bucket {bucket} is in region {actual_region}, not {region}. Use the bucket's AWS region and try again."
+            );
+        }
+        Ok(Err(err)) => {
+            let rendered = err.to_string();
+            if rendered.contains("not found") {
+                bail!("Bucket {bucket} was not found.");
+            }
+        }
+        Err(_) => {
+            bail!(VALIDATION_TIMEOUT_MSG);
+        }
+        Ok(Ok(_)) => {}
+    }
+
+    let server_env_path = Storage::new(state.storage_dir.as_ref())
+        .runtime_directory()
+        .env_path();
+    let server_secrets =
+        ServerSecrets::load(server_env_path, process_env_snapshot()).map_err(anyhow::Error::new)?;
+    let build_options = serve::ObjectStoreBuildOptions {
+        client_options,
+        retry_config: RetryConfig {
+            max_retries: 0,
+            retry_timeout: VALIDATION_TIMEOUT,
+            ..RetryConfig::default()
+        },
+    };
+    let env_lookup = install_object_store_lookup(&server_secrets, manual_credentials);
+    let object_store = serve::build_object_store_from_settings_with_lookup(
+        &settings,
+        &env_lookup,
+        Some(&build_options),
+    )?;
+
+    let probe_prefix = |index: usize, prefix: &'static str| {
+        let object_store = &object_store;
+        async move {
+            let path = ObjectStorePath::from(prefix);
+            object_store
+                .list_with_delimiter(Some(&path))
+                .await
+                .map(|_| ())
+                .map_err(|err| (index, err))
+        }
+    };
+    let probe = async {
+        tokio::try_join!(probe_prefix(0, "artifacts"), probe_prefix(1, "slatedb")).map(|_| ())
+    };
+
+    match timeout(VALIDATION_TIMEOUT, probe).await {
+        Ok(Ok(())) => Ok(()),
+        Err(_) => bail!(VALIDATION_TIMEOUT_MSG),
+        Ok(Err((index, err))) => bail!(
+            "{}",
+            classify_object_store_validation_error(bucket, region, index, &err)
+        ),
+    }
+}
+
+const PREFIX_ACCESS_ERROR_MSG: &str = "Fabro reached the bucket but could not verify access to slatedb/ and artifacts/. Validation requires bucket list access plus object access under both prefixes.";
+const VALIDATION_TIMEOUT_MSG: &str = "Timed out while checking S3 access. Verify the bucket, region, and network path, then try again.";
+
+fn bucket_credentials_error(bucket: &str, region: &str) -> String {
+    format!("Could not access bucket {bucket} in region {region} with the selected credentials.")
+}
+
+fn classify_object_store_validation_error(
+    bucket: &str,
+    region: &str,
+    prefix_index: usize,
+    err: &object_store::Error,
+) -> String {
+    let credentials_or_prefix_error = || {
+        if prefix_index == 0 {
+            bucket_credentials_error(bucket, region)
+        } else {
+            PREFIX_ACCESS_ERROR_MSG.to_string()
+        }
+    };
+    match err {
+        object_store::Error::PermissionDenied { .. }
+        | object_store::Error::Unauthenticated { .. } => credentials_or_prefix_error(),
+        object_store::Error::NotFound { .. } => format!("Bucket {bucket} was not found."),
+        object_store::Error::Generic { .. } => {
+            let rendered = err.to_string();
+            if rendered.contains("incorrectly configured region") {
+                format!(
+                    "Bucket {bucket} is not reachable in region {region}. Verify the AWS region and try again."
+                )
+            } else if rendered.contains("not found") {
+                format!("Bucket {bucket} was not found.")
+            } else {
+                credentials_or_prefix_error()
+            }
+        }
+        _ => PREFIX_ACCESS_ERROR_MSG.to_string(),
+    }
+}
+
+async fn post_install_github_token_test(
+    State(state): State<InstallAppState>,
+    headers: HeaderMap,
+    Query(query): Query<InstallTokenQuery>,
+    Json(input): Json<GithubTokenTestInput>,
+) -> Response {
+    if let Some(response) = require_valid_token(&state, &headers, query.token.as_deref()) {
+        return response;
+    }
+    observe_operator(&state, &headers);
+
+    if input.token.trim().is_empty() {
+        return install_error_response(StatusCode::UNPROCESSABLE_ENTITY, "token is required");
+    }
+
+    match validate_github_token(&state, input.token.trim()).await {
+        Ok(username) => Json(serde_json::json!({ "username": username })).into_response(),
+        Err(err) => {
+            warn!(error = ?err, "install GitHub token validation failed");
+            install_error_response(StatusCode::UNPROCESSABLE_ENTITY, err.to_string())
+        }
+    }
+}
+
+async fn put_install_github_token(
+    State(state): State<InstallAppState>,
+    headers: HeaderMap,
+    Query(query): Query<InstallTokenQuery>,
+    Json(input): Json<GithubTokenInput>,
+) -> Response {
+    if let Some(response) = require_valid_token(&state, &headers, query.token.as_deref()) {
+        return response;
+    }
+    observe_operator(&state, &headers);
+
+    if input.token.trim().is_empty() || input.username.trim().is_empty() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({ "error": "token and username are required" })),
+        )
+            .into_response();
+    }
+
+    lock_unpoisoned(&state.pending_install, "install session").github =
+        Some(GithubInstallState::Token(input));
+    info!(step = "github_token", "install step completed");
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn post_install_github_app_manifest(
+    State(state): State<InstallAppState>,
+    headers: HeaderMap,
+    Query(query): Query<InstallTokenQuery>,
+    Json(input): Json<GithubAppManifestInput>,
+) -> Response {
+    if let Some(response) = require_valid_token(&state, &headers, query.token.as_deref()) {
+        return response;
+    }
+    observe_operator(&state, &headers);
+
+    let owner = match GitHubAppOwner::try_from(input.owner) {
+        Ok(owner) => owner,
+        Err(err) => {
+            return install_error_response(StatusCode::UNPROCESSABLE_ENTITY, err);
+        }
+    };
+    if input.app_name.trim().is_empty() {
+        return install_error_response(StatusCode::UNPROCESSABLE_ENTITY, "app_name is required");
+    }
+    if input.allowed_username.trim().is_empty() {
+        return install_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "allowed_username is required",
+        );
+    }
+
+    let mut pending_install = lock_unpoisoned(&state.pending_install, "install session");
+    let Some(server) = pending_install.server.clone() else {
+        return missing_step_response("server");
+    };
+
+    let state_token = generate_ephemeral_secret();
+    let manifest = build_github_app_manifest(
+        input.app_name.trim(),
+        &format!("{}/install/github/app/redirect", server.canonical_url),
+        &format!("{}/auth/callback/github", server.canonical_url),
+        &format!("{}/setup", server.canonical_url),
+    );
+
+    pending_install.pending_github_app = Some(PendingGithubApp {
+        state:            state_token.clone(),
+        owner:            owner.clone(),
+        app_name:         input.app_name.trim().to_string(),
+        allowed_username: input.allowed_username.trim().to_string(),
+        expires_at:       Instant::now() + Duration::from_mins(10),
+    });
+
+    Json(serde_json::json!({
+        "manifest": manifest,
+        "github_form_action": owner.manifest_form_action(),
+        "state": state_token,
+    }))
+    .into_response()
+}
+
+async fn get_install_github_app_redirect(
+    State(state): State<InstallAppState>,
+    headers: HeaderMap,
+    Query(query): Query<GithubAppRedirectQuery>,
+) -> Response {
+    observe_operator(&state, &headers);
+
+    let Some(state_token) = query
+        .state
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return install_github_redirect_error(&state, "missing-install-github-app-state");
+    };
+    let Some(code) = query
+        .code
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return install_github_redirect_error(&state, "missing-install-github-app-code");
+    };
+
+    let pending = {
+        let pending_install = lock_unpoisoned(&state.pending_install, "install session");
+        let Some(pending) = pending_install.pending_github_app.clone() else {
+            return install_github_redirect_error(&state, "missing-install-github-app-state");
+        };
+        if pending.expires_at <= Instant::now() {
+            return install_github_redirect_error(&state, "expired-install-github-app-state");
+        }
+        if pending.state != state_token {
+            return install_github_redirect_error(&state, "invalid-install-github-app-state");
+        }
+        pending
+    };
+
+    match exchange_github_app_manifest_code(&state, code).await {
+        Ok(conversion) => {
+            let mut pending_install = lock_unpoisoned(&state.pending_install, "install session");
+            let Some(still_pending) = pending_install.pending_github_app.as_ref() else {
+                return install_github_redirect_error(&state, "missing-install-github-app-state");
+            };
+            if still_pending.state != pending.state {
+                return install_github_redirect_error(&state, "invalid-install-github-app-state");
+            }
+            pending_install.pending_github_app = None;
+            pending_install.github = Some(GithubInstallState::App(GithubAppInstall {
+                owner:            pending.owner,
+                app_name:         pending.app_name,
+                allowed_username: pending.allowed_username,
+                app_id:           conversion.id.to_string(),
+                slug:             conversion.slug,
+                client_id:        conversion.client_id,
+                client_secret:    conversion.client_secret,
+                webhook_secret:   conversion.webhook_secret,
+                pem:              conversion.pem,
+            }));
+            info!(step = "github_app", "install step completed");
+            (StatusCode::FOUND, [(
+                header::LOCATION,
+                format!("/install/github/done?token={}", &*state.install_token),
+            )])
+                .into_response()
+        }
+        Err(err) => {
+            error!(error = ?err, "install GitHub app exchange failed");
+            install_github_redirect_error(&state, "github-app-manifest-conversion-failed")
+        }
+    }
+}
+
+async fn post_install_finish(
+    State(state): State<InstallAppState>,
+    headers: HeaderMap,
+    Query(query): Query<InstallTokenQuery>,
+) -> Response {
+    if let Some(response) = require_valid_token(&state, &headers, query.token.as_deref()) {
+        return response;
+    }
+    observe_operator(&state, &headers);
+    let Some(finish_guard) = InstallFinishGuard::try_acquire(Arc::clone(&state.finish_in_progress))
+    else {
+        return install_error_response(StatusCode::CONFLICT, "install finish already in progress");
+    };
+
+    let pending_install = lock_unpoisoned(&state.pending_install, "install session").clone();
+
+    let Some(server) = pending_install.server else {
+        return missing_step_response("server");
+    };
+    let Some(object_store) = pending_install.object_store else {
+        return missing_step_response("object_store");
+    };
+    let Some(sandbox) = pending_install.sandbox else {
+        return missing_step_response("sandbox");
+    };
+    let Some(llm) = pending_install.llm else {
+        return missing_step_response("llm");
+    };
+    let Some(github) = pending_install.github else {
+        return missing_step_response("github");
+    };
+
+    let mut settings_doc = toml::Value::Table(toml::Table::default());
+    let install_listen = state.install_listen_config();
+    if let Err(err) =
+        merge_server_settings(&mut settings_doc, &server.canonical_url, &install_listen)
+    {
+        return install_error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+    }
+    let object_store_env_plan = match write_object_store_settings(
+        &mut settings_doc,
+        &object_store.to_persistence_selection(),
+    ) {
+        Ok(plan) => plan,
+        Err(err) => {
+            return install_error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+        }
+    };
+    if let Err(err) = write_sandbox_settings(
+        &mut settings_doc,
+        sandbox.to_persistence_selection(),
+        sandbox.allow_local,
+    ) {
+        return install_error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+    }
+    let mut vault_secrets = Vec::new();
+    if let InstallSandboxProviderState::Daytona { api_key } = &sandbox.provider {
+        vault_secrets.push(SecretStoreWrite {
+            name:        EnvVars::DAYTONA_API_KEY.to_string(),
+            value:       api_key.expose_secret().to_string(),
+            secret_type: VaultSecretType::Token,
+            description: None,
+        });
+    }
+    for provider in llm.providers {
+        let name = match provider_secret_name(&provider.provider) {
+            Ok(name) => name,
+            Err(err) => return install_error_response(StatusCode::UNPROCESSABLE_ENTITY, err),
+        };
+        vault_secrets.push(SecretStoreWrite {
+            name,
+            value: provider.api_key,
+            secret_type: VaultSecretType::Token,
+            description: None,
+        });
+    }
+
+    let make_env_write = |key: &str, value: String| EnvFileUpdate {
+        key: key.to_string(),
+        value,
+        comment: None,
+    };
+    let make_env_removal = |key: &str| EnvFileRemoval {
+        key:     key.to_string(),
+        comment: None,
+    };
+    let mut server_env_writes = object_store_env_plan.writes;
+    let mut server_env_removals = object_store_env_plan.removals;
+    let mut vault_removals = Vec::new();
+    let mut dev_token: Option<String> = None;
+    let mut dev_token_write = None;
+    match github {
+        GithubInstallState::Token(github) => {
+            if let Err(err) = write_token_settings(&mut settings_doc) {
+                return install_error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+            }
+            vault_secrets.push(SecretStoreWrite {
+                name:        EnvVars::GITHUB_TOKEN.to_string(),
+                value:       github.token,
+                secret_type: VaultSecretType::Token,
+                description: None,
+            });
+            vault_removals.extend(GITHUB_APP_VAULT_KEYS.iter().map(|k| (*k).to_string()));
+            server_env_removals.extend(
+                GITHUB_INSTALL_SECRET_KEYS
+                    .iter()
+                    .map(|k| make_env_removal(k)),
+            );
+            let dev_token_path = Storage::new(state.storage_dir.as_ref())
+                .runtime_directory()
+                .dev_token_path();
+            let prepared = match prepare_dev_token_write_for_install(&dev_token_path) {
+                Ok(value) => value,
+                Err(err) => {
+                    return install_error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        err.to_string(),
+                    );
+                }
+            };
+            dev_token_write = prepared.write;
+            dev_token = Some(prepared.token);
+        }
+        GithubInstallState::App(github) => {
+            if let Err(err) = write_github_app_settings(
+                &mut settings_doc,
+                &github.app_id,
+                &github.slug,
+                &github.client_id,
+                &[github.allowed_username],
+            ) {
+                return install_error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+            }
+            vault_secrets.push(SecretStoreWrite {
+                name:        EnvVars::GITHUB_APP_PRIVATE_KEY.to_string(),
+                value:       BASE64_STANDARD.encode(github.pem.as_bytes()),
+                secret_type: VaultSecretType::File,
+                description: None,
+            });
+            vault_secrets.push(SecretStoreWrite {
+                name:        EnvVars::GITHUB_APP_CLIENT_SECRET.to_string(),
+                value:       github.client_secret,
+                secret_type: VaultSecretType::Token,
+                description: None,
+            });
+            if let Some(secret) = github.webhook_secret {
+                vault_secrets.push(SecretStoreWrite {
+                    name:        EnvVars::GITHUB_APP_WEBHOOK_SECRET.to_string(),
+                    value:       secret,
+                    secret_type: VaultSecretType::Token,
+                    description: None,
+                });
+            } else {
+                vault_removals.push(EnvVars::GITHUB_APP_WEBHOOK_SECRET.to_string());
+            }
+            vault_removals.push(EnvVars::GITHUB_TOKEN.to_string());
+            server_env_removals.extend(
+                GITHUB_INSTALL_SECRET_KEYS
+                    .iter()
+                    .map(|k| make_env_removal(k)),
+            );
+        }
+    }
+
+    let settings_toml = match toml::to_string_pretty(&settings_doc) {
+        Ok(value) => value,
+        Err(err) => {
+            return install_error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+        }
+    };
+
+    let session_secret = session_secret::generate_session_secret();
+    server_env_writes.push(make_env_write(EnvVars::SESSION_SECRET, session_secret));
+    if let Some(token) = dev_token.as_ref() {
+        server_env_writes.push(make_env_write(EnvVars::FABRO_DEV_TOKEN, token.clone()));
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "install-finish handler: reads current settings file once to produce a rollback \
+                  snapshot before writing the new settings; one-shot per install-finish request"
+    )]
+    let previous_settings = std::fs::read_to_string(state.config_path.as_ref()).ok();
+
+    let persistence_plan = InstallPersistencePlan {
+        storage_dir: state.storage_dir.as_ref(),
+        settings_write: Some(PendingSettingsWrite {
+            path:              state.config_path.as_ref(),
+            contents:          &settings_toml,
+            previous_contents: previous_settings.as_deref(),
+        }),
+        server_env_writes,
+        server_env_removals,
+        dev_token_write,
+        vault_writes: vault_secrets,
+        vault_removals,
+    };
+    if let Err(err) = persistence_plan.persist_direct().await {
+        error!(error = %err, "install persistence failed");
+        let status = StatusCode::INTERNAL_SERVER_ERROR;
+        let detail = err.to_string();
+        let title = status.canonical_reason().unwrap_or("Unknown").to_string();
+        let leftover_env_keys: Vec<String> = if err.server_env_applied {
+            persistence_plan
+                .server_env_writes
+                .iter()
+                .map(|write| write.key.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let removed_env_keys: Vec<String> = if err.server_env_applied {
+            err.removed_env_keys.clone()
+        } else {
+            Vec::new()
+        };
+        return (
+            status,
+            Json(serde_json::json!({
+                "errors": [{
+                    "status": status.as_u16().to_string(),
+                    "title": title,
+                    "detail": detail,
+                }],
+                "leftover_env_keys": leftover_env_keys,
+                "removed_env_keys": removed_env_keys,
+            })),
+        )
+            .into_response();
+    }
+
+    // Seed the default environment in SQLite. The server does not seed on
+    // startup, so install is the only place the default is written; existing
+    // rows are preserved, so re-running install never clobbers edits.
+    if let Err(err) = seed_default_environment_in_storage(
+        state.storage_dir.as_ref(),
+        sandbox.to_environment_provider(),
+    )
+    .await
+    {
+        warn!(error = %err, "failed to seed default environment after install");
+    }
+
+    if let Ok(settings) = fabro_config::ServerSettingsBuilder::from_toml(&settings_toml) {
+        if let Err(err) = write_artifact_store_metadata(&settings, state.storage_dir.as_ref()).await
+        {
+            warn!(error = %err, "failed to write artifact store metadata after install");
+        }
+    }
+    if let Some(InstallObjectStoreState::S3 {
+        credential_mode: InstallObjectStoreCredentialMode::AccessKey,
+        manual_credentials,
+        ..
+    }) = lock_unpoisoned(&state.pending_install, "install session")
+        .object_store
+        .as_mut()
+    {
+        *manual_credentials = None;
+    }
+    {
+        let mut pending_install = lock_unpoisoned(&state.pending_install, "install session");
+        if let Some(sandbox) = pending_install.sandbox.as_mut() {
+            if matches!(
+                sandbox.provider,
+                InstallSandboxProviderState::Daytona { .. }
+            ) {
+                sandbox.provider = InstallSandboxProviderState::Docker;
+            }
+        }
+    }
+
+    if let Some(finish_hook) = state.finish_hook.clone() {
+        let info = InstallFinishInfo {
+            canonical_url: server.canonical_url.clone(),
+            dev_token:     dev_token.clone(),
+        };
+        if let Err(err) = finish_hook(&info) {
+            warn!(error = %err, "install finish hook failed");
+        }
+    }
+
+    if let Some(on_finish) = state.on_finish.clone() {
+        info!(restart_url = %server.canonical_url, "install finish succeeded");
+        info!("install exit scheduled");
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(500)).await;
+            on_finish();
+        });
+    } else {
+        info!(restart_url = %server.canonical_url, "install finish succeeded");
+    }
+    finish_guard.disarm();
+
+    let mut body = serde_json::json!({
+        "status": "completing",
+        "restart_url": server.canonical_url,
+    });
+    if let Some(token) = dev_token {
+        body["dev_token"] = serde_json::Value::String(token);
+    }
+    (StatusCode::ACCEPTED, Json(body)).into_response()
+}
+
+async fn render_install_shell(
+    State(state): State<InstallAppState>,
+    headers: HeaderMap,
+    uri: OriginalUri,
+) -> Response {
+    static_files::serve_install_with_asset_root(
+        uri.path(),
+        &headers,
+        state.static_asset_root.as_deref(),
+        false,
+    )
+    .await
+}
+
+fn token_is_valid(state: &InstallAppState, headers: &HeaderMap, query_token: Option<&str>) -> bool {
+    [
+        headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer ")),
+        query_token,
+        headers
+            .get("x-install-token")
+            .and_then(|value| value.to_str().ok()),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|token| token == &*state.install_token)
+}
+
+fn require_valid_token(
+    state: &InstallAppState,
+    headers: &HeaderMap,
+    query_token: Option<&str>,
+) -> Option<Response> {
+    (!token_is_valid(state, headers, query_token))
+        .then(|| ApiError::new(StatusCode::UNAUTHORIZED, "invalid install token").into_response())
+}
+
+fn observe_operator(state: &InstallAppState, headers: &HeaderMap) {
+    let current = InstallOperatorFingerprint {
+        user_agent: headers
+            .get(header::USER_AGENT)
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string),
+        remote_ip:  detect_remote_ip(headers),
+    };
+    if current.user_agent.is_none() && current.remote_ip.is_none() {
+        return;
+    }
+
+    let mut first = lock_unpoisoned(&state.first_operator, "install operator");
+    match first.as_ref() {
+        None => *first = Some(current),
+        Some(initial) if initial != &current => {
+            warn!(
+                initial_user_agent = ?initial.user_agent,
+                current_user_agent = ?current.user_agent,
+                initial_remote_ip = ?initial.remote_ip,
+                current_remote_ip = ?current.remote_ip,
+                "suspected concurrent install operators"
+            );
+        }
+        Some(_) => {}
+    }
+}
+
+fn detect_remote_ip(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn install_github_redirect_error(state: &InstallAppState, error: &str) -> Response {
+    (StatusCode::FOUND, [(
+        header::LOCATION,
+        format!(
+            "/install/github?token={}&error={error}",
+            state.install_token
+        ),
+    )])
+        .into_response()
+}
+
+fn detect_canonical_url(headers: &HeaderMap) -> String {
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("http");
+
+    let host = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get("host"))
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("127.0.0.1:32276");
+
+    format!("{scheme}://{}", sanitize_client_facing_host(host))
+}
+
+fn sanitize_client_facing_host(host: &str) -> String {
+    let host = host.trim();
+    if let Some(end) = host
+        .strip_prefix('[')
+        .and_then(|rest| rest.find(']').map(|end| end + 1))
+    {
+        let address = &host[1..end];
+        let suffix = &host[end + 1..];
+        if is_wildcard_host(address) {
+            return format!("localhost{suffix}");
+        }
+        return host.to_string();
+    }
+
+    if let Some((address, port)) = host.rsplit_once(':') {
+        if !address.contains(':') && is_wildcard_host(address) {
+            return format!("localhost:{port}");
+        }
+    }
+
+    if is_wildcard_host(host) {
+        return "localhost".to_string();
+    }
+
+    host.to_string()
+}
+
+fn completed_steps(pending_install: &PendingInstall) -> Vec<&'static str> {
+    let mut steps = Vec::new();
+    if pending_install.server.is_some() {
+        steps.push("server");
+    }
+    if pending_install.object_store.is_some() {
+        steps.push("object_store");
+    }
+    if pending_install.sandbox.is_some() {
+        steps.push("sandbox");
+    }
+    if pending_install.llm.is_some() {
+        steps.push("llm");
+    }
+    if pending_install.github.is_some() {
+        steps.push("github");
+    }
+    steps
+}
+
+fn redacted_llm(pending_install: &PendingInstall) -> serde_json::Value {
+    pending_install.llm.as_ref().map_or_else(
+        || serde_json::Value::Null,
+        |llm| {
+            serde_json::json!({
+                "providers": llm.providers.iter().map(|provider| serde_json::json!({
+                    "provider": provider.provider.to_string(),
+                    "configured": true,
+                })).collect::<Vec<_>>()
+            })
+        },
+    )
+}
+
+fn redacted_github(pending_install: &PendingInstall) -> serde_json::Value {
+    pending_install.github.as_ref().map_or_else(
+        || serde_json::Value::Null,
+        |github| match github {
+            GithubInstallState::Token(github) => serde_json::json!({
+                "strategy": "token",
+                "username": github.username,
+            }),
+            GithubInstallState::App(github) => serde_json::json!({
+                "strategy": "app",
+                "owner": github.owner.as_session_value(),
+                "app_name": github.app_name,
+                "slug": github.slug,
+                "allowed_username": github.allowed_username,
+            }),
+        },
+    )
+}
+
+fn redacted_object_store(pending_install: &PendingInstall) -> serde_json::Value {
+    pending_install.object_store.as_ref().map_or_else(
+        || serde_json::Value::Null,
+        InstallObjectStoreState::as_session_value,
+    )
+}
+
+fn redacted_sandbox(pending_install: &PendingInstall) -> serde_json::Value {
+    pending_install.sandbox.as_ref().map_or_else(
+        || serde_json::Value::Null,
+        InstallSandboxState::as_session_value,
+    )
+}
+
+fn missing_step_response(step: &str) -> Response {
+    ApiError::new(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        format!("install step '{step}' is incomplete"),
+    )
+    .into_response()
+}
+
+fn install_error_response(status: StatusCode, message: impl Into<String>) -> Response {
+    ApiError::new(status, message).into_response()
+}
+
+fn generate_ephemeral_secret() -> String {
+    URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>())
+}
+
+fn build_github_app_manifest(
+    app_name: &str,
+    redirect_url: &str,
+    callback_url: &str,
+    setup_url: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "name": app_name,
+        "url": "https://fabro.sh",
+        "redirect_url": redirect_url,
+        "callback_urls": [callback_url],
+        "setup_url": setup_url,
+        "public": false,
+        "default_permissions": {
+            "contents": "write",
+            "metadata": "read",
+            "pull_requests": "write",
+            "checks": "write",
+            "issues": "write",
+            "emails": "read",
+            "vulnerability_alerts": "write",
+            "organization_projects": "write"
+        },
+        "default_events": []
+    })
+}
+
+#[expect(
+    clippy::disallowed_types,
+    reason = "Install HTTP client selection parses a public upstream base URL only to decide localhost proxy behavior."
+)]
+fn install_http_client_for_url(base_url: &str) -> anyhow::Result<fabro_http::HttpClient> {
+    let mut builder = fabro_http::HttpClientBuilder::new();
+    if fabro_http::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(ToString::to_string))
+        .is_some_and(|host| host == "127.0.0.1" || host == "localhost")
+    {
+        builder = builder.no_proxy();
+    }
+    builder.build().map_err(anyhow::Error::new)
+}
+
+/// Parse and validate an install-time upstream URL.
+///
+/// In production the base URL comes from installer defaults and provider
+/// catalog base-url settings.
+/// Only test code can override via
+/// [`InstallAppState::with_github_api_base_url`]
+/// or [`InstallAppState::with_provider_base_url`], but CodeQL sees those
+/// `pub` setters as external entry points and traces taint into the
+/// `format!` URL construction sites below. Passing every upstream URL
+/// through this parser turns it into a typed `Url` with a verified scheme
+/// and host before it is combined with a path segment.
+#[expect(
+    clippy::disallowed_types,
+    reason = "Install upstream endpoints are raw HTTP request URLs; logging uses separate redacted boundaries."
+)]
+fn parse_install_upstream_url(raw: &str) -> anyhow::Result<fabro_http::Url> {
+    let url = fabro_http::Url::parse(raw).map_err(anyhow::Error::new)?;
+    match url.scheme() {
+        "http" | "https" => {}
+        other => {
+            bail!("install upstream URL must use http or https, got {other}");
+        }
+    }
+    if url.host_str().is_none() {
+        bail!("install upstream URL must include a host");
+    }
+    Ok(url)
+}
+
+/// Append `segments` as new path segments to a validated base URL.
+///
+/// Each segment is percent-encoded by `url`, so caller-controlled values
+/// (e.g. a GitHub manifest `code`) cannot insert additional path components,
+/// alter the host, or redirect the request to a different URL scheme.
+#[expect(
+    clippy::disallowed_types,
+    reason = "Install upstream endpoints are raw HTTP request URLs; logging uses separate redacted boundaries."
+)]
+fn install_upstream_endpoint(base_url: &str, segments: &[&str]) -> anyhow::Result<fabro_http::Url> {
+    let mut url = parse_install_upstream_url(base_url)?;
+    {
+        let mut path = url
+            .path_segments_mut()
+            .map_err(|()| anyhow!("install upstream URL cannot be a base"))?;
+        for segment in segments {
+            path.push(segment);
+        }
+    }
+    Ok(url)
+}
+
+async fn validate_llm_provider(
+    state: &InstallAppState,
+    input: &InstallLlmTestInput,
+) -> anyhow::Result<()> {
+    let catalog = Arc::clone(&INSTALL_CATALOG);
+    let provider = catalog.provider(&input.provider).with_context(|| {
+        format!(
+            "provider '{}' is not configured in the model catalog",
+            input.provider
+        )
+    })?;
+    ensure_install_api_key_provider(provider)?;
+
+    let mut credential = fabro_auth::ApiCredential::from_api_key(
+        input.provider.clone(),
+        input.api_key.clone(),
+        catalog.as_ref(),
+    )?;
+    if let Some(base_url) = provider_base_url_override(state, provider) {
+        credential.base_url = Some(base_url);
+    }
+
+    let client = LlmClient::from_credentials(vec![credential], Arc::clone(&catalog))
+        .await
+        .context("failed to create LLM client for install validation")?;
+    let probe_model = catalog
+        .probe_for_provider(&input.provider)
+        .with_context(|| {
+            format!(
+                "provider '{}' does not define a probe model",
+                input.provider
+            )
+        })?
+        .id
+        .clone();
+    let params = GenerateParams::new(probe_model.to_string(), Arc::new(client))
+        .provider(input.provider.to_string())
+        .prompt("Say OK")
+        .max_tokens(16);
+
+    timeout(Duration::from_secs(30), generate(params))
+        .await
+        .context("LLM provider validation timed out")?
+        .map(|_| ())
+        .context("LLM provider validation request failed")
+}
+
+fn ensure_install_api_key_provider(provider: &CatalogProvider) -> anyhow::Result<()> {
+    if provider.auth.is_none() {
+        bail!(
+            "provider '{}' does not define an API-key credential path",
+            provider.id
+        )
+    }
+    Ok(())
+}
+
+fn provider_base_url_override(
+    state: &InstallAppState,
+    provider: &CatalogProvider,
+) -> Option<String> {
+    state
+        .upstreams
+        .provider_base_urls
+        .get(&provider.id)
+        .cloned()
+        .or_else(|| provider.base_url.clone())
+}
+
+async fn validate_github_token(state: &InstallAppState, token: &str) -> anyhow::Result<String> {
+    let base_url = state
+        .upstreams
+        .github_api_base_url
+        .clone()
+        .unwrap_or_else(|| DEFAULT_INSTALL_GITHUB_API_BASE_URL.to_string());
+    let endpoint = install_upstream_endpoint(&base_url, &["user"])?;
+    let client = install_http_client_for_url(&base_url)?;
+    let response = client
+        .get(endpoint)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "fabro-server")
+        .send()
+        .await
+        .map_err(anyhow::Error::new)?;
+    if !response.status().is_success() {
+        bail!("GitHub returned {}", response.status());
+    }
+    let body: GithubUserResponse = response
+        .json()
+        .await
+        .context("Failed to parse GitHub user response")?;
+    Ok(body.login)
+}
+
+async fn exchange_github_app_manifest_code(
+    state: &InstallAppState,
+    code: &str,
+) -> anyhow::Result<GitHubAppManifestConversion> {
+    if !is_valid_github_manifest_code(code) {
+        bail!("install GitHub manifest code is not in the expected format");
+    }
+    let base_url = state
+        .upstreams
+        .github_api_base_url
+        .clone()
+        .unwrap_or_else(|| DEFAULT_INSTALL_GITHUB_API_BASE_URL.to_string());
+    let endpoint = install_upstream_endpoint(&base_url, &["app-manifests", code, "conversions"])?;
+    let client = install_http_client_for_url(&base_url)?;
+    let response = client
+        .post(endpoint)
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "fabro-server")
+        .send()
+        .await
+        .map_err(anyhow::Error::new)?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let _ = response.text().await;
+        bail!("GitHub manifest conversion failed ({status})");
+    }
+    response
+        .json()
+        .await
+        .context("Failed to parse GitHub manifest conversion response")
+}
+
+/// GitHub's manifest-conversion `code` is short, unpadded-base64url by
+/// construction. Reject anything outside that alphabet so a malicious
+/// browser callback cannot smuggle extra path segments, host overrides, or
+/// query parameters into the request.
+fn is_valid_github_manifest_code(code: &str) -> bool {
+    !code.is_empty()
+        && code.len() <= 256
+        && code
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+async fn write_artifact_store_metadata(
+    settings: &ServerSettings,
+    storage_dir: &Path,
+) -> anyhow::Result<()> {
+    let mut settings = settings.clone();
+    settings.server.storage.root = storage_dir.display().to_string();
+    let (object_store, prefix) = serve::build_artifact_object_store(&settings.server)?;
+    let artifact_store = ArtifactStore::new(object_store, prefix);
+    artifact_store.write_metadata(FABRO_VERSION).await?;
+    Ok(())
+}
+
+struct InstallListener {
+    listener: BoundInstallListener,
+    bind:     Bind,
+}
+
+enum BoundInstallListener {
+    Unix(UnixListener),
+    Tcp(TcpListener),
+}
+
+async fn bind_install_listener(requested: &BindRequest) -> anyhow::Result<InstallListener> {
+    match requested {
+        BindRequest::Unix(path) => {
+            if path.exists() {
+                std::fs::remove_file(path)?;
+            }
+            let listener = UnixListener::bind(path)?;
+            Ok(InstallListener {
+                listener: BoundInstallListener::Unix(listener),
+                bind:     Bind::Unix(path.clone()),
+            })
+        }
+        BindRequest::Tcp(address) => {
+            let listener = TcpListener::bind(address).await?;
+            Ok(InstallListener {
+                bind:     Bind::Tcp(listener.local_addr()?),
+                listener: BoundInstallListener::Tcp(listener),
+            })
+        }
+        BindRequest::TcpHost(host) => {
+            let listener = TcpListener::bind((*host, DEFAULT_TCP_PORT)).await?;
+            Ok(InstallListener {
+                bind:     Bind::Tcp(listener.local_addr()?),
+                listener: BoundInstallListener::Tcp(listener),
+            })
+        }
+    }
+}
+
+async fn wait_for_shutdown(mut shutdown_rx: watch::Receiver<bool>) {
+    if *shutdown_rx.borrow() {
+        return;
+    }
+    let _ = shutdown_rx.changed().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::io;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+
+    use axum::extract::{Query, State};
+    use axum::http::{HeaderMap, StatusCode};
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+    use fabro_config::{Storage, envfile};
+    use fabro_install::{OBJECT_STORE_ACCESS_KEY_ID_ENV, OBJECT_STORE_SECRET_ACCESS_KEY_ENV};
+    use fabro_model::{Catalog, ProviderId};
+    use fabro_static::EnvVars;
+    use fabro_vault::SecretType as VaultSecretType;
+    use object_store::Error as ObjectStoreError;
+    use serde_json::json;
+
+    use super::{
+        DEFAULT_INSTALL_GITHUB_API_BASE_URL, GitHubAppOwner, GithubAppInstall, GithubInstallState,
+        InstallAppState, InstallAwsCredentialPair, InstallFinishGuard,
+        InstallObjectStoreCredentialMode, InstallObjectStoreInput, InstallObjectStoreProvider,
+        InstallObjectStoreState, InstallSandboxProviderState, InstallSandboxState,
+        InstallTokenQuery, LlmProvidersInput, PendingInstall, ServerConfigInput, ServerSecrets,
+        classify_object_store_validation_error, detect_canonical_url, install_object_store_lookup,
+        lock_unpoisoned, post_install_finish, provider_base_url_override,
+        resolve_install_object_store_state, token_is_valid, write_artifact_store_metadata,
+    };
+
+    #[test]
+    fn token_validation_accepts_any_matching_source() {
+        let state = InstallAppState::for_test("expected");
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer wrong".parse().unwrap());
+        headers.insert("x-install-token", "also-wrong".parse().unwrap());
+
+        assert!(token_is_valid(&state, &headers, Some("expected")));
+    }
+
+    #[test]
+    fn token_validation_falls_back_to_custom_header() {
+        let state = InstallAppState::for_test("expected");
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer wrong".parse().unwrap());
+        headers.insert("x-install-token", "expected".parse().unwrap());
+
+        assert!(token_is_valid(&state, &headers, None));
+    }
+
+    #[test]
+    fn canonical_url_prefers_forwarded_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        headers.insert("x-forwarded-host", "fabro.example.com".parse().unwrap());
+
+        assert_eq!(detect_canonical_url(&headers), "https://fabro.example.com");
+    }
+
+    #[test]
+    fn token_validation_requires_exact_match() {
+        let state = InstallAppState::for_test("expected");
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer expected".parse().unwrap());
+        assert!(token_is_valid(&state, &headers, None));
+
+        headers.insert("authorization", "Bearer wrong".parse().unwrap());
+        assert!(!token_is_valid(&state, &headers, None));
+    }
+
+    #[test]
+    fn pending_install_lock_recovers_after_poison() {
+        let pending = Arc::new(Mutex::new(PendingInstall::default()));
+        let poisoned = Arc::clone(&pending);
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("poison install lock");
+        });
+
+        let _guard = lock_unpoisoned(&pending, "install session");
+    }
+
+    #[test]
+    fn finish_guard_rejects_concurrent_finish_calls() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let first = InstallFinishGuard::try_acquire(Arc::clone(&flag));
+        assert!(first.is_some());
+        assert!(InstallFinishGuard::try_acquire(Arc::clone(&flag)).is_none());
+        drop(first);
+        assert!(InstallFinishGuard::try_acquire(flag).is_some());
+    }
+
+    #[tokio::test]
+    async fn finish_with_github_app_writes_runtime_secrets_to_vault_not_server_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new(dir.path());
+        let config_path = dir.path().join("settings.toml");
+        let server_env_path = storage.runtime_directory().env_path();
+        envfile::write_env_file(
+            &server_env_path,
+            &HashMap::from([
+                (
+                    EnvVars::GITHUB_APP_PRIVATE_KEY.to_string(),
+                    "stale-private".to_string(),
+                ),
+                (
+                    EnvVars::GITHUB_APP_CLIENT_SECRET.to_string(),
+                    "stale-client".to_string(),
+                ),
+                (
+                    EnvVars::GITHUB_APP_WEBHOOK_SECRET.to_string(),
+                    "stale-webhook".to_string(),
+                ),
+            ]),
+        )
+        .unwrap();
+
+        let mut stale_vault = fabro_vault::Vault::load(storage.secrets_path()).unwrap();
+        stale_vault
+            .set(
+                EnvVars::GITHUB_TOKEN,
+                "stale-token",
+                VaultSecretType::Token,
+                None,
+            )
+            .unwrap();
+
+        let state = InstallAppState::for_test_with_paths("install-token", dir.path(), &config_path);
+        {
+            let mut pending = lock_unpoisoned(&state.pending_install, "install session");
+            pending.server = Some(ServerConfigInput {
+                canonical_url: "https://fabro.example".to_string(),
+            });
+            pending.object_store = Some(InstallObjectStoreState::Local {
+                root: dir.path().join("runs").display().to_string(),
+            });
+            pending.sandbox = Some(InstallSandboxState {
+                provider:    InstallSandboxProviderState::Docker,
+                allow_local: true,
+            });
+            pending.llm = Some(LlmProvidersInput {
+                providers: Vec::new(),
+            });
+            pending.github = Some(GithubInstallState::App(GithubAppInstall {
+                owner:            GitHubAppOwner::Personal,
+                app_name:         "Fabro Test".to_string(),
+                allowed_username: "octocat".to_string(),
+                app_id:           "12345".to_string(),
+                slug:             "fabro-test".to_string(),
+                client_id:        "Iv1.test".to_string(),
+                client_secret:    "vault-client-secret".to_string(),
+                webhook_secret:   Some("vault-webhook-secret".to_string()),
+                pem:              "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----\n"
+                    .to_string(),
+            }));
+        }
+
+        let response = post_install_finish(
+            State(state),
+            HeaderMap::new(),
+            Query(InstallTokenQuery {
+                token: Some("install-token".to_string()),
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let server_env = envfile::read_env_file(&server_env_path).unwrap();
+        assert!(server_env.contains_key(EnvVars::SESSION_SECRET));
+        assert!(!server_env.contains_key(EnvVars::GITHUB_APP_PRIVATE_KEY));
+        assert!(!server_env.contains_key(EnvVars::GITHUB_APP_CLIENT_SECRET));
+        assert!(!server_env.contains_key(EnvVars::GITHUB_APP_WEBHOOK_SECRET));
+
+        let vault =
+            fabro_vault::SecretStore::open_snapshot(storage.sqlite_path(), storage.secrets_path())
+                .await
+                .unwrap();
+        assert_eq!(vault.get(EnvVars::GITHUB_TOKEN), None);
+        assert_eq!(
+            vault.get(EnvVars::GITHUB_APP_CLIENT_SECRET),
+            Some("vault-client-secret")
+        );
+        assert_eq!(
+            vault.get(EnvVars::GITHUB_APP_WEBHOOK_SECRET),
+            Some("vault-webhook-secret")
+        );
+        let private_key_entry = vault
+            .get_entry(EnvVars::GITHUB_APP_PRIVATE_KEY)
+            .expect("private key should be stored in vault");
+        assert_eq!(private_key_entry.secret_type, VaultSecretType::File);
+        assert_eq!(
+            private_key_entry.value,
+            BASE64_STANDARD.encode(
+                "-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----\n".as_bytes()
+            )
+        );
+    }
+
+    #[test]
+    fn install_github_requests_default_to_fixed_github_api_base_url() {
+        assert_eq!(
+            DEFAULT_INSTALL_GITHUB_API_BASE_URL,
+            "https://api.github.com"
+        );
+    }
+
+    #[test]
+    fn install_provider_base_url_falls_back_to_catalog_base_url() {
+        let state = InstallAppState::for_test("expected");
+        let catalog = Catalog::builtin();
+        let provider = catalog.provider(&ProviderId::openai()).unwrap();
+
+        assert_eq!(
+            provider_base_url_override(&state, provider).as_deref(),
+            Some("https://api.openai.com/v1")
+        );
+    }
+
+    #[test]
+    fn install_provider_base_url_prefers_state_override() {
+        let state = InstallAppState::for_test("expected")
+            .with_provider_base_url(ProviderId::openai(), "https://proxy.example.com/v1");
+        let catalog = Catalog::builtin();
+        let provider = catalog.provider(&ProviderId::openai()).unwrap();
+
+        assert_eq!(
+            provider_base_url_override(&state, provider).as_deref(),
+            Some("https://proxy.example.com/v1")
+        );
+    }
+
+    #[tokio::test]
+    async fn write_artifact_store_metadata_creates_marker_in_overridden_storage_root() {
+        use object_store::path::Path as ObjectPath;
+
+        let dir = tempfile::tempdir().unwrap();
+        let settings = fabro_config::ServerSettingsBuilder::from_toml(
+            r#"
+_version = 1
+
+[server.auth]
+methods = ["dev-token"]
+"#,
+        )
+        .unwrap();
+
+        write_artifact_store_metadata(&settings, dir.path())
+            .await
+            .unwrap();
+
+        let mut overridden = settings.clone();
+        overridden.server.storage.root = dir.path().display().to_string();
+        let (object_store, prefix) =
+            crate::serve::build_artifact_object_store(&overridden.server).unwrap();
+        let marker = if prefix.is_empty() {
+            "store-metadata.json".to_string()
+        } else {
+            format!("{prefix}/store-metadata.json")
+        };
+        let bytes = object_store
+            .get(&ObjectPath::from(marker))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["fabro_version"], super::FABRO_VERSION);
+    }
+
+    #[test]
+    fn resolve_install_object_store_state_rejects_local_with_s3_fields() {
+        let err = resolve_install_object_store_state(
+            None,
+            InstallObjectStoreInput {
+                provider:          InstallObjectStoreProvider::Local,
+                root:              Some("/srv/fabro/objects".to_string()),
+                bucket:            Some("fabro-data".to_string()),
+                region:            None,
+                credential_mode:   None,
+                access_key_id:     None,
+                secret_access_key: None,
+            },
+            "/srv/fabro/objects",
+        )
+        .expect_err("local mode should reject S3-only fields");
+
+        assert_eq!(
+            err,
+            "Local disk does not accept S3 bucket, region, or AWS credential fields."
+        );
+    }
+
+    #[test]
+    fn resolve_install_object_store_state_uses_local_root() {
+        let selection = resolve_install_object_store_state(
+            None,
+            InstallObjectStoreInput {
+                provider:          InstallObjectStoreProvider::Local,
+                root:              Some(" /srv/fabro/objects ".to_string()),
+                bucket:            None,
+                region:            None,
+                credential_mode:   None,
+                access_key_id:     None,
+                secret_access_key: None,
+            },
+            "/default/fabro/objects",
+        )
+        .expect("local mode should accept a root");
+
+        assert!(matches!(
+            selection,
+            InstallObjectStoreState::Local { ref root } if root == "/srv/fabro/objects"
+        ));
+    }
+
+    #[test]
+    fn resolve_install_object_store_state_rejects_runtime_with_submitted_access_keys() {
+        let err = resolve_install_object_store_state(
+            None,
+            InstallObjectStoreInput {
+                provider:          InstallObjectStoreProvider::S3,
+                root:              None,
+                bucket:            Some("fabro-data".to_string()),
+                region:            Some("us-east-1".to_string()),
+                credential_mode:   Some(InstallObjectStoreCredentialMode::Runtime),
+                access_key_id:     Some("AKIA_FAKE_VALUE".to_string()),
+                secret_access_key: Some("fake-secret-value".to_string()),
+            },
+            "/srv/fabro/objects",
+        )
+        .expect_err("runtime mode should reject submitted access keys");
+
+        assert_eq!(
+            err,
+            "AWS access key fields are only allowed when using manual AWS access key credentials."
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "sync std::fs::write in a unit test fixture; not on a Tokio path"
+    )]
+    fn install_object_store_lookup_overrides_static_keys_and_suppresses_session_token() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let env_path = temp_dir.path().join("server.env");
+        std::fs::write(
+            &env_path,
+            "\
+AWS_ACCESS_KEY_ID=ambient-access\n\
+AWS_SECRET_ACCESS_KEY=ambient-secret\n\
+AWS_SESSION_TOKEN=ambient-session\n\
+AWS_WEB_IDENTITY_TOKEN_FILE=/tmp/fabro-web-identity-token\n",
+        )
+        .unwrap();
+        let server_secrets = ServerSecrets::load(env_path.clone(), HashMap::new()).unwrap();
+        let manual_credentials =
+            InstallAwsCredentialPair::new("submitted-access", "submitted-secret");
+
+        let lookup = install_object_store_lookup(&server_secrets, Some(&manual_credentials));
+
+        assert_eq!(
+            lookup(OBJECT_STORE_ACCESS_KEY_ID_ENV).as_deref(),
+            Some("submitted-access")
+        );
+        assert_eq!(
+            lookup(OBJECT_STORE_SECRET_ACCESS_KEY_ENV).as_deref(),
+            Some("submitted-secret")
+        );
+        assert_eq!(lookup(EnvVars::AWS_SESSION_TOKEN), None);
+        assert_eq!(
+            lookup(EnvVars::AWS_WEB_IDENTITY_TOKEN_FILE).as_deref(),
+            Some("/tmp/fabro-web-identity-token")
+        );
+    }
+
+    #[test]
+    fn classify_object_store_validation_error_reports_region_mismatch() {
+        let err = ObjectStoreError::Generic {
+            store:  "AmazonS3",
+            source: Box::new(io::Error::other(
+                "Received redirect without LOCATION, this normally indicates an incorrectly configured region",
+            )),
+        };
+
+        assert_eq!(
+            classify_object_store_validation_error("fabro-data", "us-east-1", 0, &err),
+            "Bucket fabro-data is not reachable in region us-east-1. Verify the AWS region and try again."
+        );
+    }
+
+    #[test]
+    fn install_secret_debug_display_and_json_are_redacted() {
+        let manual_credentials =
+            InstallAwsCredentialPair::new("AKIA_STRUCTURALLY_REALISTIC", "secret-value-123");
+
+        let debug = format!("{manual_credentials:?}");
+        let rendered = json!({
+            "access_key_id": &manual_credentials.access_key_id,
+            "secret_access_key": &manual_credentials.secret_access_key,
+        })
+        .to_string();
+
+        assert!(!debug.contains("AKIA_STRUCTURALLY_REALISTIC"));
+        assert!(!debug.contains("secret-value-123"));
+        assert!(!rendered.contains("AKIA_STRUCTURALLY_REALISTIC"));
+        assert!(!rendered.contains("secret-value-123"));
+        assert!(rendered.contains("[REDACTED]"));
+    }
+}

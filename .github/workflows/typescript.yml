@@ -5,7 +5,7 @@ on:
     branches: [main]
     paths:
       - "apps/**"
-      - "lib/crates/fabro-spa/**"
+      - "lib/apps/fabro-spa/**"
       - "lib/packages/**"
       - "package.json"
       - "bun.lock"
@@ -17,7 +17,7 @@ on:
     branches: [main]
     paths:
       - "apps/**"
-      - "lib/crates/fabro-spa/**"
+      - "lib/apps/fabro-spa/**"
       - "lib/packages/**"
       - "package.json"
       - "bun.lock"

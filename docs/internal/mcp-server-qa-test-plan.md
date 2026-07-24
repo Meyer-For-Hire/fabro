@@ -1,6 +1,6 @@
 # Fabro MCP Server — QA Test Plan
 
-One-time manual QA pass for the 5 tools exposed by `fabro-mcp-server`. Source of truth: `lib/crates/fabro-mcp-server/src/run_tools/`.
+One-time manual QA pass for the 5 tools exposed by `fabro-mcp-server`. Source of truth: `lib/apps/fabro-mcp-server/src/run_tools/`.
 
 This plan is **not** a template for adding automated test coverage — it exists to drive a single hands-on sweep against a real running server. Tick boxes as scenarios pass; add notes inline for failures or surprising behavior. Open bugs/PRs for issues found; do not port these scenarios into the Rust test suite.
 

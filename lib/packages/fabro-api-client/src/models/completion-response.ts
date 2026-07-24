@@ -25,7 +25,14 @@ import type { CostSource } from './cost-source';
 
 export interface CompletionResponse {
     'id': string;
+    /**
+     * Canonical model ID selected for the request.
+     */
     'model': string;
+    /**
+     * LLM provider identifier.
+     */
+    'provider': string;
     'message': CompletionMessage;
     /**
      * Why generation stopped (end_turn, max_tokens, tool_calls).
