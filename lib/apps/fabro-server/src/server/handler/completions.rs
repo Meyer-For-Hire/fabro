@@ -4,10 +4,10 @@ use std::sync::Arc;
 use fabro_model::{Catalog, ModelSelectionError};
 
 use super::super::{
-    ApiError, AppState, CompletionResponse, CompletionToolChoiceMode, CompletionUsage,
-    CreateCompletionRequest, FinishReason, GenerateParams, IntoResponse, Json, LlmMessage,
-    LlmRequest, ProviderId, RequiredUser, Response, Router, State, StatusCode, ToolChoice,
-    ToolDefinition, Ulid, error, generate_object, info, post, warn,
+    ApiError, AppState, CompletionResponse, CompletionToolChoiceMode, CreateCompletionRequest,
+    FinishReason, GenerateParams, IntoResponse, Json, LlmMessage, LlmRequest, ProviderId,
+    RequiredUser, Response, Router, State, StatusCode, ToolChoice, ToolDefinition, Ulid, error,
+    generate_object, info, post, warn,
 };
 use super::llm_sse;
 
@@ -170,10 +170,7 @@ async fn create_completion(
                         provider: selected_provider,
                         message: response.message,
                         stop_reason,
-                        usage: CompletionUsage {
-                            input_tokens:  response.usage.input_tokens,
-                            output_tokens: response.usage.output_tokens,
-                        },
+                        usage: response.usage,
                         output,
                         cost_usd: response.cost_usd,
                         cost_source: response.cost_source,
@@ -193,10 +190,7 @@ async fn create_completion(
                         provider: ProviderId::new(response.provider),
                         message: response.message,
                         stop_reason,
-                        usage: CompletionUsage {
-                            input_tokens:  response.usage.input_tokens,
-                            output_tokens: response.usage.output_tokens,
-                        },
+                        usage: response.usage,
                         output: None,
                         cost_usd: response.cost_usd,
                         cost_source: response.cost_source,

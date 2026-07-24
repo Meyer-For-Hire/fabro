@@ -15294,6 +15294,73 @@ async fn create_completion_unknown_provider_returns_clear_error() {
 }
 
 #[tokio::test]
+async fn create_completion_returns_disjoint_usage_buckets() {
+    let upstream = MockServer::start();
+    let completion = upstream.mock(|when, then| {
+        when.method(POST).path("/chat/completions");
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(json!({
+                "id": "chatcmpl-usage",
+                "model": "kimi-k3",
+                "choices": [{
+                    "message": {"role": "assistant", "content": "OK"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 200,
+                    "completion_tokens": 30,
+                    "total_tokens": 230,
+                    "prompt_tokens_details": {
+                        "cached_tokens": 50,
+                        "cache_write_tokens": 100
+                    },
+                    "completion_tokens_details": {
+                        "reasoning_tokens": 20
+                    }
+                }
+            }));
+    });
+    let state = TestAppStateBuilder::new()
+        .provider_base_url("kimi", upstream.base_url())
+        .vault_entries([(EnvVars::KIMI_API_KEY, "test-kimi-api-key")])
+        .build();
+    let app = crate::test_support::build_test_router(state);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri(api("/completions"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "provider": "kimi",
+                "model": "kimi-k3",
+                "stream": false,
+                "messages": [{
+                    "role": "user",
+                    "content": [{"kind": "text", "data": "hi"}]
+                }]
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let response = app.oneshot(req).await.unwrap();
+    let body = response_json!(response, StatusCode::OK).await;
+    assert_eq!(
+        body["usage"],
+        json!({
+            "input_tokens": 50,
+            "output_tokens": 10,
+            "reasoning_tokens": 20,
+            "cache_read_tokens": 50,
+            "cache_write_tokens": 100
+        })
+    );
+    completion.assert();
+}
+
+#[tokio::test]
 async fn create_completion_default_model_uses_app_state_catalog() {
     let upstream = MockServer::start();
     let completion = upstream.mock(|when, then| {
