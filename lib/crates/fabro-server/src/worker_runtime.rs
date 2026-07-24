@@ -29,6 +29,14 @@ pub(crate) enum WorkerRef {
     Local { pid: u32 },
 }
 
+impl WorkerRef {
+    pub(crate) const fn kind(&self) -> &'static str {
+        match self {
+            Self::Local { .. } => "local",
+        }
+    }
+}
+
 pub(crate) struct WorkerLaunchSpec {
     pub(crate) executable:             PathBuf,
     pub(crate) server_target:          String,

@@ -153,6 +153,7 @@ describe("runs route board mapping", () => {
     expect(shouldRefreshBoardForEvent("run.denied")).toBe(true);
     expect(shouldRefreshBoardForEvent("run.blocked")).toBe(true);
     expect(shouldRefreshBoardForEvent("run.unblocked")).toBe(true);
+    expect(shouldRefreshBoardForEvent("run.cancel.requested")).toBe(true);
     expect(shouldRefreshBoardForEvent("run.archived")).toBe(true);
     expect(shouldRefreshBoardForEvent("run.unarchived")).toBe(true);
     expect(shouldRefreshBoardForEvent("run.title.updated")).toBe(true);

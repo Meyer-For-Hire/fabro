@@ -3,6 +3,7 @@ import {
   BoardColumn,
   type Principal,
   type Run,
+  type RunControlAction,
   type RunSize,
   type RunStatus as ApiRunStatus,
 } from "@qltysh/fabro-api-client";
@@ -26,6 +27,7 @@ export interface RunItem {
   column?: BoardColumn;
   lifecycleStatus?: RunStatus | null;
   lifecycleStatusLabel?: string;
+  pendingControl?: RunControlAction | null;
   number?: number;
   pullRequestUrl?: string;
   additions?: number;
@@ -99,6 +101,7 @@ export function mapRunListItem(item: Run): RunItem {
     column: columnForRun(item) ?? undefined,
     lifecycleStatus,
     lifecycleStatusLabel: lifecycleStatusLabel(item.lifecycle.status, item.lifecycle.archived),
+    pendingControl: item.lifecycle.pending_control,
     number: item.pull_request?.number,
     pullRequestUrl: item.pull_request?.html_url,
     elapsed: item.timing != null ? formatDurationMs(item.timing.wall_time_ms) : undefined,

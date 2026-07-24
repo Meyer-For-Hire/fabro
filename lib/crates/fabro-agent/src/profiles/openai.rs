@@ -285,10 +285,8 @@ in the project.");
 mod tests {
     use std::sync::Arc;
 
-    use tokio::sync::Mutex as AsyncMutex;
-
     use super::*;
-    use crate::subagent::{SessionFactory, SubAgentManager};
+    use crate::subagent::{SessionFactory, SubAgentSupervisor};
     use crate::test_support::MockSandbox;
 
     fn test_catalog() -> Arc<Catalog> {
@@ -368,9 +366,9 @@ mod tests {
         let mut profile = OpenAiProfile::new("o3-mini");
         assert_eq!(profile.tool_registry().names().len(), 9);
 
-        let manager = Arc::new(AsyncMutex::new(SubAgentManager::new(3)));
+        let supervisor = SubAgentSupervisor::new(3);
         let factory: SessionFactory = Arc::new(|| panic!("should not be called in test"));
-        profile.register_subagent_tools(manager, factory, 0);
+        profile.register_subagent_tools(supervisor, factory, 0);
         assert_eq!(profile.tool_registry().names().len(), 13);
     }
 

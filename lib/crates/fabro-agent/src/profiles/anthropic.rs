@@ -272,10 +272,8 @@ impl AgentProfile for AnthropicProfile {
 mod tests {
     use std::sync::Arc;
 
-    use tokio::sync::Mutex as AsyncMutex;
-
     use super::*;
-    use crate::subagent::{SessionFactory, SubAgentManager};
+    use crate::subagent::{SessionFactory, SubAgentSupervisor};
     use crate::test_support::MockSandbox;
 
     fn test_catalog() -> Arc<Catalog> {
@@ -386,11 +384,11 @@ mod tests {
         assert!(!prompt.contains("Subagents are valuable for independent work"));
 
         let mut profile = AnthropicProfile::new("claude-sonnet-4-20250514");
-        let manager = Arc::new(AsyncMutex::new(SubAgentManager::new(3)));
+        let supervisor = SubAgentSupervisor::new(3);
         let factory: SessionFactory = Arc::new(|| {
             panic!("should not be called in test");
         });
-        profile.register_subagent_tools(manager, factory, 0);
+        profile.register_subagent_tools(supervisor, factory, 0);
         let prompt = profile.build_system_prompt(&env, &EnvContext::default(), &[], None, &[]);
 
         assert!(prompt.contains("Subagents are valuable for independent work"));
@@ -471,12 +469,12 @@ mod tests {
         let mut profile = AnthropicProfile::new("claude-sonnet-4-20250514");
         assert_eq!(profile.tool_registry().names().len(), 12);
 
-        let manager = Arc::new(AsyncMutex::new(SubAgentManager::new(3)));
+        let supervisor = SubAgentSupervisor::new(3);
         let factory: SessionFactory = Arc::new(|| {
             panic!("should not be called in test");
         });
 
-        profile.register_subagent_tools(manager, factory, 0);
+        profile.register_subagent_tools(supervisor, factory, 0);
 
         let names = profile.tool_registry().names();
         assert_eq!(names.len(), 16, "should have 12 base + 4 subagent tools");

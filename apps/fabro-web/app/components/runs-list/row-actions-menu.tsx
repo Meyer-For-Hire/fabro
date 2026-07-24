@@ -12,9 +12,12 @@ import {
   canCancel,
   canDelete,
   canUnarchive,
+  cancellationActionLabel,
+  cancellationSuccessMessage,
   cancelRun,
   deleteRun,
   denyRun,
+  isCancellationPendingState,
   mapError,
   retryRun,
   unarchiveRun,
@@ -32,7 +35,9 @@ const MENU_ITEM_DANGER_CLASS =
 export function RowActionsMenu({ run }: { run: RunWithStatus }) {
   const { mutate } = useSWRConfig();
   const { push } = useToast();
-  const [pending, setPending] = useState(false);
+  const [pendingAction, setPendingAction] = useState<LifecycleAction | "delete" | null>(null);
+  const [optimisticCancellationRunId, setOptimisticCancellationRunId] =
+    useState<string | null>(null);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [idCopied, setIdCopied] = useState(false);
 
@@ -44,6 +49,12 @@ export function RowActionsMenu({ run }: { run: RunWithStatus }) {
   const showUnarchive = canUnarchive(status);
   const showCancel = canCancel(status);
   const showDelete = canDelete(status);
+  const cancellationPending = isCancellationPendingState(
+    status,
+    run.pendingControl,
+    pendingAction === "cancel" || optimisticCancellationRunId === run.id,
+  );
+  const pending = pendingAction !== null || cancellationPending;
 
   const hasLifecycle = showRetry || showArchive || showUnarchive;
   const hasDestructive = showDeny || showCancel || showDelete;
@@ -51,17 +62,25 @@ export function RowActionsMenu({ run }: { run: RunWithStatus }) {
   async function runAction<T>(
     label: LifecycleAction,
     action: () => Promise<T>,
-    successMessage: string,
+    successMessage: string | ((result: T) => string),
   ) {
     if (pending) return;
-    setPending(true);
+    setPendingAction(label);
     try {
-      await action();
-      push({ message: successMessage });
+      const result = await action();
+      if (label === "cancel") {
+        setOptimisticCancellationRunId(run.id);
+      }
+      push({
+        message:
+          typeof successMessage === "function"
+            ? successMessage(result)
+            : successMessage,
+      });
     } catch (error) {
       push({ message: mapError(error, label), tone: "error" });
     } finally {
-      setPending(false);
+      setPendingAction(null);
       mutateRunListCaches(mutate);
     }
   }
@@ -81,7 +100,7 @@ export function RowActionsMenu({ run }: { run: RunWithStatus }) {
 
   async function handleDeleteConfirm() {
     if (pending) return;
-    setPending(true);
+    setPendingAction("delete");
     try {
       await deleteRun(run.id);
       push({ message: "Deleted run." });
@@ -89,7 +108,7 @@ export function RowActionsMenu({ run }: { run: RunWithStatus }) {
       // deleteRun throws LifecycleActionError shapes via lifecycleActionErrorFromError
       push({ message: mapError(error, "archive"), tone: "error" });
     } finally {
-      setPending(false);
+      setPendingAction(null);
       setDeleteDialogOpen(false);
       mutateRunListCaches(mutate);
     }
@@ -208,12 +227,12 @@ export function RowActionsMenu({ run }: { run: RunWithStatus }) {
               <button
                 type="button"
                 onClick={() =>
-                  void runAction("cancel", () => cancelRun(run.id), "Cancelled run.")
+                  void runAction("cancel", () => cancelRun(run.id), cancellationSuccessMessage)
                 }
                 disabled={pending}
                 className={MENU_ITEM_DANGER_CLASS}
               >
-                Cancel
+                {cancellationActionLabel(cancellationPending)}
               </button>
             </MenuItem>
           )}

@@ -208,6 +208,12 @@ pub struct AgentSteeringInjectedProps {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentRoundInterruptedProps {
+    pub generation: u64,
+    pub visit:      u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentPairUserMessageProps {
     pub pair_id:           PairId,
     pub message_id:        PairMessageId,

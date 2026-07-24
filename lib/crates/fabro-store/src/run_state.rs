@@ -8,8 +8,8 @@ use fabro_types::run_event::{
 };
 use fabro_types::settings::run::{EnvironmentProvider, RunEnvironmentSettings};
 use fabro_types::{
-    ActivatedSkill, AskFabro, BilledModelUsage, BilledTokenCounts, Checkpoint, CheckpointRecord,
-    CommandTermination, Conclusion, EventBody, FailureCategory, FailureSignature,
+    ActivatedSkill, AgentControlState, AskFabro, BilledModelUsage, BilledTokenCounts, Checkpoint,
+    CheckpointRecord, CommandTermination, Conclusion, EventBody, FailureCategory, FailureSignature,
     InterviewQuestionRecord, McpServerProjection, McpServerStatus, Outcome, PendingInterviewRecord,
     PendingReason, PullRequestLink, RepositoryRef, Run, RunApproval, RunApprovalState,
     RunBillingSummary, RunControlAction, RunDiff, RunEvent, RunId, RunLifecycle, RunLinks,
@@ -352,6 +352,7 @@ impl RunProjectionReducer for RunProjection {
                     return Ok(());
                 };
                 stage.state = StageState::Retrying;
+                stage.agent_control = AgentControlState::Running;
             }
             EventBody::StagePrompt(props) => {
                 let Some(stage) = stage_at_stored_or_visit(self, stored, props.visit, event.seq)
@@ -388,6 +389,7 @@ impl RunProjectionReducer for RunProjection {
                     stage.model = Some(billing.model().clone());
                 }
                 stage.state = StageState::from(outcome.status);
+                stage.agent_control = AgentControlState::Running;
             }
             EventBody::StageFailed(props) => {
                 let failure_reason = props.failure.as_ref().map(|detail| detail.message.clone());
@@ -411,6 +413,7 @@ impl RunProjectionReducer for RunProjection {
                 }
                 stage.state =
                     stage_state_from_failure(props.will_retry, failure_category, stage.termination);
+                stage.agent_control = AgentControlState::Running;
             }
             EventBody::AgentMessage(props) => {
                 let Some(stage) = stage_at_stored_or_visit(self, stored, props.visit, event.seq)
@@ -432,6 +435,27 @@ impl RunProjectionReducer for RunProjection {
                 };
                 stage.provider_used = Some(StageModelUsage::from_agent_session_activated(props));
                 stage.permission_level = props.permission_level;
+            }
+            EventBody::AgentRoundInterrupted(props) => {
+                let Some(stage) = stage_at_stored_or_visit(self, stored, props.visit, event.seq)
+                else {
+                    return Ok(());
+                };
+                stage.agent_control = AgentControlState::WaitingForSteer;
+            }
+            EventBody::AgentSteeringInjected(props) => {
+                let Some(stage) = stage_at_stored_or_visit(self, stored, props.visit, event.seq)
+                else {
+                    return Ok(());
+                };
+                stage.agent_control = AgentControlState::Running;
+            }
+            EventBody::AgentSessionDeactivated(props) => {
+                let Some(stage) = stage_at_stored_or_visit(self, stored, props.visit, event.seq)
+                else {
+                    return Ok(());
+                };
+                stage.agent_control = AgentControlState::Running;
             }
             EventBody::AgentToolsAvailable(props) => {
                 let Some(stage) = stage_at_stored_or_visit(self, stored, props.visit, event.seq)
@@ -544,6 +568,7 @@ impl RunProjectionReducer for RunProjection {
                 });
                 stage.timing = Some(fabro_types::StageTiming::wall_only(props.duration_ms));
                 stage.state = StageState::from(outcome);
+                stage.agent_control = AgentControlState::Running;
             }
             EventBody::TodoCreated(props) => {
                 let Some(stage) = stage_at_stored_or_current_visit(self, stored, event.seq) else {
@@ -1264,6 +1289,7 @@ fn apply_agent_terminal(
     stage.output = Some(output);
     stage.termination = Some(termination);
     stage.script_timing = Some(script_timing);
+    stage.agent_control = AgentControlState::Running;
     Ok(())
 }
 
@@ -1286,11 +1312,12 @@ mod tests {
     use fabro_types::run_event::{
         AgentAcpCancelledProps, AgentAcpCompletedProps, AgentAcpStartedProps,
         AgentAcpTimedOutProps, AgentMcpFailedProps, AgentMcpReadyProps, AgentMcpToolSummary,
-        AgentMessageProps, AgentSessionActivatedProps, AgentSessionEndedProps,
-        AgentSessionStartedProps, AgentSkillActivatedProps, AgentSkillActivationSource,
-        AgentSkillSummary, AgentSkillsDiscoveredProps, AgentSubClosedProps, AgentSubCompletedProps,
-        AgentSubFailedProps, AgentSubSpawnedProps, AgentToolCategory, AgentToolSource,
-        AgentToolStartedProps, AgentToolSummary, AgentToolsAvailableProps,
+        AgentMessageProps, AgentRoundInterruptedProps, AgentSessionActivatedProps,
+        AgentSessionDeactivatedProps, AgentSessionEndedProps, AgentSessionStartedProps,
+        AgentSkillActivatedProps, AgentSkillActivationSource, AgentSkillSummary,
+        AgentSkillsDiscoveredProps, AgentSteeringInjectedProps, AgentSubClosedProps,
+        AgentSubCompletedProps, AgentSubFailedProps, AgentSubSpawnedProps, AgentToolCategory,
+        AgentToolSource, AgentToolStartedProps, AgentToolSummary, AgentToolsAvailableProps,
         CheckpointCompletedProps, InterviewCompletedProps, InterviewOption, InterviewStartedProps,
         ParallelBranchCompletedProps, ParallelBranchStartedProps, RunCompletedProps,
         RunControlEffectProps, StageCompletedProps, StageFailedProps, StagePromptProps,
@@ -1298,15 +1325,15 @@ mod tests {
     };
     use fabro_types::settings::run::{DockerfileSource, EnvironmentProvider};
     use fabro_types::{
-        AgentBackend, AutomationRef, BilledModelUsage, BilledTokenCounts, BlockedReason,
-        Checkpoint, CheckpointRecord, CommandTermination, EventBody, FailureCategory,
-        FailureDetail, FailureReason, Graph, McpServerStatus, Outcome, PendingReason,
-        PermissionLevel, PullRequestLink, QuestionType, ReasoningEffort, RunApprovalState,
-        RunBlobId, RunControlAction, RunDiff, RunEvent, RunSize, RunSpec, RunStatus, Speed,
-        StageContextWindowBreakdownItem, StageContextWindowCategory, StageContextWindowCountMethod,
-        StageContextWindowProjection, StageContextWindowStaleness, StageContextWindowWarning,
-        StageModelUsage, StageOutcome, StageState, SubAgentStatus, SuccessReason, WorkflowSettings,
-        first_event_seq, fixtures, test_support,
+        AgentBackend, AgentControlState, AutomationRef, BilledModelUsage, BilledTokenCounts,
+        BlockedReason, Checkpoint, CheckpointRecord, CommandTermination, EventBody,
+        FailureCategory, FailureDetail, FailureReason, Graph, McpServerStatus, Outcome,
+        PendingReason, PermissionLevel, PullRequestLink, QuestionType, ReasoningEffort,
+        RunApprovalState, RunBlobId, RunControlAction, RunDiff, RunEvent, RunSize, RunSpec,
+        RunStatus, Speed, StageContextWindowBreakdownItem, StageContextWindowCategory,
+        StageContextWindowCountMethod, StageContextWindowProjection, StageContextWindowStaleness,
+        StageContextWindowWarning, StageModelUsage, StageOutcome, StageState, SubAgentStatus,
+        SuccessReason, WorkflowSettings, first_event_seq, fixtures, test_support,
     };
     use serde_json::json;
 
@@ -4866,6 +4893,86 @@ mod tests {
 
         fn stage_id() -> StageId {
             StageId::new("code", 1)
+        }
+
+        #[test]
+        fn interrupt_settlement_and_steering_update_agent_control_projection() {
+            let mut state = initialized_projection();
+            let stage_id = stage_id();
+
+            state
+                .apply_event(&test_stage_event(
+                    1,
+                    EventBody::AgentRoundInterrupted(AgentRoundInterruptedProps {
+                        generation: 1,
+                        visit:      1,
+                    }),
+                    stage_id.clone(),
+                ))
+                .unwrap();
+            assert_eq!(
+                state.stage(&stage_id).unwrap().agent_control,
+                AgentControlState::WaitingForSteer
+            );
+
+            state
+                .apply_event(&test_stage_event(
+                    2,
+                    EventBody::AgentSteeringInjected(AgentSteeringInjectedProps {
+                        text:  "continue".to_string(),
+                        visit: 1,
+                    }),
+                    stage_id.clone(),
+                ))
+                .unwrap();
+            assert_eq!(
+                state.stage(&stage_id).unwrap().agent_control,
+                AgentControlState::Running
+            );
+
+            state
+                .apply_event(&test_stage_event(
+                    3,
+                    EventBody::AgentRoundInterrupted(AgentRoundInterruptedProps {
+                        generation: 2,
+                        visit:      1,
+                    }),
+                    stage_id.clone(),
+                ))
+                .unwrap();
+            state
+                .apply_event(&test_stage_event(
+                    4,
+                    EventBody::AgentSessionDeactivated(AgentSessionDeactivatedProps { visit: 1 }),
+                    stage_id.clone(),
+                ))
+                .unwrap();
+            assert_eq!(
+                state.stage(&stage_id).unwrap().agent_control,
+                AgentControlState::Running
+            );
+
+            state
+                .apply_event(&test_stage_event(
+                    5,
+                    EventBody::AgentRoundInterrupted(AgentRoundInterruptedProps {
+                        generation: 3,
+                        visit:      1,
+                    }),
+                    stage_id.clone(),
+                ))
+                .unwrap();
+            state
+                .apply_event(&test_stage_event(
+                    6,
+                    EventBody::StageFailed(failed_props(10, false)),
+                    stage_id.clone(),
+                ))
+                .unwrap();
+            assert_eq!(
+                state.stage(&stage_id).unwrap().agent_control,
+                AgentControlState::Running
+            );
         }
 
         #[test]

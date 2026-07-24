@@ -3,12 +3,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use fabro_agent::subagent::{SessionFactory, SubAgentManager};
+use fabro_agent::subagent::{SessionFactory, SubAgentSupervisor};
 use fabro_agent::tool_registry::{RegisteredTool, ToolContext, ToolRegistry, ToolSource};
 use fabro_agent::{
     AgentEvent, AgentProfile, AnthropicProfile, CompletionCoordinator, GeminiProfile,
-    Message as AgentMessage, OpenAiProfile, Sandbox, Session, SessionOptions, StaticEnvProvider,
-    ToolEnvProvider, ToolSecrets, register_question_tools,
+    Message as AgentMessage, OpenAiProfile, Sandbox, Session, SessionOptions,
+    SessionShutdownReason, StaticEnvProvider, ToolEnvProvider, ToolSecrets,
+    register_question_tools,
 };
 use fabro_auth::{CredentialSource, EnvCredentialSource};
 use fabro_graphviz::graph::{AttrValue, Node};
@@ -24,7 +25,7 @@ use fabro_model::{AgentProfileKind, Catalog, FallbackTarget, ModelRef, ProviderI
 use fabro_types::settings::run::RunModelControls;
 use fabro_types::{PermissionLevel, RunId, SessionCapability, StageId, StageTiming};
 use serde::de::DeserializeOwned;
-use tokio::sync::{Mutex as TokioMutex, mpsc};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -155,21 +156,30 @@ fn begin_session_lifecycle(
     });
 }
 
-fn discard_session(
+async fn discard_session(
     session: &mut Session,
     lease: &mut Option<Arc<ActivationLease>>,
+    event_forwarder: &mut EventForwarder,
     emitter: &Arc<Emitter>,
 ) {
     if let Some(lease) = lease.take() {
         lease.release();
     }
     let session_id = session.id().to_string();
-    if session.close() {
-        emitter.emit(&Event::AgentSessionEnded {
-            session_id,
-            parent_session_id: None,
-        });
-    }
+    let reason = if session.cancel_token().is_cancelled() {
+        SessionShutdownReason::Cancelled
+    } else {
+        SessionShutdownReason::Error
+    };
+    session.shutdown(reason).await;
+    event_forwarder.wait_for_session_end().await;
+    // The agent-layer SessionEnded event is deliberately filtered by the
+    // bridge. This workflow-level event owns the durable session lifecycle,
+    // even when process_input already performed internal shutdown.
+    emitter.emit(&Event::AgentSessionEnded {
+        session_id,
+        parent_session_id: None,
+    });
 }
 
 fn build_profile(
@@ -539,6 +549,7 @@ fn emit_agent_tools_available(
 /// overtaking queued agent events.
 struct EventForwarder {
     processing_end_rx: mpsc::UnboundedReceiver<()>,
+    session_end_rx:    mpsc::UnboundedReceiver<()>,
     task:              JoinHandle<()>,
 }
 
@@ -546,6 +557,12 @@ impl EventForwarder {
     async fn wait_for_processing_end(&mut self) {
         if self.processing_end_rx.recv().await.is_none() {
             tracing::warn!("Agent event forwarder stopped before processing input events");
+        }
+    }
+
+    async fn wait_for_session_end(&mut self) {
+        if self.session_end_rx.recv().await.is_none() {
+            tracing::warn!("Agent event forwarder stopped before session shutdown events");
         }
     }
 
@@ -570,11 +587,15 @@ fn spawn_event_forwarder(
     let mut rx = session.subscribe();
     let root_session_id = session.id().to_string();
     let (processing_end_tx, processing_end_rx) = mpsc::unbounded_channel();
+    let (session_end_tx, session_end_rx) = mpsc::unbounded_channel();
     let task = tokio::spawn(async move {
         while let Ok(event) = rx.recv().await {
             let is_root_processing_end = event.session_id == root_session_id
                 && event.parent_session_id.is_none()
                 && matches!(&event.event, AgentEvent::ProcessingEnd);
+            let is_root_session_end = event.session_id == root_session_id
+                && event.parent_session_id.is_none()
+                && matches!(&event.event, AgentEvent::SessionEnded);
 
             // Reset watchdog on every event, including streaming deltas
             emitter.touch();
@@ -611,11 +632,15 @@ fn spawn_event_forwarder(
             if is_root_processing_end {
                 let _ = processing_end_tx.send(());
             }
+            if is_root_session_end {
+                let _ = session_end_tx.send(());
+            }
         }
     });
 
     EventForwarder {
         processing_end_rx,
+        session_end_rx,
         task,
     }
 }
@@ -833,10 +858,8 @@ impl AgentApiBackend {
             ..SessionOptions::default()
         };
 
-        let manager = Arc::new(TokioMutex::new(SubAgentManager::new(
-            config.max_subagent_depth,
-        )));
-        let manager_for_callback = manager.clone();
+        let supervisor = SubAgentSupervisor::new(config.max_subagent_depth);
+        let supervisor_for_session = supervisor.clone();
 
         // Build factory that creates child sessions WITHOUT subagent tools
         let factory_client = client.clone();
@@ -878,7 +901,7 @@ impl AgentApiBackend {
             session
         });
 
-        profile.register_subagent_tools(manager, factory, 0);
+        profile.register_subagent_tools(supervisor.clone(), factory, 0);
         register_question_tools(provider.profile_kind, profile.tool_registry_mut());
         if let Some(services) = fabro_run_tools {
             register_fabro_run_tools(profile.tool_registry_mut(), &services);
@@ -890,17 +913,14 @@ impl AgentApiBackend {
             profile,
             Arc::clone(sandbox),
             config,
-            Some(manager_for_callback.clone()),
+            Some(supervisor_for_session),
         );
         if let Some(provider) = tool_env {
             session.set_tool_env_provider(Arc::clone(provider));
         }
 
         // Wire subagent event callback to parent session's emitter
-        manager_for_callback
-            .lock()
-            .await
-            .set_event_callback(session.sub_agent_event_callback());
+        supervisor.set_event_callback(session.sub_agent_event_callback());
 
         Ok(session)
     }
@@ -938,7 +958,7 @@ impl AgentApiBackend {
         Ok(lease)
     }
 
-    fn shutdown_cached_sessions(&self, emitter: &Arc<Emitter>) {
+    async fn shutdown_cached_sessions(&self, emitter: &Arc<Emitter>) {
         let sessions: Vec<Session> = self
             .sessions
             .lock()
@@ -948,7 +968,7 @@ impl AgentApiBackend {
             .collect();
         for mut session in sessions {
             let session_id = session.id().to_string();
-            if session.close() {
+            if session.shutdown(SessionShutdownReason::Completed).await {
                 emitter.emit(&Event::AgentSessionEnded {
                     session_id,
                     parent_session_id: None,
@@ -1054,7 +1074,7 @@ impl AgentApiBackend {
 #[async_trait]
 impl CodergenBackend for AgentApiBackend {
     async fn shutdown(&self, emitter: &Arc<Emitter>) {
-        self.shutdown_cached_sessions(emitter);
+        self.shutdown_cached_sessions(emitter).await;
     }
 
     fn effective_request_controls(&self, node: &Node) -> Result<EffectiveRequestControls, Error> {
@@ -1286,12 +1306,14 @@ impl CodergenBackend for AgentApiBackend {
                 Err(err) => match classify_agent_error(err, allow_failover_primary) {
                     AgentApiErrorDisposition::Cancelled => {
                         bridge.abort();
-                        discard_session(&mut session, &mut lease, emitter);
+                        discard_session(&mut session, &mut lease, &mut event_forwarder, emitter)
+                            .await;
                         return Err(Error::Cancelled);
                     }
                     AgentApiErrorDisposition::Terminal(err) => {
                         bridge.abort();
-                        discard_session(&mut session, &mut lease, emitter);
+                        discard_session(&mut session, &mut lease, &mut event_forwarder, emitter)
+                            .await;
                         return Err(err);
                     }
                     AgentApiErrorDisposition::FailoverEligible(sdk_err) => {
@@ -1309,7 +1331,8 @@ impl CodergenBackend for AgentApiBackend {
                     Ok(active_lease) => lease = Some(active_lease),
                     Err(err) => {
                         bridge.abort();
-                        discard_session(&mut session, &mut lease, emitter);
+                        discard_session(&mut session, &mut lease, &mut event_forwarder, emitter)
+                            .await;
                         return Err(err);
                     }
                 }
@@ -1342,12 +1365,12 @@ impl CodergenBackend for AgentApiBackend {
             Err(err) => match classify_agent_error(err, allow_failover_primary) {
                 AgentApiErrorDisposition::Cancelled => {
                     bridge.abort();
-                    discard_session(&mut session, &mut lease, emitter);
+                    discard_session(&mut session, &mut lease, &mut event_forwarder, emitter).await;
                     return Err(Error::Cancelled);
                 }
                 AgentApiErrorDisposition::Terminal(err) => {
                     bridge.abort();
-                    discard_session(&mut session, &mut lease, emitter);
+                    discard_session(&mut session, &mut lease, &mut event_forwarder, emitter).await;
                     return Err(err);
                 }
                 AgentApiErrorDisposition::FailoverEligible(sdk_err) => {
@@ -1359,8 +1382,8 @@ impl CodergenBackend for AgentApiBackend {
                     let mut succeeded = false;
 
                     bridge.abort();
+                    discard_session(&mut session, &mut lease, &mut event_forwarder, emitter).await;
                     event_forwarder.abort();
-                    discard_session(&mut session, &mut lease, emitter);
 
                     for (index, target) in self.fallback_chain.iter().enumerate() {
                         emitter.emit_scoped(
@@ -1427,18 +1450,36 @@ impl CodergenBackend for AgentApiBackend {
                             match classify_agent_error(err, allow_failover_next) {
                                 AgentApiErrorDisposition::Cancelled => {
                                     bridge.abort();
-                                    discard_session(&mut session, &mut lease, emitter);
+                                    discard_session(
+                                        &mut session,
+                                        &mut lease,
+                                        &mut event_forwarder,
+                                        emitter,
+                                    )
+                                    .await;
                                     return Err(Error::Cancelled);
                                 }
                                 AgentApiErrorDisposition::Terminal(err) => {
                                     bridge.abort();
-                                    discard_session(&mut session, &mut lease, emitter);
+                                    discard_session(
+                                        &mut session,
+                                        &mut lease,
+                                        &mut event_forwarder,
+                                        emitter,
+                                    )
+                                    .await;
                                     return Err(err);
                                 }
                                 AgentApiErrorDisposition::FailoverEligible(sdk_err) => {
                                     last_err = Error::Llm(sdk_err);
                                     bridge.abort();
-                                    discard_session(&mut session, &mut lease, emitter);
+                                    discard_session(
+                                        &mut session,
+                                        &mut lease,
+                                        &mut event_forwarder,
+                                        emitter,
+                                    )
+                                    .await;
                                     continue;
                                 }
                             }
@@ -1452,7 +1493,13 @@ impl CodergenBackend for AgentApiBackend {
                             Ok(active_lease) => lease = Some(active_lease),
                             Err(err) => {
                                 bridge.abort();
-                                discard_session(&mut session, &mut lease, emitter);
+                                discard_session(
+                                    &mut session,
+                                    &mut lease,
+                                    &mut event_forwarder,
+                                    emitter,
+                                )
+                                .await;
                                 return Err(err);
                             }
                         }
@@ -1474,18 +1521,36 @@ impl CodergenBackend for AgentApiBackend {
                             Err(err) => match classify_agent_error(err, allow_failover_next) {
                                 AgentApiErrorDisposition::Cancelled => {
                                     bridge.abort();
-                                    discard_session(&mut session, &mut lease, emitter);
+                                    discard_session(
+                                        &mut session,
+                                        &mut lease,
+                                        &mut event_forwarder,
+                                        emitter,
+                                    )
+                                    .await;
                                     return Err(Error::Cancelled);
                                 }
                                 AgentApiErrorDisposition::Terminal(err) => {
                                     bridge.abort();
-                                    discard_session(&mut session, &mut lease, emitter);
+                                    discard_session(
+                                        &mut session,
+                                        &mut lease,
+                                        &mut event_forwarder,
+                                        emitter,
+                                    )
+                                    .await;
                                     return Err(err);
                                 }
                                 AgentApiErrorDisposition::FailoverEligible(sdk_err) => {
                                     last_err = Error::Llm(sdk_err);
                                     bridge.abort();
-                                    discard_session(&mut session, &mut lease, emitter);
+                                    discard_session(
+                                        &mut session,
+                                        &mut lease,
+                                        &mut event_forwarder,
+                                        emitter,
+                                    )
+                                    .await;
                                 }
                             },
                         }
@@ -1500,7 +1565,7 @@ impl CodergenBackend for AgentApiBackend {
         // bridge's `Drop` will abort the spawned task on early return.
         if let Err(err) = result {
             bridge.abort();
-            discard_session(&mut session, &mut lease, emitter);
+            discard_session(&mut session, &mut lease, &mut event_forwarder, emitter).await;
             return Err(err);
         }
 
@@ -1521,7 +1586,13 @@ impl CodergenBackend for AgentApiBackend {
                     Err(error) => {
                         if repair_attempts >= node.output_retries() {
                             bridge.abort();
-                            discard_session(&mut session, &mut lease, emitter);
+                            discard_session(
+                                &mut session,
+                                &mut lease,
+                                &mut event_forwarder,
+                                emitter,
+                            )
+                            .await;
                             return Err(Error::OutputSchemaValidation(
                                 structured_output::exhausted_failure_reason(node.output_retries()),
                             ));
@@ -1547,17 +1618,35 @@ impl CodergenBackend for AgentApiBackend {
                             Err(err) => match classify_agent_error(err, false) {
                                 AgentApiErrorDisposition::Cancelled => {
                                     bridge.abort();
-                                    discard_session(&mut session, &mut lease, emitter);
+                                    discard_session(
+                                        &mut session,
+                                        &mut lease,
+                                        &mut event_forwarder,
+                                        emitter,
+                                    )
+                                    .await;
                                     return Err(Error::Cancelled);
                                 }
                                 AgentApiErrorDisposition::Terminal(err) => {
                                     bridge.abort();
-                                    discard_session(&mut session, &mut lease, emitter);
+                                    discard_session(
+                                        &mut session,
+                                        &mut lease,
+                                        &mut event_forwarder,
+                                        emitter,
+                                    )
+                                    .await;
                                     return Err(err);
                                 }
                                 AgentApiErrorDisposition::FailoverEligible(sdk_err) => {
                                     bridge.abort();
-                                    discard_session(&mut session, &mut lease, emitter);
+                                    discard_session(
+                                        &mut session,
+                                        &mut lease,
+                                        &mut event_forwarder,
+                                        emitter,
+                                    )
+                                    .await;
                                     return Err(Error::Llm(sdk_err));
                                 }
                             },
@@ -1579,10 +1668,6 @@ impl CodergenBackend for AgentApiBackend {
         )?
         .with_reported_cost(total_cost);
 
-        // Collect files_touched from the shared tracking state.
-        let (files_touched, last_file_touched) = file_tracking_snapshot(&file_tracking);
-        drop(event_forwarder);
-
         if let Some(lease) = lease.take() {
             lease.release();
         }
@@ -1591,19 +1676,25 @@ impl CodergenBackend for AgentApiBackend {
         // the cached session is not left wired to this run's cancel token.
         if let Some(key) = reuse_key {
             bridge.abort();
+            drop(event_forwarder);
             self.sessions
                 .lock()
                 .expect("sessions mutex is never poisoned: no code panics while holding this lock")
                 .insert(key, session);
         } else {
+            bridge.abort();
             let session_id = session.id().to_string();
-            if session.close() {
-                emitter.emit(&Event::AgentSessionEnded {
-                    session_id,
-                    parent_session_id: None,
-                });
-            }
+            session.shutdown(SessionShutdownReason::Completed).await;
+            event_forwarder.wait_for_session_end().await;
+            emitter.emit(&Event::AgentSessionEnded {
+                session_id,
+                parent_session_id: None,
+            });
+            drop(event_forwarder);
         }
+
+        // Snapshot after non-cached shutdown so final child events are included.
+        let (files_touched, last_file_touched) = file_tracking_snapshot(&file_tracking);
 
         Ok(CodergenResult::Text {
             text: response,
@@ -2566,11 +2657,11 @@ reasoning = false
             AgentProfileKind::Anthropic,
             Arc::new(Catalog::from_builtin().unwrap()),
         );
-        let manager = Arc::new(TokioMutex::new(SubAgentManager::new(1)));
+        let supervisor = SubAgentSupervisor::new(1);
         let factory: SessionFactory = Arc::new(|| {
             panic!("factory should not be called in this test");
         });
-        profile.register_subagent_tools(manager, factory, 0);
+        profile.register_subagent_tools(supervisor, factory, 0);
 
         let names = profile.tool_registry().names();
         assert!(names.contains(&"spawn_agent".to_string()));
@@ -3075,6 +3166,67 @@ enabled = true
             "agent.session.ended"
         ]);
         assert!(backend.sessions.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_end_barrier_preserves_child_close_ordering() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "openai".to_string(),
+            Arc::new(ShutdownTestProvider) as Arc<dyn ProviderAdapter>,
+        );
+        let client = Client::new(providers, Some("openai".to_string()), Vec::new());
+        let mut session = Session::new(
+            client,
+            Arc::new(ShutdownTestProfile::new()),
+            Arc::new(LocalSandbox::new(
+                tempfile::tempdir().unwrap().path().to_path_buf(),
+            )),
+            SessionOptions::default(),
+            None,
+        );
+        let emitter = Arc::new(Emitter::new(RunId::new()));
+        let event_names = Arc::new(Mutex::new(Vec::new()));
+        let event_names_for_listener = Arc::clone(&event_names);
+        emitter.on_event(move |event| {
+            event_names_for_listener
+                .lock()
+                .unwrap()
+                .push(event.event_name().to_string());
+        });
+        let context = Context::new();
+        let scope = StageScope::for_handler(&context, "code");
+        let file_tracking = Arc::new(Mutex::new(FileTracking {
+            pending: HashMap::new(),
+            touched: HashSet::new(),
+            last:    None,
+        }));
+        let mut forwarder = spawn_event_forwarder(
+            &session,
+            "code".to_string(),
+            scope,
+            Arc::clone(&emitter),
+            file_tracking,
+        );
+
+        session.sub_agent_event_callback()(
+            fabro_agent::subagent::SubAgentCallbackEvent::Lifecycle(AgentEvent::SubAgentClosed {
+                agent_id: "child-1".to_string(),
+                depth:    1,
+            }),
+        );
+        let session_id = session.id().to_string();
+        session.shutdown(SessionShutdownReason::Completed).await;
+        forwarder.wait_for_session_end().await;
+        emitter.emit(&Event::AgentSessionEnded {
+            session_id,
+            parent_session_id: None,
+        });
+
+        assert_eq!(event_names.lock().unwrap().as_slice(), [
+            "agent.sub.closed",
+            "agent.session.ended"
+        ]);
     }
 
     // --- Bridge guard tests ---

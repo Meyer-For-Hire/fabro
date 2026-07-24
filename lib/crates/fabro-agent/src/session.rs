@@ -21,7 +21,7 @@ use fabro_types::{
     StageContextWindowProjection, SteeringMessage,
 };
 use futures::StreamExt;
-use tokio::sync::{Mutex as AsyncMutex, Notify, broadcast};
+use tokio::sync::{Notify, broadcast};
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -44,7 +44,7 @@ use crate::sandbox::Sandbox;
 use crate::skills::{
     ExpandedInput, Skill, default_skill_dirs, discover_skills, expand_skill, make_use_skill_tool,
 };
-use crate::subagent::{SubAgentCallbackEvent, SubAgentEventCallback, SubAgentManager};
+use crate::subagent::{SubAgentCallbackEvent, SubAgentEventCallback, SubAgentSupervisor};
 use crate::tool_execution::execute_tool_calls;
 use crate::tool_registry::ToolDefinitionWithSource;
 use crate::types::{
@@ -74,6 +74,13 @@ pub enum SteeringItem {
 pub struct SessionInputTiming {
     pub inference: Duration,
     pub tool:      Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionShutdownReason {
+    Completed,
+    Cancelled,
+    Error,
 }
 
 /// Take the value out of `start`, add its elapsed time to `total`. Used by
@@ -106,8 +113,10 @@ impl From<SteeringMessage> for SteeringItem {
 
 #[derive(Default)]
 struct ControlState {
-    queue:             VecDeque<SteeringItem>,
+    queue: VecDeque<SteeringItem>,
     waiting_for_steer: bool,
+    interrupt_generation: u64,
+    settled_interrupt_generation: u64,
 }
 
 /// Trait that lets the workflow layer keep an agent in `process_input` when a
@@ -164,6 +173,7 @@ impl SessionControlHandle {
     pub fn interrupt(&self, _actor: Option<Principal>) {
         {
             let mut control = self.control.lock().expect("control state lock poisoned");
+            control.interrupt_generation = control.interrupt_generation.saturating_add(1);
             if control.queue.is_empty() {
                 control.waiting_for_steer = true;
             }
@@ -227,8 +237,20 @@ impl SessionControlHandle {
         item: SteeringItem,
         cap: usize,
     ) -> Option<SteeringItem> {
-        let evicted = self.push_bounded(item, cap);
+        let evicted = {
+            let mut control = self.control.lock().expect("control state lock poisoned");
+            let evicted = if control.queue.len() >= cap {
+                control.queue.pop_front()
+            } else {
+                None
+            };
+            control.interrupt_generation = control.interrupt_generation.saturating_add(1);
+            control.queue.push_back(item);
+            control.waiting_for_steer = false;
+            evicted
+        };
         self.cancel_round();
+        self.notify.notify_waiters();
         evicted
     }
 
@@ -251,7 +273,7 @@ impl SessionControlHandle {
     fn interrupt_then_enqueue(&self, item: SteeringItem) {
         {
             let mut control = self.control.lock().expect("control state lock poisoned");
-            control.waiting_for_steer = true;
+            control.interrupt_generation = control.interrupt_generation.saturating_add(1);
             control.queue.push_back(item);
             control.waiting_for_steer = false;
         }
@@ -334,6 +356,7 @@ pub struct Session {
     history: History,
     event_emitter: Emitter,
     state: SessionState,
+    ended: bool,
     llm_client: Client,
     provider_profile: Arc<dyn AgentProfile>,
     sandbox: Arc<dyn Sandbox>,
@@ -350,7 +373,7 @@ pub struct Session {
     activated_skill_context_observed: bool,
     file_tracker: FileTracker,
     tool_env_provider: Option<Arc<dyn ToolEnvProvider>>,
-    subagent_manager: Option<Arc<AsyncMutex<SubAgentManager>>>,
+    subagent_supervisor: Option<SubAgentSupervisor>,
     completion_coordinator: Option<Arc<dyn CompletionCoordinator>>,
     last_input_timing: SessionInputTiming,
     last_input_usage: TokenCounts,
@@ -364,7 +387,7 @@ impl Session {
         provider_profile: Arc<dyn AgentProfile>,
         sandbox: Arc<dyn Sandbox>,
         config: SessionOptions,
-        subagent_manager: Option<Arc<AsyncMutex<SubAgentManager>>>,
+        subagent_supervisor: Option<SubAgentSupervisor>,
     ) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
         Self {
@@ -374,6 +397,7 @@ impl Session {
             history: History::default(),
             event_emitter: Emitter::new(),
             state: SessionState::Idle,
+            ended: false,
             llm_client,
             provider_profile,
             sandbox,
@@ -390,7 +414,7 @@ impl Session {
             activated_skill_context_observed: false,
             file_tracker: FileTracker::default(),
             tool_env_provider: None,
-            subagent_manager,
+            subagent_supervisor,
             completion_coordinator: None,
             last_input_timing: SessionInputTiming::default(),
             last_input_usage: TokenCounts::default(),
@@ -414,7 +438,7 @@ impl Session {
         provider_profile: Arc<dyn AgentProfile>,
         sandbox: Arc<dyn Sandbox>,
         config: SessionOptions,
-        subagent_manager: Option<Arc<AsyncMutex<SubAgentManager>>>,
+        subagent_supervisor: Option<SubAgentSupervisor>,
     ) -> Result<Self, LlmError> {
         let client = Client::from_source(source, catalog).await?;
         Ok(Self::new(
@@ -422,7 +446,7 @@ impl Session {
             provider_profile,
             sandbox,
             config,
-            subagent_manager,
+            subagent_supervisor,
         ))
     }
 
@@ -433,14 +457,14 @@ impl Session {
         provider_profile: Arc<dyn AgentProfile>,
         sandbox: Arc<dyn Sandbox>,
         config: SessionOptions,
-        subagent_manager: Option<Arc<AsyncMutex<SubAgentManager>>>,
+        subagent_supervisor: Option<SubAgentSupervisor>,
     ) -> Result<Self, Error> {
         let mut session = Self::new(
             llm_client,
             provider_profile,
             sandbox,
             config,
-            subagent_manager,
+            subagent_supervisor,
         );
         session.id = record.id.to_string();
         // from_record represents a fresh root session by default; callers
@@ -1128,18 +1152,20 @@ impl Session {
         })
     }
 
-    /// Transition the session state machine, emitting events and running
-    /// cleanup as appropriate for each transition.
+    /// Transition the in-memory session state machine.
     ///
     /// Valid transitions (matches the Attractor spec):
     /// - Idle → Thinking
     /// - Thinking → Executing
     /// - Thinking → Idle  (emits ProcessingEnd)
     /// - Executing → Thinking
-    /// - Thinking → Closed (emits SessionEnded)
-    /// - Executing → Closed (emits SessionEnded)
-    /// - Idle → Closed (emits SessionEnded)
-    /// - any → Closed (interrupt/error — emits SessionEnded)
+    /// - Thinking → Closed
+    /// - Executing → Closed
+    /// - Idle → Closed
+    /// - any → Closed (interrupt/error)
+    ///
+    /// Async resource cleanup and `SessionEnded` emission belong to
+    /// [`Self::shutdown`], never to this synchronous transition helper.
     fn transition(&mut self, to: SessionState) {
         let from = self.state;
         if from == to {
@@ -1160,17 +1186,6 @@ impl Session {
             "Invalid session state transition: {from:?} -> {to:?}"
         );
 
-        if to == SessionState::Closed && from != SessionState::Closed {
-            // Clean up subagents before emitting SessionEnded
-            if let Some(ref manager) = self.subagent_manager {
-                if let Ok(mut mgr) = manager.try_lock() {
-                    mgr.close_all();
-                }
-            }
-            self.event_emitter
-                .emit(self.id.clone(), AgentEvent::SessionEnded);
-        }
-
         if matches!(from, SessionState::Thinking | SessionState::Executing)
             && to == SessionState::Idle
         {
@@ -1181,10 +1196,24 @@ impl Session {
         self.state = to;
     }
 
-    pub fn close(&mut self) -> bool {
-        let was_open = self.state != SessionState::Closed;
+    /// Close the session and resolve all owned child tasks before emitting
+    /// `SessionEnded`. Returns `true` only for the call that performs shutdown.
+    pub async fn shutdown(&mut self, reason: SessionShutdownReason) -> bool {
+        if self.ended {
+            return false;
+        }
+        if reason == SessionShutdownReason::Cancelled {
+            self.set_interrupt_reason(InterruptReason::Cancelled);
+            self.cancel_token.cancel();
+        }
         self.transition(SessionState::Closed);
-        was_open
+        if let Some(supervisor) = &self.subagent_supervisor {
+            supervisor.shutdown_all().await;
+        }
+        self.ended = true;
+        self.event_emitter
+            .emit(self.id.clone(), AgentEvent::SessionEnded);
+        true
     }
 
     pub fn set_reasoning_effort(&mut self, effort: Option<ReasoningEffort>) {
@@ -1304,8 +1333,14 @@ impl Session {
             handle.abort();
         }
 
-        // Only transition to Idle if the session wasn't closed by an error
-        if self.state != SessionState::Closed {
+        if self.state == SessionState::Closed {
+            let reason = if self.cancel_token.is_cancelled() {
+                SessionShutdownReason::Cancelled
+            } else {
+                SessionShutdownReason::Error
+            };
+            self.shutdown(reason).await;
+        } else {
             self.transition(SessionState::Idle);
         }
 
@@ -1367,7 +1402,7 @@ impl Session {
             // swap in a fresh one before draining and rebuilding state.
             // (Terminal cancel via `cancel_token` is handled by the explicit
             // check below and by `interrupted_error()`.)
-            {
+            let round_was_interrupted = {
                 let needs_refresh = self
                     .round_token
                     .read()
@@ -1377,13 +1412,35 @@ impl Session {
                     *self.round_token.write().expect("round token lock poisoned") =
                         CancellationToken::new();
                 }
-            }
+                needs_refresh
+            };
 
             // Terminal cancellation wins even when a control interrupt has
             // parked the session waiting for steering.
             if self.cancel_token.is_cancelled() {
-                self.close();
+                self.shutdown(SessionShutdownReason::Cancelled).await;
                 return Err(self.interrupted_error());
+            }
+
+            if round_was_interrupted {
+                let generations = {
+                    let mut control = self
+                        .control_state
+                        .lock()
+                        .expect("control state lock poisoned");
+                    let first = control.settled_interrupt_generation.saturating_add(1);
+                    let last = control.interrupt_generation;
+                    control.settled_interrupt_generation = last;
+                    if first <= last {
+                        (first..=last).collect::<Vec<_>>()
+                    } else {
+                        Vec::new()
+                    }
+                };
+                for generation in generations {
+                    self.event_emitter
+                        .emit(self.id.clone(), AgentEvent::RoundInterrupted { generation });
+                }
             }
 
             // Drain pending steering messages at the top of every iteration
@@ -1473,7 +1530,7 @@ impl Session {
             } else {
                 record_elapsed(&mut inference_start, &mut timing.inference);
                 if self.cancel_token.is_cancelled() {
-                    self.close();
+                    self.shutdown(SessionShutdownReason::Cancelled).await;
                     return Err(self.interrupted_error());
                 }
                 // Round-only cancel before stream opened — re-iterate to
@@ -1548,7 +1605,7 @@ impl Session {
                 if self.cancel_token.is_cancelled() {
                     drop(event_stream);
                     record_elapsed(&mut inference_start, &mut timing.inference);
-                    self.close();
+                    self.shutdown(SessionShutdownReason::Cancelled).await;
                     return Err(self.interrupted_error());
                 }
 
@@ -1766,6 +1823,9 @@ impl Session {
             // completion coordinator: it can return `true` to force one more
             // iteration when a steer arrived during the final response.
             if tool_calls.is_empty() {
+                if round_token.is_cancelled() {
+                    continue;
+                }
                 let should_continue = self
                     .completion_coordinator
                     .as_ref()
@@ -1834,7 +1894,7 @@ impl Session {
 
             // Terminal cancel takes precedence: close and return.
             if self.cancel_token.is_cancelled() {
-                self.close();
+                self.shutdown(SessionShutdownReason::Cancelled).await;
                 return Err(self.interrupted_error());
             }
 
@@ -1949,7 +2009,7 @@ impl Session {
             tokio::select! {
                 biased;
                 () = self.cancel_token.cancelled() => {
-                    self.close();
+                    self.shutdown(SessionShutdownReason::Cancelled).await;
                     return Err(self.interrupted_error());
                 }
                 () = notified => {}
@@ -2228,13 +2288,51 @@ mod tests {
         }
     }
 
+    struct BlockingFirstStreamProvider {
+        first_started: Arc<Notify>,
+        response:      Response,
+        call_index:    AtomicUsize,
+    }
+
+    impl BlockingFirstStreamProvider {
+        fn new(response: Response) -> Self {
+            Self {
+                first_started: Arc::new(Notify::new()),
+                response,
+                call_index: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ProviderAdapter for BlockingFirstStreamProvider {
+        fn name(&self) -> &'static str {
+            "mock"
+        }
+
+        async fn complete(&self, _request: &Request) -> Result<Response, LlmError> {
+            Err(LlmError::Configuration {
+                message: "BlockingFirstStreamProvider does not implement complete()".into(),
+                source:  None,
+            })
+        }
+
+        async fn stream(&self, _request: &Request) -> Result<StreamEventStream, LlmError> {
+            if self.call_index.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.first_started.notify_one();
+                return std::future::pending().await;
+            }
+            Ok(response_to_stream(self.response.clone()))
+        }
+    }
+
     async fn make_session_with_provider(provider: Arc<dyn ProviderAdapter>) -> Session {
         make_session_with_provider_and_manager(provider, None).await
     }
 
     async fn make_session_with_provider_and_manager(
         provider: Arc<dyn ProviderAdapter>,
-        subagent_manager: Option<Arc<AsyncMutex<SubAgentManager>>>,
+        subagent_supervisor: Option<SubAgentSupervisor>,
     ) -> Session {
         let client = make_client(provider).await;
         let profile = Arc::new(TestProfile::new());
@@ -2244,7 +2342,7 @@ mod tests {
             profile,
             env,
             SessionOptions::default(),
-            subagent_manager,
+            subagent_supervisor,
         )
     }
 
@@ -2544,6 +2642,7 @@ mod tests {
     #[tokio::test]
     async fn pure_interrupt_waits_until_later_steer() {
         let mut session = make_session(vec![text_response("OK")]).await;
+        let mut events = session.subscribe();
         let handle = session.control_handle();
         handle.interrupt(None);
 
@@ -2561,6 +2660,13 @@ mod tests {
         let turns = session.history().turns();
         assert!(matches!(&turns[1], Message::Steering { content, .. } if content == "resume now"));
         assert!(!handle.is_waiting_for_steer());
+        let generations = std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|event| match event.event {
+                AgentEvent::RoundInterrupted { generation } => Some(generation),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(generations, vec![1]);
     }
 
     #[tokio::test]
@@ -2572,14 +2678,152 @@ mod tests {
         handle.interrupt_then_steer("stop now".to_string(), None);
         session.process_input("start").await.unwrap();
 
-        let mut found_text = None;
-        while let Ok(ev) = rx.try_recv() {
-            if let AgentEvent::SteeringInjected { text, .. } = ev.event {
-                found_text = Some(text);
-                break;
-            }
-        }
-        assert_eq!(found_text.as_deref(), Some("stop now"));
+        let events = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|event| event.event)
+            .collect::<Vec<_>>();
+        let settled = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::RoundInterrupted { generation: 1 }))
+            .unwrap();
+        let steered = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    AgentEvent::SteeringInjected { text, .. } if text == "stop now"
+                )
+            })
+            .unwrap();
+        assert!(settled < steered);
+        assert!(!handle.is_waiting_for_steer());
+    }
+
+    #[tokio::test]
+    async fn interrupt_during_inference_settles_once_before_steering_resumes() {
+        let provider = Arc::new(BlockingFirstStreamProvider::new(text_response("resumed")));
+        let first_started = Arc::clone(&provider.first_started);
+        let mut session = make_session_with_provider(provider.clone()).await;
+        let control = session.control_handle();
+        let mut controller_events = session.subscribe();
+        let mut recorded_events = session.subscribe();
+        let control_for_controller = control.clone();
+        let controller = tokio::spawn(async move {
+            first_started.notified().await;
+            control_for_controller.interrupt(None);
+            wait_for_agent_event(&mut controller_events, |event| {
+                matches!(event, AgentEvent::RoundInterrupted { generation: 1 })
+            })
+            .await;
+            assert!(control_for_controller.is_waiting_for_steer());
+            control_for_controller.steer("resume inference".into(), None);
+        });
+
+        timeout(Duration::from_secs(1), session.process_input("start"))
+            .await
+            .expect("inference interrupt should settle and resume")
+            .unwrap();
+        controller.await.unwrap();
+
+        let events = std::iter::from_fn(|| recorded_events.try_recv().ok())
+            .map(|event| event.event)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::RoundInterrupted { .. }))
+                .count(),
+            1
+        );
+        let settled = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::RoundInterrupted { .. }))
+            .unwrap();
+        let steered = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::SteeringInjected { .. }))
+            .unwrap();
+        assert!(settled < steered);
+        assert_eq!(provider.call_index.load(Ordering::SeqCst), 2);
+        assert!(!control.is_waiting_for_steer());
+    }
+
+    #[tokio::test]
+    async fn interrupt_during_tool_settles_once_after_balancing_tool_result() {
+        let blocking_tool = RegisteredTool {
+            definition: ToolDefinition {
+                name:        "block".into(),
+                description: "Blocks until interrupted".into(),
+                parameters:  serde_json::json!({"type": "object"}),
+            },
+            executor:   Arc::new(|_args, ctx| {
+                Box::pin(async move {
+                    ctx.cancel.cancelled().await;
+                    Err("Cancelled".to_string())
+                })
+            }),
+            source:     ToolSource::Native,
+        };
+        let mut registry = ToolRegistry::new();
+        registry.register(blocking_tool);
+        let responses = vec![
+            tool_call_response("block", "call_block", serde_json::json!({})),
+            text_response("resumed"),
+        ];
+        let mut session = make_session_with_tools(responses, registry).await;
+        let control = session.control_handle();
+        let mut controller_events = session.subscribe();
+        let mut recorded_events = session.subscribe();
+        let control_for_controller = control.clone();
+        let controller = tokio::spawn(async move {
+            wait_for_agent_event(&mut controller_events, |event| {
+                matches!(
+                    event,
+                    AgentEvent::ToolCallStarted { tool_name, .. } if tool_name == "block"
+                )
+            })
+            .await;
+            control_for_controller.interrupt(None);
+            wait_for_agent_event(&mut controller_events, |event| {
+                matches!(event, AgentEvent::RoundInterrupted { generation: 1 })
+            })
+            .await;
+            assert!(control_for_controller.is_waiting_for_steer());
+            control_for_controller.steer("resume after tool".into(), None);
+        });
+
+        timeout(
+            Duration::from_secs(1),
+            session.process_input("use the tool"),
+        )
+        .await
+        .expect("tool interrupt should settle and resume")
+        .unwrap();
+        controller.await.unwrap();
+
+        let events = std::iter::from_fn(|| recorded_events.try_recv().ok())
+            .map(|event| event.event)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::RoundInterrupted { .. }))
+                .count(),
+            1
+        );
+        let tool_completed = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::ToolCallCompleted { .. }))
+            .unwrap();
+        let settled = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::RoundInterrupted { .. }))
+            .unwrap();
+        assert!(tool_completed < settled);
+        assert!(matches!(
+            session.history().turns().get(2),
+            Some(Message::ToolResults { .. })
+        ));
+        assert!(!control.is_waiting_for_steer());
     }
 
     #[tokio::test]
@@ -2669,7 +2913,7 @@ mod tests {
 
         session.initialize().await.unwrap();
         session.process_input("Hi").await.unwrap();
-        session.close();
+        session.shutdown(SessionShutdownReason::Completed).await;
 
         // Collect events
         let mut events = Vec::new();
@@ -2984,7 +3228,7 @@ mod tests {
     #[tokio::test]
     async fn closed_session_rejects_input() {
         let mut session = make_session(vec![]).await;
-        session.close();
+        session.shutdown(SessionShutdownReason::Completed).await;
         assert_eq!(session.state(), SessionState::Closed);
 
         let result = session.process_input("Hello").await;
@@ -2997,8 +3241,8 @@ mod tests {
         let mut session = make_session(vec![]).await;
         let mut rx = session.subscribe();
 
-        assert!(session.close());
-        assert!(!session.close());
+        assert!(session.shutdown(SessionShutdownReason::Completed).await);
+        assert!(!session.shutdown(SessionShutdownReason::Completed).await);
 
         let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert_eq!(
@@ -3013,7 +3257,7 @@ mod tests {
     #[tokio::test]
     async fn closed_session_does_not_emit_session_start() {
         let mut session = make_session(vec![]).await;
-        session.close();
+        session.shutdown(SessionShutdownReason::Completed).await;
 
         let mut rx = session.subscribe();
         let result = session.process_input("Hello").await;
@@ -3253,7 +3497,7 @@ mod tests {
         session.initialize().await.unwrap();
         session.process_input("one").await.unwrap();
         session.process_input("two").await.unwrap();
-        session.close();
+        session.shutdown(SessionShutdownReason::Completed).await;
 
         let mut session_start_count = 0;
         let mut session_end_count = 0;
@@ -4703,12 +4947,8 @@ mod tests {
         );
     }
 
-    async fn make_parent_waiting_on_blocked_subagent() -> (
-        Session,
-        Arc<AsyncMutex<SubAgentManager>>,
-        String,
-        CancellationToken,
-    ) {
+    async fn make_parent_waiting_on_blocked_subagent()
+    -> (Session, SubAgentSupervisor, String, CancellationToken) {
         let block_until_cancelled = RegisteredTool {
             definition: ToolDefinition {
                 name:        "block_until_cancelled".into(),
@@ -4736,15 +4976,13 @@ mod tests {
         .await;
         let child_cancel = child.cancel_token();
 
-        let manager = Arc::new(AsyncMutex::new(SubAgentManager::new(3)));
-        let agent_id = manager
-            .lock()
-            .await
+        let supervisor = SubAgentSupervisor::new(3);
+        let agent_id = supervisor
             .spawn(child, "block until cancelled".into(), 0)
             .unwrap();
 
         let mut parent_registry = ToolRegistry::new();
-        parent_registry.register(make_wait_tool(manager.clone()));
+        parent_registry.register(make_wait_tool(supervisor.clone()));
         let parent_provider = Arc::new(ScriptedStreamProvider::new(vec![
             ScriptedStreamCall::Response(Box::new(tool_call_response(
                 "wait",
@@ -4761,14 +4999,11 @@ mod tests {
             profile,
             env,
             SessionOptions::default(),
-            Some(manager.clone()),
+            Some(supervisor.clone()),
         );
-        manager
-            .lock()
-            .await
-            .set_event_callback(session.sub_agent_event_callback());
+        supervisor.set_event_callback(session.sub_agent_event_callback());
 
-        (session, manager, agent_id, child_cancel)
+        (session, supervisor, agent_id, child_cancel)
     }
 
     async fn wait_for_agent_event(
@@ -4792,6 +5027,8 @@ mod tests {
             make_parent_waiting_on_blocked_subagent().await;
         let control = session.control_handle();
         let mut events = session.subscribe();
+        let mut recorded_events = session.subscribe();
+        let control_for_controller = control.clone();
         let controller = tokio::spawn(async move {
             wait_for_agent_event(&mut events, |event| {
                 matches!(
@@ -4800,12 +5037,17 @@ mod tests {
                 )
             })
             .await;
-            control.interrupt(None);
+            control_for_controller.interrupt(None);
             wait_for_agent_event(&mut events, |event| {
                 matches!(event, AgentEvent::SubAgentClosed { .. })
             })
             .await;
-            control.steer("resume after interrupt".into(), None);
+            wait_for_agent_event(&mut events, |event| {
+                matches!(event, AgentEvent::RoundInterrupted { generation: 1 })
+            })
+            .await;
+            assert!(control_for_controller.is_waiting_for_steer());
+            control_for_controller.steer("resume after interrupt".into(), None);
         });
 
         timeout(
@@ -4820,9 +5062,29 @@ mod tests {
         assert_eq!(session.state(), SessionState::Idle);
         assert!(child_cancel.is_cancelled());
         assert!(matches!(
-            manager.lock().await.status(&agent_id),
+            manager.status(&agent_id),
             Some(SubAgentStatus::Closed)
         ));
+        let events = std::iter::from_fn(|| recorded_events.try_recv().ok())
+            .map(|event| event.event)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::RoundInterrupted { .. }))
+                .count(),
+            1
+        );
+        let child_closed = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::SubAgentClosed { .. }))
+            .unwrap();
+        let settled = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::RoundInterrupted { .. }))
+            .unwrap();
+        assert!(child_closed < settled);
+        assert!(!control.is_waiting_for_steer());
     }
 
     #[tokio::test]
@@ -4857,40 +5119,37 @@ mod tests {
         assert_eq!(session.state(), SessionState::Closed);
         assert!(child_cancel.is_cancelled());
         assert!(matches!(
-            manager.lock().await.status(&agent_id),
+            manager.status(&agent_id),
             Some(SubAgentStatus::Closed)
         ));
     }
 
     #[tokio::test]
-    async fn close_cleans_up_subagents_before_emitting_session_ended() {
-        use crate::subagent::SubAgentManager;
-
-        let manager = Arc::new(AsyncMutex::new(SubAgentManager::new(3)));
+    async fn shutdown_cleans_up_subagents_before_emitting_session_ended() {
+        let supervisor = SubAgentSupervisor::new(3);
 
         let provider = Arc::new(ScriptedStreamProvider::new(vec![
             ScriptedStreamCall::Response(Box::new(text_response("done"))),
         ]));
         let mut session =
-            make_session_with_provider_and_manager(provider, Some(manager.clone())).await;
+            make_session_with_provider_and_manager(provider, Some(supervisor.clone())).await;
 
-        // Wire the manager's event callback to the session's emitter
-        manager
-            .lock()
-            .await
-            .set_event_callback(session.sub_agent_event_callback());
+        supervisor.set_event_callback(session.sub_agent_event_callback());
 
-        // Spawn a subagent
-        let child = make_session(vec![text_response("child done")]).await;
-        let agent_id = manager.lock().await.spawn(child, "task".into(), 0).unwrap();
+        let child_provider = Arc::new(DelayedStreamProvider::new(
+            vec![text_response("child done")],
+            Duration::from_mins(1),
+        ));
+        let child = make_session_with_provider(child_provider).await;
+        let agent_id = supervisor.spawn(child, "task".into(), 0).unwrap();
 
         // Collect events
         let mut rx = session.subscribe();
-        session.close();
+        session.shutdown(SessionShutdownReason::Completed).await;
 
         // The subagent should have been closed
         assert!(matches!(
-            manager.lock().await.status(&agent_id),
+            supervisor.status(&agent_id),
             Some(SubAgentStatus::Closed)
         ));
 

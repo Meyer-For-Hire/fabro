@@ -1,14 +1,11 @@
-use std::sync::Arc;
-
 use fabro_llm::types::ToolDefinition;
 use fabro_model::{AgentProfileKind, Catalog, Model, ProviderId};
-use tokio::sync::Mutex;
 
 use crate::profiles::EnvContext;
 use crate::sandbox::Sandbox;
 use crate::skills::Skill;
 use crate::subagent::{
-    SessionFactory, SubAgentManager, make_close_agent_tool, make_send_input_tool,
+    SessionFactory, SubAgentSupervisor, make_close_agent_tool, make_send_input_tool,
     make_spawn_agent_tool, make_wait_tool,
 };
 use crate::tool_registry::ToolRegistry;
@@ -57,21 +54,21 @@ pub trait AgentProfile: Send + Sync {
 
     fn register_subagent_tools(
         &mut self,
-        manager: Arc<Mutex<SubAgentManager>>,
+        supervisor: SubAgentSupervisor,
         session_factory: SessionFactory,
         current_depth: usize,
     ) {
         self.tool_registry_mut().register(make_spawn_agent_tool(
-            manager.clone(),
+            supervisor.clone(),
             session_factory,
             current_depth,
         ));
         self.tool_registry_mut()
-            .register(make_send_input_tool(manager.clone()));
+            .register(make_send_input_tool(supervisor.clone()));
         self.tool_registry_mut()
-            .register(make_wait_tool(manager.clone()));
+            .register(make_wait_tool(supervisor.clone()));
         self.tool_registry_mut()
-            .register(make_close_agent_tool(manager));
+            .register(make_close_agent_tool(supervisor));
     }
 }
 

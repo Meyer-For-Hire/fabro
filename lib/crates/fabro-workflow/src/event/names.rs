@@ -83,6 +83,7 @@ pub fn event_name(event: &Event) -> &'static str {
             AgentEvent::LoopDetected => "agent.loop.detected",
             AgentEvent::TurnLimitReached { .. } => "agent.turn.limit",
             AgentEvent::SteeringInjected { .. } => "agent.steering.injected",
+            AgentEvent::RoundInterrupted { .. } => "agent.round.interrupted",
             AgentEvent::CompactionStarted { .. } => "agent.compaction.started",
             AgentEvent::CompactionCompleted { .. } => "agent.compaction.completed",
             AgentEvent::LlmRetry { .. } => "agent.llm.retry",
@@ -191,6 +192,17 @@ mod tests {
                 tool_call_id:      None,
             }),
             "agent.sub.spawned"
+        );
+        assert_eq!(
+            event_name(&Event::Agent {
+                stage:             "code".to_string(),
+                visit:             1,
+                event:             AgentEvent::RoundInterrupted { generation: 1 },
+                session_id:        Some("session-1".to_string()),
+                parent_session_id: None,
+                tool_call_id:      None,
+            }),
+            "agent.round.interrupted"
         );
         assert_eq!(
             event_name(&Event::AgentToolsAvailable {

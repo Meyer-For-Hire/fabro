@@ -38,6 +38,7 @@ import {
   canRetry,
   deleteErrorMessage,
   deleteRun,
+  isCancellationPending,
   type LifecycleAction,
 } from "../lib/run-actions";
 import {
@@ -105,6 +106,9 @@ export default function RunDetail({ params }: { params: { id: string } }) {
   const filesCount = runQuery.data?.diff?.files_changed ?? null;
   const childrenCount = runQuery.data?.children_count ?? null;
   const hasSandbox = runHasSandbox(runStateQuery.data);
+  const waitingForSteer = Object.values(runStateQuery.data?.stages ?? {}).some(
+    (stage) => stage.agent_control === "waiting_for_steer",
+  );
   const tabs = buildRunDetailTabs({
     hasSandbox,
     filesCount,
@@ -157,7 +161,7 @@ export default function RunDetail({ params }: { params: { id: string } }) {
 
   const visibility = lifecycleActionVisibility(run.lifecycleStatus);
   const previewPending = previewMutation.isMutating;
-  const cancelPending = cancelMutation.isMutating;
+  const cancelPending = isCancellationPending(summary, cancelMutation.isMutating);
   const approvalActionVisible = canApprove(summary);
   const approvePending = approveMutation.isMutating;
   const denyPending = denyMutation.isMutating;
@@ -228,9 +232,9 @@ export default function RunDetail({ params }: { params: { id: string } }) {
         key:          "interrupt",
         label:        "Send interrupt",
         pendingLabel: "Interrupting…",
-          pending:      interruptMutation.isMutating,
-          disabled:     statusKind !== "running",
-          onSelect:     () => void interruptMutation.trigger(),
+        pending:      interruptMutation.isMutating,
+        disabled:     statusKind !== "running" || waitingForSteer,
+        onSelect:     () => void interruptMutation.trigger(),
       },
       {
         key:      "steer",
@@ -366,6 +370,7 @@ export default function RunDetail({ params }: { params: { id: string } }) {
             sidebarWidth={sidebarWidth}
             isResizing={isResizing}
             steerBarRef={steerBarRef}
+            waitingForSteer={waitingForSteer}
           />
         </div>
       )}
