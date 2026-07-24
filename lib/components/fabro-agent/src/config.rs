@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use fabro_llm::types::{ReasoningEffort, Speed};
 use fabro_mcp::config::McpServerSettings;
+use fabro_model::AgentProfileKind;
 use fabro_types::PermissionLevel;
 
 /// Callback invoked before each tool execution. Return `Ok(())` to allow,
@@ -99,15 +100,52 @@ impl ToolHookCallback for ToolApprovalAdapter {
     async fn post_tool_use_failure(&self, _tool_name: &str, _tool_call_id: &str, _error: &str) {}
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct ToolSecrets {
     pub brave_search_api_key: Option<String>,
 }
 
+impl std::fmt::Debug for ToolSecrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolSecrets")
+            .field(
+                "brave_search_configured",
+                &self.brave_search_api_key.is_some(),
+            )
+            .finish()
+    }
+}
+
+/// Options captured by native tool executors when a profile is constructed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeToolOptions {
+    pub default_command_timeout_ms: u64,
+    pub max_command_timeout_ms:     u64,
+    pub secrets:                    ToolSecrets,
+}
+
+impl NativeToolOptions {
+    pub(crate) fn for_profile(profile_kind: AgentProfileKind) -> Self {
+        let mut options = Self::default();
+        if profile_kind == AgentProfileKind::Anthropic {
+            options.default_command_timeout_ms = 120_000;
+        }
+        options
+    }
+}
+
+impl Default for NativeToolOptions {
+    fn default() -> Self {
+        Self {
+            default_command_timeout_ms: 10_000,
+            max_command_timeout_ms:     600_000,
+            secrets:                    ToolSecrets::default(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct SessionOptions {
-    pub default_command_timeout_ms: u64,
-    pub max_command_timeout_ms: u64,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub speed: Option<Speed>,
     pub tool_output_limits: HashMap<String, usize>,
@@ -137,8 +175,6 @@ pub struct SessionOptions {
     pub skill_dirs: Option<Vec<String>>,
     /// MCP server configurations to connect to on session startup.
     pub mcp_servers: Vec<McpServerSettings>,
-    /// Secret values supplied by the runtime boundary for native tools.
-    pub tool_secrets: ToolSecrets,
     /// Wall-clock timeout for the entire `process_input` call.
     /// When set, the session's cancel token is triggered after this duration.
     pub wall_clock_timeout: Option<Duration>,
@@ -147,11 +183,6 @@ pub struct SessionOptions {
 impl std::fmt::Debug for SessionOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SessionOptions")
-            .field(
-                "default_command_timeout_ms",
-                &self.default_command_timeout_ms,
-            )
-            .field("max_command_timeout_ms", &self.max_command_timeout_ms)
             .field("max_tokens", &self.max_tokens)
             .field("reasoning_effort", &self.reasoning_effort)
             .field("speed", &self.speed)
@@ -180,10 +211,6 @@ impl std::fmt::Debug for SessionOptions {
             .field("compaction_preserve_turns", &self.compaction_preserve_turns)
             .field("skill_dirs", &self.skill_dirs)
             .field("mcp_servers", &self.mcp_servers.len())
-            .field(
-                "brave_search_configured",
-                &self.tool_secrets.brave_search_api_key.is_some(),
-            )
             .field("wall_clock_timeout", &self.wall_clock_timeout)
             .finish()
     }
@@ -192,8 +219,6 @@ impl std::fmt::Debug for SessionOptions {
 impl Default for SessionOptions {
     fn default() -> Self {
         Self {
-            default_command_timeout_ms: 10_000,
-            max_command_timeout_ms: 600_000,
             max_tokens: None,
             reasoning_effort: None,
             speed: None,
@@ -213,7 +238,6 @@ impl Default for SessionOptions {
             compaction_preserve_turns: 6,
             skill_dirs: None,
             mcp_servers: Vec::new(),
-            tool_secrets: ToolSecrets::default(),
             wall_clock_timeout: None,
         }
     }
@@ -274,8 +298,6 @@ mod tests {
     #[test]
     fn default_config_values() {
         let config = SessionOptions::default();
-        assert_eq!(config.default_command_timeout_ms, 10_000);
-        assert_eq!(config.max_command_timeout_ms, 600_000);
         assert!(config.reasoning_effort.is_none());
         assert!(config.tool_output_limits.is_empty());
         assert!(config.tool_line_limits.is_empty());
@@ -290,20 +312,27 @@ mod tests {
             ToolExposureMode::AutoApprovedOnly
         );
         assert!(config.mcp_servers.is_empty());
-        assert_eq!(config.tool_secrets, ToolSecrets::default());
         assert!(config.wall_clock_timeout.is_none());
     }
 
     #[test]
-    fn session_options_debug_redacts_tool_secret_values() {
-        let config = SessionOptions {
-            tool_secrets: ToolSecrets {
-                brave_search_api_key: Some("brave-secret-value".to_string()),
-            },
-            ..SessionOptions::default()
+    fn native_tool_options_have_expected_profile_defaults() {
+        let openai = NativeToolOptions::for_profile(AgentProfileKind::OpenAi);
+        let anthropic = NativeToolOptions::for_profile(AgentProfileKind::Anthropic);
+
+        assert_eq!(openai.default_command_timeout_ms, 10_000);
+        assert_eq!(openai.max_command_timeout_ms, 600_000);
+        assert_eq!(anthropic.default_command_timeout_ms, 120_000);
+        assert_eq!(anthropic.max_command_timeout_ms, 600_000);
+    }
+
+    #[test]
+    fn tool_secrets_debug_redacts_values() {
+        let secrets = ToolSecrets {
+            brave_search_api_key: Some("brave-secret-value".to_string()),
         };
 
-        let debug = format!("{config:?}");
+        let debug = format!("{secrets:?}");
 
         assert!(debug.contains("brave_search_configured: true"));
         assert!(!debug.contains("brave-secret-value"));

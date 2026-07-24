@@ -5,7 +5,7 @@ use fabro_model::{AgentProfileKind, Catalog, CodecKind, ProviderId};
 use super::EnvContext;
 use crate::agent_profile::AgentProfile;
 use crate::apply_patch;
-use crate::config::SessionOptions;
+use crate::config::NativeToolOptions;
 use crate::profiles::{BaseProfile, assemble_system_prompt};
 use crate::sandbox::Sandbox;
 use crate::skills::Skill;
@@ -46,10 +46,18 @@ impl OpenAiProfile {
         model: impl Into<String>,
         summarizer: Option<WebFetchSummarizer>,
     ) -> Self {
-        let config = SessionOptions::default();
+        let options = NativeToolOptions::for_profile(AgentProfileKind::OpenAi);
+        Self::with_native_tools(model, &options, summarizer)
+    }
+
+    pub(crate) fn with_native_tools(
+        model: impl Into<String>,
+        options: &NativeToolOptions,
+        summarizer: Option<WebFetchSummarizer>,
+    ) -> Self {
         let mut registry = ToolRegistry::new();
 
-        register_core_tools(&mut registry, &config, summarizer);
+        register_core_tools(&mut registry, options, summarizer);
         registry.register(apply_patch::make_apply_patch_tool());
         // Codex-compatible `update_plan` is OpenAI-only.
         let todo_runtime = Arc::new(TodoRuntime::new());
@@ -188,6 +196,14 @@ The `old_string` must match exactly and be unique unless `replace_all` is true; 
 surrounding context to make the match unique and preserve the existing indentation.",
                 ),
             };
+        let web_search_guidance = if self.base.registry.get("web_search").is_some() {
+            "## web_search
+Search the web using Brave Search. Returns titles, URLs, and descriptions.
+
+"
+        } else {
+            ""
+        };
         let core_prompt = format!("\
 You are a coding agent powered by {provider_name}, running in a terminal-based agentic coding assistant. \
 You are expected to be precise, safe, and helpful.
@@ -263,10 +279,7 @@ Search file contents with regex. Use glob_filter to narrow results.
 ## glob
 Find files by name pattern.
 
-## web_search
-Search the web using Brave Search. Returns titles, URLs, and descriptions.
-
-## web_fetch
+{web_search_guidance}## web_fetch
 Fetch content from a URL and optionally summarize it. Pass a prompt to extract specific \
 information instead of returning the full page. URLs must start with http:// or https://.
 
@@ -330,6 +343,7 @@ mod tests {
         assert!(prompt.contains("grep"));
         assert!(prompt.contains("glob"));
         assert!(prompt.contains("timeout_ms"));
+        assert!(!prompt.contains("## web_search"));
     }
 
     #[test]
@@ -380,26 +394,26 @@ mod tests {
     #[test]
     fn openai_subagent_tools_registered() {
         let mut profile = OpenAiProfile::new("o3-mini");
-        assert_eq!(profile.tool_registry().names().len(), 9);
+        assert_eq!(profile.tool_registry().names().len(), 8);
 
         let supervisor = SubAgentSupervisor::new(3);
         let factory: SessionFactory = Arc::new(|| panic!("should not be called in test"));
         profile.register_subagent_tools(supervisor, factory, 0);
-        assert_eq!(profile.tool_registry().names().len(), 13);
+        assert_eq!(profile.tool_registry().names().len(), 12);
     }
 
     #[test]
     fn openai_tools_registered() {
         let profile = OpenAiProfile::new("o3-mini");
         let names = profile.tool_registry().names();
-        assert_eq!(names.len(), 9);
+        assert_eq!(names.len(), 8);
         assert!(names.contains(&"read_file".to_string()));
         assert!(names.contains(&"write_file".to_string()));
         assert!(names.contains(&"shell".to_string()));
         assert!(names.contains(&"grep".to_string()));
         assert!(names.contains(&"glob".to_string()));
         assert!(names.contains(&"apply_patch".to_string()));
-        assert!(names.contains(&"web_search".to_string()));
+        assert!(!names.contains(&"web_search".to_string()));
         assert!(names.contains(&"web_fetch".to_string()));
         assert!(names.contains(&"update_plan".to_string()));
 

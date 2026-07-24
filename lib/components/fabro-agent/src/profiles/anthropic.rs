@@ -4,7 +4,7 @@ use fabro_model::{AgentProfileKind, Catalog, ProviderId};
 
 use super::EnvContext;
 use crate::agent_profile::AgentProfile;
-use crate::config::SessionOptions;
+use crate::config::NativeToolOptions;
 use crate::profiles::{BaseProfile, assemble_system_prompt};
 use crate::sandbox::Sandbox;
 use crate::skills::Skill;
@@ -19,18 +19,18 @@ pub struct AnthropicProfile {
     base: BaseProfile,
 }
 
-fn anthropic_core_prompt(has_spawn_agent: bool) -> String {
+fn anthropic_core_prompt(has_spawn_agent: bool, has_web_search: bool) -> String {
     let mut sections = vec![
-        intro_section(),
-        system_section(),
-        "{env_block}",
-        doing_tasks_section(),
-        executing_actions_section(),
-        using_tools_section(),
-        session_specific_guidance_section(has_spawn_agent),
-        communicating_with_user_section(),
-        tone_and_style_section(),
-        coding_best_practices_section(),
+        intro_section().to_string(),
+        system_section().to_string(),
+        "{env_block}".to_string(),
+        doing_tasks_section().to_string(),
+        executing_actions_section().to_string(),
+        using_tools_section(has_web_search),
+        session_specific_guidance_section(has_spawn_agent).to_string(),
+        communicating_with_user_section().to_string(),
+        tone_and_style_section().to_string(),
+        coding_best_practices_section().to_string(),
     ];
     sections.retain(|section| !section.is_empty());
     sections.join("\n\n")
@@ -102,8 +102,14 @@ unexpected files, branches, locks, and configuration before deleting or overwrit
 deleting, replacing, or overwriting anything, read or inspect it first."
 }
 
-fn using_tools_section() -> &'static str {
-    "\
+fn using_tools_section(has_web_search: bool) -> String {
+    let web_guidance = if has_web_search {
+        "  - To search the internet use web_search, and to inspect a specific URL use web_fetch.\n"
+    } else {
+        "  - To inspect a specific URL use web_fetch.\n"
+    };
+    format!(
+        "\
 # Using your tools
 
 - Do NOT use the shell tool to run commands when a relevant dedicated tool is provided. Using \
@@ -113,7 +119,7 @@ dedicated tools helps the user understand and review your work.
   - To create files use write_file instead of cat with heredoc or echo redirection.
   - To search for files use glob instead of find or ls.
   - To search file contents use grep instead of shell grep or rg.
-  - To search the internet use web_search, and to inspect a specific URL use web_fetch.
+{web_guidance}\
   - Reserve shell for system commands, tests, builds, and terminal operations that require \
 shell execution.
 - Break down and manage your work with the TaskCreate tool. These tools are helpful for \
@@ -124,6 +130,7 @@ batch up multiple tasks before marking them as completed.
 - You can call multiple tools in a single response. If there are no dependencies between the \
 calls, make independent tool calls in parallel. If one call depends on another call's result, \
 run them sequentially."
+    )
 }
 
 fn session_specific_guidance_section(has_spawn_agent: bool) -> &'static str {
@@ -181,13 +188,18 @@ impl AnthropicProfile {
         model: impl Into<String>,
         summarizer: Option<WebFetchSummarizer>,
     ) -> Self {
-        let config = SessionOptions {
-            default_command_timeout_ms: 120_000,
-            ..SessionOptions::default()
-        };
+        let options = NativeToolOptions::for_profile(AgentProfileKind::Anthropic);
+        Self::with_native_tools(model, &options, summarizer)
+    }
+
+    pub(crate) fn with_native_tools(
+        model: impl Into<String>,
+        options: &NativeToolOptions,
+        summarizer: Option<WebFetchSummarizer>,
+    ) -> Self {
         let mut registry = ToolRegistry::new();
 
-        register_core_tools(&mut registry, &config, summarizer);
+        register_core_tools(&mut registry, options, summarizer);
         registry.register(make_edit_file_tool());
         // Anthropic task tools share one runtime per profile instance.
         let todo_runtime = Arc::new(TodoRuntime::new());
@@ -255,7 +267,8 @@ impl AgentProfile for AnthropicProfile {
         skills: &[Skill],
     ) -> String {
         let has_spawn_agent = self.base.registry.get("spawn_agent").is_some();
-        let core_prompt = anthropic_core_prompt(has_spawn_agent);
+        let has_web_search = self.base.registry.get("web_search").is_some();
+        let core_prompt = anthropic_core_prompt(has_spawn_agent, has_web_search);
 
         assemble_system_prompt(
             &core_prompt,
@@ -330,8 +343,8 @@ mod tests {
             "prompt should contain coding best practices"
         );
         assert!(
-            prompt.contains("web_search"),
-            "prompt should contain web_search guidance"
+            !prompt.contains("web_search"),
+            "prompt should omit guidance for unavailable tools"
         );
         assert!(
             prompt.contains("web_fetch"),
@@ -442,14 +455,14 @@ mod tests {
     fn anthropic_tools_registered() {
         let profile = AnthropicProfile::new("claude-sonnet-4-20250514");
         let names = profile.tool_registry().names();
-        assert_eq!(names.len(), 12);
+        assert_eq!(names.len(), 11);
         assert!(names.contains(&"read_file".to_string()));
         assert!(names.contains(&"write_file".to_string()));
         assert!(names.contains(&"edit_file".to_string()));
         assert!(names.contains(&"shell".to_string()));
         assert!(names.contains(&"grep".to_string()));
         assert!(names.contains(&"glob".to_string()));
-        assert!(names.contains(&"web_search".to_string()));
+        assert!(!names.contains(&"web_search".to_string()));
         assert!(names.contains(&"web_fetch".to_string()));
         assert!(names.contains(&"TaskCreate".to_string()));
         assert!(names.contains(&"TaskUpdate".to_string()));
@@ -467,7 +480,7 @@ mod tests {
     #[test]
     fn anthropic_register_subagent_tools() {
         let mut profile = AnthropicProfile::new("claude-sonnet-4-20250514");
-        assert_eq!(profile.tool_registry().names().len(), 12);
+        assert_eq!(profile.tool_registry().names().len(), 11);
 
         let supervisor = SubAgentSupervisor::new(3);
         let factory: SessionFactory = Arc::new(|| {
@@ -477,7 +490,7 @@ mod tests {
         profile.register_subagent_tools(supervisor, factory, 0);
 
         let names = profile.tool_registry().names();
-        assert_eq!(names.len(), 16, "should have 12 base + 4 subagent tools");
+        assert_eq!(names.len(), 15, "should have 11 base + 4 subagent tools");
         assert!(names.contains(&"spawn_agent".to_string()));
         assert!(names.contains(&"send_input".to_string()));
         assert!(names.contains(&"wait".to_string()));

@@ -4,7 +4,7 @@ use fabro_model::{AgentProfileKind, Catalog, ProviderId};
 
 use super::EnvContext;
 use crate::agent_profile::AgentProfile;
-use crate::config::SessionOptions;
+use crate::config::NativeToolOptions;
 use crate::profiles::{BaseProfile, assemble_system_prompt};
 use crate::sandbox::Sandbox;
 use crate::skills::Skill;
@@ -29,10 +29,18 @@ impl GeminiProfile {
         model: impl Into<String>,
         summarizer: Option<WebFetchSummarizer>,
     ) -> Self {
-        let config = SessionOptions::default();
+        let options = NativeToolOptions::for_profile(AgentProfileKind::Gemini);
+        Self::with_native_tools(model, &options, summarizer)
+    }
+
+    pub(crate) fn with_native_tools(
+        model: impl Into<String>,
+        options: &NativeToolOptions,
+        summarizer: Option<WebFetchSummarizer>,
+    ) -> Self {
         let mut registry = ToolRegistry::new();
 
-        register_core_tools(&mut registry, &config, summarizer);
+        register_core_tools(&mut registry, options, summarizer);
         registry.register(make_edit_file_tool());
         registry.register(make_read_many_files_tool());
         registry.register(make_list_dir_tool());
@@ -95,7 +103,16 @@ impl AgentProfile for GeminiProfile {
         user_instructions: Option<&str>,
         skills: &[Skill],
     ) -> String {
-        let core_prompt = "\
+        let web_search_guidance = if self.base.registry.get("web_search").is_some() {
+            "## web_search
+Search the web for information.
+
+"
+        } else {
+            ""
+        };
+        let core_prompt = format!(
+            "\
 You are Gemini CLI, an interactive CLI agent specializing in software engineering tasks \
 including solving bugs, adding new functionality, refactoring code, and explaining code. \
 Your primary goal is to help users safely and effectively.
@@ -127,7 +144,7 @@ still providing the best answer you can.
 files individually.
 - If you need to read multiple ranges in a file, do so in parallel.
 
-{env_block}
+{{env_block}}
 
 # Development Lifecycle
 
@@ -184,10 +201,7 @@ Find files by name pattern. Results sorted by modification time.
 ## list_dir
 List directory contents with depth control.
 
-## web_search
-Search the web for information.
-
-## web_fetch
+{web_search_guidance}## web_fetch
 Fetch content from a URL and optionally summarize it. Pass a prompt to extract specific \
 information instead of returning the full page.
 
@@ -210,10 +224,11 @@ These are foundational mandates that take precedence over defaults in this promp
 # Coding Best Practices
 
 Write clean, maintainable code. Handle errors appropriately. Follow existing code conventions \
-in the project.";
+in the project."
+        );
 
         assemble_system_prompt(
-            core_prompt,
+            &core_prompt,
             env,
             env_context,
             memory,
@@ -274,7 +289,7 @@ mod tests {
         assert!(prompt.contains("grep"));
         assert!(prompt.contains("glob"));
         assert!(prompt.contains("list_dir"));
-        assert!(prompt.contains("web_search"));
+        assert!(!prompt.contains("web_search"));
         assert!(prompt.contains("web_fetch"));
         assert!(prompt.contains("Default timeout is 10 seconds"));
     }
@@ -311,7 +326,7 @@ mod tests {
     fn gemini_tools_registered() {
         let profile = GeminiProfile::new("gemini-2.0-flash");
         let names = profile.tool_registry().names();
-        assert_eq!(names.len(), 10);
+        assert_eq!(names.len(), 9);
         assert!(names.contains(&"read_file".to_string()));
         assert!(names.contains(&"read_many_files".to_string()));
         assert!(names.contains(&"write_file".to_string()));
@@ -320,7 +335,7 @@ mod tests {
         assert!(names.contains(&"grep".to_string()));
         assert!(names.contains(&"glob".to_string()));
         assert!(names.contains(&"list_dir".to_string()));
-        assert!(names.contains(&"web_search".to_string()));
+        assert!(!names.contains(&"web_search".to_string()));
         assert!(names.contains(&"web_fetch".to_string()));
     }
 
@@ -333,7 +348,7 @@ mod tests {
         });
         profile.register_subagent_tools(supervisor, factory, 0);
         let names = profile.tool_registry().names();
-        assert_eq!(names.len(), 14);
+        assert_eq!(names.len(), 13);
         assert!(names.contains(&"spawn_agent".to_string()));
         assert!(names.contains(&"send_input".to_string()));
         assert!(names.contains(&"wait".to_string()));

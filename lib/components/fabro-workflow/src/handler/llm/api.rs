@@ -6,10 +6,9 @@ use async_trait::async_trait;
 use fabro_agent::subagent::{SessionFactory, SubAgentSupervisor};
 use fabro_agent::tool_registry::{RegisteredTool, ToolContext, ToolRegistry, ToolSource};
 use fabro_agent::{
-    AgentEvent, AgentProfile, AnthropicProfile, CompletionCoordinator, GeminiProfile,
-    Message as AgentMessage, OpenAiProfile, Sandbox, Session, SessionOptions,
-    SessionShutdownReason, StaticEnvProvider, ToolEnvProvider, ToolSecrets,
-    register_question_tools,
+    AgentEvent, AgentProfile, AgentProfileBuilder, CompletionCoordinator, Message as AgentMessage,
+    Sandbox, Session, SessionOptions, SessionShutdownReason, StaticEnvProvider, ToolEnvProvider,
+    ToolSecrets, register_question_tools,
 };
 use fabro_auth::{CredentialSource, EnvCredentialSource};
 use fabro_graphviz::graph::{AttrValue, Node};
@@ -20,8 +19,10 @@ use fabro_llm::types::{
 };
 use fabro_mcp::config::McpServerSettings;
 #[cfg(test)]
+use fabro_model::AgentProfileKind;
+#[cfg(test)]
 use fabro_model::catalog::LlmCatalogSettings;
-use fabro_model::{AgentProfileKind, Catalog, FallbackTarget, ModelRef, ProviderId, UsdMicros};
+use fabro_model::{Catalog, FallbackTarget, ModelRef, ProviderId, UsdMicros};
 use fabro_types::settings::run::RunModelControls;
 use fabro_types::{PermissionLevel, RunId, SessionCapability, StageId, StageTiming};
 use serde::de::DeserializeOwned;
@@ -180,31 +181,6 @@ async fn discard_session(
         session_id,
         parent_session_id: None,
     });
-}
-
-fn build_profile(
-    model: &str,
-    provider_id: ProviderId,
-    profile_kind: AgentProfileKind,
-    catalog: Arc<Catalog>,
-) -> Box<dyn AgentProfile> {
-    match profile_kind {
-        AgentProfileKind::OpenAi => Box::new(
-            OpenAiProfile::new(model)
-                .with_provider_id(provider_id)
-                .with_catalog(catalog),
-        ),
-        AgentProfileKind::Gemini => Box::new(
-            GeminiProfile::new(model)
-                .with_provider_id(provider_id)
-                .with_catalog(catalog),
-        ),
-        AgentProfileKind::Anthropic => Box::new(
-            AnthropicProfile::new(model)
-                .with_provider_id(provider_id)
-                .with_catalog(catalog),
-        ),
-    }
 }
 
 pub fn register_fabro_run_tools(registry: &mut ToolRegistry, services: &FabroRunToolServices) {
@@ -835,13 +811,14 @@ impl AgentApiBackend {
             .await
             .map_err(|e| Error::handler_with_source("Failed to create LLM client", e))?;
 
-        let mut profile = build_profile(
-            model,
-            provider.provider_id.clone(),
+        let profile_builder = AgentProfileBuilder::new(
             provider.profile_kind,
+            provider.provider_id.clone(),
+            model,
             Arc::clone(&catalog),
-        );
-        fabro_agent::register_secret_backed_tools(profile.tool_registry_mut(), &tool_secrets);
+        )
+        .with_tool_secrets(tool_secrets);
+        let mut profile = profile_builder.clone().build();
 
         let config = SessionOptions {
             max_tokens: node.max_tokens(),
@@ -849,7 +826,6 @@ impl AgentApiBackend {
             speed: controls.speed,
             tool_hooks,
             mcp_servers,
-            tool_secrets,
             // Workflow agents run with no `tool_access_policy`, which exposes
             // the entire tool registry (read, write, shell, subagent, MCP) and
             // skips approval gating. Report that truthfully so the UI doesn't
@@ -864,25 +840,13 @@ impl AgentApiBackend {
 
         // Build factory that creates child sessions WITHOUT subagent tools
         let factory_client = client.clone();
-        let factory_model = model.to_string();
-        let factory_provider = provider.clone();
-        let factory_catalog = Arc::clone(&catalog);
+        let factory_profile_builder = profile_builder;
         let factory_env = Arc::clone(sandbox);
         let factory_tool_env = tool_env.cloned();
         let factory_fabro_run_tools = fabro_run_tools.clone();
         let factory_permission_level = config.permission_level;
-        let factory_tool_secrets = config.tool_secrets.clone();
         let factory: SessionFactory = Arc::new(move || {
-            let mut child_profile = build_profile(
-                &factory_model,
-                factory_provider.provider_id.clone(),
-                factory_provider.profile_kind,
-                Arc::clone(&factory_catalog),
-            );
-            fabro_agent::register_secret_backed_tools(
-                child_profile.tool_registry_mut(),
-                &factory_tool_secrets,
-            );
+            let mut child_profile = factory_profile_builder.clone().build();
             if let Some(services) = factory_fabro_run_tools.clone() {
                 register_fabro_run_tools(child_profile.tool_registry_mut(), &services);
             }
@@ -895,7 +859,6 @@ impl AgentApiBackend {
                     reasoning_effort: controls.reasoning_effort,
                     speed: controls.speed,
                     permission_level: factory_permission_level,
-                    tool_secrets: factory_tool_secrets.clone(),
                     ..SessionOptions::default()
                 },
                 None,
@@ -2693,12 +2656,13 @@ reasoning = false
 
     #[test]
     fn build_profile_can_register_subagent_tools() {
-        let mut profile = build_profile(
-            "claude-opus-4-6",
-            ProviderId::anthropic(),
+        let mut profile = AgentProfileBuilder::new(
             AgentProfileKind::Anthropic,
+            ProviderId::anthropic(),
+            "claude-opus-4-6",
             Arc::new(Catalog::from_builtin().unwrap()),
-        );
+        )
+        .build();
         let supervisor = SubAgentSupervisor::new(1);
         let factory: SessionFactory = Arc::new(|| {
             panic!("factory should not be called in this test");

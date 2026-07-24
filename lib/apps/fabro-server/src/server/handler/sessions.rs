@@ -14,13 +14,12 @@ use fabro_agent::config::{ToolAccess, ToolAccessPolicy, ToolExposureMode};
 use fabro_agent::profiles::assemble_system_prompt;
 use fabro_agent::tool_registry::ToolRegistry;
 use fabro_agent::{
-    AgentEvent, AgentProfile, AnthropicProfile, Error as AgentError, GeminiProfile, OpenAiProfile,
-    Session, SessionEvent, SessionOptions, ToolSecrets, WebFetchSummarizer,
+    AgentEvent, AgentProfile, AgentProfileBuilder, Error as AgentError, Session, SessionEvent,
+    SessionOptions, ToolSecrets, WebFetchSummarizer,
 };
 use fabro_api::types::{
     CreateRunSessionRequest, PaginatedEventList, PaginationMeta, SubmitTurnRequest,
 };
-use fabro_llm::client::Client as LlmClient;
 use fabro_llm::types::ToolDefinition;
 use fabro_model::{
     AgentProfileKind, Catalog, ModelHandle, ModelSelectionError, ProviderId, catalog,
@@ -732,13 +731,21 @@ async fn build_agent_session(
         .await
         .map_err(AskFabroBuildError::SandboxUnavailable)?;
     let sandbox: Arc<dyn fabro_agent::Sandbox> = Arc::from(sandbox);
-    let mut profile = build_profile(
-        provider_id,
-        profile_kind,
-        &model,
-        &llm_result.client,
-        Arc::clone(&catalog),
-    );
+    let brave_search_api_key = state
+        .vault_secret(EnvVars::BRAVE_SEARCH_API_KEY)
+        .await
+        .map_err(|err| AskFabroBuildError::Agent(anyhow::Error::new(err)))?;
+    let summarizer = WebFetchSummarizer {
+        client:   llm_result.client.clone(),
+        model_id: summarizer_model_id(&provider_id, profile_kind, &catalog, &model),
+    };
+    let mut profile =
+        AgentProfileBuilder::new(profile_kind, provider_id, &model, Arc::clone(&catalog))
+            .with_web_fetch_summarizer(Some(summarizer))
+            .with_tool_secrets(ToolSecrets {
+                brave_search_api_key,
+            })
+            .build();
 
     // Give the Ask Fabro agent access to read-only run-inspection tools scoped
     // to its owning run. The session reaches the local HTTP API via a same-run
@@ -771,16 +778,9 @@ async fn build_agent_session(
     let profile: Arc<dyn AgentProfile> =
         Arc::new(AskFabroProfile::new(profile, Arc::clone(&ask_fabro_policy)));
 
-    let brave_search_api_key = state
-        .vault_secret(EnvVars::BRAVE_SEARCH_API_KEY)
-        .await
-        .map_err(|err| AskFabroBuildError::Agent(anyhow::Error::new(err)))?;
     let config = SessionOptions {
         tool_access_policy: Some(ask_fabro_policy),
         tool_exposure_mode: ToolExposureMode::AutoApprovedOnly,
-        tool_secrets: ToolSecrets {
-            brave_search_api_key,
-        },
         ..SessionOptions::default()
     };
 
@@ -915,36 +915,6 @@ fn canonical_session_model(
 
 fn session_selection_error(error: &ModelSelectionError) -> ApiError {
     ApiError::bad_request(error.to_string())
-}
-
-fn build_profile(
-    provider_id: ProviderId,
-    profile_kind: AgentProfileKind,
-    model: &str,
-    llm_client: &LlmClient,
-    catalog: Arc<Catalog>,
-) -> Box<dyn AgentProfile> {
-    let summarizer = Some(WebFetchSummarizer {
-        client:   llm_client.clone(),
-        model_id: summarizer_model_id(&provider_id, profile_kind, &catalog, model),
-    });
-    match profile_kind {
-        AgentProfileKind::OpenAi => Box::new(
-            OpenAiProfile::with_summarizer(model, summarizer)
-                .with_provider_id(provider_id)
-                .with_catalog(catalog),
-        ),
-        AgentProfileKind::Gemini => Box::new(
-            GeminiProfile::with_summarizer(model, summarizer)
-                .with_provider_id(provider_id)
-                .with_catalog(catalog),
-        ),
-        AgentProfileKind::Anthropic => Box::new(
-            AnthropicProfile::with_summarizer(model, summarizer)
-                .with_provider_id(provider_id)
-                .with_catalog(catalog),
-        ),
-    }
 }
 
 fn summarizer_model_id(
