@@ -1,4 +1,5 @@
 import { createElement, type ReactNode } from "react";
+import type { EventEnvelope } from "@qltysh/fabro-api-client";
 import TestRenderer, { act } from "react-test-renderer";
 
 const IS_REACT_ACT_ENV = "IS_REACT_ACT_ENVIRONMENT" as const;
@@ -37,6 +38,21 @@ export function setupReactTestEnv(): () => void {
       delete globals[IS_REACT_ACT_ENV];
     }
   };
+}
+
+/** Build an event envelope fixture; override any field via `partial`. */
+export function makeEventEnvelope(
+  seq: number,
+  partial: Partial<EventEnvelope>,
+): EventEnvelope {
+  return {
+    seq,
+    id: `evt-${seq}`,
+    ts: `2026-04-09T12:00:0${seq}Z`,
+    run_id: "run-1",
+    event: "stage.prompt",
+    ...partial,
+  } as EventEnvelope;
 }
 
 export function renderHook<T>(

@@ -57,13 +57,14 @@ Agents can also emit arbitrary context updates by including a JSON object with a
 | `human.gate.<node>.answer` | The answer text for a specific human gate node |
 | `human.gate.<node>.label` | The selected label for a specific human gate node, when applicable |
 
-### Parallel merge (fan-in)
+### Parallel fan-out and fan-in
 
 | Key | Value |
 |---|---|
-| `parallel.fan_in.best_id` | Node ID of the best-performing branch |
-| `parallel.fan_in.best_outcome` | Status of the best branch |
-| `parallel.fan_in.best_head_sha` | Git SHA from the best branch (if applicable) |
+| `parallel.results` | Ordered branch results. Each entry contains `id`, `status`, and the branch's isolated `context_updates`. |
+| `parallel.branch_count` | Number of outgoing branches dispatched by the parallel node. |
+
+Branch updates remain nested inside `parallel.results`; they are not merged into top-level context. Prompted fan-in nodes can synthesize the complete result array, while promptless fan-in nodes act as barriers.
 
 ### Engine-managed keys
 

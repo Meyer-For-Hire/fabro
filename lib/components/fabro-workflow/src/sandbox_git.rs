@@ -4,7 +4,6 @@ use fabro_agent::Sandbox;
 use fabro_checkpoint::trailer as trailerlink;
 use fabro_checkpoint::trailer::Trailer;
 use fabro_sandbox::shell_quote;
-use fabro_types::RunId;
 use fabro_types::settings::run::RunCheckpointSettings;
 use fabro_util::error::SharedError;
 
@@ -18,17 +17,6 @@ pub struct GitCommandError {
     pub message: String,
     #[source]
     pub source:  fabro_sandbox::Error,
-}
-
-/// Captured git state for a workflow run, shared with handlers.
-#[derive(Debug, Clone)]
-pub struct GitState {
-    pub run_id:      RunId,
-    pub base_sha:    String,
-    pub run_branch:  Option<String>,
-    pub meta_branch: Option<String>,
-    pub checkpoint:  RunCheckpointSettings,
-    pub git_author:  GitAuthor,
 }
 
 pub const GIT_REMOTE: &str =
@@ -235,48 +223,6 @@ pub(crate) async fn git_diff_with_timeout(
             source:  e,
         }),
     }
-}
-
-/// Create a branch at a specific SHA via the sandbox.
-pub async fn git_create_branch_at(sandbox: &dyn Sandbox, name: &str, sha: &str) -> bool {
-    let cmd = format!("{GIT_REMOTE} branch --force {name} {sha}");
-    matches!(
-        sandbox.exec_command(&cmd, 30_000, None, None, None).await,
-        Ok(r) if r.is_success()
-    )
-}
-
-/// Add a git worktree via the sandbox.
-pub async fn git_add_worktree(sandbox: &dyn Sandbox, path: &str, branch: &str) -> bool {
-    let cmd = format!("{GIT_REMOTE} worktree add {path} {branch}");
-    matches!(
-        sandbox.exec_command(&cmd, 30_000, None, None, None).await,
-        Ok(r) if r.is_success()
-    )
-}
-
-/// Remove a git worktree via the sandbox.
-pub async fn git_remove_worktree(sandbox: &dyn Sandbox, path: &str) -> bool {
-    let cmd = format!("{GIT_REMOTE} worktree remove --force {path}");
-    matches!(
-        sandbox.exec_command(&cmd, 30_000, None, None, None).await,
-        Ok(r) if r.is_success()
-    )
-}
-
-/// Fast-forward merge to a given SHA via the sandbox.
-pub async fn git_merge_ff_only(sandbox: &dyn Sandbox, sha: &str) -> bool {
-    let cmd = format!("{GIT_REMOTE} merge --ff-only {sha}");
-    matches!(
-        sandbox.exec_command(&cmd, 30_000, None, None, None).await,
-        Ok(r) if r.is_success()
-    )
-}
-
-/// Remove any stale worktree at `path` (best-effort), then add a fresh one.
-pub async fn git_replace_worktree(sandbox: &dyn Sandbox, path: &str, branch: &str) -> bool {
-    let _ = git_remove_worktree(sandbox, path).await;
-    git_add_worktree(sandbox, path, branch).await
 }
 
 // ── Machine-readable diff enumeration (Run Files endpoint) ─────────────────

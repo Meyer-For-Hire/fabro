@@ -127,7 +127,7 @@ impl RunDump {
             if let Some(parallel_results) = stage.parallel_results.as_ref() {
                 entries.push(RunDumpEntry::json_path(
                     &base.join("parallel_results.json"),
-                    parallel_results.clone(),
+                    serde_json::to_value(parallel_results)?,
                 ));
             }
             if let Some(output) = stage.output.as_ref() {
@@ -605,7 +605,14 @@ mod tests {
         stage.diff = Some("diff --git a/a b/a".to_string());
         stage.script_invocation = Some(serde_json::json!({ "command": "cargo test" }));
         stage.script_timing = Some(serde_json::json!({ "duration_ms": 10 }));
-        stage.parallel_results = Some(serde_json::json!([{ "stage": "fanout@1" }]));
+        stage.parallel_results = Some(vec![fabro_types::ParallelBranchResult {
+            id:              "review".to_string(),
+            status:          fabro_types::StageOutcome::Succeeded,
+            context_updates: std::collections::BTreeMap::from([(
+                "response.review".to_string(),
+                serde_json::json!("looks good"),
+            )]),
+        }]);
         stage.output = Some("output".to_string());
 
         let dump = RunDump::from_projection(&projection).unwrap();

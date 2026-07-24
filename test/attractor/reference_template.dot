@@ -106,8 +106,8 @@ digraph reference_template {
         // PROMPT: consolidate_dod
         // Role: synthesize dod_a/b/c into consensus DoD
         // Must address:
-        //   - Read branch outputs via parallel_results.json + worktree_dir
-        //   - Fall back to current worktree if parallel_results.json missing
+        //   - Review every branch result in parallel.results from prompt context
+        //   - Read branch files from the shared checkout
         //   - Read .ai/spec.md for context
         //   - Resolve contradictions, apply DoD rubric + coverage checklist
         // Writes: .ai/definition_of_done.md
@@ -138,8 +138,8 @@ digraph reference_template {
         // PROMPT: debate_consolidate
         // Role: synthesize plan_a/b/c into best-of-breed final plan
         // Must address:
-        //   - Read branch outputs via parallel_results.json + worktree_dir
-        //   - Fall back to current worktree if parallel_results.json missing
+        //   - Review every branch result in parallel.results from prompt context
+        //   - Read branch files from the shared checkout
         //   - If .ai/postmortem_latest.md exists, verify plan addresses
         //     every identified issue
         //   - Resolve conflicts, ensure dependency order
@@ -269,8 +269,8 @@ digraph reference_template {
         // PROMPT: review_consensus
         // Role: synthesize reviews into consensus verdict
         // Must address:
-        //   - Read branch outputs via parallel_results.json + worktree_dir
-        //   - Fall back to current worktree if parallel_results.json missing
+        //   - Review every branch result in parallel.results from prompt context
+        //   - Read branch files from the shared checkout
         //   - Read .ai/definition_of_done.md for criteria
         //   - Consensus: 2+ APPROVED with no critical gaps -> success;
         //     otherwise -> retry with specific issues
@@ -287,8 +287,8 @@ digraph reference_template {
         // Must address:
         //   - Read .ai/review_consensus.md (if review stage reached)
         //   - Read .ai/verify_fidelity.md (if semantic verify ran)
-        //   - Read branch review outputs via parallel_results.json +
-        //     worktree_dir if available
+        //   - Review branch status and context updates in parallel.results
+        //     from prompt context if available
         //   - Read .ai/implementation_log.md
         //   - Output: root causes, what worked (preserve), what failed
         //     (fix), concrete next changes

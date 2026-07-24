@@ -12,10 +12,7 @@ use fabro_agent::Sandbox;
 use fabro_graphviz::graph::{AttrValue, Edge, Graph, Node};
 use fabro_types::{RunEvent, WorkflowSettings, fixtures};
 use fabro_workflow::event::Emitter;
-use fabro_workflow::git::{
-    add_worktree, branch_needs_push, create_branch, push_branch, push_ref, remove_worktree,
-    replace_worktree,
-};
+use fabro_workflow::git::{branch_needs_push, push_branch, push_ref};
 use fabro_workflow::handler::HandlerRegistry;
 use fabro_workflow::handler::exit::ExitHandler;
 use fabro_workflow::handler::start::StartHandler;
@@ -170,22 +167,6 @@ fn test_run_options(run_dir: &Path) -> RunOptions {
 }
 
 #[test]
-fn replace_worktree_replaces_stale() {
-    let dir = tempfile::tempdir().unwrap();
-    init_repo(dir.path());
-    create_branch(dir.path(), "stale-branch").unwrap();
-
-    let wt_path = dir.path().join("stale-wt");
-    add_worktree(dir.path(), &wt_path, "stale-branch").unwrap();
-    assert!(wt_path.join(".git").exists());
-
-    replace_worktree(dir.path(), &wt_path, "stale-branch").unwrap();
-    assert!(wt_path.join(".git").exists());
-
-    remove_worktree(dir.path(), &wt_path).unwrap();
-}
-
-#[test]
 fn push_ref_to_bare_remote() {
     let dir = tempfile::tempdir().unwrap();
     let repo_dir = dir.path().join("repo");
@@ -195,7 +176,7 @@ fn push_ref_to_bare_remote() {
     init_repo(&repo_dir);
     add_origin(&repo_dir, &remote_dir);
 
-    create_branch(&repo_dir, "test-push").unwrap();
+    rename_branch(&repo_dir, "test-push");
     let url = format!("file://{}", remote_dir.display());
     push_ref(&repo_dir, &url, "refs/heads/test-push").unwrap();
 

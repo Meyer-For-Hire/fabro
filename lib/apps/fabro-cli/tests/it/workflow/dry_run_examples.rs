@@ -80,7 +80,9 @@ fn dry_run_parallel() {
     let mut cmd = context.run_cmd();
     cmd.args(["--dry-run", "--auto-approve"]);
     cmd.arg(&workflow);
-    fabro_snapshot!(run_output_filters(&context), cmd, @"
+    let mut filters = run_output_filters(&context);
+    filters.push((r"\bbranch[12]\b".to_string(), "[BRANCH]".to_string()));
+    fabro_snapshot!(filters, cmd, @"
     success: true
     exit_code: 0
     ----- stdout -----
@@ -93,6 +95,8 @@ fn dry_run_parallel() {
         Web UI: http://localhost:3000/runs/[ULID]
         Sandbox: local (ready in [TIME])
         ✓ start  [TIME]
+            ✓ [BRANCH]  [TIME]
+            ✓ [BRANCH]  [TIME]
         ✓ Fork Work  [TIME]
         ✓ Merge Results  [TIME]
         ✓ Review  [TIME]

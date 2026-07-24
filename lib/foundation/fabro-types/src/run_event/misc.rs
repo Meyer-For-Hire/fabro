@@ -1,8 +1,7 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use super::ExecOutputTail;
-use crate::{CommandTermination, PullRequestLink};
+use crate::{CommandTermination, ParallelBranchResult, PullRequestLink, StageOutcome};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct InterviewOption {
@@ -18,7 +17,6 @@ pub struct InterviewOption {
 pub struct ParallelStartedProps {
     pub visit:        u32,
     pub branch_count: usize,
-    pub join_policy:  String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -30,9 +28,7 @@ pub struct ParallelBranchStartedProps {
 pub struct ParallelBranchCompletedProps {
     pub index:       usize,
     pub duration_ms: u64,
-    pub status:      String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub head_sha:    Option<String>,
+    pub status:      StageOutcome,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -42,7 +38,7 @@ pub struct ParallelCompletedProps {
     pub success_count: usize,
     pub failure_count: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub results:       Vec<Value>,
+    pub results:       Vec<ParallelBranchResult>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -104,23 +100,6 @@ pub struct GitPushProps {
     pub success:          bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exec_output_tail: Option<ExecOutputTail>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct GitBranchProps {
-    pub branch: String,
-    pub sha:    String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct GitWorktreeAddProps {
-    pub path:   String,
-    pub branch: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct GitWorktreeRemoveProps {
-    pub path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

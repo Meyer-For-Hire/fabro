@@ -217,16 +217,6 @@ macro_rules! delegate_sandbox {
                 self.$field.git_push_ref(refspec).await
             }
 
-            fn parallel_worktree_path(
-                &self,
-                run_dir: &std::path::Path,
-                run_id: &str,
-                node_id: &str,
-                key: &str,
-            ) -> String {
-                self.$field.parallel_worktree_path(run_dir, run_id, node_id, key)
-            }
-
             async fn ssh_access_command(&self) -> $crate::Result<Option<String>> {
                 self.$field.ssh_access_command().await
             }
@@ -1003,23 +993,6 @@ pub trait Sandbox: Send + Sync {
         Err(crate::Error::message(
             "git_push_ref not implemented for this sandbox",
         ))
-    }
-
-    /// Compute the filesystem path for a parallel branch worktree.
-    fn parallel_worktree_path(
-        &self,
-        run_dir: &std::path::Path,
-        _run_id: &str,
-        node_id: &str,
-        key: &str,
-    ) -> String {
-        run_dir
-            .join("parallel")
-            .join(node_id)
-            .join(key)
-            .join("worktree")
-            .to_string_lossy()
-            .into_owned()
     }
 
     /// Return an SSH command string for connecting to this sandbox, if

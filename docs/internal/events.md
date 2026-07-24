@@ -523,16 +523,16 @@ Emitted when a parallel node begins executing branches.
   "id": "...", "ts": "...", "run_id": "...",
   "event": "parallel.started",
   "properties": {
-    "branch_count": 3,
-    "join_policy": "all"
+    "visit": 1,
+    "branch_count": 3
   }
 }
 ```
 
 | Property | Type | Description |
 |----------|------|-------------|
+| `visit` | number | Visit number for this parallel stage |
 | `branch_count` | number | Number of parallel branches |
-| `join_policy` | string | Join policy |
 
 ### `parallel.branch.started`
 
@@ -587,18 +587,33 @@ Emitted when all parallel branches have finished.
   "id": "...", "ts": "...", "run_id": "...",
   "event": "parallel.completed",
   "properties": {
+    "visit": 1,
     "duration_ms": 12000,
     "success_count": 2,
-    "failure_count": 1
+    "failure_count": 1,
+    "results": [
+      {
+        "id": "branch_a",
+        "status": "succeeded",
+        "context_updates": {"response.branch_a": "review complete"}
+      },
+      {
+        "id": "branch_b",
+        "status": "failed",
+        "context_updates": {"command.output": "validation failed"}
+      }
+    ]
   }
 }
 ```
 
 | Property | Type | Description |
 |----------|------|-------------|
+| `visit` | number | Visit number for this parallel stage |
 | `duration_ms` | number | Total parallel duration |
 | `success_count` | number | Branches that succeeded |
 | `failure_count` | number | Branches that failed |
+| `results` | array | Ordered typed branch results with `id`, `status`, and isolated `context_updates` |
 
 ---
 
@@ -759,58 +774,6 @@ Note: `node_id` is optional — may be absent for non-stage commits.
 |----------|------|-------------|
 | `branch` | string | Branch name |
 | `success` | boolean | Whether push succeeded |
-
-### `git.branch`
-
-```json
-{
-  "id": "...", "ts": "...", "run_id": "...",
-  "event": "git.branch",
-  "properties": {
-    "branch": "fabro/run-01JQXYZ",
-    "sha": "abc123..."
-  }
-}
-```
-
-| Property | Type | Description |
-|----------|------|-------------|
-| `branch` | string | Branch name |
-| `sha` | string | Branch HEAD SHA |
-
-### `git.worktree.added`
-
-```json
-{
-  "id": "...", "ts": "...", "run_id": "...",
-  "event": "git.worktree.added",
-  "properties": {
-    "path": "/tmp/fabro-worktrees/...",
-    "branch": "fabro/run-01JQXYZ"
-  }
-}
-```
-
-| Property | Type | Description |
-|----------|------|-------------|
-| `path` | string | Worktree directory path |
-| `branch` | string | Branch name |
-
-### `git.worktree.removed`
-
-```json
-{
-  "id": "...", "ts": "...", "run_id": "...",
-  "event": "git.worktree.removed",
-  "properties": {
-    "path": "/tmp/fabro-worktrees/..."
-  }
-}
-```
-
-| Property | Type | Description |
-|----------|------|-------------|
-| `path` | string | Worktree directory path |
 
 ### `git.fetch`
 
