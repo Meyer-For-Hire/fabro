@@ -6,6 +6,7 @@ import {
   ChevronRightIcon,
   ClipboardDocumentIcon,
   CpuChipIcon,
+  WrenchScrewdriverIcon,
 } from "@heroicons/react/16/solid";
 import { CircleStackIcon, ClockIcon } from "@heroicons/react/20/solid";
 
@@ -69,7 +70,7 @@ import {
   useRunState,
 } from "../lib/queries";
 import { STAGE_ACTIVITY_EVENT_TYPES, type StageActivityEventType } from "../lib/run-events";
-import { mapRunStagesToSidebarStages } from "../lib/stage-sidebar";
+import { ACTIVE_STAGE_STATES, mapRunStagesToSidebarStages } from "../lib/stage-sidebar";
 import { getNumber, getString, type UnknownRecord } from "../lib/unknown";
 import type { EventEnvelope, StageHandler, StageModelUsage } from "@qltysh/fabro-api-client";
 
@@ -132,7 +133,7 @@ const EVENT_KIND_LABEL: Record<EventKind, string> = {
   command: "Command",
 };
 
-const EVENTS_TABS = ["primary", "context", "debug"] as const;
+const EVENTS_TABS = ["chat", "primary", "context", "debug"] as const;
 type EventsTab = (typeof EVENTS_TABS)[number];
 
 interface StageActivityState {
@@ -183,6 +184,7 @@ const PRIMARY_TAB_LABEL: Record<StageRenderer, string> = {
 };
 
 export function eventsTabLabel(tab: EventsTab, renderer: StageRenderer): string {
+  if (tab === "chat") return "Chat";
   if (tab === "debug") return "Debug";
   if (tab === "context") return "Context";
   return PRIMARY_TAB_LABEL[renderer];
@@ -378,6 +380,36 @@ export function eventsToActivity(events: EventEnvelope[], stageId: string): Turn
   return turns;
 }
 
+export interface PendingToolCall {
+  toolName: string;
+  input: string;
+}
+
+// Tool calls that have started but not completed. The Thread view's
+// `eventsToActivity` drops these (a tool turn only exists once its result
+// arrives); the Chat view shows them as a live "working" line.
+export function pendingToolCalls(
+  events: EventEnvelope[],
+  stageId: string,
+): PendingToolCall[] {
+  const pending = new Map<string, PendingToolCall>();
+  for (const e of events) {
+    if (activityEventStageId(e) !== stageId) continue;
+    const props: UnknownRecord = e.properties ?? {};
+    const callId = getString(props, "tool_call_id") ?? e.tool_call_id ?? "";
+    if (e.event === "agent.tool.started") {
+      const args = props.arguments ?? e.arguments;
+      pending.set(callId, {
+        toolName: getString(props, "tool_name") ?? e.tool_name ?? "",
+        input: typeof args === "string" ? args : JSON.stringify(args ?? ""),
+      });
+    } else if (e.event === "agent.tool.completed") {
+      pending.delete(callId);
+    }
+  }
+  return Array.from(pending.values());
+}
+
 type ToolTurn = Extract<TurnType, { kind: "tool" }>;
 
 export type DisplayItem =
@@ -389,6 +421,33 @@ export type DisplayItem =
       durationMs: number;
       children: { turn: ToolTurn; turnIndex: number }[];
     };
+
+// The Chat view's projection: messages stay individual turns while
+// consecutive tool/command turns (regardless of tool name) merge into one
+// count. Unlike `groupConsecutiveTools`, errored calls stay in the batch —
+// the chip reports them as a count instead of breaking the group.
+export type ChatItem =
+  | { kind: "turn"; turn: TurnType; turnIndex: number }
+  | { kind: "tools"; ts: string; count: number; errored: number };
+
+export function buildChatItems(turns: TurnType[]): ChatItem[] {
+  const out: ChatItem[] = [];
+  turns.forEach((turn, turnIndex) => {
+    if (turn.kind === "tool" || turn.kind === "command") {
+      const errored = turn.kind === "tool" && turn.isError ? 1 : 0;
+      const last = out[out.length - 1];
+      if (last?.kind === "tools") {
+        last.count += 1;
+        last.errored += errored;
+      } else {
+        out.push({ kind: "tools", ts: turn.ts, count: 1, errored });
+      }
+      return;
+    }
+    out.push({ kind: "turn", turn, turnIndex });
+  });
+  return out;
+}
 
 export function groupConsecutiveTools(
   filtered: { turn: TurnType; index: number }[],
@@ -1105,8 +1164,7 @@ function EventDetailsPanel({
 
 const TOOL_INPUT_PREVIEW_KEYS = ["command", "path", "pattern", "url", "query", "script"];
 
-function toolInputPreview(turn: ToolTurn): string {
-  const raw = turn.input;
+function toolInputPreview(raw: string): string {
   if (!raw) return "";
   try {
     const parsed = JSON.parse(raw);
@@ -1149,7 +1207,7 @@ function ToolGroupChildRow({
       }`}
     >
       <span className="min-w-0 truncate font-mono text-xs text-fg-3">
-        {toolInputPreview(turn)}
+        {toolInputPreview(turn.input)}
       </span>
       <span className="inline-flex items-center justify-end gap-1.5 font-mono text-xs tabular-nums text-fg-muted">
         {metric && <ClockIcon className="size-3" aria-hidden="true" />}
@@ -1160,6 +1218,141 @@ function ToolGroupChildRow({
       </span>
       <Chevron className="size-4 text-fg-muted" aria-hidden="true" />
     </button>
+  );
+}
+
+const CHAT_PROMPT_PREVIEW_CHARS = 280;
+
+// User-side bubble. The stage prompt (and any steer / pair-user message over
+// the preview limit) collapses to a preview with an expand toggle; expanded
+// content renders as markdown.
+function ChatUserCard({ content }: { content: string }) {
+  const [expanded, setExpanded] = useState(false);
+  const isLong = content.length > CHAT_PROMPT_PREVIEW_CHARS;
+  return (
+    <div className="ml-auto w-fit max-w-[85%] rounded-2xl rounded-br-md bg-panel px-4 py-3">
+      {expanded ? (
+        <Markdown content={content} />
+      ) : (
+        <p className="whitespace-pre-wrap text-sm text-fg-2">
+          {isLong
+            ? `${content.slice(0, CHAT_PROMPT_PREVIEW_CHARS).trimEnd()}…`
+            : content}
+        </p>
+      )}
+      {isLong && (
+        <button
+          type="button"
+          onClick={() => setExpanded((v) => !v)}
+          className="mt-1.5 text-xs text-teal-500 hover:underline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-teal-500"
+        >
+          {expanded ? "Collapse" : `Show all (${formatBytes(content.length)})`}
+        </button>
+      )}
+    </div>
+  );
+}
+
+function ChatToolsChip({ item }: { item: Extract<ChatItem, { kind: "tools" }> }) {
+  return (
+    <div className="inline-flex items-center gap-1.5 text-xs text-fg-muted">
+      <WrenchScrewdriverIcon className="size-3.5" aria-hidden="true" />
+      <span>
+        {item.count} tool {item.count === 1 ? "call" : "calls"}
+        {item.errored > 0 && (
+          <span className="text-coral">
+            , {item.errored} with {item.errored === 1 ? "an error" : "errors"}
+          </span>
+        )}
+      </span>
+    </div>
+  );
+}
+
+function ChatLiveToolLine({ tool }: { tool: PendingToolCall }) {
+  return (
+    <div className="flex items-center gap-2.5 text-xs">
+      <span
+        className="size-3 shrink-0 animate-spin rounded-full border-2 border-overlay-strong border-t-teal-500 motion-reduce:animate-none"
+        aria-hidden="true"
+      />
+      <span className="shrink-0 text-fg-3">{humanizeToolName(tool.toolName)}</span>
+      <span className="min-w-0 truncate font-mono text-[11px] text-fg-muted">
+        {toolInputPreview(tool.input)}
+      </span>
+    </div>
+  );
+}
+
+function StageChatView({
+  turns,
+  pendingTools,
+  stage,
+}: {
+  turns: TurnType[];
+  pendingTools: PendingToolCall[];
+  stage: Stage;
+}) {
+  const items = useMemo(() => buildChatItems(turns), [turns]);
+  const stageActive = ACTIVE_STAGE_STATES.has(stage.status);
+  const lastIndex = items.length - 1;
+  return (
+    <div className="mx-auto flex w-full max-w-2xl flex-col gap-4 px-5">
+      {items.length === 0 && !stageActive && (
+        <p className="py-6 text-sm text-fg-muted">
+          No agent activity recorded for this stage.
+        </p>
+      )}
+      {items.map((item, i) => {
+        if (item.kind === "tools") {
+          return <ChatToolsChip key={`tools-${item.ts}-${i}`} item={item} />;
+        }
+        const { turn, turnIndex } = item;
+        switch (turn.kind) {
+          case "system":
+          case "steer":
+          case "pair_user":
+            return <ChatUserCard key={`turn-${turnIndex}`} content={turn.content} />;
+          case "pair_system":
+            return (
+              <p
+                key={`turn-${turnIndex}`}
+                className="whitespace-pre-wrap text-xs text-fg-muted"
+              >
+                {turn.content}
+              </p>
+            );
+          case "interrupt":
+            return (
+              <p key={`turn-${turnIndex}`} className="text-xs text-coral">
+                {turn.content}
+              </p>
+            );
+          case "assistant": {
+            const metric = turnMetric(turn);
+            const isFinal = i === lastIndex && !stageActive;
+            return (
+              <div key={`turn-${turnIndex}`} className="flex flex-col gap-1.5">
+                <Markdown content={turn.content} />
+                {isFinal && metric && (
+                  <div className="flex gap-3 font-mono text-[11px] tabular-nums text-fg-muted">
+                    <span>{metric}</span>
+                    {stage.duration !== "--" && <span>{stage.duration}</span>}
+                  </div>
+                )}
+              </div>
+            );
+          }
+          case "tool":
+          case "command":
+            return null;
+        }
+      })}
+      {stageActive &&
+        pendingTools.map((tool, i) => (
+          <ChatLiveToolLine key={`pending-${tool.toolName}-${i}`} tool={tool} />
+        ))}
+    </div>
   );
 }
 
@@ -1486,6 +1679,7 @@ function StageActivityBody({
   contextData,
   runEvents,
   stages,
+  pendingTools,
 }: {
   effectiveTab: EventsTab;
   renderer: StageRenderer;
@@ -1505,10 +1699,17 @@ function StageActivityBody({
   contextData: ReturnType<typeof extractStageContext>;
   runEvents: EventEnvelope[];
   stages: Stage[];
+  pendingTools: PendingToolCall[];
 }) {
   return (
     <div className="min-h-0 flex-1 overflow-y-auto pt-6 pb-[calc(1.5rem+var(--fabro-interview-dock-clearance,0px))]">
-      {effectiveTab === "primary" ? (
+      {effectiveTab === "chat" ? (
+        <StageChatView
+          turns={turns}
+          pendingTools={pendingTools}
+          stage={selectedStage}
+        />
+      ) : effectiveTab === "primary" ? (
         renderer === "agent" ? (
           turns.length > 0 && filteredTurns.length === 0 ? (
             <div className="px-2 py-6 text-sm text-fg-muted">
@@ -1727,11 +1928,20 @@ function RunStageActivityStage({
     () => extractStageContext(debugEvents),
     [debugEvents],
   );
-  const availableTabs = useMemo<EventsTab[]>(
-    () => (contextData ? [...EVENTS_TABS] : ["primary", "debug"]),
-    [contextData],
-  );
+  const availableTabs = useMemo<EventsTab[]>(() => {
+    const tabs: EventsTab[] = renderer === "agent" ? ["chat", "primary"] : ["primary"];
+    if (contextData) tabs.push("context");
+    tabs.push("debug");
+    return tabs;
+  }, [renderer, contextData]);
   const effectiveTab: EventsTab = availableTabs.includes(tab) ? tab : "primary";
+  const pendingTools = useMemo<PendingToolCall[]>(
+    () =>
+      effectiveTab === "chat"
+        ? pendingToolCalls(stageEventsQuery.data ?? [], selectedStageId)
+        : [],
+    [effectiveTab, stageEventsQuery.data, selectedStageId],
+  );
 
   return (
     <>
@@ -1815,6 +2025,7 @@ function RunStageActivityStage({
           contextData={contextData}
           runEvents={runEventsQuery.data ?? []}
           stages={stages}
+          pendingTools={pendingTools}
         />
       </div>
 

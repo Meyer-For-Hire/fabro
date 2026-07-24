@@ -2,11 +2,13 @@ import { describe, expect, test } from "bun:test";
 import type { EventEnvelope } from "@qltysh/fabro-api-client";
 
 import {
+  buildChatItems,
   buildThreadDnaItems,
   eventsTabLabel,
   eventsToActivity,
   formatStageModelUsageLabel,
   groupConsecutiveTools,
+  pendingToolCalls,
   selectStageRenderer,
 } from "./run-stages";
 
@@ -651,6 +653,108 @@ describe("eventsTabLabel", () => {
     expect(eventsTabLabel("primary", "fan_in")).toBe("Results");
     expect(eventsTabLabel("primary", "wait")).toBe("Status");
     expect(eventsTabLabel("primary", "summary")).toBe("Summary");
+  });
+
+  test("uses Chat for the chat tab", () => {
+    expect(eventsTabLabel("chat", "agent")).toBe("Chat");
+  });
+});
+
+describe("buildChatItems", () => {
+  const TS = "2026-04-09T12:00:00Z";
+
+  function assistant(content: string) {
+    return { kind: "assistant" as const, ts: TS, content, inputTokens: 0, outputTokens: 0 };
+  }
+
+  function tool(toolName: string, isError = false) {
+    return {
+      kind: "tool" as const,
+      ts: TS,
+      toolName,
+      input: "{}",
+      result: "",
+      isError,
+      durationMs: 5,
+    };
+  }
+
+  test("merges consecutive tool turns into one count regardless of tool name", () => {
+    const items = buildChatItems([
+      assistant("reading files"),
+      tool("read_file"),
+      tool("shell"),
+      tool("grep"),
+      assistant("done"),
+    ]);
+    expect(items).toEqual([
+      { kind: "turn", turn: assistant("reading files"), turnIndex: 0 },
+      { kind: "tools", ts: TS, count: 3, errored: 0 },
+      { kind: "turn", turn: assistant("done"), turnIndex: 4 },
+    ]);
+  });
+
+  test("errored calls stay in the batch and are counted", () => {
+    const items = buildChatItems([tool("shell"), tool("shell", true), tool("read_file")]);
+    expect(items).toEqual([{ kind: "tools", ts: TS, count: 3, errored: 1 }]);
+  });
+
+  test("non-tool turns break tool batches", () => {
+    const steer = { kind: "steer" as const, ts: TS, content: "focus on the API" };
+    const items = buildChatItems([tool("shell"), steer, tool("shell")]);
+    expect(items).toEqual([
+      { kind: "tools", ts: TS, count: 1, errored: 0 },
+      { kind: "turn", turn: steer, turnIndex: 1 },
+      { kind: "tools", ts: TS, count: 1, errored: 0 },
+    ]);
+  });
+});
+
+describe("pendingToolCalls", () => {
+  test("returns started-but-not-completed calls for the stage", () => {
+    const events: EventEnvelope[] = [
+      envelope(1, {
+        event: "agent.tool.started",
+        stage_id: "plan@1",
+        node_id: "plan",
+        properties: {
+          tool_call_id: "call-1",
+          tool_name: "shell",
+          arguments: { command: "cargo build" },
+        },
+      }),
+      envelope(2, {
+        event: "agent.tool.started",
+        stage_id: "plan@1",
+        node_id: "plan",
+        properties: {
+          tool_call_id: "call-2",
+          tool_name: "read_file",
+          arguments: { file_path: "/tmp/x" },
+        },
+      }),
+      envelope(3, {
+        event: "agent.tool.completed",
+        stage_id: "plan@1",
+        node_id: "plan",
+        properties: { tool_call_id: "call-1", output: "ok" },
+      }),
+    ];
+    expect(pendingToolCalls(events, "plan@1")).toEqual([
+      { toolName: "read_file", input: JSON.stringify({ file_path: "/tmp/x" }) },
+    ]);
+  });
+
+  test("ignores events from other stage visits", () => {
+    const events: EventEnvelope[] = [
+      envelope(1, {
+        event: "agent.tool.started",
+        stage_id: "plan@2",
+        node_id: "plan",
+        properties: { tool_call_id: "call-1", tool_name: "shell", arguments: {} },
+      }),
+    ];
+    expect(pendingToolCalls(events, "plan@1")).toEqual([]);
   });
 });
 
