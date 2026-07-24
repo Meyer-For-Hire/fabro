@@ -139,22 +139,23 @@ async fn create_completion(
         let msg_id = Ulid::new().to_string();
 
         if let Some(schema) = req.schema {
-            // Structured output uses generate_object for JSON parsing logic
-            let mut params =
-                GenerateParams::new(&request.model, std::sync::Arc::new(client.clone()))
-                    .messages(request.messages);
-            if let Some(ref p) = request.provider {
-                params = params.provider(p);
-            }
-            if let Some(temp) = request.temperature {
-                params = params.temperature(temp);
-            }
-            if let Some(max_tokens) = request.max_tokens {
-                params = params.max_tokens(max_tokens);
-            }
-            if let Some(top_p) = request.top_p {
-                params = params.top_p(top_p);
-            }
+            // Structured output uses generate_object for JSON parsing logic.
+            // tools/tool_choice are not forwarded: GenerateParams carries
+            // executable Arc<Tool>s, not wire ToolDefinitions, and
+            // generate_object sets response_format from the schema itself.
+            let params = GenerateParams {
+                messages: Some(request.messages),
+                provider: request.provider,
+                temperature: request.temperature,
+                top_p: request.top_p,
+                max_tokens: request.max_tokens,
+                stop_sequences: request.stop_sequences,
+                reasoning_effort: request.reasoning_effort,
+                speed: request.speed,
+                metadata: request.metadata,
+                provider_options: request.provider_options,
+                ..GenerateParams::new(request.model, std::sync::Arc::new(client.clone()))
+            };
             match generate_object(params, schema).await {
                 Ok(result) => {
                     // `result.finish_reason` / `result.usage` resolve through

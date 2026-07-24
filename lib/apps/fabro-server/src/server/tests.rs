@@ -15369,6 +15369,72 @@ reasoning = false
 }
 
 #[tokio::test]
+async fn create_completion_structured_output_forwards_reasoning_effort() {
+    let upstream = MockServer::start();
+    let completion = upstream.mock(|when, then| {
+        when.method(POST)
+            .path("/chat/completions")
+            .json_body_includes(r#"{"model":"kimi-k3","reasoning_effort":"high"}"#);
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(json!({
+                "id": "chatcmpl-kimi-structured",
+                "model": "kimi-k3",
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "{\"answer\":42}"
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 4,
+                    "total_tokens": 14
+                }
+            }));
+    });
+    let state = TestAppStateBuilder::new()
+        .provider_base_url("kimi", upstream.base_url())
+        .vault_entries([(EnvVars::KIMI_API_KEY, "test-kimi-api-key")])
+        .build();
+    let app = crate::test_support::build_test_router(state);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri(api("/completions"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "provider": "kimi",
+                "model": "kimi-k3",
+                "reasoning_effort": "high",
+                "stream": false,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "answer": {"type": "integer"}
+                    },
+                    "required": ["answer"]
+                },
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{"kind": "text", "data": "Return the answer."}]
+                    }
+                ]
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let response = app.oneshot(req).await.unwrap();
+    let body = response_json!(response, StatusCode::OK).await;
+    assert_eq!(body["output"], json!({"answer": 42}));
+    completion.assert();
+}
+
+#[tokio::test]
 async fn demo_list_runs_returns_run_list_items() {
     let state = test_app_state();
     let app = crate::test_support::build_test_router(state);
