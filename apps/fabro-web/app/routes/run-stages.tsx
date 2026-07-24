@@ -1,4 +1,4 @@
-import { useMemo, useReducer, useState } from "react";
+import { useId, useMemo, useReducer, useState } from "react";
 import { Link, useParams } from "react-router";
 import {
   ArrowDownTrayIcon,
@@ -6,7 +6,6 @@ import {
   ChevronRightIcon,
   ClipboardDocumentIcon,
   CpuChipIcon,
-  WrenchScrewdriverIcon,
 } from "@heroicons/react/16/solid";
 import { CircleStackIcon, ClockIcon } from "@heroicons/react/20/solid";
 
@@ -33,7 +32,8 @@ import { StageContext } from "../components/stage-context";
 import { StageInsightsSidebar } from "../components/stage-insights-sidebar";
 import { StageSidebar } from "../components/stage-sidebar";
 import type { Stage } from "../components/stage-sidebar";
-import { EmptyState } from "../components/state";
+import { EmptyState, Spinner } from "../components/state";
+import { ToolCallCount } from "../components/tool-call-count";
 import {
   HoverCard,
   PopoverHeader,
@@ -60,6 +60,7 @@ import {
   formatDurationMs,
   formatTokenCount,
 } from "../lib/format";
+import { plural } from "../lib/plural";
 import {
   useRun,
   useRunEventsList,
@@ -228,12 +229,26 @@ interface PendingTool {
   input: string;
 }
 
+export interface PendingToolCall {
+  toolCallId: string;
+  toolName: string;
+  input: string;
+}
+
+interface StageActivity {
+  turns: TurnType[];
+  pendingTools: PendingToolCall[];
+}
+
 interface PendingCommand {
   ts: string;
   script: string;
 }
 
-export function eventsToActivity(events: EventEnvelope[], stageId: string): TurnType[] {
+export function buildStageActivity(
+  events: EventEnvelope[],
+  stageId: string,
+): StageActivity {
   const turns: TurnType[] = [];
   const pendingTools = new Map<string, PendingTool>();
   let pendingCommand: PendingCommand | undefined;
@@ -315,6 +330,7 @@ export function eventsToActivity(events: EventEnvelope[], stageId: string): Turn
       }
       case "agent.tool.started": {
         const callId = getString(props, "tool_call_id") ?? e.tool_call_id ?? "";
+        if (!callId) break;
         const args = props.arguments ?? e.arguments;
         pendingTools.set(callId, {
           ts: e.ts,
@@ -325,6 +341,7 @@ export function eventsToActivity(events: EventEnvelope[], stageId: string): Turn
       }
       case "agent.tool.completed": {
         const callId = getString(props, "tool_call_id") ?? e.tool_call_id ?? "";
+        if (!callId) break;
         const started = pendingTools.get(callId);
         pendingTools.delete(callId);
         const output = props.output ?? e.output ?? "";
@@ -377,37 +394,18 @@ export function eventsToActivity(events: EventEnvelope[], stageId: string): Turn
     });
   }
 
-  return turns;
+  return {
+    turns,
+    pendingTools: Array.from(pendingTools, ([toolCallId, tool]) => ({
+      toolCallId,
+      toolName: tool.toolName,
+      input: tool.input,
+    })),
+  };
 }
 
-export interface PendingToolCall {
-  toolName: string;
-  input: string;
-}
-
-// Tool calls that have started but not completed. The Thread view's
-// `eventsToActivity` drops these (a tool turn only exists once its result
-// arrives); the Chat view shows them as a live "working" line.
-export function pendingToolCalls(
-  events: EventEnvelope[],
-  stageId: string,
-): PendingToolCall[] {
-  const pending = new Map<string, PendingToolCall>();
-  for (const e of events) {
-    if (activityEventStageId(e) !== stageId) continue;
-    const props: UnknownRecord = e.properties ?? {};
-    const callId = getString(props, "tool_call_id") ?? e.tool_call_id ?? "";
-    if (e.event === "agent.tool.started") {
-      const args = props.arguments ?? e.arguments;
-      pending.set(callId, {
-        toolName: getString(props, "tool_name") ?? e.tool_name ?? "",
-        input: typeof args === "string" ? args : JSON.stringify(args ?? ""),
-      });
-    } else if (e.event === "agent.tool.completed") {
-      pending.delete(callId);
-    }
-  }
-  return Array.from(pending.values());
+export function eventsToActivity(events: EventEnvelope[], stageId: string): TurnType[] {
+  return buildStageActivity(events, stageId).turns;
 }
 
 type ToolTurn = Extract<TurnType, { kind: "tool" }>;
@@ -422,19 +420,21 @@ export type DisplayItem =
       children: { turn: ToolTurn; turnIndex: number }[];
     };
 
+type ChatTurn = Exclude<TurnType, ToolTurn | CommandTurn>;
+
 // The Chat view's projection: messages stay individual turns while
-// consecutive tool/command turns (regardless of tool name) merge into one
-// count. Unlike `groupConsecutiveTools`, errored calls stay in the batch —
-// the chip reports them as a count instead of breaking the group.
+// consecutive tool turns (regardless of tool name) merge into one count.
+// Unlike `groupConsecutiveTools`, errored calls stay in the batch — the chip
+// reports them as a count instead of breaking the group.
 export type ChatItem =
-  | { kind: "turn"; turn: TurnType; turnIndex: number }
+  | { kind: "turn"; turn: ChatTurn; turnIndex: number }
   | { kind: "tools"; ts: string; count: number; errored: number };
 
 export function buildChatItems(turns: TurnType[]): ChatItem[] {
   const out: ChatItem[] = [];
   turns.forEach((turn, turnIndex) => {
-    if (turn.kind === "tool" || turn.kind === "command") {
-      const errored = turn.kind === "tool" && turn.isError ? 1 : 0;
+    if (turn.kind === "tool") {
+      const errored = turn.isError ? 1 : 0;
       const last = out[out.length - 1];
       if (last?.kind === "tools") {
         last.count += 1;
@@ -444,6 +444,7 @@ export function buildChatItems(turns: TurnType[]): ChatItem[] {
       }
       return;
     }
+    if (turn.kind === "command") return;
     out.push({ kind: "turn", turn, turnIndex });
   });
   return out;
@@ -1228,43 +1229,34 @@ const CHAT_PROMPT_PREVIEW_CHARS = 280;
 // content renders as markdown.
 function ChatUserCard({ content }: { content: string }) {
   const [expanded, setExpanded] = useState(false);
+  const contentId = useId();
   const isLong = content.length > CHAT_PROMPT_PREVIEW_CHARS;
   return (
-    <div className="ml-auto w-fit max-w-[85%] rounded-2xl rounded-br-md bg-panel px-4 py-3">
-      {expanded ? (
-        <Markdown content={content} />
-      ) : (
-        <p className="whitespace-pre-wrap text-sm text-fg-2">
-          {isLong
-            ? `${content.slice(0, CHAT_PROMPT_PREVIEW_CHARS).trimEnd()}…`
-            : content}
-        </p>
-      )}
+    <div className="flex w-fit max-w-[85%] flex-col items-start gap-1.5 self-end rounded-2xl rounded-br-md bg-panel px-4 py-3">
+      <div id={contentId}>
+        {expanded ? (
+          <Markdown content={content} />
+        ) : (
+          <p className="text-sm whitespace-pre-wrap text-fg-2">
+            {isLong
+              ? `${content.slice(0, CHAT_PROMPT_PREVIEW_CHARS).trimEnd()}…`
+              : content}
+          </p>
+        )}
+      </div>
       {isLong && (
         <button
           type="button"
-          onClick={() => setExpanded((v) => !v)}
-          className="mt-1.5 text-xs text-teal-500 hover:underline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-teal-500"
+          aria-controls={contentId}
+          aria-expanded={expanded}
+          onClick={() => setExpanded((current) => !current)}
+          className="text-xs text-teal-500 hover:underline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-teal-500"
         >
-          {expanded ? "Collapse" : `Show all (${formatBytes(content.length)})`}
+          {expanded
+            ? "Collapse"
+            : `Show all (${content.length.toLocaleString()} characters)`}
         </button>
       )}
-    </div>
-  );
-}
-
-function ChatToolsChip({ item }: { item: Extract<ChatItem, { kind: "tools" }> }) {
-  return (
-    <div className="inline-flex items-center gap-1.5 text-xs text-fg-muted">
-      <WrenchScrewdriverIcon className="size-3.5" aria-hidden="true" />
-      <span>
-        {item.count} tool {item.count === 1 ? "call" : "calls"}
-        {item.errored > 0 && (
-          <span className="text-coral">
-            , {item.errored} with {item.errored === 1 ? "an error" : "errors"}
-          </span>
-        )}
-      </span>
     </div>
   );
 }
@@ -1272,10 +1264,7 @@ function ChatToolsChip({ item }: { item: Extract<ChatItem, { kind: "tools" }> })
 function ChatLiveToolLine({ tool }: { tool: PendingToolCall }) {
   return (
     <div className="flex items-center gap-2.5 text-xs">
-      <span
-        className="size-3 shrink-0 animate-spin rounded-full border-2 border-overlay-strong border-t-teal-500 motion-reduce:animate-none"
-        aria-hidden="true"
-      />
+      <Spinner className="size-3 text-teal-500" />
       <span className="shrink-0 text-fg-3">{humanizeToolName(tool.toolName)}</span>
       <span className="min-w-0 truncate font-mono text-[11px] text-fg-muted">
         {toolInputPreview(tool.input)}
@@ -1284,20 +1273,30 @@ function ChatLiveToolLine({ tool }: { tool: PendingToolCall }) {
   );
 }
 
-function StageChatView({
+export function StageChatView({
   turns,
   pendingTools,
   stage,
+  className = "",
 }: {
   turns: TurnType[];
   pendingTools: PendingToolCall[];
   stage: Stage;
+  className?: string;
 }) {
   const items = useMemo(() => buildChatItems(turns), [turns]);
   const stageActive = ACTIVE_STAGE_STATES.has(stage.status);
-  const lastIndex = items.length - 1;
+  const duration = stage.duration === "--" ? null : stage.duration;
+  let lastAssistantTurnIndex: number | null = null;
+  for (let i = items.length - 1; i >= 0; i -= 1) {
+    const item = items[i];
+    if (item.kind === "turn" && item.turn.kind === "assistant") {
+      lastAssistantTurnIndex = item.turnIndex;
+      break;
+    }
+  }
   return (
-    <div className="mx-auto flex w-full max-w-2xl flex-col gap-4 px-5">
+    <div className={`flex w-full max-w-2xl flex-col gap-4 px-5 ${className}`}>
       {items.length === 0 && !stageActive && (
         <p className="py-6 text-sm text-fg-muted">
           No agent activity recorded for this stage.
@@ -1305,7 +1304,13 @@ function StageChatView({
       )}
       {items.map((item, i) => {
         if (item.kind === "tools") {
-          return <ChatToolsChip key={`tools-${item.ts}-${i}`} item={item} />;
+          return (
+            <ToolCallCount
+              key={`tools-${item.ts}-${i}`}
+              count={item.count}
+              errored={item.errored}
+            />
+          );
         }
         const { turn, turnIndex } = item;
         switch (turn.kind) {
@@ -1317,7 +1322,7 @@ function StageChatView({
             return (
               <p
                 key={`turn-${turnIndex}`}
-                className="whitespace-pre-wrap text-xs text-fg-muted"
+                className="text-xs whitespace-pre-wrap text-fg-muted"
               >
                 {turn.content}
               </p>
@@ -1330,28 +1335,33 @@ function StageChatView({
             );
           case "assistant": {
             const metric = turnMetric(turn);
-            const isFinal = i === lastIndex && !stageActive;
+            const isFinal =
+              turnIndex === lastAssistantTurnIndex && !stageActive;
             return (
               <div key={`turn-${turnIndex}`} className="flex flex-col gap-1.5">
                 <Markdown content={turn.content} />
-                {isFinal && metric && (
-                  <div className="flex gap-3 font-mono text-[11px] tabular-nums text-fg-muted">
-                    <span>{metric}</span>
-                    {stage.duration !== "--" && <span>{stage.duration}</span>}
+                {isFinal && (metric || duration) && (
+                  <div className="flex gap-3 font-mono text-[11px] text-fg-muted tabular-nums">
+                    {metric && <span>{metric}</span>}
+                    {duration && <span>{duration}</span>}
                   </div>
                 )}
               </div>
             );
           }
-          case "tool":
-          case "command":
-            return null;
         }
       })}
-      {stageActive &&
-        pendingTools.map((tool, i) => (
-          <ChatLiveToolLine key={`pending-${tool.toolName}-${i}`} tool={tool} />
-        ))}
+      {stageActive && pendingTools.length > 0 && (
+        <div role="status" aria-live="polite" className="flex flex-col gap-2.5">
+          <span className="sr-only">
+            {pendingTools.length} tool{" "}
+            {plural(pendingTools.length, "call", "calls")} in progress
+          </span>
+          {pendingTools.map((tool) => (
+            <ChatLiveToolLine key={tool.toolCallId} tool={tool} />
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -1663,7 +1673,7 @@ function EventsToolbar({
 function StageActivityBody({
   effectiveTab,
   renderer,
-  turns,
+  activity,
   filteredTurns,
   displayItems,
   panelSelection,
@@ -1679,11 +1689,10 @@ function StageActivityBody({
   contextData,
   runEvents,
   stages,
-  pendingTools,
 }: {
   effectiveTab: EventsTab;
   renderer: StageRenderer;
-  turns: TurnType[];
+  activity: StageActivity;
   filteredTurns: { turn: TurnType; index: number }[];
   displayItems: DisplayItem[];
   panelSelection: PanelSelection | null;
@@ -1699,15 +1708,17 @@ function StageActivityBody({
   contextData: ReturnType<typeof extractStageContext>;
   runEvents: EventEnvelope[];
   stages: Stage[];
-  pendingTools: PendingToolCall[];
 }) {
+  const { turns, pendingTools } = activity;
   return (
     <div className="min-h-0 flex-1 overflow-y-auto pt-6 pb-[calc(1.5rem+var(--fabro-interview-dock-clearance,0px))]">
       {effectiveTab === "chat" ? (
         <StageChatView
+          key={selectedStage.id}
           turns={turns}
           pendingTools={pendingTools}
           stage={selectedStage}
+          className="mx-auto"
         />
       ) : effectiveTab === "primary" ? (
         renderer === "agent" ? (
@@ -1833,27 +1844,54 @@ function RunStageActivityStage({
 }) {
   const selectedStageId = selectedStage.id;
   const stageEventsQuery = useRunStageEvents(runId, selectedStageId);
-  const turns = useMemo(
-    () => eventsToActivity(stageEventsQuery.data ?? [], selectedStageId),
+  const activity = useMemo(
+    () => buildStageActivity(stageEventsQuery.data ?? [], selectedStageId),
     [stageEventsQuery.data, selectedStageId],
   );
+  const { turns } = activity;
   const renderer: StageRenderer = selectStageRenderer(selectedStage.handler);
+  const debugEvents = useMemo<EventEnvelope[]>(() => {
+    return (stageEventsQuery.data ?? []).filter(
+      (event) => activityEventStageId(event) === selectedStageId,
+    );
+  }, [stageEventsQuery.data, selectedStageId]);
+  // The Context tab surfaces the workflow's deliberate per-visit outputs. It
+  // only exists when the stage completed and actually wrote something.
+  const contextData = useMemo(
+    () => extractStageContext(debugEvents),
+    [debugEvents],
+  );
+  const availableTabs = useMemo<EventsTab[]>(
+    () =>
+      EVENTS_TABS.filter((candidate) => {
+        if (candidate === "chat") return renderer === "agent";
+        if (candidate === "context") return contextData != null;
+        return true;
+      }),
+    [renderer, contextData],
+  );
+  const effectiveTab: EventsTab = availableTabs.includes(tab) ? tab : "primary";
+  const isPrimaryAgent = effectiveTab === "primary" && renderer === "agent";
+  const isDebug = effectiveTab === "debug";
+
   // Some renderers need run-scoped events (e.g. conditional renders the
   // engine-level edge.selected event, which has no stage_id). Only fetch when
   // the active renderer actually needs it to keep this off the hot path.
   const needsRunEvents = renderer === "conditional";
   const runEventsQuery = useRunEventsList(needsRunEvents ? runId : undefined);
   const commandTurn = useMemo<CommandTurn | null>(() => {
+    if (effectiveTab !== "primary" || renderer !== "command") return null;
     for (let i = turns.length - 1; i >= 0; i -= 1) {
       const t = turns[i];
       if (t.kind === "command") return t;
     }
     return null;
-  }, [turns]);
+  }, [effectiveTab, renderer, turns]);
 
   const [panelSelection, setPanelSelection] = useState<PanelSelection | null>(null);
   const [openDebugSeq, setOpenDebugSeq] = useState<number | null>(null);
   const filteredTurns = useMemo<{ turn: TurnType; index: number }[]>(() => {
+    if (!isPrimaryAgent) return [];
     const kindSet = new Set(selectedKinds);
     const needle = search.toLowerCase();
     const out: { turn: TurnType; index: number }[] = [];
@@ -1863,20 +1901,22 @@ function RunStageActivityStage({
       out.push({ turn, index: i });
     });
     return out;
-  }, [turns, selectedKinds, search]);
+  }, [isPrimaryAgent, turns, selectedKinds, search]);
   const displayItems = useMemo(
-    () => groupConsecutiveTools(filteredTurns),
-    [filteredTurns],
+    () => (isPrimaryAgent ? groupConsecutiveTools(filteredTurns) : []),
+    [isPrimaryAgent, filteredTurns],
   );
   const threadDnaItems = useMemo(
-    () => buildThreadDnaItems(displayItems, runStart),
-    [displayItems, runStart],
+    () => (isPrimaryAgent ? buildThreadDnaItems(displayItems, runStart) : []),
+    [isPrimaryAgent, displayItems, runStart],
   );
 
   const openTurn =
-    panelSelection?.kind === "single" ? turns[panelSelection.turnIndex] ?? null : null;
+    isPrimaryAgent && panelSelection?.kind === "single"
+      ? turns[panelSelection.turnIndex] ?? null
+      : null;
   const openGroup = useMemo<Extract<DisplayItem, { kind: "group" }> | null>(() => {
-    if (panelSelection?.kind !== "group") return null;
+    if (!isPrimaryAgent || panelSelection?.kind !== "group") return null;
     const wanted = panelSelection.childTurnIndices;
     for (const item of displayItems) {
       if (item.kind !== "group") continue;
@@ -1886,28 +1926,24 @@ function RunStageActivityStage({
       if (matches) return item;
     }
     return null;
-  }, [displayItems, panelSelection]);
-
-  const debugEvents = useMemo<EventEnvelope[]>(() => {
-    return (stageEventsQuery.data ?? []).filter(
-      (e) => activityEventStageId(e) === selectedStageId,
-    );
-  }, [stageEventsQuery.data, selectedStageId]);
+  }, [isPrimaryAgent, displayItems, panelSelection]);
   const openDebugEvent = useMemo<EventEnvelope | null>(
     () =>
-      openDebugSeq != null
+      isDebug && openDebugSeq != null
         ? debugEvents.find((e) => e.seq === openDebugSeq) ?? null
         : null,
-    [debugEvents, openDebugSeq],
+    [isDebug, debugEvents, openDebugSeq],
   );
   const availableDebugCategories = useMemo<DebugCategory[]>(() => {
+    if (!isDebug) return [];
     const set = new Set<DebugCategory>();
     for (const event of debugEvents) {
       if (event.event) set.add(debugCategory(event.event));
     }
     return Array.from(set).sort();
-  }, [debugEvents]);
+  }, [isDebug, debugEvents]);
   const filteredDebugEvents = useMemo<EventEnvelope[]>(() => {
+    if (!isDebug) return [];
     const useCategoryFilter = selectedDebugCategories.length > 0;
     const cats = new Set(selectedDebugCategories);
     const needle = search.toLowerCase();
@@ -1920,28 +1956,7 @@ function RunStageActivityStage({
       }
       return true;
     });
-  }, [debugEvents, selectedDebugCategories, search]);
-
-  // The Context tab surfaces the workflow's deliberate per-visit outputs. It
-  // only exists when the stage completed and actually wrote something.
-  const contextData = useMemo(
-    () => extractStageContext(debugEvents),
-    [debugEvents],
-  );
-  const availableTabs = useMemo<EventsTab[]>(() => {
-    const tabs: EventsTab[] = renderer === "agent" ? ["chat", "primary"] : ["primary"];
-    if (contextData) tabs.push("context");
-    tabs.push("debug");
-    return tabs;
-  }, [renderer, contextData]);
-  const effectiveTab: EventsTab = availableTabs.includes(tab) ? tab : "primary";
-  const pendingTools = useMemo<PendingToolCall[]>(
-    () =>
-      effectiveTab === "chat"
-        ? pendingToolCalls(stageEventsQuery.data ?? [], selectedStageId)
-        : [],
-    [effectiveTab, stageEventsQuery.data, selectedStageId],
-  );
+  }, [isDebug, debugEvents, selectedDebugCategories, search]);
 
   return (
     <>
@@ -2009,7 +2024,7 @@ function RunStageActivityStage({
         <StageActivityBody
           effectiveTab={effectiveTab}
           renderer={renderer}
-          turns={turns}
+          activity={activity}
           filteredTurns={filteredTurns}
           displayItems={displayItems}
           panelSelection={panelSelection}
@@ -2025,7 +2040,6 @@ function RunStageActivityStage({
           contextData={contextData}
           runEvents={runEventsQuery.data ?? []}
           stages={stages}
-          pendingTools={pendingTools}
         />
       </div>
 

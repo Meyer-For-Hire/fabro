@@ -85,7 +85,7 @@ export function LoadingState({ label }: { label?: string }) {
 export function Spinner({ className = "" }: { className?: string }) {
   return (
     <svg
-      className={`shrink-0 animate-spin ${className}`}
+      className={`shrink-0 animate-spin motion-reduce:animate-none ${className}`}
       viewBox="0 0 16 16"
       fill="none"
       aria-hidden="true"

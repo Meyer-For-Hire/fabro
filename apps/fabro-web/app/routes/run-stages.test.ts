@@ -3,12 +3,12 @@ import type { EventEnvelope } from "@qltysh/fabro-api-client";
 
 import {
   buildChatItems,
+  buildStageActivity,
   buildThreadDnaItems,
   eventsTabLabel,
   eventsToActivity,
   formatStageModelUsageLabel,
   groupConsecutiveTools,
-  pendingToolCalls,
   selectStageRenderer,
 } from "./run-stages";
 
@@ -21,6 +21,25 @@ function envelope(seq: number, partial: Partial<EventEnvelope>): EventEnvelope {
     event: "stage.prompt",
     ...partial,
   } as EventEnvelope;
+}
+
+function toolTurn(opts: {
+  ts: string;
+  toolName: string;
+  durationMs?: number;
+  isError?: boolean;
+  input?: string;
+  result?: string;
+}) {
+  return {
+    kind: "tool" as const,
+    ts: opts.ts,
+    toolName: opts.toolName,
+    input: opts.input ?? "",
+    result: opts.result ?? "",
+    isError: opts.isError ?? false,
+    durationMs: opts.durationMs ?? 0,
+  };
 }
 
 describe("eventsToActivity", () => {
@@ -465,26 +484,7 @@ describe("eventsToActivity", () => {
 describe("groupConsecutiveTools", () => {
   type Filtered = Parameters<typeof groupConsecutiveTools>[0];
 
-  function tool(opts: {
-    ts: string;
-    toolName: string;
-    durationMs?: number;
-    isError?: boolean;
-    input?: string;
-    result?: string;
-  }) {
-    return {
-      kind: "tool" as const,
-      ts: opts.ts,
-      toolName: opts.toolName,
-      input: opts.input ?? "",
-      result: opts.result ?? "",
-      isError: opts.isError ?? false,
-      durationMs: opts.durationMs ?? 0,
-    };
-  }
-
-  function entry(turn: ReturnType<typeof tool> | { kind: "system"; ts: string; content: string } | { kind: "assistant"; ts: string; content: string; inputTokens: number; outputTokens: number }, index: number): Filtered[number] {
+  function entry(turn: ReturnType<typeof toolTurn> | { kind: "system"; ts: string; content: string } | { kind: "assistant"; ts: string; content: string; inputTokens: number; outputTokens: number }, index: number): Filtered[number] {
     return { turn, index };
   }
 
@@ -493,15 +493,15 @@ describe("groupConsecutiveTools", () => {
   });
 
   test("single tool turn becomes a single, not a group", () => {
-    const t = tool({ ts: "2026-04-09T12:00:00Z", toolName: "shell", durationMs: 100 });
+    const t = toolTurn({ ts: "2026-04-09T12:00:00Z", toolName: "shell", durationMs: 100 });
     expect(groupConsecutiveTools([entry(t, 0)])).toEqual([
       { kind: "single", turn: t, turnIndex: 0 },
     ]);
   });
 
   test("two consecutive same-tool successes form a group of 2", () => {
-    const a = tool({ ts: "2026-04-09T12:00:00Z", toolName: "shell", durationMs: 1000 });
-    const b = tool({ ts: "2026-04-09T12:00:01Z", toolName: "shell", durationMs: 2000 });
+    const a = toolTurn({ ts: "2026-04-09T12:00:00Z", toolName: "shell", durationMs: 1000 });
+    const b = toolTurn({ ts: "2026-04-09T12:00:01Z", toolName: "shell", durationMs: 2000 });
     const result = groupConsecutiveTools([entry(a, 0), entry(b, 1)]);
     expect(result).toEqual([
       {
@@ -519,7 +519,7 @@ describe("groupConsecutiveTools", () => {
 
   test("five consecutive same-tool successes form one group; durations summed; ts is first", () => {
     const turns = [0, 1, 2, 3, 4].map((i) =>
-      tool({
+      toolTurn({
         ts: `2026-04-09T12:00:0${i}Z`,
         toolName: "shell",
         durationMs: (i + 1) * 1000,
@@ -538,11 +538,11 @@ describe("groupConsecutiveTools", () => {
   });
 
   test("a different tool between same-tool calls breaks the group boundary", () => {
-    const a = tool({ ts: "2026-04-09T12:00:00Z", toolName: "shell", durationMs: 1 });
-    const b = tool({ ts: "2026-04-09T12:00:01Z", toolName: "shell", durationMs: 1 });
-    const c = tool({ ts: "2026-04-09T12:00:02Z", toolName: "read_file", durationMs: 1 });
-    const d = tool({ ts: "2026-04-09T12:00:03Z", toolName: "shell", durationMs: 1 });
-    const e = tool({ ts: "2026-04-09T12:00:04Z", toolName: "shell", durationMs: 1 });
+    const a = toolTurn({ ts: "2026-04-09T12:00:00Z", toolName: "shell", durationMs: 1 });
+    const b = toolTurn({ ts: "2026-04-09T12:00:01Z", toolName: "shell", durationMs: 1 });
+    const c = toolTurn({ ts: "2026-04-09T12:00:02Z", toolName: "read_file", durationMs: 1 });
+    const d = toolTurn({ ts: "2026-04-09T12:00:03Z", toolName: "shell", durationMs: 1 });
+    const e = toolTurn({ ts: "2026-04-09T12:00:04Z", toolName: "shell", durationMs: 1 });
     const result = groupConsecutiveTools([
       entry(a, 0),
       entry(b, 1),
@@ -563,10 +563,10 @@ describe("groupConsecutiveTools", () => {
   });
 
   test("an errored tool call is never grouped and breaks the run", () => {
-    const a = tool({ ts: "2026-04-09T12:00:00Z", toolName: "shell" });
-    const errored = tool({ ts: "2026-04-09T12:00:01Z", toolName: "shell", isError: true });
-    const c = tool({ ts: "2026-04-09T12:00:02Z", toolName: "shell" });
-    const d = tool({ ts: "2026-04-09T12:00:03Z", toolName: "shell" });
+    const a = toolTurn({ ts: "2026-04-09T12:00:00Z", toolName: "shell" });
+    const errored = toolTurn({ ts: "2026-04-09T12:00:01Z", toolName: "shell", isError: true });
+    const c = toolTurn({ ts: "2026-04-09T12:00:02Z", toolName: "shell" });
+    const d = toolTurn({ ts: "2026-04-09T12:00:03Z", toolName: "shell" });
     const result = groupConsecutiveTools([
       entry(a, 0),
       entry(errored, 1),
@@ -583,8 +583,8 @@ describe("groupConsecutiveTools", () => {
   });
 
   test("non-tool turns flush the buffer correctly", () => {
-    const a = tool({ ts: "2026-04-09T12:00:00Z", toolName: "shell" });
-    const b = tool({ ts: "2026-04-09T12:00:01Z", toolName: "shell" });
+    const a = toolTurn({ ts: "2026-04-09T12:00:00Z", toolName: "shell" });
+    const b = toolTurn({ ts: "2026-04-09T12:00:01Z", toolName: "shell" });
     const msg = {
       kind: "assistant" as const,
       ts: "2026-04-09T12:00:02Z",
@@ -592,7 +592,7 @@ describe("groupConsecutiveTools", () => {
       inputTokens: 0,
       outputTokens: 0,
     };
-    const c = tool({ ts: "2026-04-09T12:00:03Z", toolName: "shell" });
+    const c = toolTurn({ ts: "2026-04-09T12:00:03Z", toolName: "shell" });
     const result = groupConsecutiveTools([
       entry(a, 0),
       entry(b, 1),
@@ -667,24 +667,22 @@ describe("buildChatItems", () => {
     return { kind: "assistant" as const, ts: TS, content, inputTokens: 0, outputTokens: 0 };
   }
 
-  function tool(toolName: string, isError = false) {
-    return {
-      kind: "tool" as const,
+  function chatTool(toolName: string, isError = false) {
+    return toolTurn({
       ts: TS,
       toolName,
       input: "{}",
-      result: "",
       isError,
       durationMs: 5,
-    };
+    });
   }
 
   test("merges consecutive tool turns into one count regardless of tool name", () => {
     const items = buildChatItems([
       assistant("reading files"),
-      tool("read_file"),
-      tool("shell"),
-      tool("grep"),
+      chatTool("read_file"),
+      chatTool("shell"),
+      chatTool("grep"),
       assistant("done"),
     ]);
     expect(items).toEqual([
@@ -695,22 +693,42 @@ describe("buildChatItems", () => {
   });
 
   test("errored calls stay in the batch and are counted", () => {
-    const items = buildChatItems([tool("shell"), tool("shell", true), tool("read_file")]);
+    const items = buildChatItems([
+      chatTool("shell"),
+      chatTool("shell", true),
+      chatTool("read_file"),
+    ]);
     expect(items).toEqual([{ kind: "tools", ts: TS, count: 3, errored: 1 }]);
   });
 
   test("non-tool turns break tool batches", () => {
     const steer = { kind: "steer" as const, ts: TS, content: "focus on the API" };
-    const items = buildChatItems([tool("shell"), steer, tool("shell")]);
+    const items = buildChatItems([chatTool("shell"), steer, chatTool("shell")]);
     expect(items).toEqual([
       { kind: "tools", ts: TS, count: 1, errored: 0 },
       { kind: "turn", turn: steer, turnIndex: 1 },
       { kind: "tools", ts: TS, count: 1, errored: 0 },
     ]);
   });
+
+  test("does not label command-stage activity as tool calls", () => {
+    expect(
+      buildChatItems([
+        {
+          kind: "command",
+          ts: TS,
+          script: "cargo build",
+          running: false,
+          exitCode: 0,
+          durationMs: 5,
+          outputBytes: 0,
+        },
+      ]),
+    ).toEqual([]);
+  });
 });
 
-describe("pendingToolCalls", () => {
+describe("buildStageActivity pending tools", () => {
   test("returns started-but-not-completed calls for the stage", () => {
     const events: EventEnvelope[] = [
       envelope(1, {
@@ -740,8 +758,12 @@ describe("pendingToolCalls", () => {
         properties: { tool_call_id: "call-1", output: "ok" },
       }),
     ];
-    expect(pendingToolCalls(events, "plan@1")).toEqual([
-      { toolName: "read_file", input: JSON.stringify({ file_path: "/tmp/x" }) },
+    expect(buildStageActivity(events, "plan@1").pendingTools).toEqual([
+      {
+        toolCallId: "call-2",
+        toolName: "read_file",
+        input: JSON.stringify({ file_path: "/tmp/x" }),
+      },
     ]);
   });
 
@@ -754,7 +776,77 @@ describe("pendingToolCalls", () => {
         properties: { tool_call_id: "call-1", tool_name: "shell", arguments: {} },
       }),
     ];
-    expect(pendingToolCalls(events, "plan@1")).toEqual([]);
+    expect(buildStageActivity(events, "plan@1").pendingTools).toEqual([]);
+  });
+
+  test("keeps stable identities for simultaneous calls with the same tool name", () => {
+    const events: EventEnvelope[] = [
+      envelope(1, {
+        event: "agent.tool.started",
+        stage_id: "plan@1",
+        properties: {
+          tool_call_id: "call-1",
+          tool_name: "shell",
+          arguments: { command: "cargo build" },
+        },
+      }),
+      envelope(2, {
+        event: "agent.tool.started",
+        stage_id: "plan@1",
+        properties: {
+          tool_call_id: "call-2",
+          tool_name: "shell",
+          arguments: { command: "cargo test" },
+        },
+      }),
+    ];
+
+    expect(buildStageActivity(events, "plan@1").pendingTools).toEqual([
+      {
+        toolCallId: "call-1",
+        toolName: "shell",
+        input: JSON.stringify({ command: "cargo build" }),
+      },
+      {
+        toolCallId: "call-2",
+        toolName: "shell",
+        input: JSON.stringify({ command: "cargo test" }),
+      },
+    ]);
+  });
+
+  test("ignores malformed tool events without a call id", () => {
+    const events: EventEnvelope[] = [
+      envelope(1, {
+        event: "agent.tool.started",
+        stage_id: "plan@1",
+        properties: { tool_name: "shell", arguments: { command: "ignored" } },
+      }),
+      envelope(2, {
+        event: "agent.tool.started",
+        stage_id: "plan@1",
+        properties: {
+          tool_call_id: "call-1",
+          tool_name: "shell",
+          arguments: { command: "kept" },
+        },
+      }),
+      envelope(3, {
+        event: "agent.tool.completed",
+        stage_id: "plan@1",
+        properties: { output: "must not clear call-1" },
+      }),
+    ];
+
+    const activity = buildStageActivity(events, "plan@1");
+    expect(activity.turns).toEqual([]);
+    expect(activity.pendingTools).toEqual([
+      {
+        toolCallId: "call-1",
+        toolName: "shell",
+        input: JSON.stringify({ command: "kept" }),
+      },
+    ]);
   });
 });
 
