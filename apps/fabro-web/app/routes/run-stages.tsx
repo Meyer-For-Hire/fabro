@@ -17,6 +17,7 @@ import {
   EventSearchInput,
   MultiSelectFilter,
   ThreadDnaStrip,
+  threadSelectionKey,
 } from "../components/event-debug";
 import {
   debugCategory,
@@ -81,7 +82,14 @@ type TurnType =
   | { kind: "interrupt"; ts: string; content: string }
   | { kind: "pair_user"; ts: string; content: string }
   | { kind: "pair_system"; ts: string; content: string }
-  | { kind: "assistant"; ts: string; content: string; inputTokens: number; outputTokens: number }
+  | {
+      kind: "assistant";
+      ts: string;
+      content: string;
+      inputTokens: number;
+      outputTokens: number;
+      toolCallCount: number | null;
+    }
   | { kind: "tool"; ts: string; toolName: string; input: string; result: string; isError: boolean; durationMs: number }
   | {
       kind: "command";
@@ -109,7 +117,7 @@ type PanelSelection = ThreadDnaSelection;
 
 const STAGE_ACTIVITY_EVENT_SET = new Set<string>(STAGE_ACTIVITY_EVENT_TYPES);
 
-const EVENT_KINDS = [
+export const EVENT_KINDS = [
   "system",
   "steer",
   "interrupt",
@@ -119,7 +127,7 @@ const EVENT_KINDS = [
   "tool",
   "command",
 ] as const;
-type EventKind = (typeof EVENT_KINDS)[number];
+export type EventKind = (typeof EVENT_KINDS)[number];
 
 const EVENT_KIND_LABEL: Record<EventKind, string> = {
   system: "System",
@@ -254,17 +262,18 @@ export function eventsToActivity(events: EventEnvelope[], stageId: string): Turn
         break;
       case "agent.message": {
         sawAssistantMessage = true;
-        const msg = getString(props, "text") ?? e.text ?? "";
-        if (msg) {
-          const billing = (props.billing ?? {}) as UnknownRecord;
-          turns.push({
-            kind: "assistant",
-            ts: e.ts,
-            content: msg,
-            inputTokens: getNumber(billing, "input_tokens") ?? 0,
-            outputTokens: getNumber(billing, "output_tokens") ?? 0,
-          });
-        }
+        // A text-free message still marks the end of a model response — it is
+        // the boundary between two batches of tool calls. Dropping it would
+        // splice unrelated batches into one tool group.
+        const billing = (props.billing ?? {}) as UnknownRecord;
+        turns.push({
+          kind: "assistant",
+          ts: e.ts,
+          content: getString(props, "text") ?? e.text ?? "",
+          inputTokens: getNumber(billing, "input_tokens") ?? 0,
+          outputTokens: getNumber(billing, "output_tokens") ?? 0,
+          toolCallCount: getNumber(props, "tool_call_count") ?? null,
+        });
         break;
       }
       case "prompt.completed": {
@@ -276,6 +285,7 @@ export function eventsToActivity(events: EventEnvelope[], stageId: string): Turn
             content: getString(props, "response") ?? "",
             inputTokens: getNumber(billing, "input_tokens") ?? 0,
             outputTokens: getNumber(billing, "output_tokens") ?? 0,
+            toolCallCount: null,
           });
         }
         break;
@@ -390,8 +400,49 @@ export type DisplayItem =
       children: { turn: ToolTurn; turnIndex: number }[];
     };
 
+// A group's elapsed time is the wall-clock envelope of its children —
+// earliest start to latest end — not the sum of their durations. Parallel
+// calls overlap, and completion order is not always start order, so neither
+// the summed duration nor the last array element is the right answer.
+export function toolGroupBounds(children: { turn: ToolTurn }[]): {
+  ts: string;
+  durationMs: number;
+} {
+  let earliestTs = children[0].turn.ts;
+  let earliestStart: number | null = null;
+  let latestEnd: number | null = null;
+
+  for (const { turn } of children) {
+    const startMs = Date.parse(turn.ts);
+    if (Number.isNaN(startMs)) continue;
+    const endMs = startMs + Math.max(0, turn.durationMs);
+    if (earliestStart == null || startMs < earliestStart) {
+      earliestStart = startMs;
+      earliestTs = turn.ts;
+    }
+    if (latestEnd == null || endMs > latestEnd) latestEnd = endMs;
+  }
+
+  if (earliestStart == null || latestEnd == null) {
+    return { ts: earliestTs, durationMs: 0 };
+  }
+  return { ts: earliestTs, durationMs: Math.max(0, latestEnd - earliestStart) };
+}
+
+export function displayItemSelection(item: DisplayItem): ThreadDnaSelection {
+  return item.kind === "single"
+    ? { kind: "single", turnIndex: item.turnIndex }
+    : {
+        kind: "group",
+        childTurnIndices: item.children.map((child) => child.turnIndex),
+      };
+}
+
+// Grouping runs over the complete turn stream, never a filtered one: any
+// non-tool turn is a real boundary whether or not the current filters make it
+// visible, and hiding one must not merge the tool batches on either side.
 export function groupConsecutiveTools(
-  filtered: { turn: TurnType; index: number }[],
+  turns: { turn: TurnType; index: number }[],
 ): DisplayItem[] {
   const out: DisplayItem[] = [];
   let buf: { turn: ToolTurn; turnIndex: number }[] = [];
@@ -401,20 +452,19 @@ export function groupConsecutiveTools(
     if (buf.length === 1) {
       out.push({ kind: "single", turn: buf[0].turn, turnIndex: buf[0].turnIndex });
     } else {
-      const first = buf[0].turn;
-      const totalMs = buf.reduce((sum, b) => sum + b.turn.durationMs, 0);
+      const bounds = toolGroupBounds(buf);
       out.push({
         kind: "group",
-        toolName: first.toolName,
-        ts: first.ts,
-        durationMs: totalMs,
+        toolName: buf[0].turn.toolName,
+        ts: bounds.ts,
+        durationMs: bounds.durationMs,
         children: buf,
       });
     }
     buf = [];
   }
 
-  for (const { turn, index } of filtered) {
+  for (const { turn, index } of turns) {
     const groupable = turn.kind === "tool" && !turn.isError;
     if (groupable && (buf.length === 0 || buf[0].turn.toolName === turn.toolName)) {
       buf.push({ turn, turnIndex: index });
@@ -431,15 +481,47 @@ export function groupConsecutiveTools(
   return out;
 }
 
-// Convert the event list / grouped tool view into bars for the Thread DNA
+// Hide display items that the kind filter or search excludes. This is purely
+// a visibility pass: it runs after grouping and after DNA timing, so it can
+// never change group membership, timestamps, or durations. A group survives
+// when Tool is selected and any child matches the search, and it is passed
+// through whole so its context is preserved.
+export function filterDisplayItems(
+  items: DisplayItem[],
+  selectedKinds: readonly EventKind[],
+  search: string,
+): DisplayItem[] {
+  const kinds = new Set<string>(selectedKinds);
+  const needle = search.toLowerCase();
+  const matchesSearch = (turn: TurnType) =>
+    !needle || searchableText(turn).toLowerCase().includes(needle);
+
+  return items.filter((item) => {
+    if (item.kind === "single") {
+      return kinds.has(item.turn.kind) && matchesSearch(item.turn);
+    }
+    return kinds.has("tool") && item.children.some((c) => matchesSearch(c.turn));
+  });
+}
+
+export function visibleTurnCount(items: DisplayItem[]): number {
+  return items.reduce(
+    (total, item) => total + (item.kind === "single" ? 1 : item.children.length),
+    0,
+  );
+}
+
+// Convert the complete grouped display list into bars for the Thread DNA
 // strip. Each bar carries the same selection identifier the event list uses,
 // so clicking a bar opens the same side-panel entry as clicking its row.
 //
 // Duration semantics:
 //   - tool / command turns use their explicit durationMs
-//   - tool groups span from the first child's start to the last child's end
-//   - assistant turns have no native duration; we treat the time from the
-//     previous activity's end to this message's ts as "thinking" time
+//   - tool groups use their wall-clock envelope (see toolGroupBounds)
+//   - assistant turns have no native duration; their bar covers the interval
+//     from the previous activity's end to the message's ts. That is the
+//     inferred model response time — provider queueing, network, streaming,
+//     and generation — not a reasoning trace.
 //   - system / steer / interrupt are instants (durationMs = 0)
 export function buildThreadDnaItems(
   items: DisplayItem[],
@@ -461,16 +543,19 @@ export function buildThreadDnaItems(
 
   const out: ThreadDnaItem[] = [];
   let prevEndMs: number | null = null;
+  // Overlapping or out-of-order tool completions must never move the
+  // previous-activity cursor backward, or the next Agent bar absorbs time
+  // that already belonged to a tool.
+  const advance = (endMs: number) => {
+    prevEndMs = prevEndMs == null ? endMs : Math.max(prevEndMs, endMs);
+  };
 
   for (const item of items) {
     if (item.kind === "single") {
       const turn = item.turn;
       const tsMs = Date.parse(turn.ts);
       if (Number.isNaN(tsMs)) continue;
-      const selection: ThreadDnaSelection = {
-        kind: "single",
-        turnIndex: item.turnIndex,
-      };
+      const selection = displayItemSelection(item);
 
       switch (turn.kind) {
         case "system":
@@ -481,7 +566,7 @@ export function buildThreadDnaItems(
             durationMs: 0,
             selection,
           });
-          prevEndMs = tsMs;
+          advance(tsMs);
           break;
         case "steer":
           out.push({
@@ -491,7 +576,7 @@ export function buildThreadDnaItems(
             durationMs: 0,
             selection,
           });
-          prevEndMs = tsMs;
+          advance(tsMs);
           break;
         case "interrupt":
           out.push({
@@ -501,7 +586,7 @@ export function buildThreadDnaItems(
             durationMs: 0,
             selection,
           });
-          prevEndMs = tsMs;
+          advance(tsMs);
           break;
         case "pair_user":
           out.push({
@@ -511,7 +596,7 @@ export function buildThreadDnaItems(
             durationMs: 0,
             selection,
           });
-          prevEndMs = tsMs;
+          advance(tsMs);
           break;
         case "pair_system":
           out.push({
@@ -521,12 +606,13 @@ export function buildThreadDnaItems(
             durationMs: 0,
             selection,
           });
-          prevEndMs = tsMs;
+          advance(tsMs);
           break;
         case "assistant": {
           // turn.ts is the moment the assistant message arrived (end of
-          // generation). Its bar represents the gap from the last activity
-          // to that moment, so the visual width approximates "thinking".
+          // generation). Its bar covers the gap from the last activity to
+          // that moment: the model's response time, tool-call-only responses
+          // included.
           const startSourceMs = prevEndMs ?? tsMs;
           const startMs = Math.max(0, startSourceMs - anchorMs);
           const durationMs = Math.max(0, tsMs - startSourceMs);
@@ -537,7 +623,7 @@ export function buildThreadDnaItems(
             durationMs,
             selection,
           });
-          prevEndMs = tsMs;
+          advance(tsMs);
           break;
         }
         case "tool": {
@@ -550,7 +636,7 @@ export function buildThreadDnaItems(
             durationMs,
             selection,
           });
-          prevEndMs = tsMs + durationMs;
+          advance(tsMs + durationMs);
           break;
         }
         case "command": {
@@ -563,29 +649,24 @@ export function buildThreadDnaItems(
             durationMs,
             selection,
           });
-          prevEndMs = tsMs + durationMs;
+          advance(tsMs + durationMs);
           break;
         }
       }
     } else {
-      const firstStart = Date.parse(item.ts);
-      const lastChild = item.children[item.children.length - 1].turn;
-      const lastEnd = Date.parse(lastChild.ts) + lastChild.durationMs;
-      if (Number.isNaN(firstStart) || Number.isNaN(lastEnd)) continue;
-
-      const startMs = Math.max(0, firstStart - anchorMs);
-      const durationMs = Math.max(0, lastEnd - firstStart);
+      // item.ts / item.durationMs are already the group's wall-clock
+      // envelope, so the row, the details header, and this bar all agree.
+      const startTsMs = Date.parse(item.ts);
+      if (Number.isNaN(startTsMs)) continue;
+      const durationMs = Math.max(0, item.durationMs);
       out.push({
         category: "tool",
         label: `${humanizeToolName(item.toolName)} ×${item.children.length}`,
-        startMs,
+        startMs: Math.max(0, startTsMs - anchorMs),
         durationMs,
-        selection: {
-          kind: "group",
-          childTurnIndices: item.children.map((c) => c.turnIndex),
-        },
+        selection: displayItemSelection(item),
       });
-      prevEndMs = lastEnd;
+      advance(startTsMs + durationMs);
     }
   }
 
@@ -706,8 +787,18 @@ export function turnSummary(turn: TurnType): string {
     case "interrupt":
     case "pair_user":
     case "pair_system":
-    case "assistant":
       return oneLine(turn.content);
+    case "assistant": {
+      const line = oneLine(turn.content);
+      if (line) return line;
+      // A model response that only requested tools has no text of its own;
+      // describe what it did instead of rendering a blank row.
+      const count = turn.toolCallCount ?? 0;
+      if (count > 0) {
+        return `Requested ${count} tool call${count === 1 ? "" : "s"}`;
+      }
+      return "Model response contained no text";
+    }
     case "tool":
       return humanizeToolName(turn.toolName);
     case "command":
@@ -748,8 +839,10 @@ export function searchableText(turn: TurnType): string {
     case "interrupt":
     case "pair_user":
     case "pair_system":
-    case "assistant":
       return turn.content;
+    case "assistant":
+      // Text-free responses are findable by the copy the thread shows.
+      return turn.content || turnSummary(turn);
     case "tool":
       return `${humanizeToolName(turn.toolName)} ${turn.toolName} ${turn.input} ${turn.result}`;
     case "command":
@@ -904,11 +997,33 @@ function EventDetails({
         turn.kind === "steer" ||
         turn.kind === "interrupt" ||
         turn.kind === "pair_user" ||
-        turn.kind === "pair_system" ||
-        turn.kind === "assistant") && (
+        turn.kind === "pair_system") && (
         <DetailField label="Content">
           <Markdown content={turn.content} />
         </DetailField>
+      )}
+
+      {turn.kind === "assistant" && (
+        <>
+          <DetailField label="Content">
+            {turn.content ? (
+              <Markdown content={turn.content} />
+            ) : (
+              <span className="text-fg-muted">{turnSummary(turn)}</span>
+            )}
+          </DetailField>
+          {turn.toolCallCount != null && turn.toolCallCount > 0 && (
+            <DetailField label="Tool calls" mono>
+              {turn.toolCallCount}
+            </DetailField>
+          )}
+          {(turn.inputTokens > 0 || turn.outputTokens > 0) && (
+            <DetailField label="Tokens" mono>
+              {formatTokenCount(turn.inputTokens)} in ·{" "}
+              {formatTokenCount(turn.outputTokens)} out
+            </DetailField>
+          )}
+        </>
       )}
 
       {turn.kind === "tool" && (
@@ -1471,8 +1586,7 @@ function StageActivityBody({
   effectiveTab,
   renderer,
   turns,
-  filteredTurns,
-  displayItems,
+  visibleItems,
   panelSelection,
   onPanelSelectionChange,
   runStart,
@@ -1490,8 +1604,7 @@ function StageActivityBody({
   effectiveTab: EventsTab;
   renderer: StageRenderer;
   turns: TurnType[];
-  filteredTurns: { turn: TurnType; index: number }[];
-  displayItems: DisplayItem[];
+  visibleItems: DisplayItem[];
   panelSelection: PanelSelection | null;
   onPanelSelectionChange: (selection: PanelSelection | null) => void;
   runStart: string | undefined;
@@ -1510,12 +1623,12 @@ function StageActivityBody({
     <div className="min-h-0 flex-1 overflow-y-auto pt-6 pb-[calc(1.5rem+var(--fabro-interview-dock-clearance,0px))]">
       {effectiveTab === "primary" ? (
         renderer === "agent" ? (
-          turns.length > 0 && filteredTurns.length === 0 ? (
+          turns.length > 0 && visibleItems.length === 0 ? (
             <div className="px-2 py-6 text-sm text-fg-muted">
               No events match these filters.
             </div>
           ) : (
-            displayItems.map((item) => {
+            visibleItems.map((item) => {
               if (item.kind === "single") {
                 return (
                   <EventRow
@@ -1652,28 +1765,35 @@ function RunStageActivityStage({
 
   const [panelSelection, setPanelSelection] = useState<PanelSelection | null>(null);
   const [openDebugSeq, setOpenDebugSeq] = useState<number | null>(null);
-  const filteredTurns = useMemo<{ turn: TurnType; index: number }[]>(() => {
-    const kindSet = new Set(selectedKinds);
-    const needle = search.toLowerCase();
-    const out: { turn: TurnType; index: number }[] = [];
-    turns.forEach((turn, i) => {
-      if (!kindSet.has(turn.kind)) return;
-      if (needle && !searchableText(turn).toLowerCase().includes(needle)) return;
-      out.push({ turn, index: i });
-    });
-    return out;
-  }, [turns, selectedKinds, search]);
+  // Semantics first, visibility second: grouping and DNA timing are derived
+  // from the complete turn stream, and the kind/search filters only decide
+  // which of those items are shown.
   const displayItems = useMemo(
-    () => groupConsecutiveTools(filteredTurns),
-    [filteredTurns],
+    () => groupConsecutiveTools(turns.map((turn, index) => ({ turn, index }))),
+    [turns],
   );
-  const threadDnaItems = useMemo(
+  const visibleItems = useMemo(
+    () => filterDisplayItems(displayItems, selectedKinds, search),
+    [displayItems, selectedKinds, search],
+  );
+  const allDnaItems = useMemo(
     () => buildThreadDnaItems(displayItems, runStart),
     [displayItems, runStart],
   );
+  const threadDnaItems = useMemo(() => {
+    if (visibleItems.length === displayItems.length) return allDnaItems;
+    const visibleKeys = new Set(
+      visibleItems.map((item) => threadSelectionKey(displayItemSelection(item))),
+    );
+    return allDnaItems.filter((item) =>
+      visibleKeys.has(threadSelectionKey(item.selection)),
+    );
+  }, [allDnaItems, displayItems, visibleItems]);
 
   const openTurn =
     panelSelection?.kind === "single" ? turns[panelSelection.turnIndex] ?? null : null;
+  // Resolve against the complete group list so changing a filter cannot
+  // corrupt or drop the identity of an open selection.
   const openGroup = useMemo<Extract<DisplayItem, { kind: "group" }> | null>(() => {
     if (panelSelection?.kind !== "group") return null;
     const wanted = panelSelection.childTurnIndices;
@@ -1764,7 +1884,7 @@ function RunStageActivityStage({
               onSearchChange={onSearchChange}
               filteredCount={
                 effectiveTab === "primary"
-                  ? filteredTurns.length
+                  ? visibleTurnCount(visibleItems)
                   : filteredDebugEvents.length
               }
               totalCount={
@@ -1800,8 +1920,7 @@ function RunStageActivityStage({
           effectiveTab={effectiveTab}
           renderer={renderer}
           turns={turns}
-          filteredTurns={filteredTurns}
-          displayItems={displayItems}
+          visibleItems={visibleItems}
           panelSelection={panelSelection}
           onPanelSelectionChange={setPanelSelection}
           runStart={runStart}

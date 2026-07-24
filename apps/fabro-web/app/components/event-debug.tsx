@@ -456,7 +456,7 @@ export interface ThreadDnaItem {
 const INSTANT_MARKER_PX = 4;
 const MIN_DURATION_PX = 3;
 
-function selectionKey(s: ThreadDnaSelection): string {
+export function threadSelectionKey(s: ThreadDnaSelection): string {
   return s.kind === "single"
     ? `s:${s.turnIndex}`
     : `g:${s.childTurnIndices.join(",")}`;
@@ -516,7 +516,7 @@ export function ThreadDnaStrip({
   const visibleItemByKey = useMemo(
     () =>
       new Map(
-        visibleItems.map((item) => [selectionKey(item.selection), item]),
+        visibleItems.map((item) => [threadSelectionKey(item.selection), item]),
       ),
     [visibleItems],
   );
@@ -552,7 +552,7 @@ export function ThreadDnaStrip({
     >
       <div className="relative h-full">
         {visibleItems.map((item) => {
-          const key = selectionKey(item.selection);
+          const key = threadSelectionKey(item.selection);
           const isInstant = item.durationMs <= 0;
           const isSelected = selectionsEqual(item.selection, selection);
           const isHovered = hover?.key === key;
