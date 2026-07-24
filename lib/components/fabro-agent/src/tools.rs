@@ -8,7 +8,7 @@ use fabro_model::ModelHandle;
 use fabro_static::EnvVars;
 use futures::{StreamExt, stream};
 
-use crate::config::SessionOptions;
+use crate::config::{SessionOptions, ToolSecrets};
 use crate::sandbox::GrepOptions;
 use crate::tool_registry::{RegisteredTool, ToolRegistry, ToolSource};
 
@@ -61,10 +61,18 @@ pub fn register_core_tools(
     registry.register(make_shell_tool_with_config(config));
     registry.register(make_grep_tool());
     registry.register(make_glob_tool());
-    registry.register(make_web_search_tool_with_api_key(
-        config.tool_secrets.brave_search_api_key.clone(),
-    ));
+    register_secret_backed_tools(registry, &config.tool_secrets);
     registry.register(make_web_fetch_tool(summarizer));
+}
+
+/// Registers core tools whose executors capture runtime-supplied secrets.
+///
+/// Calling this after profile construction replaces the unconfigured tool
+/// registrations created by the default profile constructors.
+pub fn register_secret_backed_tools(registry: &mut ToolRegistry, secrets: &ToolSecrets) {
+    registry.register(make_web_search_tool_with_api_key(
+        secrets.brave_search_api_key.clone(),
+    ));
 }
 
 pub(crate) fn required_str<'a>(args: &'a serde_json::Value, key: &str) -> Result<&'a str, String> {

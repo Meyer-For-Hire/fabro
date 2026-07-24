@@ -31,7 +31,7 @@ use crate::config::{ToolApprovalAdapter, ToolApprovalFn, ToolHookCallback, ToolS
 use crate::error::InterruptReason;
 use crate::subagent::{SessionFactory, SubAgentSupervisor};
 use crate::tool_permissions::{is_auto_approved, tool_category};
-use crate::tools::WebFetchSummarizer;
+use crate::tools::{self, WebFetchSummarizer};
 use crate::{
     AgentEvent, AgentProfile, AnthropicProfile, GeminiProfile, LocalSandbox, Message,
     OpenAiProfile, Sandbox, Session, SessionOptions, SessionShutdownReason,
@@ -597,6 +597,7 @@ pub async fn run_with_args_and_client_and_catalog(
         tool_secrets: cli_tool_secrets(),
         ..SessionOptions::default()
     };
+    tools::register_secret_backed_tools(profile.tool_registry_mut(), &config.tool_secrets);
 
     // Register subagent tools
     let supervisor = SubAgentSupervisor::new(config.max_subagent_depth);
@@ -617,13 +618,18 @@ pub async fn run_with_args_and_client_and_catalog(
             &factory_catalog,
             factory_client.clone(),
         ));
-        let child_profile: Arc<dyn AgentProfile> = Arc::from(build_profile(
+        let mut child_profile = build_profile(
             factory_profile_kind,
             factory_provider_id.clone(),
             &factory_model,
             child_summarizer,
             Arc::clone(&factory_catalog),
-        ));
+        );
+        tools::register_secret_backed_tools(
+            child_profile.tool_registry_mut(),
+            &factory_tool_secrets,
+        );
+        let child_profile: Arc<dyn AgentProfile> = Arc::from(child_profile);
         Session::new(
             factory_client.clone(),
             child_profile,

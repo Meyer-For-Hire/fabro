@@ -841,6 +841,7 @@ impl AgentApiBackend {
             provider.profile_kind,
             Arc::clone(&catalog),
         );
+        fabro_agent::register_secret_backed_tools(profile.tool_registry_mut(), &tool_secrets);
 
         let config = SessionOptions {
             max_tokens: node.max_tokens(),
@@ -877,6 +878,10 @@ impl AgentApiBackend {
                 factory_provider.provider_id.clone(),
                 factory_provider.profile_kind,
                 Arc::clone(&factory_catalog),
+            );
+            fabro_agent::register_secret_backed_tools(
+                child_profile.tool_registry_mut(),
+                &factory_tool_secrets,
             );
             if let Some(services) = factory_fabro_run_tools.clone() {
                 register_fabro_run_tools(child_profile.tool_registry_mut(), &services);
@@ -1983,6 +1988,43 @@ reasoning = false
             }
         });
         format!("data: {text_chunk}\n\ndata: {usage_chunk}\n\ndata: [DONE]\n\n")
+    }
+
+    fn chat_completion_tool_call_stream(
+        tool_name: &str,
+        tool_call_id: &str,
+        arguments: &str,
+    ) -> String {
+        let tool_call_chunk = serde_json::json!({
+            "id": uuid::Uuid::new_v4().to_string(),
+            "model": "mock-model",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": tool_call_id,
+                        "type": "function",
+                        "function": {
+                            "name": tool_name,
+                            "arguments": arguments
+                        }
+                    }]
+                },
+                "finish_reason": null
+            }]
+        });
+        let finish_chunk = serde_json::json!({
+            "id": uuid::Uuid::new_v4().to_string(),
+            "model": "mock-model",
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "tool_calls"
+            }]
+        });
+        format!("data: {tool_call_chunk}\n\ndata: {finish_chunk}\n\ndata: [DONE]\n\n")
     }
 
     fn custom_output_schema_attr() -> AttrValue {
@@ -3116,6 +3158,89 @@ enabled = true
         let usage = usage.expect("usage should be aggregated");
         assert_eq!(usage.tokens().input_tokens, 41);
         assert_eq!(usage.tokens().output_tokens, 7);
+    }
+
+    #[tokio::test]
+    async fn agent_run_web_search_uses_configured_brave_search_key() {
+        let server = MockServer::start();
+        let tool_call = server.mock(|when, then| {
+            when.method(POST)
+                .path("/chat/completions")
+                .body_includes(r#""stream":true"#)
+                .body_excludes(r#""role":"tool""#);
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(chat_completion_tool_call_stream(
+                    "web_search",
+                    "call_web_search",
+                    r#"{"query":"fabro"}"#,
+                ));
+        });
+        let completion = server.mock(|when, then| {
+            when.method(POST)
+                .path("/chat/completions")
+                .body_includes("call_web_search");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(chat_completion_stream("Done", 10, 1));
+        });
+        let backend = mock_api_backend(&server).with_tool_secrets(ToolSecrets {
+            // An invalid header value makes a correctly configured executor
+            // fail locally before any request can leave the test process.
+            brave_search_api_key: Some("\n".to_string()),
+        });
+        let node = Node::new("search");
+        let context = Context::new();
+        let emitter = Arc::new(Emitter::new(fabro_types::RunId::new()));
+        let web_search_results = Arc::new(Mutex::new(Vec::new()));
+        let web_search_results_for_listener = Arc::clone(&web_search_results);
+        emitter.on_event(move |event| {
+            if let fabro_types::EventBody::AgentToolCompleted(props) = &event.body {
+                if props.tool_name != "web_search" {
+                    return;
+                }
+                web_search_results_for_listener
+                    .lock()
+                    .unwrap()
+                    .push((props.output.clone(), props.is_error));
+            }
+        });
+        let workspace = tempfile::tempdir().unwrap();
+        let sandbox: Arc<dyn fabro_agent::Sandbox> =
+            Arc::new(LocalSandbox::new(workspace.path().to_path_buf()));
+
+        let result = backend
+            .run(CodergenRunRequest {
+                node:               &node,
+                prompt:             "Search the web",
+                context:            &context,
+                thread_id:          None,
+                emitter:            &emitter,
+                sandbox:            &sandbox,
+                tool_hooks:         None,
+                cancel_token:       CancellationToken::new(),
+                agent_tool_runtime: fabro_agent::AgentToolRuntime::default(),
+            })
+            .await
+            .unwrap();
+
+        tool_call.assert_calls(1);
+        completion.assert_calls(1);
+        let web_search_results = web_search_results.lock().unwrap();
+        assert_eq!(web_search_results.len(), 1);
+        let (output, is_error) = &web_search_results[0];
+        assert!(*is_error);
+        let output = output
+            .as_str()
+            .expect("web_search error output should be a string");
+        assert!(
+            output.starts_with("HTTP request failed:"),
+            "configured web_search should use its API key; got: {output}"
+        );
+        let CodergenResult::Text { text, .. } = result else {
+            panic!("run should return text");
+        };
+        assert_eq!(text, "Done");
     }
 
     #[tokio::test]
