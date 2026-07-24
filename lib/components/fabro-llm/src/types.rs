@@ -10,13 +10,14 @@ use std::sync::Arc;
 // model. They are re-exported here so existing `fabro_llm::types::*`
 // imports keep working.
 pub use fabro_types::{
-    AudioData, ContentPart, DocumentData, ImageData, Message, Role, ThinkingData, ToolCall,
-    ToolResult,
+    AudioData, ContentPart, DocumentData, ImageData, Message, ReasoningOutput, Role, ThinkingData,
+    ToolCall, ToolResult,
 };
 use fabro_util::backoff::BackoffPolicy;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Error;
+use crate::reasoning;
 
 // --- 3.8 FinishReason ---
 
@@ -280,6 +281,19 @@ impl Response {
         } else {
             Some(reasoning)
         }
+    }
+
+    /// Readable reasoning normalized from this response's canonical message
+    /// content, or `None` when the provider returned none.
+    ///
+    /// The message is the single source of truth: opaque provider reasoning
+    /// items are already preserved there, so normalization needs no second
+    /// stored field and cannot drift from what will be replayed. Deriving it
+    /// from the final response also keeps retried or replaced streaming
+    /// buffers out of the durable result.
+    #[must_use]
+    pub fn reasoning_output(&self) -> Option<ReasoningOutput> {
+        reasoning::normalize(&self.message.content)
     }
 }
 

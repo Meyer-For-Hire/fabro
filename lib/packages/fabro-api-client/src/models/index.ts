@@ -291,6 +291,7 @@ export * from './pull-request-user';
 export * from './question-type';
 export * from './reasoning-effort';
 export * from './reasoning-effort-feature';
+export * from './reasoning-output';
 export * from './related-workflow-diagnostic';
 export * from './render-workflow-graph-direction';
 export * from './render-workflow-graph-format';

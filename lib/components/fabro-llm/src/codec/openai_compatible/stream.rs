@@ -4,7 +4,7 @@
 //! already-stripped payloads (including the `[DONE]` sentinel) via `on_event`.
 
 use super::translate::{map_finish_reason, parse_tool_arguments};
-use super::wire::{AccumulatedToolCall, StreamChunk};
+use super::wire::{AccumulatedToolCall, ReasoningDetails, StreamChunk};
 use crate::codec::{CodecCtx, RawEvent, StreamDecoder};
 use crate::error::Error;
 use crate::types::{
@@ -20,6 +20,7 @@ pub(super) struct StreamState {
     response_model:        String,
     accumulated_text:      String,
     accumulated_reasoning: String,
+    reasoning_details:     ReasoningDetails,
     tool_calls:            Vec<AccumulatedToolCall>,
     usage:                 TokenCounts,
     finish_reason:         FinishReason,
@@ -42,6 +43,7 @@ impl StreamState {
             response_model: String::new(),
             accumulated_text: String::new(),
             accumulated_reasoning: String::new(),
+            reasoning_details: ReasoningDetails::default(),
             tool_calls: Vec::new(),
             usage: TokenCounts::default(),
             finish_reason: FinishReason::Stop,
@@ -91,6 +93,11 @@ impl StreamState {
             if !reasoning.is_empty() {
                 self.accumulated_reasoning.push_str(reasoning);
             }
+        }
+
+        // Accumulate structured reasoning detail fragments in wire order.
+        if let Some(payload) = &delta.reasoning_details {
+            self.reasoning_details.push_payload(payload);
         }
 
         // Handle text content delta.
@@ -169,6 +176,9 @@ impl StreamState {
         }
 
         let mut content_parts = Vec::new();
+
+        // Preserve the structured reasoning channel verbatim.
+        content_parts.extend(std::mem::take(&mut self.reasoning_details).into_content_part());
 
         // Include reasoning/thinking content if present (Kimi, etc.).
         if !self.accumulated_reasoning.is_empty() {

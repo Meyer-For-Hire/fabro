@@ -2,7 +2,7 @@
 
 use crate::codec::cache::CacheControl;
 use crate::codec::split_inclusive_token_total;
-use crate::types::{ReasoningEffort, TokenCounts};
+use crate::types::{ContentPart, ReasoningEffort, TokenCounts};
 
 #[derive(serde::Serialize)]
 pub(super) struct ApiRequest {
@@ -129,6 +129,11 @@ pub(super) struct ApiChoiceMessage {
     pub reasoning_content: Option<String>,
     /// OpenRouter's normalized spelling for reasoning text.
     pub reasoning:         Option<String>,
+    /// Structured reasoning channel (OpenRouter and compatible
+    /// aggregators). Kept as an untyped value so unknown detail variants
+    /// cannot fail an otherwise valid completion.
+    #[serde(default)]
+    pub reasoning_details: Option<serde_json::Value>,
     pub tool_calls:        Option<Vec<ApiToolCall>>,
 }
 
@@ -137,6 +142,88 @@ impl ApiChoiceMessage {
         self.reasoning_content
             .as_deref()
             .or(self.reasoning.as_deref())
+    }
+}
+
+/// Structured `reasoning_details` entries accumulated in wire order.
+///
+/// The entries are preserved verbatim as an opaque content part so
+/// encrypted material survives for future provider-aware replay; only known
+/// readable members are ever normalized out of them.
+#[derive(Default)]
+pub(super) struct ReasoningDetails {
+    entries: Vec<serde_json::Value>,
+}
+
+impl ReasoningDetails {
+    /// Absorb one `reasoning_details` payload.
+    ///
+    /// Providers document an array of detail objects; a lone object is
+    /// accepted as a single entry. Scalars carry nothing replayable and are
+    /// dropped. Streaming deltas repeat the same logical detail across
+    /// chunks, so a fragment that continues the previous entry is coalesced
+    /// into it rather than becoming a separate block.
+    pub(super) fn push_payload(&mut self, payload: &serde_json::Value) {
+        let incoming = match payload {
+            serde_json::Value::Array(entries) => entries.clone(),
+            serde_json::Value::Object(_) => vec![payload.clone()],
+            _ => Vec::new(),
+        };
+        for entry in incoming {
+            if !entry.is_object() {
+                continue;
+            }
+            match self.entries.last_mut() {
+                Some(last) if continues_detail(last, &entry) => merge_detail_fragment(last, &entry),
+                _ => self.entries.push(entry),
+            }
+        }
+    }
+
+    /// Opaque content part holding the accumulated entries, or `None` when
+    /// nothing usable arrived.
+    pub(super) fn into_content_part(self) -> Option<ContentPart> {
+        (!self.entries.is_empty()).then(|| ContentPart::Other {
+            kind: ContentPart::OPENAI_COMPAT_REASONING_DETAILS.to_string(),
+            data: serde_json::Value::Array(self.entries),
+        })
+    }
+}
+
+/// Text-bearing members whose fragments concatenate across stream chunks.
+const DETAIL_TEXT_MEMBERS: [&str; 3] = ["text", "summary", "data"];
+
+/// Whether `entry` continues the logical detail already in `last`.
+///
+/// Aggregators tag each logical detail with a stable `type` and `index`;
+/// fragment streams that omit `index` are matched on `type` alone.
+fn continues_detail(last: &serde_json::Value, entry: &serde_json::Value) -> bool {
+    last.get("type") == entry.get("type") && last.get("index") == entry.get("index")
+}
+
+/// Append `entry`'s text fragments onto `last` and fill in members `last`
+/// has not seen yet.
+fn merge_detail_fragment(last: &mut serde_json::Value, entry: &serde_json::Value) {
+    let Some(entry_members) = entry.as_object() else {
+        return;
+    };
+    let Some(last_members) = last.as_object_mut() else {
+        return;
+    };
+    for (key, value) in entry_members {
+        match last_members.get_mut(key) {
+            Some(serde_json::Value::String(existing))
+                if DETAIL_TEXT_MEMBERS.contains(&key.as_str()) =>
+            {
+                if let Some(fragment) = value.as_str() {
+                    existing.push_str(fragment);
+                }
+            }
+            Some(_) => {}
+            None => {
+                last_members.insert(key.clone(), value.clone());
+            }
+        }
     }
 }
 
@@ -245,6 +332,10 @@ pub(super) struct StreamDelta {
     pub reasoning_content: Option<String>,
     /// OpenRouter's normalized spelling for reasoning text.
     pub reasoning:         Option<String>,
+    /// Structured reasoning channel, streamed as fragments of the entries
+    /// the non-streaming response returns whole.
+    #[serde(default)]
+    pub reasoning_details: Option<serde_json::Value>,
     pub tool_calls:        Option<Vec<StreamToolCall>>,
 }
 

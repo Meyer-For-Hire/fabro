@@ -680,6 +680,7 @@ fn main() {
         ("SessionRecord", "fabro_types::SessionRecord", &[]),
         ("SessionSummary", "fabro_types::SessionSummary", &[]),
         ("SessionDetail", "fabro_types::SessionDetail", &[]),
+        ("ReasoningOutput", "fabro_types::ReasoningOutput", &[]),
         ("CompletionMessage", "fabro_types::Message", &[]),
         ("CompletionMessageRole", "fabro_types::Role", &[]),
         ("CompletionContentPart", "fabro_types::ContentPart", &[]),

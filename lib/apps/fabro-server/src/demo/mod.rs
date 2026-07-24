@@ -1502,6 +1502,7 @@ mod runs {
                     visit:           1,
                     message:         None,
                     context_window:  None,
+                    reasoning:       None,
                 }),
             ),
             make_envelope(
@@ -1572,6 +1573,7 @@ mod runs {
                     visit:           1,
                     message:         None,
                     context_window:  None,
+                    reasoning:       None,
                 }),
             ),
         ]

@@ -1762,6 +1762,8 @@ impl Session {
             // Record assistant turn
             let text = response.text();
             let tool_calls = response.tool_calls();
+            // Normalize before the response's content moves into history.
+            let reasoning = response.reasoning_output();
             let provider_parts: Vec<_> = response
                 .message
                 .content
@@ -1805,6 +1807,7 @@ impl Session {
                     cost_source: response.cost_source,
                     tool_call_count: tool_calls.len(),
                     context_window,
+                    reasoning,
                 });
 
             // Post-response compaction: trim context after appending assistant turn
@@ -2113,7 +2116,7 @@ mod tests {
         ContentPart, ReasoningEffort, Request, Response, Role, StreamEvent, TokenCounts, ToolCall,
         ToolDefinition,
     };
-    use fabro_types::StageContextWindowCountMethod;
+    use fabro_types::{ReasoningOutput, StageContextWindowCountMethod};
     use futures::stream;
     use tokio::time::{sleep, timeout};
 
@@ -3922,6 +3925,114 @@ mod tests {
             "delta:Recovered".to_string(),
             "message:Recovered".to_string(),
         ]);
+    }
+
+    /// Builds a response whose provider parts carry both reasoning channels.
+    fn reasoning_response(text: &str, summary: &str, trace: &str) -> Response {
+        let mut response = text_response(text);
+        let mut content = vec![ContentPart::Other {
+            kind: ContentPart::OPENAI_COMPAT_REASONING_DETAILS.to_string(),
+            data: serde_json::json!([
+                {"type": "reasoning.summary", "summary": summary},
+                {"type": "reasoning.text", "text": trace},
+            ]),
+        }];
+        content.extend(response.message.content);
+        response.message.content = content;
+        response
+    }
+
+    fn collect_message_reasoning(
+        rx: &mut broadcast::Receiver<SessionEvent>,
+    ) -> Vec<Option<ReasoningOutput>> {
+        let mut collected = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AgentEvent::AssistantMessage { reasoning, .. } = event.event {
+                collected.push(reasoning);
+            }
+        }
+        collected
+    }
+
+    #[tokio::test]
+    async fn completed_response_emits_normalized_reasoning_once() {
+        let mut session = make_session(vec![reasoning_response(
+            "4.",
+            "the user wants 2+2",
+            "2+2 is 4",
+        )])
+        .await;
+        let mut rx = session.subscribe();
+
+        session.process_input("What is 2+2?").await.unwrap();
+
+        let reasoning = collect_message_reasoning(&mut rx);
+        assert_eq!(reasoning, vec![Some(ReasoningOutput {
+            summary: Some("the user wants 2+2".to_string()),
+            trace:   Some("2+2 is 4".to_string()),
+        })]);
+    }
+
+    #[tokio::test]
+    async fn tool_call_response_with_no_visible_text_still_carries_reasoning() {
+        let mut tool_call = tool_call_response("nonexistent_tool", "call_1", serde_json::json!({}));
+        // Drop the visible text so only the tool call and reasoning remain.
+        tool_call.message.content = vec![
+            ContentPart::Other {
+                kind: ContentPart::OPENAI_COMPAT_REASONING_DETAILS.to_string(),
+                data: serde_json::json!([{"type": "reasoning.summary", "summary": "call the tool"}]),
+            },
+            ContentPart::ToolCall(ToolCall::new(
+                "call_1",
+                "nonexistent_tool",
+                serde_json::json!({}),
+            )),
+        ];
+
+        let mut session = make_session(vec![tool_call, text_response("OK")]).await;
+        let mut rx = session.subscribe();
+
+        session.process_input("Do something").await.unwrap();
+
+        let reasoning = collect_message_reasoning(&mut rx);
+        assert_eq!(reasoning, vec![
+            Some(ReasoningOutput {
+                summary: Some("call the tool".to_string()),
+                trace:   None,
+            }),
+            None,
+        ]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn only_the_final_response_contributes_reasoning_after_a_retry() {
+        let provider = Arc::new(ScriptedStreamProvider::new(vec![
+            ScriptedStreamCall::Events(vec![
+                Ok(StreamEvent::ReasoningDelta {
+                    delta: "discarded thinking".to_string(),
+                }),
+                Err(LlmError::Stream {
+                    message: "connection reset".into(),
+                    source:  None,
+                }),
+            ]),
+            ScriptedStreamCall::Response(Box::new(reasoning_response(
+                "Recovered",
+                "final summary",
+                "final trace",
+            ))),
+        ]));
+        let mut session = make_session_with_provider(provider.clone()).await;
+        let mut rx = session.subscribe();
+
+        session.process_input("Hello").await.unwrap();
+
+        assert_eq!(provider.call_index.load(Ordering::SeqCst), 2);
+        let reasoning = collect_message_reasoning(&mut rx);
+        assert_eq!(reasoning, vec![Some(ReasoningOutput {
+            summary: Some("final summary".to_string()),
+            trace:   Some("final trace".to_string()),
+        })]);
     }
 
     #[tokio::test(start_paused = true)]

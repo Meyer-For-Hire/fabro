@@ -21,6 +21,9 @@ import type { BilledTokenCounts } from './billed-token-counts';
 import type { BillingModelRef } from './billing-model-ref';
 // May contain unused imports in some cases
 // @ts-ignore
+import type { ReasoningOutput } from './reasoning-output';
+// May contain unused imports in some cases
+// @ts-ignore
 import type { StageContextWindowProjection } from './stage-context-window-projection';
 
 /**
@@ -34,4 +37,5 @@ export interface AgentMessageProps {
     'visit': number;
     'message'?: { [key: string]: any; } | null;
     'context_window'?: StageContextWindowProjection | null;
+    'reasoning'?: ReasoningOutput | null;
 }

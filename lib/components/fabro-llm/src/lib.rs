@@ -9,6 +9,7 @@ pub mod middleware;
 pub mod model_test;
 pub mod provider;
 pub mod providers;
+mod reasoning;
 pub mod retry;
 pub mod token_count;
 pub mod tools;

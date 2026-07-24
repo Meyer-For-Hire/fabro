@@ -1,7 +1,7 @@
 //! Response decoding: Chat Completions body → canonical `Response`.
 
 use super::translate::{self, map_finish_reason};
-use super::wire::{ApiResponse, ApiUsage};
+use super::wire::{ApiResponse, ApiUsage, ReasoningDetails};
 use crate::codec::CodecCtx;
 use crate::error::{Error, ProviderErrorDetail, ProviderErrorKind};
 use crate::types::{
@@ -25,6 +25,11 @@ pub(super) fn decode_response(
     })?;
 
     let mut content_parts = Vec::new();
+    if let Some(payload) = &choice.message.reasoning_details {
+        let mut details = ReasoningDetails::default();
+        details.push_payload(payload);
+        content_parts.extend(details.into_content_part());
+    }
     if let Some(reasoning) = choice.message.reasoning() {
         if !reasoning.is_empty() {
             content_parts.push(ContentPart::Thinking(ThinkingData {

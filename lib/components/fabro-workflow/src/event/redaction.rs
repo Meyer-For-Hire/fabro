@@ -30,7 +30,10 @@ pub fn event_payload_from_redacted_json(line: &str, run_id: &RunId) -> Result<Ev
 
 #[cfg(test)]
 mod tests {
-    use ::fabro_types::{fixtures, run_event as fabro_types};
+    use ::fabro_types::{ReasoningOutput, fixtures, run_event as fabro_types};
+    use fabro_agent::AgentEvent;
+    use fabro_llm::types::TokenCounts as LlmTokenCounts;
+    use fabro_model::{ModelRef, ProviderId};
 
     use super::*;
     use crate::event::{Event, to_run_event};
@@ -71,5 +74,46 @@ mod tests {
             payload.as_value()["properties"]["exec_output_tail"]["stderr"],
             "plain stderr"
         );
+    }
+
+    /// Reasoning is model-authored text like any other, so it goes through
+    /// the same canonical redaction pass as assistant output.
+    #[test]
+    fn build_redacted_event_payload_redacts_secrets_inside_reasoning() {
+        let secret = "sk-ant-api03-xK9mZ2vL8nQ5rT1wY4bC7dF0gH3jE6pA";
+        let stored = to_run_event(&fixtures::RUN_8, &Event::Agent {
+            stage:             "code".to_string(),
+            visit:             1,
+            event:             AgentEvent::AssistantMessage {
+                text:            "done".to_string(),
+                model:           ModelRef {
+                    provider: ProviderId::openai(),
+                    model_id: "gpt-5.4".into(),
+                    speed:    None,
+                },
+                usage:           LlmTokenCounts::default(),
+                cost_usd:        None,
+                cost_source:     None,
+                tool_call_count: 0,
+                context_window:  None,
+                reasoning:       Some(ReasoningOutput {
+                    summary: Some(format!("the key is {secret}")),
+                    trace:   Some(format!("reading {secret} from the env")),
+                }),
+            },
+            session_id:        Some("ses_agent".to_string()),
+            parent_session_id: None,
+            tool_call_id:      None,
+        });
+
+        let payload = build_redacted_event_payload(&stored, &fixtures::RUN_8).unwrap();
+        let reasoning = &payload.as_value()["properties"]["reasoning"];
+        let summary = reasoning["summary"].as_str().unwrap();
+        let trace = reasoning["trace"].as_str().unwrap();
+
+        assert!(!summary.contains(secret));
+        assert!(!trace.contains(secret));
+        assert!(summary.contains("REDACTED"));
+        assert!(trace.contains("REDACTED"));
     }
 }

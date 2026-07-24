@@ -237,6 +237,11 @@ impl ContentPart {
     pub const OPENAI_REASONING: &str = "openai_reasoning";
     /// Kind string for opaque OpenAI message output items.
     pub const OPENAI_MESSAGE: &str = "openai_message";
+    /// Kind string for opaque OpenAI-compatible `reasoning_details` entries.
+    /// The data is the received array of detail objects, preserved verbatim
+    /// so encrypted entries survive for future provider-aware replay. Only
+    /// known readable members are ever normalized out of it.
+    pub const OPENAI_COMPAT_REASONING_DETAILS: &str = "openai_compat_reasoning_details";
 
     pub fn text(text: impl Into<String>) -> Self {
         Self::Text(text.into())

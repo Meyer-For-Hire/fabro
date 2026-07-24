@@ -4032,6 +4032,7 @@ mod tests {
             visit: 1,
             message: None,
             context_window: None,
+            reasoning: None,
         }
     }
 

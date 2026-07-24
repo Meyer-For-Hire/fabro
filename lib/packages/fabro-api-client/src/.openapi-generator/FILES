@@ -321,6 +321,7 @@ models/pull-request.ts
 models/question-type.ts
 models/reasoning-effort-feature.ts
 models/reasoning-effort.ts
+models/reasoning-output.ts
 models/related-workflow-diagnostic.ts
 models/render-workflow-graph-direction.ts
 models/render-workflow-graph-format.ts

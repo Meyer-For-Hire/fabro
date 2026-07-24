@@ -10045,6 +10045,27 @@ components:
             - $ref: "#/components/schemas/StageContextWindowProjection"
             - type: "null"
           description: Latest content-free context-window projection for this agent stage.
+        reasoning:
+          oneOf:
+            - $ref: "#/components/schemas/ReasoningOutput"
+            - type: "null"
+          description: Readable reasoning the provider returned with this response, if any.
+
+    ReasoningOutput:
+      description: >-
+        Readable model reasoning normalized into a provider-neutral shape.
+        Both members may be present for the same response, and at least one is
+        present whenever the object is emitted. Opaque provider material
+        (signatures, item IDs, encrypted or redacted payloads) never appears
+        here.
+      type: object
+      properties:
+        summary:
+          type: string
+          description: Model-authored summary of its reasoning.
+        trace:
+          type: string
+          description: Verbatim readable reasoning text, when the provider returns it.
 
     AgentToolsAvailableProps:
       description: Properties for the `agent.tools.available` event.

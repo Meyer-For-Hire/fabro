@@ -347,6 +347,53 @@ data: {\"type\":\"text_delta\",\"delta\":\" world\",\"text_id\":null}\n\
         assert_eq!(response.cost_source, Some(CostSource::Estimated));
     }
 
+    /// Reasoning needs no dedicated wire field on this hop: the canonical
+    /// message already transports the provider parts it is derived from.
+    #[tokio::test]
+    async fn complete_normalizes_reasoning_from_the_transported_message() {
+        let server = MockServer::start();
+
+        server.mock(|when, then| {
+            when.method(POST).path("/completions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "id": "resp-123",
+                    "model": "test-model",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "kind": "openai_compat_reasoning_details",
+                                "data": [
+                                    {"type": "reasoning.summary", "summary": "weighed both"},
+                                    {"type": "reasoning.text", "text": "step one"},
+                                ]
+                            },
+                            {"kind": "text", "data": "Hello there!"},
+                        ],
+                        "name": null,
+                        "tool_call_id": null
+                    },
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 10, "output_tokens": 5}
+                }));
+        });
+
+        let adapter = Adapter::new(
+            fabro_test::test_http_client(),
+            server.base_url(),
+            "test-provider",
+        );
+
+        let response = adapter.complete(&make_request()).await.unwrap();
+
+        assert_eq!(response.text(), "Hello there!");
+        let reasoning = response.reasoning_output().expect("reasoning present");
+        assert_eq!(reasoning.summary.as_deref(), Some("weighed both"));
+        assert_eq!(reasoning.trace.as_deref(), Some("step one"));
+    }
+
     #[tokio::test]
     async fn complete_returns_error_on_502() {
         let server = MockServer::start();
