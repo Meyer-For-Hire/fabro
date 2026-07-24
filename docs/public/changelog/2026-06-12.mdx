@@ -1,0 +1,13 @@
+---
+title: "OpenRouter support"
+date: "2026-06-12"
+---
+
+## OpenRouter support
+
+Using OpenRouter previously required custom provider configuration, and aggregator-specific cache and cost details were lost. OpenRouter is now an opt-in built-in provider with a curated model catalog, cached and reasoning token accounting, and authoritative provider-reported costs for blocking and streaming responses.
+
+```toml title="settings.toml"
+[llm.providers.openrouter]
+enabled = true
+```

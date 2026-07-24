@@ -121,7 +121,7 @@ Each server entry specifies a transport type and optional timeouts. The server n
 
 ### Server-managed catalog
 
-Fabro servers can also manage a shared MCP catalog through the MCP servers REST API. Workflows reference a catalog definition by id instead of repeating its transport configuration:
+Fabro servers can also manage a shared MCP catalog from **Settings → MCP servers** in the web UI or through the MCP servers REST API. Workflows reference a catalog definition by id instead of repeating its transport configuration:
 
 ```toml
 [run.agent.mcps.sentry]
@@ -133,6 +133,28 @@ Server-managed definitions are stored in the server's shared SQLite database. Re
 When upgrading an installation that stored definitions as `mcps/*.toml` next to the active `settings.toml`, Fabro validates and imports the directory during startup. Existing SQLite rows win on id conflicts. After a successful transaction, Fabro renames the source directory to a timestamped backup such as `mcps.imported-20260711T120000000000Z.bak`.
 
 Transport env/header values preserve their existing plaintext-at-rest behavior in SQLite. Prefer `{{ secrets.NAME }}` interpolation over literal credentials where possible.
+
+Set `enabled = false` to keep an inline server or catalog reference in configuration without connecting to it:
+
+```toml
+[run.agent.mcps.sentry]
+id = "sentry"
+enabled = false
+```
+
+## Runtime interpolation
+
+Inline transport fields can interpolate values at the run boundary:
+
+| Syntax | Resolution time |
+|---|---|
+| `{{ vars.NAME }}` | When the server creates the run, using that run's variable snapshot |
+| `{{ env.NAME }}` | When the worker launches the MCP transport |
+| `{{ secrets.NAME }}` | When the worker launches the MCP transport, using a token secret from the server vault |
+
+Interpolation applies to stdio and sandbox commands and env values, plus HTTP URLs and headers. Variable tokens are replaced in the created run configuration. Worker-time environment and secret expressions remain in persisted configuration, while resolved secret values do not. A missing environment variable, missing secret, or non-token secret fails MCP startup instead of passing an unresolved token to the transport.
+
+Standalone `fabro exec` can resolve `{{ env.* }}` from its process environment, but it has no server vault. A `{{ secrets.* }}` reference therefore fails with an explicit error in standalone execution.
 
 ## Transports
 
@@ -153,6 +175,7 @@ NODE_ENV = "production"
 
 | Field | Description | Default |
 |---|---|---|
+| `enabled` | Whether to connect to this server. | `true` |
 | `type` | Must be `"stdio"`. | — |
 | `command` | Array: the executable followed by its arguments. | — |
 | `script` | Shell script alternative to `command`. | — |
@@ -175,6 +198,7 @@ Authorization = "Bearer sk-xxx"
 
 | Field | Description | Default |
 |---|---|---|
+| `enabled` | Whether to connect to this server. | `true` |
 | `type` | Must be `"http"`. | — |
 | `protocol` | HTTP MCP protocol: `"streamable_http"` or legacy `"sse"`. | `"streamable_http"` |
 | `url` | The MCP server endpoint URL. | — |
@@ -198,6 +222,7 @@ tool_timeout = "2m"
 
 | Field | Description | Default |
 |---|---|---|
+| `enabled` | Whether to connect to this server. | `true` |
 | `type` | Must be `"sandbox"`. | — |
 | `protocol` | HTTP MCP protocol exposed by the sandbox server: `"streamable_http"` or legacy `"sse"`. | `"streamable_http"` |
 | `command` | Array: the command to run inside the sandbox. Must include a flag that makes the server listen on `port`. | — |

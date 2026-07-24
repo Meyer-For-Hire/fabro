@@ -3,8 +3,23 @@ title: "Provider header interpolation"
 date: "2026-07-09"
 ---
 
+<Warning>
+**Provider `extra_headers` use a new value syntax.** Replace `{ literal = "value" }` with `"value"`, `{ env = "NAME" }` with `"{{ env.NAME }}"`, and `{ vault = "NAME" }` with `"{{ secrets.NAME }}"`.
+</Warning>
+
 ## Provider header interpolation
 
-Provider `extra_headers` now use interpolation strings instead of typed `{ literal = ... }`, `{ env = ... }`, and `{ vault = ... }` tables. Write literal header values as plain strings, replace `{ env = "X" }` with a `{{ env.X }}` token, and replace `{ vault = "X" }` with a `{{ secrets.X }}` token. Secret header tokens resolve only token-style vault entries, so file and OAuth vault entries fail closed.
+Provider headers can now mix literal text with environment or secret values in one string, making bearer prefixes and gateway-specific formats straightforward. Secret tokens resolve only token-style vault entries, so missing, file, and OAuth secrets fail closed; put credentials in secrets rather than literal header values.
 
-This also enables mixed literal and secret values such as `Authorization = "Bearer {{ secrets.GATEWAY_TOKEN }}"`. Bare string header values are now accepted; put credentials in secrets and reference them with `{{ secrets.NAME }}` instead of pasting a credential as a literal. Provider `base_url` remains a plain literal string for now and is not interpolated.
+```toml
+[llm.providers.gateway.extra_headers]
+Authorization = "Bearer {{ secrets.GATEWAY_TOKEN }}"
+```
+
+Provider `base_url` remains a literal string and is not interpolated.
+
+## More
+
+<Accordion title="Improvements">
+- Run graph zoom and pan now survive switching between the Overview and Stages tabs
+</Accordion>

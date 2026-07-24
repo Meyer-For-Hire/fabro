@@ -117,7 +117,7 @@ enabled = true
 default_channel = "#fabro-reviews"
 ```
 
-`default_channel` is used only for human-in-the-loop interview prompts. Run lifecycle notifications use per-run or per-workflow `[run.notifications]` routes instead.
+`default_channel` is a literal channel name used only for human-in-the-loop interview prompts. Fabro does not interpolate `{{ env.* }}` in this server setting. Run lifecycle notifications use per-run or per-workflow `[run.notifications]` routes instead, whose channel values can use environment interpolation.
 
 ### 8. Invite the bot
 

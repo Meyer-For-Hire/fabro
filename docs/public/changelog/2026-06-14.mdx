@@ -1,0 +1,14 @@
+---
+title: "Local environment working directories"
+date: "2026-06-14"
+---
+
+## More
+
+<Accordion title="Workflows">
+- Added `cwd` to server-managed local environments so remote servers can choose an absolute host working directory; Docker and Daytona ignore this setting
+</Accordion>
+
+<Accordion title="Fixes">
+- Local runs now keep a submitted source directory only when it exists on the server and otherwise report how to configure environment `cwd` instead of trying to recreate a client-only path
+</Accordion>
