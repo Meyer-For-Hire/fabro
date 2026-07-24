@@ -15241,6 +15241,27 @@ async fn create_completion_missing_messages_returns_422() {
 }
 
 #[tokio::test]
+async fn create_completion_invalid_reasoning_effort_returns_422() {
+    let app = test_app_with();
+
+    let req = Request::builder()
+        .method("POST")
+        .uri(api("/completions"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "messages": [],
+                "reasoning_effort": "bogus"
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let response = app.oneshot(req).await.unwrap();
+    assert_status!(response, StatusCode::UNPROCESSABLE_ENTITY).await;
+}
+
+#[tokio::test]
 async fn create_completion_unknown_provider_returns_clear_error() {
     let app = test_app_with();
 

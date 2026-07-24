@@ -12,7 +12,7 @@ credentials = ["env:ZAI_API_KEY", "vault:ZAI_API_KEY"]
 display_name = "GLM 5.2"
 family = "glm-5"
 default = true
-aliases = ["glm", "glm5"]
+aliases = ["glm", "glm5", "glm52", "glm5.2"]
 
 [providers.zai.models."glm-5.2".limits]
 context_window = 1048576

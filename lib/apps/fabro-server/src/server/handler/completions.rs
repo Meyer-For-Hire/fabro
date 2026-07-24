@@ -109,7 +109,7 @@ async fn create_completion(
         } else {
             Some(req.stop_sequences)
         },
-        reasoning_effort: req.reasoning_effort.as_deref().and_then(|s| s.parse().ok()),
+        reasoning_effort: req.reasoning_effort,
         speed: None,
         metadata: None,
         provider_options: req.provider_options,

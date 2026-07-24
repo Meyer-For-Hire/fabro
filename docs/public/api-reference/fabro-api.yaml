@@ -8498,7 +8498,7 @@ components:
             type: string
           description: Stop sequences.
         reasoning_effort:
-          type: string
+          $ref: "#/components/schemas/ReasoningEffort"
           description: Reasoning effort level.
         provider:
           type: string
