@@ -50,7 +50,7 @@ cache_input_cost_per_mtok = 0.19
 
 [providers.fireworks.models."kimi-k2.6"]
 api_id = "accounts/fireworks/models/kimi-k2p6"
-display_name = "Kimi K2.6 (via Fireworks)"
+display_name = "Kimi K2.6"
 family = "kimi-k2"
 
 [providers.fireworks.models."kimi-k2.6".limits]
@@ -59,7 +59,7 @@ max_output = 16384
 
 [providers.fireworks.models."kimi-k2.6".features]
 tools = true
-vision = true
+vision = false
 reasoning = false
 prompt_cache = true
 
@@ -70,7 +70,7 @@ cache_input_cost_per_mtok = 0.16
 
 [providers.fireworks.models."deepseek-v4-pro"]
 api_id = "accounts/fireworks/models/deepseek-v4-pro"
-display_name = "DeepSeek V4 Pro (via Fireworks)"
+display_name = "DeepSeek V4 Pro"
 family = "deepseek-v4"
 
 [providers.fireworks.models."deepseek-v4-pro".limits]
@@ -90,7 +90,7 @@ cache_input_cost_per_mtok = 0.145
 
 [providers.fireworks.models."deepseek-v4-flash"]
 api_id = "accounts/fireworks/models/deepseek-v4-flash"
-display_name = "DeepSeek V4 Flash (via Fireworks)"
+display_name = "DeepSeek V4 Flash"
 family = "deepseek-v4"
 
 [providers.fireworks.models."deepseek-v4-flash".limits]
@@ -130,7 +130,7 @@ cache_input_cost_per_mtok = 0.14
 
 [providers.fireworks.models."minimax-m2.7"]
 api_id = "accounts/fireworks/models/minimax-m2p7"
-display_name = "MiniMax M2.7 (via Fireworks)"
+display_name = "MiniMax M2.7"
 family = "minimax-m2"
 
 [providers.fireworks.models."minimax-m2.7".limits]
@@ -150,7 +150,7 @@ cache_input_cost_per_mtok = 0.059
 
 [providers.fireworks.models."qwen3.7-plus"]
 api_id = "accounts/fireworks/models/qwen3p7-plus"
-display_name = "Qwen 3.7 Plus"
+display_name = "Qwen3.7 Plus"
 family = "qwen3"
 
 [providers.fireworks.models."qwen3.7-plus".limits]

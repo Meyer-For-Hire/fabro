@@ -3425,6 +3425,12 @@ enabled = true
         );
         assert_eq!(
             catalog
+                .small_default_for_provider(&fireworks)
+                .map(|model| model.id.as_str()),
+            Some("gpt-oss-20b")
+        );
+        assert_eq!(
+            catalog
                 .probe_for_provider(&fireworks)
                 .map(|model| model.id.as_str()),
             Some("gpt-oss-20b")
@@ -3442,13 +3448,17 @@ enabled = true
         ))
         .expect("enabled Fireworks override should build from the built-in provider settings");
 
-        // (id, api_id, context_window, max_output, input, output, cache_read)
+        // (id, api_id, family, context_window, max_output, vision, reasoning,
+        //  input, output, cache_read)
         let expected = [
             (
                 "kimi-k2.7-code",
                 "accounts/fireworks/models/kimi-k2p7-code",
+                "kimi-k2",
                 262_144,
                 32_768,
+                true,
+                true,
                 0.95,
                 4.0,
                 0.19,
@@ -3456,8 +3466,11 @@ enabled = true
             (
                 "kimi-k2.6",
                 "accounts/fireworks/models/kimi-k2p6",
+                "kimi-k2",
                 262_144,
                 16_384,
+                false,
+                false,
                 0.95,
                 4.0,
                 0.16,
@@ -3465,8 +3478,11 @@ enabled = true
             (
                 "deepseek-v4-pro",
                 "accounts/fireworks/models/deepseek-v4-pro",
+                "deepseek-v4",
                 1_048_576,
                 16_384,
+                false,
+                true,
                 1.74,
                 3.48,
                 0.145,
@@ -3474,8 +3490,11 @@ enabled = true
             (
                 "deepseek-v4-flash",
                 "accounts/fireworks/models/deepseek-v4-flash",
+                "deepseek-v4",
                 1_048_576,
                 16_384,
+                false,
+                false,
                 0.14,
                 0.28,
                 0.028,
@@ -3483,8 +3502,11 @@ enabled = true
             (
                 "glm-5.2",
                 "accounts/fireworks/models/glm-5p2",
+                "glm-5",
                 1_048_576,
                 131_072,
+                false,
+                true,
                 1.4,
                 4.4,
                 0.14,
@@ -3492,8 +3514,11 @@ enabled = true
             (
                 "minimax-m2.7",
                 "accounts/fireworks/models/minimax-m2p7",
+                "minimax-m2",
                 196_608,
                 16_384,
+                false,
+                false,
                 0.3,
                 1.2,
                 0.059,
@@ -3501,8 +3526,11 @@ enabled = true
             (
                 "qwen3.7-plus",
                 "accounts/fireworks/models/qwen3p7-plus",
+                "qwen3",
                 262_144,
                 16_384,
+                true,
+                false,
                 0.4,
                 1.6,
                 0.08,
@@ -3510,8 +3538,11 @@ enabled = true
             (
                 "gpt-oss-120b",
                 "accounts/fireworks/models/gpt-oss-120b",
+                "gpt-oss",
                 131_072,
                 32_768,
+                false,
+                true,
                 0.15,
                 0.6,
                 0.015,
@@ -3519,8 +3550,11 @@ enabled = true
             (
                 "gpt-oss-20b",
                 "accounts/fireworks/models/gpt-oss-20b",
+                "gpt-oss",
                 131_072,
                 32_768,
+                false,
+                true,
                 0.07,
                 0.3,
                 0.035,
@@ -3540,13 +3574,28 @@ enabled = true
             "expected rows must cover every Fireworks model"
         );
 
-        for (id, api_id, context, max_output, input, output, cache_read) in expected {
+        for (
+            id,
+            api_id,
+            family,
+            context,
+            max_output,
+            vision,
+            reasoning,
+            input,
+            output,
+            cache_read,
+        ) in expected
+        {
             let model = catalog
                 .get_on_provider(&fireworks, id)
                 .unwrap_or_else(|| panic!("Fireworks model '{id}' should be present"));
+            assert_eq!(model.family, family, "{id}");
             assert_eq!(model.limits.context_window, context, "{id}");
             assert_eq!(model.limits.max_output, Some(max_output), "{id}");
             assert!(model.features.tools, "{id}");
+            assert_eq!(model.features.vision, vision, "{id}");
+            assert_eq!(model.features.reasoning, reasoning, "{id}");
             assert!(model.features.prompt_cache, "{id}");
             assert_eq!(model.costs.input_cost_per_mtok, Some(input), "{id}");
             assert_eq!(model.costs.output_cost_per_mtok, Some(output), "{id}");
