@@ -28,7 +28,7 @@ import type { StageState } from './stage-state';
  */
 export interface RunStage {
     /**
-     * StageId in \"node_id@visit\" form, e.g. verify@2.
+     * Canonical stage execution identifier in `node_id@visit` form.
      */
     'id': string;
     /**
@@ -46,9 +46,17 @@ export interface RunStage {
      */
     'node_id': string;
     /**
-     * 1-based visit count; bumped each time the workflow re-enters this node.
+     * 1-based stage execution ordinal, the numeric component of `id`. It increments each time the node produces a new observable execution: graph re-entry (loops) and replay of post-checkpoint work after resume. Automatic in-place retries do not increment it.
      */
     'visit': number;
+    /**
+     * 1-based count of how many times workflow control entered this node (drives `max_visits`). Differs from `visit` when a post-checkpoint execution is replayed after resume. Absent for stages recorded before execution identity was tracked.
+     */
+    'graph_visit'?: number | null;
+    /**
+     * Canonical stage execution identifier in `node_id@visit` form.
+     */
+    'resumed_from_stage_id'?: string | null;
     'provider_used'?: StageModelUsage | null;
     /**
      * Wall-clock time the latest attempt of this stage started, if known.

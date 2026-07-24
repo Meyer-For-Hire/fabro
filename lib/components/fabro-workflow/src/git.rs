@@ -455,6 +455,8 @@ mod tests {
         .await
         .unwrap();
         append_event(&run, &fixtures::RUN_1, &Event::CheckpointCompleted {
+            graph_visit: None,
+            resumed_from_stage_id: None,
             node_id: "work".into(),
             status: "succeeded".into(),
             current_node: "work".into(),

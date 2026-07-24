@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -17,6 +17,7 @@ use crate::error::Error;
 use crate::event::{Emitter, Event, RunNoticeCode, RunNoticeLevel, StageScope};
 use crate::hook_context::set_hook_node;
 use crate::outcome::{FailureCategory, FailureDetail, Outcome, OutcomeExt};
+use crate::run_dir::visit_from_context;
 use crate::{artifact, millis_u64};
 
 /// Fans out execution to multiple branches concurrently.
@@ -32,7 +33,12 @@ struct BranchDispatch {
     index:     usize,
     target_id: String,
     branch_id: ParallelBranchId,
-    scope:     StageScope,
+    /// Scope reserved by the branch task right before its
+    /// `ParallelBranchStarted` becomes observable. Empty when the branch was
+    /// cancelled or failed before starting — no events exist to pair a
+    /// completion with, and emitting one under a guessed ordinal would
+    /// resurrect a prior execution's stage.
+    scope:     Arc<OnceLock<StageScope>>,
     handle:    JoinHandle<Result<BranchResult, Error>>,
 }
 
@@ -117,6 +123,7 @@ async fn run_branches(
     let max_parallel = usize::try_from(max_parallel).unwrap_or(4).max(1);
     let semaphore = Arc::new(Semaphore::new(max_parallel));
     let shared_graph = Arc::new(graph.clone());
+    let branch_graph_visit = u32::try_from(visit_from_context(context)).unwrap_or(u32::MAX);
 
     let branch_preambles = parse_branch_preambles(
         context.get(keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES),
@@ -169,18 +176,13 @@ async fn run_branches(
         let run_dir = run_dir.to_path_buf();
         let semaphore = Arc::clone(&semaphore);
         let group_id = parallel_group_id.clone();
-        let branch_scope = StageScope::for_parallel_branch(
-            target_id.clone(),
-            1,
-            group_id.clone(),
-            parallel_branch_id.clone(),
-        );
+        let reserved_scope = Arc::new(OnceLock::new());
 
         dispatches.push(BranchDispatch {
             index:     branch_index,
             target_id: target_id.clone(),
             branch_id: parallel_branch_id.clone(),
-            scope:     branch_scope.clone(),
+            scope:     Arc::clone(&reserved_scope),
             handle:    tokio::spawn(async move {
                 let branch_start = Instant::now();
                 let task = async {
@@ -195,12 +197,39 @@ async fn run_branches(
                         permit = &mut permit => permit
                             .map_err(|err| Error::handler_with_source("semaphore error", err))?,
                     };
+                    // Only reserve once the branch is ready to become
+                    // observable, so a branch cancelled while waiting on the
+                    // semaphore never consumes an execution identity.
+                    let execution = branch_services
+                        .run
+                        .stage_executions
+                        .reserve(&target_id, branch_graph_visit);
+                    branch_context.set(
+                        keys::CURRENT_NODE,
+                        serde_json::Value::String(target_id.clone()),
+                    );
+                    branch_context.set(
+                        keys::INTERNAL_STAGE_EXECUTION_ORDINAL,
+                        serde_json::json!(execution.stage_id.visit()),
+                    );
+                    let branch_scope = reserved_scope
+                        .get_or_init(|| {
+                            StageScope::for_parallel_branch(
+                                target_id.clone(),
+                                execution.stage_id.visit(),
+                                group_id.clone(),
+                                parallel_branch_id.clone(),
+                            )
+                        })
+                        .clone();
                     branch_services.run.emitter.emit_scoped(
                         &Event::ParallelBranchStarted {
-                            parallel_group_id:  group_id.clone(),
-                            parallel_branch_id: parallel_branch_id.clone(),
-                            branch:             target_id.clone(),
-                            index:              branch_index,
+                            parallel_group_id:     group_id.clone(),
+                            parallel_branch_id:    parallel_branch_id.clone(),
+                            branch:                target_id.clone(),
+                            index:                 branch_index,
+                            graph_visit:           Some(execution.graph_visit),
+                            resumed_from_stage_id: execution.resumed_from.clone(),
                         },
                         &branch_scope,
                     );
@@ -255,15 +284,17 @@ async fn run_branches(
                     Err(payload) => {
                         let result =
                             failed_branch_result(&target_id, super::format_panic_message(&payload));
-                        emit_branch_completed(
-                            &branch_services.run.emitter,
-                            &branch_scope,
-                            group_id,
-                            parallel_branch_id,
-                            branch_index,
-                            millis_u64(branch_start.elapsed()),
-                            result.outcome.status,
-                        );
+                        if let Some(scope) = reserved_scope.get() {
+                            emit_branch_completed(
+                                &branch_services.run.emitter,
+                                scope,
+                                group_id,
+                                parallel_branch_id,
+                                branch_index,
+                                millis_u64(branch_start.elapsed()),
+                                result.outcome.status,
+                            );
+                        }
                         Ok(result)
                     }
                 }
@@ -295,15 +326,17 @@ async fn run_branches(
             ),
         };
         if emit_completion {
-            emit_branch_completed(
-                &services.run.emitter,
-                &dispatch.scope,
-                parallel_group_id.clone(),
-                dispatch.branch_id,
-                dispatch.index,
-                0,
-                result.outcome.status,
-            );
+            if let Some(scope) = dispatch.scope.get() {
+                emit_branch_completed(
+                    &services.run.emitter,
+                    scope,
+                    parallel_group_id.clone(),
+                    dispatch.branch_id,
+                    dispatch.index,
+                    0,
+                    result.outcome.status,
+                );
+            }
         }
         if result.outcome.failure_category() == Some(FailureCategory::Canceled) {
             cancelled = true;
@@ -799,6 +832,7 @@ mod tests {
         logger.register(services.run.emitter.as_ref());
         let (node, graph) = parallel_graph();
         let context = test_context();
+        context.set(keys::INTERNAL_NODE_VISIT_COUNT, serde_json::json!(2));
 
         let outcome = ParallelHandler
             .execute(&node, &context, &graph, Path::new("/tmp/test"), &services)
@@ -825,7 +859,7 @@ mod tests {
         let state = run_store.state().await.unwrap();
         assert_eq!(
             state
-                .stage(&StageId::new("par", 1))
+                .stage(&StageId::new("par", 2))
                 .unwrap()
                 .parallel_results
                 .as_ref()
@@ -833,6 +867,15 @@ mod tests {
                 .len(),
             2
         );
+        for branch in ["branch_a", "branch_b"] {
+            assert_eq!(
+                state
+                    .stage(&StageId::new(branch, 1))
+                    .and_then(|stage| stage.graph_visit),
+                Some(2),
+                "parallel children should inherit the parent graph visit"
+            );
+        }
     }
 
     #[tokio::test]

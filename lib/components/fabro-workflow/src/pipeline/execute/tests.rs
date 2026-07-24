@@ -31,7 +31,7 @@ use crate::handler::start::StartHandler;
 use crate::handler::{Handler as HandlerTrait, HandlerRegistry};
 use crate::outcome::{Outcome, OutcomeExt, StageOutcome};
 use crate::pipeline::initialize;
-use crate::pipeline::types::{InitOptions, LlmSpec, Persisted, SandboxEnvSpec};
+use crate::pipeline::types::{InitOptions, LlmSpec, Persisted, ResumeState, SandboxEnvSpec};
 use crate::records::RunSpec;
 use crate::run_options::{GitCheckpointOptions, LifecycleOptions, RunOptions, SetupCommand};
 use crate::test_support::run_graph;
@@ -291,7 +291,7 @@ async fn execute_test_run_with_options(
             run_control: None,
             registry_override,
             artifact_sink: None,
-            checkpoint: None,
+            resume: None,
             seed_context: None,
             fabro_run_tools: None,
         },
@@ -353,7 +353,7 @@ async fn execute_runs_start_to_exit_and_returns_final_context() {
             run_control: None,
             registry_override: None,
             artifact_sink: None,
-            checkpoint: None,
+            resume: None,
             seed_context: None,
             fabro_run_tools: None,
         },
@@ -372,6 +372,186 @@ async fn execute_runs_start_to_exit_and_returns_final_context() {
             .final_context
             .get(crate::context::keys::INTERNAL_RUN_ID),
         Some(serde_json::json!(test_run_id("run-test").to_string()))
+    );
+}
+
+#[tokio::test]
+async fn resumed_in_flight_node_starts_a_new_stage_execution() {
+    let temp = tempfile::tempdir().unwrap();
+    let run_dir = temp.path().join("run");
+    std::fs::create_dir_all(&run_dir).unwrap();
+
+    // start -> work -> exit; `work` resolves to the default (dry-run) handler.
+    let mut graph = Graph::new("resume_identity");
+    let mut start = Node::new("start");
+    start.attrs.insert(
+        "shape".to_string(),
+        AttrValue::String("Mdiamond".to_string()),
+    );
+    graph.nodes.insert("start".to_string(), start);
+    graph.nodes.insert("work".to_string(), Node::new("work"));
+    let mut exit = Node::new("exit");
+    exit.attrs.insert(
+        "shape".to_string(),
+        AttrValue::String("Msquare".to_string()),
+    );
+    graph.nodes.insert("exit".to_string(), exit);
+    graph.edges.push(Edge::new("start", "work"));
+    graph.edges.push(Edge::new("work", "exit"));
+
+    let run_options = test_run_options(&run_dir, "resume-identity");
+    let run_id = run_options.run_id;
+    let run_store = test_run_store(&run_id).await;
+    seed_created_and_starting(&run_store, &run_options, &graph).await;
+    // Resume reconnects to the previously recorded sandbox.
+    append_event(&run_store, &run_id, &Event::SandboxInitialized {
+        working_directory: std::env::current_dir().unwrap().display().to_string(),
+        provider:          fabro_types::SandboxProviderKind::Local,
+        id:                "local".to_string(),
+        image:             None,
+        snapshot:          None,
+        repo_cloned:       None,
+        clone_origin_url:  None,
+        clone_branch:      None,
+        workspace_root:    None,
+        repos_root:        None,
+        primary_repo_path: None,
+        primary_repo_link: None,
+    })
+    .await
+    .unwrap();
+    let emitter = test_emitter_arc("resume-identity");
+    let events: Arc<std::sync::Mutex<Vec<fabro_types::RunEvent>>> = Arc::default();
+    {
+        let events = Arc::clone(&events);
+        emitter.on_event(move |event| {
+            events
+                .lock()
+                .expect("event capture mutex should not be poisoned")
+                .push(event.clone());
+        });
+    }
+
+    // Simulate resuming after `work@1` was cancelled mid-flight: the selected
+    // checkpoint predates `work`, while the allocator seed carries the
+    // projection-observed high-water mark and provenance link.
+    let checkpoint = crate::records::Checkpoint {
+        timestamp:                  chrono::Utc::now(),
+        current_node:               "start".to_string(),
+        completed_nodes:            vec!["start".to_string()],
+        node_retries:               HashMap::new(),
+        context_values:             HashMap::new(),
+        node_outcomes:              HashMap::new(),
+        next_node_id:               Some("work".to_string()),
+        git_commit_sha:             None,
+        loop_failure_signatures:    HashMap::new(),
+        restart_failure_signatures: HashMap::new(),
+        node_visits:                HashMap::from([("start".to_string(), 1usize)]),
+    };
+    let seed = crate::stage_execution::StageExecutionSeed::test_with_high_water(
+        &fabro_types::StageId::new("work", 1),
+        Some(fabro_types::StageId::new("work", 1)),
+    );
+    let resume = ResumeState::for_test(checkpoint, seed);
+
+    let initialized = initialize(
+        persisted_workflow(graph, String::new(), &run_dir, run_id),
+        InitOptions {
+            run_store: run_store.into(),
+            dry_run: false,
+            emitter: emitter.clone(),
+            sandbox: SandboxSpec::Local {
+                working_directory: std::env::current_dir().unwrap(),
+            },
+            llm: LlmSpec {
+                model:          "test-model".to_string(),
+                provider_id:    fabro_model::ProviderId::anthropic(),
+                fallback_chain: Vec::new(),
+                mcp_servers:    Vec::new(),
+                model_controls: RunModelControls::default(),
+                dry_run:        true,
+            },
+            interviewer: Arc::new(AutoApproveInterviewer::engine()),
+            steering_hub: Arc::new(crate::steering_hub::SteeringHub::new(emitter.clone())),
+            catalog: test_catalog(),
+            lifecycle: LifecycleOptions {
+                setup_commands:           vec![],
+                setup_command_timeout_ms: 1_000,
+            },
+            run_options,
+            workflow_path: None,
+            workflow_bundle: None,
+            hooks: HookSettings { hooks: vec![] },
+            sandbox_env: SandboxEnvSpec {
+                toml_env:           HashMap::new(),
+                github_permissions: None,
+                origin_url:         None,
+            },
+            vault: None,
+            git: None,
+            run_control: None,
+            registry_override: Some(Arc::new(make_registry())),
+            artifact_sink: None,
+            resume: Some(resume),
+            seed_context: None,
+            fabro_run_tools: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let executed = execute(initialized).await;
+    assert_eq!(executed.outcome.unwrap().status, StageOutcome::Succeeded);
+
+    let events = events
+        .lock()
+        .expect("event capture mutex should not be poisoned");
+    let work_started = events
+        .iter()
+        .find(|event| {
+            matches!(event.body, fabro_types::EventBody::StageStarted(_))
+                && event.node_id.as_deref() == Some("work")
+        })
+        .expect("resumed run should emit stage.started for work");
+    // The reexecution owns a fresh StageId while the graph visit stays at 1.
+    assert_eq!(
+        work_started.stage_id,
+        Some(fabro_types::StageId::new("work", 2))
+    );
+    let fabro_types::EventBody::StageStarted(props) = &work_started.body else {
+        panic!("expected stage.started body");
+    };
+    assert_eq!(props.graph_visit, Some(1));
+    assert_eq!(
+        props.resumed_from_stage_id,
+        Some(fabro_types::StageId::new("work", 1))
+    );
+
+    // Every later stage-scoped event from this invocation carries the same
+    // execution id, including the checkpoint envelope.
+    let work_checkpoint = events
+        .iter()
+        .find(|event| {
+            matches!(event.body, fabro_types::EventBody::CheckpointCompleted(_))
+                && event.node_id.as_deref() == Some("work")
+        })
+        .expect("resumed run should checkpoint work");
+    assert_eq!(
+        work_checkpoint.stage_id,
+        Some(fabro_types::StageId::new("work", 2))
+    );
+
+    // A node without a prior observable execution starts at ordinal 1.
+    let exit_started = events
+        .iter()
+        .find(|event| {
+            matches!(event.body, fabro_types::EventBody::StageStarted(_))
+                && event.node_id.as_deref() == Some("exit")
+        })
+        .expect("terminal node should emit its synthetic stage.started");
+    assert_eq!(
+        exit_started.stage_id,
+        Some(fabro_types::StageId::new("exit", 1))
     );
 }
 
@@ -423,7 +603,7 @@ async fn run_with_lifecycle(
             run_control: None,
             registry_override: Some(Arc::new(registry)),
             artifact_sink: None,
-            checkpoint: None,
+            resume: None,
             seed_context: None,
             fabro_run_tools: None,
         },

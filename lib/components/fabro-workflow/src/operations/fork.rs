@@ -273,6 +273,8 @@ fn checkpoint_completed_event(checkpoint: &Checkpoint) -> Event {
         node_visits: checkpoint.node_visits.clone().into_iter().collect(),
         diff: None,
         diff_summary: None,
+        graph_visit: None,
+        resumed_from_stage_id: None,
     }
 }
 
@@ -428,6 +430,8 @@ mod tests {
         .unwrap();
 
         event::append_event(&source, &source_run_id, &Event::CheckpointCompleted {
+            graph_visit: None,
+            resumed_from_stage_id: None,
             node_id: "work".to_string(),
             status: "succeeded".to_string(),
             current_node: "work".to_string(),

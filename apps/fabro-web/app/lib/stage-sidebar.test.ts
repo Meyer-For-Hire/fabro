@@ -11,6 +11,8 @@ function makeStage(nodeId: string, visit: number, status: StageState): Stage {
     handler: "agent",
     nodeId,
     visit,
+    graphVisit: null,
+    resumedFromStageId: null,
     status,
     duration: "--",
     startedAt: null,
@@ -122,6 +124,62 @@ describe("mapRunStagesToSidebarStages", () => {
     };
 
     expect(mapRunStagesToSidebarStages(stages)[0].duration).toBe("--");
+  });
+
+  test("maps a resumed execution's identity fields and keeps both entries in order", () => {
+    const stages: PaginatedRunStageList = {
+      data: [
+        {
+          id: "work@1",
+          name: "work",
+          handler: "agent",
+          status: "cancelled",
+          node_id: "work",
+          visit: 1,
+          graph_visit: 1,
+        },
+        {
+          id: "work@2",
+          name: "work",
+          handler: "agent",
+          status: "running",
+          node_id: "work",
+          visit: 2,
+          graph_visit: 1,
+          resumed_from_stage_id: "work@1",
+        },
+      ],
+      meta: { has_more: false },
+    };
+
+    const result = mapRunStagesToSidebarStages(stages);
+    expect(result.map((s) => s.id)).toEqual(["work@1", "work@2"]);
+    expect(result[0].status).toBe("cancelled");
+    expect(result[0].resumedFromStageId).toBeNull();
+    expect(result[1].status).toBe("running");
+    expect(result[1].graphVisit).toBe(1);
+    expect(result[1].resumedFromStageId).toBe("work@1");
+    expect(formatStageLabel(result[1])).toBe("work@2");
+  });
+
+  test("omits identity fields for stages recorded before execution tracking", () => {
+    const stages: PaginatedRunStageList = {
+      data: [
+        {
+          id: "verify@1",
+          name: "verify",
+          handler: "agent",
+          status: "succeeded",
+          node_id: "verify",
+          visit: 1,
+        },
+      ],
+      meta: { has_more: false },
+    };
+
+    const result = mapRunStagesToSidebarStages(stages);
+    expect(result[0].graphVisit).toBeNull();
+    expect(result[0].resumedFromStageId).toBeNull();
   });
 
   test("preserves the authoritative handler for renderer dispatch", () => {

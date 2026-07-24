@@ -22,6 +22,13 @@ pub mod keys {
     pub const INTERNAL_FIDELITY: &str = "internal.fidelity";
     pub const INTERNAL_THREAD_ID: &str = "internal.thread_id";
     pub const INTERNAL_NODE_VISIT_COUNT: &str = "internal.node_visit_count";
+    /// 1-based stage execution ordinal for the currently-executing node — the
+    /// numeric component of the external `StageId`. Runtime-only: reserved by
+    /// the lifecycle when a stage execution first becomes observable and
+    /// stripped from durable context snapshots, unlike
+    /// [`INTERNAL_NODE_VISIT_COUNT`], which remains the checkpointed graph
+    /// visit.
+    pub const INTERNAL_STAGE_EXECUTION_ORDINAL: &str = "internal.stage_execution_ordinal";
     pub const INTERNAL_PARENT_PREAMBLE: &str = "internal.parent_preamble";
     pub const INTERNAL_PARALLEL_GROUP_ID: &str = "internal.parallel_group_id";
     pub const INTERNAL_PARALLEL_BRANCH_ID: &str = "internal.parallel_branch_id";
@@ -46,8 +53,11 @@ pub mod keys {
     pub const PARALLEL_BRANCH_COUNT: &str = "parallel.branch_count";
 
     /// Runtime-only keys stripped from durable context projections.
-    pub(crate) const TRANSIENT_CONTEXT_KEYS: &[&str] =
-        &[CURRENT_PREAMBLE, INTERNAL_PARALLEL_BRANCH_PREAMBLES];
+    pub(crate) const TRANSIENT_CONTEXT_KEYS: &[&str] = &[
+        CURRENT_PREAMBLE,
+        INTERNAL_PARALLEL_BRANCH_PREAMBLES,
+        INTERNAL_STAGE_EXECUTION_ORDINAL,
+    ];
 
     // --- Prefix constants (for filtering and dynamic keys) ---
     pub const GRAPH_PREFIX: &str = "graph.";
@@ -195,7 +205,7 @@ pub trait WorkflowContext {
     fn parallel_group_id(&self) -> Option<StageId>;
     fn parallel_branch_id(&self) -> Option<ParallelBranchId>;
     /// Build the stage-level emit scope from the currently-executing node and
-    /// its accumulated visit count. Returns `None` for run-level emissions
+    /// its execution ordinal. Returns `None` for run-level emissions
     /// where no stage is active (i.e., `CURRENT_NODE` is unset).
     fn current_stage_scope(&self) -> Option<StageScope>;
 }
