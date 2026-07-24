@@ -720,6 +720,23 @@ async fn stream_reasoning_details_normalize_like_the_non_streaming_body() {
     assert_eq!(reasoning.trace(), Some("2 plus 2 is 4"));
 }
 
+/// Providers may omit the optional index after the first fragment; the type
+/// still identifies the logical detail being continued.
+#[tokio::test]
+async fn stream_reasoning_details_coalesce_when_a_later_fragment_omits_index() {
+    let sse = support::sse_data_transcript(&[
+        r#"{"id":"chatcmpl_stream","object":"chat.completion.chunk","created":1700000000,"model":"test-model","choices":[{"index":0,"delta":{"role":"assistant","reasoning_details":[{"type":"reasoning.text","text":"first ","index":0}]},"finish_reason":null}]}"#,
+        r#"{"id":"chatcmpl_stream","object":"chat.completion.chunk","created":1700000000,"model":"test-model","choices":[{"index":0,"delta":{"reasoning_details":[{"type":"reasoning.text","text":"second"}]},"finish_reason":null}]}"#,
+        r#"{"id":"chatcmpl_stream","object":"chat.completion.chunk","created":1700000000,"model":"test-model","choices":[{"index":0,"delta":{"content":"done"},"finish_reason":null}]}"#,
+        r#"{"id":"chatcmpl_stream","object":"chat.completion.chunk","created":1700000000,"model":"test-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        "[DONE]",
+    ]);
+
+    let response = stream_final_response(&sse).await;
+    let reasoning = response.reasoning_output().expect("reasoning present");
+    assert_eq!(reasoning.trace(), Some("first second"));
+}
+
 /// Cached and reasoning detail tokens are split into their own disjoint
 /// buckets and subtracted out of input/output.
 #[tokio::test]

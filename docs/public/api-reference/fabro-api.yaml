@@ -10058,16 +10058,30 @@ components:
         present whenever the object is emitted. Opaque provider material
         (signatures, item IDs, encrypted or redacted payloads) never appears
         here.
+      oneOf:
+        - $ref: "#/components/schemas/ReasoningOutputWithSummary"
+        - $ref: "#/components/schemas/ReasoningOutputTraceOnly"
+
+    ReasoningOutputWithSummary:
       type: object
-      anyOf:
-        - required:
-            - summary
-        - required:
-            - trace
+      required:
+        - summary
       properties:
         summary:
           type: string
           description: Model-authored summary of its reasoning.
+        trace:
+          type: string
+          description: Verbatim readable reasoning text, when the provider returns it.
+
+    ReasoningOutputTraceOnly:
+      type: object
+      required:
+        - trace
+      not:
+        required:
+          - summary
+      properties:
         trace:
           type: string
           description: Verbatim readable reasoning text, when the provider returns it.

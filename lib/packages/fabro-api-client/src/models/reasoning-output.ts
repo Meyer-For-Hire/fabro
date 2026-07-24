@@ -13,17 +13,15 @@
  */
 
 
+// May contain unused imports in some cases
+// @ts-ignore
+import type { ReasoningOutputTraceOnly } from './reasoning-output-trace-only';
+// May contain unused imports in some cases
+// @ts-ignore
+import type { ReasoningOutputWithSummary } from './reasoning-output-with-summary';
 
 /**
+ * @type ReasoningOutput
  * Readable model reasoning normalized into a provider-neutral shape. Both members may be present for the same response, and at least one is present whenever the object is emitted. Opaque provider material (signatures, item IDs, encrypted or redacted payloads) never appears here.
  */
-export interface ReasoningOutput {
-    /**
-     * Model-authored summary of its reasoning.
-     */
-    'summary'?: string;
-    /**
-     * Verbatim readable reasoning text, when the provider returns it.
-     */
-    'trace'?: string;
-}
+export type ReasoningOutput = ReasoningOutputTraceOnly | ReasoningOutputWithSummary;

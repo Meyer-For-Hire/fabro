@@ -176,8 +176,9 @@ impl ReasoningDetails {
     /// Absorb one streamed `reasoning_details` payload.
     ///
     /// Fragments carrying the same `type` and `index` are coalesced even when
-    /// other logical details appear between them. First-seen detail order is
-    /// retained.
+    /// other logical details appear between them. Without an index, a fragment
+    /// continues the most recently seen detail of the same type. First-seen
+    /// detail order is retained.
     pub(super) fn push_stream_payload(&mut self, payload: serde_json::Value) {
         let incoming = match payload {
             serde_json::Value::Array(entries) => entries,
@@ -191,6 +192,7 @@ impl ReasoningDetails {
             match self
                 .entries
                 .iter_mut()
+                .rev()
                 .find(|existing| continues_detail(existing, &entry))
             {
                 Some(existing) => merge_detail_fragment(existing, entry),
@@ -217,10 +219,23 @@ const DETAIL_TEXT_MEMBERS: [&str; 3] = ["text", "summary", "data"];
 /// Aggregators tag each logical detail with a stable `type` and `index`;
 /// fragment streams that omit `index` are matched on `type` alone.
 fn continues_detail(last: &serde_json::Value, entry: &serde_json::Value) -> bool {
-    let Some(entry_type) = entry.get("type") else {
+    let (Some(last_type), Some(entry_type)) = (
+        last.get("type").and_then(serde_json::Value::as_str),
+        entry.get("type").and_then(serde_json::Value::as_str),
+    ) else {
         return false;
     };
-    last.get("type") == Some(entry_type) && last.get("index") == entry.get("index")
+    if last_type != entry_type {
+        return false;
+    }
+
+    match (
+        last.get("index").and_then(serde_json::Value::as_u64),
+        entry.get("index").and_then(serde_json::Value::as_u64),
+    ) {
+        (Some(last_index), Some(entry_index)) => last_index == entry_index,
+        _ => true,
+    }
 }
 
 /// Append `entry`'s text fragments onto `last` and fill in members `last`
@@ -393,9 +408,65 @@ pub(super) struct AccumulatedToolCall {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiResponse, ApiUsage, ChatContent, ChatTextPart, StreamChunk};
+    use super::{
+        ApiResponse, ApiUsage, ChatContent, ChatTextPart, ReasoningDetails, StreamChunk,
+        continues_detail,
+    };
     use crate::codec::cache::CacheControl;
-    use crate::types::TokenCounts;
+    use crate::types::{ContentPart, TokenCounts};
+
+    #[test]
+    fn reasoning_detail_continuation_uses_type_when_either_index_is_missing() {
+        let indexed = serde_json::json!({"type": "reasoning.text", "index": 0});
+        let unindexed = serde_json::json!({"type": "reasoning.text"});
+
+        assert!(continues_detail(&indexed, &unindexed));
+        assert!(continues_detail(&unindexed, &indexed));
+        assert!(continues_detail(&unindexed, &unindexed));
+    }
+
+    #[test]
+    fn reasoning_detail_continuation_requires_a_matching_string_type() {
+        let detail = serde_json::json!({"type": "reasoning.text", "index": 0});
+
+        assert!(!continues_detail(
+            &detail,
+            &serde_json::json!({"type": "reasoning.summary", "index": 0})
+        ));
+        assert!(!continues_detail(
+            &serde_json::json!({"index": 0}),
+            &serde_json::json!({"index": 0})
+        ));
+        assert!(!continues_detail(
+            &serde_json::json!({"type": 7, "index": 0}),
+            &serde_json::json!({"type": 7, "index": 0})
+        ));
+    }
+
+    #[test]
+    fn unindexed_reasoning_fragment_continues_the_latest_matching_type() {
+        let mut details = ReasoningDetails::default();
+        details.push_stream_payload(serde_json::json!([
+            {"type": "reasoning.text", "text": "first", "index": 0},
+            {"type": "reasoning.text", "text": "second", "index": 1},
+        ]));
+        details.push_stream_payload(serde_json::json!([
+            {"type": "reasoning.text", "text": " continued"},
+        ]));
+
+        let ContentPart::Other { data, .. } =
+            details.into_content_part().expect("reasoning detail part")
+        else {
+            panic!("expected opaque reasoning detail part");
+        };
+        assert_eq!(
+            data,
+            serde_json::json!([
+                {"type": "reasoning.text", "text": "first", "index": 0},
+                {"type": "reasoning.text", "text": "second continued", "index": 1},
+            ])
+        );
+    }
 
     #[test]
     fn chat_content_text_serializes_as_plain_string() {

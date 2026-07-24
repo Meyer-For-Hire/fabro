@@ -47,8 +47,8 @@ impl Blocks<'_> {
     }
 }
 
-/// Join complete blocks in provider order, dropping empty and
-/// whitespace-only fragments. Retained text is never trimmed or rewritten.
+/// Join retained complete blocks in provider order. Text is never trimmed or
+/// rewritten.
 fn join_blocks(blocks: &[&str]) -> Option<String> {
     (!blocks.is_empty()).then(|| blocks.join(BLOCK_SEPARATOR))
 }
