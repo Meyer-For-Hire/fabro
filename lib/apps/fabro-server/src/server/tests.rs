@@ -15241,6 +15241,27 @@ async fn create_completion_missing_messages_returns_422() {
 }
 
 #[tokio::test]
+async fn create_completion_invalid_reasoning_effort_returns_422() {
+    let app = test_app_with();
+
+    let req = Request::builder()
+        .method("POST")
+        .uri(api("/completions"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "messages": [],
+                "reasoning_effort": "bogus"
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let response = app.oneshot(req).await.unwrap();
+    assert_status!(response, StatusCode::UNPROCESSABLE_ENTITY).await;
+}
+
+#[tokio::test]
 async fn create_completion_unknown_provider_returns_clear_error() {
     let app = test_app_with();
 
@@ -15324,14 +15345,35 @@ async fn create_completion_unsupported_reasoning_efforts_return_bad_request() {
 }
 
 #[tokio::test]
-async fn create_completion_unparseable_reasoning_effort_returns_bad_request() {
+async fn create_completion_returns_disjoint_usage_buckets() {
     let upstream = MockServer::start();
     let completion = upstream.mock(|when, then| {
-        when.method(POST);
-        then.status(500);
+        when.method(POST).path("/chat/completions");
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(json!({
+                "id": "chatcmpl-usage",
+                "model": "kimi-k3",
+                "choices": [{
+                    "message": {"role": "assistant", "content": "OK"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 200,
+                    "completion_tokens": 30,
+                    "total_tokens": 230,
+                    "prompt_tokens_details": {
+                        "cached_tokens": 50,
+                        "cache_write_tokens": 100
+                    },
+                    "completion_tokens_details": {
+                        "reasoning_tokens": 20
+                    }
+                }
+            }));
     });
     let state = TestAppStateBuilder::new()
-        .provider_base_url("kimi", upstream.url("/v1"))
+        .provider_base_url("kimi", upstream.base_url())
         .vault_entries([(EnvVars::KIMI_API_KEY, "test-kimi-api-key")])
         .build();
     let app = crate::test_support::build_test_router(state);
@@ -15341,29 +15383,32 @@ async fn create_completion_unparseable_reasoning_effort_returns_bad_request() {
         .uri(api("/completions"))
         .header("content-type", "application/json")
         .body(Body::from(
-            serde_json::json!({
+            json!({
                 "provider": "kimi",
                 "model": "kimi-k3",
-                "reasoning_effort": "bananas",
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [{"kind": "text", "data": "hi"}]
-                    }
-                ]
+                "stream": false,
+                "messages": [{
+                    "role": "user",
+                    "content": [{"kind": "text", "data": "hi"}]
+                }]
             })
             .to_string(),
         ))
         .unwrap();
 
     let response = app.oneshot(req).await.unwrap();
-    let body = response_json!(response, StatusCode::BAD_REQUEST).await;
+    let body = response_json!(response, StatusCode::OK).await;
     assert_eq!(
-        body["errors"][0]["detail"],
-        "invalid reasoning_effort 'bananas'; allowed values: low, medium, high, xhigh, max"
+        body["usage"],
+        json!({
+            "input_tokens": 50,
+            "output_tokens": 10,
+            "reasoning_tokens": 20,
+            "cache_read_tokens": 50,
+            "cache_write_tokens": 100
+        })
     );
-
-    completion.assert_calls(0);
+    completion.assert();
 }
 
 #[tokio::test]
@@ -15438,6 +15483,72 @@ reasoning = false
             .contains("expected test failure"),
         "unexpected error body: {body:?}"
     );
+    completion.assert();
+}
+
+#[tokio::test]
+async fn create_completion_structured_output_forwards_reasoning_effort() {
+    let upstream = MockServer::start();
+    let completion = upstream.mock(|when, then| {
+        when.method(POST)
+            .path("/chat/completions")
+            .json_body_includes(r#"{"model":"kimi-k3","reasoning_effort":"high"}"#);
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(json!({
+                "id": "chatcmpl-kimi-structured",
+                "model": "kimi-k3",
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "{\"answer\":42}"
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 4,
+                    "total_tokens": 14
+                }
+            }));
+    });
+    let state = TestAppStateBuilder::new()
+        .provider_base_url("kimi", upstream.base_url())
+        .vault_entries([(EnvVars::KIMI_API_KEY, "test-kimi-api-key")])
+        .build();
+    let app = crate::test_support::build_test_router(state);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri(api("/completions"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "provider": "kimi",
+                "model": "kimi-k3",
+                "reasoning_effort": "high",
+                "stream": false,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "answer": {"type": "integer"}
+                    },
+                    "required": ["answer"]
+                },
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{"kind": "text", "data": "Return the answer."}]
+                    }
+                ]
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let response = app.oneshot(req).await.unwrap();
+    let body = response_json!(response, StatusCode::OK).await;
+    assert_eq!(body["output"], json!({"answer": 42}));
     completion.assert();
 }
 

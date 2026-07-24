@@ -1,13 +1,13 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use fabro_model::{Catalog, ModelSelectionError, ReasoningEffort};
+use fabro_model::{Catalog, ModelSelectionError};
 
 use super::super::{
-    ApiError, AppState, CompletionResponse, CompletionToolChoiceMode, CompletionUsage,
-    CreateCompletionRequest, FinishReason, GenerateParams, IntoResponse, Json, LlmMessage,
-    LlmRequest, ProviderId, RequiredUser, Response, Router, State, StatusCode, ToolChoice,
-    ToolDefinition, Ulid, error, generate_object, info, post, warn,
+    ApiError, AppState, CompletionResponse, CompletionToolChoiceMode, CreateCompletionRequest,
+    FinishReason, GenerateParams, IntoResponse, Json, LlmMessage, LlmRequest, ProviderId,
+    RequiredUser, Response, Router, State, StatusCode, ToolChoice, ToolDefinition, Ulid, error,
+    generate_object, info, post, warn,
 };
 use super::llm_sse;
 
@@ -93,24 +93,6 @@ async fn create_completion(
         CompletionToolChoiceMode::Named => ToolChoice::named(tc.tool_name.unwrap_or_default()),
     });
 
-    let reasoning_effort = match req.reasoning_effort.as_deref() {
-        None => None,
-        Some(value) => match value.parse::<ReasoningEffort>() {
-            Ok(effort) => Some(effort),
-            Err(_) => {
-                return ApiError::bad_request(format!(
-                    "invalid reasoning_effort '{value}'; allowed values: {}",
-                    ReasoningEffort::variants()
-                        .iter()
-                        .map(|v| <&'static str>::from(*v))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ))
-                .into_response();
-            }
-        },
-    };
-
     // Build the LLM request
     let request = LlmRequest {
         model: model_id.clone(),
@@ -127,7 +109,7 @@ async fn create_completion(
         } else {
             Some(req.stop_sequences)
         },
-        reasoning_effort,
+        reasoning_effort: req.reasoning_effort,
         speed: None,
         metadata: None,
         provider_options: req.provider_options,
@@ -154,22 +136,23 @@ async fn create_completion(
         let msg_id = Ulid::new().to_string();
 
         if let Some(schema) = req.schema {
-            // Structured output uses generate_object for JSON parsing logic
-            let mut params =
-                GenerateParams::new(&request.model, std::sync::Arc::new(client.clone()))
-                    .messages(request.messages);
-            if let Some(ref p) = request.provider {
-                params = params.provider(p);
-            }
-            if let Some(temp) = request.temperature {
-                params = params.temperature(temp);
-            }
-            if let Some(max_tokens) = request.max_tokens {
-                params = params.max_tokens(max_tokens);
-            }
-            if let Some(top_p) = request.top_p {
-                params = params.top_p(top_p);
-            }
+            // Structured output uses generate_object for JSON parsing logic.
+            // tools/tool_choice are not forwarded: GenerateParams carries
+            // executable Arc<Tool>s, not wire ToolDefinitions, and
+            // generate_object sets response_format from the schema itself.
+            let params = GenerateParams {
+                messages: Some(request.messages),
+                provider: request.provider,
+                temperature: request.temperature,
+                top_p: request.top_p,
+                max_tokens: request.max_tokens,
+                stop_sequences: request.stop_sequences,
+                reasoning_effort: request.reasoning_effort,
+                speed: request.speed,
+                metadata: request.metadata,
+                provider_options: request.provider_options,
+                ..GenerateParams::new(request.model, std::sync::Arc::new(client.clone()))
+            };
             match generate_object(params, schema).await {
                 Ok(result) => {
                     // `result.finish_reason` / `result.usage` resolve through
@@ -184,10 +167,7 @@ async fn create_completion(
                         provider: selected_provider,
                         message: response.message,
                         stop_reason,
-                        usage: CompletionUsage {
-                            input_tokens:  response.usage.input_tokens,
-                            output_tokens: response.usage.output_tokens,
-                        },
+                        usage: response.usage,
                         output,
                         cost_usd: response.cost_usd,
                         cost_source: response.cost_source,
@@ -206,10 +186,7 @@ async fn create_completion(
                         provider: ProviderId::new(response.provider),
                         message: response.message,
                         stop_reason,
-                        usage: CompletionUsage {
-                            input_tokens:  response.usage.input_tokens,
-                            output_tokens: response.usage.output_tokens,
-                        },
+                        usage: response.usage,
                         output: None,
                         cost_usd: response.cost_usd,
                         cost_source: response.cost_source,
