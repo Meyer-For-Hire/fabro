@@ -4,7 +4,8 @@ import type {
   ToolCallMessagePartProps,
 } from "@assistant-ui/react";
 import { useMessage } from "@assistant-ui/react";
-import { WrenchScrewdriverIcon } from "@heroicons/react/24/outline";
+
+import { ToolCallCount } from "../tool-call-count";
 
 const EMPTY_PARTS: readonly ThreadAssistantMessagePart[] = [];
 
@@ -33,19 +34,12 @@ export default function ToolCallSummary(props: ToolCallMessagePartProps) {
 
   const total = toolCalls.length;
   const errored = toolCalls.filter((toolCall) => toolCall.isError).length;
-  const noun = total === 1 ? "call" : "calls";
 
   return (
-    <div className="my-2 inline-flex items-center gap-1.5 rounded-md border border-line bg-overlay/60 px-2 py-1 text-xs text-fg-muted">
-      <WrenchScrewdriverIcon className="size-3.5" aria-hidden="true" />
-      <span>
-        {total} tool {noun}
-        {errored > 0 && (
-          <span className="text-rose-300">
-            , {errored} with {errored === 1 ? "an error" : "errors"}
-          </span>
-        )}
-      </span>
-    </div>
+    <ToolCallCount
+      count={total}
+      errored={errored}
+      className="my-2 rounded-md border border-line bg-overlay/60 px-2 py-1"
+    />
   );
 }

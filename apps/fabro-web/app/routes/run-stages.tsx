@@ -1,4 +1,4 @@
-import { useMemo, useReducer, useState } from "react";
+import { useId, useMemo, useReducer, useState } from "react";
 import { Link, useParams } from "react-router";
 import {
   ArrowDownTrayIcon,
@@ -34,7 +34,8 @@ import { StageContext } from "../components/stage-context";
 import { StageInsightsSidebar } from "../components/stage-insights-sidebar";
 import { StageSidebar } from "../components/stage-sidebar";
 import type { Stage } from "../components/stage-sidebar";
-import { EmptyState } from "../components/state";
+import { EmptyState, Spinner } from "../components/state";
+import { ToolCallCount } from "../components/tool-call-count";
 import {
   HoverCard,
   PopoverHeader,
@@ -71,10 +72,20 @@ import {
   useRunStages,
   useRunState,
 } from "../lib/queries";
-import { STAGE_ACTIVITY_EVENT_TYPES, type StageActivityEventType } from "../lib/run-events";
-import { mapRunStagesToSidebarStages } from "../lib/stage-sidebar";
+import {
+  STAGE_ACTIVITY_EVENT_TYPES,
+  type StageActivityEventType,
+} from "../lib/run-events";
+import {
+  ACTIVE_STAGE_STATES,
+  mapRunStagesToSidebarStages,
+} from "../lib/stage-sidebar";
 import { getNumber, getString, type UnknownRecord } from "../lib/unknown";
-import type { EventEnvelope, StageHandler, StageModelUsage } from "@qltysh/fabro-api-client";
+import type {
+  EventEnvelope,
+  StageHandler,
+  StageModelUsage,
+} from "@qltysh/fabro-api-client";
 
 export const handle = { wide: true, fullHeight: true };
 
@@ -92,7 +103,15 @@ type TurnType =
       outputTokens: number;
       toolCallCount: number | null;
     }
-  | { kind: "tool"; ts: string; toolName: string; input: string; result: string; isError: boolean; durationMs: number }
+  | {
+      kind: "tool";
+      ts: string;
+      toolName: string;
+      input: string;
+      result: string;
+      isError: boolean;
+      durationMs: number;
+    }
   | {
       kind: "command";
       ts: string;
@@ -142,7 +161,7 @@ const EVENT_KIND_LABEL: Record<EventKind, string> = {
   command: "Command",
 };
 
-const EVENTS_TABS = ["primary", "context", "debug"] as const;
+const EVENTS_TABS = ["chat", "primary", "context", "debug"] as const;
 type EventsTab = (typeof EVENTS_TABS)[number];
 
 interface StageActivityState {
@@ -192,7 +211,11 @@ const PRIMARY_TAB_LABEL: Record<StageRenderer, string> = {
   summary: "Summary",
 };
 
-export function eventsTabLabel(tab: EventsTab, renderer: StageRenderer): string {
+export function eventsTabLabel(
+  tab: EventsTab,
+  renderer: StageRenderer,
+): string {
+  if (tab === "chat") return "Chat";
   if (tab === "debug") return "Debug";
   if (tab === "context") return "Context";
   return PRIMARY_TAB_LABEL[renderer];
@@ -236,12 +259,26 @@ interface PendingTool {
   input: string;
 }
 
+export interface PendingToolCall {
+  toolCallId: string;
+  toolName: string;
+  input: string;
+}
+
+interface StageActivity {
+  turns: TurnType[];
+  pendingTools: PendingToolCall[];
+}
+
 interface PendingCommand {
   ts: string;
   script: string;
 }
 
-export function eventsToActivity(events: EventEnvelope[], stageId: string): TurnType[] {
+export function buildStageActivity(
+  events: EventEnvelope[],
+  stageId: string,
+): StageActivity {
   const turns: TurnType[] = [];
   const pendingTools = new Map<string, PendingTool>();
   let pendingCommand: PendingCommand | undefined;
@@ -260,7 +297,11 @@ export function eventsToActivity(events: EventEnvelope[], stageId: string): Turn
     const props: UnknownRecord = e.properties ?? {};
     switch (eventType) {
       case "stage.prompt":
-        turns.push({ kind: "system", ts: e.ts, content: getString(props, "text") ?? e.text ?? "" });
+        turns.push({
+          kind: "system",
+          ts: e.ts,
+          content: getString(props, "text") ?? e.text ?? "",
+        });
         break;
       case "agent.message": {
         sawAssistantMessage = true;
@@ -300,7 +341,11 @@ export function eventsToActivity(events: EventEnvelope[], stageId: string): Turn
         break;
       }
       case "agent.interrupt.injected":
-        turns.push({ kind: "interrupt", ts: e.ts, content: "Agent interrupted" });
+        turns.push({
+          kind: "interrupt",
+          ts: e.ts,
+          content: "Agent interrupted",
+        });
         break;
       case "agent.round.interrupted":
         turns.push({
@@ -325,6 +370,7 @@ export function eventsToActivity(events: EventEnvelope[], stageId: string): Turn
       }
       case "agent.tool.started": {
         const callId = getString(props, "tool_call_id") ?? e.tool_call_id ?? "";
+        if (!callId) break;
         const args = props.arguments ?? e.arguments;
         pendingTools.set(callId, {
           ts: e.ts,
@@ -335,14 +381,20 @@ export function eventsToActivity(events: EventEnvelope[], stageId: string): Turn
       }
       case "agent.tool.completed": {
         const callId = getString(props, "tool_call_id") ?? e.tool_call_id ?? "";
+        if (!callId) break;
         const started = pendingTools.get(callId);
         pendingTools.delete(callId);
         const output = props.output ?? e.output ?? "";
-        const result = typeof output === "string" ? output : JSON.stringify(output, null, 2);
+        const result =
+          typeof output === "string" ? output : JSON.stringify(output, null, 2);
         turns.push({
           kind: "tool",
           ts: started?.ts ?? e.ts,
-          toolName: started?.toolName ?? getString(props, "tool_name") ?? e.tool_name ?? "",
+          toolName:
+            started?.toolName ??
+            getString(props, "tool_name") ??
+            e.tool_name ??
+            "",
           input: started?.input ?? "",
           result,
           isError: (props.is_error ?? e.is_error) === true,
@@ -387,7 +439,21 @@ export function eventsToActivity(events: EventEnvelope[], stageId: string): Turn
     });
   }
 
-  return turns;
+  return {
+    turns,
+    pendingTools: Array.from(pendingTools, ([toolCallId, tool]) => ({
+      toolCallId,
+      toolName: tool.toolName,
+      input: tool.input,
+    })),
+  };
+}
+
+export function eventsToActivity(
+  events: EventEnvelope[],
+  stageId: string,
+): TurnType[] {
+  return buildStageActivity(events, stageId).turns;
 }
 
 type ToolTurn = Extract<TurnType, { kind: "tool" }>;
@@ -413,6 +479,36 @@ export type DisplayItem =
       children: ToolGroupChildren;
       selection: Extract<ThreadDnaSelection, { kind: "group" }>;
     };
+
+type ChatTurn = Exclude<TurnType, ToolTurn | CommandTurn>;
+
+// The Chat view's projection: messages stay individual turns while
+// consecutive tool turns (regardless of tool name) merge into one count.
+// Unlike `groupConsecutiveTools`, errored calls stay in the batch — the chip
+// reports them as a count instead of breaking the group.
+export type ChatItem =
+  | { kind: "turn"; turn: ChatTurn; turnIndex: number }
+  | { kind: "tools"; ts: string; count: number; errored: number };
+
+export function buildChatItems(turns: TurnType[]): ChatItem[] {
+  const out: ChatItem[] = [];
+  turns.forEach((turn, turnIndex) => {
+    if (turn.kind === "tool") {
+      const errored = turn.isError ? 1 : 0;
+      const last = out[out.length - 1];
+      if (last?.kind === "tools") {
+        last.count += 1;
+        last.errored += errored;
+      } else {
+        out.push({ kind: "tools", ts: turn.ts, count: 1, errored });
+      }
+      return;
+    }
+    if (turn.kind === "command") return;
+    out.push({ kind: "turn", turn, turnIndex });
+  });
+  return out;
+}
 
 // A group's elapsed time is the wall-clock envelope of its children —
 // earliest start to latest end — not the sum of their durations. Parallel
@@ -498,7 +594,10 @@ export function groupConsecutiveTools(
 
   for (const { turn, index } of turns) {
     const groupable = turn.kind === "tool" && !turn.isError;
-    if (groupable && (buf.length === 0 || buf[0].turn.toolName === turn.toolName)) {
+    if (
+      groupable &&
+      (buf.length === 0 || buf[0].turn.toolName === turn.toolName)
+    ) {
       buf.push({ turn, turnIndex: index });
       continue;
     }
@@ -540,13 +639,16 @@ export function filterDisplayItems(
     if (item.kind === "single") {
       return kinds.has(item.turn.kind) && matchesSearch(item.turn);
     }
-    return kinds.has("tool") && item.children.some((c) => matchesSearch(c.turn));
+    return (
+      kinds.has("tool") && item.children.some((c) => matchesSearch(c.turn))
+    );
   });
 }
 
 export function visibleTurnCount(items: DisplayItem[]): number {
   return items.reduce(
-    (total, item) => total + (item.kind === "single" ? 1 : item.children.length),
+    (total, item) =>
+      total + (item.kind === "single" ? 1 : item.children.length),
     0,
   );
 }
@@ -586,8 +688,7 @@ export function buildThreadDnaItems(
       const parsed = Date.parse(runStart);
       if (!Number.isNaN(parsed)) return parsed;
     }
-    const firstTs =
-      items[0].kind === "single" ? items[0].turn.ts : items[0].ts;
+    const firstTs = items[0].kind === "single" ? items[0].turn.ts : items[0].ts;
     const parsedFirst = Date.parse(firstTs);
     return Number.isNaN(parsedFirst) ? null : parsedFirst;
   })();
@@ -734,7 +835,11 @@ export function formatStageModelUsageLabel(
   return effort ? `${model}[${effort}]` : model;
 }
 
-function ModelUsagePopover({ providerUsed }: { providerUsed: StageModelUsage }) {
+function ModelUsagePopover({
+  providerUsed,
+}: {
+  providerUsed: StageModelUsage;
+}) {
   return (
     <>
       <PopoverHeader>Model</PopoverHeader>
@@ -748,7 +853,9 @@ function ModelUsagePopover({ providerUsed }: { providerUsed: StageModelUsage }) 
           </PopoverRow>
         )}
         {providerUsed.reasoning_effort && (
-          <PopoverRow label="Reasoning">{providerUsed.reasoning_effort}</PopoverRow>
+          <PopoverRow label="Reasoning">
+            {providerUsed.reasoning_effort}
+          </PopoverRow>
         )}
         {providerUsed.speed && (
           <PopoverRow label="Speed">{providerUsed.speed}</PopoverRow>
@@ -922,7 +1029,12 @@ function EventRow({
   onSelect: () => void;
 }) {
   const metric = turnMetric(turn);
-  const MetricIcon = metric == null ? null : turn.kind === "assistant" ? CircleStackIcon : ClockIcon;
+  const MetricIcon =
+    metric == null
+      ? null
+      : turn.kind === "assistant"
+        ? CircleStackIcon
+        : ClockIcon;
   const metricSpan = (
     <span className="inline-flex items-center justify-end gap-1.5 font-mono text-xs tabular-nums text-fg-muted">
       {turn.kind === "tool" && turn.isError && (
@@ -998,7 +1110,8 @@ function ToolGroupRow({
   selected: boolean;
   onSelect: () => void;
 }) {
-  const metric = group.durationMs > 0 ? formatDurationMs(group.durationMs) : null;
+  const metric =
+    group.durationMs > 0 ? formatDurationMs(group.durationMs) : null;
   return (
     <button
       type="button"
@@ -1111,7 +1224,9 @@ function EventDetails({
             {turn.running
               ? "Running…"
               : `exit ${turn.exitCode ?? "?"}${
-                  turn.durationMs ? ` · ${formatDurationMs(turn.durationMs)}` : ""
+                  turn.durationMs
+                    ? ` · ${formatDurationMs(turn.durationMs)}`
+                    : ""
                 }`}
           </DetailField>
           <DetailField label="Script">
@@ -1143,7 +1258,11 @@ function LogStream({
   byteCount: number;
   enabled: boolean;
 }) {
-  const { data, error, isLoading } = useRunStageLog(runId, stageId, enabled && byteCount > 0);
+  const { data, error, isLoading } = useRunStageLog(
+    runId,
+    stageId,
+    enabled && byteCount > 0,
+  );
   const text = useMemo(() => {
     if (!data?.bytes_base64) return "";
     try {
@@ -1153,7 +1272,9 @@ function LogStream({
     }
   }, [data]);
   const truncated =
-    data && data.total_bytes > data.next_offset ? data.total_bytes - data.next_offset : 0;
+    data && data.total_bytes > data.next_offset
+      ? data.total_bytes - data.next_offset
+      : 0;
 
   return (
     <section>
@@ -1167,9 +1288,7 @@ function LogStream({
           </span>
         )}
       </header>
-      <pre
-        className="overflow-x-auto whitespace-pre-wrap rounded-md bg-overlay-strong p-3 font-mono text-xs leading-relaxed text-fg-3"
-      >
+      <pre className="overflow-x-auto whitespace-pre-wrap rounded-md bg-overlay-strong p-3 font-mono text-xs leading-relaxed text-fg-3">
         {byteCount === 0 ? (
           <span className="text-fg-muted">empty</span>
         ) : isLoading && !data ? (
@@ -1182,7 +1301,8 @@ function LogStream({
       </pre>
       {truncated > 0 && (
         <p className="mt-1 text-[11px] text-fg-muted">
-          Showing first {formatBytes(data!.next_offset)} of {formatBytes(data!.total_bytes)}.
+          Showing first {formatBytes(data!.next_offset)} of{" "}
+          {formatBytes(data!.total_bytes)}.
         </p>
       )}
     </section>
@@ -1280,10 +1400,16 @@ function EventDetailsPanel({
   );
 }
 
-const TOOL_INPUT_PREVIEW_KEYS = ["command", "path", "pattern", "url", "query", "script"];
+const TOOL_INPUT_PREVIEW_KEYS = [
+  "command",
+  "path",
+  "pattern",
+  "url",
+  "query",
+  "script",
+];
 
-function toolInputPreview(turn: ToolTurn): string {
-  const raw = turn.input;
+function toolInputPreview(raw: string): string {
   if (!raw) return "";
   try {
     const parsed = JSON.parse(raw);
@@ -1326,7 +1452,7 @@ function ToolGroupChildRow({
       }`}
     >
       <span className="min-w-0 truncate font-mono text-xs text-fg-3">
-        {toolInputPreview(turn)}
+        {toolInputPreview(turn.input)}
       </span>
       <span className="inline-flex items-center justify-end gap-1.5 font-mono text-xs tabular-nums text-fg-muted">
         {metric && <ClockIcon className="size-3" aria-hidden="true" />}
@@ -1340,6 +1466,154 @@ function ToolGroupChildRow({
   );
 }
 
+const CHAT_PROMPT_PREVIEW_CHARS = 280;
+
+// User-side bubble. The stage prompt (and any steer / pair-user message over
+// the preview limit) collapses to a preview with an expand toggle; expanded
+// content renders as markdown.
+function ChatUserCard({ content }: { content: string }) {
+  const [expanded, setExpanded] = useState(false);
+  const contentId = useId();
+  const isLong = content.length > CHAT_PROMPT_PREVIEW_CHARS;
+  return (
+    <div className="flex w-fit max-w-[85%] flex-col items-start gap-1.5 self-end rounded-2xl rounded-br-md bg-panel px-4 py-3">
+      <div id={contentId}>
+        {expanded ? (
+          <Markdown content={content} />
+        ) : (
+          <p className="text-sm whitespace-pre-wrap text-fg-2">
+            {isLong
+              ? `${content.slice(0, CHAT_PROMPT_PREVIEW_CHARS).trimEnd()}…`
+              : content}
+          </p>
+        )}
+      </div>
+      {isLong && (
+        <button
+          type="button"
+          aria-controls={contentId}
+          aria-expanded={expanded}
+          onClick={() => setExpanded((current) => !current)}
+          className="text-xs text-teal-500 hover:underline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-teal-500"
+        >
+          {expanded
+            ? "Collapse"
+            : `Show all (${content.length.toLocaleString()} characters)`}
+        </button>
+      )}
+    </div>
+  );
+}
+
+function ChatLiveToolLine({ tool }: { tool: PendingToolCall }) {
+  return (
+    <div className="flex items-center gap-2.5 text-xs">
+      <Spinner className="size-3 text-teal-500" />
+      <span className="shrink-0 text-fg-3">
+        {humanizeToolName(tool.toolName)}
+      </span>
+      <span className="min-w-0 truncate font-mono text-[11px] text-fg-muted">
+        {toolInputPreview(tool.input)}
+      </span>
+    </div>
+  );
+}
+
+export function StageChatView({
+  turns,
+  pendingTools,
+  stage,
+  className = "",
+}: {
+  turns: TurnType[];
+  pendingTools: PendingToolCall[];
+  stage: Stage;
+  className?: string;
+}) {
+  const items = useMemo(() => buildChatItems(turns), [turns]);
+  const stageActive = ACTIVE_STAGE_STATES.has(stage.status);
+  const duration = stage.duration === "--" ? null : stage.duration;
+  let lastAssistantTurnIndex: number | null = null;
+  for (let i = items.length - 1; i >= 0; i -= 1) {
+    const item = items[i];
+    if (item.kind === "turn" && item.turn.kind === "assistant") {
+      lastAssistantTurnIndex = item.turnIndex;
+      break;
+    }
+  }
+  return (
+    <div className={`flex w-full max-w-2xl flex-col gap-4 px-5 ${className}`}>
+      {items.length === 0 && !stageActive && (
+        <p className="py-6 text-sm text-fg-muted">
+          No agent activity recorded for this stage.
+        </p>
+      )}
+      {items.map((item, i) => {
+        if (item.kind === "tools") {
+          return (
+            <ToolCallCount
+              key={`tools-${item.ts}-${i}`}
+              count={item.count}
+              errored={item.errored}
+            />
+          );
+        }
+        const { turn, turnIndex } = item;
+        switch (turn.kind) {
+          case "system":
+          case "steer":
+          case "pair_user":
+            return (
+              <ChatUserCard key={`turn-${turnIndex}`} content={turn.content} />
+            );
+          case "pair_system":
+            return (
+              <p
+                key={`turn-${turnIndex}`}
+                className="text-xs whitespace-pre-wrap text-fg-muted"
+              >
+                {turn.content}
+              </p>
+            );
+          case "interrupt":
+            return (
+              <p key={`turn-${turnIndex}`} className="text-xs text-coral">
+                {turn.content}
+              </p>
+            );
+          case "assistant": {
+            const metric = turnMetric(turn);
+            const isFinal =
+              turnIndex === lastAssistantTurnIndex && !stageActive;
+            return (
+              <div key={`turn-${turnIndex}`} className="flex flex-col gap-1.5">
+                <Markdown content={turn.content} />
+                {isFinal && (metric || duration) && (
+                  <div className="flex gap-3 font-mono text-[11px] text-fg-muted tabular-nums">
+                    {metric && <span>{metric}</span>}
+                    {duration && <span>{duration}</span>}
+                  </div>
+                )}
+              </div>
+            );
+          }
+        }
+      })}
+      {stageActive && pendingTools.length > 0 && (
+        <div role="status" aria-live="polite" className="flex flex-col gap-2.5">
+          <span className="sr-only">
+            {pendingTools.length} tool{" "}
+            {plural(pendingTools.length, "call", "calls")} in progress
+          </span>
+          {pendingTools.map((tool) => (
+            <ChatLiveToolLine key={tool.toolCallId} tool={tool} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ToolGroupDetails({
   group,
   runStart,
@@ -1350,7 +1624,8 @@ function ToolGroupDetails({
   const [expandedIndex, setExpandedIndex] = useState<number | null>(null);
 
   const elapsed = formatElapsed(group.ts, runStart);
-  const totalDuration = group.durationMs > 0 ? formatDurationMs(group.durationMs) : null;
+  const totalDuration =
+    group.durationMs > 0 ? formatDurationMs(group.durationMs) : null;
 
   return (
     <div className="-mx-5 -mt-4">
@@ -1476,7 +1751,9 @@ function EventExportActions({
         disabled={disabled}
         onClick={async () => {
           try {
-            await navigator.clipboard.writeText(JSON.stringify(events, null, 2));
+            await navigator.clipboard.writeText(
+              JSON.stringify(events, null, 2),
+            );
             setCopied(true);
             window.setTimeout(() => setCopied(false), 1200);
           } catch {
@@ -1556,7 +1833,8 @@ function EventsToolbar({
   // Filters apply to: the agent transcript (filter event kinds) and the Debug
   // tab (filter event categories). Specialized renderers (human, parallel,
   // wait, etc.) and the command logs view don't have a filterable list.
-  const showFilters = tab === "debug" || (tab === "primary" && renderer === "agent");
+  const showFilters =
+    tab === "debug" || (tab === "primary" && renderer === "agent");
   const transcriptAllSelected = selectedKinds.length === EVENT_KINDS.length;
   const debugAllSelected =
     selectedDebugCategories.length === 0 ||
@@ -1647,7 +1925,7 @@ function EventsToolbar({
 function StageActivityBody({
   effectiveTab,
   renderer,
-  turns,
+  activity,
   visibleItems,
   panelSelection,
   onPanelSelectionChange,
@@ -1665,7 +1943,7 @@ function StageActivityBody({
 }: {
   effectiveTab: EventsTab;
   renderer: StageRenderer;
-  turns: TurnType[];
+  activity: StageActivity;
   visibleItems: DisplayItem[];
   panelSelection: PanelSelection | null;
   onPanelSelectionChange: (selection: PanelSelection | null) => void;
@@ -1681,9 +1959,18 @@ function StageActivityBody({
   runEvents: EventEnvelope[];
   stages: Stage[];
 }) {
+  const { turns, pendingTools } = activity;
   return (
     <div className="min-h-0 flex-1 overflow-y-auto pt-6 pb-[calc(1.5rem+var(--fabro-interview-dock-clearance,0px))]">
-      {effectiveTab === "primary" ? (
+      {effectiveTab === "chat" ? (
+        <StageChatView
+          key={selectedStage.id}
+          turns={turns}
+          pendingTools={pendingTools}
+          stage={selectedStage}
+          className="mx-auto"
+        />
+      ) : effectiveTab === "primary" ? (
         renderer === "agent" ? (
           turns.length > 0 && visibleItems.length === 0 ? (
             <div className="px-2 py-6 text-sm text-fg-muted">
@@ -1720,7 +2007,11 @@ function StageActivityBody({
             })
           )
         ) : renderer === "command" ? (
-          <CommandLogs runId={runId} stageId={selectedStage.id} turn={commandTurn} />
+          <CommandLogs
+            runId={runId}
+            stageId={selectedStage.id}
+            turn={commandTurn}
+          />
         ) : renderer === "human" ? (
           <HumanQA stage={selectedStage} events={debugEvents} />
         ) : renderer === "conditional" ? (
@@ -1745,7 +2036,9 @@ function StageActivityBody({
           <StageSummary stage={selectedStage} events={debugEvents} />
         )
       ) : effectiveTab === "context" ? (
-        contextData ? <StageContext data={contextData} /> : null
+        contextData ? (
+          <StageContext data={contextData} />
+        ) : null
       ) : debugEvents.length > 0 && filteredDebugEvents.length === 0 ? (
         <div className="px-2 py-6 text-sm text-fg-muted">
           No events match these filters.
@@ -1794,59 +2087,100 @@ function RunStageActivityStage({
 }) {
   const selectedStageId = selectedStage.id;
   const stageEventsQuery = useRunStageEvents(runId, selectedStageId);
-  const turns = useMemo(
-    () => eventsToActivity(stageEventsQuery.data ?? [], selectedStageId),
+  const activity = useMemo(
+    () => buildStageActivity(stageEventsQuery.data ?? [], selectedStageId),
     [stageEventsQuery.data, selectedStageId],
   );
+  const { turns } = activity;
   const renderer: StageRenderer = selectStageRenderer(selectedStage.handler);
+  const debugEvents = useMemo<EventEnvelope[]>(() => {
+    return (stageEventsQuery.data ?? []).filter(
+      (event) => activityEventStageId(event) === selectedStageId,
+    );
+  }, [stageEventsQuery.data, selectedStageId]);
+  // The Context tab surfaces the workflow's deliberate per-visit outputs. It
+  // only exists when the stage completed and actually wrote something.
+  const contextData = useMemo(
+    () => extractStageContext(debugEvents),
+    [debugEvents],
+  );
+  const availableTabs = useMemo<EventsTab[]>(
+    () =>
+      EVENTS_TABS.filter((candidate) => {
+        if (candidate === "chat") return renderer === "agent";
+        if (candidate === "context") return contextData != null;
+        return true;
+      }),
+    [renderer, contextData],
+  );
+  const effectiveTab: EventsTab = availableTabs.includes(tab) ? tab : "primary";
+  const isPrimaryAgent = effectiveTab === "primary" && renderer === "agent";
+  const isDebug = effectiveTab === "debug";
+
   // Some renderers need run-scoped events (e.g. conditional renders the
   // engine-level edge.selected event, which has no stage_id). Only fetch when
   // the active renderer actually needs it to keep this off the hot path.
   const needsRunEvents = renderer === "conditional";
   const runEventsQuery = useRunEventsList(needsRunEvents ? runId : undefined);
   const commandTurn = useMemo<CommandTurn | null>(() => {
+    if (effectiveTab !== "primary" || renderer !== "command") return null;
     for (let i = turns.length - 1; i >= 0; i -= 1) {
       const t = turns[i];
       if (t.kind === "command") return t;
     }
     return null;
-  }, [turns]);
+  }, [effectiveTab, renderer, turns]);
 
-  const [panelSelection, setPanelSelection] = useState<PanelSelection | null>(null);
+  const [panelSelection, setPanelSelection] = useState<PanelSelection | null>(
+    null,
+  );
   const [openDebugSeq, setOpenDebugSeq] = useState<number | null>(null);
   // Semantics first, visibility second: grouping and DNA timing are derived
   // from the complete turn stream, and the kind/search filters only decide
   // which of those items are shown.
   const displayItems = useMemo(
-    () => groupConsecutiveTools(turns.map((turn, index) => ({ turn, index }))),
-    [turns],
+    () =>
+      isPrimaryAgent
+        ? groupConsecutiveTools(turns.map((turn, index) => ({ turn, index })))
+        : [],
+    [isPrimaryAgent, turns],
   );
   const visibleItems = useMemo(
-    () => filterDisplayItems(displayItems, selectedKinds, search),
-    [displayItems, selectedKinds, search],
+    () =>
+      isPrimaryAgent
+        ? filterDisplayItems(displayItems, selectedKinds, search)
+        : [],
+    [isPrimaryAgent, displayItems, selectedKinds, search],
   );
   const visibleCount = useMemo(
-    () => visibleTurnCount(visibleItems),
-    [visibleItems],
+    () => (isPrimaryAgent ? visibleTurnCount(visibleItems) : 0),
+    [isPrimaryAgent, visibleItems],
   );
   const allDnaItems = useMemo(
-    () => buildThreadDnaItems(displayItems, runStart),
-    [displayItems, runStart],
+    () => (isPrimaryAgent ? buildThreadDnaItems(displayItems, runStart) : []),
+    [isPrimaryAgent, displayItems, runStart],
   );
   const threadDnaItems = useMemo(
     () =>
-      visibleItems === displayItems
-        ? allDnaItems
-        : filterThreadDnaItems(allDnaItems, visibleItems),
-    [allDnaItems, displayItems, visibleItems],
+      !isPrimaryAgent
+        ? []
+        : visibleItems === displayItems
+          ? allDnaItems
+          : filterThreadDnaItems(allDnaItems, visibleItems),
+    [isPrimaryAgent, allDnaItems, displayItems, visibleItems],
   );
 
   const openTurn =
-    panelSelection?.kind === "single" ? turns[panelSelection.turnIndex] ?? null : null;
+    isPrimaryAgent && panelSelection?.kind === "single"
+      ? (turns[panelSelection.turnIndex] ?? null)
+      : null;
   // Resolve against the complete group list so changing a filter cannot
   // corrupt or drop the identity of an open selection.
-  const openGroup = useMemo<Extract<DisplayItem, { kind: "group" }> | null>(() => {
-    if (panelSelection?.kind !== "group") return null;
+  const openGroup = useMemo<Extract<
+    DisplayItem,
+    { kind: "group" }
+  > | null>(() => {
+    if (!isPrimaryAgent || panelSelection?.kind !== "group") return null;
     for (const item of displayItems) {
       if (
         item.kind === "group" &&
@@ -1856,28 +2190,24 @@ function RunStageActivityStage({
       }
     }
     return null;
-  }, [displayItems, panelSelection]);
-
-  const debugEvents = useMemo<EventEnvelope[]>(() => {
-    return (stageEventsQuery.data ?? []).filter(
-      (e) => activityEventStageId(e) === selectedStageId,
-    );
-  }, [stageEventsQuery.data, selectedStageId]);
+  }, [isPrimaryAgent, displayItems, panelSelection]);
   const openDebugEvent = useMemo<EventEnvelope | null>(
     () =>
-      openDebugSeq != null
-        ? debugEvents.find((e) => e.seq === openDebugSeq) ?? null
+      isDebug && openDebugSeq != null
+        ? (debugEvents.find((e) => e.seq === openDebugSeq) ?? null)
         : null,
-    [debugEvents, openDebugSeq],
+    [isDebug, debugEvents, openDebugSeq],
   );
   const availableDebugCategories = useMemo<DebugCategory[]>(() => {
+    if (!isDebug) return [];
     const set = new Set<DebugCategory>();
     for (const event of debugEvents) {
       if (event.event) set.add(debugCategory(event.event));
     }
     return Array.from(set).sort();
-  }, [debugEvents]);
+  }, [isDebug, debugEvents]);
   const filteredDebugEvents = useMemo<EventEnvelope[]>(() => {
+    if (!isDebug) return [];
     const useCategoryFilter = selectedDebugCategories.length > 0;
     const cats = new Set(selectedDebugCategories);
     const needle = search.toLowerCase();
@@ -1885,24 +2215,13 @@ function RunStageActivityStage({
       const name = event.event ?? "";
       if (useCategoryFilter && !cats.has(debugCategory(name))) return false;
       if (needle) {
-        const blob = `${name} ${JSON.stringify(event.properties ?? {})}`.toLowerCase();
+        const blob =
+          `${name} ${JSON.stringify(event.properties ?? {})}`.toLowerCase();
         if (!blob.includes(needle)) return false;
       }
       return true;
     });
-  }, [debugEvents, selectedDebugCategories, search]);
-
-  // The Context tab surfaces the workflow's deliberate per-visit outputs. It
-  // only exists when the stage completed and actually wrote something.
-  const contextData = useMemo(
-    () => extractStageContext(debugEvents),
-    [debugEvents],
-  );
-  const availableTabs = useMemo<EventsTab[]>(
-    () => (contextData ? [...EVENTS_TABS] : ["primary", "debug"]),
-    [contextData],
-  );
-  const effectiveTab: EventsTab = availableTabs.includes(tab) ? tab : "primary";
+  }, [isDebug, debugEvents, selectedDebugCategories, search]);
 
   return (
     <>
@@ -1970,7 +2289,7 @@ function RunStageActivityStage({
         <StageActivityBody
           effectiveTab={effectiveTab}
           renderer={renderer}
-          turns={turns}
+          activity={activity}
           visibleItems={visibleItems}
           panelSelection={panelSelection}
           onPanelSelectionChange={setPanelSelection}
@@ -2069,7 +2388,8 @@ export default function RunStages() {
     [stagesQuery.data],
   );
 
-  const selectedStage = stages.find((s: Stage) => s.id === stageId) ?? stages[0];
+  const selectedStage =
+    stages.find((s: Stage) => s.id === stageId) ?? stages[0];
   const selectedStageId = selectedStage?.id;
   const runStart =
     selectedStage?.startedAt ??
@@ -2102,7 +2422,11 @@ export default function RunStages() {
   return (
     <div className="-mr-4 -mt-3 flex min-h-0 flex-1 sm:-mr-6 lg:-mr-8">
       <div className="min-h-0 shrink-0 overflow-y-auto overflow-x-hidden pr-3 pt-3 pb-[calc(1.5rem+var(--fabro-interview-dock-clearance,0px))]">
-        <StageSidebar stages={stages} runId={id} selectedStageId={selectedStage.id} />
+        <StageSidebar
+          stages={stages}
+          runId={id}
+          selectedStageId={selectedStage.id}
+        />
       </div>
 
       <div className="relative w-px shrink-0">

@@ -1407,7 +1407,7 @@ mod runs {
                 "Detect Drift",
                 StageState::Succeeded,
                 Some(72_000),
-                StageHandler::Command,
+                StageHandler::Agent,
             ),
             stage(
                 &StageId::new("propose-changes", 1),
