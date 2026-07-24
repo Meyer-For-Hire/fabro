@@ -3118,8 +3118,11 @@ enabled = true
         for provider in [ProviderId::openai(), ProviderId::new("openrouter")] {
             for (alias, canonical_id) in [
                 ("sol", "gpt-5.6-sol"),
+                ("gpt-sol", "gpt-5.6-sol"),
                 ("terra", "gpt-5.6-terra"),
+                ("gpt-terra", "gpt-5.6-terra"),
                 ("luna", "gpt-5.6-luna"),
+                ("gpt-luna", "gpt-5.6-luna"),
             ] {
                 let model = catalog
                     .resolve_on_provider(&provider, alias)
