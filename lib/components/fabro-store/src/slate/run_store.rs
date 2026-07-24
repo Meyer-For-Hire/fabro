@@ -84,8 +84,13 @@ impl RunDatabase {
         shared_projection_cache: Arc<RunProjectionCache>,
         run_summary_store: Arc<OnceLock<Arc<RunSummaryStore>>>,
     ) -> Result<Self> {
-        let event_seq =
-            recover_next_seq(&db, keys::run_events_prefix(&run_id), keys::parse_event_seq).await?;
+        let event_seq = if read_only {
+            // Readers never append, so they do not need to scan the full event
+            // history to recover the next write sequence.
+            1
+        } else {
+            recover_next_seq(&db, keys::run_events_prefix(&run_id), keys::parse_event_seq).await?
+        };
         let (event_tx, _) = broadcast::channel(DEFAULT_EVENT_TAIL_LIMIT.max(16));
         let blob_store = BlobStore::new(Arc::new(db.clone()));
         Ok(Self {
@@ -563,8 +568,33 @@ async fn list_events_from_with_limit<R>(
 where
     R: DbRead + Sync,
 {
-    let mut events = list_events_from(db, run_id, start_seq).await?;
-    events.truncate(limit.saturating_add(1));
+    let event_prefix = keys::run_events_prefix(run_id);
+    let max_events = limit.saturating_add(1);
+    // Seek to the page cursor and decode only the requested page plus the
+    // sentinel used to compute `has_more`.
+    let mut iter = db
+        .scan(keys::run_event_seq_prefix(run_id, start_seq)..)
+        .await?;
+    let mut events = Vec::new();
+    while events.len() < max_events {
+        let Some(entry) = iter.next().await? else {
+            break;
+        };
+        if !entry.key.starts_with(event_prefix.as_ref()) {
+            break;
+        }
+        let key = key_to_string(&entry.key)?;
+        let Some(seq) = keys::parse_event_seq(&key) else {
+            continue;
+        };
+        if seq < start_seq {
+            continue;
+        }
+        events.push(EventEnvelope {
+            seq,
+            event: serde_json::from_slice(&entry.value)?,
+        });
+    }
     Ok(events)
 }
 
@@ -734,7 +764,7 @@ mod tests {
     use object_store::memory::InMemory;
     use serde_json::json;
 
-    use crate::{Database, EventPayload};
+    use crate::{Database, EventPayload, keys};
 
     #[tokio::test]
     async fn list_blobs_reads_global_cas_namespace() {
@@ -834,6 +864,56 @@ mod tests {
             .await
             .unwrap();
         run
+    }
+
+    #[tokio::test]
+    async fn list_events_from_with_limit_does_not_read_past_limit_plus_one() {
+        let run = fresh_run().await;
+        let run_id = run.run_id();
+        run.append_event(&stage_prompt_payload(&run_id, 1, Some("alpha")))
+            .await
+            .unwrap();
+        run.append_event(&stage_prompt_payload(&run_id, 2, Some("beta")))
+            .await
+            .unwrap();
+        run.inner
+            .db
+            .put(keys::run_event_key(&run_id, 4, 0), b"invalid json")
+            .await
+            .unwrap();
+
+        let events = super::list_events_from_with_limit(&run.inner.db, &run_id, 1, 2)
+            .await
+            .unwrap();
+
+        let seqs: Vec<u32> = events.iter().map(|event| event.seq).collect();
+        assert_eq!(seqs, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn list_events_from_with_limit_seeks_to_start_sequence() {
+        let run = fresh_run().await;
+        let run_id = run.run_id();
+        run.append_event(&stage_prompt_payload(&run_id, 1, Some("alpha")))
+            .await
+            .unwrap();
+        run.append_event(&stage_prompt_payload(&run_id, 2, Some("beta")))
+            .await
+            .unwrap();
+        let mut unreadable_earlier_key = keys::run_event_seq_prefix(&run_id, 2).as_ref().to_vec();
+        unreadable_earlier_key.push(0xff);
+        run.inner
+            .db
+            .put(unreadable_earlier_key, b"invalid json")
+            .await
+            .unwrap();
+
+        let events = super::list_events_from_with_limit(&run.inner.db, &run_id, 3, 1)
+            .await
+            .unwrap();
+
+        let seqs: Vec<u32> = events.iter().map(|event| event.seq).collect();
+        assert_eq!(seqs, vec![3]);
     }
 
     #[tokio::test]
