@@ -6,7 +6,7 @@ use super::EnvContext;
 use crate::agent_profile::AgentProfile;
 use crate::apply_patch;
 use crate::config::NativeToolOptions;
-use crate::profiles::{BaseProfile, assemble_system_prompt, render_prompt};
+use crate::profiles::{BaseProfile, assemble_system_prompt, bool_var};
 use crate::sandbox::Sandbox;
 use crate::skills::Skill;
 use crate::todo_runtime::TodoRuntime;
@@ -14,9 +14,7 @@ use crate::todo_tools::make_update_plan_tool;
 use crate::tool_registry::ToolRegistry;
 use crate::tools::{self, WebFetchSummarizer, register_core_tools};
 
-const CORE_PROMPT: &str = include_str!("prompts/openai.md");
-const APPLY_PATCH_SECTION: &str = include_str!("prompts/openai_apply_patch.md");
-const EDIT_FILE_SECTION: &str = include_str!("prompts/openai_edit_file.md");
+const CORE_PROMPT: &str = include_str!("prompts/openai.md.j2");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FileEditToolKind {
@@ -157,50 +155,24 @@ impl AgentProfile for OpenAiProfile {
         user_instructions: Option<&str>,
         skills: &[Skill],
     ) -> String {
-        let (file_edit_tool_name, file_edit_failure_guidance) = match self.file_edit_tool {
-            // One-line failure hints stay inline; the multi-line usage blocks
-            // they pair with live in prompts/openai_{apply_patch,edit_file}.md.
-            FileEditToolKind::ApplyPatch => (
-                "apply_patch",
-                "- When apply_patch fails, use the error text to construct a corrected patch. \
-Re-read the target file if you need fresh context.",
-            ),
-            FileEditToolKind::EditFile => (
-                "edit_file",
-                "- When edit_file fails, use the error text to construct a corrected exact \
-replacement. Re-read the target file if you need fresh context.",
-            ),
+        let file_edit_tool = match self.file_edit_tool {
+            FileEditToolKind::ApplyPatch => "apply_patch",
+            FileEditToolKind::EditFile => "edit_file",
         };
-        let file_edit_tool_guidance = match self.file_edit_tool {
-            FileEditToolKind::ApplyPatch => APPLY_PATCH_SECTION,
-            FileEditToolKind::EditFile => EDIT_FILE_SECTION,
-        };
-        let web_search_guidance = if self
+        let has_web_search = self
             .base
             .registry
             .get(tools::WEB_SEARCH_TOOL_NAME)
-            .is_some()
-        {
-            "## web_search
-Search the web using Brave Search. Returns titles, URLs, and descriptions.
-
-"
-        } else {
-            ""
-        };
-        let core_prompt = render_prompt(CORE_PROMPT, &[
-            ("provider_name", &self.provider_display_name()),
-            ("file_edit_tool_name", file_edit_tool_name),
-            ("file_edit_failure_guidance", file_edit_failure_guidance),
-            (
-                "file_edit_tool_guidance",
-                file_edit_tool_guidance.trim_end(),
-            ),
-            ("web_search_section", web_search_guidance),
-        ]);
+            .is_some();
 
         assemble_system_prompt(
-            &core_prompt,
+            "openai",
+            CORE_PROMPT,
+            &[
+                ("provider_name", &self.provider_display_name()),
+                ("file_edit_tool", file_edit_tool),
+                ("has_web_search", bool_var(has_web_search)),
+            ],
             env,
             env_context,
             memory,

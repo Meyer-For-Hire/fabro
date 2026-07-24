@@ -5,7 +5,7 @@ use fabro_model::{AgentProfileKind, Catalog, ProviderId};
 use super::EnvContext;
 use crate::agent_profile::AgentProfile;
 use crate::config::NativeToolOptions;
-use crate::profiles::{BaseProfile, assemble_system_prompt, render_prompt};
+use crate::profiles::{BaseProfile, assemble_system_prompt, bool_var};
 use crate::sandbox::Sandbox;
 use crate::skills::Skill;
 use crate::tool_registry::ToolRegistry;
@@ -14,7 +14,7 @@ use crate::tools::{
     make_read_many_files_tool, register_core_tools,
 };
 
-const CORE_PROMPT: &str = include_str!("prompts/gemini.md");
+const CORE_PROMPT: &str = include_str!("prompts/gemini.md.j2");
 
 pub struct GeminiProfile {
     base: BaseProfile,
@@ -97,19 +97,12 @@ impl AgentProfile for GeminiProfile {
         user_instructions: Option<&str>,
         skills: &[Skill],
     ) -> String {
-        let web_search_guidance = if self.base.registry.get(WEB_SEARCH_TOOL_NAME).is_some() {
-            "## web_search
-Search the web for information.
-
-"
-        } else {
-            ""
-        };
-        let core_prompt =
-            render_prompt(CORE_PROMPT, &[("web_search_section", web_search_guidance)]);
+        let has_web_search = self.base.registry.get(WEB_SEARCH_TOOL_NAME).is_some();
 
         assemble_system_prompt(
-            &core_prompt,
+            "gemini",
+            CORE_PROMPT,
+            &[("has_web_search", bool_var(has_web_search))],
             env,
             env_context,
             memory,

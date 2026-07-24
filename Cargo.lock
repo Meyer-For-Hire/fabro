@@ -2274,6 +2274,7 @@ dependencies = [
  "fabro-model",
  "fabro-sandbox",
  "fabro-static",
+ "fabro-template",
  "fabro-test",
  "fabro-types",
  "fabro-util",

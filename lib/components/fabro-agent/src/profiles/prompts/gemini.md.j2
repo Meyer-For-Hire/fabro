@@ -19,7 +19,7 @@ Be strategic in your use of the available tools to minimize unnecessary context 
 - Prefer using tools like `grep` to identify points of interest instead of reading lots of files individually.
 - If you need to read multiple ranges in a file, do so in parallel.
 
-{env_block}
+{{ vars.env_block }}
 
 # Development Lifecycle
 
@@ -62,7 +62,10 @@ Find files by name pattern. Results sorted by modification time.
 ## list_dir
 List directory contents with depth control.
 
-{web_search_section}## web_fetch
+{% if vars.has_web_search == "true" %}## web_search
+Search the web for information.
+
+{% endif %}## web_fetch
 Fetch content from a URL and optionally summarize it. Pass a prompt to extract specific information instead of returning the full page.
 
 # Project Docs

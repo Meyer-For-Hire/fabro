@@ -981,9 +981,11 @@ fn build_ask_fabro_system_prompt(
     registry: &ToolRegistry,
     policy: &dyn ToolAccessPolicy,
 ) -> String {
-    let tool_guidance = render_ask_fabro_tool_guidance(registry, policy);
-    let core_prompt = format!(
-        "\
+    // `tool_guidance` is passed as a template variable rather than interpolated
+    // into the template text: it carries tool names and descriptions that can
+    // come from MCP servers, and MiniJinja does not re-render substituted
+    // values, so arbitrary `{{ ... }}` in a tool description stays inert.
+    const CORE_PROMPT: &str = "\
 You are Ask Fabro, an interactive read-only, run-scoped analyst.
 
 Answer questions about the current Fabro run, its event history, and its workspace. Stay scoped to this run. Do not modify the run or workspace, and do not take control actions.
@@ -995,17 +997,27 @@ When answering:
 - Cite the source of important facts in plain language, such as \"from run events\" or \"from workspace file <path>\".
 - If evidence is incomplete, say what you could not inspect.
 
-{{env_block}}
+{{ vars.env_block }}
 
 # Tool Access
 
 You can only call these tools:
-{tool_guidance}
+{{ vars.tool_guidance }}
 
-Do not claim access to tools that are not listed. Treat tool failures as real failures, not as permission discovery. If the available tools are insufficient, say what cannot be inspected."
-    );
+Do not claim access to tools that are not listed. Treat tool failures as real failures, not as permission discovery. If the available tools are insufficient, say what cannot be inspected.";
 
-    assemble_system_prompt(&core_prompt, env, env_context, &[], user_instructions, &[])
+    let tool_guidance = render_ask_fabro_tool_guidance(registry, policy);
+
+    assemble_system_prompt(
+        "ask-fabro",
+        CORE_PROMPT,
+        &[("tool_guidance", tool_guidance.as_str())],
+        env,
+        env_context,
+        &[],
+        user_instructions,
+        &[],
+    )
 }
 
 fn build_ask_fabro_run_snapshot(projection: &fabro_types::RunProjection, run_id: RunId) -> String {

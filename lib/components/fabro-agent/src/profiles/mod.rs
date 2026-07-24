@@ -112,46 +112,47 @@ pub struct EnvContext {
     pub git_recent_commits: Option<String>,
 }
 
-/// Substitute `{name}` placeholders in a prompt template.
+/// Render a boolean as the string a template compares against.
 ///
-/// Placeholders not listed in `vars` are left intact — notably `{env_block}`,
-/// which [`assemble_system_prompt`] fills in later.
+/// The shared [`fabro_template::TemplateContext`] types `vars` as strings, so
+/// templates test `{% if vars.flag == "true" %}` rather than relying on
+/// truthiness (a bare `{% if %}` on the string `"false"` would be true).
 #[must_use]
-pub fn render_prompt(template: &str, vars: &[(&str, &str)]) -> String {
-    let mut rendered = template.trim_end().to_string();
-    for (name, value) in vars {
-        rendered = rendered.replace(&format!("{{{name}}}"), value);
-    }
-    rendered
+pub fn bool_var(value: bool) -> &'static str {
+    if value { "true" } else { "false" }
 }
 
-/// Splice an optional block into the `{name}` placeholder, dropping the blank
-/// line ahead of it when the block is empty so omitting a section never leaves
-/// a double gap.
+/// Render a profile's system prompt template.
 ///
-/// Use this for whole sections that come and go. Placeholders that swap a
-/// single line in place — where the surrounding blank lines are unaffected —
-/// belong in [`render_prompt`] instead.
-#[must_use]
-pub fn splice_optional_section(template: &str, name: &str, section: &str) -> String {
-    let placeholder = format!("\n\n{{{name}}}");
-    let replacement = if section.is_empty() {
-        String::new()
-    } else {
-        format!("\n\n{}", section.trim_end())
-    };
-    template.trim_end().replace(&placeholder, &replacement)
+/// Templates are MiniJinja, rendered through [`fabro_template`] like the rest
+/// of the workspace. Values land under `vars`, so a template reads
+/// `{{ vars.env_block }}`; booleans are passed as `"true"`/`"false"` and
+/// compared explicitly, because the shared context types `vars` as strings.
+///
+/// # Panics
+/// Panics if the template fails to render. Templates are embedded at compile
+/// time with `include_str!` and every variant is covered by tests, so a
+/// failure here is a build-time bug rather than a runtime condition.
+fn render_profile_prompt(name: &str, template: &str, vars: &[(&str, &str)]) -> String {
+    let vars = vars
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect();
+    let ctx = fabro_template::TemplateContext::new().with_vars(vars);
+    fabro_template::render_named(name, template, &ctx)
+        .unwrap_or_else(|err| panic!("embedded prompt template '{name}' failed to render: {err}"))
 }
 
-/// Assembles a complete system prompt from a core prompt template and standard
-/// sections.
+/// Assembles a complete system prompt from a profile template and the standard
+/// trailing sections.
 ///
-/// The `core_prompt` should contain `{env_block}` as a placeholder where the
-/// environment context block will be inserted. Project docs and user
-/// instructions are appended at the end.
+/// The template is rendered with `env_block` plus whatever `vars` the profile
+/// supplies; project docs, skills, and user instructions are appended after.
 #[must_use]
 pub fn assemble_system_prompt(
-    core_prompt: &str,
+    name: &str,
+    template: &str,
+    vars: &[(&str, &str)],
     env: &dyn Sandbox,
     env_context: &EnvContext,
     memory: &[String],
@@ -159,6 +160,10 @@ pub fn assemble_system_prompt(
     skills: &[Skill],
 ) -> String {
     let env_block = build_env_context_block_with(env, env_context);
+    let mut all_vars = vec![("env_block", env_block.as_str())];
+    all_vars.extend_from_slice(vars);
+    let prompt = render_profile_prompt(name, template, &all_vars);
+
     let docs_section = if memory.is_empty() {
         String::new()
     } else {
@@ -177,7 +182,6 @@ pub fn assemble_system_prompt(
         None => String::new(),
     };
 
-    let prompt = core_prompt.replace("{env_block}", &env_block);
     format!("{prompt}{docs_section}{skills_section}{user_section}")
 }
 

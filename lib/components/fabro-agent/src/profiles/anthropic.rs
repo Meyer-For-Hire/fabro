@@ -5,9 +5,7 @@ use fabro_model::{AgentProfileKind, Catalog, ProviderId};
 use super::EnvContext;
 use crate::agent_profile::AgentProfile;
 use crate::config::NativeToolOptions;
-use crate::profiles::{
-    BaseProfile, assemble_system_prompt, render_prompt, splice_optional_section,
-};
+use crate::profiles::{BaseProfile, assemble_system_prompt, bool_var};
 use crate::sandbox::Sandbox;
 use crate::skills::Skill;
 use crate::todo_runtime::TodoRuntime;
@@ -23,27 +21,7 @@ pub struct AnthropicProfile {
     base: BaseProfile,
 }
 
-const CORE_PROMPT: &str = include_str!("prompts/anthropic.md");
-const SUBAGENT_SECTION: &str = include_str!("prompts/anthropic_subagents.md");
-
-const WEB_SEARCH_BULLET: &str =
-    "  - To search the internet use web_search, and to inspect a specific URL use web_fetch.";
-const NO_WEB_SEARCH_BULLET: &str = "  - To inspect a specific URL use web_fetch.";
-
-fn anthropic_core_prompt(has_spawn_agent: bool, has_web_search: bool) -> String {
-    let web_guidance = if has_web_search {
-        WEB_SEARCH_BULLET
-    } else {
-        NO_WEB_SEARCH_BULLET
-    };
-    let subagents = if has_spawn_agent {
-        SUBAGENT_SECTION
-    } else {
-        ""
-    };
-    let template = render_prompt(CORE_PROMPT, &[("web_guidance", web_guidance)]);
-    splice_optional_section(&template, "session_specific_guidance", subagents)
-}
+const CORE_PROMPT: &str = include_str!("prompts/anthropic.md.j2");
 
 impl AnthropicProfile {
     #[must_use]
@@ -128,10 +106,14 @@ impl AgentProfile for AnthropicProfile {
     ) -> String {
         let has_spawn_agent = self.base.registry.get("spawn_agent").is_some();
         let has_web_search = self.base.registry.get(WEB_SEARCH_TOOL_NAME).is_some();
-        let core_prompt = anthropic_core_prompt(has_spawn_agent, has_web_search);
 
         assemble_system_prompt(
-            &core_prompt,
+            "anthropic",
+            CORE_PROMPT,
+            &[
+                ("has_spawn_agent", bool_var(has_spawn_agent)),
+                ("has_web_search", bool_var(has_web_search)),
+            ],
             env,
             env_context,
             memory,
