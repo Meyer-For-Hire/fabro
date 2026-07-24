@@ -292,9 +292,38 @@
         "icon": "clock-rotate-left",
         "groups": [
           {
+            "group": "July 2026",
+            "icon": "clock-rotate-left",
+            "pages": [
+              "changelog/2026-07-24",
+              "changelog/2026-07-23",
+              "changelog/2026-07-22",
+              "changelog/2026-07-11",
+              "changelog/2026-07-10",
+              "changelog/2026-07-09",
+              "changelog/2026-07-08",
+              "changelog/2026-07-07",
+              "changelog/2026-07-03",
+              "changelog/2026-07-02",
+              "changelog/2026-07-01"
+            ]
+          },
+          {
             "group": "June 2026",
             "icon": "clock-rotate-left",
             "pages": [
+              "changelog/2026-06-30",
+              "changelog/2026-06-27",
+              "changelog/2026-06-26",
+              "changelog/2026-06-25",
+              "changelog/2026-06-24",
+              "changelog/2026-06-18",
+              "changelog/2026-06-16",
+              "changelog/2026-06-15",
+              "changelog/2026-06-14",
+              "changelog/2026-06-13",
+              "changelog/2026-06-12",
+              "changelog/2026-06-11",
               "changelog/2026-06-10",
               "changelog/2026-06-09",
               "changelog/2026-06-05",
