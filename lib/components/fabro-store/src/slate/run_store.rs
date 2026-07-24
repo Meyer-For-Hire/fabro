@@ -445,8 +445,8 @@ impl RunDatabase {
     }
 
     /// Latest appended event sequence, or 0 when the run has no events.
-    /// Served from the projection cache when warm; otherwise recovered by
-    /// scanning the event history.
+    /// Served from the projection cache when warm; otherwise recovered with
+    /// bounded probes of the event key space rather than a full history scan.
     async fn latest_event_seq(&self) -> Result<u32> {
         match self
             .inner
@@ -455,9 +455,7 @@ impl RunDatabase {
             .await
         {
             Some((_, seq)) => Ok(seq),
-            None => Ok(recover_next_seq(&self.inner.db, &self.inner.run_id)
-                .await?
-                .saturating_sub(1)),
+            None => recover_latest_seq(&self.inner.db, &self.inner.run_id).await,
         }
     }
 
@@ -623,6 +621,39 @@ where
         }
     }
     Ok(max_seq.saturating_add(1).max(1))
+}
+
+/// Smallest stored event sequence at or above `seq`, if any.
+async fn first_event_seq_at_or_after<R>(db: &R, run_id: &RunId, seq: u32) -> Result<Option<u32>>
+where
+    R: DbRead + Sync,
+{
+    let mut scan = EventScan::seek(db, run_id, seq).await?;
+    Ok(scan.next().await?.map(|(seq, _)| seq))
+}
+
+/// Largest stored event sequence for the run, or 0 when the run has no
+/// events. Binary-searches the sequence space with single-entry probes so
+/// recovery reads O(log `MAX_EVENT_SEQ`) entries instead of the full event
+/// history. Probing for the smallest sequence at or above a bound is
+/// monotone even when failed appends leave gaps in the sequence.
+async fn recover_latest_seq<R>(db: &R, run_id: &RunId) -> Result<u32>
+where
+    R: DbRead + Sync,
+{
+    let Some(mut lo) = first_event_seq_at_or_after(db, run_id, 1).await? else {
+        return Ok(0);
+    };
+    // Invariant: `lo` is a stored sequence and no stored sequence is >= `hi`.
+    let mut hi = keys::MAX_EVENT_SEQ + 1;
+    while lo + 1 < hi {
+        let mid = lo + (hi - lo) / 2;
+        match first_event_seq_at_or_after(db, run_id, mid).await? {
+            Some(seq) => lo = seq,
+            None => hi = mid,
+        }
+    }
+    Ok(lo)
 }
 
 /// Cursor over a run's stored events starting at `start_seq`, yielding raw
@@ -1115,6 +1146,81 @@ mod tests {
 
         let seqs: Vec<u32> = events.iter().map(|event| event.seq).collect();
         assert_eq!(seqs, vec![keys::MAX_EVENT_SEQ, keys::MAX_EVENT_SEQ - 1]);
+    }
+
+    #[tokio::test]
+    async fn recover_latest_seq_returns_zero_for_empty_history() {
+        let object_store = Arc::new(InMemory::new());
+        let store = Database::new(object_store, "", Duration::from_millis(1), None);
+        let run_id: RunId = "01JT56VE4Z5NZ814GZN2JZD65A".parse().unwrap();
+        let run = store.create_run(&run_id).await.unwrap();
+
+        let latest = super::recover_latest_seq(&run.inner.db, &run_id)
+            .await
+            .unwrap();
+
+        assert_eq!(latest, 0);
+    }
+
+    #[tokio::test]
+    async fn recover_latest_seq_finds_latest_across_sparse_gaps() {
+        let run = fresh_run().await;
+        let run_id = run.run_id();
+        run.append_event(&stage_prompt_payload(&run_id, 1, Some("alpha")))
+            .await
+            .unwrap();
+        run.inner
+            .db
+            .put(keys::run_event_key(&run_id, 731_204, 0), b"{}")
+            .await
+            .unwrap();
+
+        let latest = super::recover_latest_seq(&run.inner.db, &run_id)
+            .await
+            .unwrap();
+
+        assert_eq!(latest, 731_204);
+    }
+
+    #[tokio::test]
+    async fn recover_latest_seq_reads_max_event_seq() {
+        let run = fresh_run().await;
+        let run_id = run.run_id();
+        run.inner
+            .db
+            .put(keys::run_event_key(&run_id, keys::MAX_EVENT_SEQ, 0), b"{}")
+            .await
+            .unwrap();
+
+        let latest = super::recover_latest_seq(&run.inner.db, &run_id)
+            .await
+            .unwrap();
+
+        assert_eq!(latest, keys::MAX_EVENT_SEQ);
+    }
+
+    #[tokio::test]
+    async fn list_events_before_with_limit_serves_newest_page_from_cold_cache() {
+        let object_store = Arc::new(InMemory::new());
+        let store = Database::new(object_store.clone(), "", Duration::from_millis(1), None);
+        let run_id: RunId = "01JT56VE4Z5NZ814GZN2JZD65A".parse().unwrap();
+        let run = store.create_run(&run_id).await.unwrap();
+        run.append_event(&run_created_payload(&run_id))
+            .await
+            .unwrap();
+        for idx in 1..=4 {
+            run.append_event(&stage_prompt_payload(&run_id, idx, Some("alpha")))
+                .await
+                .unwrap();
+        }
+
+        let reopened = Database::new(object_store, "", Duration::from_millis(1), None);
+        let reader = reopened.open_run_reader(&run_id).await.unwrap();
+
+        let events = reader.list_events_before_with_limit(None, 2).await.unwrap();
+
+        let seqs: Vec<u32> = events.iter().map(|event| event.seq).collect();
+        assert_eq!(seqs, vec![5, 4, 3]);
     }
 
     #[tokio::test]
