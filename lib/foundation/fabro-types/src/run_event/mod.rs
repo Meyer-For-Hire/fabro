@@ -2155,6 +2155,7 @@ mod tests {
             visit:           1,
             message:         None,
             context_window:  None,
+            reasoning:       None,
         });
 
         let value = serde_json::to_value(&body).unwrap();
@@ -2168,6 +2169,68 @@ mod tests {
         );
         let parsed: EventBody = serde_json::from_value(value).unwrap();
         assert_eq!(parsed.event_name(), "agent.message");
+    }
+
+    #[test]
+    fn agent_message_omits_reasoning_when_absent() {
+        let body = EventBody::AgentMessage(AgentMessageProps {
+            text:            "ok".to_string(),
+            model:           crate::ModelRef {
+                provider: fabro_model::ProviderId::openai(),
+                model_id: "gpt-5.4".into(),
+                speed:    None,
+            },
+            billing:         BilledTokenCounts::default(),
+            cost_source:     None,
+            tool_call_count: 0,
+            visit:           1,
+            message:         None,
+            context_window:  None,
+            reasoning:       None,
+        });
+
+        let value = serde_json::to_value(&body).unwrap();
+        assert!(
+            value["properties"]
+                .as_object()
+                .unwrap()
+                .get("reasoning")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn agent_message_carries_reasoning_through_canonical_json() {
+        let body = EventBody::AgentMessage(AgentMessageProps {
+            text:            String::new(),
+            model:           crate::ModelRef {
+                provider: fabro_model::ProviderId::openai(),
+                model_id: "gpt-5.4".into(),
+                speed:    None,
+            },
+            billing:         BilledTokenCounts::default(),
+            cost_source:     None,
+            tool_call_count: 1,
+            visit:           1,
+            message:         None,
+            context_window:  None,
+            reasoning:       Some(crate::ReasoningOutput::new(
+                "inspect the implementation first",
+                "read convert.rs, then the sink",
+            )),
+        });
+
+        let value = serde_json::to_value(&body).unwrap();
+        assert_eq!(value["event"], "agent.message");
+        assert_eq!(
+            value["properties"]["reasoning"],
+            serde_json::json!({
+                "summary": "inspect the implementation first",
+                "trace": "read convert.rs, then the sink",
+            })
+        );
+        let parsed: EventBody = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, body);
     }
 
     #[test]
@@ -2208,6 +2271,7 @@ mod tests {
             visit:           1,
             message:         None,
             context_window:  Some(context_window),
+            reasoning:       None,
         });
 
         let value = serde_json::to_value(&body).unwrap();

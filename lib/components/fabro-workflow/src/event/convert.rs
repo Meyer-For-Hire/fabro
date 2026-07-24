@@ -612,6 +612,7 @@ fn event_body_from_event(event: &Event) -> EventBody {
                 cost_source,
                 tool_call_count,
                 context_window,
+                reasoning,
             } => {
                 let billing = billed_token_counts_from_llm(usage)
                     .with_reported_cost(cost_usd.map(UsdMicros::from_usd));
@@ -624,6 +625,7 @@ fn event_body_from_event(event: &Event) -> EventBody {
                     visit: *visit,
                     message: None,
                     context_window: context_window.clone(),
+                    reasoning: reasoning.clone(),
                 })
             }
             AgentEvent::ToolCallStarted {
@@ -2230,6 +2232,7 @@ mod tests {
                 cost_source:     None,
                 tool_call_count: 0,
                 context_window:  None,
+                reasoning:       None,
             },
             session_id:        Some("ses_agent".to_string()),
             parent_session_id: None,
@@ -2264,6 +2267,7 @@ mod tests {
                 cost_source:     None,
                 tool_call_count: 0,
                 context_window:  None,
+                reasoning:       None,
             },
             session_id:        Some("ses_agent".to_string()),
             parent_session_id: None,
@@ -2301,6 +2305,7 @@ mod tests {
                 cost_source:     Some(fabro_model::CostSource::Authoritative),
                 tool_call_count: 0,
                 context_window:  None,
+                reasoning:       None,
             },
             session_id:        Some("ses_agent".to_string()),
             parent_session_id: None,
@@ -2351,6 +2356,7 @@ mod tests {
                 cost_source:     None,
                 tool_call_count: 0,
                 context_window:  Some(context_window),
+                reasoning:       None,
             },
             session_id:        Some("ses_agent".to_string()),
             parent_session_id: None,
@@ -2365,6 +2371,52 @@ mod tests {
         assert_eq!(
             context_window.count_method,
             ::fabro_types::StageContextWindowCountMethod::LocalEstimate
+        );
+    }
+
+    #[test]
+    fn agent_assistant_message_copies_reasoning_into_canonical_event() {
+        let stored = to_run_event(&fixtures::RUN_1, &Event::Agent {
+            stage:             "code".to_string(),
+            visit:             1,
+            event:             AgentEvent::AssistantMessage {
+                text:            String::new(),
+                model:           ModelRef {
+                    provider: ProviderId::openai(),
+                    model_id: "gpt-5.4".into(),
+                    speed:    None,
+                },
+                usage:           LlmTokenCounts::default(),
+                cost_usd:        None,
+                cost_source:     None,
+                tool_call_count: 1,
+                context_window:  None,
+                reasoning:       Some(::fabro_types::ReasoningOutput::new(
+                    "inspect the conversion first",
+                    "read convert.rs, then the sink",
+                )),
+            },
+            session_id:        Some("ses_agent".to_string()),
+            parent_session_id: None,
+            tool_call_id:      None,
+        });
+
+        let EventBody::AgentMessage(message) = &stored.body else {
+            panic!("expected agent message body");
+        };
+        let reasoning = message.reasoning.as_ref().expect("reasoning copied");
+        assert_eq!(reasoning.summary(), Some("inspect the conversion first"));
+        assert_eq!(reasoning.trace(), Some("read convert.rs, then the sink"));
+
+        let value = stored.to_value().unwrap();
+        assert_eq!(value["event"], "agent.message");
+        assert_eq!(
+            value["properties"]["reasoning"]["summary"],
+            "inspect the conversion first"
+        );
+        assert_eq!(
+            value["properties"]["reasoning"]["trace"],
+            "read convert.rs, then the sink"
         );
     }
 

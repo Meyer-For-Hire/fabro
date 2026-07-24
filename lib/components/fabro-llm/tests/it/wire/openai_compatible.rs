@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use fabro_llm::generate::StreamAccumulator;
 use fabro_llm::provider::ProviderAdapter;
 use fabro_llm::providers::OpenAiCompatibleAdapter;
 use fabro_llm::types::{
@@ -29,6 +30,11 @@ const CREATED_TS: i64 = 1_700_000_000;
 
 /// Minimal valid Chat Completions body for encode-side tests.
 fn minimal_body() -> serde_json::Value {
+    body_with_message(&serde_json::json!({"role": "assistant", "content": "ok"}))
+}
+
+/// Wraps an assistant message in a complete Chat Completions body.
+fn body_with_message(message: &serde_json::Value) -> serde_json::Value {
     serde_json::json!({
         "id": "chatcmpl_test",
         "object": "chat.completion",
@@ -36,7 +42,7 @@ fn minimal_body() -> serde_json::Value {
         "model": MODEL,
         "choices": [{
             "index": 0,
-            "message": {"role": "assistant", "content": "ok"},
+            "message": message,
             "finish_reason": "stop"
         }],
         "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
@@ -437,6 +443,28 @@ async fn decode_response(body: serde_json::Value) -> fabro_llm::types::Response 
     response
 }
 
+/// Streams an SSE transcript and returns the final accumulated response.
+async fn stream_final_response(sse_body: &str) -> fabro_llm::types::Response {
+    use futures::StreamExt;
+
+    let server = MockServer::start();
+    let (mock, _slot) = mount_capture_sse(&server, "/chat/completions", sse_body);
+    let adapter = adapter(&server);
+    let mut stream = adapter
+        .stream(&base_request(MODEL))
+        .await
+        .expect("stream should start");
+    let mut accumulator = StreamAccumulator::new();
+    while let Some(item) = stream.next().await {
+        accumulator.process(&item.expect("stream event should decode"));
+    }
+    mock.assert();
+    accumulator
+        .response()
+        .cloned()
+        .expect("stream should emit a finish event")
+}
+
 #[tokio::test]
 async fn decode_tool_calls_with_string_arguments() {
     let response = decode_response(serde_json::json!({
@@ -483,6 +511,230 @@ async fn decode_reasoning_content_as_thinking() {
     }))
     .await;
     fabro_test::fabro_json_snapshot!(response);
+}
+
+// ---------------------------------------------------------------------------
+// Structured reasoning details
+// ---------------------------------------------------------------------------
+
+/// The structured channel classifies summary and trace independently.
+#[tokio::test]
+async fn decode_reasoning_details_normalize_summary_and_trace() {
+    let response = decode_response(body_with_message(&serde_json::json!({
+        "role": "assistant",
+        "content": "4.",
+        "reasoning_details": [
+            {"type": "reasoning.summary", "summary": "the user wants 2+2", "index": 0},
+            {"type": "reasoning.text", "text": "2 plus 2 is 4", "index": 1},
+        ]
+    })))
+    .await;
+
+    let reasoning = response.reasoning_output().expect("reasoning present");
+    assert_eq!(reasoning.summary(), Some("the user wants 2+2"));
+    assert_eq!(reasoning.trace(), Some("2 plus 2 is 4"));
+}
+
+/// Encrypted entries stay in the opaque provider part for future replay but
+/// never reach the normalized output.
+#[tokio::test]
+async fn decode_reasoning_details_preserve_encrypted_entries_opaquely() {
+    let response = decode_response(body_with_message(&serde_json::json!({
+        "role": "assistant",
+        "content": "4.",
+        "reasoning_details": [
+            {"type": "reasoning.encrypted", "data": "gAAAAAopaque", "index": 0},
+            {"type": "reasoning.summary", "summary": "visible", "index": 1},
+        ]
+    })))
+    .await;
+
+    let opaque = response
+        .message
+        .content
+        .iter()
+        .find_map(|part| match part {
+            fabro_llm::types::ContentPart::Other { kind, data }
+                if kind == fabro_llm::types::ContentPart::OPENAI_COMPAT_REASONING_DETAILS =>
+            {
+                Some(data)
+            }
+            _ => None,
+        })
+        .expect("opaque reasoning details preserved");
+    assert_eq!(opaque[0]["data"], "gAAAAAopaque");
+
+    let reasoning = response.reasoning_output().expect("reasoning present");
+    assert_eq!(reasoning.summary(), Some("visible"));
+    assert!(reasoning.trace().is_none());
+}
+
+/// Complete-response details are already assembled and must retain their
+/// received block boundaries.
+#[tokio::test]
+async fn decode_reasoning_details_preserves_complete_entries_verbatim() {
+    let details = serde_json::json!([
+        {"type": "reasoning.summary", "summary": "first"},
+        {"type": "reasoning.summary", "summary": "second"},
+    ]);
+    let response = decode_response(body_with_message(&serde_json::json!({
+        "role": "assistant",
+        "content": "4.",
+        "reasoning_details": details,
+    })))
+    .await;
+
+    let opaque = response
+        .message
+        .content
+        .iter()
+        .find_map(|part| match part {
+            fabro_llm::types::ContentPart::Other { kind, data }
+                if kind == fabro_llm::types::ContentPart::OPENAI_COMPAT_REASONING_DETAILS =>
+            {
+                Some(data)
+            }
+            _ => None,
+        })
+        .expect("opaque reasoning details preserved");
+    assert_eq!(opaque, &details);
+
+    let reasoning = response.reasoning_output().expect("reasoning present");
+    assert_eq!(reasoning.summary(), Some("first\n\nsecond"));
+}
+
+/// Unknown and malformed detail entries must not fail an otherwise valid
+/// completion.
+#[tokio::test]
+async fn decode_tolerates_unknown_and_malformed_reasoning_details() {
+    let response = decode_response(body_with_message(&serde_json::json!({
+        "role": "assistant",
+        "content": "4.",
+        "reasoning_details": [
+            {"type": "reasoning.future", "text": "new channel", "extra": {"nested": true}},
+            {"type": "reasoning.summary", "summary": 7},
+            "not-an-object",
+            42,
+        ]
+    })))
+    .await;
+
+    assert_eq!(response.text(), "4.");
+    assert!(response.reasoning_output().is_none());
+}
+
+/// A scalar `reasoning_details` carries nothing replayable and is dropped
+/// without disturbing the rest of the response.
+#[tokio::test]
+async fn decode_ignores_scalar_reasoning_details() {
+    let response = decode_response(body_with_message(&serde_json::json!({
+        "role": "assistant",
+        "content": "4.",
+        "reasoning_details": "unexpected"
+    })))
+    .await;
+
+    assert_eq!(response.text(), "4.");
+    assert!(response.reasoning_output().is_none());
+}
+
+/// OpenRouter returns both the structured channel and a flattened copy of
+/// the same material; the summary must not appear twice.
+#[tokio::test]
+async fn decode_structured_details_suppress_the_duplicate_flattened_value() {
+    let response = decode_response(body_with_message(&serde_json::json!({
+        "role": "assistant",
+        "content": "4.",
+        "reasoning": "the user wants 2+2",
+        "reasoning_details": [
+            {"type": "reasoning.summary", "summary": "the user wants 2+2", "index": 0},
+        ]
+    })))
+    .await;
+
+    let reasoning = response.reasoning_output().expect("reasoning present");
+    assert_eq!(reasoning.summary(), Some("the user wants 2+2"));
+    assert!(reasoning.trace().is_none());
+}
+
+/// A structured trace takes precedence over the flattened trace channel.
+#[tokio::test]
+async fn decode_structured_trace_takes_precedence_over_flattened_trace() {
+    let response = decode_response(body_with_message(&serde_json::json!({
+        "role": "assistant",
+        "content": "4.",
+        "reasoning": "flattened trace",
+        "reasoning_details": [{"type": "reasoning.text", "text": "verbatim trace", "index": 0}]
+    })))
+    .await;
+
+    let reasoning = response.reasoning_output().expect("reasoning present");
+    assert!(reasoning.summary().is_none());
+    assert_eq!(reasoning.trace(), Some("verbatim trace"));
+}
+
+/// A structured summary and distinct flattened trace are both retained.
+#[tokio::test]
+async fn decode_structured_summary_keeps_distinct_flattened_trace() {
+    let response = decode_response(body_with_message(&serde_json::json!({
+        "role": "assistant",
+        "content": "4.",
+        "reasoning": "full verbatim trace",
+        "reasoning_details": [
+            {"type": "reasoning.summary", "summary": "short summary", "index": 0},
+        ]
+    })))
+    .await;
+
+    let reasoning = response.reasoning_output().expect("reasoning present");
+    assert_eq!(reasoning.summary(), Some("short summary"));
+    assert_eq!(reasoning.trace(), Some("full verbatim trace"));
+}
+
+/// Streamed detail fragments coalesce back into the same normalized output
+/// the non-streaming body produces.
+#[tokio::test]
+async fn stream_reasoning_details_normalize_like_the_non_streaming_body() {
+    let sse = support::sse_data_transcript(&[
+        r#"{"id":"chatcmpl_stream","object":"chat.completion.chunk","created":1700000000,"model":"test-model","choices":[{"index":0,"delta":{"role":"assistant","reasoning_details":[{"type":"reasoning.summary","summary":"the user ","index":0},{"type":"reasoning.text","text":"2 plus ","index":1}]},"finish_reason":null}]}"#,
+        r#"{"id":"chatcmpl_stream","object":"chat.completion.chunk","created":1700000000,"model":"test-model","choices":[{"index":0,"delta":{"reasoning_details":[{"type":"reasoning.summary","summary":"wants 2+2","index":0},{"type":"reasoning.text","text":"2 is 4","index":1}]},"finish_reason":null}]}"#,
+        r#"{"id":"chatcmpl_stream","object":"chat.completion.chunk","created":1700000000,"model":"test-model","choices":[{"index":0,"delta":{"content":"4."},"finish_reason":null}]}"#,
+        r#"{"id":"chatcmpl_stream","object":"chat.completion.chunk","created":1700000000,"model":"test-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        "[DONE]",
+    ]);
+    let streamed = stream_final_response(&sse).await;
+
+    let non_streamed = decode_response(body_with_message(&serde_json::json!({
+        "role": "assistant",
+        "content": "4.",
+        "reasoning_details": [
+            {"type": "reasoning.summary", "summary": "the user wants 2+2", "index": 0},
+            {"type": "reasoning.text", "text": "2 plus 2 is 4", "index": 1},
+        ]
+    })))
+    .await;
+
+    assert_eq!(streamed.reasoning_output(), non_streamed.reasoning_output());
+    let reasoning = streamed.reasoning_output().expect("reasoning present");
+    assert_eq!(reasoning.summary(), Some("the user wants 2+2"));
+    assert_eq!(reasoning.trace(), Some("2 plus 2 is 4"));
+}
+
+/// Providers may omit the optional index after the first fragment; the type
+/// still identifies the logical detail being continued.
+#[tokio::test]
+async fn stream_reasoning_details_coalesce_when_a_later_fragment_omits_index() {
+    let sse = support::sse_data_transcript(&[
+        r#"{"id":"chatcmpl_stream","object":"chat.completion.chunk","created":1700000000,"model":"test-model","choices":[{"index":0,"delta":{"role":"assistant","reasoning_details":[{"type":"reasoning.text","text":"first ","index":0}]},"finish_reason":null}]}"#,
+        r#"{"id":"chatcmpl_stream","object":"chat.completion.chunk","created":1700000000,"model":"test-model","choices":[{"index":0,"delta":{"reasoning_details":[{"type":"reasoning.text","text":"second"}]},"finish_reason":null}]}"#,
+        r#"{"id":"chatcmpl_stream","object":"chat.completion.chunk","created":1700000000,"model":"test-model","choices":[{"index":0,"delta":{"content":"done"},"finish_reason":null}]}"#,
+        r#"{"id":"chatcmpl_stream","object":"chat.completion.chunk","created":1700000000,"model":"test-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        "[DONE]",
+    ]);
+
+    let response = stream_final_response(&sse).await;
+    let reasoning = response.reasoning_output().expect("reasoning present");
+    assert_eq!(reasoning.trace(), Some("first second"));
 }
 
 /// Cached and reasoning detail tokens are split into their own disjoint

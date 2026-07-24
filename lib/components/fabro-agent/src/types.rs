@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use fabro_llm::Error as LlmError;
 use fabro_llm::types::{ContentPart, ThinkingData, TokenCounts, ToolCall, ToolResult};
 use fabro_model::{CostSource, ModelRef};
-use fabro_types::{SessionMessage, StageContextWindowProjection};
+use fabro_types::{ReasoningOutput, SessionMessage, StageContextWindowProjection};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -254,6 +254,11 @@ pub enum AgentEvent {
         tool_call_count: usize,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         context_window:  Option<StageContextWindowProjection>,
+        /// Readable reasoning normalized from the final response. Derived
+        /// once the response is complete, so retried or replaced streaming
+        /// buffers never become durable reasoning.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning:       Option<ReasoningOutput>,
     },
     TextDelta {
         delta: String,
@@ -892,6 +897,7 @@ mod tests {
             cost_source:     Some(CostSource::Authoritative),
             tool_call_count: 2,
             context_window:  None,
+            reasoning:       None,
         };
         match &event {
             AgentEvent::AssistantMessage {

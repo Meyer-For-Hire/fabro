@@ -22,6 +22,7 @@ pub mod pair;
 pub mod parallel;
 pub mod principal;
 pub mod pull_request;
+pub mod reasoning;
 pub mod repository;
 pub mod run;
 pub mod run_blob_id;
@@ -101,6 +102,7 @@ pub use pull_request::{
     PullRequestDetailsUnavailableReason, PullRequestGithubDetail, PullRequestLink, PullRequestMeta,
     PullRequestRef, PullRequestResponse, PullRequestTimestamps, PullRequestUser,
 };
+pub use reasoning::ReasoningOutput;
 pub use repository::{RepositoryProvider, RepositoryRef};
 pub use run::{
     DirtyStatus, ForkSourceRef, GitContext, PreRunPushOutcome, RunClientProvenance, RunProvenance,

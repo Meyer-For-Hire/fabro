@@ -7,7 +7,7 @@ use super::BilledTokenCounts;
 use crate::transcript::{ToolCall, ToolResult, TranscriptMessage};
 use crate::{
     MessageId, ModelRef, PairId, PairMessageId, PairSystemMessageKind, PermissionLevel,
-    StageContextWindowProjection, TurnId,
+    ReasoningOutput, StageContextWindowProjection, TurnId,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -135,6 +135,11 @@ pub struct AgentMessageProps {
     /// computed from the request that produced this assistant response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window:  Option<StageContextWindowProjection>,
+    /// Readable reasoning the provider returned with this response, if any.
+    /// Absent when the provider returned none or returned only opaque
+    /// material, so events without reasoning keep their previous shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning:       Option<ReasoningOutput>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -409,6 +414,33 @@ mod tests {
         assert!(props.cost_source.is_none());
         assert!(props.message.is_none());
         assert!(props.context_window.is_none());
+        assert!(props.reasoning.is_none());
+    }
+
+    #[test]
+    fn agent_message_props_round_trips_reasoning_with_both_fields() {
+        let props = AgentMessageProps {
+            text:            String::new(),
+            model:           sample_model_ref(),
+            billing:         BilledTokenCounts::default(),
+            cost_source:     None,
+            tool_call_count: 1,
+            visit:           1,
+            message:         None,
+            context_window:  None,
+            reasoning:       Some(ReasoningOutput::new(
+                "inspect the implementation first",
+                "read convert.rs, then the sink",
+            )),
+        };
+        let v = serde_json::to_value(&props).unwrap();
+        assert_eq!(
+            v["reasoning"]["summary"],
+            "inspect the implementation first"
+        );
+        assert_eq!(v["reasoning"]["trace"], "read convert.rs, then the sink");
+        let back: AgentMessageProps = serde_json::from_value(v).unwrap();
+        assert_eq!(back, props);
     }
 
     #[test]
@@ -425,6 +457,7 @@ mod tests {
             visit:           1,
             message:         Some(msg.clone()),
             context_window:  None,
+            reasoning:       None,
         };
         let v = serde_json::to_value(&props).unwrap();
         assert_eq!(v["message"]["kind"], "agent");

@@ -534,6 +534,7 @@ mod tests {
             cost_source:     None,
             tool_call_count: 0,
             context_window:  None,
+            reasoning:       None,
         })
     }
 

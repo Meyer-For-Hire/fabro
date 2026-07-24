@@ -4171,6 +4171,7 @@ fn context_window_event(
             cost_source:     None,
             tool_call_count: 0,
             context_window:  Some(context_window),
+            reasoning:       None,
         },
         session_id: Some("session-1".to_string()),
         parent_session_id: None,
@@ -15380,6 +15381,79 @@ async fn cancel_before_run_transitions_to_running_returns_empty_attach_stream() 
     let response = app.oneshot(req).await.unwrap();
     let body = response_bytes!(response, StatusCode::OK).await;
     assert!(body.is_empty(), "expected an empty attach stream");
+}
+
+/// Reasoning has to survive the whole durable path, not just the local
+/// struct conversion: emitted event → run store → attach SSE JSON.
+#[tokio::test]
+async fn attach_stream_replays_agent_message_reasoning() {
+    let state = test_app_state();
+    let app = crate::test_support::build_test_router(Arc::clone(&state));
+    let run_id = fixtures::RUN_1;
+
+    create_durable_run_with_events(&state, run_id, &[
+        stage_started_event("code", "agent"),
+        workflow_event::Event::Agent {
+            stage:             "code".to_string(),
+            visit:             1,
+            event:             fabro_agent::AgentEvent::AssistantMessage {
+                text:            String::new(),
+                model:           ModelRef {
+                    provider: ProviderId::openai(),
+                    model_id: "gpt-5.4".into(),
+                    speed:    None,
+                },
+                usage:           TokenCounts::default(),
+                cost_usd:        None,
+                cost_source:     None,
+                tool_call_count: 1,
+                context_window:  None,
+                reasoning:       Some(fabro_types::ReasoningOutput::new(
+                    "inspect the sink first",
+                    "read events.rs, then attach",
+                )),
+            },
+            session_id:        Some("session-1".to_string()),
+            parent_session_id: None,
+            tool_call_id:      None,
+        },
+        workflow_event::Event::WorkflowRunCompleted {
+            timing:               fabro_types::RunTiming::wall_only(1000),
+            artifact_count:       0,
+            status:               "succeeded".to_string(),
+            reason:               SuccessReason::Completed,
+            total_usd_micros:     None,
+            final_git_commit_sha: None,
+            final_patch:          None,
+            diff_summary:         None,
+            billing:              None,
+        },
+    ])
+    .await;
+
+    let req = Request::builder()
+        .method("GET")
+        .uri(api(&format!("/runs/{run_id}/attach?since_seq=1")))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(req).await.unwrap();
+    let body = response_bytes!(response, StatusCode::OK).await;
+    let text = String::from_utf8(body.clone()).unwrap();
+
+    let message = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+        .find(|value| value["event"] == "agent.message")
+        .expect("attach stream should replay the agent message");
+    assert_eq!(
+        message["properties"]["reasoning"]["summary"],
+        "inspect the sink first"
+    );
+    assert_eq!(
+        message["properties"]["reasoning"]["trace"],
+        "read events.rs, then attach"
+    );
 }
 
 #[tokio::test]
