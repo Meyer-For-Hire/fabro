@@ -3136,6 +3136,57 @@ enabled = true
     }
 
     #[test]
+    fn builtin_glm_5_2_aliases_are_portable() {
+        let catalog = Catalog::from_builtin_with_overrides(&minimal_settings(
+            r"
+[providers.openrouter]
+enabled = true
+",
+        ))
+        .expect("enabled OpenRouter override should build from the built-in provider settings");
+
+        for provider in [ProviderId::new("zai"), ProviderId::new("openrouter")] {
+            for alias in ["glm", "glm5", "glm52", "glm5.2"] {
+                let model = catalog
+                    .resolve_on_provider(&provider, alias)
+                    .unwrap_or_else(|error| {
+                        panic!("{alias} should resolve on {provider}: {error}")
+                    });
+                assert_eq!(model.provider, provider, "{alias}");
+                assert_eq!(model.id, "glm-5.2", "{alias}");
+            }
+        }
+    }
+
+    #[test]
+    fn builtin_deepseek_v4_selectors_resolve_on_openrouter() {
+        let catalog = Catalog::from_builtin_with_overrides(&minimal_settings(
+            r"
+[providers.openrouter]
+enabled = true
+",
+        ))
+        .expect("enabled OpenRouter override should build from the built-in provider settings");
+        let openrouter = ProviderId::new("openrouter");
+
+        for (selector, canonical_id) in [
+            ("deepseek-v4-pro", "deepseek-v4-pro"),
+            ("deepseek-v4", "deepseek-v4-pro"),
+            ("deepseek", "deepseek-v4-pro"),
+            ("deepseek-v4-flash", "deepseek-v4-flash"),
+            ("deepseek-flash", "deepseek-v4-flash"),
+        ] {
+            let model = catalog
+                .resolve_on_provider(&openrouter, selector)
+                .unwrap_or_else(|error| {
+                    panic!("{selector} should resolve on {openrouter}: {error}")
+                });
+            assert_eq!(model.provider, openrouter, "{selector}");
+            assert_eq!(model.id, canonical_id, "{selector}");
+        }
+    }
+
+    #[test]
     fn builtin_legacy_vendor_ids_normalize_for_pinned_and_unpinned_selection() {
         let catalog = Catalog::from_builtin_with_overrides(&minimal_settings(
             r"
@@ -3260,7 +3311,12 @@ enabled = true
                 ),
             },
             estimated_output_tps: None,
-            aliases: [],
+            aliases: [
+                "glm",
+                "glm5",
+                "glm52",
+                "glm5.2",
+            ],
             default: false,
             small_default: false,
             configured: false,
@@ -6107,6 +6163,8 @@ sampling_params = false
             aliases: [
                 "glm",
                 "glm5",
+                "glm52",
+                "glm5.2",
             ],
             default: true,
             small_default: false,
@@ -6124,6 +6182,8 @@ sampling_params = false
         ]);
         assert_eq!(catalog.get("glm").unwrap().id, "glm-5.2");
         assert_eq!(catalog.get("glm5").unwrap().id, "glm-5.2");
+        assert_eq!(catalog.get("glm52").unwrap().id, "glm-5.2");
+        assert_eq!(catalog.get("glm5.2").unwrap().id, "glm-5.2");
     }
 
     #[test]
