@@ -38,7 +38,9 @@ pub(crate) struct RunDatabaseInner {
     run_id: RunId,
     db: Db,
     blob_store: BlobStore,
-    event_seq: AtomicU32,
+    // `None` for reader-built inners: readers never append, so they carry no
+    // next-write sequence and any append through them fails as read-only.
+    event_seq: Option<AtomicU32>,
     close_lock: Mutex<()>,
     state_lock: Mutex<()>,
     projection_cache: Mutex<EventProjectionCache>,
@@ -85,13 +87,11 @@ impl RunDatabase {
         run_summary_store: Arc<OnceLock<Arc<RunSummaryStore>>>,
     ) -> Result<Self> {
         let event_seq = if read_only {
-            // Placeholder: readers never append (append_event_envelope
-            // rejects read-only handles, and reader inners are never cached
-            // in active_runs), so skip the full event history scan that
-            // recovers the next write sequence.
-            1
+            // Readers never append, so they do not need to scan the full event
+            // history to recover the next write sequence.
+            None
         } else {
-            recover_next_seq(&db, keys::run_events_prefix(&run_id), keys::parse_event_seq).await?
+            Some(AtomicU32::new(recover_next_seq(&db, &run_id).await?))
         };
         let (event_tx, _) = broadcast::channel(DEFAULT_EVENT_TAIL_LIMIT.max(16));
         let blob_store = BlobStore::new(Arc::new(db.clone()));
@@ -100,7 +100,7 @@ impl RunDatabase {
                 run_id,
                 db,
                 blob_store,
-                event_seq: AtomicU32::new(event_seq),
+                event_seq,
                 close_lock: Mutex::new(()),
                 state_lock: Mutex::new(()),
                 projection_cache: Mutex::new(EventProjectionCache::default()),
@@ -247,15 +247,12 @@ impl RunDatabase {
         if start_seq < oldest_seq {
             return None;
         }
-        let mut events = recent_events
+        let events = recent_events
             .iter()
             .filter(|event| event.seq >= start_seq)
             .take(limit.saturating_add(1))
             .cloned()
             .collect::<Vec<_>>();
-        if events.is_empty() && start_seq <= self.inner.event_seq.load(Ordering::SeqCst) {
-            events = Vec::new();
-        }
         Some(events)
     }
 }
@@ -294,7 +291,8 @@ impl RunDatabase {
     }
 
     async fn append_event_envelope_locked(&self, payload: &EventPayload) -> Result<EventEnvelope> {
-        let seq = self.inner.event_seq.fetch_add(1, Ordering::SeqCst);
+        let event_seq = self.inner.event_seq.as_ref().ok_or(Error::ReadOnly)?;
+        let seq = event_seq.fetch_add(1, Ordering::SeqCst);
         let event = EventEnvelope {
             seq,
             event: RunEvent::try_from(payload)?,
@@ -367,9 +365,11 @@ impl RunDatabase {
     }
 
     pub async fn list_events(&self) -> Result<Vec<EventEnvelope>> {
-        self.list_events_from_with_limit(1, usize::MAX / 2).await
+        self.list_events_from_with_limit(1, usize::MAX).await
     }
 
+    /// Returns up to `limit + 1` events starting at `start_seq`. The extra
+    /// item lets callers compute `has_more` without a second read.
     pub async fn list_events_from_with_limit(
         &self,
         start_seq: u32,
@@ -424,13 +424,9 @@ impl RunDatabase {
             .await
         {
             Some(seq) => Ok(seq),
-            None => Ok(recover_next_seq(
-                &self.inner.db,
-                keys::run_events_prefix(&self.inner.run_id),
-                keys::parse_event_seq,
-            )
-            .await?
-            .saturating_sub(1)),
+            None => Ok(recover_next_seq(&self.inner.db, &self.inner.run_id)
+                .await?
+                .saturating_sub(1)),
         }
     }
 
@@ -572,19 +568,15 @@ fn apply_cached_projection_event(
     Ok(())
 }
 
-async fn recover_next_seq<R>(
-    db: &R,
-    prefix: keys::SlateKey,
-    parse: fn(&str) -> Option<u32>,
-) -> Result<u32>
+async fn recover_next_seq<R>(db: &R, run_id: &RunId) -> Result<u32>
 where
     R: DbRead + Sync,
 {
-    let mut iter = db.scan_prefix(prefix).await?;
+    let mut iter = db.scan_prefix(keys::run_events_prefix(run_id)).await?;
     let mut max_seq = 0;
     while let Some(entry) = iter.next().await? {
-        let key = key_to_string(&entry.key)?;
-        if let Some(seq) = parse(&key) {
+        let key = key_to_str(&entry.key)?;
+        if let Some(seq) = keys::parse_event_seq(key) {
             max_seq = max_seq.max(seq);
         }
     }
@@ -595,25 +587,11 @@ async fn list_events_from<R>(db: &R, run_id: &RunId, start_seq: u32) -> Result<V
 where
     R: DbRead + Sync,
 {
-    let mut iter = db.scan_prefix(keys::run_events_prefix(run_id)).await?;
-    let mut events = Vec::new();
-    while let Some(entry) = iter.next().await? {
-        let key = key_to_string(&entry.key)?;
-        let Some(seq) = keys::parse_event_seq(&key) else {
-            continue;
-        };
-        if seq < start_seq {
-            continue;
-        }
-        events.push(EventEnvelope {
-            seq,
-            event: serde_json::from_slice(&entry.value)?,
-        });
-    }
-    events.sort_by_key(|event| event.seq);
-    Ok(events)
+    list_events_from_with_limit(db, run_id, start_seq, usize::MAX).await
 }
 
+/// Returns up to `limit + 1` events starting at `start_seq`; the extra item
+/// lets callers compute `has_more` without a second read.
 async fn list_events_from_with_limit<R>(
     db: &R,
     run_id: &RunId,
@@ -640,28 +618,25 @@ where
         return Ok(Vec::new());
     }
 
-    let event_prefix = keys::run_events_prefix(run_id);
     let max_events = limit.saturating_add(1);
     // Seek to the page cursor and decode only the requested page plus the
-    // sentinel used to compute `has_more`.
-    let start_key = keys::run_event_seq_prefix(run_id, start_seq);
-    let mut iter = match end_seq {
+    // sentinel used to compute `has_more`. Bound forward scans to this run's
+    // event namespace.
+    let range = match end_seq {
         Some(end_seq) => {
             let end_key = keys::run_event_seq_prefix(run_id, end_seq);
-            db.scan(start_key..end_key).await?
+            keys::run_event_seq_prefix(run_id, start_seq)..end_key
         }
-        None => db.scan(start_key..).await?,
+        None => keys::run_events_range(run_id, start_seq),
     };
+    let mut iter = db.scan(range).await?;
     let mut events = Vec::new();
     while events.len() < max_events {
         let Some(entry) = iter.next().await? else {
             break;
         };
-        if !entry.key.starts_with(event_prefix.as_ref()) {
-            break;
-        }
-        let key = key_to_string(&entry.key)?;
-        let Some(seq) = keys::parse_event_seq(&key) else {
+        let key = key_to_str(&entry.key)?;
+        let Some(seq) = keys::parse_event_seq(key) else {
             continue;
         };
         if seq < start_seq {
@@ -722,8 +697,8 @@ where
     let mut iter = db.scan_prefix(keys::run_events_prefix(run_id)).await?;
     let mut events: Vec<EventEnvelope> = Vec::new();
     while let Some(entry) = iter.next().await? {
-        let key = key_to_string(&entry.key)?;
-        let Some(seq) = keys::parse_event_seq(&key) else {
+        let key = key_to_str(&entry.key)?;
+        let Some(seq) = keys::parse_event_seq(key) else {
             continue;
         };
         if seq < start_seq {
@@ -782,8 +757,8 @@ where
     let mut iter = db.scan_prefix(keys::run_events_prefix(run_id)).await?;
     let mut events = Vec::new();
     while let Some(entry) = iter.next().await? {
-        let key = key_to_string(&entry.key)?;
-        let Some(seq) = keys::parse_event_seq(&key) else {
+        let key = key_to_str(&entry.key)?;
+        let Some(seq) = keys::parse_event_seq(key) else {
             continue;
         };
         if seq < start_seq {
@@ -817,8 +792,8 @@ where
     let mut iter = db.scan_prefix(keys::blobs_prefix()).await?;
     let mut blob_ids = Vec::new();
     while let Some(entry) = iter.next().await? {
-        let key = key_to_string(&entry.key)?;
-        let Some(blob_id) = keys::parse_blob_id(&key) else {
+        let key = key_to_str(&entry.key)?;
+        let Some(blob_id) = keys::parse_blob_id(key) else {
             continue;
         };
         blob_ids.push(blob_id);
@@ -827,8 +802,8 @@ where
     Ok(blob_ids)
 }
 
-fn key_to_string(key: &Bytes) -> Result<String> {
-    String::from_utf8(key.to_vec())
+fn key_to_str(key: &Bytes) -> Result<&str> {
+    std::str::from_utf8(key)
         .map_err(|err| Error::Other(format!("stored key is not valid UTF-8: {err}")))
 }
 
