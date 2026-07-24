@@ -421,12 +421,11 @@ impl Client {
 
         if let Some(speed) = request.speed {
             if speed != Speed::Standard && !settings.controls.speed.contains(&speed) {
-                return Err(Error::Configuration {
+                return Err(Error::InvalidRequest {
                     message: format!(
                         "model '{model_id}' does not support speed '{speed}'; allowed values: standard{}",
                         format_additional_speeds(&settings.controls.speed),
                     ),
-                    source:  None,
                 });
             }
         }
@@ -1527,9 +1526,8 @@ output_cost_per_mtok = 20.0
 
         assert!(matches!(
             err,
-            Error::Configuration {
+            Error::InvalidRequest {
                 ref message,
-                ..
             } if message.contains("model 'gpt-5.4' does not support speed 'fast'")
         ));
     }
@@ -1616,9 +1614,8 @@ output_cost_per_mtok = 20.0
 
         assert!(matches!(
             err,
-            Error::Configuration {
+            Error::InvalidRequest {
                 ref message,
-                ..
             } if message.contains("model 'gpt-5.4' does not support speed 'fast'")
         ));
     }

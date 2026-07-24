@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use fabro_model::{Catalog, ModelSelectionError};
+use fabro_model::{Catalog, ModelSelectionError, ReasoningEffort};
 
 use super::super::{
     ApiError, AppState, CompletionResponse, CompletionToolChoiceMode, CompletionUsage,
@@ -23,17 +23,6 @@ fn finish_reason_to_api_stop_reason(reason: &FinishReason) -> String {
         FinishReason::ContentFilter => "content_filter".to_string(),
         FinishReason::Error => "error".to_string(),
         FinishReason::Other(s) => s.clone(),
-    }
-}
-
-fn llm_error_response(error: fabro_llm::Error) -> Response {
-    match error {
-        fabro_llm::Error::InvalidRequest { message } => {
-            ApiError::bad_request(message).into_response()
-        }
-        error => {
-            ApiError::new(StatusCode::BAD_GATEWAY, format!("LLM error: {error}")).into_response()
-        }
     }
 }
 
@@ -104,6 +93,24 @@ async fn create_completion(
         CompletionToolChoiceMode::Named => ToolChoice::named(tc.tool_name.unwrap_or_default()),
     });
 
+    let reasoning_effort = match req.reasoning_effort.as_deref() {
+        None => None,
+        Some(value) => match value.parse::<ReasoningEffort>() {
+            Ok(effort) => Some(effort),
+            Err(_) => {
+                return ApiError::bad_request(format!(
+                    "invalid reasoning_effort '{value}'; allowed values: {}",
+                    ReasoningEffort::variants()
+                        .iter()
+                        .map(|v| <&'static str>::from(*v))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+                .into_response();
+            }
+        },
+    };
+
     // Build the LLM request
     let request = LlmRequest {
         model: model_id.clone(),
@@ -120,7 +127,7 @@ async fn create_completion(
         } else {
             Some(req.stop_sequences)
         },
-        reasoning_effort: req.reasoning_effort.as_deref().and_then(|s| s.parse().ok()),
+        reasoning_effort,
         speed: None,
         metadata: None,
         provider_options: req.provider_options,
@@ -138,7 +145,7 @@ async fn create_completion(
         // Streaming path: forward all StreamEvents as SSE
         let stream_result = match client.stream(&request).await {
             Ok(s) => s,
-            Err(error) => return llm_error_response(error),
+            Err(error) => return ApiError::from(error).into_response(),
         };
 
         llm_sse::stream_response(stream_result, state.shutdown_token())
@@ -187,7 +194,7 @@ async fn create_completion(
                     })
                     .into_response()
                 }
-                Err(error) => llm_error_response(error),
+                Err(error) => ApiError::from(error).into_response(),
             }
         } else {
             match client.complete(&request).await {
@@ -209,7 +216,7 @@ async fn create_completion(
                     })
                     .into_response()
                 }
-                Err(error) => llm_error_response(error),
+                Err(error) => ApiError::from(error).into_response(),
             }
         }
     }

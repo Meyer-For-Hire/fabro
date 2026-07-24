@@ -15314,10 +15314,54 @@ async fn create_completion_unsupported_reasoning_efforts_return_bad_request() {
                 body["errors"][0]["detail"],
                 format!(
                     "model 'kimi-k3' does not support reasoning_effort '{effort}'; allowed values: low, high, max"
-                )
+                ),
+                "stream={stream}"
             );
         }
     }
+
+    completion.assert_calls(0);
+}
+
+#[tokio::test]
+async fn create_completion_unparseable_reasoning_effort_returns_bad_request() {
+    let upstream = MockServer::start();
+    let completion = upstream.mock(|when, then| {
+        when.method(POST);
+        then.status(500);
+    });
+    let state = TestAppStateBuilder::new()
+        .provider_base_url("kimi", upstream.url("/v1"))
+        .vault_entries([(EnvVars::KIMI_API_KEY, "test-kimi-api-key")])
+        .build();
+    let app = crate::test_support::build_test_router(state);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri(api("/completions"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "provider": "kimi",
+                "model": "kimi-k3",
+                "reasoning_effort": "bananas",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{"kind": "text", "data": "hi"}]
+                    }
+                ]
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let response = app.oneshot(req).await.unwrap();
+    let body = response_json!(response, StatusCode::BAD_REQUEST).await;
+    assert_eq!(
+        body["errors"][0]["detail"],
+        "invalid reasoning_effort 'bananas'; allowed values: low, medium, high, xhigh, max"
+    );
 
     completion.assert_calls(0);
 }
