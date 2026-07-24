@@ -24,6 +24,8 @@ pub enum Error {
     SessionAlreadyExists(String),
     #[error("run store is read-only")]
     ReadOnly,
+    #[error("event sequence limit of {max_seq} reached")]
+    EventSequenceExhausted { max_seq: u32 },
     #[error("invalid key segment: {segment:?}")]
     InvalidKeySegment { segment: String },
     #[error("failed to parse key: {0}")]

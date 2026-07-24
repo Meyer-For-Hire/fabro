@@ -292,7 +292,7 @@ impl RunDatabase {
 
     async fn append_event_envelope_locked(&self, payload: &EventPayload) -> Result<EventEnvelope> {
         let event_seq = self.inner.event_seq.as_ref().ok_or(Error::ReadOnly)?;
-        let seq = event_seq.fetch_add(1, Ordering::SeqCst);
+        let seq = allocate_event_seq(event_seq)?;
         let event = EventEnvelope {
             seq,
             event: RunEvent::try_from(payload)?,
@@ -505,6 +505,16 @@ impl RunDatabase {
     pub async fn state(&self) -> Result<RunProjection> {
         self.projected_state().await
     }
+}
+
+fn allocate_event_seq(event_seq: &AtomicU32) -> Result<u32> {
+    event_seq
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |seq| {
+            (seq <= keys::MAX_EVENT_SEQ).then_some(seq + 1)
+        })
+        .map_err(|_| Error::EventSequenceExhausted {
+            max_seq: keys::MAX_EVENT_SEQ,
+        })
 }
 
 fn apply_cached_projection_event(
@@ -736,13 +746,14 @@ fn key_to_str(key: &Bytes) -> Result<&str> {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     use fabro_types::{Graph, RunId, SessionId, StageId, WorkflowSettings, test_support};
     use object_store::memory::InMemory;
     use serde_json::json;
 
-    use crate::{Database, EventPayload, keys};
+    use crate::{Database, Error, EventPayload, keys};
 
     #[tokio::test]
     async fn list_blobs_reads_global_cas_namespace() {
@@ -892,6 +903,39 @@ mod tests {
 
         let seqs: Vec<u32> = events.iter().map(|event| event.seq).collect();
         assert_eq!(seqs, vec![3]);
+    }
+
+    #[tokio::test]
+    async fn append_event_rejects_sequences_beyond_key_order_limit() {
+        let run = fresh_run().await;
+        let run_id = run.run_id();
+        run.inner
+            .event_seq
+            .as_ref()
+            .unwrap()
+            .store(keys::MAX_EVENT_SEQ, Ordering::SeqCst);
+
+        let seq = run
+            .append_event(&stage_prompt_payload(&run_id, 1, Some("alpha")))
+            .await
+            .unwrap();
+        assert_eq!(seq, keys::MAX_EVENT_SEQ);
+
+        let err = run
+            .append_event(&stage_prompt_payload(&run_id, 2, Some("beta")))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::EventSequenceExhausted { max_seq }
+                if max_seq == keys::MAX_EVENT_SEQ
+        ));
+        assert!(
+            run.get_event(keys::MAX_EVENT_SEQ + 1)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
