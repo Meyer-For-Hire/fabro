@@ -176,12 +176,6 @@ pub enum EventBody {
     GitCommit(GitCommitProps),
     #[serde(rename = "git.push")]
     GitPush(GitPushProps),
-    #[serde(rename = "git.branch")]
-    GitBranch(GitBranchProps),
-    #[serde(rename = "git.worktree.added")]
-    GitWorktreeAdd(GitWorktreeAddProps),
-    #[serde(rename = "git.worktree.removed")]
-    GitWorktreeRemove(GitWorktreeRemoveProps),
     #[serde(rename = "git.fetch")]
     GitFetch(GitFetchProps),
     #[serde(rename = "git.reset")]
@@ -477,9 +471,6 @@ impl EventBody {
             Self::CheckpointFailed(_) => "checkpoint.failed",
             Self::GitCommit(_) => "git.commit",
             Self::GitPush(_) => "git.push",
-            Self::GitBranch(_) => "git.branch",
-            Self::GitWorktreeAdd(_) => "git.worktree.added",
-            Self::GitWorktreeRemove(_) => "git.worktree.removed",
             Self::GitFetch(_) => "git.fetch",
             Self::GitReset(_) => "git.reset",
             Self::EdgeSelected(_) => "edge.selected",
@@ -649,9 +640,6 @@ fn is_known_event_name(event: &str) -> bool {
             | "checkpoint.failed"
             | "git.commit"
             | "git.push"
-            | "git.branch"
-            | "git.worktree.added"
-            | "git.worktree.removed"
             | "git.fetch"
             | "git.reset"
             | "edge.selected"

@@ -9,6 +9,7 @@ mod freeform_edge_count;
 mod goal_gate_has_retry;
 mod import_error;
 mod inert_attribute;
+mod join_policy_removed;
 mod model_support;
 mod node_model_known;
 mod orphan_custom_outcome;
@@ -58,6 +59,7 @@ pub fn built_in_rules() -> Vec<Box<dyn LintRule>> {
         orphan_custom_outcome::rule(),
         script_absolute_cd::rule(),
         import_error::rule(),
+        join_policy_removed::rule(),
         unresolved_file_ref::rule(),
         thread_id_requires_fidelity_full::rule(),
         selection_valid::rule(),

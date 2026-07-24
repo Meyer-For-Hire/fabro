@@ -14,7 +14,7 @@ use tokio::time::{sleep, timeout};
 use super::{EngineServices, Handler};
 use crate::artifact_upload::ArtifactSink;
 use crate::condition::evaluate_condition;
-use crate::context::{Context, WorkflowContext, keys};
+use crate::context::{Context, WorkflowContext, context_diff, keys};
 use crate::error::Error;
 use crate::operations::{ValidateInput, WorkflowInput, validate};
 use crate::outcome::{Outcome, OutcomeExt, StageOutcome};
@@ -131,21 +131,6 @@ fn parse_child_graph(node: &Node, services: &EngineServices) -> Result<ParsedChi
         });
     }
     Err(Error::handler("No child workflow source".to_string()))
-}
-
-/// Compute the context diff: keys that changed or were added relative to
-/// `before`.
-fn context_diff(
-    before: &HashMap<String, serde_json::Value>,
-    after: &HashMap<String, serde_json::Value>,
-) -> HashMap<String, serde_json::Value> {
-    let mut diff = HashMap::new();
-    for (key, value) in after {
-        if before.get(key) != Some(value) {
-            diff.insert(key.clone(), value.clone());
-        }
-    }
-    diff
 }
 
 #[async_trait]
@@ -273,7 +258,6 @@ impl Handler for SubWorkflowHandler {
                     run: child_run,
                     registry,
                     interviewer,
-                    git_state: std::sync::RwLock::new(None),
                     base_env,
                     github_token,
                     inputs,
@@ -299,8 +283,8 @@ impl Handler for SubWorkflowHandler {
                     };
 
                     // Compute context diff, filtering engine-internal keys
-                    let after_snapshot = child_final_context.snapshot();
-                    let raw_diff = context_diff(&before_snapshot, &after_snapshot);
+                    let raw_diff =
+                        context_diff(&before_snapshot, child_final_context.snapshot());
                     let diff: HashMap<String, serde_json::Value> = raw_diff
                         .into_iter()
                         .filter(|(key, _)| !keys::is_engine_internal_key(key))
@@ -824,7 +808,7 @@ mod tests {
         let before = HashMap::new();
         let mut after = HashMap::new();
         after.insert("key".to_string(), serde_json::json!("value"));
-        let diff = context_diff(&before, &after);
+        let diff = context_diff(&before, after);
         assert_eq!(diff.len(), 1);
         assert_eq!(diff.get("key"), Some(&serde_json::json!("value")));
     }
@@ -835,7 +819,7 @@ mod tests {
         before.insert("key".to_string(), serde_json::json!("old"));
         let mut after = HashMap::new();
         after.insert("key".to_string(), serde_json::json!("new"));
-        let diff = context_diff(&before, &after);
+        let diff = context_diff(&before, after);
         assert_eq!(diff.len(), 1);
         assert_eq!(diff.get("key"), Some(&serde_json::json!("new")));
     }
@@ -846,7 +830,7 @@ mod tests {
         before.insert("key".to_string(), serde_json::json!("same"));
         let mut after = HashMap::new();
         after.insert("key".to_string(), serde_json::json!("same"));
-        let diff = context_diff(&before, &after);
+        let diff = context_diff(&before, after);
         assert!(diff.is_empty());
     }
 
@@ -855,7 +839,7 @@ mod tests {
         let mut before = HashMap::new();
         before.insert("removed".to_string(), serde_json::json!("gone"));
         let after = HashMap::new();
-        let diff = context_diff(&before, &after);
+        let diff = context_diff(&before, after);
         assert!(diff.is_empty());
     }
 
@@ -876,7 +860,7 @@ mod tests {
         after.insert("response.plan".to_string(), serde_json::json!("the plan"));
         after.insert("review.result".to_string(), serde_json::json!("approved"));
 
-        let raw_diff = context_diff(&before, &after);
+        let raw_diff = context_diff(&before, after);
         let filtered: HashMap<String, serde_json::Value> = raw_diff
             .into_iter()
             .filter(|(key, _)| !keys::is_engine_internal_key(key))

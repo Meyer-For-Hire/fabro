@@ -130,7 +130,7 @@ pub(super) enum ProgressEvent {
     ParallelBranchCompleted {
         branch:      String,
         duration_ms: u64,
-        status:      String,
+        status:      fabro_types::StageOutcome,
     },
     ParallelCompleted,
     AssistantMessage {
@@ -318,7 +318,7 @@ pub(super) fn from_run_event(stored: &RunEvent) -> Option<ProgressEvent> {
         EventBody::ParallelBranchCompleted(props) => Some(ProgressEvent::ParallelBranchCompleted {
             branch:      node_id,
             duration_ms: props.duration_ms,
-            status:      props.status.clone(),
+            status:      props.status,
         }),
         EventBody::ParallelCompleted(_) => Some(ProgressEvent::ParallelCompleted),
         EventBody::AgentMessage(props) => Some(ProgressEvent::AssistantMessage {

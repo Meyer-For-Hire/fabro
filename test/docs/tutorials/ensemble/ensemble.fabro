@@ -14,7 +14,7 @@ digraph Ensemble {
     start [shape=Mdiamond, label="Start"]
     exit  [shape=Msquare, label="Exit"]
 
-    fork [label="Fan Out", shape=component, join_policy="wait_all"]
+    fork [label="Fan Out", shape=component]
 
     opus    [label="Opus",    prompt="Analyze the goal. Provide your independent assessment, recommendations, and any code or prose needed. Be thorough.", shape=tab]
     gemini  [label="Gemini",  prompt="Analyze the goal. Provide your independent assessment, recommendations, and any code or prose needed. Be thorough.", shape=tab]

@@ -30,7 +30,6 @@ pub enum RunNoticeCode {
     GitPushFailed,
     GithubTokenFailed,
     GithubTokenRefreshLimited,
-    ParallelBaseCheckpointFailed,
     PullRequestFailed,
     SandboxCleanupFailed,
     SandboxGitUnavailable,

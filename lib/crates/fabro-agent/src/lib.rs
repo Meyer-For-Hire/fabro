@@ -57,8 +57,7 @@ pub use read_before_write_sandbox::ReadBeforeWriteSandbox;
 pub use sandbox::{
     CommandOutputCallback, DirEntry, ExecResult, ExecStreamingResult, GrepOptions, RefreshOutcome,
     Sandbox, SandboxEvent, SandboxEventCallback, StderrCollector, StdioProcess, StdioProcessHandle,
-    WorktreeEvent, WorktreeEventCallback, WorktreeOptions, WorktreeSandbox, format_lines_numbered,
-    shell_quote,
+    format_lines_numbered, shell_quote,
 };
 pub use session::{
     CompletionCoordinator, Session, SessionControlHandle, SessionInputTiming, StaticEnvProvider,

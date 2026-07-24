@@ -6,9 +6,9 @@ use fabro_types::graph::Graph;
 use fabro_types::run::RunSpec;
 use fabro_types::{
     BilledModelUsage, BilledTokenCounts, Checkpoint, CheckpointRecord, InterviewQuestionRecord,
-    QuestionType, RunDiff, RunSandbox, RunSandboxInstance, RunSandboxPlan, RunSandboxRuntime,
-    RunStatus, SandboxProviderKind, StageCompletion, StageModelUsage, StageOutcome, StartRecord,
-    WorkflowSettings, first_event_seq, fixtures, test_support,
+    ParallelBranchResult, QuestionType, RunDiff, RunSandbox, RunSandboxInstance, RunSandboxPlan,
+    RunSandboxRuntime, RunStatus, SandboxProviderKind, StageCompletion, StageModelUsage,
+    StageOutcome, StartRecord, WorkflowSettings, first_event_seq, fixtures, test_support,
 };
 use serde_json::json;
 
@@ -143,7 +143,12 @@ fn serializable_projection_round_trips_and_trims_bulky_node_fields() {
     stage.diff = Some("diff --git a/a b/a".to_string());
     stage.script_invocation = Some(json!({ "command": "cargo test" }));
     stage.script_timing = Some(json!({ "duration_ms": 10 }));
-    stage.parallel_results = Some(json!([{ "stage": "fanout@1" }]));
+    let parallel_results = vec![ParallelBranchResult {
+        id:              "review".to_string(),
+        status:          StageOutcome::Succeeded,
+        context_updates: BTreeMap::from([("response.review".to_string(), json!("looks good"))]),
+    }];
+    stage.parallel_results = Some(parallel_results.clone());
     stage.timing = Some(fabro_types::StageTiming::wall_only(1234));
     let usage = sample_usage();
     let usage_counts = BilledTokenCounts::from_billed_usage(std::slice::from_ref(&usage));
@@ -203,10 +208,7 @@ fn serializable_projection_round_trips_and_trims_bulky_node_fields() {
         Some(json!({ "command": "cargo test" }))
     );
     assert_eq!(node.script_timing, Some(json!({ "duration_ms": 10 })));
-    assert_eq!(
-        node.parallel_results,
-        Some(json!([{ "stage": "fanout@1" }]))
-    );
+    assert_eq!(node.parallel_results, Some(parallel_results));
     assert_eq!(node.timing.map(|t| t.wall_time_ms), Some(1234));
     assert_eq!(node.usage, usage_counts);
     assert_eq!(node.model.as_ref(), Some(usage.model()));

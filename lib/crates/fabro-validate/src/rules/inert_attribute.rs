@@ -18,7 +18,6 @@ const HANDLER_SPECIFIC_ATTRS: &[(&str, &[&str])] = &[
     ("script", &["command"]),
     ("language", &["command"]),
     ("duration", &["wait"]),
-    ("join_policy", &["parallel"]),
     ("max_parallel", &["parallel"]),
     ("output_schema", &["agent", "prompt"]),
     ("prompt", &["agent", "prompt", "parallel.fan_in"]),
@@ -140,15 +139,11 @@ mod tests {
     fn warns_on_parallel_attrs_on_agent_node() {
         let mut g = minimal_graph();
         let mut node = Node::new("work");
-        node.attrs.insert(
-            "join_policy".to_string(),
-            AttrValue::String("wait_all".to_string()),
-        );
         node.attrs
             .insert("max_parallel".to_string(), AttrValue::Integer(4));
         g.nodes.insert("work".to_string(), node);
         let d = Rule.apply(&g);
-        assert_eq!(d.len(), 2);
+        assert_eq!(d.len(), 1);
     }
 
     #[test]
@@ -180,7 +175,7 @@ mod tests {
         );
         g.nodes.insert(
             "fork".to_string(),
-            node_with_attr("fork", "component", "join_policy", "wait_all"),
+            node_with_attr("fork", "component", "max_parallel", "4"),
         );
         g.nodes.insert(
             "spec".to_string(),

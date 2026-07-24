@@ -3,10 +3,9 @@ import type { EventEnvelope } from "@qltysh/fabro-api-client";
 
 import {
   extractStageContext,
-  extractStageNotes,
-  parseFanInOutcome,
   parseHumanInterviewPairs,
   parseParallelOverview,
+  parseReducerTranscript,
 } from "./helpers";
 
 function envelope(seq: number, partial: Partial<EventEnvelope>): EventEnvelope {
@@ -144,45 +143,70 @@ describe("parseHumanInterviewPairs", () => {
 });
 
 describe("parseParallelOverview", () => {
-  test("rolls up branch_count from started and results from completed", () => {
+  test("rolls up branch_count and status-only results", () => {
     const events: EventEnvelope[] = [
       envelope(1, {
         event: "parallel.started",
-        properties: { branch_count: 3, join_policy: "wait_all" },
+        properties: { branch_count: 3 },
       }),
       envelope(2, {
         event: "parallel.completed",
         properties: {
+          duration_ms: 12000,
           success_count: 2,
           failure_count: 1,
           results: [
-            { id: "branch-a", status: "succeeded", head_sha: "abc1234567890" },
-            { id: "branch-b", status: "succeeded" },
-            { id: "branch-c", status: "failed" },
+            {
+              id: "branch-a",
+              status: "succeeded",
+              context_updates: { "response.branch-a": "A" },
+            },
+            {
+              id: "branch-b",
+              status: "succeeded",
+              context_updates: { "command.output": { stdout: "B" } },
+            },
+            {
+              id: "branch-c",
+              status: "failed",
+              context_updates: { "response.branch-c": "C" },
+            },
           ],
         },
       }),
     ];
     const overview = parseParallelOverview(events);
-    expect(overview).toMatchObject({
+    expect(overview).toEqual({
       branchCount: 3,
-      joinPolicy: "wait_all",
       successCount: 2,
       failureCount: 1,
+      durationMs: 12000,
+      results: [
+        {
+          id: "branch-a",
+          status: "succeeded",
+          context_updates: { "response.branch-a": "A" },
+        },
+        {
+          id: "branch-b",
+          status: "succeeded",
+          context_updates: { "command.output": { stdout: "B" } },
+        },
+        {
+          id: "branch-c",
+          status: "failed",
+          context_updates: { "response.branch-c": "C" },
+        },
+      ],
       isComplete: true,
     });
-    expect(overview.results).toEqual([
-      { id: "branch-a", status: "succeeded", headSha: "abc1234567890" },
-      { id: "branch-b", status: "succeeded", headSha: null },
-      { id: "branch-c", status: "failed", headSha: null },
-    ]);
   });
 
   test("reports in-flight when only the started event is present", () => {
     const events: EventEnvelope[] = [
       envelope(1, {
         event: "parallel.started",
-        properties: { branch_count: 4, join_policy: "first_success" },
+        properties: { branch_count: 4 },
       }),
     ];
     const overview = parseParallelOverview(events);
@@ -192,49 +216,52 @@ describe("parseParallelOverview", () => {
   });
 });
 
-describe("parseFanInOutcome", () => {
-  test("extracts the selected branch id from notes", () => {
-    const outcome = parseFanInOutcome([], "Selected best candidate: branch-42");
-    expect(outcome.selectedId).toBe("branch-42");
-    expect(outcome.hasReducerTranscript).toBe(false);
+describe("parseReducerTranscript", () => {
+  test("returns null when fan-in joins without a reducer", () => {
+    expect(parseReducerTranscript([])).toBeNull();
   });
 
-  test("flags reducer presence when fan-in prompt events exist", () => {
+  test("parses the standard prompt transcript when a reducer ran", () => {
     const events: EventEnvelope[] = [
       envelope(1, {
         event: "stage.prompt",
-        properties: { mode: "fan_in", text: "rank these", model: "claude-sonnet-4-6" },
+        properties: {
+          mode: "prompt",
+          text: "Combine the branch results.",
+          model: "claude-sonnet-4-6",
+        },
       }),
       envelope(2, {
         event: "prompt.completed",
-        properties: { response: "branch-a wins", model: "ignored-downstream-model" },
+        properties: {
+          response: "The branch results are joined.",
+          billing: { input_tokens: 1200, output_tokens: 340 },
+        },
       }),
     ];
-    const outcome = parseFanInOutcome(events, "Selected best candidate: branch-a");
-    expect(outcome.hasReducerTranscript).toBe(true);
-    expect(outcome.reducerModel).toBe("claude-sonnet-4-6");
-    expect(outcome.selectedId).toBe("branch-a");
+
+    expect(parseReducerTranscript(events)).toEqual({
+      prompt: "Combine the branch results.",
+      response: "The branch results are joined.",
+      model: "claude-sonnet-4-6",
+      inputTokens: 1200,
+      outputTokens: 340,
+    });
   });
 
-  test("returns null selection when notes lack the selected line", () => {
-    const outcome = parseFanInOutcome([], "all candidates failed");
-    expect(outcome.selectedId).toBeNull();
-  });
-});
-
-describe("extractStageNotes", () => {
-  test("returns notes from the stage.completed event", () => {
+  test("uses normal prompt mode for the reducer transcript", () => {
     const events: EventEnvelope[] = [
       envelope(1, {
-        event: "stage.completed",
-        properties: { notes: "Stop condition satisfied at cycle 7" },
+        event: "stage.prompt",
+        properties: { mode: "prompt", text: "Standard reducer" },
+      }),
+      envelope(2, {
+        event: "prompt.completed",
+        properties: { response: "Standard response" },
       }),
     ];
-    expect(extractStageNotes(events)).toBe("Stop condition satisfied at cycle 7");
-  });
 
-  test("returns null when there is no stage.completed event", () => {
-    expect(extractStageNotes([])).toBeNull();
+    expect(parseReducerTranscript(events)?.response).toBe("Standard response");
   });
 });
 

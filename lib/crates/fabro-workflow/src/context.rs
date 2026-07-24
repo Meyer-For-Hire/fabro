@@ -40,9 +40,6 @@ pub mod keys {
     // --- parallel.* keys ---
     pub const PARALLEL_RESULTS: &str = "parallel.results";
     pub const PARALLEL_BRANCH_COUNT: &str = "parallel.branch_count";
-    pub const PARALLEL_FAN_IN_BEST_ID: &str = "parallel.fan_in.best_id";
-    pub const PARALLEL_FAN_IN_BEST_OUTCOME: &str = "parallel.fan_in.best_outcome";
-    pub const PARALLEL_FAN_IN_BEST_HEAD_SHA: &str = "parallel.fan_in.best_head_sha";
 
     // --- Prefix constants (for filtering and dynamic keys) ---
     pub const GRAPH_PREFIX: &str = "graph.";
@@ -132,11 +129,26 @@ pub mod keys {
     }
 }
 
+use std::collections::HashMap;
+
 pub use fabro_core::Context;
 use fabro_graphviz::Fidelity;
-use fabro_types::{ParallelBranchId, StageId};
+use fabro_types::{ParallelBranchId, RunId, StageId};
 
+use crate::error::Error;
 use crate::event::StageScope;
+
+/// Keys whose values changed or were added in `after` relative to `before`.
+/// Takes `after` by value so changed entries move instead of clone.
+pub(crate) fn context_diff(
+    before: &HashMap<String, serde_json::Value>,
+    after: HashMap<String, serde_json::Value>,
+) -> HashMap<String, serde_json::Value> {
+    after
+        .into_iter()
+        .filter(|(key, value)| before.get(key) != Some(value))
+        .collect()
+}
 
 /// Domain-specific typed accessors for workflow context values.
 pub trait WorkflowContext {
@@ -144,6 +156,9 @@ pub trait WorkflowContext {
     fn thread_id(&self) -> Option<String>;
     fn preamble(&self) -> String;
     fn run_id(&self) -> String;
+    /// Parse `internal.run_id`, failing when the engine did not seed a
+    /// valid run ID.
+    fn parsed_run_id(&self) -> Result<RunId, Error>;
     fn parallel_group_id(&self) -> Option<StageId>;
     fn parallel_branch_id(&self) -> Option<ParallelBranchId>;
     /// Build the stage-level emit scope from the currently-executing node and
@@ -170,6 +185,12 @@ impl WorkflowContext for Context {
 
     fn run_id(&self) -> String {
         self.get_string(keys::INTERNAL_RUN_ID, "unknown")
+    }
+
+    fn parsed_run_id(&self) -> Result<RunId, Error> {
+        self.run_id()
+            .parse()
+            .map_err(|err| Error::handler_with_source("invalid internal run_id", err))
     }
 
     fn parallel_group_id(&self) -> Option<StageId> {

@@ -249,8 +249,7 @@ audit [
 
 | Attribute | Type | Description |
 |---|---|---|
-| `join_policy` | String | When the merge can proceed: `wait_all` (default), `first_success` |
-| `max_parallel` | Integer | Maximum concurrent branches (default: 4) |
+| `max_parallel` | Integer | Maximum concurrent branches (default: 4). The node always waits for every branch. |
 
 ### Wait nodes
 

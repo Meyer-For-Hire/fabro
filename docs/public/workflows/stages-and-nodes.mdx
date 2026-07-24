@@ -155,10 +155,10 @@ Conditions support `=`, `!=`, `&&`, and context variable lookups (e.g. `context.
 
 **Shape:** `component`
 
-Fans out to execute multiple branches concurrently. Each branch gets its own isolated context.
+Fans out to execute multiple branches concurrently. Every branch runs in the same sandbox checkout and working directory, and the parallel node waits for every branch to finish.
 
 ```dot
-fork [label="Fan Out", shape=component, join_policy="wait_all"]
+fork [label="Fan Out", shape=component]
 
 fork -> security
 fork -> architecture
@@ -167,24 +167,22 @@ fork -> quality
 
 | Attribute | Description |
 |---|---|
-| `join_policy` | When the merge can proceed (see table below) |
 | `max_parallel` | Maximum concurrent branches (default: 4) |
 
-**Join policies:**
-
-| Policy | Behavior |
-|---|---|
-| `wait_all` | Wait for every branch to finish (default) |
-| `first_success` | Proceed as soon as one branch succeeds |
+Because the checkout is shared, file changes from one branch are immediately visible to the others. Concurrent writes can race or overwrite each other. Fabro does not isolate branch files, lock paths, detect conflicts, or warn about overlapping writes. Design branches to be read-only or assign each branch disjoint files and directories when deterministic workspace changes matter.
 
 ### Merge (fan-in)
 
 **Shape:** `tripleoctagon`
 
-Collects results from parallel branches into a single context. Typically paired with a parallel fan-out node:
+Converges parallel branches after all of them finish. Branch status and context updates are collected in the runtime context at `parallel.results`; Fabro does not create a `parallel_results.json` file in the checkout.
 
 ```dot
-merge [label="Merge Results", shape=tripleoctagon]
+merge [
+    label="Synthesize Results",
+    shape=tripleoctagon,
+    prompt="Synthesize every branch result into one report."
+]
 
 security     -> merge
 architecture -> merge
@@ -192,7 +190,7 @@ quality      -> merge
 merge -> report
 ```
 
-The merged results are available to downstream nodes as `parallel_results.json`.
+A fan-in node with a `prompt` synthesizes the collected results. It never chooses, restores, or merges a branch's workspace state: all branches have already operated on the same checkout. Without a prompt, fan-in is only a convergence barrier.
 
 ## Common node attributes
 

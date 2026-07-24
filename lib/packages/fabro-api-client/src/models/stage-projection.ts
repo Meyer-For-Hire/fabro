@@ -30,6 +30,9 @@ import type { CommandTermination } from './command-termination';
 import type { McpServerProjection } from './mcp-server-projection';
 // May contain unused imports in some cases
 // @ts-ignore
+import type { ParallelBranchResult } from './parallel-branch-result';
+// May contain unused imports in some cases
+// @ts-ignore
 import type { PermissionLevel } from './permission-level';
 // May contain unused imports in some cases
 // @ts-ignore
@@ -75,9 +78,9 @@ export interface StageProjection {
      */
     'script_timing'?: object | null;
     /**
-     * Per-branch result objects produced by a parallel stage.
+     * Ordered per-branch results produced by a parallel stage.
      */
-    'parallel_results'?: Array<object> | null;
+    'parallel_results'?: Array<ParallelBranchResult> | null;
     'output'?: string | null;
     'output_bytes'?: number | null;
     'live_streaming'?: boolean | null;

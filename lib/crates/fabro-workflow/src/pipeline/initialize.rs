@@ -611,7 +611,6 @@ pub async fn initialize(
         run: Arc::clone(&run_services),
         registry,
         interviewer: Arc::clone(&options.interviewer),
-        git_state: std::sync::RwLock::new(None),
         base_env,
         github_token,
         inputs: options.run_options.settings.run.inputs.clone(),

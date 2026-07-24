@@ -37,8 +37,7 @@ impl StageScope {
     }
 
     /// Build scope for the branch-lifecycle events emitted by the parallel
-    /// handler (`ParallelBranchStarted`, `ParallelBranchCompleted`, and the
-    /// pre-dispatch `GitCommit` for the branch worktree).
+    /// handler (`ParallelBranchStarted` and `ParallelBranchCompleted`).
     ///
     /// `target_visit` is the visit count of `target_node_id` for this
     /// particular branch dispatch. The parallel handler currently passes

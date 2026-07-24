@@ -348,6 +348,11 @@ fn main() {
         ("StageState", "fabro_types::StageState", &[]),
         ("CommandTermination", "fabro_types::CommandTermination", &[]),
         ("StageModelUsage", "fabro_types::StageModelUsage", &[]),
+        (
+            "ParallelBranchResult",
+            "fabro_types::ParallelBranchResult",
+            &[],
+        ),
         ("StageProjection", "fabro_types::StageProjection", &[]),
         ("PermissionLevel", "fabro_types::PermissionLevel", &[]),
         (

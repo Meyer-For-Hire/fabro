@@ -10411,6 +10411,22 @@ components:
           items:
             $ref: "#/components/schemas/StageContextWindowWarning"
 
+    ParallelBranchResult:
+      description: The outcome and isolated context updates from one parallel branch.
+      type: object
+      required:
+        - id
+        - status
+        - context_updates
+      properties:
+        id:
+          type: string
+        status:
+          $ref: "#/components/schemas/StageOutcome"
+        context_updates:
+          type: object
+          additionalProperties: true
+
     StageProjection:
       description: Observable projection data for one workflow stage execution.
       type: object
@@ -10447,8 +10463,8 @@ components:
         parallel_results:
           type: ["array", "null"]
           items:
-            type: object
-          description: Per-branch result objects produced by a parallel stage.
+            $ref: "#/components/schemas/ParallelBranchResult"
+          description: Ordered per-branch results produced by a parallel stage.
         output:
           type: ["string", "null"]
         output_bytes:

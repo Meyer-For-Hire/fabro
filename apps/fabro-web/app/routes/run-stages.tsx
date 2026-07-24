@@ -42,10 +42,7 @@ import {
 } from "../components/ui";
 import { ConditionalDecision } from "../components/stage-renderers/conditional-decision";
 import { FanInResults } from "../components/stage-renderers/fan-in-results";
-import {
-  extractStageContext,
-  extractStageNotes,
-} from "../components/stage-renderers/helpers";
+import { extractStageContext } from "../components/stage-renderers/helpers";
 import { HumanQA } from "../components/stage-renderers/human-qa";
 import { ParallelChildren } from "../components/stage-renderers/parallel-children";
 import {
@@ -1572,11 +1569,7 @@ function StageActivityBody({
             allStages={stages}
           />
         ) : renderer === "fan_in" ? (
-          <FanInResults
-            stage={selectedStage}
-            events={debugEvents}
-            notes={extractStageNotes(debugEvents)}
-          />
+          <FanInResults stage={selectedStage} events={debugEvents} />
         ) : renderer === "wait" ? (
           <WaitStatus stage={selectedStage} />
         ) : (
