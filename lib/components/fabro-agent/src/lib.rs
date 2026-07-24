@@ -34,8 +34,8 @@ pub mod types;
 
 pub use agent_profile::AgentProfile;
 pub use config::{
-    SessionOptions, ToolAccess, ToolAccessPolicy, ToolApprovalAdapter, ToolExposureMode,
-    ToolHookCallback, ToolHookDecision, ToolSecrets,
+    NativeToolOptions, SessionOptions, ToolAccess, ToolAccessPolicy, ToolApprovalAdapter,
+    ToolExposureMode, ToolHookCallback, ToolHookDecision, ToolSecrets,
 };
 #[cfg(feature = "docker")]
 pub use docker_sandbox::{DockerSandbox, DockerSandboxOptions};
@@ -47,7 +47,9 @@ pub use history::History;
 pub use local_sandbox::LocalSandbox;
 pub use loop_detection::detect_loop;
 pub use memory::{MemoryDocument, discover_memory};
-pub use profiles::{AnthropicProfile, EnvContext, GeminiProfile, OpenAiProfile};
+pub use profiles::{
+    AgentProfileBuilder, AnthropicProfile, EnvContext, GeminiProfile, OpenAiProfile,
+};
 pub use question_tools::{
     ANTHROPIC_ASK_USER_QUESTION_TOOL, AgentQuestion, AgentQuestionAnswer,
     AgentQuestionAnswerStatus, AgentQuestionRuntime, AgentToolRuntime,
@@ -73,7 +75,7 @@ pub use todo_tools::{
 pub use tool_registry::{AgentEventEmitter, ToolRegistry};
 pub use tools::{
     WebFetchSummarizer, make_edit_file_tool, make_glob_tool, make_grep_tool, make_read_file_tool,
-    make_shell_tool, make_shell_tool_with_config, make_write_file_tool, register_core_tools,
+    make_shell_tool, make_shell_tool_with_options, make_write_file_tool, register_core_tools,
 };
 pub use truncation::{TruncationMode, truncate_lines, truncate_output, truncate_tool_output};
 pub use types::{

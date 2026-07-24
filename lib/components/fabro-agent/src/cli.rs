@@ -33,8 +33,8 @@ use crate::subagent::{SessionFactory, SubAgentSupervisor};
 use crate::tool_permissions::{is_auto_approved, tool_category};
 use crate::tools::WebFetchSummarizer;
 use crate::{
-    AgentEvent, AgentProfile, AnthropicProfile, GeminiProfile, LocalSandbox, Message,
-    OpenAiProfile, Sandbox, Session, SessionOptions, SessionShutdownReason,
+    AgentEvent, AgentProfile, AgentProfileBuilder, LocalSandbox, Message, Sandbox, Session,
+    SessionOptions, SessionShutdownReason,
 };
 
 #[expect(
@@ -220,32 +220,6 @@ fn build_summarizer(
     WebFetchSummarizer {
         client:   llm_client,
         model_id: summarizer_model_id(provider_id, catalog, model),
-    }
-}
-
-fn build_profile(
-    profile_kind: AgentProfileKind,
-    provider_id: ProviderId,
-    model: &str,
-    summarizer: Option<WebFetchSummarizer>,
-    catalog: Arc<Catalog>,
-) -> Box<dyn AgentProfile> {
-    match profile_kind {
-        AgentProfileKind::OpenAi => Box::new(
-            OpenAiProfile::with_summarizer(model, summarizer)
-                .with_provider_id(provider_id)
-                .with_catalog(catalog),
-        ),
-        AgentProfileKind::Gemini => Box::new(
-            GeminiProfile::with_summarizer(model, summarizer)
-                .with_provider_id(provider_id)
-                .with_catalog(catalog),
-        ),
-        AgentProfileKind::Anthropic => Box::new(
-            AnthropicProfile::with_summarizer(model, summarizer)
-                .with_provider_id(provider_id)
-                .with_catalog(catalog),
-        ),
     }
 }
 
@@ -559,18 +533,21 @@ pub async fn run_with_args_and_client_and_catalog(
     };
     let profile_kind = profile_kind_for_provider(&catalog, &provider_id, Some(&model))?;
     eprintln!("{}", styles.dim.apply_to(format!("Using model: {model}")));
-    let mut profile = build_profile(
+    let tool_secrets = cli_tool_secrets();
+    let profile_builder = AgentProfileBuilder::new(
         profile_kind,
         provider_id.clone(),
         &model,
-        Some(build_summarizer(
-            &provider_id,
-            &model,
-            &catalog,
-            client.clone(),
-        )),
         Arc::clone(&catalog),
-    );
+    )
+    .with_web_fetch_summarizer(Some(build_summarizer(
+        &provider_id,
+        &model,
+        &catalog,
+        client.clone(),
+    )))
+    .with_tool_secrets(tool_secrets);
+    let mut profile = profile_builder.build();
 
     // Build sandbox
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -594,7 +571,6 @@ pub async fn run_with_args_and_client_and_catalog(
         permission_level: Some(permissions),
         skill_dirs: args.skills_dir.map(|d| vec![d]),
         mcp_servers,
-        tool_secrets: cli_tool_secrets(),
         ..SessionOptions::default()
     };
 
@@ -602,28 +578,13 @@ pub async fn run_with_args_and_client_and_catalog(
     let supervisor = SubAgentSupervisor::new(config.max_subagent_depth);
     let supervisor_for_session = supervisor.clone();
     let factory_client = client.clone();
-    let factory_model = model.clone();
-    let factory_catalog = Arc::clone(&catalog);
-    let factory_provider_id = provider_id.clone();
-    let factory_profile_kind = profile_kind;
+    let factory_profile_builder = profile_builder;
     let factory_env = Arc::clone(&env);
     let factory_hooks = config.tool_hooks.clone();
     let factory_permission_level = config.permission_level;
-    let factory_tool_secrets = config.tool_secrets.clone();
     let factory: SessionFactory = Arc::new(move || {
-        let child_summarizer = Some(build_summarizer(
-            &factory_provider_id,
-            &factory_model,
-            &factory_catalog,
-            factory_client.clone(),
-        ));
-        let child_profile: Arc<dyn AgentProfile> = Arc::from(build_profile(
-            factory_profile_kind,
-            factory_provider_id.clone(),
-            &factory_model,
-            child_summarizer,
-            Arc::clone(&factory_catalog),
-        ));
+        let child_profile = factory_profile_builder.build();
+        let child_profile: Arc<dyn AgentProfile> = Arc::from(child_profile);
         Session::new(
             factory_client.clone(),
             child_profile,
@@ -631,7 +592,6 @@ pub async fn run_with_args_and_client_and_catalog(
             SessionOptions {
                 tool_hooks: factory_hooks.clone(),
                 permission_level: factory_permission_level,
-                tool_secrets: factory_tool_secrets.clone(),
                 ..SessionOptions::default()
             },
             None,
@@ -959,36 +919,8 @@ mod tests {
         assert!(approval_fn("shell", &json!({})).is_ok());
     }
 
-    // build_profile tests
-
     fn test_catalog() -> Arc<Catalog> {
         Arc::new(Catalog::from_builtin().unwrap())
-    }
-
-    #[test]
-    fn build_profile_anthropic() {
-        let profile = build_profile(
-            AgentProfileKind::Anthropic,
-            ProviderId::anthropic(),
-            "model",
-            None,
-            test_catalog(),
-        );
-        assert_eq!(profile.profile_kind(), AgentProfileKind::Anthropic);
-        assert_eq!(profile.provider_id(), ProviderId::anthropic());
-    }
-
-    #[test]
-    fn build_profile_openai() {
-        let profile = build_profile(
-            AgentProfileKind::OpenAi,
-            ProviderId::openai(),
-            "model",
-            None,
-            test_catalog(),
-        );
-        assert_eq!(profile.profile_kind(), AgentProfileKind::OpenAi);
-        assert_eq!(profile.provider_id(), ProviderId::openai());
     }
 
     #[test]
@@ -999,19 +931,6 @@ mod tests {
             error.to_string(),
             "LLM credentials not configured for provider 'anthropic'"
         );
-    }
-
-    #[test]
-    fn build_profile_gemini() {
-        let profile = build_profile(
-            AgentProfileKind::Gemini,
-            ProviderId::gemini(),
-            "model",
-            None,
-            test_catalog(),
-        );
-        assert_eq!(profile.profile_kind(), AgentProfileKind::Gemini);
-        assert_eq!(profile.provider_id(), ProviderId::gemini());
     }
 
     #[test]
@@ -1226,13 +1145,13 @@ mod tests {
 
     #[test]
     fn build_profile_can_register_subagent_tools() {
-        let mut profile = build_profile(
+        let mut profile = AgentProfileBuilder::new(
             AgentProfileKind::Anthropic,
             ProviderId::anthropic(),
             "model",
-            None,
             test_catalog(),
-        );
+        )
+        .build();
         let supervisor = SubAgentSupervisor::new(1);
         let factory: SessionFactory = Arc::new(|| {
             panic!("factory should not be called in this test");

@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use fabro_agent::subagent::SessionFactory;
 use fabro_agent::{
-    AgentEvent, AgentProfile, AnthropicProfile, GeminiProfile, LocalSandbox, OpenAiProfile,
-    Session, SessionOptions, SubAgentSupervisor, WebFetchSummarizer,
+    AgentEvent, AgentProfile, AgentProfileBuilder, LocalSandbox, OpenAiProfile, Session,
+    SessionOptions, SubAgentSupervisor, ToolSecrets, WebFetchSummarizer,
 };
 use fabro_auth::EnvCredentialSource;
 use fabro_llm::client::Client;
@@ -19,7 +19,7 @@ use fabro_llm::provider::ProviderAdapter;
 use fabro_llm::providers::{OpenAiAdapter, OpenAiCompatibleAdapter};
 use fabro_model::catalog::{LlmCatalogSettings, ProviderCatalogSettings};
 use fabro_model::{Catalog, ModelHandle, ProviderId};
-use fabro_test::{TwinScenario, TwinScenarios, TwinToolCall, twin_openai};
+use fabro_test::{EnvVars, TwinScenario, TwinScenarios, TwinToolCall, twin_openai};
 
 type Provider = ProviderId;
 
@@ -54,65 +54,44 @@ fn build_summarizer(provider: &Provider, client: &Client) -> WebFetchSummarizer 
     }
 }
 
-fn build_profile(provider: &Provider, model: &str, client: &Client) -> Box<dyn AgentProfile> {
+fn profile_builder(
+    provider: &Provider,
+    model: &str,
+    client: &Client,
+    tool_secrets: ToolSecrets,
+) -> AgentProfileBuilder {
     let summarizer = Some(build_summarizer(provider, client));
     let catalog = Arc::new(Catalog::from_builtin().expect("default catalog should build"));
-    match provider.as_str() {
-        ProviderId::ANTHROPIC => Box::new(AnthropicProfile::with_summarizer(model, summarizer)),
-        ProviderId::OPENAI => Box::new(
-            OpenAiProfile::with_summarizer(model, summarizer).with_catalog(Arc::clone(&catalog)),
-        ),
-        "kimi" | "zai" | "minimax" | "inception" => Box::new(
-            OpenAiProfile::with_summarizer(model, summarizer)
-                .with_provider_id(provider.clone())
-                .with_catalog(Arc::clone(&catalog)),
-        ),
-        ProviderId::GEMINI => Box::new(GeminiProfile::with_summarizer(model, summarizer)),
-        other => panic!("unexpected provider {other}"),
-    }
+    // Ask the catalog rather than keeping a provider->profile list in the test,
+    // so adding a provider to the catalog cannot silently skip this matrix.
+    let profile_kind = catalog
+        .effective_agent_profile(provider, Some(model))
+        .unwrap_or_else(|| panic!("no agent profile for provider {provider:?} in catalog"));
+    AgentProfileBuilder::new(profile_kind, provider.clone(), model, Arc::clone(&catalog))
+        .with_web_fetch_summarizer(summarizer)
+        .with_tool_secrets(tool_secrets)
 }
 
 async fn make_session(
     provider: Provider,
     model: &str,
     cwd: &Path,
+    tool_secrets: ToolSecrets,
     twin: Option<OpenAiTwinOptions>,
 ) -> Session {
     let client = make_client(&provider, twin.as_ref()).await;
-    let mut profile = build_profile(&provider, model, &client);
+    let profile_builder = profile_builder(&provider, model, &client, tool_secrets);
+    let mut profile = profile_builder.build();
     let env = Arc::new(LocalSandbox::new(cwd.to_path_buf()));
 
     // Register subagent tools so spawn_agent / wait / send_input / close_agent are
     // available
     let supervisor = SubAgentSupervisor::new(3);
     let factory_client = client.clone();
-    let factory_model: String = model.to_string();
     let factory_cwd = cwd.to_path_buf();
-    let factory_provider = provider.clone();
+    let factory_profile_builder = profile_builder;
     let factory: SessionFactory = Arc::new(move || {
-        let catalog = Arc::new(Catalog::from_builtin().expect("default catalog should build"));
-        let sub_profile: Arc<dyn AgentProfile> = {
-            let summarizer = Some(build_summarizer(&factory_provider, &factory_client));
-            match factory_provider.as_str() {
-                ProviderId::ANTHROPIC => Arc::new(AnthropicProfile::with_summarizer(
-                    &factory_model,
-                    summarizer,
-                )),
-                ProviderId::OPENAI => Arc::new(
-                    OpenAiProfile::with_summarizer(&factory_model, summarizer)
-                        .with_catalog(Arc::clone(&catalog)),
-                ),
-                "kimi" | "zai" | "minimax" | "inception" => Arc::new(
-                    OpenAiProfile::with_summarizer(&factory_model, summarizer)
-                        .with_provider_id(factory_provider.clone())
-                        .with_catalog(Arc::clone(&catalog)),
-                ),
-                ProviderId::GEMINI => {
-                    Arc::new(GeminiProfile::with_summarizer(&factory_model, summarizer))
-                }
-                other => panic!("unexpected provider {other}"),
-            }
-        };
+        let sub_profile: Arc<dyn AgentProfile> = Arc::from(factory_profile_builder.build());
         let sub_env = Arc::new(LocalSandbox::new(factory_cwd.clone()));
         Session::new(
             factory_client.clone(),
@@ -142,7 +121,8 @@ async fn make_session_with_config(
     twin: Option<OpenAiTwinOptions>,
 ) -> Session {
     let client = make_client(&provider, twin.as_ref()).await;
-    let profile: Arc<dyn AgentProfile> = Arc::from(build_profile(&provider, model, &client));
+    let profile: Arc<dyn AgentProfile> =
+        Arc::from(profile_builder(&provider, model, &client, ToolSecrets::default()).build());
     let env = Arc::new(LocalSandbox::new(cwd.to_path_buf()));
     Session::new(client, profile, env, config, None)
 }
@@ -211,15 +191,50 @@ fn make_openai_compatible_twin_session(
 
 macro_rules! provider_test {
     ($scenario:ident, $provider:expr, $model:expr, $prefix:ident, keys = [$($key:expr),+ $(,)?]) => {
+        provider_test!(
+            $scenario, $provider, $model, $prefix,
+            keys = [$($key),+],
+            secrets = ToolSecrets::default()
+        );
+    };
+    (
+        $scenario:ident, $provider:expr, $model:expr, $prefix:ident,
+        keys = [$($key:expr),+ $(,)?],
+        secrets = $secrets:expr
+    ) => {
         paste::paste! {
             #[fabro_macros::e2e_test($(live($key)),+)]
             async fn [<$prefix _ $scenario>]() {
                 let tmp = tempfile::tempdir().expect("failed to create tempdir");
-                let mut session = make_session($provider, $model, tmp.path(), None).await;
+                let mut session = make_session(
+                    $provider,
+                    $model,
+                    tmp.path(),
+                    $secrets,
+                    None,
+                ).await;
                 session.initialize().await.unwrap();
                 [<scenario_ $scenario>](&mut session, tmp.path()).await;
             }
         }
+    };
+}
+
+/// `web_search` is only registered when a Brave key is configured, so these
+/// scenarios must supply one rather than relying on ambient env.
+macro_rules! web_search_provider_test {
+    ($provider:expr, $model:expr, $prefix:ident, keys = [$($key:expr),+ $(,)?]) => {
+        provider_test!(
+            web_search, $provider, $model, $prefix,
+            keys = [$($key),+],
+            secrets = ToolSecrets {
+                brave_search_api_key: Some(
+                    std::env::var(EnvVars::BRAVE_SEARCH_API_KEY).expect(
+                        "BRAVE_SEARCH_API_KEY must be set for web-search tests",
+                    ),
+                ),
+            }
+        );
     };
 }
 
@@ -239,6 +254,7 @@ macro_rules! openai_twin_provider_test {
                     ProviderId::openai(),
                     "gpt-5.4-mini",
                     tmp.path(),
+                    ToolSecrets::default(),
                     Some(twin),
                 ).await;
                 session.initialize().await.unwrap();
@@ -429,52 +445,45 @@ provider_test!(
     keys = ["INCEPTION_API_KEY", "OPENAI_API_KEY"]
 );
 
-provider_test!(
-    web_search,
+web_search_provider_test!(
     ProviderId::anthropic(),
     "claude-haiku-4-5",
     anthropic,
     keys = ["ANTHROPIC_API_KEY", "BRAVE_SEARCH_API_KEY"]
 );
-provider_test!(
-    web_search,
+web_search_provider_test!(
     ProviderId::openai(),
     "gpt-5.4-mini",
     openai,
     keys = ["OPENAI_API_KEY", "BRAVE_SEARCH_API_KEY"]
 );
-provider_test!(
-    web_search,
+web_search_provider_test!(
     ProviderId::gemini(),
     "gemini-3-flash-preview",
     gemini,
     keys = ["GEMINI_API_KEY", "BRAVE_SEARCH_API_KEY"]
 );
-provider_test!(
-    web_search,
+web_search_provider_test!(
     ProviderId::new("kimi"),
     "kimi-k2.5",
     kimi,
     keys = ["KIMI_API_KEY", "BRAVE_SEARCH_API_KEY"]
 );
 #[cfg(feature = "quarantine")]
-provider_test!(
-    web_search,
+web_search_provider_test!(
     ProviderId::new("zai"),
     "glm-4.7",
     zai,
     keys = ["ZAI_API_KEY", "BRAVE_SEARCH_API_KEY"]
 );
-provider_test!(
-    web_search,
+web_search_provider_test!(
     ProviderId::new("minimax"),
     "minimax-m2.5",
     minimax,
     keys = ["MINIMAX_API_KEY", "BRAVE_SEARCH_API_KEY"]
 );
 #[cfg(feature = "quarantine")]
-provider_test!(
-    web_search,
+web_search_provider_test!(
     ProviderId::new("inception"),
     "mercury-2",
     inception,

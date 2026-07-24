@@ -73,9 +73,13 @@ pub trait AgentProfile: Send + Sync {
 ```
 
 Built-in profiles:
-- **`AnthropicProfile`** -- 200K context, extended thinking beta headers, tools: `read_file`, `write_file`, `edit_file`, `shell`, `grep`, `glob`
-- **`OpenAiProfile`** -- 128K context, reasoning effort support, tools: `read_file`, `write_file`, `shell`, `grep`, `glob`, `apply_patch` (Codex apply_patch format)
-- **`GeminiProfile`** -- 1M context, safety settings, tools: all Anthropic tools plus `read_many_files`, `list_dir`, `web_search`, `web_fetch`
+- **`AnthropicProfile`** -- 200K context, extended thinking beta headers, and Anthropic task tools
+- **`OpenAiProfile`** -- 128K context, reasoning effort support, and `apply_patch` (Codex apply_patch format)
+- **`GeminiProfile`** -- 1M context, safety settings, plus `read_many_files` and `list_dir`
+
+All profiles include the common file, shell, search, and `web_fetch` tools.
+`web_search` is included only when a Brave Search API key is supplied while
+building the profile.
 
 ### `Sandbox`
 

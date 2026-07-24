@@ -457,9 +457,9 @@ impl HookExecutorImpl {
                 }
             };
 
-            let config = fabro_agent::SessionOptions::default();
+            let options = fabro_agent::NativeToolOptions::default();
             let mut registry = fabro_agent::ToolRegistry::new();
-            fabro_agent::register_core_tools(&mut registry, &config, None);
+            fabro_agent::register_core_tools(&mut registry, &options, None);
             let tool_defs = registry.definitions();
 
             let mut messages = vec![

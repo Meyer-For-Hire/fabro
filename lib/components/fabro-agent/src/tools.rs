@@ -5,10 +5,11 @@ use std::sync::Arc;
 use fabro_llm::client::Client;
 use fabro_llm::types::{Message, Request, ToolDefinition};
 use fabro_model::ModelHandle;
+#[cfg(test)]
 use fabro_static::EnvVars;
 use futures::{StreamExt, stream};
 
-use crate::config::SessionOptions;
+use crate::config::NativeToolOptions;
 use crate::sandbox::GrepOptions;
 use crate::tool_registry::{RegisteredTool, ToolRegistry, ToolSource};
 
@@ -45,25 +46,29 @@ fn html_to_markdown(text: &str) -> String {
     converter.convert(text).unwrap_or_else(|_| text.to_string())
 }
 
+/// Name of the Brave-backed web search tool. Profiles look this up in their own
+/// registry to decide whether to advertise web search in the system prompt, so
+/// availability and prompt guidance cannot drift apart.
+pub const WEB_SEARCH_TOOL_NAME: &str = "web_search";
+
 /// Registers the core tools shared by all provider profiles: `read_file`,
-/// `write_file`, `shell`, `grep`, `glob`, `web_search`, and `web_fetch`.
+/// `write_file`, `shell`, `grep`, `glob`, and `web_fetch`. `web_search` is
+/// included when a Brave Search API key is configured.
 ///
-/// The shell tool uses `config` to set its default and max timeouts. Pass a
-/// custom `SessionOptions` (e.g. with a longer `default_command_timeout_ms`)
-/// for providers that need non-default shell behavior.
+/// The shell tool captures its default and max timeouts from `options`.
 pub fn register_core_tools(
     registry: &mut ToolRegistry,
-    config: &SessionOptions,
+    options: &NativeToolOptions,
     summarizer: Option<WebFetchSummarizer>,
 ) {
     registry.register(make_read_file_tool());
     registry.register(make_write_file_tool());
-    registry.register(make_shell_tool_with_config(config));
+    registry.register(make_shell_tool_with_options(options));
     registry.register(make_grep_tool());
     registry.register(make_glob_tool());
-    registry.register(make_web_search_tool_with_api_key(
-        config.tool_secrets.brave_search_api_key.clone(),
-    ));
+    if let Some(api_key) = &options.secrets.brave_search_api_key {
+        registry.register(make_web_search_tool_with_api_key(api_key.clone()));
+    }
     registry.register(make_web_fetch_tool(summarizer));
 }
 
@@ -210,13 +215,13 @@ pub fn make_edit_file_tool() -> RegisteredTool {
 
 #[must_use]
 pub fn make_shell_tool() -> RegisteredTool {
-    make_shell_tool_with_config(&SessionOptions::default())
+    make_shell_tool_with_options(&NativeToolOptions::default())
 }
 
 #[must_use]
-pub fn make_shell_tool_with_config(config: &SessionOptions) -> RegisteredTool {
-    let default_timeout = config.default_command_timeout_ms;
-    let max_timeout = config.max_command_timeout_ms;
+pub fn make_shell_tool_with_options(options: &NativeToolOptions) -> RegisteredTool {
+    let default_timeout = options.default_command_timeout_ms;
+    let max_timeout = options.max_command_timeout_ms;
     RegisteredTool {
         definition: ToolDefinition {
             name:        "shell".into(),
@@ -516,13 +521,13 @@ fn format_brave_results(body: &serde_json::Value) -> String {
     output
 }
 
-fn make_web_search_tool_with_api_key(api_key: Option<String>) -> RegisteredTool {
+fn make_web_search_tool_with_api_key(api_key: String) -> RegisteredTool {
     use std::sync::OnceLock;
     static CLIENT: OnceLock<fabro_http::HttpClient> = OnceLock::new();
 
     RegisteredTool {
         definition: ToolDefinition {
-            name:        "web_search".into(),
+            name:        WEB_SEARCH_TOOL_NAME.into(),
             description: "Search the web using Brave Search when current external information is needed. Returns result titles, URLs, and descriptions; use web_fetch for a specific URL.".into(),
             parameters:  serde_json::json!({
                 "type": "object",
@@ -536,10 +541,6 @@ fn make_web_search_tool_with_api_key(api_key: Option<String>) -> RegisteredTool 
         executor:   Arc::new(move |args, _ctx| {
             let api_key = api_key.clone();
             Box::pin(async move {
-                let api_key = api_key.ok_or_else(|| {
-                    format!("{} is not configured", EnvVars::BRAVE_SEARCH_API_KEY)
-                })?;
-
                 let query = required_str(&args, "query")?;
                 let client = CLIENT
                     .get_or_init(|| {
@@ -692,19 +693,19 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
-    use crate::config::ToolSecrets;
+    use crate::config::{NativeToolOptions, ToolSecrets};
     use crate::sandbox::*;
     use crate::test_support::MockSandbox;
     use crate::tool_registry::ToolContext;
 
     #[test]
     fn core_tool_descriptions_include_actionable_guidance() {
-        let config = SessionOptions::default();
+        let options = NativeToolOptions::default();
         let tools = [
             make_read_file_tool(),
             make_write_file_tool(),
             make_edit_file_tool(),
-            make_shell_tool_with_config(&config),
+            make_shell_tool_with_options(&options),
             make_grep_tool(),
             make_glob_tool(),
             make_web_fetch_tool(None),
@@ -1331,27 +1332,18 @@ mod tests {
         assert!(output.contains("src/lib.rs"));
     }
 
-    #[tokio::test]
-    async fn web_search_missing_api_key_returns_error() {
-        let tool = make_web_search_tool_with_api_key(None);
-        let env: Arc<dyn Sandbox> = Arc::new(MockSandbox::default());
-        let result = (tool.executor)(serde_json::json!({"query": "test"}), ToolContext {
-            env,
-            cancel: CancellationToken::new(),
-            tool_env_provider: None,
-            session_id: None,
-            root_session_id: None,
-            tool_call_id: None,
-            agent_event_emitter: None,
-        })
-        .await;
-        let err = result.unwrap_err();
-        assert_eq!(err, "BRAVE_SEARCH_API_KEY is not configured");
+    #[test]
+    fn register_core_tools_omits_web_search_without_api_key() {
+        let mut registry = ToolRegistry::new();
+
+        register_core_tools(&mut registry, &NativeToolOptions::default(), None);
+
+        assert!(registry.get("web_search").is_none());
     }
 
     #[tokio::test]
     async fn web_search_missing_query_returns_error() {
-        let tool = make_web_search_tool_with_api_key(Some("fake-key".into()));
+        let tool = make_web_search_tool_with_api_key("fake-key".into());
         let env: Arc<dyn Sandbox> = Arc::new(MockSandbox::default());
         let result = (tool.executor)(serde_json::json!({}), ToolContext {
             env,
@@ -1373,14 +1365,14 @@ mod tests {
     #[tokio::test]
     async fn register_core_tools_passes_configured_brave_search_key() {
         let mut registry = ToolRegistry::new();
-        let config = SessionOptions {
-            tool_secrets: ToolSecrets {
+        let options = NativeToolOptions {
+            secrets: ToolSecrets {
                 brave_search_api_key: Some("fake-key".to_string()),
             },
-            ..SessionOptions::default()
+            ..NativeToolOptions::default()
         };
 
-        register_core_tools(&mut registry, &config, None);
+        register_core_tools(&mut registry, &options, None);
 
         let tool = registry
             .get("web_search")
@@ -1815,7 +1807,7 @@ mod tests {
     async fn web_search_returns_results() {
         let api_key = std::env::var(EnvVars::BRAVE_SEARCH_API_KEY)
             .expect("BRAVE_SEARCH_API_KEY must be set to run this test");
-        let tool = make_web_search_tool_with_api_key(Some(api_key));
+        let tool = make_web_search_tool_with_api_key(api_key);
         let env: Arc<dyn Sandbox> = Arc::new(MockSandbox::default());
         let result = (tool.executor)(
             serde_json::json!({"query": "rust programming language"}),
