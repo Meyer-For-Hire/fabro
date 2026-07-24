@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { ReactNode } from "react";
 import TestRenderer, { act } from "react-test-renderer";
+import { MemoryRouter } from "react-router";
 import { SWRConfig } from "swr";
 import type { EventEnvelope } from "@qltysh/fabro-api-client";
 
@@ -22,15 +23,17 @@ function makeEvent(overrides: Partial<EventEnvelope>): EventEnvelope {
 
 function makeStage(overrides: Partial<Stage> = {}): Stage {
   return {
-    id:           "implement@1",
-    name:         "implement",
-    handler:      "agent",
-    nodeId:       "implement",
-    visit:        1,
-    status:       "succeeded",
-    duration:     "1m 30s",
-    startedAt:    "2026-05-24T11:58:30Z",
-    providerUsed: { mode: "policy", model: "claude-opus-4-7", reasoning_effort: "high" },
+    id:                 "implement@1",
+    name:               "implement",
+    handler:            "agent",
+    nodeId:             "implement",
+    visit:              1,
+    graphVisit:         null,
+    resumedFromStageId: null,
+    status:             "succeeded",
+    duration:           "1m 30s",
+    startedAt:          "2026-05-24T11:58:30Z",
+    providerUsed:       { mode: "policy", model: "claude-opus-4-7", reasoning_effort: "high" },
     ...overrides,
   };
 }
@@ -273,6 +276,36 @@ describe("StagePopover rendering", () => {
     expect(text).toContain("agent");
     expect(text).not.toContain("Tokens");
     expect(text).not.toContain("Reason");
+  });
+
+  test("resumed stage links to the prior execution and shows a divergent graph visit", () => {
+    const stage = makeStage({
+      id: "implement@2",
+      visit: 2,
+      graphVisit: 1,
+      resumedFromStageId: "review/security@1",
+      status: "running",
+      duration: "--",
+    });
+    const tree = render(
+      <MemoryRouter initialEntries={["/runs/run-1"]}>
+        <StagePopover runId="run-1" stage={stage} duration="--" />
+      </MemoryRouter>,
+    );
+    const text = textOf(tree);
+    expect(text).toContain("Resumed from");
+    expect(text).toContain("review/security@1");
+    expect(text).toContain("Graph visit");
+    const json = JSON.stringify(tree.toJSON());
+    expect(json).toContain("/runs/run-1/stages/review%2Fsecurity%401");
+  });
+
+  test("stage without ordinal divergence hides the graph visit row", () => {
+    const stage = makeStage({ graphVisit: 1, status: "pending", duration: "--" });
+    const tree = render(<StagePopover runId="run-1" stage={stage} duration="--" />);
+    const text = textOf(tree);
+    expect(text).not.toContain("Resumed from");
+    expect(text).not.toContain("Graph visit");
   });
 
   test("failed command stage shows exit code instead of model", async () => {

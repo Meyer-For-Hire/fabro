@@ -1,5 +1,5 @@
 import { useMemo, useReducer, useState } from "react";
-import { useParams } from "react-router";
+import { Link, useParams } from "react-router";
 import {
   ArrowDownTrayIcon,
   ChevronDownIcon,
@@ -1738,6 +1738,17 @@ function RunStageActivityStage({
       <div className="flex min-h-0 min-w-0 flex-1 flex-col pt-3">
         <div className="shrink-0 border-b border-line">
           <div className="pl-3 pr-3">
+            {selectedStage.resumedFromStageId && (
+              <p className="pb-2 text-xs text-fg-muted">
+                Resumed from{" "}
+                <Link
+                  to={`/runs/${runId}/stages/${encodeURIComponent(selectedStage.resumedFromStageId)}`}
+                  className="font-mono text-teal-500 hover:underline"
+                >
+                  {selectedStage.resumedFromStageId}
+                </Link>
+              </p>
+            )}
             <EventsToolbar
               tab={effectiveTab}
               renderer={renderer}

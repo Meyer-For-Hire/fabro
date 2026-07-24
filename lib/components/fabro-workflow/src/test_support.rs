@@ -27,6 +27,7 @@ use crate::run_metadata::RunMetadataRuntime;
 use crate::run_options::RunOptions;
 use crate::sandbox_git_runtime::SandboxGitRuntime;
 use crate::services::{EngineServices, RunLocations, RunServices};
+use crate::stage_execution::StageExecutionTracker;
 
 #[cfg(feature = "test-support")]
 pub(crate) fn test_configured_provider_ids(
@@ -253,6 +254,7 @@ async fn initialized(
                     Arc::new(SandboxGitRuntime::new()),
                     Arc::new(RunMetadataRuntime::new()),
                     None,
+                    StageExecutionTracker::default(),
                 ),
                 registry:        Arc::new(registry),
                 interviewer:     Arc::new(AutoApproveInterviewer::engine()),

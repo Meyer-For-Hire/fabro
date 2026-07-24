@@ -319,59 +319,71 @@ impl StageContextWindow {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StageProjection {
-    pub first_event_seq:   NonZeroU32,
-    pub prompt:            Option<String>,
-    pub response:          Option<String>,
-    pub completion:        Option<StageCompletion>,
-    pub provider_used:     Option<StageModelUsage>,
-    pub diff:              Option<String>,
-    pub script_invocation: Option<serde_json::Value>,
-    pub script_timing:     Option<serde_json::Value>,
-    pub parallel_results:  Option<Vec<crate::ParallelBranchResult>>,
-    pub output:            Option<String>,
+    pub first_event_seq:       NonZeroU32,
+    pub prompt:                Option<String>,
+    pub response:              Option<String>,
+    pub completion:            Option<StageCompletion>,
+    pub provider_used:         Option<StageModelUsage>,
+    pub diff:                  Option<String>,
+    pub script_invocation:     Option<serde_json::Value>,
+    pub script_timing:         Option<serde_json::Value>,
+    pub parallel_results:      Option<Vec<crate::ParallelBranchResult>>,
+    pub output:                Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_bytes:      Option<u64>,
+    pub output_bytes:          Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub live_streaming:    Option<bool>,
+    pub live_streaming:        Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub termination:       Option<crate::CommandTermination>,
+    pub termination:           Option<crate::CommandTermination>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub started_at:        Option<DateTime<Utc>>,
+    pub started_at:            Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub handler:           Option<StageHandler>,
-    /// Per-attempt timing breakdown for the latest terminal attempt.
+    pub handler:               Option<StageHandler>,
+    /// Graph visit that produced this stage execution. The `StageId` ordinal
+    /// counts executions, which diverges from the graph visit when
+    /// post-checkpoint work is replayed after resume. Absent on
+    /// projections built from events written before stage execution identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_visit:           Option<u32>,
+    /// Prior execution superseded by this resumed replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed_from_stage_id: Option<StageId>,
+    /// Timing breakdown for this stage execution's latest terminal attempt.
+    /// One projection represents one execution, which may contain multiple
+    /// automatic attempts; earlier executions of the same node keep their own
+    /// immutable projections under their own `StageId`s.
     ///
     /// `None` for stages still in flight (`started_at` is set but no terminal
     /// event has been observed yet). For live wall-time ticking, the UI uses
     /// `started_at`; once terminal this carries the finalized breakdown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timing:            Option<StageTiming>,
+    pub timing:                Option<StageTiming>,
     #[serde(default)]
-    pub usage:             BilledTokenCounts,
+    pub usage:                 BilledTokenCounts,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model:             Option<ModelRef>,
+    pub model:                 Option<ModelRef>,
     /// Todo/task list owned by the stage's root agent session.
     ///
     /// OpenAI child sessions own separate per-session plans and do not appear
     /// here. Anthropic task lists are root-scoped and shared with child
     /// sessions, so child mutations of that shared list do appear here.
     #[serde(default, rename = "todos", skip_serializing_if = "Option::is_none")]
-    pub root_agent_todos:  Option<TodoListProjection>,
+    pub root_agent_todos:      Option<TodoListProjection>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub subagents:         Vec<SubAgentProjection>,
+    pub subagents:             Vec<SubAgentProjection>,
     #[serde(default, skip_serializing_if = "SkillsProjection::is_empty")]
-    pub skills:            SkillsProjection,
+    pub skills:                SkillsProjection,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub permission_level:  Option<PermissionLevel>,
+    pub permission_level:      Option<PermissionLevel>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub agent_tools:       Vec<AgentToolSummary>,
+    pub agent_tools:           Vec<AgentToolSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub mcp_servers:       Vec<McpServerProjection>,
+    pub mcp_servers:           Vec<McpServerProjection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context_window:    Option<StageContextWindowProjection>,
+    pub context_window:        Option<StageContextWindowProjection>,
     #[serde(default)]
-    pub agent_control:     AgentControlState,
-    pub state:             StageState,
+    pub agent_control:         AgentControlState,
+    pub state:                 StageState,
 }
 
 #[derive(
@@ -485,6 +497,8 @@ impl StageProjection {
             termination: None,
             started_at: None,
             handler: None,
+            graph_visit: None,
+            resumed_from_stage_id: None,
             state: StageState::Running,
         }
     }
@@ -518,14 +532,24 @@ impl StageProjection {
         self.timing.map(|timing| timing.wall_time_ms)
     }
 
-    /// Begin a new attempt (or visit) for this stage: clear every
+    /// Begin a new automatic attempt within this stage execution: clear every
     /// per-attempt field so prior-attempt data does not leak, then record
     /// `started_at` and `state = Running`. Preserves `first_event_seq`
-    /// (identity / sort key).
+    /// (identity / sort key) and the execution identity metadata
+    /// (`graph_visit`, `resumed_from_stage_id`).
+    ///
+    /// One stage projection represents one execution; a replay after resume
+    /// gets a new `StageId` and never flows through here. Replays of legacy
+    /// histories with duplicate `stage.started` events for one `StageId`
+    /// retain this last-attempt behavior.
     pub fn begin_attempt(&mut self, started_at: DateTime<Utc>, handler: StageHandler) {
+        let graph_visit = self.graph_visit;
+        let resumed_from_stage_id = self.resumed_from_stage_id.take();
         *self = Self::new(self.first_event_seq);
         self.started_at = Some(started_at);
         self.handler = Some(handler);
+        self.graph_visit = graph_visit;
+        self.resumed_from_stage_id = resumed_from_stage_id;
         self.state = StageState::Running;
     }
 }
@@ -569,11 +593,18 @@ impl RunProjection {
         self.stages.get(stage)
     }
 
+    /// Iterate stages in unspecified order without allocating or sorting.
+    ///
+    /// Use this only for order-independent aggregation. Presentation and
+    /// serialization callers should use [`Self::iter_stages`] instead.
+    pub fn iter_stages_unordered(&self) -> impl Iterator<Item = (&StageId, &StageProjection)> {
+        self.stages.iter()
+    }
+
     /// Iterate stages in `first_event_seq` order (the chronological order in
     /// which each stage's first lifecycle event was recorded). Internal
-    /// storage is a `HashMap`, so iteration would otherwise be
-    /// non-deterministic; every caller wants chronological order, so we sort
-    /// here once instead of asking each caller to remember.
+    /// storage is a `HashMap`, so presentation callers sort through this
+    /// helper instead of relying on non-deterministic map iteration.
     pub fn iter_stages(&self) -> impl Iterator<Item = (&StageId, &StageProjection)> {
         let mut entries: Vec<(&StageId, &StageProjection)> = self.stages.iter().collect();
         entries.sort_by(|(left_id, left_stage), (right_id, right_stage)| {

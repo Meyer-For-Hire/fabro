@@ -20,9 +20,10 @@ use crate::artifact_snapshot::{ArtifactCollectionSummary, collect_artifacts};
 use crate::artifact_upload::ArtifactSink;
 use crate::event::{Emitter, Event, RunNoticeCode, RunNoticeLevel};
 use crate::graph::{WorkflowGraph, WorkflowNode};
-use crate::lifecycle::event::{stage_scope_for, stage_visit};
+use crate::lifecycle::event::stage_scope_for;
 use crate::outcome::BilledModelUsage;
 use crate::runtime_store::RunStoreHandle;
+use crate::stage_execution::StageExecutionTracker;
 
 type WfRunState = ExecutionState<Option<BilledModelUsage>>;
 type WfNodeResult = NodeResult<Option<BilledModelUsage>>;
@@ -46,6 +47,8 @@ pub(crate) struct ArtifactLifecycle {
     /// Per-attempt state: epoch seconds when the attempt started.
     attempt_start_epoch: std::sync::Mutex<Option<f64>>,
     captured_artifacts:  std::sync::Mutex<HashSet<ArtifactIdentity>>,
+    /// Run-scoped stage execution allocator shared with `RunServices`.
+    stage_executions:    StageExecutionTracker,
 }
 
 impl ArtifactLifecycle {
@@ -56,6 +59,7 @@ impl ArtifactLifecycle {
         run_id: RunId,
         artifact_globs: Vec<String>,
         artifact_sink: Option<ArtifactSink>,
+        stage_executions: StageExecutionTracker,
     ) -> Self {
         Self {
             sandbox,
@@ -66,6 +70,7 @@ impl ArtifactLifecycle {
             artifact_sink,
             attempt_start_epoch: std::sync::Mutex::new(None),
             captured_artifacts: std::sync::Mutex::new(HashSet::new()),
+            stage_executions,
         }
     }
 }
@@ -120,7 +125,10 @@ impl RunLifecycle<WorkflowGraph> for ArtifactLifecycle {
             .expect("artifact mutex should not be poisoned: no code panics while holding this lock")
             .unwrap_or(0.0);
         let node_id = ctx.node.id();
-        let visit = stage_visit(state, node_id);
+        // Artifact identity follows the stage execution ordinal so a resumed
+        // reexecution stores its captures under the new `StageId`.
+        let scope = stage_scope_for(&self.stage_executions, state, node_id);
+        let visit = scope.visit;
         let node_slug = if visit <= 1 {
             node_id.to_string()
         } else {
@@ -144,7 +152,7 @@ impl RunLifecycle<WorkflowGraph> for ArtifactLifecycle {
                     return Ok(());
                 }
 
-                let stage_id = StageId::new(node_id.to_string(), visit);
+                let stage_id = scope.stage_id();
                 if let Err(err) = self
                     .persist_artifacts(
                         &stage_id,
@@ -162,7 +170,6 @@ impl RunLifecycle<WorkflowGraph> for ArtifactLifecycle {
                     return Ok(());
                 }
                 self.record_captured_assets(&new_assets);
-                let scope = stage_scope_for(state, node_id);
                 for asset in &new_assets {
                     self.emitter.emit_scoped(
                         &Event::ArtifactCaptured {
