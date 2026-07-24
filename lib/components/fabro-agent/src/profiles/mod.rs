@@ -112,6 +112,37 @@ pub struct EnvContext {
     pub git_recent_commits: Option<String>,
 }
 
+/// Substitute `{name}` placeholders in a prompt template.
+///
+/// Placeholders not listed in `vars` are left intact — notably `{env_block}`,
+/// which [`assemble_system_prompt`] fills in later.
+#[must_use]
+pub fn render_prompt(template: &str, vars: &[(&str, &str)]) -> String {
+    let mut rendered = template.trim_end().to_string();
+    for (name, value) in vars {
+        rendered = rendered.replace(&format!("{{{name}}}"), value);
+    }
+    rendered
+}
+
+/// Splice an optional block into the `{name}` placeholder, dropping the blank
+/// line ahead of it when the block is empty so omitting a section never leaves
+/// a double gap.
+///
+/// Use this for whole sections that come and go. Placeholders that swap a
+/// single line in place — where the surrounding blank lines are unaffected —
+/// belong in [`render_prompt`] instead.
+#[must_use]
+pub fn splice_optional_section(template: &str, name: &str, section: &str) -> String {
+    let placeholder = format!("\n\n{{{name}}}");
+    let replacement = if section.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n{}", section.trim_end())
+    };
+    template.trim_end().replace(&placeholder, &replacement)
+}
+
 /// Assembles a complete system prompt from a core prompt template and standard
 /// sections.
 ///

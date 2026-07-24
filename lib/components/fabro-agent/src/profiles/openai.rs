@@ -6,13 +6,17 @@ use super::EnvContext;
 use crate::agent_profile::AgentProfile;
 use crate::apply_patch;
 use crate::config::NativeToolOptions;
-use crate::profiles::{BaseProfile, assemble_system_prompt};
+use crate::profiles::{BaseProfile, assemble_system_prompt, render_prompt};
 use crate::sandbox::Sandbox;
 use crate::skills::Skill;
 use crate::todo_runtime::TodoRuntime;
 use crate::todo_tools::make_update_plan_tool;
 use crate::tool_registry::ToolRegistry;
 use crate::tools::{self, WebFetchSummarizer, register_core_tools};
+
+const CORE_PROMPT: &str = include_str!("prompts/openai.md");
+const APPLY_PATCH_SECTION: &str = include_str!("prompts/openai_apply_patch.md");
+const EDIT_FILE_SECTION: &str = include_str!("prompts/openai_edit_file.md");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FileEditToolKind {
@@ -153,41 +157,24 @@ impl AgentProfile for OpenAiProfile {
         user_instructions: Option<&str>,
         skills: &[Skill],
     ) -> String {
-        let provider_name = self.provider_display_name();
-        let (file_edit_tool_name, file_edit_failure_guidance, file_edit_tool_guidance) =
-            match self.file_edit_tool {
-                FileEditToolKind::ApplyPatch => (
-                    "apply_patch",
-                    "- When apply_patch fails, use the error text to construct a corrected patch. \
+        let (file_edit_tool_name, file_edit_failure_guidance) = match self.file_edit_tool {
+            // One-line failure hints stay inline; the multi-line usage blocks
+            // they pair with live in prompts/openai_{apply_patch,edit_file}.md.
+            FileEditToolKind::ApplyPatch => (
+                "apply_patch",
+                "- When apply_patch fails, use the error text to construct a corrected patch. \
 Re-read the target file if you need fresh context.",
-                    "## apply_patch
-Use the `apply_patch` tool for all file modifications. This is a freeform tool: pass the raw \
-patch text directly, never wrap it in JSON. The format uses `*** Begin Patch` / \
-`*** End Patch` delimiters with `*** Add File:`, `*** Delete File:`, `*** Update File:` \
-operations. Use `-` for removals, `+` for additions, and space-prefix for unchanged context \
-lines. Show 3 lines of context around each change. NEVER use `applypatch` or `apply-patch`, \
-only `apply_patch`.
-
-Example:
-```
-*** Begin Patch
-*** Update File: src/main.py
-@@ def hello():
--    print(\"old\")
-+    print(\"new\")
-*** End Patch
-```",
-                ),
-                FileEditToolKind::EditFile => (
-                    "edit_file",
-                    "- When edit_file fails, use the error text to construct a corrected exact \
+            ),
+            FileEditToolKind::EditFile => (
+                "edit_file",
+                "- When edit_file fails, use the error text to construct a corrected exact \
 replacement. Re-read the target file if you need fresh context.",
-                    "## edit_file
-Use `edit_file` to modify an existing file by replacing an exact string. Read the file first. \
-The `old_string` must match exactly and be unique unless `replace_all` is true; include enough \
-surrounding context to make the match unique and preserve the existing indentation.",
-                ),
-            };
+            ),
+        };
+        let file_edit_tool_guidance = match self.file_edit_tool {
+            FileEditToolKind::ApplyPatch => APPLY_PATCH_SECTION,
+            FileEditToolKind::EditFile => EDIT_FILE_SECTION,
+        };
         let web_search_guidance = if self
             .base
             .registry
@@ -201,89 +188,16 @@ Search the web using Brave Search. Returns titles, URLs, and descriptions.
         } else {
             ""
         };
-        let core_prompt = format!("\
-You are a coding agent powered by {provider_name}, running in a terminal-based agentic coding assistant. \
-You are expected to be precise, safe, and helpful.
-
-You can receive user prompts and context such as files in the workspace, communicate with the \
-user by streaming thinking and responses, and emit function calls to run terminal commands and \
-edit files.
-
-# Personality
-
-Be concise, direct, and friendly. Communicate efficiently, keeping the user clearly informed \
-about ongoing actions without unnecessary detail. Prioritize actionable guidance, clearly \
-stating assumptions, environment prerequisites, and next steps.
-
-{{env_block}}
-
-# AGENTS.md
-
-Repos may contain AGENTS.md files with instructions for the agent. These files can appear \
-anywhere in the repository. Instructions in AGENTS.md files whose scope includes a file you \
-touch must be obeyed. More-deeply-nested AGENTS.md files take precedence in case of conflict. \
-Direct system/developer/user instructions take precedence over AGENTS.md instructions.
-
-# Task Execution
-
-Keep going until the task is completely resolved before ending your turn. Autonomously resolve \
-the query to the best of your ability using the tools available. Do NOT guess or make up an answer.
-
-Working on repos in the current environment is allowed, even if they are proprietary.
-
-If completing the task requires writing or modifying files:
-- Fix the problem at the root cause rather than applying surface-level patches, when possible.
-- Avoid unneeded complexity in your solution.
-- Do not attempt to fix unrelated bugs or broken tests.
-- Keep changes consistent with the style of the existing codebase. Changes should be minimal \
-and focused on the task.
-- Use `git log` and `git blame` to search the history of the codebase if additional context is needed.
-- NEVER add copyright or license headers unless specifically requested.
-{file_edit_failure_guidance}
-- Do not `git commit` your changes or create new git branches unless explicitly requested.
-
-# Planning
-
-If you create a checklist or task list, you update item statuses incrementally as each item is \
-completed rather than marking every item done only at the end.
-
-# Validating Your Work
-
-If the codebase has tests or the ability to build or run, consider using them to verify your \
-work. Start as specific as possible to the code you changed to catch issues efficiently, then \
-make your way to broader tests as you build confidence.
-
-# Tools
-
-Use the provided tools to interact with the codebase and environment.
-
-## read_file
-Read files to understand code before modifying. Use offset/limit for large files.
-
-{file_edit_tool_guidance}
-
-## write_file
-Use for creating new files. For modifications, prefer {file_edit_tool_name}.
-
-## shell
-Execute shell commands. Default timeout is 10 seconds. Use timeout_ms parameter for \
-longer-running commands. When searching for text or files, prefer `rg` (ripgrep) because \
-it is much faster than alternatives like `grep`.
-
-## grep
-Search file contents with regex. Use glob_filter to narrow results.
-
-## glob
-Find files by name pattern.
-
-{web_search_guidance}## web_fetch
-Fetch content from a URL and optionally summarize it. Pass a prompt to extract specific \
-information instead of returning the full page. URLs must start with http:// or https://.
-
-# Coding Best Practices
-
-Write clean, maintainable code. Handle errors appropriately. Follow existing code conventions \
-in the project.");
+        let core_prompt = render_prompt(CORE_PROMPT, &[
+            ("provider_name", &self.provider_display_name()),
+            ("file_edit_tool_name", file_edit_tool_name),
+            ("file_edit_failure_guidance", file_edit_failure_guidance),
+            (
+                "file_edit_tool_guidance",
+                file_edit_tool_guidance.trim_end(),
+            ),
+            ("web_search_section", web_search_guidance),
+        ]);
 
         assemble_system_prompt(
             &core_prompt,
