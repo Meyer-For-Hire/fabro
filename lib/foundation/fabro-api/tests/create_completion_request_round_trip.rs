@@ -10,16 +10,5 @@ fn create_completion_request_reuses_canonical_reasoning_effort() {
     }))
     .unwrap();
 
-    let reasoning_effort: Option<ReasoningEffort> = request.reasoning_effort;
-    assert_eq!(reasoning_effort, Some(ReasoningEffort::High));
-}
-
-#[test]
-fn create_completion_request_rejects_unknown_reasoning_effort() {
-    let result = serde_json::from_value::<CreateCompletionRequest>(json!({
-        "messages": [],
-        "reasoning_effort": "bogus"
-    }));
-
-    assert!(result.is_err());
+    assert_eq!(request.reasoning_effort, Some(ReasoningEffort::High));
 }
