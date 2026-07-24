@@ -398,17 +398,6 @@ export const ModelsApiFactory = function (configuration?: Configuration, basePat
             return localVarFp.testProviderCredentials(provider, providerCredentialTestRequest, options).then((request) => request(axios, basePath));
         },
         /**
-         * Validates an LLM provider API key against the server\'s effective catalog without persisting it.
-         * @summary Test Provider Credentials
-         * @param {string} provider The provider identifier.
-         * @param {ProviderCredentialTestRequest} providerCredentialTestRequest
-         * @param {*} [options] Override http request option.
-         * @throws {RequiredError}
-         */
-        testProviderCredentials(provider: string, providerCredentialTestRequest: ProviderCredentialTestRequest, options?: RawAxiosRequestConfig): AxiosPromise<ProviderCredentialTestResponse> {
-            return localVarFp.testProviderCredentials(provider, providerCredentialTestRequest, options).then((request) => request(axios, basePath));
-        },
-        /**
          * Tests every configured LLM provider once using the catalog probe model. Provider-level failures are returned in the response body with HTTP 200.
          * @summary Test Providers
          * @param {*} [options] Override http request option.
@@ -459,18 +448,6 @@ export class ModelsApi extends BaseAPI {
      */
     public testModel(id: string, provider?: string, mode?: ModelTestMode, options?: RawAxiosRequestConfig) {
         return ModelsApiFp(this.configuration).testModel(id, provider, mode, options).then((request) => request(this.axios, this.basePath));
-    }
-
-    /**
-     * Validates an LLM provider API key against the server\'s effective catalog without persisting it.
-     * @summary Test Provider Credentials
-     * @param {string} provider The provider identifier.
-     * @param {ProviderCredentialTestRequest} providerCredentialTestRequest
-     * @param {*} [options] Override http request option.
-     * @throws {RequiredError}
-     */
-    public testProviderCredentials(provider: string, providerCredentialTestRequest: ProviderCredentialTestRequest, options?: RawAxiosRequestConfig) {
-        return ModelsApiFp(this.configuration).testProviderCredentials(provider, providerCredentialTestRequest, options).then((request) => request(this.axios, this.basePath));
     }
 
     /**
