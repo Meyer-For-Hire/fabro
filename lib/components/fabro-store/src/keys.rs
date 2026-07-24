@@ -3,6 +3,8 @@ use std::ops::Range;
 
 use fabro_types::{RunBlobId, RunId, SessionId};
 
+pub(crate) const MAX_EVENT_SEQ: u32 = 999_999;
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct SlateKey(String);
 
@@ -61,8 +63,9 @@ pub(crate) fn run_events_prefix(run_id: &RunId) -> SlateKey {
 }
 
 // Sequence keys zero-pad `seq` to six digits so lexicographic key order
-// matches numeric seq order for up to 999,999 events per run. Seek-based
-// event listing (`run_events_range`) depends on this invariant.
+// matches numeric seq order through `MAX_EVENT_SEQ`. Seek-based event listing
+// (`run_events_range`) depends on this invariant, so event allocation rejects
+// larger sequences.
 pub(crate) fn run_event_key(run_id: &RunId, seq: u32, epoch_ms: i64) -> SlateKey {
     SlateKey::new("runs")
         .with(run_id)
@@ -184,7 +187,7 @@ mod tests {
 
         assert!(!contains(&run_event_key(&run_id, 1, 123)));
         assert!(contains(&run_event_key(&run_id, 2, 123)));
-        assert!(contains(&run_event_key(&run_id, 999_999, 123)));
+        assert!(contains(&run_event_key(&run_id, MAX_EVENT_SEQ, 123)));
         // Sibling namespaces of the same run sort outside the range.
         assert!(!contains(&SlateKey::new("runs").with(run_id).with("state")));
         assert!(!contains(

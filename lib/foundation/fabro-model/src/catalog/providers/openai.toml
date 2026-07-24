@@ -14,7 +14,7 @@ family = "gpt-5"
 training = "2026-02-16"
 knowledge_cutoff = "February 16, 2026"
 default = true
-aliases = ["sol", "gpt56-sol", "gpt-56-sol", "gpt-5.6", "gpt56", "gpt-56"]
+aliases = ["sol", "gpt-sol", "gpt56-sol", "gpt-56-sol", "gpt-5.6", "gpt56", "gpt-56"]
 
 [providers.openai.models."gpt-5.6-sol".limits]
 context_window = 272000
@@ -37,7 +37,7 @@ display_name = "GPT-5.6 Terra"
 family = "gpt-5"
 training = "2026-02-16"
 knowledge_cutoff = "February 16, 2026"
-aliases = ["terra", "gpt56-terra", "gpt-56-terra"]
+aliases = ["terra", "gpt-terra", "gpt56-terra", "gpt-56-terra"]
 
 [providers.openai.models."gpt-5.6-terra".limits]
 context_window = 272000
@@ -60,7 +60,7 @@ display_name = "GPT-5.6 Luna"
 family = "gpt-5"
 training = "2026-02-16"
 knowledge_cutoff = "February 16, 2026"
-aliases = ["luna", "gpt56-luna", "gpt-56-luna"]
+aliases = ["luna", "gpt-luna", "gpt56-luna", "gpt-56-luna"]
 
 [providers.openai.models."gpt-5.6-luna".limits]
 context_window = 272000
