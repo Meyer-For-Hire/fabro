@@ -299,6 +299,7 @@ mod tests {
             ("claude-opus-4-6",                    "claude-opus-4-6",                     T::Anthropic,         C::AnthropicMessages, B::Anthropic, P::Anthropic),
             ("claude-opus-4-7",                    "claude-opus-4-7",                     T::Anthropic,         C::AnthropicMessages, B::Anthropic, P::Anthropic),
             ("claude-opus-4-8",                    "claude-opus-4-8",                     T::Anthropic,         C::AnthropicMessages, B::Anthropic, P::Anthropic),
+            ("claude-opus-5",                      "claude-opus-5",                       T::Anthropic,         C::AnthropicMessages, B::Anthropic, P::Anthropic),
             ("claude-sonnet-4-5",                  "claude-sonnet-4-5",                   T::Anthropic,         C::AnthropicMessages, B::Anthropic, P::Anthropic),
             ("claude-sonnet-4-6",                  "claude-sonnet-4-6",                   T::Anthropic,         C::AnthropicMessages, B::Anthropic, P::Anthropic),
             ("gemini-3-flash-preview",             "gemini-3-flash-preview",              T::Gemini,            C::GeminiGenerate,    B::Gemini,    P::Gemini),
