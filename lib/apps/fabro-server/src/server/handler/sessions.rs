@@ -305,8 +305,8 @@ async fn attach_session_events(
     };
     let start_seq = match params.since_seq {
         Some(seq) => seq.max(1),
-        None => match run_store.list_events().await {
-            Ok(events) => events.last().map_or(1, |event| event.seq.saturating_add(1)),
+        None => match run_store.last_event_seq().await {
+            Ok(last_seq) => last_seq.map_or(1, |seq| seq.saturating_add(1)),
             Err(err) => return store_error(&err).into_response(),
         },
     };
