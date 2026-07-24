@@ -5,10 +5,12 @@ use fabro_model::{AgentProfileKind, Catalog, ProviderId};
 
 pub mod anthropic;
 pub mod gemini;
+pub mod kimi;
 pub mod openai;
 
 pub use anthropic::AnthropicProfile;
 pub use gemini::GeminiProfile;
+pub use kimi::KimiProfile;
 pub use openai::OpenAiProfile;
 
 use crate::agent_profile::AgentProfile;
@@ -82,6 +84,11 @@ impl AgentProfileBuilder {
             ),
             AgentProfileKind::Anthropic => Box::new(
                 AnthropicProfile::with_native_tools(model, options, summarizer)
+                    .with_provider_id(self.provider_id.clone())
+                    .with_catalog(Arc::clone(&self.catalog)),
+            ),
+            AgentProfileKind::Kimi => Box::new(
+                KimiProfile::with_native_tools(model, options, summarizer)
                     .with_provider_id(self.provider_id.clone())
                     .with_catalog(Arc::clone(&self.catalog)),
             ),

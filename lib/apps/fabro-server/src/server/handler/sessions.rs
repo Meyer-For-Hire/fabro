@@ -928,7 +928,10 @@ fn summarizer_model_id(
             .map_or_else(
                 || match profile_kind {
                     AgentProfileKind::Anthropic => "claude-haiku-4-5",
-                    AgentProfileKind::OpenAi => selected_model,
+                    // Kimi is reached through several providers, so there is
+                    // no fixed summarizer model to name; reuse the selected
+                    // one, as the OpenAI profile does.
+                    AgentProfileKind::OpenAi | AgentProfileKind::Kimi => selected_model,
                     AgentProfileKind::Gemini => "gemini-2.0-flash",
                 },
                 |model| model.id.as_str(),

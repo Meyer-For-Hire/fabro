@@ -71,6 +71,11 @@ pub enum AgentProfileKind {
     #[strum(to_string = "openai")]
     OpenAi,
     Gemini,
+    /// Kimi (Moonshot) models, wherever they are served from. Selected per
+    /// model rather than per provider, so a Kimi model reached through a
+    /// gateway such as OpenRouter gets the same profile as one reached
+    /// directly at `api.moonshot.ai`.
+    Kimi,
 }
 
 #[cfg(test)]

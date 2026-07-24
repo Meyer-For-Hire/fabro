@@ -34,6 +34,9 @@ pub async fn discover_memory(
         AgentProfileKind::Anthropic => vec!["AGENTS.md", "CLAUDE.md"],
         AgentProfileKind::OpenAi => vec!["AGENTS.md", ".codex/instructions.md"],
         AgentProfileKind::Gemini => vec!["AGENTS.md", "GEMINI.md"],
+        // Kimi Code reads only AGENTS.md (and a lowercase variant); it has no
+        // vendor-specific instruction filename of its own.
+        AgentProfileKind::Kimi => vec!["AGENTS.md"],
     };
 
     let mut results: Vec<MemoryDocument> = Vec::new();

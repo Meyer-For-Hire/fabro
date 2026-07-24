@@ -131,6 +131,10 @@ impl NativeToolOptions {
         // rather than silently inheriting the default timeout.
         let default_command_timeout_ms = match profile_kind {
             AgentProfileKind::Anthropic => 120_000,
+            // Matches the 60s foreground default Kimi Code's Bash tool
+            // documents, which is what these models are used to budgeting
+            // against.
+            AgentProfileKind::Kimi => 60_000,
             AgentProfileKind::OpenAi | AgentProfileKind::Gemini => {
                 defaults.default_command_timeout_ms
             }
