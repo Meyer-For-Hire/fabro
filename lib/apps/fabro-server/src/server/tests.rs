@@ -15431,7 +15431,7 @@ async fn create_completion_structured_output_forwards_reasoning_effort() {
     let response = app.oneshot(req).await.unwrap();
     let body = response_json!(response, StatusCode::OK).await;
     assert_eq!(body["output"], json!({"answer": 42}));
-    completion.assert_calls(1);
+    completion.assert();
 }
 
 #[tokio::test]
