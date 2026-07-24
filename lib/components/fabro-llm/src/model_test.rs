@@ -169,7 +169,9 @@ fn validate_deep_result(result: &GenerateResult) -> Result<(), String> {
 mod tests {
     use std::collections::HashMap;
 
-    use fabro_model::{ModelCosts, ModelFeatures, ModelLimits, ProviderId, ReasoningEffortFeature};
+    use fabro_model::{
+        ModelControls, ModelCosts, ModelFeatures, ModelLimits, ProviderId, ReasoningEffortFeature,
+    };
 
     use super::*;
     use crate::types::{FinishReason, Message, Response, StepResult, TokenCounts, ToolResult};
@@ -187,6 +189,7 @@ mod tests {
             training: None,
             knowledge_cutoff: None,
             features,
+            controls: ModelControls::default(),
             costs: ModelCosts {
                 input_cost_per_mtok:       None,
                 output_cost_per_mtok:      None,

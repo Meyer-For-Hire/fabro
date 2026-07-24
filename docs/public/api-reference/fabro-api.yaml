@@ -8289,6 +8289,20 @@ components:
           description: Cost per million cached input tokens in USD.
           example: 1.50
 
+    ModelControls:
+      description: Request-control values accepted by a provider/model offering.
+      type: object
+      required:
+        - reasoning_effort
+      properties:
+        reasoning_effort:
+          type: array
+          description: >-
+            Exact reasoning-effort values accepted by this offering. An empty
+            array means the request control is unsupported.
+          items:
+            $ref: "#/components/schemas/ReasoningEffort"
+
     Model:
       description: |
         One provider's offering of an LLM model. The `id` is unique within
@@ -8303,6 +8317,7 @@ components:
         - training
         - knowledge_cutoff
         - features
+        - controls
         - costs
         - estimated_output_tps
         - aliases
@@ -8336,6 +8351,8 @@ components:
           example: "May 2025"
         features:
           $ref: "#/components/schemas/ModelFeatures"
+        controls:
+          $ref: "#/components/schemas/ModelControls"
         costs:
           $ref: "#/components/schemas/ModelCosts"
         estimated_output_tps:

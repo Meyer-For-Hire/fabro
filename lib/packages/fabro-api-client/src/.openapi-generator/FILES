@@ -226,6 +226,7 @@ models/mcp-transport.ts
 models/merge-method.ts
 models/merge-run-pull-request-request.ts
 models/merge-run-pull-request-response.ts
+models/model-controls.ts
 models/model-costs.ts
 models/model-features.ts
 models/model-limits.ts

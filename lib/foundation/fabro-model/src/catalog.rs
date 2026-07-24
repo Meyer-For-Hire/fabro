@@ -15,7 +15,9 @@ use crate::codec::CodecKind;
 use crate::ids::{ModelId, ProviderId};
 use crate::provider::Provider;
 use crate::reasoning::ReasoningEffort;
-use crate::types::{Model, ModelCosts, ModelFeatures, ModelLimits, ReasoningEffortFeature};
+use crate::types::{
+    Model, ModelControls, ModelCosts, ModelFeatures, ModelLimits, ReasoningEffortFeature,
+};
 
 #[derive(RustEmbed)]
 #[folder = "src/catalog/providers"]
@@ -2228,6 +2230,9 @@ fn build_model(
         training: settings.training.clone(),
         knowledge_cutoff: settings.knowledge_cutoff.clone(),
         features: model_features,
+        controls: ModelControls {
+            reasoning_effort: controls.reasoning_effort.clone(),
+        },
         costs,
         estimated_output_tps: settings.estimated_output_tps,
         aliases: settings.aliases.clone().unwrap_or_default(),
@@ -3324,6 +3329,12 @@ enabled = true
                 cache_control_breakpoints: false,
                 sampling_params: true,
             },
+            controls: ModelControls {
+                reasoning_effort: [
+                    High,
+                    XHigh,
+                ],
+            },
             costs: ModelCosts {
                 input_cost_per_mtok: Some(
                     0.784,
@@ -3393,6 +3404,13 @@ enabled = true
                 prompt_cache: true,
                 cache_control_breakpoints: false,
                 sampling_params: false,
+            },
+            controls: ModelControls {
+                reasoning_effort: [
+                    Low,
+                    High,
+                    Max,
+                ],
             },
             costs: ModelCosts {
                 input_cost_per_mtok: Some(
@@ -6018,6 +6036,15 @@ sampling_params = false
                 cache_control_breakpoints: false,
                 sampling_params: true,
             },
+            controls: ModelControls {
+                reasoning_effort: [
+                    Low,
+                    Medium,
+                    High,
+                    XHigh,
+                    Max,
+                ],
+            },
             costs: ModelCosts {
                 input_cost_per_mtok: Some(
                     5.0,
@@ -6075,6 +6102,9 @@ sampling_params = false
                 cache_control_breakpoints: false,
                 sampling_params: false,
             },
+            controls: ModelControls {
+                reasoning_effort: [],
+            },
             costs: ModelCosts {
                 input_cost_per_mtok: Some(
                     0.6,
@@ -6123,6 +6153,13 @@ sampling_params = false
                 prompt_cache: true,
                 cache_control_breakpoints: false,
                 sampling_params: false,
+            },
+            controls: ModelControls {
+                reasoning_effort: [
+                    Low,
+                    High,
+                    Max,
+                ],
             },
             costs: ModelCosts {
                 input_cost_per_mtok: Some(
@@ -6197,6 +6234,12 @@ sampling_params = false
                 cache_control_breakpoints: false,
                 sampling_params: true,
             },
+            controls: ModelControls {
+                reasoning_effort: [
+                    High,
+                    Max,
+                ],
+            },
             costs: ModelCosts {
                 input_cost_per_mtok: Some(
                     1.4,
@@ -6267,6 +6310,15 @@ sampling_params = false
                 cache_control_breakpoints: false,
                 sampling_params: true,
             },
+            controls: ModelControls {
+                reasoning_effort: [
+                    Low,
+                    Medium,
+                    High,
+                    XHigh,
+                    Max,
+                ],
+            },
             costs: ModelCosts {
                 input_cost_per_mtok: Some(
                     0.25,
@@ -6323,6 +6375,15 @@ sampling_params = false
                 prompt_cache: false,
                 cache_control_breakpoints: false,
                 sampling_params: true,
+            },
+            controls: ModelControls {
+                reasoning_effort: [
+                    Low,
+                    Medium,
+                    High,
+                    XHigh,
+                    Max,
+                ],
             },
             costs: ModelCosts {
                 input_cost_per_mtok: Some(
