@@ -15,6 +15,7 @@ import {
   cancellationActionLabel,
   cancellationSuccessMessage,
   cancelRun,
+  deleteErrorMessage,
   deleteRun,
   denyRun,
   isCancellationPendingState,
@@ -104,8 +105,7 @@ export function RowActionsMenu({ run }: { run: RunWithStatus }) {
       await deleteRun(run.id);
       push({ message: "Deleted run." });
     } catch (error) {
-      // deleteRun throws LifecycleActionError shapes via lifecycleActionErrorFromError
-      push({ message: mapError(error, "archive"), tone: "error" });
+      push({ message: deleteErrorMessage(error), tone: "error" });
     } finally {
       setPendingAction(null);
       setDeleteDialogOpen(false);
