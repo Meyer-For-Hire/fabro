@@ -41,6 +41,27 @@ enum EventSequenceOrder {
 #[derive(serde::Deserialize)]
 pub(crate) struct EventListParams {
     #[serde(default)]
+    since_seq: Option<u32>,
+    #[serde(default)]
+    limit:     Option<usize>,
+}
+
+impl EventListParams {
+    pub(crate) fn since_seq(&self) -> u32 {
+        self.since_seq.unwrap_or(1).max(1)
+    }
+
+    pub(crate) fn limit(&self) -> usize {
+        self.limit.unwrap_or(100).clamp(1, 1000)
+    }
+}
+
+/// Query parameters for `/runs/{id}/events` only. Descending pagination via
+/// `before_seq` + `order` is not part of the shared `EventListParams`
+/// contract used by the session, stage, and pair transcript endpoints.
+#[derive(serde::Deserialize)]
+struct RunEventListParams {
+    #[serde(default)]
     since_seq:  Option<u32>,
     #[serde(default)]
     before_seq: Option<u32>,
@@ -50,12 +71,12 @@ pub(crate) struct EventListParams {
     limit:      Option<usize>,
 }
 
-impl EventListParams {
-    pub(crate) fn since_seq(&self) -> u32 {
+impl RunEventListParams {
+    fn since_seq(&self) -> u32 {
         self.since_seq.unwrap_or(1).max(1)
     }
 
-    pub(crate) fn limit(&self) -> usize {
+    fn limit(&self) -> usize {
         self.limit.unwrap_or(100).clamp(1, 1000)
     }
 
@@ -224,7 +245,7 @@ async fn append_run_event(
 async fn list_run_events(
     RequireRunManagementTarget(id, _actor): RequireRunManagementTarget,
     State(state): State<Arc<AppState>>,
-    Query(params): Query<EventListParams>,
+    Query(params): Query<RunEventListParams>,
 ) -> Response {
     if let Some(detail) = params.cursor_error() {
         return ApiError::bad_request(detail).into_response();

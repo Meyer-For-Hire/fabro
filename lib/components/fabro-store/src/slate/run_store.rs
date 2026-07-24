@@ -407,20 +407,25 @@ impl RunDatabase {
 
     /// Returns up to `limit + 1` events immediately before `before_seq` in
     /// descending sequence order. Omitting `before_seq` starts at the newest
+    /// event, and a cursor beyond the newest event pages from the newest
     /// event. The extra item lets callers compute `has_more`.
     pub async fn list_events_before_with_limit(
         &self,
         before_seq: Option<u32>,
         limit: usize,
     ) -> Result<Vec<EventEnvelope>> {
-        // Event keys zero-pad seq to six digits (see `keys::run_event_key`),
-        // so an end bound past `MAX_EVENT_SEQ` would format as a seven-digit
-        // prefix that breaks lexicographic key order. No stored seq exceeds
-        // `MAX_EVENT_SEQ`, so clamp and treat that bound as unbounded.
+        // Clamp the exclusive end to just past the newest stored event so an
+        // oversized cursor pages from the newest event instead of probing
+        // empty key space above it, and never past `MAX_EVENT_SEQ + 1`: event
+        // keys zero-pad seq to six digits (see `keys::run_event_key`), so a
+        // larger end bound would format as a seven-digit prefix that breaks
+        // lexicographic key order.
+        let newest = u64::from(self.latest_event_seq().await?);
         let end_seq = match before_seq {
             Some(seq) => u64::from(seq),
-            None => u64::from(self.latest_event_seq().await?) + 1,
+            None => u64::MAX,
         }
+        .min(newest + 1)
         .min(u64::from(keys::MAX_EVENT_SEQ) + 1);
         if end_seq <= 1 {
             return Ok(Vec::new());
@@ -660,7 +665,11 @@ where
 /// `(seq, payload)` entries in ascending sequence order (event keys embed a
 /// zero-padded sequence, so key order matches sequence order).
 struct EventScan {
-    iter: DbIterator,
+    // `None` when the requested start is beyond the storable sequence range:
+    // event keys zero-pad seq to six digits, so seeking past `MAX_EVENT_SEQ`
+    // would format a seven-digit prefix that breaks lexicographic order and
+    // returns an incorrect slice of history instead of an empty one.
+    iter: Option<DbIterator>,
 }
 
 impl EventScan {
@@ -668,8 +677,11 @@ impl EventScan {
     where
         R: DbRead + Sync,
     {
+        if start_seq > keys::MAX_EVENT_SEQ {
+            return Ok(Self { iter: None });
+        }
         let iter = db.scan(keys::run_events_range(run_id, start_seq)).await?;
-        Ok(Self { iter })
+        Ok(Self { iter: Some(iter) })
     }
 
     /// Like `seek`, but stops before `end_seq` instead of scanning to the
@@ -678,14 +690,25 @@ impl EventScan {
     where
         R: DbRead + Sync,
     {
+        if end_seq > keys::MAX_EVENT_SEQ {
+            // No stored sequence exceeds `MAX_EVENT_SEQ`, so a larger end
+            // bound is equivalent to an unbounded scan.
+            return Self::seek(db, run_id, start_seq).await;
+        }
+        if start_seq >= end_seq {
+            return Ok(Self { iter: None });
+        }
         let range = keys::run_event_seq_prefix(run_id, start_seq)
             ..keys::run_event_seq_prefix(run_id, end_seq);
         let iter = db.scan(range).await?;
-        Ok(Self { iter })
+        Ok(Self { iter: Some(iter) })
     }
 
     async fn next(&mut self) -> Result<Option<(u32, Bytes)>> {
-        while let Some(entry) = self.iter.next().await? {
+        let Some(iter) = self.iter.as_mut() else {
+            return Ok(None);
+        };
+        while let Some(entry) = iter.next().await? {
             let key = key_to_str(&entry.key)?;
             let Some(seq) = keys::parse_event_seq(key) else {
                 continue;
@@ -1146,6 +1169,48 @@ mod tests {
 
         let seqs: Vec<u32> = events.iter().map(|event| event.seq).collect();
         assert_eq!(seqs, vec![keys::MAX_EVENT_SEQ, keys::MAX_EVENT_SEQ - 1]);
+    }
+
+    #[tokio::test]
+    async fn list_events_from_with_limit_is_empty_beyond_key_order_limit() {
+        let run = fresh_run().await;
+        let run_id = run.run_id();
+        run.inner
+            .event_seq
+            .as_ref()
+            .unwrap()
+            .store(keys::MAX_EVENT_SEQ - 1, Ordering::SeqCst);
+        run.append_event(&stage_prompt_payload(&run_id, 1, Some("alpha")))
+            .await
+            .unwrap();
+        run.append_event(&stage_prompt_payload(&run_id, 2, Some("beta")))
+            .await
+            .unwrap();
+
+        let events = super::list_events_from_with_limit(&run.inner.db, &run_id, 5_000_000, 10)
+            .await
+            .unwrap();
+
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_events_before_with_limit_pages_from_newest_for_oversized_cursor() {
+        let run = fresh_run().await;
+        let run_id = run.run_id();
+        for idx in 1..=5 {
+            run.append_event(&stage_prompt_payload(&run_id, idx, Some("alpha")))
+                .await
+                .unwrap();
+        }
+
+        let events = run
+            .list_events_before_with_limit(Some(500_000), 2)
+            .await
+            .unwrap();
+
+        let seqs: Vec<u32> = events.iter().map(|event| event.seq).collect();
+        assert_eq!(seqs, vec![6, 5, 4]);
     }
 
     #[tokio::test]
