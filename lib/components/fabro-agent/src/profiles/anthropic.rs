@@ -5,7 +5,7 @@ use fabro_model::{AgentProfileKind, Catalog, ProviderId};
 use super::EnvContext;
 use crate::agent_profile::AgentProfile;
 use crate::config::NativeToolOptions;
-use crate::profiles::{BaseProfile, assemble_system_prompt, bool_var};
+use crate::profiles::{self, BaseProfile, EmbeddedPrompt};
 use crate::sandbox::Sandbox;
 use crate::skills::Skill;
 use crate::todo_runtime::TodoRuntime;
@@ -106,14 +106,12 @@ impl AgentProfile for AnthropicProfile {
     ) -> String {
         let has_spawn_agent = self.base.registry.get("spawn_agent").is_some();
         let has_web_search = self.base.registry.get(WEB_SEARCH_TOOL_NAME).is_some();
+        let template = EmbeddedPrompt::new("anthropic.md.j2", CORE_PROMPT)
+            .with_bool("has_spawn_agent", has_spawn_agent)
+            .with_bool("has_web_search", has_web_search);
 
-        assemble_system_prompt(
-            "anthropic",
-            CORE_PROMPT,
-            &[
-                ("has_spawn_agent", bool_var(has_spawn_agent)),
-                ("has_web_search", bool_var(has_web_search)),
-            ],
+        profiles::assemble_system_prompt(
+            template,
             env,
             env_context,
             memory,

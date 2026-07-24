@@ -5,7 +5,7 @@ use fabro_model::{AgentProfileKind, Catalog, ProviderId};
 use super::EnvContext;
 use crate::agent_profile::AgentProfile;
 use crate::config::NativeToolOptions;
-use crate::profiles::{BaseProfile, assemble_system_prompt, bool_var};
+use crate::profiles::{self, BaseProfile, EmbeddedPrompt};
 use crate::sandbox::Sandbox;
 use crate::skills::Skill;
 use crate::tool_registry::ToolRegistry;
@@ -98,11 +98,11 @@ impl AgentProfile for GeminiProfile {
         skills: &[Skill],
     ) -> String {
         let has_web_search = self.base.registry.get(WEB_SEARCH_TOOL_NAME).is_some();
+        let template = EmbeddedPrompt::new("gemini.md.j2", CORE_PROMPT)
+            .with_bool("has_web_search", has_web_search);
 
-        assemble_system_prompt(
-            "gemini",
-            CORE_PROMPT,
-            &[("has_web_search", bool_var(has_web_search))],
+        profiles::assemble_system_prompt(
+            template,
             env,
             env_context,
             memory,

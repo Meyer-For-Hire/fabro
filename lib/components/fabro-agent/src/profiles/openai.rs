@@ -6,7 +6,7 @@ use super::EnvContext;
 use crate::agent_profile::AgentProfile;
 use crate::apply_patch;
 use crate::config::NativeToolOptions;
-use crate::profiles::{BaseProfile, assemble_system_prompt, bool_var};
+use crate::profiles::{self, BaseProfile, EmbeddedPrompt};
 use crate::sandbox::Sandbox;
 use crate::skills::Skill;
 use crate::todo_runtime::TodoRuntime;
@@ -16,7 +16,8 @@ use crate::tools::{self, WebFetchSummarizer, register_core_tools};
 
 const CORE_PROMPT: &str = include_str!("prompts/openai.md.j2");
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 enum FileEditToolKind {
     ApplyPatch,
     EditFile,
@@ -155,24 +156,19 @@ impl AgentProfile for OpenAiProfile {
         user_instructions: Option<&str>,
         skills: &[Skill],
     ) -> String {
-        let file_edit_tool = match self.file_edit_tool {
-            FileEditToolKind::ApplyPatch => "apply_patch",
-            FileEditToolKind::EditFile => "edit_file",
-        };
+        let file_edit_tool: &'static str = self.file_edit_tool.into();
         let has_web_search = self
             .base
             .registry
             .get(tools::WEB_SEARCH_TOOL_NAME)
             .is_some();
+        let template = EmbeddedPrompt::new("openai.md.j2", CORE_PROMPT)
+            .with_string("provider_name", self.provider_display_name())
+            .with_string("file_edit_tool", file_edit_tool)
+            .with_bool("has_web_search", has_web_search);
 
-        assemble_system_prompt(
-            "openai",
-            CORE_PROMPT,
-            &[
-                ("provider_name", &self.provider_display_name()),
-                ("file_edit_tool", file_edit_tool),
-                ("has_web_search", bool_var(has_web_search)),
-            ],
+        profiles::assemble_system_prompt(
+            template,
             env,
             env_context,
             memory,

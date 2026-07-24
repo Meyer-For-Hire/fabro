@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use fabro_model::{AgentProfileKind, Catalog, ProviderId};
@@ -112,47 +113,63 @@ pub struct EnvContext {
     pub git_recent_commits: Option<String>,
 }
 
-/// Render a boolean as the string a template compares against.
+/// A checked-in MiniJinja system-prompt template and its typed inputs.
 ///
-/// The shared [`fabro_template::TemplateContext`] types `vars` as strings, so
-/// templates test `{% if vars.flag == "true" %}` rather than relying on
-/// truthiness (a bare `{% if %}` on the string `"false"` would be true).
-#[must_use]
-pub fn bool_var(value: bool) -> &'static str {
-    if value { "true" } else { "false" }
+/// The environment block is supplied by [`assemble_system_prompt`] and cannot
+/// be overridden by callers.
+pub struct EmbeddedPrompt {
+    name:   &'static str,
+    source: &'static str,
+    inputs: HashMap<String, toml::Value>,
 }
 
-/// Render a profile's system prompt template.
-///
-/// Templates are MiniJinja, rendered through [`fabro_template`] like the rest
-/// of the workspace. Values land under `vars`, so a template reads
-/// `{{ vars.env_block }}`; booleans are passed as `"true"`/`"false"` and
-/// compared explicitly, because the shared context types `vars` as strings.
+impl EmbeddedPrompt {
+    #[must_use]
+    pub fn new(name: &'static str, source: &'static str) -> Self {
+        Self {
+            name,
+            source,
+            inputs: HashMap::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_string(mut self, name: &'static str, value: impl Into<String>) -> Self {
+        self.inputs
+            .insert(name.to_string(), toml::Value::String(value.into()));
+        self
+    }
+
+    #[must_use]
+    pub fn with_bool(mut self, name: &'static str, value: bool) -> Self {
+        self.inputs
+            .insert(name.to_string(), toml::Value::Boolean(value));
+        self
+    }
+
+    fn render(mut self, env_block: String) -> String {
+        self.inputs
+            .insert("env_block".to_string(), toml::Value::String(env_block));
+        let ctx = fabro_template::TemplateContext::new().with_inputs(self.inputs);
+        fabro_template::render_named(self.name, self.source, &ctx).unwrap_or_else(|err| {
+            panic!(
+                "embedded prompt template '{}' failed to render: {err}",
+                self.name
+            )
+        })
+    }
+}
+
+/// Assembles a complete system prompt from an embedded template and the
+/// standard trailing sections.
 ///
 /// # Panics
-/// Panics if the template fails to render. Templates are embedded at compile
-/// time with `include_str!` and every variant is covered by tests, so a
-/// failure here is a build-time bug rather than a runtime condition.
-fn render_profile_prompt(name: &str, template: &str, vars: &[(&str, &str)]) -> String {
-    let vars = vars
-        .iter()
-        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
-        .collect();
-    let ctx = fabro_template::TemplateContext::new().with_vars(vars);
-    fabro_template::render_named(name, template, &ctx)
-        .unwrap_or_else(|err| panic!("embedded prompt template '{name}' failed to render: {err}"))
-}
-
-/// Assembles a complete system prompt from a profile template and the standard
-/// trailing sections.
-///
-/// The template is rendered with `env_block` plus whatever `vars` the profile
-/// supplies; project docs, skills, and user instructions are appended after.
+/// Panics if a checked-in template is invalid or references an input its
+/// caller did not supply. Tests render every conditional template variant, so
+/// this indicates a programmer error rather than a recoverable runtime error.
 #[must_use]
 pub fn assemble_system_prompt(
-    name: &str,
-    template: &str,
-    vars: &[(&str, &str)],
+    template: EmbeddedPrompt,
     env: &dyn Sandbox,
     env_context: &EnvContext,
     memory: &[String],
@@ -160,9 +177,7 @@ pub fn assemble_system_prompt(
     skills: &[Skill],
 ) -> String {
     let env_block = build_env_context_block_with(env, env_context);
-    let mut all_vars = vec![("env_block", env_block.as_str())];
-    all_vars.extend_from_slice(vars);
-    let prompt = render_profile_prompt(name, template, &all_vars);
+    let prompt = template.render(env_block);
 
     let docs_section = if memory.is_empty() {
         String::new()
@@ -230,8 +245,57 @@ pub fn build_env_context_block_with(env: &dyn Sandbox, ctx: &EnvContext) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::subagent::{SessionFactory, SubAgentSupervisor};
     use crate::test_support::MockSandbox;
     use crate::tools::WEB_SEARCH_TOOL_NAME;
+
+    fn native_tool_options(
+        profile_kind: AgentProfileKind,
+        has_web_search: bool,
+    ) -> NativeToolOptions {
+        let mut options = NativeToolOptions::for_profile(profile_kind);
+        options.secrets.brave_search_api_key = has_web_search.then(|| "configured-key".to_string());
+        options
+    }
+
+    fn system_prompt(profile: &dyn AgentProfile) -> String {
+        let env = MockSandbox::linux();
+        let context = EnvContext::default();
+        profile.build_system_prompt(&env, &context, &[], None, &[])
+    }
+
+    fn register_test_subagent_tools(profile: &mut dyn AgentProfile) {
+        let factory: SessionFactory = Arc::new(|| {
+            panic!("should not be called while rendering a system prompt");
+        });
+        profile.register_subagent_tools(SubAgentSupervisor::new(3), factory, 0);
+    }
+
+    fn anthropic_profile(has_web_search: bool, has_subagents: bool) -> AnthropicProfile {
+        let options = native_tool_options(AgentProfileKind::Anthropic, has_web_search);
+        let mut profile = AnthropicProfile::with_native_tools("claude-haiku-4-5", &options, None);
+        if has_subagents {
+            register_test_subagent_tools(&mut profile);
+        }
+        profile
+    }
+
+    fn gemini_profile(has_web_search: bool) -> GeminiProfile {
+        let options = native_tool_options(AgentProfileKind::Gemini, has_web_search);
+        GeminiProfile::with_native_tools("gemini-3-flash-preview", &options, None)
+    }
+
+    fn openai_apply_patch_profile(has_web_search: bool) -> OpenAiProfile {
+        let options = native_tool_options(AgentProfileKind::OpenAi, has_web_search);
+        OpenAiProfile::with_native_tools("gpt-5.4-mini", &options, None)
+    }
+
+    fn openai_edit_file_profile(has_web_search: bool) -> OpenAiProfile {
+        let options = native_tool_options(AgentProfileKind::OpenAi, has_web_search);
+        OpenAiProfile::with_native_tools("kimi-k2.5", &options, None)
+            .with_provider_id(ProviderId::new("kimi"))
+            .with_catalog(Arc::new(Catalog::from_builtin().unwrap()))
+    }
 
     #[test]
     fn env_context_block_contains_platform() {
@@ -329,5 +393,55 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn anthropic_default_prompt_snapshot() {
+        insta::assert_snapshot!(system_prompt(&anthropic_profile(false, false)));
+    }
+
+    #[test]
+    fn anthropic_web_search_prompt_snapshot() {
+        insta::assert_snapshot!(system_prompt(&anthropic_profile(true, false)));
+    }
+
+    #[test]
+    fn anthropic_subagents_prompt_snapshot() {
+        insta::assert_snapshot!(system_prompt(&anthropic_profile(false, true)));
+    }
+
+    #[test]
+    fn anthropic_web_search_and_subagents_prompt_snapshot() {
+        insta::assert_snapshot!(system_prompt(&anthropic_profile(true, true)));
+    }
+
+    #[test]
+    fn gemini_default_prompt_snapshot() {
+        insta::assert_snapshot!(system_prompt(&gemini_profile(false)));
+    }
+
+    #[test]
+    fn gemini_web_search_prompt_snapshot() {
+        insta::assert_snapshot!(system_prompt(&gemini_profile(true)));
+    }
+
+    #[test]
+    fn openai_apply_patch_prompt_snapshot() {
+        insta::assert_snapshot!(system_prompt(&openai_apply_patch_profile(false)));
+    }
+
+    #[test]
+    fn openai_apply_patch_and_web_search_prompt_snapshot() {
+        insta::assert_snapshot!(system_prompt(&openai_apply_patch_profile(true)));
+    }
+
+    #[test]
+    fn openai_edit_file_prompt_snapshot() {
+        insta::assert_snapshot!(system_prompt(&openai_edit_file_profile(false)));
+    }
+
+    #[test]
+    fn openai_edit_file_and_web_search_prompt_snapshot() {
+        insta::assert_snapshot!(system_prompt(&openai_edit_file_profile(true)));
     }
 }

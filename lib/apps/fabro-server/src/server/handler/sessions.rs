@@ -11,7 +11,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use fabro_agent::config::{ToolAccess, ToolAccessPolicy, ToolExposureMode};
-use fabro_agent::profiles::assemble_system_prompt;
+use fabro_agent::profiles::{self, EmbeddedPrompt};
 use fabro_agent::tool_registry::ToolRegistry;
 use fabro_agent::{
     AgentEvent, AgentProfile, AgentProfileBuilder, Error as AgentError, Session, SessionEvent,
@@ -58,6 +58,8 @@ use crate::server_secrets::LlmClientResult;
 use crate::worker_token::issue_worker_token;
 
 const SESSION_SSE_BUFFER_CAPACITY: usize = 1024;
+
+const ASK_FABRO_SYSTEM_PROMPT: &str = include_str!("prompts/ask_fabro.md.j2");
 
 const ASK_FABRO_RUN_TOOL_NAMES: &[&str] = &[
     fabro_tool::FABRO_RUN_EVENTS_TOOL_NAME,
@@ -985,39 +987,11 @@ fn build_ask_fabro_system_prompt(
     // into the template text: it carries tool names and descriptions that can
     // come from MCP servers, and MiniJinja does not re-render substituted
     // values, so arbitrary `{{ ... }}` in a tool description stays inert.
-    const CORE_PROMPT: &str = "\
-You are Ask Fabro, an interactive read-only, run-scoped analyst.
-
-Answer questions about the current Fabro run, its event history, and its workspace. Stay scoped to this run. Do not modify the run or workspace, and do not take control actions.
-
-Use the provided run snapshot for orientation. Treat it as possibly stale. Use `fabro_run_events` for current status, exact timestamps, failures, tool calls, stage outputs, and event-backed claims. Use workspace file tools only when the question asks about files, code, artifacts, or implementation details.
-
-When answering:
-- Be concise by default.
-- Cite the source of important facts in plain language, such as \"from run events\" or \"from workspace file <path>\".
-- If evidence is incomplete, say what you could not inspect.
-
-{{ vars.env_block }}
-
-# Tool Access
-
-You can only call these tools:
-{{ vars.tool_guidance }}
-
-Do not claim access to tools that are not listed. Treat tool failures as real failures, not as permission discovery. If the available tools are insufficient, say what cannot be inspected.";
-
     let tool_guidance = render_ask_fabro_tool_guidance(registry, policy);
+    let template = EmbeddedPrompt::new("ask_fabro.md.j2", ASK_FABRO_SYSTEM_PROMPT)
+        .with_string("tool_guidance", tool_guidance);
 
-    assemble_system_prompt(
-        "ask-fabro",
-        CORE_PROMPT,
-        &[("tool_guidance", tool_guidance.as_str())],
-        env,
-        env_context,
-        &[],
-        user_instructions,
-        &[],
-    )
+    profiles::assemble_system_prompt(template, env, env_context, &[], user_instructions, &[])
 }
 
 fn build_ask_fabro_run_snapshot(projection: &fabro_types::RunProjection, run_id: RunId) -> String {
@@ -1880,6 +1854,28 @@ reasoning = false
         assert!(prompt.contains("Use the provided run snapshot for orientation"));
         assert!(prompt.contains("Use `fabro_run_events` for current status"));
         assert!(prompt.contains("Use workspace file tools only when the question asks"));
+    }
+
+    #[test]
+    fn ask_fabro_prompt_keeps_tool_descriptions_inert() {
+        let mut registry = ToolRegistry::new();
+        let mut tool = stub_tool("read_file");
+        tool.definition.description = "{{ inputs.env_block }}".to_string();
+        registry.register(tool);
+        let policy = build_ask_fabro_tool_access_policy();
+
+        let prompt = build_ask_fabro_system_prompt(
+            &fabro_agent::LocalSandbox::new(std::env::current_dir().unwrap()),
+            &fabro_agent::EnvContext::default(),
+            &[],
+            None,
+            &[],
+            &registry,
+            policy.as_ref(),
+        );
+
+        assert!(prompt.contains("- `read_file`: {{ inputs.env_block }}"));
+        assert_eq!(prompt.matches("<environment>").count(), 1);
     }
 
     #[test]
