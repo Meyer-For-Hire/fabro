@@ -4908,6 +4908,7 @@ async fn import_e2e_through_engine() {
         catalog:            std::sync::Arc::clone(&catalog),
         default_provider:   None,
         eligible_providers: catalog.all_provider_ids(),
+        fallback_providers: None,
     })
     .unwrap();
     let validated = validate(transformed, catalog.as_ref(), &[]);

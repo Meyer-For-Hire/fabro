@@ -835,10 +835,22 @@ async fn run_preflight(
         return ApiError::bad_request(format!("Run config variable interpolation failed: {err}"))
             .into_response();
     }
-    let mut validated = match run_manifest::validate_prepared_manifest_with_vars(
+    let llm_result = state.resolve_llm_client().await;
+    if let Err(error) = &llm_result {
+        tracing::warn!(
+            error = ?error,
+            "Failed to resolve LLM client while checking ready providers"
+        );
+    }
+    let ready_providers = llm_result
+        .as_ref()
+        .map(LlmClientResult::provider_ids)
+        .unwrap_or_default();
+    let mut validated = match run_manifest::validate_prepared_manifest_for_preflight(
         &prepared,
         state.catalog(),
         vars,
+        &ready_providers,
     ) {
         Ok(validated) => validated,
         Err(WorkflowError::Parse(_)) => {
@@ -847,7 +859,15 @@ async fn run_preflight(
         Err(err) => return ApiError::bad_request(err.to_string()).into_response(),
     };
     validated.promote_template_undefined_variables_to_errors();
-    let response = match run_manifest::run_preflight(&state, &prepared, &validated).await {
+    let response = match run_manifest::run_preflight(
+        &state,
+        &prepared,
+        &validated,
+        &ready_providers,
+        llm_result,
+    )
+    .await
+    {
         Ok((response, _ok)) => response,
         Err(err) => {
             return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())

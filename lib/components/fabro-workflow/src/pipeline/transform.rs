@@ -68,6 +68,7 @@ pub fn transform(parsed: Parsed, options: &TransformOptions) -> Result<Transform
         options.eligible_providers.clone(),
     )
     .with_default_provider(options.default_provider.clone())
+    .with_fallback_providers(options.fallback_providers.clone())
     .apply(graph)?;
 
     // Custom transforms
@@ -120,6 +121,7 @@ mod tests {
             catalog:            test_catalog(),
             default_provider:   None,
             eligible_providers: Catalog::builtin().all_provider_ids(),
+            fallback_providers: None,
         }
     }
 
@@ -184,6 +186,7 @@ mod tests {
             catalog:            test_catalog(),
             default_provider:   None,
             eligible_providers: Catalog::builtin().all_provider_ids(),
+            fallback_providers: None,
         })
         .unwrap();
 
@@ -238,6 +241,7 @@ mod tests {
             catalog:            test_catalog(),
             default_provider:   None,
             eligible_providers: Catalog::builtin().all_provider_ids(),
+            fallback_providers: None,
         })
         .unwrap();
 
@@ -370,6 +374,7 @@ mod tests {
             catalog:            test_catalog(),
             default_provider:   None,
             eligible_providers: Catalog::builtin().all_provider_ids(),
+            fallback_providers: None,
         })
         .unwrap();
 

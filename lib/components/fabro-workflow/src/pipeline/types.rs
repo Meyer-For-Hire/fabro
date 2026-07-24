@@ -332,6 +332,7 @@ pub struct TransformOptions {
     pub catalog:            Arc<fabro_model::Catalog>,
     pub default_provider:   Option<ProviderId>,
     pub eligible_providers: HashSet<ProviderId>,
+    pub fallback_providers: Option<HashSet<ProviderId>>,
 }
 
 /// Options for the FINALIZE phase.

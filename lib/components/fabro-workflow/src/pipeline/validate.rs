@@ -51,6 +51,7 @@ mod tests {
             catalog:            std::sync::Arc::clone(&catalog),
             default_provider:   None,
             eligible_providers: catalog.all_provider_ids(),
+            fallback_providers: None,
         })
         .unwrap();
         validate(transformed, catalog.as_ref(), &[])

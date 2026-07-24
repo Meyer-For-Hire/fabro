@@ -312,6 +312,7 @@ fn create_from_source(
             .filter(|provider| !provider.is_empty())
             .map(ProviderId::new),
         &options.configured_providers,
+        None,
         &options.catalog,
     )?;
 
@@ -336,6 +337,7 @@ pub(super) fn preprocess_and_validate(
     render_mode: RenderMode,
     default_provider: Option<ProviderId>,
     eligible_providers: &[ProviderId],
+    fallback_providers: Option<&[ProviderId]>,
     catalog: &Arc<Catalog>,
 ) -> Result<Validated, Error> {
     let mut parsed = pipeline::parse(dot_source)?;
@@ -351,6 +353,7 @@ pub(super) fn preprocess_and_validate(
         catalog: Arc::clone(catalog),
         default_provider,
         eligible_providers: eligible_providers.iter().cloned().collect(),
+        fallback_providers: fallback_providers.map(|providers| providers.iter().cloned().collect()),
     })?;
     Ok(pipeline::validate(transformed, catalog.as_ref(), &[]))
 }
@@ -579,6 +582,7 @@ reasoning = false
             RenderMode::Structural,
             None,
             &test_provider_ids(),
+            None,
             &test_catalog(),
         )
         .unwrap()
@@ -749,6 +753,7 @@ reasoning = false
             RenderMode::Strict,
             None,
             &test_provider_ids(),
+            None,
             &test_catalog(),
         );
         let Err(err) = result else {
@@ -787,6 +792,7 @@ reasoning = false
             RenderMode::Strict,
             None,
             &test_provider_ids(),
+            None,
             &test_catalog(),
         );
         let Err(err) = result else {

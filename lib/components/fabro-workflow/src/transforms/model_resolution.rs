@@ -13,6 +13,7 @@ pub struct ModelResolutionTransform {
     catalog:            Arc<Catalog>,
     default_provider:   Option<ProviderId>,
     eligible_providers: HashSet<ProviderId>,
+    fallback_providers: Option<HashSet<ProviderId>>,
 }
 
 impl ModelResolutionTransform {
@@ -23,6 +24,7 @@ impl ModelResolutionTransform {
             catalog,
             default_provider: None,
             eligible_providers,
+            fallback_providers: None,
         }
     }
 
@@ -32,6 +34,7 @@ impl ModelResolutionTransform {
             catalog,
             default_provider: None,
             eligible_providers,
+            fallback_providers: None,
         }
     }
 
@@ -41,16 +44,33 @@ impl ModelResolutionTransform {
         self
     }
 
+    #[must_use]
+    pub fn with_fallback_providers(
+        mut self,
+        fallback_providers: Option<HashSet<ProviderId>>,
+    ) -> Self {
+        self.fallback_providers = fallback_providers;
+        self
+    }
+
     fn resolve_model(
         &self,
         model: &str,
         explicit_provider: Option<&ProviderId>,
     ) -> Result<(String, ProviderId), Error> {
-        let selected = self.catalog.resolve_selection(
-            Some(model),
-            explicit_provider,
-            &self.eligible_providers,
-        )?;
+        let selected = match &self.fallback_providers {
+            Some(fallback_providers) => self.catalog.resolve_selection_with_fallback(
+                Some(model),
+                explicit_provider,
+                &self.eligible_providers,
+                fallback_providers,
+            ),
+            None => self.catalog.resolve_selection(
+                Some(model),
+                explicit_provider,
+                &self.eligible_providers,
+            ),
+        }?;
         Ok((selected.model, selected.provider))
     }
 }
@@ -324,6 +344,50 @@ reasoning = false
                 .and_then(AttrValue::as_str),
             Some("venice")
         );
+    }
+
+    #[test]
+    fn fallback_resolution_keeps_ready_preference_for_unpinned_nodes() {
+        let overrides: LlmCatalogSettings = toml::from_str(
+            r"
+[providers.openrouter]
+enabled = true
+",
+        )
+        .unwrap();
+        let catalog = Arc::new(Catalog::from_builtin_with_overrides(&overrides).unwrap());
+        let mut graph = Graph::new("test");
+        let mut portable = Node::new("portable");
+        portable.attrs.insert(
+            "model".to_string(),
+            AttrValue::String("claude-fable".to_string()),
+        );
+        graph.nodes.insert("portable".to_string(), portable);
+        let mut pinned = Node::new("pinned");
+        pinned.attrs.insert(
+            "model".to_string(),
+            AttrValue::String("claude-fable".to_string()),
+        );
+        pinned.attrs.insert(
+            "provider".to_string(),
+            AttrValue::String("anthropic".to_string()),
+        );
+        graph.nodes.insert("pinned".to_string(), pinned);
+
+        let graph = ModelResolutionTransform::for_eligible(
+            Arc::clone(&catalog),
+            HashSet::from([ProviderId::new("openrouter")]),
+        )
+        .with_fallback_providers(Some(catalog.all_provider_ids()))
+        .apply(graph)
+        .unwrap();
+
+        assert_eq!(
+            graph.nodes["portable"].provider(),
+            Some("openrouter"),
+            "the unrelated unavailable pin must not force catalog-wide routing"
+        );
+        assert_eq!(graph.nodes["pinned"].provider(), Some("anthropic"));
     }
 
     #[test]

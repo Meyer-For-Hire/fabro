@@ -9,10 +9,36 @@ use fabro_types::settings::run::RunGoal;
 use crate::error::Error;
 
 pub fn materialize_run(
+    settings: WorkflowSettings,
+    graph: &Graph,
+    catalog: &Catalog,
+    configured_providers: &[ProviderId],
+) -> Result<WorkflowSettings, Error> {
+    materialize_run_with_provider_sets(settings, graph, catalog, configured_providers, None)
+}
+
+pub fn materialize_run_with_provider_fallback(
+    settings: WorkflowSettings,
+    graph: &Graph,
+    catalog: &Catalog,
+    preferred_providers: &[ProviderId],
+    fallback_providers: &[ProviderId],
+) -> Result<WorkflowSettings, Error> {
+    materialize_run_with_provider_sets(
+        settings,
+        graph,
+        catalog,
+        preferred_providers,
+        Some(fallback_providers),
+    )
+}
+
+fn materialize_run_with_provider_sets(
     mut settings: WorkflowSettings,
     graph: &Graph,
     catalog: &Catalog,
     configured_providers: &[ProviderId],
+    fallback_providers: Option<&[ProviderId]>,
 ) -> Result<WorkflowSettings, Error> {
     let configured_model = settings.run.model.name.take();
     let configured_provider = settings.run.model.provider.take();
@@ -30,11 +56,24 @@ pub fn materialize_run(
     let provider = configured_provider.or(graph_provider);
     let model = configured_model.or(graph_model);
     let eligible = configured_providers.iter().cloned().collect::<HashSet<_>>();
-    let (resolved_model, resolved_provider) =
-        resolve_run_model(catalog, &eligible, model.as_deref(), provider.as_deref())?;
+    let fallback =
+        fallback_providers.map(|providers| providers.iter().cloned().collect::<HashSet<_>>());
+    let provider = provider
+        .as_deref()
+        .filter(|provider| !provider.is_empty())
+        .map(ProviderId::new);
+    let selected = match fallback {
+        Some(fallback) => catalog.resolve_selection_with_fallback(
+            model.as_deref(),
+            provider.as_ref(),
+            &eligible,
+            &fallback,
+        ),
+        None => catalog.resolve_selection(model.as_deref(), provider.as_ref(), &eligible),
+    }?;
 
-    settings.run.model.name = Some(resolved_model);
-    settings.run.model.provider = Some(resolved_provider.into_inner());
+    settings.run.model.name = Some(selected.model);
+    settings.run.model.provider = Some(selected.provider.into_inner());
 
     let goal = graph.goal().to_string();
     settings.run.goal = if goal.is_empty() {
