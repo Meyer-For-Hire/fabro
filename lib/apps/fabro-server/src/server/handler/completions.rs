@@ -155,6 +155,9 @@ async fn create_completion(
             if let Some(top_p) = request.top_p {
                 params = params.top_p(top_p);
             }
+            if let Some(reasoning_effort) = request.reasoning_effort {
+                params = params.reasoning_effort(reasoning_effort);
+            }
             match generate_object(params, schema).await {
                 Ok(result) => {
                     // `result.finish_reason` / `result.usage` resolve through
