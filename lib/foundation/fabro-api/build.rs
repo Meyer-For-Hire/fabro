@@ -461,6 +461,7 @@ fn main() {
             "fabro_types::PendingInterviewRecord",
             &[],
         ),
+        ("CompletionUsage", "fabro_model::TokenCounts", &[]),
         ("BilledTokenCounts", "fabro_types::BilledTokenCounts", &[]),
         ("BillingModelRef", "fabro_model::ModelRef", &[]),
         ("BillingSpeed", "fabro_model::Speed", &[]),

@@ -22,7 +22,7 @@ pub mod types {
     pub use fabro_model::{
         CostSource, Model, ModelControls, ModelCosts, ModelFeatures, ModelLimits,
         ModelRef as BillingModelRef, ModelTestMode, Provider, ReasoningEffort,
-        ReasoningEffortFeature, Speed as BillingSpeed,
+        ReasoningEffortFeature, Speed as BillingSpeed, TokenCounts as CompletionUsage,
     };
     pub use fabro_types::run_event::AgentSessionActivatedProps;
     pub use fabro_types::settings::run::McpHttpProtocol;
