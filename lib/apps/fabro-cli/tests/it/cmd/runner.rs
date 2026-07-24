@@ -840,7 +840,7 @@ fn detached_run_cancel_reaches_worker_over_control_websocket() {
                 .expect("cancel request should succeed");
             assert_reqwest_status(
                 response,
-                fabro_http::StatusCode::OK,
+                fabro_http::StatusCode::ACCEPTED,
                 format!("POST /api/v1/runs/{run_id}/cancel"),
             )
             .await;

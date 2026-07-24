@@ -60,13 +60,11 @@ pub use sandbox::{
     format_lines_numbered, shell_quote,
 };
 pub use session::{
-    CompletionCoordinator, Session, SessionControlHandle, SessionInputTiming, StaticEnvProvider,
-    SteeringItem, ToolEnvProvider,
+    CompletionCoordinator, Session, SessionControlHandle, SessionInputTiming,
+    SessionShutdownReason, StaticEnvProvider, SteeringItem, ToolEnvProvider,
 };
 pub use skills::Skill;
-pub use subagent::{
-    SubAgent, SubAgentEventCallback, SubAgentManager, SubAgentResult, SubAgentStatus,
-};
+pub use subagent::{SubAgentEventCallback, SubAgentResult, SubAgentStatus, SubAgentSupervisor};
 pub use todo_runtime::TodoRuntime;
 pub use todo_tools::{
     make_task_create_tool, make_task_get_tool, make_task_list_tool, make_task_update_tool,

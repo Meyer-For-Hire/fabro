@@ -133,6 +133,7 @@ export function RunDetailDockedControls({
   sidebarWidth,
   isResizing,
   steerBarRef,
+  waitingForSteer,
 }: {
   runId: string;
   hideSteerBar: boolean;
@@ -141,6 +142,7 @@ export function RunDetailDockedControls({
   sidebarWidth: number;
   isResizing: boolean;
   steerBarRef: RefObject<SteerBarHandle | null>;
+  waitingForSteer: boolean;
 }) {
   if (hideSteerBar && !hasPendingQuestions) return null;
 
@@ -156,7 +158,11 @@ export function RunDetailDockedControls({
       {hasPendingQuestions ? (
         <InterviewDock runId={runId} questions={pendingQuestions} />
       ) : (
-        <SteerBar ref={steerBarRef} runId={runId} />
+        <SteerBar
+          ref={steerBarRef}
+          runId={runId}
+          waitingForSteer={waitingForSteer}
+        />
       )}
     </div>
   );

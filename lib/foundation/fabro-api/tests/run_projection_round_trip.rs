@@ -94,6 +94,7 @@ fn run_projection_round_trips_populated_projection() {
                     "cache_read_tokens": 0,
                     "cache_write_tokens": 0
                 },
+                "agent_control": "running",
                 "state": "running"
             }
         }

@@ -290,6 +290,13 @@ export function eventsToActivity(events: EventEnvelope[], stageId: string): Turn
       case "agent.interrupt.injected":
         turns.push({ kind: "interrupt", ts: e.ts, content: "Agent interrupted" });
         break;
+      case "agent.round.interrupted":
+        turns.push({
+          kind: "interrupt",
+          ts: e.ts,
+          content: "Interrupted — waiting for steering",
+        });
+        break;
       case "agent.pair.user_message": {
         const text = getString(props, "text") ?? e.text ?? "";
         if (text) {

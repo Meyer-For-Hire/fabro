@@ -663,6 +663,12 @@ fn event_body_from_event(event: &Event) -> EventBody {
                     visit: *visit,
                 })
             }
+            AgentEvent::RoundInterrupted { generation } => {
+                EventBody::AgentRoundInterrupted(fabro_types::AgentRoundInterruptedProps {
+                    generation: *generation,
+                    visit:      *visit,
+                })
+            }
             AgentEvent::CompactionStarted {
                 estimated_tokens,
                 context_window_size,
@@ -1861,6 +1867,30 @@ mod tests {
         assert_eq!(stored.actor, Some(actor));
         match stored.body {
             EventBody::AgentInterruptInjected(props) => assert_eq!(props.visit, 3),
+            other => panic!("unexpected body: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_round_interrupted_populates_stage_session_and_generation() {
+        let stored = to_run_event(&fixtures::RUN_1, &Event::Agent {
+            stage:             "code".to_string(),
+            visit:             3,
+            event:             AgentEvent::RoundInterrupted { generation: 2 },
+            session_id:        Some("ses_1".to_string()),
+            parent_session_id: None,
+            tool_call_id:      None,
+        });
+
+        assert_eq!(stored.event_name(), "agent.round.interrupted");
+        assert_eq!(stored.node_id.as_deref(), Some("code"));
+        assert_eq!(stored.stage_id, Some(StageId::new("code", 3)));
+        assert_eq!(stored.session_id.as_deref(), Some("ses_1"));
+        match stored.body {
+            EventBody::AgentRoundInterrupted(props) => {
+                assert_eq!(props.generation, 2);
+                assert_eq!(props.visit, 3);
+            }
             other => panic!("unexpected body: {other:?}"),
         }
     }

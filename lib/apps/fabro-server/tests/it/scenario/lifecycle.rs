@@ -256,7 +256,7 @@ async fn full_http_lifecycle_cancel() {
     let response = app.clone().oneshot(req).await.unwrap();
     let body = response_json(
         response,
-        StatusCode::OK,
+        StatusCode::ACCEPTED,
         format!("POST /api/v1/runs/{run_id}/cancel"),
     )
     .await;
@@ -323,7 +323,7 @@ async fn cancel_at_human_gate_persists_cancelled_terminal_event() {
     let response = app.clone().oneshot(req).await.unwrap();
     response_status(
         response,
-        StatusCode::OK,
+        StatusCode::ACCEPTED,
         format!("POST /api/v1/runs/{run_id}/cancel"),
     )
     .await;

@@ -346,6 +346,7 @@ fn main() {
         ("StageOutcome", "fabro_types::StageOutcome", &[]),
         ("StageHandler", "fabro_types::StageHandler", &[]),
         ("StageState", "fabro_types::StageState", &[]),
+        ("AgentControlState", "fabro_types::AgentControlState", &[]),
         ("CommandTermination", "fabro_types::CommandTermination", &[]),
         ("StageModelUsage", "fabro_types::StageModelUsage", &[]),
         (

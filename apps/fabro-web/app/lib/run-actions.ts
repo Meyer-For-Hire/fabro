@@ -6,6 +6,7 @@ import type {
   BatchRunLifecycleSummary,
   ErrorResponseEntry,
   Run,
+  RunControlAction,
 } from "@qltysh/fabro-api-client";
 
 import {
@@ -159,9 +160,38 @@ export function canDelete(status: string | null | undefined): boolean {
   return status === "archived";
 }
 
-export function isTerminalCancelledRun(run: Run): boolean {
+export function isTerminalCancelledRun(run: Pick<Run, "lifecycle">): boolean {
   const status = run.lifecycle.status;
   return status.kind === "failed" && status.reason === "cancelled";
+}
+
+export function isCancellationPending(
+  run: Pick<Run, "lifecycle"> | null | undefined,
+  mutationPending = false,
+): boolean {
+  return isCancellationPendingState(
+    run?.lifecycle.status.kind,
+    run?.lifecycle.pending_control,
+    mutationPending,
+  );
+}
+
+export function isCancellationPendingState(
+  status: string | null | undefined,
+  pendingControl: RunControlAction | null | undefined,
+  mutationPending = false,
+): boolean {
+  return canCancel(status) && (mutationPending || pendingControl === "cancel");
+}
+
+export function cancellationSuccessMessage(run: Pick<Run, "lifecycle">): string {
+  return isTerminalCancelledRun(run)
+    ? "Run cancelled."
+    : "Cancellation requested.";
+}
+
+export function cancellationActionLabel(pending: boolean): string {
+  return pending ? "Cancelling…" : "Cancel";
 }
 
 export function deleteErrorMessage(error: unknown): string {

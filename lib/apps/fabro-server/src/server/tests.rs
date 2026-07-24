@@ -37,6 +37,7 @@ use fabro_workflow::records::CheckpointExt;
 use httpmock::Method::{GET, POST};
 use httpmock::MockServer;
 use serde_json::json;
+use tokio::sync::Notify;
 use tokio_stream::StreamExt as _;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message as WebSocketMessage;
@@ -2943,9 +2944,10 @@ fn worker_token_claims(cmd: &Command, state: &AppState) -> crate::worker_token::
 
 #[derive(Default)]
 struct RecordingWorkerRuntime {
-    requested: StdMutex<Vec<WorkerRef>>,
-    forced:    StdMutex<Vec<WorkerRef>>,
-    alive:     AtomicBool,
+    requested:     StdMutex<Vec<WorkerRef>>,
+    forced:        StdMutex<Vec<WorkerRef>>,
+    alive:         AtomicBool,
+    forced_notify: Notify,
 }
 
 impl RecordingWorkerRuntime {
@@ -2962,6 +2964,20 @@ impl RecordingWorkerRuntime {
 
     fn set_alive(&self, alive: bool) {
         self.alive.store(alive, Ordering::Relaxed);
+    }
+
+    async fn wait_for_forced_ref(&self, worker_ref: &WorkerRef) {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let notified = self.forced_notify.notified();
+                if self.forced_refs().contains(worker_ref) {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .expect("worker should be force-stopped after the cancellation grace period");
     }
 }
 
@@ -2984,6 +3000,7 @@ impl WorkerRuntime for RecordingWorkerRuntime {
             .expect("forced lock poisoned")
             .push(worker_ref.clone());
         self.alive.store(false, Ordering::Relaxed);
+        self.forced_notify.notify_one();
     }
 
     async fn is_alive(&self, _worker_ref: &WorkerRef) -> bool {
@@ -14148,7 +14165,7 @@ async fn cancel_run_overwrites_pending_pause_request() {
         .body(Body::empty())
         .unwrap();
     let response = app.clone().oneshot(req).await.unwrap();
-    let body = response_json!(response, StatusCode::OK).await;
+    let body = response_json!(response, StatusCode::ACCEPTED).await;
     assert_eq!(run_json_pending_control(&body).as_str(), Some("cancel"));
 
     let summary = state
@@ -14165,19 +14182,29 @@ async fn cancel_run_overwrites_pending_pause_request() {
     );
 }
 
+async fn advance_past_worker_cancel_grace() {
+    tokio::task::yield_now().await;
+    tokio::time::advance(WORKER_CANCEL_GRACE).await;
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+}
+
 #[tokio::test]
 async fn cancel_run_requests_worker_runtime_stop_when_control_unavailable() {
     let runtime = StdArc::new(RecordingWorkerRuntime::default());
+    runtime.set_alive(true);
     let state = TestAppStateBuilder::new()
         .vault_entries([(EnvVars::OPENAI_API_KEY, "test-openai-api-key")])
         .worker_runtime(runtime.clone())
         .build();
     let app = crate::test_support::build_test_router(Arc::clone(&state));
-    let run_id = create_and_start_run(&app, MINIMAL_DOT)
+    let run_id = create_run(&app, MINIMAL_DOT)
         .await
         .parse::<RunId>()
         .unwrap();
     let worker_ref = test_worker_ref(u32::MAX);
+    tokio::time::pause();
 
     {
         let mut runs = state.runs.lock().expect("runs lock poisoned");
@@ -14193,9 +14220,203 @@ async fn cancel_run_requests_worker_runtime_stop_when_control_unavailable() {
         .body(Body::empty())
         .unwrap();
     let response = app.oneshot(req).await.unwrap();
-    assert_status!(response, StatusCode::OK).await;
+    assert_status!(response, StatusCode::ACCEPTED).await;
 
-    assert_eq!(runtime.requested_refs(), vec![worker_ref]);
+    assert_eq!(runtime.requested_refs(), vec![worker_ref.clone()]);
+
+    advance_past_worker_cancel_grace().await;
+    runtime.wait_for_forced_ref(&worker_ref).await;
+
+    assert_eq!(runtime.forced_refs(), vec![worker_ref]);
+}
+
+#[tokio::test]
+async fn cancel_run_force_stops_worker_when_delivered_control_does_not_converge() {
+    let runtime = StdArc::new(RecordingWorkerRuntime::default());
+    runtime.set_alive(true);
+    let state = TestAppStateBuilder::new()
+        .vault_entries([(EnvVars::OPENAI_API_KEY, "test-openai-api-key")])
+        .worker_runtime(runtime.clone())
+        .build();
+    let app = crate::test_support::build_test_router(Arc::clone(&state));
+    let run_id = create_run(&app, MINIMAL_DOT)
+        .await
+        .parse::<RunId>()
+        .unwrap();
+    let worker_ref = test_worker_ref(u32::MAX);
+    let (answer_transport, _receiver) = worker_transport_with_receiver(run_id).await;
+    tokio::time::pause();
+
+    {
+        let mut runs = state.runs.lock().expect("runs lock poisoned");
+        let managed_run = runs.get_mut(&run_id).expect("run should exist");
+        managed_run.status = RunStatus::Running;
+        managed_run.answer_transport = Some(answer_transport);
+        managed_run.worker_ref = Some(worker_ref.clone());
+    }
+
+    let req = Request::builder()
+        .method("POST")
+        .uri(api(&format!("/runs/{run_id}/cancel")))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(req).await.unwrap();
+    assert_status!(response, StatusCode::ACCEPTED).await;
+
+    assert!(runtime.requested_refs().is_empty());
+    assert!(runtime.forced_refs().is_empty());
+
+    advance_past_worker_cancel_grace().await;
+    runtime.wait_for_forced_ref(&worker_ref).await;
+
+    assert_eq!(runtime.forced_refs(), vec![worker_ref]);
+}
+
+#[tokio::test]
+async fn cancel_run_watchdog_does_not_stop_replacement_worker() {
+    let runtime = StdArc::new(RecordingWorkerRuntime::default());
+    runtime.set_alive(true);
+    let state = TestAppStateBuilder::new()
+        .vault_entries([(EnvVars::OPENAI_API_KEY, "test-openai-api-key")])
+        .worker_runtime(runtime.clone())
+        .build();
+    let app = crate::test_support::build_test_router(Arc::clone(&state));
+    let run_id = create_run(&app, MINIMAL_DOT)
+        .await
+        .parse::<RunId>()
+        .unwrap();
+    let cancelled_worker_ref = test_worker_ref(u32::MAX - 1);
+    let replacement_worker_ref = test_worker_ref(u32::MAX);
+    let (answer_transport, _receiver) = worker_transport_with_receiver(run_id).await;
+    tokio::time::pause();
+
+    {
+        let mut runs = state.runs.lock().expect("runs lock poisoned");
+        let managed_run = runs.get_mut(&run_id).expect("run should exist");
+        managed_run.status = RunStatus::Running;
+        managed_run.answer_transport = Some(answer_transport);
+        managed_run.worker_ref = Some(cancelled_worker_ref);
+    }
+
+    let req = Request::builder()
+        .method("POST")
+        .uri(api(&format!("/runs/{run_id}/cancel")))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(req).await.unwrap();
+    assert_status!(response, StatusCode::ACCEPTED).await;
+
+    tokio::task::yield_now().await;
+    {
+        let mut runs = state.runs.lock().expect("runs lock poisoned");
+        let managed_run = runs.get_mut(&run_id).expect("run should exist");
+        managed_run.worker_ref = Some(replacement_worker_ref);
+    }
+    advance_past_worker_cancel_grace().await;
+
+    assert!(runtime.forced_refs().is_empty());
+}
+
+#[tokio::test]
+async fn cancel_run_watchdog_does_not_stop_worker_after_live_ref_clears() {
+    let runtime = StdArc::new(RecordingWorkerRuntime::default());
+    runtime.set_alive(true);
+    let state = TestAppStateBuilder::new()
+        .vault_entries([(EnvVars::OPENAI_API_KEY, "test-openai-api-key")])
+        .worker_runtime(runtime.clone())
+        .build();
+    let app = crate::test_support::build_test_router(Arc::clone(&state));
+    let run_id = create_run(&app, MINIMAL_DOT)
+        .await
+        .parse::<RunId>()
+        .unwrap();
+    let worker_ref = test_worker_ref(u32::MAX);
+    let (answer_transport, _receiver) = worker_transport_with_receiver(run_id).await;
+    tokio::time::pause();
+
+    {
+        let mut runs = state.runs.lock().expect("runs lock poisoned");
+        let managed_run = runs.get_mut(&run_id).expect("run should exist");
+        managed_run.status = RunStatus::Running;
+        managed_run.answer_transport = Some(answer_transport);
+        managed_run.worker_ref = Some(worker_ref);
+    }
+
+    let req = Request::builder()
+        .method("POST")
+        .uri(api(&format!("/runs/{run_id}/cancel")))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(req).await.unwrap();
+    assert_status!(response, StatusCode::ACCEPTED).await;
+
+    tokio::task::yield_now().await;
+    {
+        let mut runs = state.runs.lock().expect("runs lock poisoned");
+        let managed_run = runs.get_mut(&run_id).expect("run should exist");
+        managed_run.worker_ref = None;
+    }
+    advance_past_worker_cancel_grace().await;
+
+    assert!(runtime.forced_refs().is_empty());
+}
+
+#[tokio::test]
+async fn repeated_cancel_request_arms_one_watchdog_and_persists_one_intent() {
+    let runtime = StdArc::new(RecordingWorkerRuntime::default());
+    runtime.set_alive(true);
+    let state = TestAppStateBuilder::new()
+        .vault_entries([(EnvVars::OPENAI_API_KEY, "test-openai-api-key")])
+        .worker_runtime(runtime.clone())
+        .build();
+    let app = crate::test_support::build_test_router(Arc::clone(&state));
+    let run_id = create_run(&app, MINIMAL_DOT)
+        .await
+        .parse::<RunId>()
+        .unwrap();
+    let worker_ref = test_worker_ref(u32::MAX);
+    let (answer_transport, _receiver) = worker_transport_with_receiver(run_id).await;
+    tokio::time::pause();
+
+    {
+        let mut runs = state.runs.lock().expect("runs lock poisoned");
+        let managed_run = runs.get_mut(&run_id).expect("run should exist");
+        managed_run.status = RunStatus::Running;
+        managed_run.answer_transport = Some(answer_transport);
+        managed_run.worker_ref = Some(worker_ref.clone());
+    }
+
+    let first_request = Request::builder()
+        .method("POST")
+        .uri(api(&format!("/runs/{run_id}/cancel")))
+        .body(Body::empty())
+        .unwrap();
+    let second_request = Request::builder()
+        .method("POST")
+        .uri(api(&format!("/runs/{run_id}/cancel")))
+        .body(Body::empty())
+        .unwrap();
+    let (first_response, second_response) = tokio::join!(
+        app.clone().oneshot(first_request),
+        app.clone().oneshot(second_request)
+    );
+    assert_status!(first_response.unwrap(), StatusCode::ACCEPTED).await;
+    assert_status!(second_response.unwrap(), StatusCode::ACCEPTED).await;
+
+    let run_store = state.stores.runs.open_run_reader(&run_id).await.unwrap();
+    let request_count = run_store
+        .list_events()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|event| event.event.event_name() == "run.cancel.requested")
+        .count();
+    assert_eq!(request_count, 1);
+
+    advance_past_worker_cancel_grace().await;
+    runtime.wait_for_forced_ref(&worker_ref).await;
+
+    assert_eq!(runtime.forced_refs(), vec![worker_ref]);
 }
 
 #[tokio::test]
@@ -14248,7 +14469,7 @@ async fn cancel_durably_blocked_in_process_run_cancels_pending_interview_without
         .body(Body::empty())
         .unwrap();
     let response = app.oneshot(req).await.unwrap();
-    assert_status!(response, StatusCode::OK).await;
+    assert_status!(response, StatusCode::ACCEPTED).await;
 
     let submission = tokio::time::timeout(std::time::Duration::from_millis(100), ask)
         .await
@@ -14790,8 +15011,7 @@ id = "local"
         if matches!(
             live_status_before_cancel,
             Some(
-                RunStatus::Runnable
-                    | RunStatus::Starting
+                RunStatus::Starting
                     | RunStatus::Running
                     | RunStatus::Blocked { .. }
                     | RunStatus::Paused { .. }
@@ -14805,8 +15025,7 @@ id = "local"
         matches!(
             live_status_before_cancel,
             Some(
-                RunStatus::Runnable
-                    | RunStatus::Starting
+                RunStatus::Starting
                     | RunStatus::Running
                     | RunStatus::Blocked { .. }
                     | RunStatus::Paused { .. }
@@ -14825,7 +15044,7 @@ id = "local"
     let response_body = body_json(response.into_body()).await;
     assert_eq!(
         response_status,
-        StatusCode::OK,
+        StatusCode::ACCEPTED,
         "unexpected cancel response body: {response_body}; live status before cancel: {live_status_before_cancel:?}"
     );
 
@@ -14887,7 +15106,7 @@ async fn cancel_before_run_transitions_to_running_returns_empty_attach_stream() 
         .body(Body::empty())
         .unwrap();
     let response = app.clone().oneshot(req).await.unwrap();
-    assert_status!(response, StatusCode::OK).await;
+    assert_status!(response, StatusCode::ACCEPTED).await;
 
     runner.await.unwrap();
 

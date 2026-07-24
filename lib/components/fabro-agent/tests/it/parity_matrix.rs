@@ -11,7 +11,7 @@ use std::sync::Arc;
 use fabro_agent::subagent::SessionFactory;
 use fabro_agent::{
     AgentEvent, AgentProfile, AnthropicProfile, GeminiProfile, LocalSandbox, OpenAiProfile,
-    Session, SessionOptions, SubAgentManager, WebFetchSummarizer,
+    Session, SessionOptions, SubAgentSupervisor, WebFetchSummarizer,
 };
 use fabro_auth::EnvCredentialSource;
 use fabro_llm::client::Client;
@@ -20,7 +20,6 @@ use fabro_llm::providers::{OpenAiAdapter, OpenAiCompatibleAdapter};
 use fabro_model::catalog::{LlmCatalogSettings, ProviderCatalogSettings};
 use fabro_model::{Catalog, ModelHandle, ProviderId};
 use fabro_test::{TwinScenario, TwinScenarios, TwinToolCall, twin_openai};
-use tokio::sync::Mutex as AsyncMutex;
 
 type Provider = ProviderId;
 
@@ -85,7 +84,7 @@ async fn make_session(
 
     // Register subagent tools so spawn_agent / wait / send_input / close_agent are
     // available
-    let manager = Arc::new(AsyncMutex::new(SubAgentManager::new(3)));
+    let supervisor = SubAgentSupervisor::new(3);
     let factory_client = client.clone();
     let factory_model: String = model.to_string();
     let factory_cwd = cwd.to_path_buf();
@@ -123,10 +122,16 @@ async fn make_session(
             None,
         )
     });
-    profile.register_subagent_tools(manager, factory, 0);
+    profile.register_subagent_tools(supervisor.clone(), factory, 0);
 
     let profile: Arc<dyn AgentProfile> = Arc::from(profile);
-    Session::new(client, profile, env, SessionOptions::default(), None)
+    Session::new(
+        client,
+        profile,
+        env,
+        SessionOptions::default(),
+        Some(supervisor),
+    )
 }
 
 async fn make_session_with_config(

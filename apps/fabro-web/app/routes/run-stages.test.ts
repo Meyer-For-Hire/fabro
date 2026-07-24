@@ -228,6 +228,31 @@ describe("eventsToActivity", () => {
     ]);
   });
 
+  test("renders settled interrupt as waiting for steering", () => {
+    const events: EventEnvelope[] = [
+      envelope(1, {
+        event: "agent.round.interrupted",
+        stage_id: "nap@1",
+        node_id: "nap",
+        properties: { generation: 1, visit: 1 },
+      }),
+      envelope(2, {
+        event: "agent.round.interrupted",
+        stage_id: "other@1",
+        node_id: "other",
+        properties: { generation: 1, visit: 1 },
+      }),
+    ];
+
+    expect(eventsToActivity(events, "nap@1")).toEqual([
+      {
+        kind: "interrupt",
+        ts: "2026-04-09T12:00:00Z",
+        content: "Interrupted — waiting for steering",
+      },
+    ]);
+  });
+
   test("renders pair messages as transcript turns for the matching stage", () => {
     const events: EventEnvelope[] = [
       envelope(1, {

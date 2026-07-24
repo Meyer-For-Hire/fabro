@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use chrono::Utc;
+use tokio::time::{Instant, sleep_until};
 
 use super::super::{
     ApiError, AppState, AskFabroReadiness, BatchDeleteRunsRequest, BatchDeleteRunsResponse,
@@ -15,7 +16,7 @@ use super::super::{
     TimelineEntryResponse, WORKER_CANCEL_GRACE, WorkflowError, append_control_request,
     clear_live_run_state, delete_run_internal, durable_run_status, get, load_pending_control,
     managed_run, operations, parse_run_id_path, persist_cancelled_run_status, post,
-    reject_if_archived, sleep, update_live_run_from_event, workflow_event,
+    reject_if_archived, update_live_run_from_event, workflow_event,
 };
 use super::runs::run_provenance;
 use crate::worker_runtime::WorkerRef;
@@ -349,17 +350,90 @@ async fn deny_run(
     run_response(state.as_ref(), id, StatusCode::OK).await
 }
 
-fn schedule_worker_force_stop(state: Arc<AppState>, run_id: RunId, worker_ref: WorkerRef) {
-    tokio::spawn(async move {
-        sleep(WORKER_CANCEL_GRACE).await;
-        let current_ref = {
-            let runs = state.runs.lock().expect("runs lock poisoned");
-            runs.get(&run_id).and_then(|run| run.worker_ref.clone())
+fn schedule_worker_cancel_escalation(state: Arc<AppState>, run_id: RunId, worker_ref: WorkerRef) {
+    let requested_at = Instant::now();
+    let armed = {
+        let mut runs = state.runs.lock().expect("runs lock poisoned");
+        let Some(run) = runs.get_mut(&run_id) else {
+            return;
         };
-        if current_ref.as_ref() == Some(&worker_ref)
-            && state.worker_runtime.is_alive(&worker_ref).await
-        {
-            state.worker_runtime.force_stop(&worker_ref).await;
+        if run.cancel_escalation_worker.as_ref() == Some(&worker_ref) {
+            false
+        } else {
+            run.cancel_escalation_worker = Some(worker_ref.clone());
+            true
+        }
+    };
+    if !armed {
+        tracing::debug!(
+            run_id = %run_id,
+            worker_kind = worker_ref.kind(),
+            worker_ref = ?worker_ref,
+            "Worker cancellation escalation is already armed"
+        );
+        return;
+    }
+
+    tokio::spawn(async move {
+        sleep_until(requested_at + WORKER_CANCEL_GRACE).await;
+        let should_escalate = {
+            let mut runs = state.runs.lock().expect("runs lock poisoned");
+            let Some(run) = runs.get_mut(&run_id) else {
+                return;
+            };
+            run.escalation_still_current(&worker_ref)
+        };
+        if !should_escalate {
+            tracing::debug!(
+                run_id = %run_id,
+                worker_kind = worker_ref.kind(),
+                worker_ref = ?worker_ref,
+                "Skipping stale worker cancellation escalation"
+            );
+            return;
+        }
+        if !state.worker_runtime.is_alive(&worker_ref).await {
+            let mut runs = state.runs.lock().expect("runs lock poisoned");
+            if let Some(run) = runs.get_mut(&run_id) {
+                run.clear_escalation_for(&worker_ref);
+            }
+            tracing::debug!(
+                run_id = %run_id,
+                worker_kind = worker_ref.kind(),
+                worker_ref = ?worker_ref,
+                "Skipping worker cancellation escalation because worker exited"
+            );
+            return;
+        }
+        let still_current = {
+            let mut runs = state.runs.lock().expect("runs lock poisoned");
+            let Some(run) = runs.get_mut(&run_id) else {
+                return;
+            };
+            run.escalation_still_current(&worker_ref)
+        };
+        if !still_current {
+            tracing::debug!(
+                run_id = %run_id,
+                worker_kind = worker_ref.kind(),
+                worker_ref = ?worker_ref,
+                "Skipping worker cancellation escalation after liveness check"
+            );
+            return;
+        }
+
+        let elapsed_ms = u64::try_from(requested_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        tracing::warn!(
+            run_id = %run_id,
+            worker_kind = worker_ref.kind(),
+            worker_ref = ?worker_ref,
+            elapsed_ms,
+            "Force-stopping worker after cancellation grace period"
+        );
+        state.worker_runtime.force_stop(&worker_ref).await;
+        let mut runs = state.runs.lock().expect("runs lock poisoned");
+        if let Some(run) = runs.get_mut(&run_id) {
+            run.clear_escalation_for(&worker_ref);
         }
     });
 }
@@ -470,21 +544,29 @@ async fn cancel_run(
     } else {
         false
     };
-    if !delivered_control {
-        if let Some(worker_ref) = worker_ref {
+    tracing::debug!(
+        run_id = %id,
+        delivered_control,
+        "Processed cooperative run cancellation signal"
+    );
+    if let Some(worker_ref) = worker_ref {
+        if !delivered_control {
             state.worker_runtime.request_stop(&worker_ref).await;
-            schedule_worker_force_stop(Arc::clone(&state), id, worker_ref);
         }
+        schedule_worker_cancel_escalation(Arc::clone(&state), id, worker_ref);
     }
 
-    if persist_cancelled_status {
+    let response_status = if persist_cancelled_status {
         if let Err(err) = persist_cancelled_run_status(state.as_ref(), id).await {
             return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
                 .into_response();
         }
-    }
+        StatusCode::OK
+    } else {
+        StatusCode::ACCEPTED
+    };
 
-    run_response(state.as_ref(), id, StatusCode::OK).await
+    run_response(state.as_ref(), id, response_status).await
 }
 
 async fn unmanaged_cancel_response(

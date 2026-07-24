@@ -43,6 +43,7 @@ describe("queryKeysForRunEvent", () => {
   test("terminal events invalidate run-scoped resources", () => {
     expect(queryKeysForRunEvent("run-1", "run.completed")).toEqual([
       queryKeys.runs.detail("run-1"),
+      queryKeys.runs.state("run-1"),
       ...queryKeys.runs.filesAllScopes("run-1"),
       queryKeys.runs.commits("run-1"),
       queryKeys.runs.billing("run-1"),
@@ -60,6 +61,7 @@ describe("queryKeysForRunEvent", () => {
       queryKeys.runs.graph("run-1", "LR"),
       queryKeys.runs.graph("run-1", "TB"),
       queryKeys.runs.detail("run-1"),
+      queryKeys.runs.state("run-1"),
       queryKeys.runs.stageEvents("run-1", "verify@2"),
       queryKeys.runs.stageContextWindow("run-1", "verify@2"),
     ]);
@@ -78,6 +80,21 @@ describe("queryKeysForRunEvent", () => {
       queryKeys.runs.events("run-1", 1000),
       queryKeys.runs.stageEvents("run-1", "nap@1"),
       queryKeys.runs.stageContextWindow("run-1", "nap@1"),
+    ]);
+  });
+
+  test("interrupt settlement invalidates projected control state and stage activity", () => {
+    expect(queryKeysForRunEvent("run-1", "agent.round.interrupted", "nap@1")).toEqual([
+      queryKeys.runs.state("run-1"),
+      queryKeys.runs.events("run-1", 1000),
+      queryKeys.runs.stageEvents("run-1", "nap@1"),
+      queryKeys.runs.stageContextWindow("run-1", "nap@1"),
+    ]);
+  });
+
+  test("cancel requests invalidate the durable run summary", () => {
+    expect(queryKeysForRunEvent("run-1", "run.cancel.requested")).toEqual([
+      queryKeys.runs.detail("run-1"),
     ]);
   });
 

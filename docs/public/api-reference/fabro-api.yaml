@@ -1567,12 +1567,23 @@ paths:
       operationId: cancelRun
       tags: [Runs]
       summary: Cancel Run
-      description: Cancels a pending, runnable, or running run. Returns 409 if the run has already completed or been cancelled.
+      description: |
+        Cancels a pending, runnable, or running run. Pre-execution runs are
+        cancelled synchronously. Live runs return after the cancellation
+        request is durably recorded and continue converging to a terminal
+        cancelled state. Returns 409 if the run has already completed or been
+        cancelled.
       parameters:
         - $ref: "#/components/parameters/RunId"
       responses:
         "200":
-          description: Run cancelled
+          description: Run was cancelled synchronously before execution
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Run"
+        "202":
+          description: Cancellation was durably requested for a live run
           content:
             application/json:
               schema:
@@ -10488,6 +10499,7 @@ components:
       required:
         - first_event_seq
         - usage
+        - agent_control
         - state
       properties:
         first_event_seq:
@@ -10587,6 +10599,9 @@ components:
             - $ref: "#/components/schemas/StageContextWindowProjection"
             - type: "null"
           description: Latest content-free context-window snapshot for this agent stage.
+        agent_control:
+          $ref: "#/components/schemas/AgentControlState"
+          description: Whether the agent is executing normally or waiting for steering after an interrupt.
         state:
           $ref: "#/components/schemas/StageState"
           description: Lifecycle state of the stage projection.
@@ -12362,6 +12377,13 @@ components:
           description: Failure signature counts across loop_restart edges.
 
     # ── Stage / Turn Schemas ─────────────────────────────────────────────
+
+    AgentControlState:
+      description: Control state of a live agent stage.
+      type: string
+      enum:
+        - running
+        - waiting_for_steer
 
     StageState:
       description: Lifecycle projection state of a workflow stage.

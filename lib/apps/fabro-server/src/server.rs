@@ -281,8 +281,33 @@ struct ManagedRun {
     cancel_tx: Option<oneshot::Sender<()>>,
     cancel_token: Option<CancellationToken>,
     worker_ref: Option<WorkerRef>,
+    /// Exact worker currently covered by a cancellation escalation task.
+    /// Prevents repeated cancel requests from arming duplicate watchdogs.
+    cancel_escalation_worker: Option<WorkerRef>,
     run_dir: Option<std::path::PathBuf>,
     execution_mode: RunExecutionMode,
+}
+
+impl ManagedRun {
+    /// True if cancellation should still escalate to `worker_ref`; clears a
+    /// stale escalation marker as a side effect.
+    fn escalation_still_current(&mut self, worker_ref: &WorkerRef) -> bool {
+        let matches_watchdog = self.cancel_escalation_worker.as_ref() == Some(worker_ref);
+        let still_current = matches_watchdog
+            && !self.status.is_terminal()
+            && self.worker_ref.as_ref() == Some(worker_ref);
+        if matches_watchdog && !still_current {
+            self.cancel_escalation_worker = None;
+        }
+        still_current
+    }
+
+    /// Clears the escalation marker if it is still owned by `worker_ref`.
+    fn clear_escalation_for(&mut self, worker_ref: &WorkerRef) {
+        if self.cancel_escalation_worker.as_ref() == Some(worker_ref) {
+            self.cancel_escalation_worker = None;
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2961,6 +2986,7 @@ fn clear_live_run_state(run: &mut ManagedRun) {
     run.cancel_tx = None;
     run.cancel_token = None;
     run.worker_ref = None;
+    run.cancel_escalation_worker = None;
 }
 
 fn cleanup_worker_control_bus_for_run(state: &AppState, run_id: RunId) {
@@ -3328,6 +3354,7 @@ fn managed_run(
         cancel_tx: None,
         cancel_token: None,
         worker_ref: None,
+        cancel_escalation_worker: None,
         run_dir: Some(run_dir),
         execution_mode,
     }
@@ -4479,7 +4506,15 @@ async fn append_control_request(
         RunControlAction::Pause => workflow_event::Event::RunPauseRequested { actor },
         RunControlAction::Unpause => workflow_event::Event::RunUnpauseRequested { actor },
     };
-    workflow_event::append_event(&run_store, &run_id, &event).await
+    if action == RunControlAction::Cancel {
+        workflow_event::append_event_if(&run_store, &run_id, &event, |projection| {
+            projection.pending_control != Some(RunControlAction::Cancel)
+        })
+        .await
+        .map(|_| ())
+    } else {
+        workflow_event::append_event(&run_store, &run_id, &event).await
+    }
 }
 
 /// Returns a 409 response with an actionable "unarchive first" message if the

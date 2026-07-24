@@ -21,12 +21,19 @@ pub(crate) trait WorkerRuntime: Send + Sync {
     async fn is_alive(&self, worker_ref: &WorkerRef) -> bool;
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
 pub(crate) enum WorkerRef {
     /// A worker running as a local subprocess. `pre_exec_setpgid` ensures the
     /// child is the leader of its own process group with `pgid == pid`, so a
     /// single PID identifies both the process and its group.
     Local { pid: u32 },
+}
+
+impl WorkerRef {
+    pub(crate) fn kind(&self) -> &'static str {
+        self.into()
+    }
 }
 
 pub(crate) struct WorkerLaunchSpec {

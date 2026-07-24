@@ -1,13 +1,16 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use fabro_llm::types::ToolDefinition;
-use tokio::sync::Mutex as AsyncMutex;
-use tokio::task::JoinHandle;
+use futures::future;
+use tokio::sync::{oneshot, watch};
+use tokio::task::{AbortHandle, JoinHandle};
+use tokio::time::{Instant, timeout_at};
 use tokio_util::sync::CancellationToken;
 
-use crate::error::Error;
-use crate::session::Session;
+use crate::error::{Error, InterruptReason};
+use crate::session::{Session, SessionShutdownReason};
 use crate::tool_registry::{RegisteredTool, ToolSource};
 use crate::tools::required_str;
 use crate::types::{AgentEvent, SessionEvent};
@@ -33,45 +36,176 @@ pub struct SubAgentResult {
 pub enum SubAgentStatus {
     Running,
     Finished(Result<SubAgentResult, Error>),
+    Closing,
     Closed,
 }
 
-pub struct SubAgent {
-    task:           Option<JoinHandle<Result<SubAgentResult, Error>>>,
-    followup_queue: Arc<Mutex<VecDeque<String>>>,
-    cancel_token:   CancellationToken,
-    depth:          usize,
-    status:         SubAgentStatus,
+const SUBAGENT_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+struct SubAgent {
+    status:             watch::Sender<SubAgentStatus>,
+    cleanup_done:       watch::Sender<bool>,
+    cleanup_started:    bool,
+    monitor_task:       Option<JoinHandle<()>>,
+    event_forwarder:    Option<JoinHandle<()>>,
+    cleanup_task:       Option<JoinHandle<()>>,
+    child_abort_handle: AbortHandle,
+    followup_queue:     Arc<Mutex<VecDeque<String>>>,
+    cancel_token:       CancellationToken,
+    depth:              usize,
 }
 
-pub struct SubAgentManager {
-    agents:         HashMap<String, SubAgent>,
+impl Drop for SubAgent {
+    fn drop(&mut self) {
+        self.cancel_token.cancel();
+        self.child_abort_handle.abort();
+        if let Some(task) = self.monitor_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.event_forwarder.take() {
+            task.abort();
+        }
+        if let Some(task) = self.cleanup_task.take() {
+            task.abort();
+        }
+    }
+}
+
+#[derive(Default)]
+struct SupervisorState {
+    agents: HashMap<String, SubAgent>,
+}
+
+struct ShutdownWork {
+    agent_id:            String,
+    depth:               usize,
+    close_running_agent: bool,
+    status:              watch::Sender<SubAgentStatus>,
+    cleanup_done:        watch::Sender<bool>,
+    monitor_task:        Option<JoinHandle<()>>,
+    event_forwarder:     Option<JoinHandle<()>>,
+    child_abort_handle:  AbortHandle,
+    cancel_token:        CancellationToken,
+}
+
+impl Drop for ShutdownWork {
+    fn drop(&mut self) {
+        self.cancel_token.cancel();
+        self.child_abort_handle.abort();
+        if let Some(task) = self.monitor_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.event_forwarder.take() {
+            task.abort();
+        }
+    }
+}
+
+enum ShutdownDisposition {
+    Lead(ShutdownWork),
+    Follow(watch::Receiver<bool>),
+    Done,
+}
+
+struct CleanupDoneGuard(watch::Sender<bool>);
+
+impl Drop for CleanupDoneGuard {
+    fn drop(&mut self) {
+        self.0.send_replace(true);
+    }
+}
+
+fn spawn_result_monitor(
+    child_task: JoinHandle<Result<SubAgentResult, Error>>,
+    status: watch::Sender<SubAgentStatus>,
+    event_callback: Arc<RwLock<Option<SubAgentEventCallback>>>,
+    agent_id: String,
+    depth: usize,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let task_result = match child_task.await {
+            Ok(result) => result,
+            Err(err) => Err(Error::InvalidState(format!(
+                "Agent task failed to join: {err}"
+            ))),
+        };
+        let committed = status.send_if_modified(|current| {
+            if matches!(current, SubAgentStatus::Running) {
+                *current = SubAgentStatus::Finished(task_result.clone());
+                true
+            } else {
+                false
+            }
+        });
+        if !committed {
+            return;
+        }
+
+        let event = match task_result {
+            Ok(result) => AgentEvent::SubAgentCompleted {
+                agent_id,
+                depth,
+                success: result.success,
+                turns_used: result.turns_used,
+            },
+            Err(error) => AgentEvent::SubAgentFailed {
+                agent_id,
+                depth,
+                error,
+            },
+        };
+        let callback = event_callback
+            .read()
+            .expect("subagent callback lock poisoned")
+            .clone();
+        if let Some(callback) = callback {
+            callback(SubAgentCallbackEvent::Lifecycle(event));
+        }
+    })
+}
+
+/// Owns all child-session tasks for one parent agent session.
+///
+/// The supervisor is the only production-facing subagent handle. Its internal
+/// mutex protects short state transitions only; task waits and callbacks always
+/// happen after the guard has been released.
+#[derive(Clone)]
+pub struct SubAgentSupervisor {
+    state:          Arc<Mutex<SupervisorState>>,
     max_depth:      usize,
-    event_callback: Option<SubAgentEventCallback>,
+    event_callback: Arc<RwLock<Option<SubAgentEventCallback>>>,
 }
 
-impl SubAgentManager {
+impl SubAgentSupervisor {
     #[must_use]
     pub fn new(max_depth: usize) -> Self {
         Self {
-            agents: HashMap::new(),
+            state: Arc::new(Mutex::new(SupervisorState::default())),
             max_depth,
-            event_callback: None,
+            event_callback: Arc::new(RwLock::new(None)),
         }
     }
 
-    pub fn set_event_callback(&mut self, cb: SubAgentEventCallback) {
-        self.event_callback = Some(cb);
+    pub fn set_event_callback(&self, cb: SubAgentEventCallback) {
+        *self
+            .event_callback
+            .write()
+            .expect("subagent callback lock poisoned") = Some(cb);
     }
 
     fn emit_event(&self, event: AgentEvent) {
-        if let Some(ref cb) = self.event_callback {
+        let callback = self
+            .event_callback
+            .read()
+            .expect("subagent callback lock poisoned")
+            .clone();
+        if let Some(cb) = callback {
             cb(SubAgentCallbackEvent::Lifecycle(event));
         }
     }
 
     pub fn spawn(
-        &mut self,
+        &self,
         mut session: Session,
         task_prompt: String,
         depth: usize,
@@ -87,11 +221,17 @@ impl SubAgentManager {
         let followup_queue = session.followup_queue_handle();
         let cancel_token = session.cancel_token();
 
-        // Subscribe to child session events and forward them via callback
-        if let Some(ref cb) = self.event_callback {
+        // Subscribe before moving the session into its task. The forwarding
+        // task is owned by the supervisor and joined during shutdown.
+        let event_forwarder = if self
+            .event_callback
+            .read()
+            .expect("subagent callback lock poisoned")
+            .is_some()
+        {
             let mut rx = session.subscribe();
-            let cb = cb.clone();
-            tokio::spawn(async move {
+            let callback = Arc::clone(&self.event_callback);
+            Some(tokio::spawn(async move {
                 while let Ok(event) = rx.recv().await {
                     // Skip streaming / noise events
                     if event.event.is_streaming_noise()
@@ -104,65 +244,104 @@ impl SubAgentManager {
                     {
                         continue;
                     }
-                    cb(SubAgentCallbackEvent::Forwarded(event));
+                    let callback = callback
+                        .read()
+                        .expect("subagent callback lock poisoned")
+                        .clone();
+                    if let Some(callback) = callback {
+                        callback(SubAgentCallbackEvent::Forwarded(event));
+                    }
                 }
+            }))
+        } else {
+            None
+        };
+
+        let task_prompt_for_spawn = task_prompt.clone();
+        let (start_tx, start_rx) = oneshot::channel();
+        let child_task = tokio::spawn(async move {
+            let _ = start_rx.await;
+            let result = async {
+                session.initialize().await?;
+                let output = session
+                    .process_input_with_output(&task_prompt_for_spawn)
+                    .await?
+                    .ok_or_else(|| {
+                        Error::InvalidState(
+                            "Subagent completed without a non-empty final response".to_string(),
+                        )
+                    })?;
+                let turns = session.history().turns();
+                Ok(SubAgentResult {
+                    output,
+                    success: true,
+                    turns_used: turns.len(),
+                })
+            }
+            .await;
+            let reason = match &result {
+                Ok(_) => SessionShutdownReason::Completed,
+                Err(Error::Interrupted(_)) => SessionShutdownReason::Cancelled,
+                Err(_) => SessionShutdownReason::Error,
+            };
+            session.shutdown(reason).await;
+            result
+        });
+        let child_abort_handle = child_task.abort_handle();
+        let (status, _) = watch::channel(SubAgentStatus::Running);
+        let (cleanup_done, _) = watch::channel(false);
+        let child_depth = depth + 1;
+        let monitor_task = spawn_result_monitor(
+            child_task,
+            status.clone(),
+            Arc::clone(&self.event_callback),
+            agent_id.clone(),
+            child_depth,
+        );
+
+        {
+            let mut state = self.state.lock().expect("subagent state lock poisoned");
+            state.agents.insert(agent_id.clone(), SubAgent {
+                status,
+                cleanup_done,
+                cleanup_started: false,
+                monitor_task: Some(monitor_task),
+                event_forwarder,
+                cleanup_task: None,
+                child_abort_handle,
+                followup_queue,
+                cancel_token,
+                depth: child_depth,
             });
         }
 
-        let task_prompt_for_spawn = task_prompt.clone();
-        let task = tokio::spawn(async move {
-            session.initialize().await?;
-            let output = session
-                .process_input_with_output(&task_prompt_for_spawn)
-                .await?
-                .ok_or_else(|| {
-                    Error::InvalidState(
-                        "Subagent completed without a non-empty final response".to_string(),
-                    )
-                })?;
-            let turns = session.history().turns();
-            Ok(SubAgentResult {
-                output,
-                success: true,
-                turns_used: turns.len(),
-            })
-        });
-
-        self.agents.insert(agent_id.clone(), SubAgent {
-            task: Some(task),
-            followup_queue,
-            cancel_token,
-            depth: depth + 1,
-            status: SubAgentStatus::Running,
-        });
-
         self.emit_event(AgentEvent::SubAgentSpawned {
             agent_id: agent_id.clone(),
-            depth:    depth + 1,
+            depth:    child_depth,
             task:     task_prompt,
         });
+        let _ = start_tx.send(());
 
         Ok(agent_id)
     }
 
     pub fn send_input(&self, agent_id: &str, message: &str) -> Result<(), Error> {
-        let agent = self.agents.get(agent_id).ok_or_else(|| {
-            Error::InvalidState(format!(
-                "No agent found with id: {agent_id} (it was never spawned)"
-            ))
-        })?;
-
-        match agent.status {
-            SubAgentStatus::Running => {}
-            _ => {
+        let followup_queue = {
+            let state = self.state.lock().expect("subagent state lock poisoned");
+            let agent = state.agents.get(agent_id).ok_or_else(|| {
+                Error::InvalidState(format!(
+                    "No agent found with id: {agent_id} (it was never spawned)"
+                ))
+            })?;
+            if !matches!(*agent.status.borrow(), SubAgentStatus::Running) {
                 return Err(Error::InvalidState(format!(
                     "Agent {agent_id} is not running"
                 )));
             }
-        }
+            Arc::clone(&agent.followup_queue)
+        };
 
-        agent
-            .followup_queue
+        followup_queue
             .lock()
             .expect("followup queue lock poisoned")
             .push_back(message.to_string());
@@ -170,140 +349,309 @@ impl SubAgentManager {
         Ok(())
     }
 
-    pub async fn wait(&mut self, agent_id: &str) -> Result<SubAgentResult, Error> {
-        // Phase 1: Check existence and current status
-        let agent = self.agents.get(agent_id);
-        let depth = match agent {
-            None => {
-                return Err(Error::InvalidState(format!(
-                    "No agent found with id: {agent_id} (it was never spawned)"
-                )));
-            }
-            Some(a) => a.depth,
+    pub async fn wait_with_cancel(
+        &self,
+        agent_id: &str,
+        cancel: &CancellationToken,
+    ) -> Result<SubAgentResult, Error> {
+        let mut status = {
+            let state = self.state.lock().expect("subagent state lock poisoned");
+            state
+                .agents
+                .get(agent_id)
+                .ok_or_else(|| {
+                    Error::InvalidState(format!(
+                        "No agent found with id: {agent_id} (it was never spawned)"
+                    ))
+                })?
+                .status
+                .subscribe()
         };
 
-        match &self.agents[agent_id].status {
-            SubAgentStatus::Closed => {
-                return Err(Error::InvalidState(format!(
-                    "Agent {agent_id} has been closed"
-                )));
+        loop {
+            let current = status.borrow().clone();
+            match current {
+                SubAgentStatus::Running => {
+                    tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => {
+                            self.ensure_closed(agent_id).await?;
+                            return Err(Error::Interrupted(InterruptReason::Cancelled));
+                        }
+                        changed = status.changed() => {
+                            changed.map_err(|_| {
+                                Error::InvalidState(format!(
+                                    "Agent {agent_id} result observer closed unexpectedly"
+                                ))
+                            })?;
+                        }
+                    }
+                }
+                SubAgentStatus::Finished(result) => return result,
+                SubAgentStatus::Closing | SubAgentStatus::Closed => {
+                    return Err(Error::InvalidState(format!(
+                        "Agent {agent_id} has been closed"
+                    )));
+                }
             }
-            SubAgentStatus::Finished(result) => {
-                return result.clone();
-            }
-            SubAgentStatus::Running => {}
-        }
-
-        // Phase 2: Take the JoinHandle (brief mutable borrow, no await)
-        let join_handle = self
-            .agents
-            .get_mut(agent_id)
-            .expect("agent should still exist after status check")
-            .task
-            .take()
-            .ok_or_else(|| Error::InvalidState(format!("Agent {agent_id} has no running task")))?;
-
-        // Phase 3: Await the task (no borrow held)
-        let task_result = match join_handle.await {
-            Ok(result) => result,
-            Err(e) => Err(Error::InvalidState(format!("Agent task panicked: {e}"))),
-        };
-
-        // Phase 4: Emit event
-        match &task_result {
-            Ok(result) => {
-                self.emit_event(AgentEvent::SubAgentCompleted {
-                    agent_id: agent_id.to_string(),
-                    depth,
-                    success: result.success,
-                    turns_used: result.turns_used,
-                });
-            }
-            Err(e) => {
-                self.emit_event(AgentEvent::SubAgentFailed {
-                    agent_id: agent_id.to_string(),
-                    depth,
-                    error: e.clone(),
-                });
-            }
-        }
-
-        // Phase 5: Store result in status and return clone
-        let agent = self
-            .agents
-            .get_mut(agent_id)
-            .expect("agent should still exist when storing task result");
-        agent.status = SubAgentStatus::Finished(task_result);
-
-        match &agent.status {
-            SubAgentStatus::Finished(result) => result.clone(),
-            _ => unreachable!("agent status was just assigned to Finished on the line above"),
         }
     }
 
-    pub fn close(&mut self, agent_id: &str) -> Result<(), Error> {
-        let agent = self.agents.get_mut(agent_id).ok_or_else(|| {
+    #[cfg(test)]
+    async fn wait(&self, agent_id: &str) -> Result<SubAgentResult, Error> {
+        self.wait_with_cancel(agent_id, &CancellationToken::new())
+            .await
+    }
+
+    fn begin_shutdown(&self, agent_id: &str, strict: bool) -> Result<ShutdownDisposition, Error> {
+        let mut state = self.state.lock().expect("subagent state lock poisoned");
+        let agent = state.agents.get_mut(agent_id).ok_or_else(|| {
             Error::InvalidState(format!(
                 "No agent found with id: {agent_id} (it was never spawned)"
             ))
         })?;
 
-        match agent.status {
-            SubAgentStatus::Closed => {
+        let close_running_agent = loop {
+            let current = agent.status.borrow().clone();
+            match current {
+                SubAgentStatus::Running => {
+                    if agent.status.send_if_modified(|status| {
+                        if matches!(status, SubAgentStatus::Running) {
+                            *status = SubAgentStatus::Closing;
+                            true
+                        } else {
+                            false
+                        }
+                    }) {
+                        break true;
+                    }
+                }
+                SubAgentStatus::Finished(_) if strict => {
+                    return Err(Error::InvalidState(format!(
+                        "Agent {agent_id} is not running"
+                    )));
+                }
+                SubAgentStatus::Finished(_) => break false,
+                SubAgentStatus::Closing | SubAgentStatus::Closed if strict => {
+                    return Err(Error::InvalidState(format!(
+                        "Agent {agent_id} is already closed"
+                    )));
+                }
+                SubAgentStatus::Closing => {
+                    return Ok(ShutdownDisposition::Follow(agent.cleanup_done.subscribe()));
+                }
+                SubAgentStatus::Closed => return Ok(ShutdownDisposition::Done),
+            }
+        };
+
+        if agent.cleanup_started {
+            return Ok(ShutdownDisposition::Follow(agent.cleanup_done.subscribe()));
+        }
+        agent.cleanup_started = true;
+
+        Ok(ShutdownDisposition::Lead(ShutdownWork {
+            agent_id: agent_id.to_string(),
+            depth: agent.depth,
+            close_running_agent,
+            status: agent.status.clone(),
+            cleanup_done: agent.cleanup_done.clone(),
+            monitor_task: agent.monitor_task.take(),
+            event_forwarder: agent.event_forwarder.take(),
+            child_abort_handle: agent.child_abort_handle.clone(),
+            cancel_token: agent.cancel_token.clone(),
+        }))
+    }
+
+    async fn run_shutdown(
+        mut work: ShutdownWork,
+        event_callback: Arc<RwLock<Option<SubAgentEventCallback>>>,
+    ) {
+        let _cleanup_done = CleanupDoneGuard(work.cleanup_done.clone());
+        let deadline = Instant::now() + SUBAGENT_SHUTDOWN_GRACE;
+        if work.close_running_agent {
+            work.cancel_token.cancel();
+        }
+
+        if let Some(mut task) = work.monitor_task.take() {
+            if timeout_at(deadline, &mut task).await.is_err() {
+                work.child_abort_handle.abort();
+                let _ = task.await;
+            }
+        }
+
+        if let Some(mut task) = work.event_forwarder.take() {
+            if timeout_at(deadline, &mut task).await.is_err() {
+                task.abort();
+                let _ = task.await;
+            }
+        }
+
+        let emit_closed = work.close_running_agent
+            && work.status.send_if_modified(|status| {
+                if matches!(status, SubAgentStatus::Closing) {
+                    *status = SubAgentStatus::Closed;
+                    true
+                } else {
+                    false
+                }
+            });
+        if emit_closed {
+            let callback = event_callback
+                .read()
+                .expect("subagent callback lock poisoned")
+                .clone();
+            if let Some(callback) = callback {
+                callback(SubAgentCallbackEvent::Lifecycle(
+                    AgentEvent::SubAgentClosed {
+                        agent_id: work.agent_id.clone(),
+                        depth:    work.depth,
+                    },
+                ));
+            }
+        }
+    }
+
+    fn spawn_shutdown(&self, work: ShutdownWork) -> watch::Receiver<bool> {
+        let cleanup_done = work.cleanup_done.subscribe();
+        let agent_id = work.agent_id.clone();
+        let event_callback = Arc::clone(&self.event_callback);
+        let cleanup_task = tokio::spawn(Self::run_shutdown(work, event_callback));
+        let mut state = self.state.lock().expect("subagent state lock poisoned");
+        let agent = state
+            .agents
+            .get_mut(&agent_id)
+            .expect("shutdown agent should remain supervised");
+        debug_assert!(agent.cleanup_task.is_none());
+        agent.cleanup_task = Some(cleanup_task);
+        cleanup_done
+    }
+
+    async fn await_shutdown(&self, agent_id: &str, cleanup_done: watch::Receiver<bool>) {
+        Self::follow_shutdown(cleanup_done).await;
+        let cleanup_task = {
+            let mut state = self.state.lock().expect("subagent state lock poisoned");
+            state
+                .agents
+                .get_mut(agent_id)
+                .and_then(|agent| agent.cleanup_task.take())
+        };
+        if let Some(task) = cleanup_task {
+            let _ = task.await;
+        }
+    }
+
+    async fn follow_shutdown(mut cleanup_done: watch::Receiver<bool>) {
+        while !*cleanup_done.borrow() {
+            if cleanup_done.changed().await.is_err() {
+                break;
+            }
+        }
+    }
+
+    async fn ensure_closed(&self, agent_id: &str) -> Result<(), Error> {
+        let cleanup_done = match self.begin_shutdown(agent_id, false)? {
+            ShutdownDisposition::Lead(work) => self.spawn_shutdown(work),
+            ShutdownDisposition::Follow(cleanup_done) => cleanup_done,
+            ShutdownDisposition::Done => return Ok(()),
+        };
+        self.await_shutdown(agent_id, cleanup_done).await;
+        Ok(())
+    }
+
+    /// Strict user-facing close: only a currently running child may be closed.
+    pub async fn close_agent(&self, agent_id: &str) -> Result<(), Error> {
+        let cleanup_done = match self.begin_shutdown(agent_id, true)? {
+            ShutdownDisposition::Lead(work) => self.spawn_shutdown(work),
+            ShutdownDisposition::Follow(_) | ShutdownDisposition::Done => {
                 return Err(Error::InvalidState(format!(
                     "Agent {agent_id} is already closed"
                 )));
             }
-            SubAgentStatus::Running => {
-                agent.cancel_token.cancel();
-                if let Some(join_handle) = agent.task.take() {
-                    join_handle.abort();
-                }
-            }
-            SubAgentStatus::Finished(_) => {
-                // No task to cancel, just transition status
-            }
-        }
-
-        agent.status = SubAgentStatus::Closed;
-        let depth = agent.depth;
-
-        self.emit_event(AgentEvent::SubAgentClosed {
-            agent_id: agent_id.to_string(),
-            depth,
-        });
-
+        };
+        self.await_shutdown(agent_id, cleanup_done).await;
         Ok(())
     }
 
-    /// Close all active subagents, cancelling their tokens and aborting tasks.
-    pub fn close_all(&mut self) {
-        let ids: Vec<String> = self
+    /// Cooperatively shut down active children and join every owned child and
+    /// event-forwarding task. Finished children are reaped without rewriting
+    /// their terminal result.
+    pub async fn shutdown_all(&self) {
+        let ids = {
+            let state = self.state.lock().expect("subagent state lock poisoned");
+            state.agents.keys().cloned().collect::<Vec<_>>()
+        };
+        future::join_all(ids.iter().map(|id| self.ensure_closed(id))).await;
+    }
+
+    #[must_use]
+    pub fn status(&self, agent_id: &str) -> Option<SubAgentStatus> {
+        let state = self.state.lock().expect("subagent state lock poisoned");
+        state
             .agents
-            .iter()
-            .filter(|(_, a)| matches!(a.status, SubAgentStatus::Running))
-            .map(|(id, _)| id.clone())
-            .collect();
-        for id in ids {
-            let _ = self.close(&id);
-        }
+            .get(agent_id)
+            .map(|agent| agent.status.borrow().clone())
     }
 
     #[cfg(test)]
     #[must_use]
-    pub fn get(&self, agent_id: &str) -> Option<&SubAgent> {
-        self.agents.get(agent_id)
+    fn contains(&self, agent_id: &str) -> bool {
+        self.state
+            .lock()
+            .expect("subagent state lock poisoned")
+            .agents
+            .contains_key(agent_id)
     }
 
     #[cfg(test)]
     #[must_use]
-    pub fn status(&self, agent_id: &str) -> Option<&SubAgentStatus> {
-        self.agents.get(agent_id).map(|a| &a.status)
+    fn is_empty(&self) -> bool {
+        self.state
+            .lock()
+            .expect("subagent state lock poisoned")
+            .agents
+            .is_empty()
+    }
+
+    #[cfg(test)]
+    fn supervise_test_task(
+        &self,
+        agent_id: String,
+        child_task: JoinHandle<Result<SubAgentResult, Error>>,
+        cancel_token: CancellationToken,
+        event_forwarder: Option<JoinHandle<()>>,
+    ) {
+        let child_abort_handle = child_task.abort_handle();
+        let (status, _) = watch::channel(SubAgentStatus::Running);
+        let (cleanup_done, _) = watch::channel(false);
+        let depth = 1;
+        let monitor_task = spawn_result_monitor(
+            child_task,
+            status.clone(),
+            Arc::clone(&self.event_callback),
+            agent_id.clone(),
+            depth,
+        );
+        self.state
+            .lock()
+            .expect("subagent state lock poisoned")
+            .agents
+            .insert(agent_id, SubAgent {
+                status,
+                cleanup_done,
+                cleanup_started: false,
+                monitor_task: Some(monitor_task),
+                event_forwarder,
+                cleanup_task: None,
+                child_abort_handle,
+                followup_queue: Arc::new(Mutex::new(VecDeque::new())),
+                cancel_token,
+                depth,
+            });
     }
 }
 
 pub fn make_spawn_agent_tool(
-    manager: Arc<AsyncMutex<SubAgentManager>>,
+    supervisor: SubAgentSupervisor,
     session_factory: SessionFactory,
     current_depth: usize,
 ) -> RegisteredTool {
@@ -323,7 +671,7 @@ pub fn make_spawn_agent_tool(
             }),
         },
         executor:   Arc::new(move |args, ctx| {
-            let manager = manager.clone();
+            let supervisor = supervisor.clone();
             let session_factory = session_factory.clone();
             Box::pin(async move {
                 let task = required_str(&args, "task")?;
@@ -335,8 +683,8 @@ pub fn make_spawn_agent_tool(
                 if let Some(root) = ctx.root_session_id.as_ref().or(ctx.session_id.as_ref()) {
                     session.set_root_session_id(root.clone());
                 }
-                let mut mgr = manager.lock().await;
-                mgr.spawn(session, task.to_string(), current_depth)
+                supervisor
+                    .spawn(session, task.to_string(), current_depth)
                     .map_err(|e| e.to_string())
             })
         }),
@@ -344,7 +692,7 @@ pub fn make_spawn_agent_tool(
     }
 }
 
-pub fn make_send_input_tool(manager: Arc<AsyncMutex<SubAgentManager>>) -> RegisteredTool {
+pub fn make_send_input_tool(supervisor: SubAgentSupervisor) -> RegisteredTool {
     RegisteredTool {
         definition: ToolDefinition {
             name:        "send_input".into(),
@@ -365,13 +713,13 @@ pub fn make_send_input_tool(manager: Arc<AsyncMutex<SubAgentManager>>) -> Regist
             }),
         },
         executor:   Arc::new(move |args, _ctx| {
-            let manager = manager.clone();
+            let supervisor = supervisor.clone();
             Box::pin(async move {
                 let agent_id = required_str(&args, "agent_id")?;
                 let message = required_str(&args, "message")?;
 
-                let mgr = manager.lock().await;
-                mgr.send_input(agent_id, message)
+                supervisor
+                    .send_input(agent_id, message)
                     .map_err(|e| e.to_string())?;
                 Ok(format!("Message sent to agent {agent_id}"))
             })
@@ -380,7 +728,7 @@ pub fn make_send_input_tool(manager: Arc<AsyncMutex<SubAgentManager>>) -> Regist
     }
 }
 
-pub fn make_wait_tool(manager: Arc<AsyncMutex<SubAgentManager>>) -> RegisteredTool {
+pub fn make_wait_tool(supervisor: SubAgentSupervisor) -> RegisteredTool {
     RegisteredTool {
         definition: ToolDefinition {
             name:        "wait".into(),
@@ -396,13 +744,17 @@ pub fn make_wait_tool(manager: Arc<AsyncMutex<SubAgentManager>>) -> RegisteredTo
                 "required": ["agent_id"]
             }),
         },
-        executor:   Arc::new(move |args, _ctx| {
-            let manager = manager.clone();
+        executor:   Arc::new(move |args, ctx| {
+            let supervisor = supervisor.clone();
             Box::pin(async move {
                 let agent_id = required_str(&args, "agent_id")?;
-
-                let mut mgr = manager.lock().await;
-                let result = mgr.wait(agent_id).await.map_err(|e| e.to_string())?;
+                let result = match supervisor.wait_with_cancel(agent_id, &ctx.cancel).await {
+                    Ok(result) => result,
+                    Err(Error::Interrupted(InterruptReason::Cancelled)) => {
+                        return Err("Cancelled".to_string());
+                    }
+                    Err(error) => return Err(error.to_string()),
+                };
                 Ok(format!(
                     "Agent completed (success: {}, turns: {})\n\n{}",
                     result.success, result.turns_used, result.output
@@ -413,7 +765,7 @@ pub fn make_wait_tool(manager: Arc<AsyncMutex<SubAgentManager>>) -> RegisteredTo
     }
 }
 
-pub fn make_close_agent_tool(manager: Arc<AsyncMutex<SubAgentManager>>) -> RegisteredTool {
+pub fn make_close_agent_tool(supervisor: SubAgentSupervisor) -> RegisteredTool {
     RegisteredTool {
         definition: ToolDefinition {
             name:        "close_agent".into(),
@@ -430,12 +782,13 @@ pub fn make_close_agent_tool(manager: Arc<AsyncMutex<SubAgentManager>>) -> Regis
             }),
         },
         executor:   Arc::new(move |args, _ctx| {
-            let manager = manager.clone();
+            let supervisor = supervisor.clone();
             Box::pin(async move {
                 let agent_id = required_str(&args, "agent_id")?;
-
-                let mut mgr = manager.lock().await;
-                mgr.close(agent_id).map_err(|e| e.to_string())?;
+                supervisor
+                    .close_agent(agent_id)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 Ok(format!("Agent {agent_id} closed"))
             })
         }),
@@ -447,17 +800,19 @@ pub fn make_close_agent_tool(manager: Arc<AsyncMutex<SubAgentManager>>) -> Regis
 mod tests {
     use fabro_llm::provider::ProviderAdapter;
     use fabro_llm::types::Role;
+    use tokio::task::yield_now;
     use tokio::time;
 
     use super::*;
     use crate::config::SessionOptions;
     use crate::test_support::*;
+    use crate::tool_registry::ToolContext;
 
     // --- Tests ---
 
     #[test]
     fn subagent_tool_descriptions_explain_delegation_lifecycle() {
-        let manager = Arc::new(AsyncMutex::new(SubAgentManager::new(3)));
+        let manager = SubAgentSupervisor::new(3);
         let factory: SessionFactory = Arc::new(|| {
             panic!("should not construct subagent in description test");
         });
@@ -482,25 +837,25 @@ mod tests {
 
     #[test]
     fn manager_creation() {
-        let manager = SubAgentManager::new(3);
+        let manager = SubAgentSupervisor::new(3);
         assert_eq!(manager.max_depth, 3);
-        assert!(manager.agents.is_empty());
+        assert!(manager.is_empty());
     }
 
     #[tokio::test]
     async fn spawn_creates_agent_and_returns_id() {
-        let mut manager = SubAgentManager::new(3);
+        let manager = SubAgentSupervisor::new(3);
         let session = make_session(vec![text_response("Hello")]).await;
         let result = manager.spawn(session, "Do something".into(), 0);
         assert!(result.is_ok());
         let agent_id = result.unwrap();
         assert!(!agent_id.is_empty());
-        assert!(manager.get(&agent_id).is_some());
+        assert!(manager.contains(&agent_id));
     }
 
     #[tokio::test]
     async fn spawn_initializes_session_before_processing_input() {
-        let mut manager = SubAgentManager::new(3);
+        let manager = SubAgentSupervisor::new(3);
 
         let provider = Arc::new(CapturingLlmProvider::new());
         let provider_ref = provider.clone();
@@ -530,7 +885,7 @@ mod tests {
 
     #[tokio::test]
     async fn depth_limit_enforced() {
-        let mut manager = SubAgentManager::new(2);
+        let manager = SubAgentSupervisor::new(2);
         let session = make_session(vec![text_response("Hello")]).await;
         let result = manager.spawn(session, "Do something".into(), 2);
         assert!(result.is_err());
@@ -544,12 +899,12 @@ mod tests {
 
     #[tokio::test]
     async fn close_sets_closed_status() {
-        let mut manager = SubAgentManager::new(3);
+        let manager = SubAgentSupervisor::new(3);
         let session = make_session(vec![text_response("Hello")]).await;
         let agent_id = manager.spawn(session, "Do something".into(), 0).unwrap();
-        assert!(manager.get(&agent_id).is_some());
+        assert!(manager.contains(&agent_id));
 
-        let result = manager.close(&agent_id);
+        let result = manager.close_agent(&agent_id).await;
         assert!(result.is_ok());
         assert!(matches!(
             manager.status(&agent_id),
@@ -559,7 +914,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_input_nonexistent_agent_errors() {
-        let manager = SubAgentManager::new(3);
+        let manager = SubAgentSupervisor::new(3);
         let result = manager.send_input("nonexistent-id", "hello");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("No agent found"));
@@ -567,7 +922,7 @@ mod tests {
 
     #[tokio::test]
     async fn wait_nonexistent_agent_errors() {
-        let mut manager = SubAgentManager::new(3);
+        let manager = SubAgentSupervisor::new(3);
         let result = manager.wait("nonexistent-id").await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("No agent found"));
@@ -575,7 +930,7 @@ mod tests {
 
     #[tokio::test]
     async fn wait_returns_result() {
-        let mut manager = SubAgentManager::new(3);
+        let manager = SubAgentSupervisor::new(3);
         let session = make_session(vec![text_response("Task completed successfully")]).await;
         let agent_id = manager.spawn(session, "Do something".into(), 0).unwrap();
 
@@ -591,9 +946,60 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn wait_tool_returns_when_context_is_cancelled() {
+        let child_cancel = CancellationToken::new();
+        let child_cancel_probe = child_cancel.clone();
+        let task_cancel = child_cancel.clone();
+        let task = tokio::spawn(async move {
+            task_cancel.cancelled().await;
+            Ok(SubAgentResult {
+                output:     String::new(),
+                success:    false,
+                turns_used: 0,
+            })
+        });
+
+        let agent_id = "blocked-agent".to_string();
+        let manager = SubAgentSupervisor::new(3);
+        manager.supervise_test_task(agent_id.clone(), task, child_cancel, None);
+
+        let tool = make_wait_tool(manager.clone());
+        let tool_cancel = CancellationToken::new();
+        let ctx = ToolContext {
+            env:                 Arc::new(MockSandbox::default()),
+            cancel:              tool_cancel.clone(),
+            tool_env_provider:   None,
+            session_id:          None,
+            root_session_id:     None,
+            tool_call_id:        None,
+            agent_event_emitter: None,
+        };
+        let mut wait = (tool.executor)(serde_json::json!({ "agent_id": agent_id }), ctx);
+
+        assert!(
+            futures::poll!(wait.as_mut()).is_pending(),
+            "blocked subagent should leave the wait tool pending"
+        );
+        tool_cancel.cancel();
+
+        let result = time::timeout(std::time::Duration::from_millis(100), wait.as_mut()).await;
+        drop(wait);
+        manager.shutdown_all().await;
+
+        let result =
+            result.expect("wait tool should return promptly when its context is cancelled");
+        assert_eq!(result, Err("Cancelled".to_string()));
+        assert!(child_cancel_probe.is_cancelled());
+        assert!(matches!(
+            manager.status(&agent_id),
+            Some(SubAgentStatus::Closed)
+        ));
+    }
+
     #[test]
     fn tool_definitions_correct() {
-        let manager = Arc::new(AsyncMutex::new(SubAgentManager::new(3)));
+        let manager = SubAgentSupervisor::new(3);
         let factory: SessionFactory = Arc::new(|| {
             panic!("should not be called");
         });
@@ -652,7 +1058,7 @@ mod tests {
     #[tokio::test]
     async fn callback_captures_spawn_event() {
         let (cb, events) = captured_events();
-        let mut manager = SubAgentManager::new(3);
+        let manager = SubAgentSupervisor::new(3);
         manager.set_event_callback(cb);
 
         let session = make_session(vec![text_response("Hello")]).await;
@@ -670,7 +1076,7 @@ mod tests {
     #[tokio::test]
     async fn callback_captures_wait_completed_event() {
         let (cb, events) = captured_events();
-        let mut manager = SubAgentManager::new(3);
+        let manager = SubAgentSupervisor::new(3);
         manager.set_event_callback(cb);
 
         let session = make_session(vec![text_response("done")]).await;
@@ -691,12 +1097,12 @@ mod tests {
     #[tokio::test]
     async fn callback_captures_close_event() {
         let (cb, events) = captured_events();
-        let mut manager = SubAgentManager::new(3);
+        let manager = SubAgentSupervisor::new(3);
         manager.set_event_callback(cb);
 
         let session = make_session(vec![text_response("Hello")]).await;
         let agent_id = manager.spawn(session, "task".into(), 1).unwrap();
-        manager.close(&agent_id).unwrap();
+        manager.close_agent(&agent_id).await.unwrap();
 
         let captured = events.lock().unwrap();
         assert!(captured.iter().any(|e| matches!(
@@ -708,7 +1114,7 @@ mod tests {
     #[tokio::test]
     async fn callback_forwards_child_events() {
         let (cb, events) = captured_events();
-        let mut manager = SubAgentManager::new(3);
+        let manager = SubAgentSupervisor::new(3);
         manager.set_event_callback(cb);
 
         let session = make_session(vec![text_response("Hello")]).await;
@@ -769,7 +1175,7 @@ mod tests {
     #[test]
     fn no_callback_does_not_panic() {
         // Manager without callback should not panic on emit
-        let manager = SubAgentManager::new(3);
+        let manager = SubAgentSupervisor::new(3);
         manager.emit_event(AgentEvent::SubAgentClosed {
             agent_id: "x".into(),
             depth:    0,
@@ -778,15 +1184,15 @@ mod tests {
 
     #[tokio::test]
     async fn close_all_closes_all_agents() {
-        let mut manager = SubAgentManager::new(3);
+        let manager = SubAgentSupervisor::new(3);
         let session1 = make_session(vec![text_response("Hello")]).await;
         let session2 = make_session(vec![text_response("World")]).await;
         let id1 = manager.spawn(session1, "Task 1".into(), 0).unwrap();
         let id2 = manager.spawn(session2, "Task 2".into(), 0).unwrap();
-        assert!(manager.get(&id1).is_some());
-        assert!(manager.get(&id2).is_some());
+        assert!(manager.contains(&id1));
+        assert!(manager.contains(&id2));
 
-        manager.close_all();
+        manager.shutdown_all().await;
 
         assert!(matches!(manager.status(&id1), Some(SubAgentStatus::Closed)));
         assert!(matches!(manager.status(&id2), Some(SubAgentStatus::Closed)));
@@ -794,14 +1200,14 @@ mod tests {
 
     #[tokio::test]
     async fn close_all_on_empty_manager_is_noop() {
-        let mut manager = SubAgentManager::new(3);
-        manager.close_all(); // should not panic
-        assert!(manager.agents.is_empty());
+        let manager = SubAgentSupervisor::new(3);
+        manager.shutdown_all().await;
+        assert!(manager.is_empty());
     }
 
     #[tokio::test]
     async fn wait_twice_returns_cached_result() {
-        let mut manager = SubAgentManager::new(3);
+        let manager = SubAgentSupervisor::new(3);
         let session = make_session(vec![text_response("cached output")]).await;
         let agent_id = manager.spawn(session, "Do something".into(), 0).unwrap();
 
@@ -818,7 +1224,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_final_response_is_not_reported_as_success() {
-        let mut manager = SubAgentManager::new(3);
+        let manager = SubAgentSupervisor::new(3);
         let session = make_session(vec![text_response("")]).await;
         let agent_id = manager.spawn(session, "Do something".into(), 0).unwrap();
 
@@ -833,7 +1239,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_input_to_completed_agent_errors() {
-        let mut manager = SubAgentManager::new(3);
+        let manager = SubAgentSupervisor::new(3);
         let session = make_session(vec![text_response("done")]).await;
         let agent_id = manager.spawn(session, "Do something".into(), 0).unwrap();
         let _ = manager.wait(&agent_id).await.unwrap();
@@ -845,10 +1251,10 @@ mod tests {
 
     #[tokio::test]
     async fn send_input_to_closed_agent_errors() {
-        let mut manager = SubAgentManager::new(3);
+        let manager = SubAgentSupervisor::new(3);
         let session = make_session(vec![text_response("Hello")]).await;
         let agent_id = manager.spawn(session, "Do something".into(), 0).unwrap();
-        manager.close(&agent_id).unwrap();
+        manager.close_agent(&agent_id).await.unwrap();
 
         let result = manager.send_input(&agent_id, "hello");
         assert!(result.is_err());
@@ -857,19 +1263,19 @@ mod tests {
 
     #[tokio::test]
     async fn close_already_closed_agent_errors() {
-        let mut manager = SubAgentManager::new(3);
+        let manager = SubAgentSupervisor::new(3);
         let session = make_session(vec![text_response("Hello")]).await;
         let agent_id = manager.spawn(session, "Do something".into(), 0).unwrap();
-        manager.close(&agent_id).unwrap();
+        manager.close_agent(&agent_id).await.unwrap();
 
-        let result = manager.close(&agent_id);
+        let result = manager.close_agent(&agent_id).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("already closed"));
     }
 
     #[tokio::test]
-    async fn close_completed_agent_succeeds() {
-        let mut manager = SubAgentManager::new(3);
+    async fn close_completed_agent_preserves_finished_result() {
+        let manager = SubAgentSupervisor::new(3);
         let session = make_session(vec![text_response("done")]).await;
         let agent_id = manager.spawn(session, "Do something".into(), 0).unwrap();
         let _ = manager.wait(&agent_id).await.unwrap();
@@ -878,17 +1284,17 @@ mod tests {
             Some(SubAgentStatus::Finished(Ok(_)))
         ));
 
-        let result = manager.close(&agent_id);
-        assert!(result.is_ok());
+        let result = manager.close_agent(&agent_id).await;
+        assert!(result.is_err());
         assert!(matches!(
             manager.status(&agent_id),
-            Some(SubAgentStatus::Closed)
+            Some(SubAgentStatus::Finished(Ok(_)))
         ));
     }
 
     #[tokio::test]
     async fn status_is_running_after_spawn() {
-        let mut manager = SubAgentManager::new(3);
+        let manager = SubAgentSupervisor::new(3);
         let session = make_session(vec![text_response("Hello")]).await;
         let agent_id = manager.spawn(session, "Do something".into(), 0).unwrap();
         assert!(matches!(
@@ -899,13 +1305,189 @@ mod tests {
 
     #[tokio::test]
     async fn wait_on_closed_agent_errors() {
-        let mut manager = SubAgentManager::new(3);
+        let manager = SubAgentSupervisor::new(3);
         let session = make_session(vec![text_response("Hello")]).await;
         let agent_id = manager.spawn(session, "Do something".into(), 0).unwrap();
-        manager.close(&agent_id).unwrap();
+        manager.close_agent(&agent_id).await.unwrap();
 
         let result = manager.wait(&agent_id).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("has been closed"));
+    }
+
+    #[tokio::test]
+    async fn natural_completion_updates_status_without_a_waiter() {
+        let (callback, events) = captured_events();
+        let supervisor = SubAgentSupervisor::new(3);
+        supervisor.set_event_callback(callback);
+        let session = make_session(vec![text_response("done")]).await;
+        let agent_id = supervisor.spawn(session, "task".into(), 0).unwrap();
+
+        time::timeout(Duration::from_secs(1), async {
+            while !matches!(
+                supervisor.status(&agent_id),
+                Some(SubAgentStatus::Finished(Ok(_)))
+            ) {
+                yield_now().await;
+            }
+        })
+        .await
+        .expect("child completion should update status without a waiter");
+
+        let completion_count = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    SubAgentCallbackEvent::Lifecycle(AgentEvent::SubAgentCompleted { .. })
+                )
+            })
+            .count();
+        assert_eq!(completion_count, 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_waiters_share_one_result_and_completion_event() {
+        let (callback, events) = captured_events();
+        let supervisor = SubAgentSupervisor::new(3);
+        supervisor.set_event_callback(callback);
+        let session = make_session(vec![text_response("shared")]).await;
+        let agent_id = supervisor.spawn(session, "task".into(), 0).unwrap();
+        let first_cancel = CancellationToken::new();
+        let second_cancel = CancellationToken::new();
+
+        let (first, second) = tokio::join!(
+            supervisor.wait_with_cancel(&agent_id, &first_cancel),
+            supervisor.wait_with_cancel(&agent_id, &second_cancel),
+        );
+
+        assert_eq!(first.unwrap().output, "shared");
+        assert_eq!(second.unwrap().output, "shared");
+        let completion_count = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    SubAgentCallbackEvent::Lifecycle(AgentEvent::SubAgentCompleted { .. })
+                )
+            })
+            .count();
+        assert_eq!(completion_count, 1);
+    }
+
+    #[tokio::test]
+    async fn uncooperative_child_and_forwarder_are_aborted_after_grace() {
+        struct DropProbe(Arc<std::sync::atomic::AtomicBool>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        time::pause();
+        let supervisor = SubAgentSupervisor::new(3);
+        let child_cancel = CancellationToken::new();
+        let child = tokio::spawn(async {
+            future::pending::<()>().await;
+            Ok(SubAgentResult {
+                output:     String::new(),
+                success:    false,
+                turns_used: 0,
+            })
+        });
+        let forwarder_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let forwarder_probe = Arc::clone(&forwarder_dropped);
+        let forwarder = tokio::spawn(async move {
+            let _probe = DropProbe(forwarder_probe);
+            future::pending::<()>().await;
+        });
+        let agent_id = "uncooperative".to_string();
+        supervisor.supervise_test_task(
+            agent_id.clone(),
+            child,
+            child_cancel.clone(),
+            Some(forwarder),
+        );
+
+        let closer = {
+            let supervisor = supervisor.clone();
+            let agent_id = agent_id.clone();
+            tokio::spawn(async move { supervisor.close_agent(&agent_id).await })
+        };
+        yield_now().await;
+
+        assert!(child_cancel.is_cancelled());
+        assert!(matches!(
+            supervisor.status(&agent_id),
+            Some(SubAgentStatus::Closing)
+        ));
+        assert!(!closer.is_finished());
+
+        time::advance(SUBAGENT_SHUTDOWN_GRACE).await;
+        yield_now().await;
+        closer.await.unwrap().unwrap();
+
+        assert!(matches!(
+            supervisor.status(&agent_id),
+            Some(SubAgentStatus::Closed)
+        ));
+        assert!(forwarder_dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn concurrent_shutdown_calls_wait_for_the_same_cleanup() {
+        let supervisor = SubAgentSupervisor::new(3);
+        let child_cancel = CancellationToken::new();
+        let task_cancel = child_cancel.clone();
+        let child = tokio::spawn(async move {
+            task_cancel.cancelled().await;
+            Ok(SubAgentResult {
+                output:     String::new(),
+                success:    false,
+                turns_used: 0,
+            })
+        });
+        let agent_id = "concurrent-close".to_string();
+        supervisor.supervise_test_task(agent_id.clone(), child, child_cancel, None);
+
+        let (first, second) = tokio::join!(supervisor.shutdown_all(), supervisor.shutdown_all());
+        assert_eq!(first, ());
+        assert_eq!(second, ());
+        assert!(matches!(
+            supervisor.status(&agent_id),
+            Some(SubAgentStatus::Closed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_callback_can_reenter_supervisor() {
+        let supervisor = SubAgentSupervisor::new(3);
+        let reentrant_supervisor = supervisor.clone();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_for_callback = Arc::clone(&observed);
+        supervisor.set_event_callback(Arc::new(move |event| {
+            let SubAgentCallbackEvent::Lifecycle(
+                AgentEvent::SubAgentSpawned { agent_id, .. }
+                | AgentEvent::SubAgentCompleted { agent_id, .. },
+            ) = event
+            else {
+                return;
+            };
+            observed_for_callback
+                .lock()
+                .unwrap()
+                .push(reentrant_supervisor.status(&agent_id).is_some());
+        }));
+
+        let session = make_session(vec![text_response("done")]).await;
+        let agent_id = supervisor.spawn(session, "task".into(), 0).unwrap();
+        supervisor.wait(&agent_id).await.unwrap();
+
+        assert_eq!(*observed.lock().unwrap(), vec![true, true]);
     }
 }
