@@ -33,23 +33,23 @@ pub fn validate(input: ValidateInput) -> Result<Validated, Error> {
         .all_provider_ids()
         .into_iter()
         .collect::<Vec<_>>();
-    validate_with_provider_sets(input, &eligible_providers, None)
+    validate_with_eligible_providers(input, &eligible_providers, false)
 }
 
-/// Parse, transform, and validate while preferring one provider snapshot and
-/// falling back to another only for provider-readiness selection failures.
-pub fn validate_with_provider_fallback(
+/// Parse, transform, and validate, resolving models against the ready
+/// providers first and falling back to the full catalog only for
+/// provider-readiness selection failures.
+pub fn validate_with_ready_providers(
     input: ValidateInput,
-    preferred_providers: &[ProviderId],
-    fallback_providers: &[ProviderId],
+    ready_providers: &[ProviderId],
 ) -> Result<Validated, Error> {
-    validate_with_provider_sets(input, preferred_providers, Some(fallback_providers))
+    validate_with_eligible_providers(input, ready_providers, true)
 }
 
-fn validate_with_provider_sets(
+fn validate_with_eligible_providers(
     input: ValidateInput,
     eligible_providers: &[ProviderId],
-    fallback_providers: Option<&[ProviderId]>,
+    catalog_fallback: bool,
 ) -> Result<Validated, Error> {
     let resolved = resolve_workflow(ResolveWorkflowInput {
         workflow: input.workflow,
@@ -79,7 +79,7 @@ fn validate_with_provider_sets(
             .filter(|provider| !provider.is_empty())
             .map(fabro_model::ProviderId::new),
         eligible_providers,
-        fallback_providers,
+        catalog_fallback,
         &input.catalog,
     )
 }

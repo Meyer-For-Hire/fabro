@@ -35,12 +35,10 @@ use fabro_util::check_report::{CheckDetail, CheckReport, CheckResult, CheckSecti
 use fabro_validate::Severity;
 use fabro_workflow::Error as WorkflowError;
 use fabro_workflow::operations::{
-    CreateRunInput, ValidateInput, WorkflowInput, validate, validate_with_provider_fallback,
+    CreateRunInput, ValidateInput, WorkflowInput, validate, validate_with_ready_providers,
 };
 use fabro_workflow::pipeline::Validated;
-#[cfg(test)]
-use fabro_workflow::run_materialization::materialize_run;
-use fabro_workflow::run_materialization::materialize_run_with_provider_fallback;
+use fabro_workflow::run_materialization::materialize_run_with_ready_providers;
 use fabro_workflow::workflow_bundle::{BundledWorkflow, ParsedWorkflowConfig, WorkflowBundle};
 use futures_util::stream::{self, StreamExt};
 use tokio::process::Command;
@@ -199,14 +197,7 @@ pub(crate) fn validate_prepared_manifest_with_vars(
     catalog: Arc<Catalog>,
     vars: HashMap<String, String>,
 ) -> Result<Validated, WorkflowError> {
-    validate(ValidateInput {
-        workflow: WorkflowInput::Bundled(prepared.workflow_input.clone()),
-        settings: prepared.settings.clone(),
-        vars,
-        cwd: prepared.cwd.clone(),
-        custom_transforms: Vec::new(),
-        catalog,
-    })
+    validate(manifest_validate_input(prepared, catalog, vars))
 }
 
 pub(crate) fn validate_prepared_manifest_for_preflight(
@@ -215,19 +206,25 @@ pub(crate) fn validate_prepared_manifest_for_preflight(
     vars: HashMap<String, String>,
     ready_providers: &[ProviderId],
 ) -> Result<Validated, WorkflowError> {
-    let fallback_providers = catalog.all_provider_ids().into_iter().collect::<Vec<_>>();
-    validate_with_provider_fallback(
-        ValidateInput {
-            workflow: WorkflowInput::Bundled(prepared.workflow_input.clone()),
-            settings: prepared.settings.clone(),
-            vars,
-            cwd: prepared.cwd.clone(),
-            custom_transforms: Vec::new(),
-            catalog,
-        },
+    validate_with_ready_providers(
+        manifest_validate_input(prepared, catalog, vars),
         ready_providers,
-        &fallback_providers,
     )
+}
+
+fn manifest_validate_input(
+    prepared: &PreparedManifest,
+    catalog: Arc<Catalog>,
+    vars: HashMap<String, String>,
+) -> ValidateInput {
+    ValidateInput {
+        workflow: WorkflowInput::Bundled(prepared.workflow_input.clone()),
+        settings: prepared.settings.clone(),
+        vars,
+        cwd: prepared.cwd.clone(),
+        custom_transforms: Vec::new(),
+        catalog,
+    }
 }
 
 pub(crate) fn create_run_input(
@@ -262,11 +259,10 @@ pub(crate) async fn run_preflight(
     state: &AppState,
     prepared: &PreparedManifest,
     validated: &Validated,
-    preferred_providers: &[ProviderId],
     llm_result: Result<LlmClientResult>,
 ) -> Result<(types::PreflightResponse, bool)> {
     let (report, checks_ok) =
-        build_preflight_report(state, prepared, validated, preferred_providers, llm_result).await?;
+        build_preflight_report(state, prepared, validated, llm_result).await?;
     let preflight_ok = !validated.has_errors() && checks_ok;
     Ok((
         preflight_response(
@@ -485,7 +481,6 @@ async fn build_preflight_report(
     state: &AppState,
     prepared: &PreparedManifest,
     validated: &Validated,
-    preferred_providers: &[ProviderId],
     llm_result: Result<LlmClientResult>,
 ) -> Result<(CheckReport, bool)> {
     let graph = validated.graph();
@@ -504,15 +499,23 @@ async fn build_preflight_report(
     }
 
     let catalog = state.catalog();
-    let fallback_providers = catalog.all_provider_ids().into_iter().collect::<Vec<_>>();
-    let materialized = materialize_run_with_provider_fallback(
+    let ready_providers = llm_result
+        .as_ref()
+        .map(LlmClientResult::provider_ids)
+        .unwrap_or_default();
+    let materialized = materialize_run_with_ready_providers(
         prepared.settings.clone(),
         graph,
         catalog.as_ref(),
-        preferred_providers,
-        &fallback_providers,
+        &ready_providers,
     )?;
     let resolved_run = materialized.run;
+    let (Some(run_model), Some(run_provider)) = (
+        resolved_run.model.name.as_deref(),
+        resolved_run.model.provider.as_deref(),
+    ) else {
+        bail!("materialized run is missing a resolved model or provider");
+    };
     let server_settings = state.server_settings();
     let github_integration = &server_settings.server.integrations.github;
     let sandbox_provider = effective_sandbox_provider(&resolved_run);
@@ -575,7 +578,8 @@ async fn build_preflight_report(
     let llm_ok = run_llm_check(
         &mut checks,
         graph,
-        &resolved_run,
+        run_model,
+        run_provider,
         catalog.as_ref(),
         llm_result,
     )
@@ -1051,25 +1055,11 @@ struct PendingModelProbe {
 async fn run_llm_check(
     checks: &mut Vec<CheckResult>,
     graph: &Graph,
-    settings: &RunNamespace,
+    model: &str,
+    default_provider: &str,
     catalog: &Catalog,
     llm_result: Result<LlmClientResult>,
 ) -> bool {
-    let (Some(model), Some(default_provider)) = (
-        settings.model.name.as_deref(),
-        settings.model.provider.as_deref(),
-    ) else {
-        checks.push(CheckResult {
-            name:        "LLM".into(),
-            status:      CheckStatus::Error,
-            summary:     "model resolution failed".into(),
-            details:     Vec::new(),
-            remediation: Some(
-                "Preflight did not produce a resolved run model and provider".to_string(),
-            ),
-        });
-        return false;
-    };
     let mut model_providers = std::collections::BTreeSet::new();
     let mut has_llm_nodes = false;
 
@@ -1388,6 +1378,7 @@ fn report_to_api(report: &CheckReport) -> types::PreflightCheckReport {
 mod tests {
     use fabro_model::ProviderId;
     use fabro_model::catalog::LlmCatalogSettings;
+    use fabro_workflow::run_materialization::materialize_run;
 
     use super::*;
 
@@ -1563,29 +1554,18 @@ digraph Demo {{
         )
         .unwrap();
 
-        run_preflight(
-            state.as_ref(),
-            &prepared,
-            &validated,
-            &ready_providers,
-            llm_result,
-        )
-        .await
-        .unwrap()
+        run_preflight(state.as_ref(), &prepared, &validated, llm_result)
+            .await
+            .unwrap()
     }
 
-    async fn run_preflight_with_catalog_routes(
+    async fn resolve_and_run_preflight(
         state: &AppState,
         prepared: &PreparedManifest,
         validated: &Validated,
     ) -> Result<(types::PreflightResponse, bool)> {
         let llm_result = state.resolve_llm_client().await;
-        let preferred_providers = state
-            .catalog()
-            .all_provider_ids()
-            .into_iter()
-            .collect::<Vec<_>>();
-        run_preflight(state, prepared, validated, &preferred_providers, llm_result).await
+        run_preflight(state, prepared, validated, llm_result).await
     }
 
     fn manifest_workflow() -> types::ManifestWorkflow {
@@ -2217,10 +2197,9 @@ name = "Control Plane"
 
         assert!(validated.has_errors());
 
-        let (response, ok) =
-            run_preflight_with_catalog_routes(state.as_ref(), &prepared, &validated)
-                .await
-                .unwrap();
+        let (response, ok) = resolve_and_run_preflight(state.as_ref(), &prepared, &validated)
+            .await
+            .unwrap();
 
         assert!(!ok);
         assert_eq!(response.workflow.name, "Invalid");
@@ -2262,10 +2241,9 @@ issues = "read"
         let validated = validate_prepared_manifest(&prepared, test_catalog()).unwrap();
         assert!(!validated.has_errors());
 
-        let (response, _ok) =
-            run_preflight_with_catalog_routes(state.as_ref(), &prepared, &validated)
-                .await
-                .unwrap();
+        let (response, _ok) = resolve_and_run_preflight(state.as_ref(), &prepared, &validated)
+            .await
+            .unwrap();
 
         assert!(
             response.checks.sections[0]
@@ -2314,10 +2292,9 @@ id = "local"
 
         assert!(!validated.has_errors());
 
-        let (response, ok) =
-            run_preflight_with_catalog_routes(state.as_ref(), &prepared, &validated)
-                .await
-                .unwrap();
+        let (response, ok) = resolve_and_run_preflight(state.as_ref(), &prepared, &validated)
+            .await
+            .unwrap();
 
         assert!(ok);
         assert!(response.workflow.diagnostics.is_empty());
@@ -2422,10 +2399,9 @@ id = "daytona"
         .unwrap();
         let validated = validate_prepared_manifest(&prepared, test_catalog()).unwrap();
 
-        let (response, _ok) =
-            run_preflight_with_catalog_routes(state.as_ref(), &prepared, &validated)
-                .await
-                .unwrap();
+        let (response, _ok) = resolve_and_run_preflight(state.as_ref(), &prepared, &validated)
+            .await
+            .unwrap();
 
         assert!(response.workflow.diagnostics.is_empty());
         assert!(
@@ -2491,10 +2467,9 @@ digraph Demo {
         .unwrap();
         let validated = validate_prepared_manifest(&prepared, test_catalog()).unwrap();
 
-        let (response, ok) =
-            run_preflight_with_catalog_routes(state.as_ref(), &prepared, &validated)
-                .await
-                .unwrap();
+        let (response, ok) = resolve_and_run_preflight(state.as_ref(), &prepared, &validated)
+            .await
+            .unwrap();
 
         assert!(!ok);
         let llm_check = response.checks.sections[0]
@@ -2677,15 +2652,9 @@ digraph Demo {
         )
         .unwrap();
 
-        let (response, ok) = run_preflight(
-            state.as_ref(),
-            &prepared,
-            &validated,
-            &ready_providers,
-            llm_result,
-        )
-        .await
-        .unwrap();
+        let (response, ok) = run_preflight(state.as_ref(), &prepared, &validated, llm_result)
+            .await
+            .unwrap();
 
         assert!(!ok);
         let llm_check = response.checks.sections[0]

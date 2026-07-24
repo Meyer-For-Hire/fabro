@@ -1445,14 +1445,26 @@ impl AppState {
         self.llm_source.configured_providers(catalog.as_ref()).await
     }
 
-    pub(crate) async fn ready_llm_provider_ids(&self) -> Vec<ProviderId> {
-        match self.resolve_llm_client().await {
-            Ok(result) => result.provider_ids(),
-            Err(err) => {
-                warn!(error = ?err, "Failed to resolve LLM client while checking ready providers");
-                Vec::new()
-            }
+    /// Resolve the LLM client once and derive the ready provider IDs from it,
+    /// logging a warning when resolution fails. Callers that need both values
+    /// must use this instead of `ready_llm_provider_ids` so the client is not
+    /// resolved twice.
+    pub(crate) async fn resolve_llm_client_with_ready_ids(
+        &self,
+    ) -> (anyhow::Result<LlmClientResult>, Vec<ProviderId>) {
+        let llm_result = self.resolve_llm_client().await;
+        if let Err(err) = &llm_result {
+            warn!(error = ?err, "Failed to resolve LLM client while checking ready providers");
         }
+        let ready_provider_ids = llm_result
+            .as_ref()
+            .map(LlmClientResult::provider_ids)
+            .unwrap_or_default();
+        (llm_result, ready_provider_ids)
+    }
+
+    pub(crate) async fn ready_llm_provider_ids(&self) -> Vec<ProviderId> {
+        self.resolve_llm_client_with_ready_ids().await.1
     }
 
     pub(crate) async fn decorate_run_summary(&self, run: fabro_types::Run) -> fabro_types::Run {

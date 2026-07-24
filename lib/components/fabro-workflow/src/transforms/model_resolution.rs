@@ -13,7 +13,7 @@ pub struct ModelResolutionTransform {
     catalog:            Arc<Catalog>,
     default_provider:   Option<ProviderId>,
     eligible_providers: HashSet<ProviderId>,
-    fallback_providers: Option<HashSet<ProviderId>>,
+    catalog_fallback:   bool,
 }
 
 impl ModelResolutionTransform {
@@ -24,7 +24,7 @@ impl ModelResolutionTransform {
             catalog,
             default_provider: None,
             eligible_providers,
-            fallback_providers: None,
+            catalog_fallback: false,
         }
     }
 
@@ -34,7 +34,7 @@ impl ModelResolutionTransform {
             catalog,
             default_provider: None,
             eligible_providers,
-            fallback_providers: None,
+            catalog_fallback: false,
         }
     }
 
@@ -44,12 +44,11 @@ impl ModelResolutionTransform {
         self
     }
 
+    /// When enabled, provider-readiness selection failures fall back to the
+    /// full catalog instead of erroring.
     #[must_use]
-    pub fn with_fallback_providers(
-        mut self,
-        fallback_providers: Option<HashSet<ProviderId>>,
-    ) -> Self {
-        self.fallback_providers = fallback_providers;
+    pub fn with_catalog_fallback(mut self, catalog_fallback: bool) -> Self {
+        self.catalog_fallback = catalog_fallback;
         self
     }
 
@@ -58,18 +57,15 @@ impl ModelResolutionTransform {
         model: &str,
         explicit_provider: Option<&ProviderId>,
     ) -> Result<(String, ProviderId), Error> {
-        let selected = match &self.fallback_providers {
-            Some(fallback_providers) => self.catalog.resolve_selection_with_fallback(
+        let selected = if self.catalog_fallback {
+            self.catalog.resolve_selection_with_catalog_fallback(
                 Some(model),
                 explicit_provider,
                 &self.eligible_providers,
-                fallback_providers,
-            ),
-            None => self.catalog.resolve_selection(
-                Some(model),
-                explicit_provider,
-                &self.eligible_providers,
-            ),
+            )
+        } else {
+            self.catalog
+                .resolve_selection(Some(model), explicit_provider, &self.eligible_providers)
         }?;
         Ok((selected.model, selected.provider))
     }
@@ -378,7 +374,7 @@ enabled = true
             Arc::clone(&catalog),
             HashSet::from([ProviderId::new("openrouter")]),
         )
-        .with_fallback_providers(Some(catalog.all_provider_ids()))
+        .with_catalog_fallback(true)
         .apply(graph)
         .unwrap();
 
