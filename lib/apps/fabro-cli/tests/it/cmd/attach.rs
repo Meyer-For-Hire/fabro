@@ -1169,6 +1169,7 @@ fn attach_json_errors_without_prompting_for_human_input() {
         "node_label": "Start",
         "properties": {
           "attempt": 1,
+          "graph_visit": 1,
           "handler_type": "start",
           "index": 0,
           "max_attempts": 1
@@ -1257,6 +1258,7 @@ fn attach_json_errors_without_prompting_for_human_input() {
             "outcome": "succeeded"
           },
           "current_node": "start",
+          "graph_visit": 1,
           "next_node_id": "approve",
           "node_outcomes": {
             "start": {
@@ -1284,6 +1286,7 @@ fn attach_json_errors_without_prompting_for_human_input() {
         "node_label": "Approve?",
         "properties": {
           "attempt": 1,
+          "graph_visit": 1,
           "handler_type": "human",
           "index": 1,
           "max_attempts": 1

@@ -1025,6 +1025,7 @@ mod tests {
             Arc::new(SandboxGitRuntime::new()),
             metadata_runtime,
             metadata_writer,
+            crate::stage_execution::StageExecutionTracker::default(),
         )
     }
 
@@ -1057,6 +1058,7 @@ mod tests {
             Arc::new(SandboxGitRuntime::new()),
             Arc::new(RunMetadataRuntime::new()),
             None,
+            crate::stage_execution::StageExecutionTracker::default(),
         );
         let executed = test_executed(
             Graph::new("test"),

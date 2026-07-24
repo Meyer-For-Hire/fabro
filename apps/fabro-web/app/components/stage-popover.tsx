@@ -1,4 +1,5 @@
 import { useMemo } from "react";
+import { Link } from "react-router";
 import type { StageState } from "@qltysh/fabro-api-client";
 
 import { formatTokenCount } from "../lib/format";
@@ -223,6 +224,21 @@ export function StagePopover({ runId, stage, duration }: StagePopoverProps) {
         {duration !== "--" && (
           <PopoverRow label="Duration">
             <span className="font-mono tabular-nums">{duration}</span>
+          </PopoverRow>
+        )}
+        {stage.resumedFromStageId && (
+          <PopoverRow label="Resumed from">
+            <Link
+              to={`/runs/${runId}/stages/${encodeURIComponent(stage.resumedFromStageId)}`}
+              className="font-mono text-teal-500 hover:underline"
+            >
+              {stage.resumedFromStageId}
+            </Link>
+          </PopoverRow>
+        )}
+        {stage.graphVisit != null && stage.graphVisit !== stage.visit && (
+          <PopoverRow label="Graph visit">
+            <span className="font-mono tabular-nums">{stage.graphVisit}</span>
           </PopoverRow>
         )}
         <StatusTail stage={stage} summary={summary} loading={loading} />

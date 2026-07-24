@@ -18,6 +18,7 @@ use crate::context::{Context, WorkflowContext};
 use crate::event::{Emitter, Event, StageScope};
 use crate::graph::{WorkflowGraph, WorkflowNode};
 use crate::outcome::{BilledModelUsage, FailureCategory, FailureDetail, Outcome, StageOutcome};
+use crate::stage_execution::{StageExecution, StageExecutionTracker};
 use crate::{artifact, context};
 
 type WfRunState = ExecutionState<Option<BilledModelUsage>>;
@@ -46,6 +47,8 @@ pub(crate) struct EventLifecycle {
     /// EventLifecycle when emitting CheckpointCompleted).
     pub checkpoint_git_result: Arc<Mutex<Option<GitCheckpointResult>>>,
     pub circuit_breaker:       Arc<CircuitBreakerLifecycle>,
+    /// Run-scoped stage execution allocator shared with `RunServices`.
+    pub stage_executions:      StageExecutionTracker,
 }
 
 fn snapshot_failure_signatures(
@@ -92,13 +95,16 @@ fn response_from_outcome(node_id: &str, outcome: &Outcome) -> Option<String> {
         .and_then(|value| value.as_str().map(ToOwned::to_owned))
 }
 
-/// Context values for `StageCompleted` events. Unlike
-/// `artifact::strip_transient_keys`, this keeps `CURRENT_PREAMBLE` — stage
-/// events have always included the active preamble — and drops only the
-/// parallel stash, which can embed every branch's rendered preamble.
+/// Context values for `StageCompleted` events. Runtime-only keys are stripped,
+/// except for `CURRENT_PREAMBLE`, which stage events have historically
+/// included.
 fn stage_context_values(workflow_context: &Context) -> Option<BTreeMap<String, serde_json::Value>> {
     let mut snapshot = workflow_context.snapshot();
-    snapshot.remove(context::keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES);
+    let preamble = snapshot.get(context::keys::CURRENT_PREAMBLE).cloned();
+    artifact::strip_transient_keys(&mut snapshot);
+    if let Some(preamble) = preamble {
+        snapshot.insert(context::keys::CURRENT_PREAMBLE.to_owned(), preamble);
+    }
     (!snapshot.is_empty()).then(|| snapshot.into_iter().collect())
 }
 
@@ -107,13 +113,38 @@ pub(super) fn stage_visit(state: &WfRunState, node_id: &str) -> u32 {
     u32::try_from(visits).unwrap_or(u32::MAX)
 }
 
-pub(crate) fn stage_scope_for(state: &WfRunState, node_id: &str) -> StageScope {
+fn stage_scope_from_execution(
+    execution: Option<&StageExecution>,
+    state: &WfRunState,
+    node_id: &str,
+) -> StageScope {
+    let (node_id, visit) = execution.map_or_else(
+        || (node_id.to_owned(), stage_visit(state, node_id)),
+        |execution| {
+            (
+                execution.stage_id.node_id().to_owned(),
+                execution.stage_id.visit(),
+            )
+        },
+    );
     StageScope {
-        node_id:            node_id.to_string(),
-        visit:              stage_visit(state, node_id),
-        parallel_group_id:  state.context.parallel_group_id(),
+        node_id,
+        visit,
+        parallel_group_id: state.context.parallel_group_id(),
         parallel_branch_id: state.context.parallel_branch_id(),
     }
+}
+
+/// Build the emission scope for a node from its active stage execution.
+/// Falls back to the graph visit for direct unit-test call sites that emit
+/// without a reservation; the two are equal for a first execution.
+pub(crate) fn stage_scope_for(
+    stage_executions: &StageExecutionTracker,
+    state: &WfRunState,
+    node_id: &str,
+) -> StageScope {
+    let execution = stage_executions.active(node_id);
+    stage_scope_from_execution(execution.as_deref(), state, node_id)
 }
 
 #[async_trait]
@@ -160,17 +191,24 @@ impl RunLifecycle<WorkflowGraph> for EventLifecycle {
         }
         let gv = node.inner();
         let stage_index = state.stage_index;
-        let scope = stage_scope_for(state, &gv.id);
+        // Terminal nodes bypass `before_node`/`before_attempt`, so their
+        // synthetic paired events reserve an execution here.
+        let execution = self
+            .stage_executions
+            .reserve(&gv.id, stage_visit(state, &gv.id));
+        let scope = stage_scope_from_execution(Some(&execution), state, &gv.id);
         let (loop_failure_signatures, restart_failure_signatures) =
             snapshot_failure_signatures(&self.circuit_breaker);
         self.emitter.emit_scoped(
             &Event::StageStarted {
-                node_id:      gv.id.clone(),
-                name:         gv.label().to_string(),
-                index:        stage_index,
-                handler_type: gv.handler_type().unwrap_or_default().to_string(),
-                attempt:      1,
-                max_attempts: 1,
+                node_id:               gv.id.clone(),
+                name:                  gv.label().to_string(),
+                index:                 stage_index,
+                handler_type:          gv.handler_type().unwrap_or_default().to_string(),
+                attempt:               1,
+                max_attempts:          1,
+                graph_visit:           Some(execution.graph_visit),
+                resumed_from_stage_id: execution.resumed_from.clone(),
             },
             &scope,
         );
@@ -210,15 +248,23 @@ impl RunLifecycle<WorkflowGraph> for EventLifecycle {
         state: &WfRunState,
     ) -> CoreResult<NodeDecision<Option<BilledModelUsage>>> {
         let gv = ctx.node.inner();
-        let scope = stage_scope_for(state, &gv.id);
+        let execution = self.stage_executions.active(&gv.id);
+        let scope = stage_scope_from_execution(execution.as_deref(), state, &gv.id);
+        let graph_visit = execution
+            .as_ref()
+            .map_or_else(|| stage_visit(state, &gv.id), |e| e.graph_visit);
         self.emitter.emit_scoped(
             &Event::StageStarted {
-                node_id:      gv.id.clone(),
-                name:         gv.label().to_string(),
-                index:        state.stage_index,
-                handler_type: gv.handler_type().unwrap_or_default().to_string(),
-                attempt:      ctx.attempt as usize,
-                max_attempts: ctx.max_attempts as usize,
+                node_id:               gv.id.clone(),
+                name:                  gv.label().to_string(),
+                index:                 state.stage_index,
+                handler_type:          gv.handler_type().unwrap_or_default().to_string(),
+                attempt:               ctx.attempt as usize,
+                max_attempts:          ctx.max_attempts as usize,
+                graph_visit:           Some(graph_visit),
+                resumed_from_stage_id: execution
+                    .as_ref()
+                    .and_then(|execution| execution.resumed_from.clone()),
             },
             &scope,
         );
@@ -234,7 +280,7 @@ impl RunLifecycle<WorkflowGraph> for EventLifecycle {
             let gv = ctx.node.inner();
             let outcome = &ctx.result.outcome;
             let stage_index = state.stage_index;
-            let scope = stage_scope_for(state, &gv.id);
+            let scope = stage_scope_for(&self.stage_executions, state, &gv.id);
 
             let timing = node_result_timing(ctx.result);
             let failure = outcome.failure.clone().unwrap_or_else(|| {
@@ -283,7 +329,7 @@ impl RunLifecycle<WorkflowGraph> for EventLifecycle {
         }
         let gv = node.inner();
         let stage_index = state.stage_index;
-        let scope = stage_scope_for(state, &gv.id);
+        let scope = stage_scope_for(&self.stage_executions, state, &gv.id);
         let timing = node_result_timing(result);
         let (loop_failure_signatures, restart_failure_signatures) =
             snapshot_failure_signatures(&self.circuit_breaker);
@@ -400,7 +446,11 @@ impl RunLifecycle<WorkflowGraph> for EventLifecycle {
         node_outcomes.insert(node.id().to_string(), result.outcome.clone());
         artifact::normalize_durable_outcomes(&mut node_outcomes);
 
-        let scope = stage_scope_for(state, node.id());
+        let execution = self.stage_executions.active(node.id());
+        let scope = stage_scope_from_execution(execution.as_deref(), state, node.id());
+        let graph_visit = execution
+            .as_ref()
+            .map_or_else(|| stage_visit(state, node.id()), |e| e.graph_visit);
         self.emitter.emit_scoped(
             &Event::CheckpointCompleted {
                 node_id: node.id().to_string(),
@@ -425,6 +475,10 @@ impl RunLifecycle<WorkflowGraph> for EventLifecycle {
                     .collect::<BTreeMap<_, _>>(),
                 diff,
                 diff_summary,
+                graph_visit: Some(graph_visit),
+                resumed_from_stage_id: execution
+                    .as_ref()
+                    .and_then(|execution| execution.resumed_from.clone()),
             },
             &scope,
         );
@@ -458,17 +512,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stage_context_values_drops_parallel_branch_preambles() {
+    fn stage_context_values_drops_runtime_keys_but_keeps_current_preamble() {
         let workflow_context = Context::new();
         workflow_context.set(
             context::keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES,
             serde_json::json!([{"fidelity": "summary:high", "preamble": "runtime only"}]),
+        );
+        workflow_context.set(
+            context::keys::INTERNAL_STAGE_EXECUTION_ORDINAL,
+            serde_json::json!(2),
+        );
+        workflow_context.set(
+            context::keys::CURRENT_PREAMBLE,
+            serde_json::json!("active preamble"),
         );
         workflow_context.set("response.work", serde_json::json!("durable"));
 
         let values = stage_context_values(&workflow_context).expect("snapshot should not be empty");
 
         assert!(!values.contains_key(context::keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES));
+        assert!(!values.contains_key(context::keys::INTERNAL_STAGE_EXECUTION_ORDINAL));
+        assert_eq!(
+            values.get(context::keys::CURRENT_PREAMBLE),
+            Some(&serde_json::json!("active preamble"))
+        );
         assert_eq!(
             values.get("response.work"),
             Some(&serde_json::json!("durable"))

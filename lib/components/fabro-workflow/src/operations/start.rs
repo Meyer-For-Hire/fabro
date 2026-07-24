@@ -38,8 +38,9 @@ use crate::handler::HandlerRegistry;
 use crate::outcome::{Outcome, StageOutcome};
 use crate::pipeline::{
     self, FinalizeOptions, Finalized, InitOptions, LlmSpec, Persisted, PullRequestOptions,
-    SandboxEnvSpec, build_conclusion_from_store, classify_engine_result,
+    ResumeState, SandboxEnvSpec, build_conclusion_from_store, classify_engine_result,
 };
+#[cfg(test)]
 use crate::records::Checkpoint;
 use crate::run_control::RunControlState;
 use crate::run_materialization::resolve_run_model;
@@ -174,7 +175,7 @@ pub async fn start(run_dir: &Path, services: StartServices) -> Result<Started, E
 
 pub(super) async fn execute_persisted_run(
     run_dir: &Path,
-    checkpoint: Option<Checkpoint>,
+    resume: Option<ResumeState>,
     services: StartServices,
 ) -> Result<Started, Error> {
     let cancel_token = services.cancel_token.clone();
@@ -261,7 +262,7 @@ pub(super) async fn execute_persisted_run(
         cancel_token,
     );
     let run_start = Instant::now();
-    let started = Box::pin(session.run(persisted, checkpoint)).await;
+    let started = Box::pin(session.run(persisted, resume)).await;
 
     match started {
         Ok(started) => {
@@ -797,7 +798,7 @@ impl RunSession {
     async fn run(
         self,
         persisted: Persisted,
-        checkpoint: Option<Checkpoint>,
+        resume: Option<ResumeState>,
     ) -> Result<Started, Error> {
         let on_node = self.on_node.clone();
 
@@ -878,7 +879,7 @@ impl RunSession {
             registry_override: self.registry_override,
             artifact_sink: self.artifact_sink,
             run_control: self.run_control,
-            checkpoint,
+            resume,
             seed_context: self.seed_context,
             fabro_run_tools: self.fabro_run_tools,
         };
@@ -2126,6 +2127,8 @@ reasoning = false
                 {
                     injected.store(true, Ordering::SeqCst);
                     emitter_for_injection.emit(&Event::CheckpointCompleted {
+                        graph_visit: None,
+                        resumed_from_stage_id: None,
                         node_id: "start".to_string(),
                         status: "succeeded".to_string(),
                         current_node: "start".to_string(),
@@ -2509,6 +2512,8 @@ reasoning = false
             &store.open_run(&fixtures::RUN_1).await.unwrap(),
             &services.run_id,
             &Event::CheckpointCompleted {
+                graph_visit: None,
+                resumed_from_stage_id: None,
                 node_id: checkpoint.current_node.clone(),
                 status: checkpoint
                     .node_outcomes
@@ -2607,6 +2612,8 @@ reasoning = false
         };
         let run_store = store.open_run(&fixtures::RUN_1).await.unwrap();
         crate::event::append_event(&run_store, &fixtures::RUN_1, &Event::CheckpointCompleted {
+            graph_visit: None,
+            resumed_from_stage_id: None,
             node_id: checkpoint.current_node.clone(),
             status: "succeeded".to_string(),
             current_node: checkpoint.current_node.clone(),

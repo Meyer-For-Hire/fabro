@@ -11,6 +11,8 @@ function makeStage(overrides: Partial<Stage> = {}): Stage {
     handler:   "agent",
     nodeId:    "implement",
     visit:     1,
+    graphVisit: null,
+    resumedFromStageId: null,
     status:    "running",
     duration:  "--",
     startedAt: null,
