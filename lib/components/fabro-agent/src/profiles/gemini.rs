@@ -227,10 +227,8 @@ in the project.";
 mod tests {
     use std::sync::Arc;
 
-    use tokio::sync::Mutex as AsyncMutex;
-
     use super::*;
-    use crate::subagent::{SessionFactory, SubAgentManager};
+    use crate::subagent::{SessionFactory, SubAgentSupervisor};
     use crate::test_support::MockSandbox;
 
     fn test_catalog() -> Arc<Catalog> {
@@ -329,11 +327,11 @@ mod tests {
     #[test]
     fn gemini_subagent_tools_registered() {
         let mut profile = GeminiProfile::new("gemini-2.0-flash");
-        let manager = Arc::new(AsyncMutex::new(SubAgentManager::new(3)));
+        let supervisor = SubAgentSupervisor::new(3);
         let factory: SessionFactory = Arc::new(|| {
             panic!("should not be called");
         });
-        profile.register_subagent_tools(manager, factory, 0);
+        profile.register_subagent_tools(supervisor, factory, 0);
         let names = profile.tool_registry().names();
         assert_eq!(names.len(), 14);
         assert!(names.contains(&"spawn_agent".to_string()));

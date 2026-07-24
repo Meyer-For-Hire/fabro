@@ -197,6 +197,7 @@ function makeRunSummary({
   title = "Run 1",
   askFabro = null as any,
   automation = null as any,
+  pendingControl = null as any,
 }: {
   status?: string;
   diffSummary?: any;
@@ -204,6 +205,7 @@ function makeRunSummary({
   title?: string;
   askFabro?: any;
   automation?: any;
+  pendingControl?: any;
 } = {}) {
   const apiStatus =
     status === "succeeded"
@@ -229,7 +231,7 @@ function makeRunSummary({
     lifecycle:        {
       status:          archived ? { kind: "succeeded", reason: "completed" } : apiStatus,
       approval:        null,
-      pending_control: null,
+      pending_control: pendingControl,
       queue_position:  null,
       error:           null,
       archived,
@@ -284,6 +286,7 @@ async function renderRunDetailHarness({
   title,
   askFabro = null,
   automation = null,
+  pendingControl = null,
 }: {
   initialEntry: string;
   status?: string;
@@ -293,8 +296,17 @@ async function renderRunDetailHarness({
   title?: string;
   askFabro?: any;
   automation?: any;
+  pendingControl?: any;
 }) {
-  currentRunSummary = makeRunSummary({ status, diffSummary, pullRequest, title, askFabro, automation });
+  currentRunSummary = makeRunSummary({
+    status,
+    diffSummary,
+    pullRequest,
+    title,
+    askFabro,
+    automation,
+    pendingControl,
+  });
   currentQuestions = questions;
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -801,6 +813,39 @@ describe("RunDetail full-height child routes", () => {
         node.props.href === "/runs/run_1/sandbox",
     );
     expect(sandboxLinks).toHaveLength(0);
+  });
+
+  test("keeps cancellation visibly pending from durable server state", async () => {
+    const renderer = await renderRunDetail({
+      initialEntry:   "/runs/run_1",
+      status:         "running",
+      pendingControl: "cancel",
+    });
+
+    const cancelButton = findButtonByText(renderer, "Cancelling…");
+    expect(cancelButton).toBeDefined();
+    expect(cancelButton!.props.disabled).toBe(true);
+  });
+
+  test("shows projected interrupt settlement until steering resumes", async () => {
+    currentRunState = {
+      stages: {
+        "code@1": {
+          agent_control: "waiting_for_steer",
+        },
+      },
+    };
+    const renderer = await renderRunDetail({
+      initialEntry: "/runs/run_1",
+      status:       "running",
+    });
+
+    const statuses = renderer.root.findAll(
+      (node) => node.type === "p" && node.props.role === "status",
+    );
+    expect(statuses.map(textFromTestNode)).toContain(
+      "Interrupted — waiting for steering",
+    );
   });
 
   test("defers steer bar focus until after the Actions menu item click settles", async () => {

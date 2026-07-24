@@ -8,7 +8,7 @@ import {
   canCancel,
   canDelete,
   canUnarchive,
-  isTerminalCancelledRun,
+  cancellationSuccessMessage,
   mapError,
   type LifecycleAction,
 } from "../../lib/run-actions";
@@ -92,7 +92,7 @@ export function handleLifecycleToastResult(
 
   if (intent === "cancel") {
     toastApi.push({
-      message: isTerminalCancelledRun(result.run) ? "Run cancelled." : "Cancellation requested.",
+      message: cancellationSuccessMessage(result.run),
     });
     return nextState;
   }

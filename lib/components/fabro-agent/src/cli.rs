@@ -26,16 +26,15 @@ use fabro_util::terminal::Styles;
 use fabro_vault::SecretStore;
 use tokio::io::{AsyncWriteExt, stdout};
 use tokio::signal;
-use tokio::sync::Mutex as AsyncMutex;
 
 use crate::config::{ToolApprovalAdapter, ToolApprovalFn, ToolHookCallback, ToolSecrets};
 use crate::error::InterruptReason;
-use crate::subagent::{SessionFactory, SubAgentManager};
+use crate::subagent::{SessionFactory, SubAgentSupervisor};
 use crate::tool_permissions::{is_auto_approved, tool_category};
 use crate::tools::WebFetchSummarizer;
 use crate::{
     AgentEvent, AgentProfile, AnthropicProfile, GeminiProfile, LocalSandbox, Message,
-    OpenAiProfile, Sandbox, Session, SessionOptions,
+    OpenAiProfile, Sandbox, Session, SessionOptions, SessionShutdownReason,
 };
 
 #[expect(
@@ -600,10 +599,8 @@ pub async fn run_with_args_and_client_and_catalog(
     };
 
     // Register subagent tools
-    let manager = Arc::new(AsyncMutex::new(SubAgentManager::new(
-        config.max_subagent_depth,
-    )));
-    let manager_for_callback = manager.clone();
+    let supervisor = SubAgentSupervisor::new(config.max_subagent_depth);
+    let supervisor_for_session = supervisor.clone();
     let factory_client = client.clone();
     let factory_model = model.clone();
     let factory_catalog = Arc::clone(&catalog);
@@ -640,22 +637,13 @@ pub async fn run_with_args_and_client_and_catalog(
             None,
         )
     });
-    profile.register_subagent_tools(manager, factory, 0);
+    profile.register_subagent_tools(supervisor.clone(), factory, 0);
     let profile: Arc<dyn AgentProfile> = Arc::from(profile);
 
-    let mut session = Session::new(
-        client,
-        profile,
-        env,
-        config,
-        Some(manager_for_callback.clone()),
-    );
+    let mut session = Session::new(client, profile, env, config, Some(supervisor_for_session));
 
     // Wire subagent event callback to parent session's emitter
-    manager_for_callback
-        .lock()
-        .await
-        .set_event_callback(session.sub_agent_event_callback());
+    supervisor.set_event_callback(session.sub_agent_event_callback());
 
     // SIGINT handler
     let cancel_token = session.cancel_token();
@@ -797,8 +785,18 @@ pub async fn run_with_args_and_client_and_catalog(
     });
 
     // Initialize and run
-    session.initialize().await?;
-    let result = session.process_input(&args.prompt).await;
+    let result = match session.initialize().await {
+        Ok(()) => session.process_input(&args.prompt).await,
+        Err(error) => Err(error),
+    };
+    let shutdown_reason = if result.is_ok() {
+        SessionShutdownReason::Completed
+    } else if session.cancel_token().is_cancelled() {
+        SessionShutdownReason::Cancelled
+    } else {
+        SessionShutdownReason::Error
+    };
+    session.shutdown(shutdown_reason).await;
 
     if matches!(output_format, OutputFormat::Text) {
         // Print assistant text to stdout
@@ -1235,11 +1233,11 @@ mod tests {
             None,
             test_catalog(),
         );
-        let manager = Arc::new(AsyncMutex::new(SubAgentManager::new(1)));
+        let supervisor = SubAgentSupervisor::new(1);
         let factory: SessionFactory = Arc::new(|| {
             panic!("factory should not be called in this test");
         });
-        profile.register_subagent_tools(manager, factory, 0);
+        profile.register_subagent_tools(supervisor, factory, 0);
 
         let names = profile.tool_registry().names();
         assert!(names.contains(&"spawn_agent".to_string()));

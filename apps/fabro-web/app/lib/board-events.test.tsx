@@ -38,6 +38,7 @@ describe("shouldRefreshBoardForEvent", () => {
   test("refreshes board for run and interview status changes only", () => {
     expect(shouldRefreshBoardForEvent("run.running")).toBe(true);
     expect(shouldRefreshBoardForEvent("run.blocked")).toBe(true);
+    expect(shouldRefreshBoardForEvent("run.cancel.requested")).toBe(true);
     expect(shouldRefreshBoardForEvent("interview.completed")).toBe(true);
     expect(shouldRefreshBoardForEvent("checkpoint.completed")).toBe(false);
   });

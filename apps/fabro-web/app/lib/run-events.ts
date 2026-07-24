@@ -47,6 +47,9 @@ const RUN_SUMMARY_EVENTS = new Set([
   "run.unpaused",
   "run.blocked",
   "run.unblocked",
+  "run.cancel.requested",
+  "run.pause.requested",
+  "run.unpause.requested",
   "run.archived",
   "run.unarchived",
   "run.title.updated",
@@ -77,6 +80,7 @@ export const STAGE_ACTIVITY_EVENT_TYPES = [
   "agent.tool.completed",
   "agent.steering.injected",
   "agent.interrupt.injected",
+  "agent.round.interrupted",
   "agent.pair.user_message",
   "agent.pair.system_message",
   "command.started",
@@ -95,10 +99,16 @@ const STEERING_EVENTS = new Set([
   "run.steer",
   "agent.steering.injected",
   "agent.interrupt.injected",
+  "agent.round.interrupted",
   "agent.session.activated",
   "agent.session.deactivated",
   "agent.steer.buffered",
   "agent.steer.dropped",
+]);
+const AGENT_CONTROL_STATE_EVENTS = new Set([
+  "agent.round.interrupted",
+  "agent.steering.injected",
+  "agent.session.deactivated",
 ]);
 // Todo / task mutation events refresh `getRunState` consumers (so per-stage
 // todo projections update live) and the run events list.
@@ -123,6 +133,7 @@ export function queryKeysForRunEvent(
   if (TERMINAL_EVENTS.has(event)) {
     return [
       queryKeys.runs.detail(runId),
+      queryKeys.runs.state(runId),
       ...queryKeys.runs.filesAllScopes(runId),
       queryKeys.runs.commits(runId),
       queryKeys.runs.billing(runId),
@@ -151,6 +162,7 @@ export function queryKeysForRunEvent(
       queryKeys.runs.graph(runId, "LR"),
       queryKeys.runs.graph(runId, "TB"),
       queryKeys.runs.detail(runId),
+      queryKeys.runs.state(runId),
     ];
     if (stageId) {
       keys.push(queryKeys.runs.stageEvents(runId, stageId));
@@ -161,6 +173,9 @@ export function queryKeysForRunEvent(
 
   if (STEERING_EVENTS.has(event)) {
     const keys: Key[] = [queryKeys.runs.events(runId, 1000)];
+    if (AGENT_CONTROL_STATE_EVENTS.has(event)) {
+      keys.unshift(queryKeys.runs.state(runId));
+    }
     if (stageId) {
       keys.push(queryKeys.runs.stageEvents(runId, stageId));
       keys.push(queryKeys.runs.stageContextWindow(runId, stageId));
@@ -238,6 +253,7 @@ function runInvalidation(runId: string, payload: RunEventPayload) {
 function resyncKeysForRun(runId: string) {
   return [
     queryKeys.runs.detail(runId),
+    queryKeys.runs.state(runId),
     ...queryKeys.runs.filesAllScopes(runId),
     queryKeys.runs.commits(runId),
     queryKeys.runs.billing(runId),

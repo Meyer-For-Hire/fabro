@@ -75,6 +75,7 @@ describe("queryKeys", () => {
       queryKeys.runs.graph("run-1", "LR"),
       queryKeys.runs.graph("run-1", "TB"),
       queryKeys.runs.detail("run-1"),
+      queryKeys.runs.state("run-1"),
       queryKeys.runs.stageEvents("run-1", "stage-1"),
       queryKeys.runs.stageContextWindow("run-1", "stage-1"),
     ]);

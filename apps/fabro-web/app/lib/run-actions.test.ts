@@ -15,9 +15,13 @@ import {
   canCancel,
   canRetry,
   canUnarchive,
+  cancellationActionLabel,
+  cancellationSuccessMessage,
   cancelRun,
   deleteRuns,
   isTerminalCancelledRun,
+  isCancellationPending,
+  isCancellationPendingState,
   mapError,
   retryRun,
   unarchiveRun,
@@ -171,6 +175,20 @@ describe("run lifecycle actions", () => {
     if (result.lifecycle.status.kind === "failed") {
       expect(result.lifecycle.status.reason).toBe("cancelled");
     }
+  });
+
+  test("cancelRun parses a 202 response as a pending cancellation", async () => {
+    const run = makeRun({ kind: "running" });
+    run.lifecycle.pending_control = "cancel";
+    stubGeneratedAxiosOnce({
+      status: 202,
+      body: run,
+    });
+
+    const result = await cancelRun("run-1");
+    expect(result.lifecycle.status.kind).toBe("running");
+    expect(result.lifecycle.pending_control).toBe("cancel");
+    expect(cancellationSuccessMessage(result)).toBe("Cancellation requested.");
   });
 
   test("archiveRun parses a 200 response", async () => {
@@ -447,5 +465,23 @@ describe("run lifecycle actions", () => {
         makeRun({ kind: "running" }, false),
       ),
     ).toBe(false);
+  });
+
+  test("cancellation pending combines durable state with the active mutation", () => {
+    const running = makeRun({ kind: "running" });
+    expect(isCancellationPending(running)).toBe(false);
+    expect(isCancellationPending(running, true)).toBe(true);
+
+    running.lifecycle.pending_control = "cancel";
+    expect(isCancellationPending(running)).toBe(true);
+
+    const cancelled = makeRun({ kind: "failed", reason: "cancelled" });
+    cancelled.lifecycle.pending_control = "cancel";
+    expect(isCancellationPending(cancelled, true)).toBe(false);
+    expect(cancellationSuccessMessage(cancelled)).toBe("Run cancelled.");
+    expect(isCancellationPendingState("running", "cancel")).toBe(true);
+    expect(isCancellationPendingState("failed", "cancel", true)).toBe(false);
+    expect(cancellationActionLabel(true)).toBe("Cancelling…");
+    expect(cancellationActionLabel(false)).toBe("Cancel");
   });
 });

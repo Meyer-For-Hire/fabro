@@ -13,6 +13,7 @@ import { ErrorMessage } from "./ui";
 
 export interface SteerBarProps {
   runId: string;
+  waitingForSteer?: boolean;
   ref?: Ref<SteerBarHandle>;
 }
 
@@ -20,13 +21,38 @@ export interface SteerBarHandle {
   focus(): void;
 }
 
-export function SteerBar({ runId, ref }: SteerBarProps) {
+export function isInterruptDisabled(
+  waitingForSteer: boolean,
+  mutationPending: boolean,
+): boolean {
+  return waitingForSteer || mutationPending;
+}
+
+export function SteerWaitingStatus({
+  waitingForSteer,
+}: {
+  waitingForSteer: boolean;
+}) {
+  if (!waitingForSteer) return null;
+  return (
+    <p role="status" className="mt-2 text-xs text-amber">
+      Interrupted — waiting for steering
+    </p>
+  );
+}
+
+export function SteerBar({
+  runId,
+  waitingForSteer = false,
+  ref,
+}: SteerBarProps) {
   const [text, setText] = useState("");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const steer = useSteerRun(runId);
   const interrupt = useInterruptRun(runId);
   const pending = steer.isMutating || interrupt.isMutating;
+  const interruptDisabled = isInterruptDisabled(waitingForSteer, pending);
 
   useImperativeHandle(ref, () => ({
     focus() {
@@ -49,7 +75,7 @@ export function SteerBar({ runId, ref }: SteerBarProps) {
   }
 
   async function fireInterrupt() {
-    if (pending) return;
+    if (interruptDisabled) return;
     setErrorMessage(null);
     try {
       await interrupt.trigger();
@@ -91,7 +117,7 @@ export function SteerBar({ runId, ref }: SteerBarProps) {
         <button
           type="button"
           onClick={() => void fireInterrupt()}
-          disabled={pending}
+          disabled={interruptDisabled}
           className="inline-flex shrink-0 items-center gap-2 rounded-md bg-overlay px-3 py-2 text-sm font-medium text-amber outline-1 -outline-offset-1 outline-amber/40 transition-colors hover:bg-amber/15 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber disabled:cursor-not-allowed disabled:opacity-60"
         >
           {interrupt.isMutating ? "Interrupting…" : "Interrupt"}
@@ -109,6 +135,7 @@ export function SteerBar({ runId, ref }: SteerBarProps) {
           <ErrorMessage message={errorMessage} />
         </div>
       )}
+      <SteerWaitingStatus waitingForSteer={waitingForSteer} />
     </form>
   );
 }

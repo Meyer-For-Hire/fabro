@@ -292,6 +292,11 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<fabro_types::Principal>,
     },
+    /// The cancelled round has fully unwound and the session is ready to
+    /// consume queued steering or wait for a later steering message.
+    RoundInterrupted {
+        generation: u64,
+    },
     CompactionStarted {
         estimated_tokens:    usize,
         context_window_size: usize,
@@ -463,6 +468,9 @@ impl AgentEvent {
             }
             Self::SteeringInjected { text, .. } => {
                 debug!(session_id, text_len = text.len(), "Steering injected");
+            }
+            Self::RoundInterrupted { generation } => {
+                debug!(session_id, generation, "Agent round interrupted");
             }
             Self::CompactionStarted {
                 estimated_tokens,

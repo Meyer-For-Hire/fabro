@@ -288,7 +288,7 @@ export const RunsApiAxiosParamCreator = function (configuration?: Configuration)
             };
         },
         /**
-         * Cancels a pending, runnable, or running run. Returns 409 if the run has already completed or been cancelled.
+         * Cancels a pending, runnable, or running run. Pre-execution runs are cancelled synchronously. Live runs return after the cancellation request is durably recorded and continue converging to a terminal cancelled state. Returns 409 if the run has already completed or been cancelled.
          * @summary Cancel Run
          * @param {string} id Unique run identifier (ULID).
          * @param {*} [options] Override http request option.
@@ -1607,7 +1607,7 @@ export const RunsApiFp = function(configuration?: Configuration) {
             return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
         },
         /**
-         * Cancels a pending, runnable, or running run. Returns 409 if the run has already completed or been cancelled.
+         * Cancels a pending, runnable, or running run. Pre-execution runs are cancelled synchronously. Live runs return after the cancellation request is durably recorded and continue converging to a terminal cancelled state. Returns 409 if the run has already completed or been cancelled.
          * @summary Cancel Run
          * @param {string} id Unique run identifier (ULID).
          * @param {*} [options] Override http request option.
@@ -2060,7 +2060,7 @@ export const RunsApiFactory = function (configuration?: Configuration, basePath?
             return localVarFp.batchUnarchiveRuns(batchRunLifecycleRequest, options).then((request) => request(axios, basePath));
         },
         /**
-         * Cancels a pending, runnable, or running run. Returns 409 if the run has already completed or been cancelled.
+         * Cancels a pending, runnable, or running run. Pre-execution runs are cancelled synchronously. Live runs return after the cancellation request is durably recorded and continue converging to a terminal cancelled state. Returns 409 if the run has already completed or been cancelled.
          * @summary Cancel Run
          * @param {string} id Unique run identifier (ULID).
          * @param {*} [options] Override http request option.
@@ -2429,7 +2429,7 @@ export class RunsApi extends BaseAPI {
     }
 
     /**
-     * Cancels a pending, runnable, or running run. Returns 409 if the run has already completed or been cancelled.
+     * Cancels a pending, runnable, or running run. Pre-execution runs are cancelled synchronously. Live runs return after the cancellation request is durably recorded and continue converging to a terminal cancelled state. Returns 409 if the run has already completed or been cancelled.
      * @summary Cancel Run
      * @param {string} id Unique run identifier (ULID).
      * @param {*} [options] Override http request option.

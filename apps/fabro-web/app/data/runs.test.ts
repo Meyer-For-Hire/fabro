@@ -83,6 +83,7 @@ describe("mapRunListItem", () => {
         html_url: "https://github.com/fabro-sh/fabro/pull/123",
       },
     });
+    summary.lifecycle.pending_control = "cancel";
     const item = mapRunListItem(summary);
     expect(item.id).toBe("01ABC");
     expect(item.title).toBe("Server supplied title");
@@ -94,6 +95,7 @@ describe("mapRunListItem", () => {
     expect(item.lifecycleStatus).toBe("paused");
     expect(item.number).toBe(123);
     expect(item.pullRequestUrl).toBe("https://github.com/fabro-sh/fabro/pull/123");
+    expect(item.pendingControl).toBe("cancel");
   });
 
   test("uses a fallback title when the server title is blank", () => {

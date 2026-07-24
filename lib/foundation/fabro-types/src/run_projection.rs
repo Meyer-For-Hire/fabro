@@ -370,7 +370,30 @@ pub struct StageProjection {
     pub mcp_servers:       Vec<McpServerProjection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window:    Option<StageContextWindowProjection>,
+    #[serde(default)]
+    pub agent_control:     AgentControlState,
     pub state:             StageState,
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    Display,
+    EnumString,
+    IntoStaticStr,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum AgentControlState {
+    #[default]
+    Running,
+    WaitingForSteer,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -451,6 +474,7 @@ impl StageProjection {
             agent_tools: Vec::new(),
             mcp_servers: Vec::new(),
             context_window: None,
+            agent_control: AgentControlState::default(),
             provider_used: None,
             diff: None,
             script_invocation: None,
@@ -752,7 +776,9 @@ mod iter_stages_tests {
     use serde_json::json;
 
     use super::RunProjection;
-    use crate::{Graph, RunId, RunSpec, StageProjection, WorkflowSettings, test_support};
+    use crate::{
+        AgentControlState, Graph, RunId, RunSpec, StageProjection, WorkflowSettings, test_support,
+    };
 
     fn seq(n: u32) -> NonZeroU32 {
         NonZeroU32::new(n).unwrap()
@@ -825,7 +851,7 @@ mod iter_stages_tests {
     }
 
     #[test]
-    fn stage_projection_defaults_missing_agent_tools_to_empty_and_omits_empty_list() {
+    fn stage_projection_defaults_missing_agent_fields() {
         let value = json!({
             "first_event_seq": 1,
             "state": "running"
@@ -833,6 +859,7 @@ mod iter_stages_tests {
 
         let stage: StageProjection = serde_json::from_value(value).unwrap();
         assert!(stage.agent_tools.is_empty());
+        assert_eq!(stage.agent_control, AgentControlState::Running);
 
         let serialized = serde_json::to_value(stage).unwrap();
         assert!(

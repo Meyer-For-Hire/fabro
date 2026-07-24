@@ -119,8 +119,9 @@ function useLifecycleMutation(
       onSuccess: (result) => {
         if (!id || !result.ok) return;
         if (intent !== "retry") {
-          // Retry doesn't mutate the source run, so skip invalidating its detail/billing keys.
-          void mutate(queryKeys.runs.detail(id));
+          // Keep the returned lifecycle state visible while revalidation
+          // observes the durable follow-up event (notably a 202 cancel).
+          void mutate(queryKeys.runs.detail(id), result.run, { revalidate: true });
           void mutate(queryKeys.runs.billing(id));
         }
         mutateRunListCaches(mutate);

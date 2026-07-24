@@ -1,7 +1,8 @@
 use std::any::{TypeId, type_name};
 
 use fabro_api::types::{
-    ActivatedSkill as ApiActivatedSkill, AgentMcpToolSummary as ApiAgentMcpToolSummary,
+    ActivatedSkill as ApiActivatedSkill, AgentControlState as ApiAgentControlState,
+    AgentMcpToolSummary as ApiAgentMcpToolSummary,
     AgentSkillActivationSource as ApiAgentSkillActivationSource,
     AgentSkillSummary as ApiAgentSkillSummary, AgentToolCategory as ApiAgentToolCategory,
     AgentToolSource as ApiAgentToolSource, AgentToolSummary as ApiAgentToolSummary,
@@ -20,13 +21,13 @@ use fabro_api::types::{
     SubAgentStatus as ApiSubAgentStatus, TodoListProjection as ApiTodoListProjection,
 };
 use fabro_types::{
-    ActivatedSkill, AgentMcpToolSummary, AgentSkillActivationSource, AgentSkillSummary,
-    AgentToolCategory, AgentToolSource, AgentToolSummary, AgentToolsAvailableProps,
-    McpServerProjection, McpServerStatus, PermissionLevel, SkillsProjection, StageContextWindow,
-    StageContextWindowBreakdownItem, StageContextWindowCategory, StageContextWindowCountMethod,
-    StageContextWindowProjection, StageContextWindowStaleness, StageContextWindowUnavailableReason,
-    StageContextWindowWarning, StageProjection, SubAgentProjection, SubAgentStatus, TodoListKind,
-    TodoListProjection,
+    ActivatedSkill, AgentControlState, AgentMcpToolSummary, AgentSkillActivationSource,
+    AgentSkillSummary, AgentToolCategory, AgentToolSource, AgentToolSummary,
+    AgentToolsAvailableProps, McpServerProjection, McpServerStatus, PermissionLevel,
+    SkillsProjection, StageContextWindow, StageContextWindowBreakdownItem,
+    StageContextWindowCategory, StageContextWindowCountMethod, StageContextWindowProjection,
+    StageContextWindowStaleness, StageContextWindowUnavailableReason, StageContextWindowWarning,
+    StageProjection, SubAgentProjection, SubAgentStatus, TodoListKind, TodoListProjection,
 };
 use serde_json::json;
 
@@ -37,6 +38,7 @@ fn stage_projection_reuses_canonical_type() {
 
 #[test]
 fn stage_projection_reuses_nested_agent_state_types() {
+    assert_same_type::<ApiAgentControlState, AgentControlState>();
     assert_same_type::<ApiTodoListProjection, TodoListProjection>();
     assert_same_type::<ApiSubAgentProjection, SubAgentProjection>();
     assert_same_type::<ApiSubAgentStatus, SubAgentStatus>();
@@ -198,6 +200,7 @@ fn stage_projection_round_trips_representative_json() {
             ],
             "warnings": []
         },
+        "agent_control": "running",
         "state": "succeeded"
     });
 
