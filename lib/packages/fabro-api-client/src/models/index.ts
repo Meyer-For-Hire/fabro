@@ -197,6 +197,7 @@ export * from './merge-method';
 export * from './merge-run-pull-request-request';
 export * from './merge-run-pull-request-response';
 export * from './model';
+export * from './model-controls';
 export * from './model-costs';
 export * from './model-features';
 export * from './model-limits';

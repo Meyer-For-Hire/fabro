@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{ModelId, ProviderId};
+use crate::reasoning::ReasoningEffort;
 
 // --- 2.9 Model ---
 
@@ -83,6 +84,14 @@ pub struct ModelCosts {
     pub cache_input_cost_per_mtok: Option<f64>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelControls {
+    /// Exact reasoning-effort values accepted by this provider/model offering.
+    /// An empty list means the request control is unsupported.
+    #[serde(default)]
+    pub reasoning_effort: Vec<ReasoningEffort>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Model {
     pub id:                   ModelId,
@@ -93,6 +102,8 @@ pub struct Model {
     pub training:             Option<String>,
     pub knowledge_cutoff:     Option<String>,
     pub features:             ModelFeatures,
+    #[serde(default)]
+    pub controls:             ModelControls,
     pub costs:                ModelCosts,
     pub estimated_output_tps: Option<f64>,
     pub aliases:              Vec<String>,
@@ -236,6 +247,7 @@ mod tests {
                 cache_control_breakpoints: false,
                 sampling_params:           true,
             },
+            controls:             ModelControls::default(),
             costs:                ModelCosts {
                 input_cost_per_mtok:       Some(1.0),
                 output_cost_per_mtok:      Some(2.0),

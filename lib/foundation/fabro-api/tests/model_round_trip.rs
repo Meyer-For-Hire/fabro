@@ -2,7 +2,8 @@ use std::any::{TypeId, type_name};
 
 use fabro_api::types::Model as ApiModel;
 use fabro_model::{
-    Model, ModelCosts, ModelFeatures, ModelLimits, ProviderId, ReasoningEffortFeature,
+    Model, ModelControls, ModelCosts, ModelFeatures, ModelLimits, ProviderId, ReasoningEffort,
+    ReasoningEffortFeature,
 };
 
 #[test]
@@ -32,6 +33,13 @@ fn model_json_matches_openapi_shape() {
             cache_control_breakpoints: false,
             sampling_params:           true,
         },
+        controls:             ModelControls {
+            reasoning_effort: vec![
+                ReasoningEffort::Low,
+                ReasoningEffort::High,
+                ReasoningEffort::Max,
+            ],
+        },
         costs:                ModelCosts {
             input_cost_per_mtok:       Some(5.0),
             output_cost_per_mtok:      Some(25.0),
@@ -50,6 +58,10 @@ fn model_json_matches_openapi_shape() {
     assert_eq!(json["knowledge_cutoff"], "May 2025");
     assert_eq!(json["features"]["reasoning_effort"], "levels");
     assert_eq!(json["features"]["prompt_cache"], true);
+    assert_eq!(
+        json["controls"]["reasoning_effort"],
+        serde_json::json!(["low", "high", "max"])
+    );
     assert_eq!(json["estimated_output_tps"], 25.0);
     assert_eq!(json["small_default"], true);
     assert_eq!(json["configured"], true);
