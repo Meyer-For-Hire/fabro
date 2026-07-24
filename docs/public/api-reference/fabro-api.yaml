@@ -8238,6 +8238,7 @@ components:
         - reasoning
         - reasoning_effort
         - prompt_cache
+        - cache_control_breakpoints
         - sampling_params
       properties:
         tools:
@@ -8254,6 +8255,12 @@ components:
         prompt_cache:
           type: boolean
           description: Whether the model endpoint supports prompt caching.
+        cache_control_breakpoints:
+          type: boolean
+          description: >-
+            Whether the endpoint only caches when the request marks the
+            cacheable prefix with Anthropic-style cache_control breakpoints
+            (e.g. Claude via OpenRouter).
         sampling_params:
           type: boolean
           description: Whether the model accepts classic sampling parameters (temperature, top_p).
@@ -10541,7 +10548,11 @@ components:
           oneOf:
             - $ref: "#/components/schemas/TodoListProjection"
             - type: "null"
-          description: Projected todo / task list for this stage.
+          description: |
+            Todo / task list owned by this stage's root agent session. OpenAI
+            child sessions have separate per-session plans that do not appear
+            here. Anthropic task lists are root-scoped and shared with child
+            sessions, so child mutations of that shared list do appear here.
         subagents:
           type: array
           description: Subagents spawned by this stage, in replay/insertion order.

@@ -91,6 +91,44 @@ async fn chat_completions_accepts_supported_openai_compatible_fields() {
 }
 
 #[tokio::test]
+async fn chat_completions_accepts_tool_call_history() {
+    let server = common::spawn_server().await.expect("server should start");
+
+    let response = server
+        .post_chat(json!({
+            "model": "gpt-test",
+            "messages": [
+                { "role": "user", "content": "replace old with new" },
+                {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_edit",
+                        "type": "function",
+                        "function": {
+                            "name": "edit_file",
+                            "arguments": "{\"old\":\"old\",\"new\":\"new\"}"
+                        }
+                    }]
+                },
+                {
+                    "role": "tool",
+                    "content": "Updated data.txt",
+                    "tool_call_id": "call_edit"
+                }
+            ],
+            "stream": false
+        }))
+        .await;
+
+    assert_eq!(response.status(), 200);
+    let body = response.json::<serde_json::Value>().await.expect("json");
+    assert_eq!(
+        body["choices"][0]["message"]["content"],
+        "deterministic: replace old with new"
+    );
+}
+
+#[tokio::test]
 async fn chat_completions_supports_scripted_tool_call_and_json_schema() {
     let server = common::spawn_server().await.expect("server should start");
     server

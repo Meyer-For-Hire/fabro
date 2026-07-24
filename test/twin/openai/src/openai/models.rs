@@ -625,15 +625,34 @@ impl ChatCompletionsRequest {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChatMessage {
-    pub role:    String,
-    pub content: Value,
+    pub role:              String,
+    pub content:           Option<Value>,
+    pub reasoning_content: Option<String>,
+    pub tool_call_id:      Option<String>,
+    pub tool_calls:        Option<Vec<ChatMessageToolCall>>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatMessageToolCall {
+    pub id:       String,
+    #[serde(rename = "type")]
+    pub kind:     String,
+    pub function: ChatMessageToolCallFunction,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChatMessageToolCallFunction {
+    pub name:      String,
+    pub arguments: String,
 }
 
 impl ChatMessage {
     fn extract_texts(&self) -> Vec<String> {
-        match &self.content {
-            Value::String(text) => vec![normalize_whitespace(text)],
-            Value::Array(parts) => parts
+        match self.content.as_ref() {
+            Some(Value::String(text)) => vec![normalize_whitespace(text)],
+            Some(Value::Array(parts)) => parts
                 .iter()
                 .filter_map(|part| {
                     part.get("text")
@@ -647,13 +666,21 @@ impl ChatMessage {
 
     fn contains_reasoning_content(&self) -> bool {
         self.role == "assistant"
-            && self.content.as_array().is_some_and(|parts| {
-                parts.iter().any(|part| {
-                    part.get("type")
-                        .and_then(Value::as_str)
-                        .is_some_and(|kind| kind == "reasoning")
-                })
-            })
+            && (self
+                .reasoning_content
+                .as_deref()
+                .is_some_and(|reasoning| !reasoning.trim().is_empty())
+                || self
+                    .content
+                    .as_ref()
+                    .and_then(Value::as_array)
+                    .is_some_and(|parts| {
+                        parts.iter().any(|part| {
+                            part.get("type")
+                                .and_then(Value::as_str)
+                                .is_some_and(|kind| kind == "reasoning")
+                        })
+                    }))
     }
 }
 
@@ -680,12 +707,22 @@ fn validate_chat_message(message: &ChatMessage) -> Result<(), OpenAiError> {
         ));
     }
 
-    match &message.content {
-        Value::String(_) => Ok(()),
-        Value::Array(parts) if !parts.is_empty() => {
+    validate_chat_tool_fields(message)?;
+
+    match message.content.as_ref() {
+        Some(Value::String(_)) => Ok(()),
+        Some(Value::Array(parts)) if !parts.is_empty() => {
             for part in parts {
                 validate_chat_message_part(part, &message.role)?;
             }
+            Ok(())
+        }
+        None if message.role == "assistant"
+            && message
+                .tool_calls
+                .as_ref()
+                .is_some_and(|tool_calls| !tool_calls.is_empty()) =>
+        {
             Ok(())
         }
         _ => Err(OpenAiError::invalid_request(
@@ -693,6 +730,56 @@ fn validate_chat_message(message: &ChatMessage) -> Result<(), OpenAiError> {
             "unsupported message content shape",
         )),
     }
+}
+
+fn validate_chat_tool_fields(message: &ChatMessage) -> Result<(), OpenAiError> {
+    if message.role == "tool" {
+        if message
+            .tool_call_id
+            .as_deref()
+            .is_none_or(|tool_call_id| tool_call_id.trim().is_empty())
+        {
+            return Err(OpenAiError::invalid_request(
+                "messages",
+                "tool messages require a tool_call_id",
+            ));
+        }
+    } else if message.tool_call_id.is_some() {
+        return Err(OpenAiError::invalid_request(
+            "messages",
+            "tool_call_id is only supported on tool messages",
+        ));
+    }
+
+    let Some(tool_calls) = &message.tool_calls else {
+        return Ok(());
+    };
+    if message.role != "assistant" {
+        return Err(OpenAiError::invalid_request(
+            "messages",
+            "tool_calls are only supported on assistant messages",
+        ));
+    }
+    if tool_calls.is_empty() {
+        return Err(OpenAiError::invalid_request(
+            "messages",
+            "tool_calls must not be empty",
+        ));
+    }
+    for tool_call in tool_calls {
+        if tool_call.id.trim().is_empty()
+            || tool_call.kind != "function"
+            || tool_call.function.name.trim().is_empty()
+            || tool_call.function.arguments.trim().is_empty()
+        {
+            return Err(OpenAiError::invalid_request(
+                "messages",
+                "invalid assistant tool call",
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_chat_message_part(part: &Value, role: &str) -> Result<(), OpenAiError> {

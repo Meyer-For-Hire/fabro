@@ -1,0 +1,28 @@
+[package]
+name = "fabro-variable"
+edition.workspace = true
+version.workspace = true
+publish = false
+license.workspace = true
+description = "Workflow-visible non-sensitive variables for Fabro"
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+chrono.workspace = true
+fabro-db = { path = "../../foundation/fabro-db" }
+fabro-types = { path = "../../foundation/fabro-types" }
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+tempfile = "3"

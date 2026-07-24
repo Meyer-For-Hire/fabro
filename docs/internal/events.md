@@ -1252,26 +1252,6 @@ Emitted when the agent detects a tool-use loop.
 
 No properties.
 
-### `agent.turn.limit`
-
-Emitted when the agent reaches its maximum turn count.
-
-```json
-{
-  "id": "...", "ts": "...", "run_id": "...",
-  "event": "agent.turn.limit",
-  "node_id": "code", "node_label": "code",
-  "session_id": "ses_abc",
-  "properties": {
-    "max_turns": 25
-  }
-}
-```
-
-| Property | Type | Description |
-|----------|------|-------------|
-| `max_turns` | number | Maximum turns allowed |
-
 ### `agent.skill.expanded`
 
 ```json
