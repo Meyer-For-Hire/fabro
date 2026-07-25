@@ -76,6 +76,7 @@ pub fn event_name(event: &Event) -> &'static str {
             AgentEvent::ToolCallStarted { .. } => "agent.tool.started",
             AgentEvent::ToolCallOutputDelta { .. } => "agent.tool.output.delta",
             AgentEvent::ToolCallCompleted { .. } => "agent.tool.completed",
+            AgentEvent::ToolProcessCompleted { .. } => "agent.tool.process.completed",
             AgentEvent::Error { .. } => "agent.error",
             AgentEvent::Warning { .. } => "agent.warning",
             AgentEvent::LoopDetected => "agent.loop.detected",

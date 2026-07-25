@@ -419,7 +419,7 @@ impl Sandbox for LocalSandbox {
         working_dir: Option<&str>,
         env_vars: Option<&std::collections::HashMap<String, String>>,
         cancel_token: Option<CancellationToken>,
-        output_callback: CommandOutputCallback,
+        output_callback: Option<CommandOutputCallback>,
     ) -> crate::Result<ExecStreamingResult> {
         let start = Instant::now();
 
@@ -831,7 +831,7 @@ async fn sigterm_then_kill(child: &mut Child) {
 async fn drain_command_pipe<R>(
     mut reader: Option<R>,
     stream: CommandOutputStream,
-    output_callback: CommandOutputCallback,
+    output_callback: Option<CommandOutputCallback>,
 ) -> crate::Result<Vec<u8>>
 where
     R: AsyncRead + Unpin,
@@ -851,7 +851,9 @@ where
             return Ok(output);
         }
         output.extend_from_slice(&buf[..read]);
-        output_callback(stream, buf[..read].to_vec()).await?;
+        if let Some(output_callback) = output_callback.as_ref() {
+            output_callback(stream, buf[..read].to_vec()).await?;
+        }
     }
 }
 

@@ -780,12 +780,13 @@ impl RunProjectionReducer for RunProjection {
 /// OpenAI plan lists are scoped per agent session (`openai_plan:<session_id>`),
 /// so a child/subagent session emits its own list events on the same stage.
 /// The root-agent projection excludes those child plans, while the underlying
-/// events remain in the run event log. Anthropic task lists are root-scoped
-/// (`anthropic_tasks:<root_session_id>`) and intentionally shared with
-/// subagents, so they always project.
+/// events remain in the run event log. Kimi todo lists
+/// (`kimi_todos:<session_id>`) are scoped the same way. Anthropic task lists
+/// are root-scoped (`anthropic_tasks:<root_session_id>`) and intentionally
+/// shared with subagents, so they always project.
 fn should_project_root_agent_todo_event(stored: &RunEvent, list_kind: TodoListKind) -> bool {
     match list_kind {
-        TodoListKind::OpenAiPlan => stored.parent_session_id.is_none(),
+        TodoListKind::OpenAiPlan | TodoListKind::KimiTodos => stored.parent_session_id.is_none(),
         TodoListKind::AnthropicTasks => true,
     }
 }
@@ -5399,35 +5400,34 @@ mod tests {
         }
 
         #[test]
-        fn child_openai_plan_does_not_project_when_root_has_no_plan() {
-            let mut state = initialized_projection();
-            let stage_id = stage_id();
-            state
-                .apply_event(&test_stage_event(
-                    1,
-                    EventBody::StageStarted(started_props()),
-                    stage_id.clone(),
-                ))
-                .unwrap();
-            state
-                .apply_event(&child_stage_event(
-                    2,
-                    created(
-                        "openai_plan:child_session",
-                        TodoListKind::OpenAiPlan,
-                        "c-a",
-                        0,
-                        "child work",
-                    ),
-                    stage_id.clone(),
-                ))
-                .unwrap();
+        fn child_session_whole_lists_do_not_project_when_root_has_no_list() {
+            for (kind, child_list) in [
+                (TodoListKind::OpenAiPlan, "openai_plan:child_session"),
+                (TodoListKind::KimiTodos, "kimi_todos:child_session"),
+            ] {
+                let mut state = initialized_projection();
+                let stage_id = stage_id();
+                state
+                    .apply_event(&test_stage_event(
+                        1,
+                        EventBody::StageStarted(started_props()),
+                        stage_id.clone(),
+                    ))
+                    .unwrap();
+                state
+                    .apply_event(&child_stage_event(
+                        2,
+                        created(child_list, kind, "c-a", 0, "child work"),
+                        stage_id.clone(),
+                    ))
+                    .unwrap();
 
-            let stage = state.stage(&stage_id).expect("stage projection present");
-            assert!(
-                stage.root_agent_todos.is_none(),
-                "a child session's plan must not become the stage's root plan"
-            );
+                let stage = state.stage(&stage_id).expect("stage projection present");
+                assert!(
+                    stage.root_agent_todos.is_none(),
+                    "a child session's {kind} list must not become the stage's root list"
+                );
+            }
         }
 
         #[test]

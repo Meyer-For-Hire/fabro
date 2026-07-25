@@ -3,11 +3,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use strum::{Display, EnumString, IntoStaticStr};
 
-use super::BilledTokenCounts;
+use super::{BilledTokenCounts, ExecOutputTail};
 use crate::transcript::{ToolCall, ToolResult, TranscriptMessage};
 use crate::{
-    MessageId, ModelRef, PairId, PairMessageId, PairSystemMessageKind, PermissionLevel,
-    ReasoningOutput, StageContextWindowProjection, TurnId,
+    CommandTermination, MessageId, ModelRef, PairId, PairMessageId, PairSystemMessageKind,
+    PermissionLevel, ReasoningOutput, StageContextWindowProjection, TurnId,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -179,6 +179,25 @@ pub struct AgentToolCompletedProps {
     /// Turn that owned this tool call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id:      Option<TurnId>,
+}
+
+/// Subordinate diagnostic for a tool call that ran a process: the real
+/// termination, exit code, duration, and bounded redacted output tails.
+///
+/// This never replaces `agent.tool.completed`, which remains the single
+/// tool-protocol completion and the authoritative owner of `is_error`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentToolProcessCompletedProps {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code:         Option<i32>,
+    pub termination:       CommandTermination,
+    pub duration_ms:       u64,
+    /// `false` when the provider could not separate stdout from stderr. The
+    /// combined output is then carried in `exec_output_tail.stdout`.
+    pub streams_separated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec_output_tail:  Option<ExecOutputTail>,
+    pub visit:             u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

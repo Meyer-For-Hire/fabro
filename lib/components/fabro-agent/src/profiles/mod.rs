@@ -5,14 +5,18 @@ use fabro_model::{AgentProfileKind, Catalog, ProviderId};
 
 pub mod anthropic;
 pub mod gemini;
+pub mod kimi;
+pub mod kimi_tools;
 pub mod openai;
 
 pub use anthropic::AnthropicProfile;
 pub use gemini::GeminiProfile;
+pub use kimi::KimiProfile;
 pub use openai::OpenAiProfile;
 
 use crate::agent_profile::AgentProfile;
 use crate::config::{NativeToolOptions, ToolSecrets};
+use crate::native_tool::ToolVocabulary;
 use crate::sandbox::Sandbox;
 use crate::skills::{Skill, format_skills_prompt_section};
 use crate::tool_registry::ToolRegistry;
@@ -85,6 +89,11 @@ impl AgentProfileBuilder {
                     .with_provider_id(self.provider_id.clone())
                     .with_catalog(Arc::clone(&self.catalog)),
             ),
+            AgentProfileKind::Kimi => Box::new(
+                KimiProfile::with_native_tools(model, options, summarizer)
+                    .with_provider_id(self.provider_id.clone())
+                    .with_catalog(Arc::clone(&self.catalog)),
+            ),
         }
     }
 }
@@ -118,9 +127,11 @@ pub struct EnvContext {
 /// The environment block is supplied by [`assemble_system_prompt`] and cannot
 /// be overridden by callers.
 pub struct EmbeddedPrompt {
-    name:   &'static str,
-    source: &'static str,
-    inputs: HashMap<String, toml::Value>,
+    name:       &'static str,
+    source:     &'static str,
+    inputs:     HashMap<String, toml::Value>,
+    /// Vocabulary the surrounding prompt sections should name tools in.
+    vocabulary: ToolVocabulary,
 }
 
 impl EmbeddedPrompt {
@@ -130,7 +141,15 @@ impl EmbeddedPrompt {
             name,
             source,
             inputs: HashMap::new(),
+            vocabulary: ToolVocabulary::Fabro,
         }
+    }
+
+    /// Name tools in `vocabulary` in the generated sections.
+    #[must_use]
+    pub fn with_vocabulary(mut self, vocabulary: ToolVocabulary) -> Self {
+        self.vocabulary = vocabulary;
+        self
     }
 
     #[must_use]
@@ -177,6 +196,7 @@ pub fn assemble_system_prompt(
     skills: &[Skill],
 ) -> String {
     let env_block = build_env_context_block_with(env, env_context);
+    let vocabulary = template.vocabulary;
     let prompt = template.render(env_block);
 
     let docs_section = if memory.is_empty() {
@@ -185,7 +205,7 @@ pub fn assemble_system_prompt(
         format!("\n\n{}", memory.join("\n\n"))
     };
     let skills_section = {
-        let s = format_skills_prompt_section(skills);
+        let s = format_skills_prompt_section(skills, vocabulary);
         if s.is_empty() {
             String::new()
         } else {
@@ -295,6 +315,66 @@ mod tests {
         OpenAiProfile::with_native_tools("kimi-k2.5", &options, None)
             .with_provider_id(ProviderId::new("kimi"))
             .with_catalog(Arc::new(Catalog::from_builtin().unwrap()))
+    }
+
+    /// Per-profile tool descriptions must stay per-profile. The Kimi profile
+    /// rewrites several built-in descriptions; every other profile shares the
+    /// registry factories, so a leak would silently reword tools for models
+    /// that were never meant to see the change.
+    #[test]
+    fn kimi_tool_descriptions_do_not_leak_into_other_profiles() {
+        use crate::agent_profile::AgentProfile;
+        use crate::native_tool::NativeTool;
+
+        let describe = |profile: &dyn AgentProfile, tool: NativeTool| {
+            let vocabulary = profile.tool_registry().vocabulary();
+            profile
+                .tool_registry()
+                .get(tool.name(vocabulary))
+                .map(|t| t.definition.description.clone())
+        };
+
+        let anthropic = AnthropicProfile::new("claude-sonnet-4-6");
+        let openai = OpenAiProfile::new("gpt-5.5");
+        let gemini = GeminiProfile::new("gemini-3-flash-preview");
+        let kimi = KimiProfile::new("kimi-k3");
+
+        for tool in [
+            NativeTool::ReadFile,
+            NativeTool::WriteFile,
+            NativeTool::EditFile,
+            NativeTool::Shell,
+            NativeTool::Grep,
+            NativeTool::Glob,
+        ] {
+            let (Some(kimi_text), Some(anthropic_text)) =
+                (describe(&kimi, tool), describe(&anthropic, tool))
+            else {
+                continue;
+            };
+            assert_ne!(
+                kimi_text, anthropic_text,
+                "{tool} should be reworded for Kimi only"
+            );
+
+            // The other three share the stock wording.
+            for (label, other) in [
+                ("openai", describe(&openai, tool)),
+                ("gemini", describe(&gemini, tool)),
+            ] {
+                let Some(other) = other else { continue };
+                assert_eq!(
+                    other, anthropic_text,
+                    "{label} should keep the stock {tool} description"
+                );
+            }
+
+            // The specific Kimi-only phrasing must not appear elsewhere.
+            assert!(
+                !anthropic_text.contains("has not been read"),
+                "read-before-write drilling leaked into {tool} for other profiles"
+            );
+        }
     }
 
     #[test]

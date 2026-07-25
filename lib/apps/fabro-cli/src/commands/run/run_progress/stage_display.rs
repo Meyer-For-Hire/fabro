@@ -482,6 +482,33 @@ impl StageDisplay {
         }
     }
 
+    pub(super) fn on_compaction_failed(
+        &mut self,
+        renderer: &ProgressRenderer,
+        stage_node_id: &str,
+        error: &str,
+    ) {
+        let message = format!(
+            "{} compaction failed: {error}",
+            styles::red_cross(renderer.styles())
+        );
+
+        if renderer.is_tty() {
+            if let Some(bar) = self
+                .active_stages
+                .get_mut(stage_node_id)
+                .and_then(|stage| stage.compaction_bar.take())
+            {
+                bar.set_style(styles::style_tool_done());
+                bar.finish_with_message(message);
+            } else {
+                self.insert_info_line_for_stage(renderer, stage_node_id, &message);
+            }
+        } else {
+            renderer.print_line(6, &message);
+        }
+    }
+
     /// Open the live line for an inference request.
     ///
     /// It says only what is provable: a request is open and nothing has come

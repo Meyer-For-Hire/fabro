@@ -146,6 +146,11 @@ pub struct SettingsModelFeatures {
     pub vision:                    Option<bool>,
     #[serde(default)]
     pub reasoning:                 Option<bool>,
+    /// Whether requests reason when no effort control is supplied. When
+    /// omitted, effort-capable models default to `true` and other models to
+    /// `false`.
+    #[serde(default)]
+    pub reasoning_by_default:      Option<bool>,
     #[serde(default)]
     pub reasoning_effort:          Option<ReasoningEffortFeature>,
     #[serde(default)]
@@ -443,17 +448,20 @@ pub struct CatalogModelControls {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CatalogModelSettings {
-    pub api_id:         String,
+    pub api_id:               String,
     /// Wire dialect for this model's route (the provider codec unless the
     /// model row overrides it).
-    pub codec:          CodecKind,
+    pub codec:                CodecKind,
     /// Billing family for this model (the provider policy unless the model
     /// row overrides it).
-    pub billing_policy: BillingPolicy,
-    pub agent_profile:  AgentProfileKind,
-    pub controls:       CatalogModelControls,
-    pub speed_costs:    HashMap<Speed, ModelCosts>,
-    probe:              bool,
+    pub billing_policy:       BillingPolicy,
+    pub agent_profile:        AgentProfileKind,
+    /// Whether the provider route reasons when a request omits an effort
+    /// control.
+    pub reasoning_by_default: bool,
+    pub controls:             CatalogModelControls,
+    pub speed_costs:          HashMap<Speed, ModelCosts>,
+    probe:                    bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -578,6 +586,8 @@ pub enum CatalogBuildError {
     ReasoningEffortControlsWithoutReasoning { model: String },
     #[error("model '{model}' declares reasoning_effort feature but features.reasoning is false")]
     ReasoningEffortWithoutReasoning { model: String },
+    #[error("model '{model}' sets reasoning_by_default but features.reasoning is false")]
+    DefaultReasoningWithoutReasoning { model: String },
     #[error(
         "model '{model}' declares cache_control_breakpoints but features.prompt_cache is false"
     )]
@@ -1983,6 +1993,9 @@ fn merge_model_features_settings(
         tools:                     higher.tools.or(fallback.tools),
         vision:                    higher.vision.or(fallback.vision),
         reasoning:                 higher.reasoning.or(fallback.reasoning),
+        reasoning_by_default:      higher
+            .reasoning_by_default
+            .or(fallback.reasoning_by_default),
         reasoning_effort:          higher.reasoning_effort.or(fallback.reasoning_effort),
         prompt_cache:              higher.prompt_cache.or(fallback.prompt_cache),
         cache_control_breakpoints: higher
@@ -2214,6 +2227,14 @@ fn build_model(
                 field: "features",
             })?;
     let model_features = build_model_features(model_id, features)?;
+    let reasoning_by_default = features
+        .reasoning_by_default
+        .unwrap_or_else(|| model_features.supports_reasoning_effort());
+    if reasoning_by_default && !model_features.reasoning {
+        return Err(CatalogBuildError::DefaultReasoningWithoutReasoning {
+            model: model_id.to_string(),
+        });
+    }
     let controls = build_model_controls(model_id, &model_features, settings)?;
     let costs = build_model_costs(settings.costs.as_ref());
     let speed_costs = build_speed_costs(model_id, settings.costs.as_ref(), &controls)?;
@@ -2255,6 +2276,7 @@ fn build_model(
         codec: resolve_model_codec(model_id, provider, settings.codec)?,
         billing_policy: settings.billing_policy.unwrap_or(provider.billing_policy),
         agent_profile: settings.agent_profile.unwrap_or(provider.agent_profile),
+        reasoning_by_default,
         controls,
         speed_costs,
         probe: settings.probe.unwrap_or_default(),
@@ -2832,6 +2854,12 @@ enabled = true
             .get_on_provider(&bedrock, "claude-fable-5")
             .expect("fable row should be present");
         assert!(!fable.features.sampling_params);
+        assert!(
+            catalog
+                .settings_for(fable)
+                .expect("fable settings should be present")
+                .reasoning_by_default
+        );
         assert_eq!(
             catalog
                 .model_settings_on_provider(&bedrock, "claude-fable-5")
@@ -3056,6 +3084,19 @@ enabled = true
                 BillingPolicy::OpenAi,
             ),
             (
+                "claude-opus-5",
+                "anthropic/claude-opus-5",
+                "claude-5",
+                1_000_000,
+                5.0,
+                25.0,
+                0.5,
+                ReasoningEffortFeature::Levels,
+                false,
+                true,
+                BillingPolicy::Anthropic,
+            ),
+            (
                 "claude-opus-4-8",
                 "anthropic/claude-opus-4.8",
                 "claude-4",
@@ -3132,6 +3173,13 @@ enabled = true
                 ReasoningEffort::VARIANTS,
                 "{id}"
             );
+        }
+
+        for alias in ["opus", "claude-opus"] {
+            let model = catalog
+                .resolve_on_provider(&ProviderId::new("openrouter"), alias)
+                .unwrap_or_else(|error| panic!("{alias} should resolve on OpenRouter: {error}"));
+            assert_eq!(model.id, "claude-opus-5", "{alias}");
         }
     }
 
@@ -5915,6 +5963,7 @@ context_window = 1000
 tools = true
 vision = false
 reasoning = true
+reasoning_by_default = false
 reasoning_effort = "levels"
 prompt_cache = true
 
@@ -5930,6 +5979,12 @@ reasoning_effort = ["low", "medium"]
             crate::ReasoningEffortFeature::Levels
         );
         assert!(model.features.prompt_cache);
+        assert!(
+            !catalog
+                .model_settings("model")
+                .unwrap()
+                .reasoning_by_default
+        );
         assert_eq!(
             catalog
                 .model_settings("model")
@@ -5974,6 +6029,12 @@ prompt_cache = true
             crate::ReasoningEffortFeature::AlwaysAdaptive
         );
         assert!(model.supports_reasoning_effort());
+        assert!(
+            catalog
+                .model_settings("model")
+                .unwrap()
+                .reasoning_by_default
+        );
         // Always-adaptive models get the full default effort controls, same as
         // Levels.
         assert_eq!(
@@ -6008,6 +6069,7 @@ context_window = 1000
 tools = true
 vision = false
 reasoning = true
+reasoning_by_default = true
 reasoning_effort = "none"
 
 [models.model.controls]
@@ -6020,6 +6082,12 @@ reasoning_effort = ["low"]
         assert_eq!(
             model.features.reasoning_effort,
             crate::ReasoningEffortFeature::None
+        );
+        assert!(
+            catalog
+                .model_settings("model")
+                .unwrap()
+                .reasoning_by_default
         );
         assert_eq!(
             catalog
@@ -6094,6 +6162,38 @@ reasoning_effort = "levels"
         assert!(matches!(
             Catalog::from_settings(&settings).unwrap_err(),
             CatalogBuildError::ReasoningEffortWithoutReasoning { model }
+                if model == "model"
+        ));
+    }
+
+    #[test]
+    fn catalog_from_settings_rejects_default_reasoning_without_reasoning() {
+        let settings = minimal_settings(
+            r#"
+[providers.test]
+display_name = "Test"
+adapter = "openai"
+agent_profile = "openai"
+
+[models.model]
+provider = "test"
+display_name = "Model"
+family = "test"
+
+[models.model.limits]
+context_window = 1000
+
+[models.model.features]
+tools = true
+vision = false
+reasoning = false
+reasoning_by_default = true
+"#,
+        );
+
+        assert!(matches!(
+            Catalog::from_settings(&settings).unwrap_err(),
+            CatalogBuildError::DefaultReasoningWithoutReasoning { model }
                 if model == "model"
         ));
     }

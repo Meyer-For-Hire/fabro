@@ -1116,6 +1116,45 @@ Emitted when a tool call finishes.
 | `output` | any | Tool output (string or structured) |
 | `is_error` | boolean | Whether the tool returned an error |
 
+### `agent.tool.process.completed`
+
+Subordinate diagnostic for a tool call that ran a process, emitted between
+`agent.tool.started` and `agent.tool.completed`. It explains the underlying
+process outcome; `agent.tool.completed.is_error` remains the protocol and UI
+truth. Absent when the tool never produced a process result (setup, transport,
+or launch failure) and when the tool ran without a session-bound emitter.
+
+```json
+{
+  "id": "...", "ts": "...", "run_id": "...",
+  "event": "agent.tool.process.completed",
+  "node_id": "code", "node_label": "code",
+  "session_id": "ses_abc",
+  "tool_call_id": "call_abc123",
+  "properties": {
+    "exit_code": 7,
+    "termination": "exited",
+    "duration_ms": 812,
+    "streams_separated": true,
+    "exec_output_tail": {"stdout": "...", "stderr": "..."},
+    "visit": 1
+  }
+}
+```
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `exit_code` | integer | Process exit code; omitted for timeout and cancellation |
+| `termination` | string | `exited`, `timed_out`, or `cancelled` |
+| `duration_ms` | integer | Process duration |
+| `streams_separated` | boolean | `false` when the provider could not separate stdout from stderr; the combined output is then in `exec_output_tail.stdout` |
+| `exec_output_tail` | object | Bounded, redacted output tails; omitted when both streams were empty |
+| `exec_output_tail.stdout` | string | Bounded stdout tail, or combined-output tail when `streams_separated` is `false`; omitted when empty |
+| `exec_output_tail.stderr` | string | Bounded stderr tail; omitted when empty |
+| `exec_output_tail.stdout_truncated` | boolean | `true` when earlier stdout bytes were omitted; omitted when `false` |
+| `exec_output_tail.stderr_truncated` | boolean | `true` when earlier stderr bytes were omitted; omitted when `false` |
+| `visit` | integer | Stage visit |
+
 ### `agent.error`
 
 Emitted when the agent encounters an error.

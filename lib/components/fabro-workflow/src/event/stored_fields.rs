@@ -328,7 +328,8 @@ fn agent_actor_for_event(
         }),
         AgentEvent::ToolCallStarted { .. }
         | AgentEvent::ToolCallOutputDelta { .. }
-        | AgentEvent::ToolCallCompleted { .. } => Some(Principal::Agent {
+        | AgentEvent::ToolCallCompleted { .. }
+        | AgentEvent::ToolProcessCompleted { .. } => Some(Principal::Agent {
             session_id:        session_id.map(str::to_string),
             parent_session_id: parent_session_id.map(str::to_string),
             model:             None,

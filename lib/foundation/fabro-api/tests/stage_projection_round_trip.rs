@@ -365,18 +365,27 @@ fn permission_level_matches_openapi_json_shape() {
 
 #[test]
 fn nested_agent_state_types_match_openapi_json_shape() {
-    let todo_list = TodoListProjection::new(TodoListKind::OpenAiPlan, "openai_plan:ses_root");
-    let todo_json = serde_json::to_value(&todo_list).unwrap();
-    assert_eq!(
-        todo_json,
-        json!({
-            "kind": "openai_plan",
-            "list_id": "openai_plan:ses_root",
-            "items": []
-        })
-    );
-    let api_todo_list: ApiTodoListProjection = serde_json::from_value(todo_json).unwrap();
-    assert_eq!(api_todo_list, todo_list);
+    for (kind, list_id, wire_kind) in [
+        (
+            TodoListKind::OpenAiPlan,
+            "openai_plan:ses_root",
+            "openai_plan",
+        ),
+        (TodoListKind::KimiTodos, "kimi_todos:ses_root", "kimi_todos"),
+    ] {
+        let todo_list = TodoListProjection::new(kind, list_id);
+        let todo_json = serde_json::to_value(&todo_list).unwrap();
+        assert_eq!(
+            todo_json,
+            json!({
+                "kind": wire_kind,
+                "list_id": list_id,
+                "items": []
+            })
+        );
+        let api_todo_list: ApiTodoListProjection = serde_json::from_value(todo_json).unwrap();
+        assert_eq!(api_todo_list, todo_list);
+    }
 
     let subagent = SubAgentProjection {
         agent_id: "sub-1".to_string(),
