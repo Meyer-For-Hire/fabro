@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { watch as fsWatch } from "node:fs";
 import {
   cp,
@@ -34,13 +35,103 @@ const tailwindCliBin = join(
   JSON.parse(await readFile(tailwindCliPackageJsonPath, "utf8")).bin.tailwindcss,
 );
 
-function newBuildId(): string {
+// Names the `.dist-builds/` staging directory only. Time-ordered so builds sort
+// chronologically on disk, and unique so concurrent builds never collide. This
+// is deliberately NOT the id published to browsers: see `publishedBuildId`.
+function newBuildDirName(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+/**
+ * Lowercase-alphanumeric 8-char digest, matching the `[a-z0-9]{8}` shape the
+ * bundler uses for its own content hashes — and which the server's cache
+ * classifier (`is_content_hashed` in `static_files.rs`) keys on to decide
+ * between `immutable` and `no-cache`.
+ */
+function toShortId(hex: string): string {
+  return BigInt(`0x${hex.slice(0, 32)}`)
+    .toString(36)
+    .padStart(8, "0")
+    .slice(0, 8);
+}
+
+function contentHash8(content: string | Uint8Array): string {
+  return toShortId(createHash("sha256").update(content).digest("hex"));
+}
+
+// Everything that determines what the bundle contains. `bun.lock` lives at the
+// workspace root, so a dependency bump changes the id even though no file under
+// `app/` moved.
+const BUILD_INPUT_DIRS = ["app", "public"];
+const BUILD_INPUT_FILES = [
+  "index.template.html",
+  "package.json",
+  "scripts/build.ts",
+  "../../bun.lock",
+];
+
+/**
+ * The build id published to browsers, derived from the bundle's *source inputs*.
+ *
+ * The obvious implementation — hash the emitted asset filenames, which already
+ * embed content hashes — does not work, because **Bun's minified identifier
+ * naming is not deterministic**. Building this app twice from an unchanged tree
+ * produces byte-different output roughly one run in three: same length, ~100k
+ * differing bytes, all of it mangled names (`var Gr=C3((Pl5,qq)=>` in one run,
+ * `var yr=C3((Uc5,Oq)=>` in the next). Output hashes therefore change without
+ * any source change.
+ *
+ * That matters because the client shows a "new version" toast on mismatch. An id
+ * that flips at random would fire the toast on redeploys of identical code and
+ * train people to ignore it, which is worse than having no toast at all. Hashing
+ * the inputs makes the id change if and only if something we actually control
+ * changed.
+ *
+ * The tradeoff: when Bun emits a different permutation for the same source, the
+ * asset filenames change while the build id does not, so an open tab isn't told
+ * to reload. That is the correct call — the two builds are the same program —
+ * and `importChunk` covers the case where such a tab later needs a chunk whose
+ * name moved.
+ */
+async function publishedBuildId(): Promise<string> {
+  const files: string[] = [];
+  for (const dir of BUILD_INPUT_DIRS) {
+    files.push(...(await collectFilesRecursively(join(rootPath, dir))));
+  }
+  for (const file of BUILD_INPUT_FILES) {
+    files.push(join(rootPath, file));
+  }
+
+  const digest = createHash("sha256");
+  // The bundler itself is an input: a Bun upgrade can change output semantics.
+  digest.update(`bun:${Bun.version}\n`);
+  for (const file of files.sort()) {
+    // Hash the repo-relative path, not the absolute one, so the id doesn't
+    // depend on where the repo is checked out.
+    digest.update(relative(rootPath, file));
+    digest.update("\0");
+    digest.update(createHash("sha256").update(await readFile(file)).digest());
+  }
+  return toShortId(digest.digest("hex"));
+}
+
+async function collectFilesRecursively(dir: string): Promise<string[]> {
+  const collected: string[] = [];
+  const entries = await readdir(dir, { withFileTypes: true });
+  for (const entry of entries) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      collected.push(...(await collectFilesRecursively(full)));
+    } else if (entry.isFile()) {
+      collected.push(full);
+    }
+  }
+  return collected;
+}
+
 async function buildOnce() {
-  const buildId = newBuildId();
-  const buildDir = join(buildsRootDir, buildId);
+  const buildDirName = newBuildDirName();
+  const buildDir = join(buildsRootDir, buildDirName);
   const buildAssetsDir = join(buildDir, "assets");
   await mkdir(buildAssetsDir, { recursive: true });
 
@@ -75,18 +166,48 @@ async function buildOnce() {
     throw new Error("Tailwind build failed");
   }
 
+  const stylesheetPath = await hashStylesheet(buildDir, buildAssetsDir);
+
   await cp(publicDir, buildDir, { recursive: true });
   await copyPierreWorkerAssets(join(buildAssetsDir, "pierre-diffs-worker"));
-  await writeIndexHtml(
-    buildDir,
-    result.outputs.map((output: any) => ({
-      kind: output.kind,
-      path: relative(buildDir, output.path),
-    })),
+
+  const outputs: IndexHtmlOutput[] = result.outputs.map((output: any) => ({
+    kind: output.kind,
+    path: relative(buildDir, output.path),
+  }));
+  const buildId = await publishedBuildId();
+
+  await writeIndexHtml(buildDir, outputs, stylesheetPath, buildId);
+  // Served with `no-cache` + ETag (it doesn't match the server's content-hash
+  // pattern), so a polling client revalidates it as a cheap 304.
+  await writeFile(
+    join(buildDir, "build-id.json"),
+    `${JSON.stringify({ buildId }, null, 2)}\n`,
+    "utf8",
   );
 
   await publishBuild(buildDir);
-  await pruneOldBuilds(buildId);
+  await pruneOldBuilds(buildDirName);
+}
+
+/**
+ * Renames Tailwind's stable-named `app.css` to `app-<hash>.css`.
+ *
+ * A stable name forces `no-cache`, which lets a tab revalidate into the new
+ * stylesheet while still running the previous build's JavaScript. Tailwind
+ * purges unused classes per build, so classes the old JS still emits can vanish
+ * from the new CSS and elements silently render unstyled. Hashing pins the two
+ * together and lets the server cache the stylesheet immutably.
+ */
+async function hashStylesheet(
+  buildDir: string,
+  buildAssetsDir: string,
+): Promise<string> {
+  const source = join(buildAssetsDir, "app.css");
+  const css = await readFile(source);
+  const hashedName = `app-${contentHash8(css)}.css`;
+  await rename(source, join(buildAssetsDir, hashedName));
+  return relative(buildDir, join(buildAssetsDir, hashedName));
 }
 
 async function copyPierreWorkerAssets(targetDir: string) {
@@ -110,7 +231,12 @@ type IndexHtmlOutput = {
   path: string;
 };
 
-async function writeIndexHtml(buildDir: string, outputs: IndexHtmlOutput[]) {
+async function writeIndexHtml(
+  buildDir: string,
+  outputs: IndexHtmlOutput[],
+  stylesheetPath: string,
+  buildId: string,
+) {
   const template = await readFile(templatePath, "utf8");
   // Only entry points get <script> tags. Bun's `splitting: true` emits
   // hundreds of chunks reachable from the entry through static and dynamic
@@ -123,7 +249,7 @@ async function writeIndexHtml(buildDir: string, outputs: IndexHtmlOutput[]) {
     .map((output) => `<script type="module" src="/${output.path.replaceAll("\\\\", "/")}"></script>`)
     .join("\n    ");
   const styles = [
-    "/assets/app.css",
+    `/${stylesheetPath.replaceAll("\\\\", "/")}`,
     ...outputs
       .filter((output) => output.path.endsWith(".css"))
       .map((output) => `/${output.path.replaceAll("\\\\", "/")}`),
@@ -132,8 +258,15 @@ async function writeIndexHtml(buildDir: string, outputs: IndexHtmlOutput[]) {
     .map((path) => `<link rel="stylesheet" href="${path}" />`)
     .join("\n    ");
 
+  // Records which build this document loaded. A tab reads it back at runtime
+  // and compares against /build-id.json; the meta tag is the honest answer
+  // because client-side routing never re-fetches index.html, so it stays
+  // pinned to the build the tab actually started with.
+  const buildMeta = `<meta name="fabro-build-id" content="${buildId}" />`;
+
   const html = template
     .replace("{{styles}}", styles)
+    .replace("{{buildMeta}}", buildMeta)
     .replace("{{scripts}}", scripts);
 
   await writeFile(join(buildDir, "index.html"), html, "utf8");

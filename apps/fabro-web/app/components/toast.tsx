@@ -9,10 +9,17 @@ import { Toaster as SonnerToaster, toast as sonnerToast, useSonner } from "sonne
 
 export type ToastTone = "info" | "error";
 
+export interface ToastAction {
+  label: string;
+  onClick: () => void;
+}
+
 export interface ToastInput {
   message: string;
   tone?: ToastTone;
+  /** Pass `Infinity` for a toast that stays until dismissed or acted on. */
   autoDismissMs?: number;
+  action?: ToastAction;
 }
 
 interface ToastContextValue {
@@ -27,6 +34,14 @@ function push(toast: ToastInput): string {
   const id = `toast-${nextToastId++}`;
   const options = {
     id,
+    ...(toast.action
+      ? {
+          action: {
+            label: toast.action.label,
+            onClick: toast.action.onClick,
+          },
+        }
+      : {}),
     ...(toast.tone === "error"
       ? { duration: Infinity }
       : toast.autoDismissMs != null

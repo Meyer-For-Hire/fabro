@@ -15,6 +15,7 @@ import { Link, Outlet, useLocation, useMatches } from "react-router";
 import { FabroToaster } from "../components/toast";
 import { ErrorState } from "../components/state";
 import { TooltipProvider } from "../components/ui";
+import { useBuildVersionGuard } from "../hooks/use-build-version-guard";
 import { DemoModeProvider } from "../lib/demo-mode";
 import { useAuthMe } from "../lib/queries";
 import { navigation } from "./navigation";
@@ -31,6 +32,9 @@ export default function AppShell() {
   const { data: auth, error, isLoading } = useAuthMe();
   const { pathname } = useLocation();
   const matches = useMatches();
+  // Before the early returns below, so the check keeps running while the shell
+  // is in its loading or error state.
+  useBuildVersionGuard();
 
   if (isLoading && !auth) {
     return <div className="min-h-full bg-page" />;

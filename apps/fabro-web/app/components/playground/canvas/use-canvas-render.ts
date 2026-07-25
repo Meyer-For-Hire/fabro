@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState, type RefObject } from "react";
 
+import { importChunk } from "../../../lib/import-chunk";
+
 /**
  * Synchronizes a DOM container with a Graphviz-rendered SVG. Pipes the
  * supplied DOT string through `@viz-js/viz` (the same layout engine Fabro
@@ -28,7 +30,7 @@ export function useCanvasRender(
     let cancelled = false;
     (async () => {
       try {
-        const { instance } = await import("@viz-js/viz");
+        const { instance } = await importChunk(() => import("@viz-js/viz"));
         const viz = await instance();
         if (cancelled) return;
         const svg = viz.renderSVGElement(dot);

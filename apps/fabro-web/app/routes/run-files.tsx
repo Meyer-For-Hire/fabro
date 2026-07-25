@@ -16,6 +16,7 @@ import {
   type FileContents,
 } from "@pierre/diffs/react";
 import { useToast } from "../components/toast";
+import { importChunk } from "../lib/import-chunk";
 import type {
   FileDiff as ApiFileDiff,
   PaginatedRunFileList,
@@ -58,9 +59,11 @@ import { useTickingNow } from "../lib/time";
 export { extractRequestId };
 
 const FileTreeSidebar = lazy(() =>
-  import("./run-files/file-tree-sidebar").then((module) => ({
-    default: module.FileTreeSidebar,
-  })),
+  importChunk(() =>
+    import("./run-files/file-tree-sidebar").then((module) => ({
+      default: module.FileTreeSidebar,
+    })),
+  ),
 );
 
 export const handle = { wide: true, fullHeight: true };

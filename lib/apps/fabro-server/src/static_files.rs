@@ -473,6 +473,10 @@ mod tests {
             "assets/entry-0sv53bs3.js",
             "assets/chunk-4tr91ktd.js",
             "assets/chunk-x912wb67.css",
+            // Tailwind's stylesheet is hashed by the build so it moves with the
+            // bundle; a stable name would let a tab revalidate into new CSS
+            // while still running the previous build's JavaScript.
+            "assets/app-381qtfxr.css",
         ] {
             assert!(is_content_hashed(path), "{path} should be content-hashed");
         }
@@ -485,6 +489,9 @@ mod tests {
         // pinned stale in browsers for a year if marked immutable.
         for path in [
             "index.html",
+            // Clients poll this to learn whether their tab is running a stale
+            // build, so it must revalidate rather than be pinned for a year.
+            "build-id.json",
             "assets/app.css",
             "assets/pierre-diffs-worker/worker-portable.js",
             "images/apple-touch-icon.png",

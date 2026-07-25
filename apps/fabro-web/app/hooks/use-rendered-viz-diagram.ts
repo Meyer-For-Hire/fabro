@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
 
+import { importChunk } from "../lib/import-chunk";
+
 /**
  * Synchronizes a DOT source with the imperative @viz-js SVG renderer and a DOM
  * container. Async renders are ignored after identity changes or unmount.
@@ -27,7 +29,7 @@ export function useRenderedVizDiagram<TIdentity>({
     async function render() {
       setError(null);
       onRenderStart?.();
-      const { instance } = await import("@viz-js/viz");
+      const { instance } = await importChunk(() => import("@viz-js/viz"));
       const viz = await instance();
       if (cancelled) return;
 

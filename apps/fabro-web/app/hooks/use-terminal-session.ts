@@ -6,6 +6,7 @@ import {
   buildTerminalWebSocketUrl,
   parseTerminalServerMessage,
 } from "../components/terminal-view-helpers";
+import { importChunk } from "../lib/import-chunk";
 
 export type ConnectionStatus = "connecting" | "ready" | "closed" | "error";
 
@@ -93,8 +94,8 @@ export function useTerminalSession({
       setError(null);
 
       const [{ Terminal }, { FitAddon }] = await Promise.all([
-        import("@xterm/xterm"),
-        import("@xterm/addon-fit"),
+        importChunk(() => import("@xterm/xterm")),
+        importChunk(() => import("@xterm/addon-fit")),
       ]);
       if (disposed || !terminalEl.current) return;
 
