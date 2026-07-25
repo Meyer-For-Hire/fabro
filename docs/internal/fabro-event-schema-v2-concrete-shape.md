@@ -377,6 +377,8 @@ V2 keeps the current durable family surface broadly intact.
 - `agent.steering.injected`
 - `agent.compaction.started`
 - `agent.compaction.completed`
+- `agent.llm.started`
+- `agent.llm.first_output`
 - `agent.llm.retry`
 - `agent.sub.spawned`
 - `agent.sub.completed`
@@ -417,7 +419,6 @@ The current boundary that keeps live token/delta noise out of `RunEvent` should 
 
 These stay outside the durable persisted contract:
 
-- `agent.output.start`
 - `agent.output.replace`
 - `agent.text.delta`
 - `agent.reasoning.delta`

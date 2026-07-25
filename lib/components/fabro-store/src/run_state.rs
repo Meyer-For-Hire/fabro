@@ -4,21 +4,22 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use fabro_types::run_event::{
-    CheckpointCompletedProps, RunCompletedProps, RunFailedProps, StageCompletedProps,
-    TodoCreatedProps, TodoDeletedProps, TodoUpdatedProps,
+    AgentLlmStartedProps, CheckpointCompletedProps, RunCompletedProps, RunFailedProps,
+    StageCompletedProps, TodoCreatedProps, TodoDeletedProps, TodoUpdatedProps,
 };
 use fabro_types::settings::run::{EnvironmentProvider, RunEnvironmentSettings};
 use fabro_types::{
     ActivatedSkill, AgentControlState, AskFabro, BilledModelUsage, BilledTokenCounts, Checkpoint,
     CheckpointRecord, CommandTermination, Conclusion, EventBody, FailureCategory, FailureSignature,
-    InterviewQuestionRecord, McpServerProjection, McpServerStatus, Outcome, PendingInterviewRecord,
-    PendingReason, PullRequestLink, RepositoryRef, Run, RunApproval, RunApprovalState,
-    RunBillingSummary, RunControlAction, RunDiff, RunEvent, RunId, RunLifecycle, RunLinks,
-    RunModel, RunOrigin, RunProjection, RunSandbox, RunSandboxFailure, RunSandboxInstance,
-    RunSandboxPlan, RunSandboxRuntime, RunSize, RunSpec, RunStatus, RunTimestamps,
-    SandboxProviderKind, StageCompletion, StageHandler, StageId, StageModelUsage, StageOutcome,
-    StageProjection, StageState, StartRecord, SubAgentProjection, SubAgentStatus, TodoListKind,
-    TodoListProjection, TodoProjection, WorkflowRef, first_event_seq,
+    InterviewQuestionRecord, McpServerProjection, McpServerStatus, ModelId, ModelRef, Outcome,
+    PendingInterviewRecord, PendingReason, ProviderId, PullRequestLink, RepositoryRef, Run,
+    RunApproval, RunApprovalState, RunBillingSummary, RunControlAction, RunDiff, RunEvent, RunId,
+    RunLifecycle, RunLinks, RunModel, RunOrigin, RunProjection, RunSandbox, RunSandboxFailure,
+    RunSandboxInstance, RunSandboxPlan, RunSandboxRuntime, RunSize, RunSpec, RunStatus,
+    RunTimestamps, SandboxProviderKind, StageCompletion, StageHandler, StageId,
+    StageInferenceProjection, StageModelUsage, StageOutcome, StageProjection, StageState,
+    StartRecord, SubAgentProjection, SubAgentStatus, TodoListKind, TodoListProjection,
+    TodoProjection, WorkflowRef, first_event_seq,
 };
 use fabro_util::error::render_compact_with_causes;
 
@@ -449,6 +450,39 @@ impl RunProjectionReducer for RunProjection {
                     context_window.event_seq = Some(event.seq);
                     stage.context_window = Some(context_window);
                 }
+                close_inference_bracket(self, stored, props.visit, event.seq);
+            }
+            EventBody::AgentLlmStarted(props) => {
+                open_inference_bracket(self, stored, props, event.seq, ts);
+            }
+            EventBody::AgentLlmFirstOutput(props) => {
+                let Some(inference) =
+                    matching_inference_bracket(self, stored, props.visit, event.seq)
+                else {
+                    return Ok(());
+                };
+                inference.first_output_at = Some(ts);
+                inference.first_output_kind = Some(props.kind);
+            }
+            EventBody::AgentLlmRetry(props) => {
+                let Some(inference) =
+                    matching_inference_bracket(self, stored, props.visit, event.seq)
+                else {
+                    return Ok(());
+                };
+                inference.retries = inference.retries.saturating_add(1);
+                // A retry discards whatever the failed attempt produced.
+                // Replay is driven purely by events, so resetting the
+                // in-process latch is not enough: without this the projection
+                // keeps asserting output the agent already threw away.
+                inference.first_output_at = None;
+                inference.first_output_kind = None;
+            }
+            EventBody::AgentError(props) => {
+                close_inference_bracket(self, stored, props.visit, event.seq);
+            }
+            EventBody::AgentSessionEnded(_) => {
+                close_inference_brackets_for_session(self, stored);
             }
             EventBody::AgentSessionActivated(props) => {
                 let Some(stage) = stage_at_stored_or_visit(self, stored, props.visit, event.seq)
@@ -464,6 +498,7 @@ impl RunProjectionReducer for RunProjection {
                     return Ok(());
                 };
                 stage.agent_control = AgentControlState::WaitingForSteer;
+                close_inference_bracket(self, stored, props.visit, event.seq);
             }
             EventBody::AgentSteeringInjected(props) => {
                 let Some(stage) = stage_at_stored_or_visit(self, stored, props.visit, event.seq)
@@ -963,6 +998,116 @@ fn stage_at_stored_or_visit<'a>(
         return Some(stage_at_stored_stage_id(state, stage_id, seq));
     }
     stage_at_visit(state, stored, visit, seq)
+}
+
+/// Open the inference bracket for the stage this event names.
+///
+/// Only root-session events open a bracket: forwarded child events carry a
+/// parent session and must not overwrite the parent's bracket. The session id
+/// is copied from the envelope so every later transition can be gated on it.
+fn open_inference_bracket(
+    state: &mut RunProjection,
+    stored: &RunEvent,
+    props: &AgentLlmStartedProps,
+    seq: u32,
+    ts: DateTime<Utc>,
+) {
+    if stored.parent_session_id.is_some() {
+        return;
+    }
+    let Some(session_id) = stored.session_id.clone() else {
+        return;
+    };
+    let Some(stage) = stage_at_stored_or_visit(state, stored, props.visit, seq) else {
+        return;
+    };
+    stage.inference = Some(StageInferenceProjection {
+        session_id,
+        started_at: ts,
+        requested_model: ModelRef {
+            provider: ProviderId::new(props.provider.clone()),
+            model_id: ModelId::new(props.model.clone()),
+            speed:    None,
+        },
+        first_output_at: None,
+        first_output_kind: None,
+        retries: 0,
+    });
+}
+
+/// Resolve the stage's `inference` slot when it holds a bracket this event is
+/// allowed to mutate.
+///
+/// `None` when the event came from a child session, when the stage has no
+/// open bracket, or when the bracket belongs to a different session — the
+/// last case matters after failover, which discards the session and builds a
+/// new one within a single visit.
+fn matching_inference_slot<'a>(
+    state: &'a mut RunProjection,
+    stored: &RunEvent,
+    visit: u32,
+    seq: u32,
+) -> Option<&'a mut Option<StageInferenceProjection>> {
+    if stored.parent_session_id.is_some() {
+        return None;
+    }
+    let session_id = stored.session_id.as_deref()?;
+    let stage = stage_at_stored_or_visit(state, stored, visit, seq)?;
+    let opened_here = stage
+        .inference
+        .as_ref()
+        .is_some_and(|inference| inference.session_id == session_id);
+    opened_here.then_some(&mut stage.inference)
+}
+
+/// Resolve the open inference bracket this event is allowed to mutate.
+fn matching_inference_bracket<'a>(
+    state: &'a mut RunProjection,
+    stored: &RunEvent,
+    visit: u32,
+    seq: u32,
+) -> Option<&'a mut StageInferenceProjection> {
+    matching_inference_slot(state, stored, visit, seq)?.as_mut()
+}
+
+/// Close the bracket on a stage-addressed terminal event.
+fn close_inference_bracket(state: &mut RunProjection, stored: &RunEvent, visit: u32, seq: u32) {
+    if let Some(slot) = matching_inference_slot(state, stored, visit, seq) {
+        *slot = None;
+    }
+}
+
+/// Close every bracket opened by the session that just ended.
+///
+/// `agent.session.ended` is the only ordering-safe backstop for terminal
+/// cancel and wall-clock timeout, which tear the session down through
+/// `discard_session` without emitting a message, error, or interrupt. It is
+/// emitted after the forwarder drains queued agent events, unlike
+/// `agent.session.deactivated`, which is emitted before the drain and so can
+/// be followed by a queued `agent.llm.started` that would re-open the bracket.
+///
+/// The tradeoff is that it carries no stage identity — its props are empty and
+/// its envelope has only session ids. So the close takes ordering from the
+/// event and identity from the projection, scanning for brackets this session
+/// opened. Implemented as a normal stage lookup it would find no target and
+/// silently no-op, leaving the bracket open forever on exactly the path it
+/// exists to cover.
+fn close_inference_brackets_for_session(state: &mut RunProjection, stored: &RunEvent) {
+    if stored.parent_session_id.is_some() {
+        return;
+    }
+    let Some(session_id) = stored.session_id.as_deref() else {
+        return;
+    };
+    for (_, stage) in state.iter_stages_mut() {
+        let opened_here = stage
+            .inference
+            .as_ref()
+            .is_some_and(|inference| inference.session_id == session_id);
+        if opened_here {
+            stage.inference = None;
+        }
+    }
 }
 
 fn stage_at_stored_or_current_visit<'a>(
@@ -6139,6 +6284,256 @@ mod tests {
                     message: "input token count is a local estimate".to_string(),
                 }],
             }
+        }
+    }
+
+    mod inference_bracket_reducer {
+        use fabro_types::run_event::{
+            AgentErrorProps, AgentLlmFirstOutputProps, AgentLlmRetryProps, AgentLlmStartedProps,
+        };
+        use fabro_types::{LlmOutputKind, LlmRetryPhase, StageInferenceProjection};
+
+        use super::*;
+
+        const ROOT: &str = "ses_root";
+
+        fn stage_id() -> StageId {
+            StageId::new("code", 1)
+        }
+
+        /// Stage-addressed event attributed to a root session.
+        fn root_event(seq: u32, body: EventBody) -> EventEnvelope {
+            let mut event = test_stage_event(seq, body, stage_id());
+            event.event.session_id = Some(ROOT.to_string());
+            event
+        }
+
+        /// Forwarded child-session event: same stage, but with a parent link.
+        fn child_event(seq: u32, body: EventBody) -> EventEnvelope {
+            let mut event = test_stage_event(seq, body, stage_id());
+            event.event.session_id = Some("ses_child".to_string());
+            event.event.parent_session_id = Some(ROOT.to_string());
+            event
+        }
+
+        /// `agent.session.ended` as it is actually stored: session ids only,
+        /// no `node_id` and no `stage_id`.
+        fn session_ended_event(seq: u32, session_id: &str) -> EventEnvelope {
+            let mut event = test_event(
+                seq,
+                EventBody::AgentSessionEnded(AgentSessionEndedProps {}),
+                None,
+            );
+            event.event.session_id = Some(session_id.to_string());
+            event
+        }
+
+        fn started() -> EventBody {
+            EventBody::AgentLlmStarted(AgentLlmStartedProps {
+                provider: "anthropic".to_string(),
+                model:    "claude-fable-5".to_string(),
+                visit:    1,
+            })
+        }
+
+        fn first_output(kind: LlmOutputKind) -> EventBody {
+            EventBody::AgentLlmFirstOutput(AgentLlmFirstOutputProps { kind, visit: 1 })
+        }
+
+        fn retry(phase: LlmRetryPhase) -> EventBody {
+            EventBody::AgentLlmRetry(AgentLlmRetryProps {
+                provider:   "anthropic".to_string(),
+                model:      "claude-fable-5".to_string(),
+                attempt:    0,
+                delay_secs: 0.0,
+                error:      json!({ "kind": "stream" }),
+                phase:      Some(phase),
+                visit:      1,
+            })
+        }
+
+        fn open_bracket(state: &RunProjection) -> Option<&StageInferenceProjection> {
+            state.stage(&stage_id()).unwrap().inference.as_ref()
+        }
+
+        #[test]
+        fn started_opens_a_bracket_carrying_the_requested_model() {
+            let mut state = initialized_projection();
+            state.apply_event(&root_event(1, started())).unwrap();
+
+            let inference = open_bracket(&state).expect("bracket should be open");
+            assert_eq!(inference.session_id, ROOT);
+            assert_eq!(inference.requested_model.provider.as_str(), "anthropic");
+            assert_eq!(
+                inference.requested_model.model_id.as_str(),
+                "claude-fable-5"
+            );
+            assert_eq!(inference.first_output_at, None);
+            assert_eq!(inference.first_output_kind, None);
+            assert_eq!(inference.retries, 0);
+        }
+
+        #[test]
+        fn first_output_records_the_observed_kind() {
+            let mut state = initialized_projection();
+            state.apply_event(&root_event(1, started())).unwrap();
+            state
+                .apply_event(&root_event(2, first_output(LlmOutputKind::ToolCall)))
+                .unwrap();
+
+            let inference = open_bracket(&state).unwrap();
+            assert!(inference.first_output_at.is_some());
+            assert_eq!(inference.first_output_kind, Some(LlmOutputKind::ToolCall));
+        }
+
+        #[test]
+        fn message_closes_the_bracket() {
+            let mut state = initialized_projection();
+            state.apply_event(&root_event(1, started())).unwrap();
+            state
+                .apply_event(&root_event(2, first_output(LlmOutputKind::Text)))
+                .unwrap();
+            state
+                .apply_event(&root_event(
+                    3,
+                    EventBody::AgentMessage(live_agent_message_props(live_counts(10, 5))),
+                ))
+                .unwrap();
+
+            assert!(open_bracket(&state).is_none());
+            // The close must not undo the rest of the message's work.
+            assert_eq!(state.stage(&stage_id()).unwrap().usage.input_tokens, 10);
+        }
+
+        #[test]
+        fn error_and_round_interrupt_close_the_bracket() {
+            for close in [
+                EventBody::AgentError(AgentErrorProps {
+                    error: json!({ "message": "boom" }),
+                    visit: 1,
+                }),
+                EventBody::AgentRoundInterrupted(AgentRoundInterruptedProps {
+                    generation: 1,
+                    visit:      1,
+                }),
+            ] {
+                let mut state = initialized_projection();
+                state.apply_event(&root_event(1, started())).unwrap();
+                state.apply_event(&root_event(2, close)).unwrap();
+                assert!(open_bracket(&state).is_none());
+            }
+        }
+
+        #[test]
+        fn retry_counts_the_attempt_and_clears_observed_output() {
+            let mut state = initialized_projection();
+            state.apply_event(&root_event(1, started())).unwrap();
+            state
+                .apply_event(&root_event(2, first_output(LlmOutputKind::Text)))
+                .unwrap();
+            state
+                .apply_event(&root_event(3, retry(LlmRetryPhase::Consume)))
+                .unwrap();
+
+            // Replay is event-driven, so the projection must forget output the
+            // agent discarded rather than keep asserting it.
+            let inference = open_bracket(&state).unwrap();
+            assert_eq!(inference.retries, 1);
+            assert_eq!(inference.first_output_at, None);
+            assert_eq!(inference.first_output_kind, None);
+
+            state
+                .apply_event(&root_event(4, first_output(LlmOutputKind::Reasoning)))
+                .unwrap();
+            state
+                .apply_event(&root_event(5, retry(LlmRetryPhase::Open)))
+                .unwrap();
+            let inference = open_bracket(&state).unwrap();
+            assert_eq!(inference.retries, 2);
+            assert_eq!(inference.first_output_kind, None);
+        }
+
+        #[test]
+        fn session_ended_closes_a_bracket_it_cannot_address_by_stage() {
+            let mut state = initialized_projection();
+            state.apply_event(&root_event(1, started())).unwrap();
+            assert!(open_bracket(&state).is_some());
+
+            // Terminal cancel path: no message, error, or interrupt is ever
+            // emitted. The envelope carries no node_id or stage_id, so a
+            // normal stage lookup would silently no-op and leave the bracket
+            // open forever.
+            state.apply_event(&session_ended_event(2, ROOT)).unwrap();
+            assert!(open_bracket(&state).is_none());
+        }
+
+        #[test]
+        fn session_ended_from_another_session_leaves_the_bracket_open() {
+            let mut state = initialized_projection();
+            state.apply_event(&root_event(1, started())).unwrap();
+            state
+                .apply_event(&session_ended_event(2, "ses_other"))
+                .unwrap();
+            assert!(open_bracket(&state).is_some());
+        }
+
+        #[test]
+        fn a_start_queued_behind_deactivation_does_not_leave_a_phantom_bracket() {
+            let mut state = initialized_projection();
+
+            // `lease.release()` emits deactivation *before* the forwarder
+            // drains queued agent events, so a queued start legitimately
+            // arrives after it. Keying the close on deactivation would clear
+            // the bracket and then immediately re-open it.
+            state
+                .apply_event(&root_event(
+                    1,
+                    EventBody::AgentSessionDeactivated(AgentSessionDeactivatedProps { visit: 1 }),
+                ))
+                .unwrap();
+            state.apply_event(&root_event(2, started())).unwrap();
+            state.apply_event(&session_ended_event(3, ROOT)).unwrap();
+
+            assert!(open_bracket(&state).is_none());
+        }
+
+        #[test]
+        fn child_session_events_do_not_touch_the_root_bracket() {
+            let mut state = initialized_projection();
+            state.apply_event(&root_event(1, started())).unwrap();
+            state
+                .apply_event(&root_event(2, first_output(LlmOutputKind::Text)))
+                .unwrap();
+
+            // A sub-agent runs its own rounds on the same stage. None of them
+            // may open, advance, or close the root session's bracket.
+            state.apply_event(&child_event(3, started())).unwrap();
+            state
+                .apply_event(&child_event(4, first_output(LlmOutputKind::ToolCall)))
+                .unwrap();
+            state
+                .apply_event(&child_event(5, retry(LlmRetryPhase::Open)))
+                .unwrap();
+            state
+                .apply_event(&session_ended_event(6, "ses_child"))
+                .unwrap();
+
+            let inference = open_bracket(&state).expect("root bracket should survive");
+            assert_eq!(inference.session_id, ROOT);
+            assert_eq!(inference.first_output_kind, Some(LlmOutputKind::Text));
+            assert_eq!(inference.retries, 0);
+        }
+
+        #[test]
+        fn transitions_without_an_open_bracket_are_ignored() {
+            let mut state = initialized_projection();
+            state
+                .apply_event(&root_event(1, first_output(LlmOutputKind::Text)))
+                .unwrap();
+            state
+                .apply_event(&root_event(2, retry(LlmRetryPhase::Open)))
+                .unwrap();
+            assert!(open_bracket(&state).is_none());
         }
     }
 }

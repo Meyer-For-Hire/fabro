@@ -316,6 +316,19 @@ impl ProgressUI {
                     tracked_file_count,
                 );
             }
+            ProgressEvent::LlmRequestStarted {
+                stage_node_id,
+                model,
+            } => {
+                self.stage
+                    .on_llm_request_started(renderer, &stage_node_id, &model);
+            }
+            ProgressEvent::LlmFirstOutput {
+                stage_node_id,
+                kind,
+            } => {
+                self.stage.on_llm_first_output(&stage_node_id, kind);
+            }
             ProgressEvent::LlmRetry {
                 stage_node_id,
                 model,
@@ -680,6 +693,50 @@ mod tests {
     }
 
     #[test]
+    fn inference_bracket_sets_updates_and_clears_bar() {
+        let mut ui = ProgressUI::new(true, false);
+
+        emit(&mut ui, stage_started("s1", "Build"));
+        assert!(ui.stage.active_stages["s1"].inference_bar.is_none());
+
+        emit(
+            &mut ui,
+            agent_event("s1", AgentEvent::LlmRequestStarted {
+                provider: "anthropic".into(),
+                model:    "claude-fable-5".into(),
+            }),
+        );
+        let message = ui.stage.active_stages["s1"]
+            .inference_bar
+            .as_ref()
+            .expect("bracket should open a live line")
+            .message();
+        assert!(
+            message.contains("waiting on claude-fable-5"),
+            "expected the requested model, got: {message:?}"
+        );
+
+        emit(
+            &mut ui,
+            agent_event("s1", AgentEvent::LlmFirstOutput {
+                kind: fabro_types::LlmOutputKind::ToolCall,
+            }),
+        );
+        let message = ui.stage.active_stages["s1"]
+            .inference_bar
+            .as_ref()
+            .expect("the line stays open until the round ends")
+            .message();
+        assert!(
+            message.contains("calling tools"),
+            "expected the observed output kind, got: {message:?}"
+        );
+
+        emit(&mut ui, assistant_message("s1", "claude-fable-5"));
+        assert!(ui.stage.active_stages["s1"].inference_bar.is_none());
+    }
+
+    #[test]
     fn handle_json_line_ignores_invalid_json() {
         let (mut ui, buffer) = capture_ui(false);
         ui.handle_json_line("not valid json");
@@ -743,6 +800,7 @@ mod tests {
                 model:      "gpt-5-mini".into(),
                 attempt:    2,
                 delay_secs: 1.5,
+                phase:      Some(fabro_types::LlmRetryPhase::Open),
                 error:      fabro_llm::Error::Configuration {
                     message: "busy".into(),
                     source:  None,
@@ -1101,6 +1159,7 @@ mod tests {
                 model:      "gpt-5-mini".into(),
                 attempt:    2,
                 delay_secs: 1.5,
+                phase:      Some(fabro_types::LlmRetryPhase::Open),
                 error:      fabro_llm::Error::Configuration {
                     message: "busy".into(),
                     source:  None,

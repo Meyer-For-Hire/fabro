@@ -31,6 +31,7 @@ import type {
   ThreadDnaSelection,
 } from "../components/event-debug";
 import { StageContext } from "../components/stage-context";
+import { StageInferenceIndicator } from "../components/stage-inference-indicator";
 import { StageInsightsSidebar } from "../components/stage-insights-sidebar";
 import { StageSidebar } from "../components/stage-sidebar";
 import type { Stage } from "../components/stage-sidebar";
@@ -84,6 +85,7 @@ import { getNumber, getString, type UnknownRecord } from "../lib/unknown";
 import type {
   EventEnvelope,
   StageHandler,
+  StageInferenceProjection,
   StageModelUsage,
 } from "@qltysh/fabro-api-client";
 
@@ -2063,6 +2065,8 @@ function RunStageActivityStage({
   selectedStage,
   stages,
   runStart,
+  inference,
+  runSettled,
   tab,
   selectedKinds,
   selectedDebugCategories,
@@ -2076,6 +2080,8 @@ function RunStageActivityStage({
   selectedStage: Stage;
   stages: Stage[];
   runStart: string | undefined;
+  inference: StageInferenceProjection | null | undefined;
+  runSettled: boolean;
   tab: EventsTab;
   selectedKinds: EventKind[];
   selectedDebugCategories: DebugCategory[];
@@ -2087,6 +2093,17 @@ function RunStageActivityStage({
 }) {
   const selectedStageId = selectedStage.id;
   const stageEventsQuery = useRunStageEvents(runId, selectedStageId);
+  // An open bracket on a run that can no longer advance means we never learned
+  // how the request ended, not that it is still working. The watchdog stays
+  // the authority on "actually stuck", so its timeout settles the readout too.
+  const inferenceSettled = useMemo(
+    () =>
+      runSettled ||
+      (stageEventsQuery.data ?? []).some(
+        (event) => event.event === "watchdog.timeout",
+      ),
+    [runSettled, stageEventsQuery.data],
+  );
   const activity = useMemo(
     () => buildStageActivity(stageEventsQuery.data ?? [], selectedStageId),
     [stageEventsQuery.data, selectedStageId],
@@ -2239,6 +2256,11 @@ function RunStageActivityStage({
                 </Link>
               </p>
             )}
+            <StageInferenceIndicator
+              inference={inference}
+              settled={inferenceSettled}
+            />
+
             <EventsToolbar
               tab={effectiveTab}
               renderer={renderer}
@@ -2336,11 +2358,15 @@ function RunStageActivity({
   selectedStage,
   stages,
   runStart,
+  inference,
+  runSettled,
 }: {
   runId: string;
   selectedStage: Stage;
   stages: Stage[];
   runStart: string | undefined;
+  inference: StageInferenceProjection | null | undefined;
+  runSettled: boolean;
 }) {
   const [activityState, dispatchActivity] = useReducer(
     stageActivityReducer,
@@ -2356,6 +2382,8 @@ function RunStageActivity({
       selectedStage={selectedStage}
       stages={stages}
       runStart={runStart}
+      inference={inference}
+      runSettled={runSettled}
       tab={tab}
       selectedKinds={selectedKinds}
       selectedDebugCategories={selectedDebugCategories}
@@ -2407,6 +2435,11 @@ export default function RunStages() {
     isAgentStage && selectedStageId
       ? runStateQuery.data?.stages[selectedStageId]
       : undefined;
+  const runStatusKind = runQuery.data?.lifecycle.status.kind;
+  const runSettled =
+    runStatusKind === "succeeded" ||
+    runStatusKind === "failed" ||
+    runStatusKind === "dead";
 
   if (!id || !selectedStage) {
     return (
@@ -2458,6 +2491,8 @@ export default function RunStages() {
         selectedStage={selectedStage}
         stages={stages}
         runStart={runStart}
+        inference={stageProjection?.inference}
+        runSettled={runSettled}
       />
     </div>
   );

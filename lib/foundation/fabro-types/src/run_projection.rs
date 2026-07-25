@@ -10,9 +10,9 @@ use crate::run_event::{AgentSessionActivatedProps, StagePromptProps};
 use crate::{
     AgentBackend, AgentMcpToolSummary, AgentSkillActivationSource, AgentSkillSummary,
     AgentToolSummary, BilledTokenCounts, Checkpoint, Conclusion, InterviewQuestionRecord,
-    InvalidTransition, ModelRef, PermissionLevel, PullRequestLink, RunApproval, RunControlAction,
-    RunDiff, RunId, RunSandbox, RunSpec, RunStatus, RunTiming, StageCompletion, StageHandler,
-    StageId, StageState, StageTiming, StartRecord, TodoListProjection,
+    InvalidTransition, LlmOutputKind, ModelRef, PermissionLevel, PullRequestLink, RunApproval,
+    RunControlAction, RunDiff, RunId, RunSandbox, RunSpec, RunStatus, RunTiming, StageCompletion,
+    StageHandler, StageId, StageState, StageTiming, StartRecord, TodoListProjection,
 };
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -381,9 +381,39 @@ pub struct StageProjection {
     pub mcp_servers:           Vec<McpServerProjection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window:        Option<StageContextWindowProjection>,
+    /// Open inference bracket for this stage, if the event log contains one.
+    ///
+    /// `Some` means exactly *"an `agent.llm.started` was recorded and no
+    /// closing event has been seen"* — not "the model is computing right
+    /// now". A worker killed mid-turn leaves the bracket open, which is the
+    /// truthful statement of what the log knows. `watchdog.timeout` remains
+    /// the authority on whether a run is actually stuck.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inference:             Option<StageInferenceProjection>,
     #[serde(default)]
     pub agent_control:         AgentControlState,
     pub state:                 StageState,
+}
+
+/// One open inference bracket: a dispatched LLM request that has not yet
+/// produced a message, error, or interrupt.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct StageInferenceProjection {
+    /// Copied from the envelope `RunEvent.session_id` when the bracket opens.
+    /// Every later transition is gated on it so a sub-agent's rounds cannot
+    /// overwrite the root session's bracket.
+    pub session_id:        String,
+    pub started_at:        DateTime<Utc>,
+    /// Provider and model the request was *sent to*. Failover can re-target,
+    /// so `StageProjection::model` stays authoritative for what answered.
+    pub requested_model:   ModelRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_output_at:   Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_output_kind: Option<LlmOutputKind>,
+    /// Attempts that failed and restarted within this bracket.
+    #[serde(default)]
+    pub retries:           u32,
 }
 
 #[derive(
@@ -485,6 +515,7 @@ impl StageProjection {
             agent_tools: Vec::new(),
             mcp_servers: Vec::new(),
             context_window: None,
+            inference: None,
             agent_control: AgentControlState::default(),
             provider_used: None,
             diff: None,

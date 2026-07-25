@@ -17,8 +17,8 @@ use fabro_mcp::connection_manager::McpConnectionManager;
 use fabro_mcp::http_transport;
 use fabro_model::{AgentProfileKind, Catalog, ModelRef, Speed, UsdMicros};
 use fabro_types::{
-    AgentToolSummary, PermissionLevel, Principal, SessionMessage, SessionRecord,
-    StageContextWindowProjection, SteeringMessage,
+    AgentToolSummary, LlmOutputKind, LlmRetryPhase, PermissionLevel, Principal, SessionMessage,
+    SessionRecord, StageContextWindowProjection, SteeringMessage,
 };
 use futures::StreamExt;
 use tokio::sync::{Notify, broadcast};
@@ -89,6 +89,25 @@ pub enum SessionShutdownReason {
 fn record_elapsed(start: &mut Option<Instant>, total: &mut Duration) {
     if let Some(s) = start.take() {
         *total = total.saturating_add(s.elapsed());
+    }
+}
+
+/// Classify a stream event as the first unit of provider output, or `None`
+/// when it carries no output.
+///
+/// `StreamStart` is deliberately excluded: `openai_compatible` never emits it,
+/// so latching on it would leave whole providers silent. The start/delta/end
+/// events below are emitted by every codec that produces that kind of output.
+fn first_output_kind(event: &StreamEvent) -> Option<LlmOutputKind> {
+    match event {
+        StreamEvent::ReasoningStart | StreamEvent::ReasoningDelta { .. } => {
+            Some(LlmOutputKind::Reasoning)
+        }
+        StreamEvent::TextStart { .. } | StreamEvent::TextDelta { .. } => Some(LlmOutputKind::Text),
+        StreamEvent::ToolCallStart { .. }
+        | StreamEvent::ToolCallDelta { .. }
+        | StreamEvent::ToolCallEnd { .. } => Some(LlmOutputKind::ToolCall),
+        _ => None,
     }
 }
 
@@ -1479,15 +1498,24 @@ impl Session {
             let local_context_window = built_request.context_window.clone();
             let request = built_request.request;
 
-            // Emit AssistantTextStart before LLM call
+            let requested_provider = self.provider_profile.provider_id().to_string();
+            let requested_model = self.provider_profile.model().to_string();
+
+            // Open the inference bracket for this round. The request is built
+            // and compaction has run, so this is the last point before the
+            // provider is contacted at which we still know nothing about the
+            // response.
             self.event_emitter
-                .emit(self.id.clone(), AgentEvent::AssistantTextStart);
+                .emit(self.id.clone(), AgentEvent::LlmRequestStarted {
+                    provider: requested_provider.clone(),
+                    model:    requested_model.clone(),
+                });
 
             // Call LLM (streaming) with retry for transient errors
             let retry_emitter = self.event_emitter.clone();
             let retry_session_id = self.id.clone();
-            let retry_provider = self.provider_profile.provider_id().to_string();
-            let retry_model = self.provider_profile.model().to_string();
+            let retry_provider = requested_provider.clone();
+            let retry_model = requested_model.clone();
             let retry_policy = RetryPolicy {
                 max_retries: 3,
                 on_retry: Some(std::sync::Arc::new(move |err, attempt, delay| {
@@ -1497,6 +1525,7 @@ impl Session {
                         attempt:    attempt as usize,
                         delay_secs: delay.as_secs_f64(),
                         error:      err.clone(),
+                        phase:      Some(LlmRetryPhase::Open),
                     });
                 })),
                 ..Default::default()
@@ -1542,6 +1571,10 @@ impl Session {
                 let mut accumulator = StreamAccumulator::new();
                 let mut attempt_emitted_output = false;
                 let mut stream_error = None;
+                // Re-armed per attempt: a replayed turn discards everything
+                // the previous attempt produced, so its first output is a new
+                // observation rather than a continuation.
+                let mut first_output_emitted = false;
 
                 loop {
                     let chunk = tokio::select! {
@@ -1560,6 +1593,13 @@ impl Session {
                     };
                     match event_result {
                         Ok(event) => {
+                            if !first_output_emitted {
+                                if let Some(kind) = first_output_kind(&event) {
+                                    first_output_emitted = true;
+                                    self.event_emitter
+                                        .emit(self.id.clone(), AgentEvent::LlmFirstOutput { kind });
+                                }
+                            }
                             match &event {
                                 StreamEvent::TextDelta { ref delta, .. } => {
                                     attempt_emitted_output = true;
@@ -1638,9 +1678,19 @@ impl Session {
                             );
                             visible_output_present = false;
                         }
-                        if let Some(ref on_retry) = retry_policy.on_retry {
-                            on_retry(&err, retry_attempt, delay);
-                        }
+                        // Emitted directly rather than through
+                        // `retry_policy.on_retry` so the event can name the
+                        // consume loop as the source of `attempt`; the policy
+                        // callback only ever runs for stream-open failures.
+                        self.event_emitter
+                            .emit(self.id.clone(), AgentEvent::LlmRetry {
+                                provider:   requested_provider.clone(),
+                                model:      requested_model.clone(),
+                                attempt:    stream_attempt,
+                                delay_secs: delay.as_secs_f64(),
+                                error:      err.clone(),
+                                phase:      Some(LlmRetryPhase::Consume),
+                            });
 
                         let delay_outcome = tokio::select! {
                             biased;
@@ -1707,6 +1757,21 @@ impl Session {
                         );
                         visible_output_present = false;
                     }
+                    // The only mid-turn restart that reaches no error handler:
+                    // without this the round replays and discards its output
+                    // with nothing on the durable stream to show for it.
+                    self.event_emitter
+                        .emit(self.id.clone(), AgentEvent::LlmRetry {
+                            provider:   requested_provider.clone(),
+                            model:      requested_model.clone(),
+                            attempt:    stream_attempt,
+                            delay_secs: 0.0,
+                            error:      LlmError::Stream {
+                                message: "Stream ended without a finish event".to_string(),
+                                source:  None,
+                            },
+                            phase:      Some(LlmRetryPhase::Consume),
+                        });
                     let cancel_token_for_select = self.cancel_token.clone();
                     let retry_outcome: Option<Result<StreamEventStream, Error>> = tokio::select! {
                         biased;
@@ -4205,6 +4270,122 @@ mod tests {
         assert_eq!(tool_completed_count, 0);
     }
 
+    /// Drain the receiver into `(label, detail)` pairs for the inference
+    /// bracket events, ignoring everything else.
+    fn collect_bracket_events(rx: &mut broadcast::Receiver<SessionEvent>) -> Vec<(String, String)> {
+        let mut observed = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            match event.event {
+                AgentEvent::LlmRequestStarted { provider, model } => {
+                    observed.push(("started".to_string(), format!("{provider}/{model}")));
+                }
+                AgentEvent::LlmFirstOutput { kind } => {
+                    observed.push(("first_output".to_string(), kind.to_string()));
+                }
+                AgentEvent::AssistantMessage { text, .. } => {
+                    observed.push(("message".to_string(), text));
+                }
+                _ => {}
+            }
+        }
+        observed
+    }
+
+    #[tokio::test]
+    async fn inference_bracket_wraps_a_text_first_turn() {
+        let provider = Arc::new(ScriptedStreamProvider::new(vec![
+            ScriptedStreamCall::Response(Box::new(text_response("Hello"))),
+        ]));
+        let mut session = make_session_with_provider(provider).await;
+        let mut rx = session.subscribe();
+
+        session.process_input("Hi").await.unwrap();
+
+        // `started` carries the requested provider/model, and precedes any
+        // knowledge of what the response will contain.
+        assert_eq!(collect_bracket_events(&mut rx), vec![
+            ("started".to_string(), "anthropic/mock-model".to_string()),
+            ("first_output".to_string(), "text".to_string()),
+            ("message".to_string(), "Hello".to_string()),
+        ]);
+    }
+
+    #[tokio::test]
+    async fn first_output_reports_reasoning_when_reasoning_arrives_first() {
+        let response = text_response("Hello");
+        let provider = Arc::new(ScriptedStreamProvider::new(vec![
+            ScriptedStreamCall::Events(vec![
+                Ok(StreamEvent::ReasoningDelta {
+                    delta: "weighing options".to_string(),
+                }),
+                Ok(StreamEvent::text_delta("Hello", None)),
+                Ok(StreamEvent::finish(
+                    response.finish_reason.clone(),
+                    response.usage.clone(),
+                    response,
+                )),
+            ]),
+        ]));
+        let mut session = make_session_with_provider(provider).await;
+        let mut rx = session.subscribe();
+
+        session.process_input("Hi").await.unwrap();
+
+        // Edge-triggered: the later text delta does not re-fire the latch.
+        assert_eq!(collect_bracket_events(&mut rx), vec![
+            ("started".to_string(), "anthropic/mock-model".to_string()),
+            ("first_output".to_string(), "reasoning".to_string()),
+            ("message".to_string(), "Hello".to_string()),
+        ]);
+    }
+
+    #[tokio::test]
+    async fn first_output_reports_tool_call_for_a_turn_with_no_text_or_reasoning() {
+        let tool_call = ToolCall::new("call_1", "nonexistent_tool", serde_json::json!({}));
+        let mut response = tool_call_response("nonexistent_tool", "call_1", serde_json::json!({}));
+        // Strip the visible text so the turn produces neither a text nor a
+        // reasoning delta — the case a latch keyed on those two would miss
+        // entirely, leaving tool-heavy rounds silent.
+        response.message.content = vec![ContentPart::ToolCall(tool_call.clone())];
+
+        let provider = Arc::new(ScriptedStreamProvider::new(vec![
+            ScriptedStreamCall::Events(vec![
+                Ok(StreamEvent::ToolCallStart {
+                    tool_call: tool_call.clone(),
+                }),
+                Ok(StreamEvent::ToolCallEnd {
+                    tool_call: tool_call.clone(),
+                }),
+                Ok(StreamEvent::finish(
+                    response.finish_reason.clone(),
+                    response.usage.clone(),
+                    response,
+                )),
+            ]),
+            ScriptedStreamCall::Response(Box::new(text_response("Done"))),
+        ]));
+        let mut session = make_session_with_provider(provider).await;
+        let mut rx = session.subscribe();
+
+        session.process_input("Use the tool").await.unwrap();
+
+        let observed = collect_bracket_events(&mut rx);
+        let kinds: Vec<&str> = observed
+            .iter()
+            .filter(|(label, _)| label == "first_output")
+            .map(|(_, kind)| kind.as_str())
+            .collect();
+        assert_eq!(kinds, vec!["tool_call", "text"]);
+        // One bracket per round: the tool round and the round that follows it.
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|(label, _)| label == "started")
+                .count(),
+            2
+        );
+    }
+
     #[tokio::test]
     async fn stream_retries_when_stream_ends_without_finish_before_any_deltas() {
         let provider = Arc::new(ScriptedStreamProvider::new(vec![
@@ -4223,24 +4404,33 @@ mod tests {
             Some(Message::Assistant { content, .. }) if content == "Recovered"
         ));
 
-        let mut assistant_text_start_count = 0;
+        let mut request_started_count = 0;
         let mut replace_count = 0;
         let mut deltas = Vec::new();
         let mut assistant_messages = Vec::new();
+        let mut consume_retries = Vec::new();
         while let Ok(event) = rx.try_recv() {
             match event.event {
-                AgentEvent::AssistantTextStart => assistant_text_start_count += 1,
+                AgentEvent::LlmRequestStarted { .. } => request_started_count += 1,
                 AgentEvent::AssistantOutputReplace { .. } => replace_count += 1,
                 AgentEvent::TextDelta { delta } => deltas.push(delta),
                 AgentEvent::AssistantMessage { text, .. } => assistant_messages.push(text),
+                AgentEvent::LlmRetry { attempt, phase, .. } => {
+                    consume_retries.push((attempt, phase));
+                }
                 _ => {}
             }
         }
 
-        assert_eq!(assistant_text_start_count, 1);
+        // One round, so one bracket open — the finish-less stream is replayed
+        // inside the round rather than starting a new one.
+        assert_eq!(request_started_count, 1);
         assert_eq!(replace_count, 0);
         assert_eq!(deltas, vec!["Recovered".to_string()]);
         assert_eq!(assistant_messages, vec!["Recovered".to_string()]);
+        // The finish-less restart is the one mid-turn path with no error to
+        // report; without this event it would be invisible downstream.
+        assert_eq!(consume_retries, vec![(0, Some(LlmRetryPhase::Consume))]);
     }
 
     #[tokio::test]
@@ -4264,10 +4454,14 @@ mod tests {
         let mut observed = Vec::new();
         while let Ok(event) = rx.try_recv() {
             match event.event {
-                AgentEvent::AssistantTextStart => observed.push("start".to_string()),
+                AgentEvent::LlmRequestStarted { .. } => observed.push("start".to_string()),
+                AgentEvent::LlmFirstOutput { kind } => observed.push(format!("first:{kind}")),
                 AgentEvent::TextDelta { delta } => observed.push(format!("delta:{delta}")),
                 AgentEvent::AssistantOutputReplace { text, reasoning } => {
                     observed.push(format!("replace:{text}:{reasoning:?}"));
+                }
+                AgentEvent::LlmRetry { phase, .. } => {
+                    observed.push(format!("retry:{}", phase.expect("phase is always set")));
                 }
                 AgentEvent::AssistantMessage { text, .. } => {
                     observed.push(format!("message:{text}"));
@@ -4276,10 +4470,15 @@ mod tests {
             }
         }
 
+        // The latch re-arms on restart: the replayed attempt's first delta is
+        // a fresh observation, not a continuation of the discarded one.
         assert_eq!(observed, vec![
             "start".to_string(),
+            "first:text".to_string(),
             "delta:Hel".to_string(),
             "replace::None".to_string(),
+            "retry:consume".to_string(),
+            "first:text".to_string(),
             "delta:Hello".to_string(),
             "message:Hello".to_string(),
         ]);
@@ -4317,7 +4516,7 @@ mod tests {
         let mut found_auth_error_event = false;
         while let Ok(event) = rx.try_recv() {
             match event.event {
-                AgentEvent::AssistantTextStart => observed.push("start".to_string()),
+                AgentEvent::LlmRequestStarted { .. } => observed.push("start".to_string()),
                 AgentEvent::TextDelta { delta } => observed.push(format!("delta:{delta}")),
                 AgentEvent::AssistantOutputReplace { text, reasoning } => {
                     observed.push(format!("replace:{text}:{reasoning:?}"));

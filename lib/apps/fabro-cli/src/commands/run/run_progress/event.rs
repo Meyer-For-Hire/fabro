@@ -1,7 +1,7 @@
 use std::convert::TryFrom;
 
 use chrono::{DateTime, Utc};
-use fabro_types::{BilledModelUsage, EventBody, RunEvent};
+use fabro_types::{BilledModelUsage, EventBody, LlmOutputKind, RunEvent};
 use fabro_util::error;
 use fabro_workflow::event::RunNoticeLevel;
 use serde_json::Value;
@@ -163,6 +163,14 @@ pub(super) enum ProgressEvent {
         original_turn_count:  u64,
         preserved_turn_count: u64,
         tracked_file_count:   u64,
+    },
+    LlmRequestStarted {
+        stage_node_id: String,
+        model:         String,
+    },
+    LlmFirstOutput {
+        stage_node_id: String,
+        kind:          LlmOutputKind,
     },
     LlmRetry {
         stage_node_id: String,
@@ -359,6 +367,14 @@ pub(super) fn from_run_event(stored: &RunEvent) -> Option<ProgressEvent> {
             original_turn_count:  props.original_turn_count as u64,
             preserved_turn_count: props.preserved_turn_count as u64,
             tracked_file_count:   props.tracked_file_count as u64,
+        }),
+        EventBody::AgentLlmStarted(props) => Some(ProgressEvent::LlmRequestStarted {
+            stage_node_id: node_id,
+            model:         props.model.clone(),
+        }),
+        EventBody::AgentLlmFirstOutput(props) => Some(ProgressEvent::LlmFirstOutput {
+            stage_node_id: node_id,
+            kind:          props.kind,
         }),
         EventBody::AgentLlmRetry(props) => {
             #[allow(

@@ -47,7 +47,7 @@ pub mod types {
         DirtyStatus, EventEnvelope, ExecOutputTail, FailureCategory, FailureDetail,
         FailureSignature, GitContext, IdpIdentity, IntegrationConnectionKind,
         IntegrationConnectionState, IntegrationConnectionStatus, IntegrationProvider,
-        IntegrationStatus, InterviewOption, InterviewQuestionRecord,
+        IntegrationStatus, InterviewOption, InterviewQuestionRecord, LlmOutputKind, LlmRetryPhase,
         McpServerDraft as CreateMcpServerRequest, McpServerProjection,
         McpServerReplace as ReplaceMcpServerRequest, McpServerStatus, McpServerView as McpServer,
         McpTransportView, Message, PairId, PairMessageId, PairMessageRecord, PairMessageRequest,
@@ -68,10 +68,11 @@ pub mod types {
         SkillsProjection, StageCompletion, StageContextWindow, StageContextWindowBreakdownItem,
         StageContextWindowCategory, StageContextWindowCountMethod, StageContextWindowProjection,
         StageContextWindowStaleness, StageContextWindowUnavailableReason,
-        StageContextWindowWarning, StageHandler, StageId, StageModelUsage, StageOutcome,
-        StageProjection, StageState, SubAgentProjection, SubAgentStatus, SystemActorKind,
-        SystemIntegrationStatus, SystemIntegrationsResponse, TodoListProjection, TurnId,
-        UpdateVariableRequest, UserPrincipal, Variable, VariableListResponse, WorkflowSettings,
+        StageContextWindowWarning, StageHandler, StageId, StageInferenceProjection,
+        StageModelUsage, StageOutcome, StageProjection, StageState, SubAgentProjection,
+        SubAgentStatus, SystemActorKind, SystemIntegrationStatus, SystemIntegrationsResponse,
+        TodoListProjection, TurnId, UpdateVariableRequest, UserPrincipal, Variable,
+        VariableListResponse, WorkflowSettings,
     };
 
     pub use crate::generated::types::*;

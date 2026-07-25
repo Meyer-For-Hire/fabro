@@ -10719,12 +10719,82 @@ components:
             - $ref: "#/components/schemas/StageContextWindowProjection"
             - type: "null"
           description: Latest content-free context-window snapshot for this agent stage.
+        inference:
+          oneOf:
+            - $ref: "#/components/schemas/StageInferenceProjection"
+            - type: "null"
+          description: >
+            Open inference bracket, if the event log contains one. Present means
+            a model request was dispatched and no closing event has been seen —
+            not that the model is computing right now.
         agent_control:
           $ref: "#/components/schemas/AgentControlState"
           description: Whether the agent is executing normally or waiting for steering after an interrupt.
         state:
           $ref: "#/components/schemas/StageState"
           description: Lifecycle state of the stage projection.
+
+    StageInferenceProjection:
+      description: >
+        One open inference bracket: a dispatched LLM request that has not yet
+        produced a message, error, or interrupt. Carries no usage or cost — none
+        exists until the turn completes.
+      type: object
+      required:
+        - session_id
+        - started_at
+        - requested_model
+        - retries
+      properties:
+        session_id:
+          type: string
+          description: >
+            Agent session that opened the bracket, copied from the event
+            envelope. Transitions are gated on it so sub-agent rounds cannot
+            overwrite the root session's bracket.
+        started_at:
+          type: string
+          format: date-time
+          description: When the request was dispatched.
+        requested_model:
+          $ref: "#/components/schemas/BillingModelRef"
+          description: >
+            Provider and model the request was sent to. Failover can re-target,
+            so `StageProjection.model` stays authoritative for what answered.
+        first_output_at:
+          type: ["string", "null"]
+          format: date-time
+          description: When the provider produced its first output, if it has.
+        first_output_kind:
+          oneOf:
+            - $ref: "#/components/schemas/LlmOutputKind"
+            - type: "null"
+          description: Kind of the first output observed for the current attempt.
+        retries:
+          type: integer
+          format: uint32
+          minimum: 0
+          description: Attempts that failed and restarted within this bracket.
+
+    LlmOutputKind:
+      description: >
+        Kind of output a provider produced first for an inference attempt.
+        Observed, never inferred.
+      type: string
+      enum:
+        - reasoning
+        - text
+        - tool_call
+
+    LlmRetryPhase:
+      description: >
+        Which retry loop produced the `attempt` index on an `agent.llm.retry`
+        event: `open` for a stream that failed to open, `consume` for one that
+        broke or ended without a finish event.
+      type: string
+      enum:
+        - open
+        - consume
 
     SubAgentProjection:
       description: Current projected state for one subagent spawned by an agent stage.

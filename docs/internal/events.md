@@ -968,21 +968,59 @@ No properties.
 |----------|------|-------------|
 | `text` | string | User input text |
 
-### `agent.output.start`
+### `agent.llm.started`
 
-Signals the beginning of assistant text output.
+An inference request is about to be dispatched for this round. Emitted once
+per round, after the request is built and compaction has run, immediately
+before the stream is opened.
+
+`provider` and `model` are the *requested* target. Failover can re-target
+mid-stage, so `agent.message` remains authoritative for what actually
+answered. No usage or cost fields: neither exists yet at this point.
 
 ```json
 {
   "id": "...", "ts": "...", "run_id": "...",
-  "event": "agent.output.start",
+  "event": "agent.llm.started",
   "node_id": "code", "node_label": "code",
   "session_id": "ses_abc",
-  "properties": {}
+  "properties": {
+    "provider": "anthropic",
+    "model": "claude-fable-5",
+    "visit": 1
+  }
 }
 ```
 
-No properties.
+| Property | Type | Description |
+|----------|------|-------------|
+| `provider` | string | Requested provider |
+| `model` | string | Requested model |
+| `visit` | number | Graph visit |
+
+### `agent.llm.first_output`
+
+The provider produced its first output for the current attempt. Edge-triggered
+once per stream attempt; the latch re-arms when a broken or finish-less stream
+replays the turn.
+
+```json
+{
+  "id": "...", "ts": "...", "run_id": "...",
+  "event": "agent.llm.first_output",
+  "node_id": "code", "node_label": "code",
+  "session_id": "ses_abc",
+  "properties": {
+    "kind": "reasoning",
+    "visit": 1
+  }
+}
+```
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `kind` | string | `reasoning`, `text`, or `tool_call` — observed, not inferred |
+| `visit` | number | Graph visit |
 
 ### `agent.output.replace`
 
@@ -1297,7 +1335,9 @@ No properties.
 
 ### `agent.llm.retry`
 
-Emitted when an LLM API call is retried.
+Emitted when an attempt fails to open **or sustain** a stream and the turn is
+replayed. The finish-less-stream case carries a synthetic `Stream` error and a
+zero delay: the turn restarts even though no error was reported.
 
 ```json
 {
@@ -1310,6 +1350,7 @@ Emitted when an LLM API call is retried.
     "model": "claude-sonnet-4-20250514",
     "attempt": 2,
     "delay_secs": 1.5,
+    "phase": "open",
     "error": { ... }
   }
 }
@@ -1319,8 +1360,9 @@ Emitted when an LLM API call is retried.
 |----------|------|-------------|
 | `provider` | string | LLM provider name |
 | `model` | string | Model identifier |
-| `attempt` | number | Retry attempt number |
+| `attempt` | number | Retry attempt number, 0-based within the loop named by `phase` |
 | `delay_secs` | number | Delay before retry in seconds |
+| `phase` | string? | `open` (stream failed to open) or `consume` (stream broke or ended without a finish event). Absent on events stored before the discriminator existed |
 | `error` | object | SdkError (serialized) |
 
 ### `agent.sub.spawned`
