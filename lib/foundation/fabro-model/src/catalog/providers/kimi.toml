@@ -23,6 +23,7 @@ max_output = 32768
 tools = true
 vision = true
 reasoning = true
+reasoning_by_default = true
 prompt_cache = true
 sampling_params = false
 
