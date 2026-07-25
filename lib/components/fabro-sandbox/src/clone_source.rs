@@ -1,3 +1,5 @@
+use crate::sandbox;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CloneDecision {
     EmptyWorkspace {
@@ -32,9 +34,9 @@ pub(crate) fn github_repo_layout(
     })?;
     let workspace_root = trim_root(workspace_root);
     let repos_root = trim_root(repos_root);
-    let repos_owner_path = join_remote_path(repos_root, &owner);
-    let primary_repo_path = join_remote_path(&repos_owner_path, &repo);
-    let primary_repo_link = join_remote_path(workspace_root, &repo);
+    let repos_owner_path = sandbox::join_sandbox_path(repos_root, &owner);
+    let primary_repo_path = sandbox::join_sandbox_path(&repos_owner_path, &repo);
+    let primary_repo_link = sandbox::join_sandbox_path(workspace_root, &repo);
 
     Ok(GitHubRepoLayout {
         owner,
@@ -49,14 +51,6 @@ pub(crate) fn github_repo_layout(
 fn trim_root(root: &str) -> &str {
     let trimmed = root.trim_end_matches('/');
     if trimmed.is_empty() { "/" } else { trimmed }
-}
-
-fn join_remote_path(root: &str, name: &str) -> String {
-    if root == "/" {
-        format!("/{name}")
-    } else {
-        format!("{root}/{name}")
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

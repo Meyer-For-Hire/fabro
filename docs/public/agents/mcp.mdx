@@ -315,7 +315,7 @@ After startup, the agent sees 22 Playwright tools including:
 - `mcp__playwright__browser_type`
 - `mcp__playwright__browser_fill_form`
 
-The agent uses `browser_snapshot` (accessibility tree) for structured page understanding and `browser_take_screenshot` to save visual captures. Screenshots saved to `screenshots/` are automatically collected as [artifacts](/execution/run-configuration#assets).
+The agent uses `browser_snapshot` (accessibility tree) for structured page understanding and `browser_take_screenshot` to save visual captures. Screenshots saved to `screenshots/` can be collected as [artifacts](/execution/run-configuration#runartifacts) by including `screenshots/**`.
 
 <Note>
 When using Playwright MCP with the sandbox transport, call the `browser_install` tool first to ensure the Playwright browser binaries are available inside the sandbox.

@@ -61,6 +61,45 @@ fn run_model_controls_default_to_none() {
 }
 
 #[test]
+fn run_artifact_globs_are_validated_during_resolve() {
+    let error = workflow_settings_from_toml(
+        r#"
+_version = 1
+
+[run.artifacts]
+include = ["/tmp/*.md", "../reports/*.md", "src/[abc"]
+"#,
+    )
+    .expect_err("invalid artifact workspace globs should not resolve");
+
+    let errors = match error {
+        crate::Error::Resolve { errors, .. } => errors,
+        other => panic!("expected structured resolve errors, got {other:#}"),
+    };
+    let invalid = errors
+        .into_iter()
+        .map(|error| match error {
+            crate::ResolveError::Invalid { path, reason } => (path, reason),
+            other => panic!("expected invalid-value error, got {other}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        invalid
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "run.artifacts.include[0]",
+            "run.artifacts.include[1]",
+            "run.artifacts.include[2]",
+        ]
+    );
+    assert!(invalid[0].1.contains("must be relative"));
+    assert!(invalid[1].1.contains("parent directory"));
+    assert!(invalid[2].1.contains("invalid workspace glob"));
+}
+
+#[test]
 fn resolves_run_defaults_from_empty_settings() {
     let settings = super::workflow_settings_from_layer(SettingsLayer::default())
         .expect("empty settings should resolve")

@@ -29,6 +29,7 @@ use fabro_types::{
     SystemActorKind, WorkflowSettings, parse_blob_ref,
 };
 use fabro_util::version::FABRO_VERSION;
+use fabro_util::workspace_glob::{WorkspaceGlob, WorkspaceGlobError};
 use fabro_workflow::command_log::{command_log_path, read_json_string_blob, read_log_slice};
 use fabro_workflow::run_status::RunStatus;
 use fabro_workflow::{Error as WorkflowError, operations};
@@ -902,13 +903,31 @@ async fn snapshot_run_variables(
     state.stores.variables.value_map().await
 }
 
+#[derive(Debug, thiserror::Error)]
+enum RunVariableSubstitutionError {
+    #[error(transparent)]
+    Interpolation(#[from] ResolveError),
+
+    #[error("run.artifacts.include[{index}]: {source}")]
+    ArtifactGlob {
+        index:  usize,
+        #[source]
+        source: WorkspaceGlobError,
+    },
+}
+
 fn substitute_run_variables(
     variables: &HashMap<String, String>,
     settings: &mut WorkflowSettings,
-) -> Result<(), ResolveError> {
+) -> Result<(), RunVariableSubstitutionError> {
     settings
         .run
-        .substitute_variables(|name| variables.get(name).cloned())
+        .substitute_variables(|name| variables.get(name).cloned())?;
+    for (index, pattern) in settings.run.artifacts.include.iter().enumerate() {
+        WorkspaceGlob::try_new(pattern)
+            .map_err(|source| RunVariableSubstitutionError::ArtifactGlob { index, source })?;
+    }
+    Ok(())
 }
 
 async fn get_run_status(
@@ -1212,4 +1231,27 @@ fn build_command_log_response(
         live_streaming,
     })
     .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_artifact_glob_that_becomes_unsafe_after_interpolation() {
+        let variables = HashMap::from([("PATTERN".to_string(), "../outside/**".to_string())]);
+        let mut settings = WorkflowSettings::default();
+        settings.run.artifacts.include = vec!["{{ vars.PATTERN }}".to_string()];
+
+        let error = substitute_run_variables(&variables, &mut settings)
+            .expect_err("interpolated parent traversal should be rejected");
+
+        assert!(matches!(
+            error,
+            RunVariableSubstitutionError::ArtifactGlob {
+                index:  0,
+                source: WorkspaceGlobError::ParentTraversal { .. },
+            }
+        ));
+    }
 }

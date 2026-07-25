@@ -39,9 +39,6 @@ fabro-static.workspace = true
 fabro-util = { path = "../../foundation/fabro-util" }
 fabro-redact.workspace = true
 
-# local
-glob = { version = "0.3" }
-
 futures = { workspace = true }
 
 # docker

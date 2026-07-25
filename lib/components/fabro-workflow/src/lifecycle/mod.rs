@@ -177,7 +177,7 @@ impl WorkflowLifecycle {
             run_store.clone(),
             Arc::clone(emitter),
             run_options.run_id,
-            run_options.artifact_globs(),
+            run_options.artifact_glob_patterns(),
             artifact_sink,
             stage_executions.clone(),
         );

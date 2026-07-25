@@ -489,11 +489,11 @@ pub fn make_glob_tool() -> RegisteredTool {
     RegisteredTool {
         definition: ToolDefinition {
             name:        "glob".into(),
-            description: "Find files by file names using a glob pattern. Use path to choose the search root. Prefer this over shell find or ls when locating repository files.".into(),
+            description: "Find files by search-root-relative path using a glob pattern. Use path to choose the search root. `*` stays within one path segment and `**` searches recursively. Prefer this over shell find or ls when locating repository files.".into(),
             parameters:  serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "pattern": {"type": "string", "description": "Glob pattern to match files"},
+                    "pattern": {"type": "string", "description": "Glob pattern relative to the search root"},
                     "path": {"type": "string", "description": "Directory to search in (default: working directory)"}
                 },
                 "required": ["pattern"]
@@ -870,7 +870,8 @@ mod tests {
         assert!(description("shell").contains("timeout_ms"));
         assert!(description("grep").contains("regex"));
         assert!(description("grep").contains("glob_filter"));
-        assert!(description("glob").contains("file names"));
+        assert!(description("glob").contains("search-root-relative"));
+        assert!(description("glob").contains("`**` searches recursively"));
         assert!(description("web_fetch").contains("http:// or https://"));
         assert!(description("web_fetch").contains("prompt"));
 

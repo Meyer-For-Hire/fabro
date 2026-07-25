@@ -17,6 +17,7 @@ pub mod text;
 pub mod time;
 pub mod version;
 pub mod warnings;
+pub mod workspace_glob;
 
 #[doc(hidden)]
 pub use console;

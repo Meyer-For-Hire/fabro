@@ -25,6 +25,8 @@ dirs.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
+glob.workspace = true
+thiserror.workspace = true
 open = "5"
 
 [dev-dependencies]

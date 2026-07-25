@@ -91,6 +91,7 @@ pub trait Sandbox: Send + Sync {
     async fn write_file(&self, path: &str, content: &str) -> Result<(), String>;
     async fn exec_command(&self, command: &str, timeout_ms: u64, ...) -> Result<ExecResult, String>;
     async fn grep(&self, pattern: &str, path: &str, options: &GrepOptions) -> Result<Vec<String>, String>;
+    async fn walk_files(&self, base: &str, relative_start: &str, options: &WalkOptions) -> Result<Vec<SandboxFile>, String>;
     async fn glob(&self, pattern: &str, path: Option<&str>) -> Result<Vec<String>, String>;
     // ... plus delete_file, file_exists, list_directory, initialize, cleanup, platform info
 }

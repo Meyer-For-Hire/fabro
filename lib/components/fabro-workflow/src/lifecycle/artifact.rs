@@ -6,13 +6,15 @@ use anyhow::{Context as _, Result, anyhow};
 use async_trait::async_trait;
 use fabro_core::error::{Error as CoreError, Result as CoreResult};
 use fabro_core::graph::NodeSpec;
-use fabro_core::lifecycle::{AttemptContext, AttemptResultContext, NodeDecision, RunLifecycle};
+use fabro_core::lifecycle::{AttemptResultContext, RunLifecycle};
 use fabro_core::outcome::NodeResult;
 use fabro_core::state::ExecutionState;
 use fabro_store::{ArtifactKey, ArtifactStore};
 use fabro_types::{ArtifactUpload, EventBody, RunId, StageId};
 use fabro_util::error::collect_chain;
+use fabro_util::workspace_glob::{WorkspaceGlobError, WorkspaceGlobSet};
 use tokio::fs;
+use tokio::sync::OnceCell;
 use tokio::time::sleep;
 
 use crate::artifact::{normalize_durable_updates, offload_large_values, sync_artifacts_to_env};
@@ -27,7 +29,6 @@ use crate::stage_execution::StageExecutionTracker;
 
 type WfRunState = ExecutionState<Option<BilledModelUsage>>;
 type WfNodeResult = NodeResult<Option<BilledModelUsage>>;
-type WfNodeDecision = NodeDecision<Option<BilledModelUsage>>;
 type ArtifactIdentity = (String, String);
 
 const ARTIFACT_UPLOAD_RETRY_DELAYS: [Duration; 3] = [
@@ -38,17 +39,16 @@ const ARTIFACT_UPLOAD_RETRY_DELAYS: [Duration; 3] = [
 
 /// Sub-lifecycle responsible for artifact collection, offloading, and syncing.
 pub(crate) struct ArtifactLifecycle {
-    pub sandbox:         Arc<dyn fabro_sandbox::Sandbox>,
-    pub run_store:       RunStoreHandle,
-    pub emitter:         Arc<Emitter>,
-    pub run_id:          RunId,
-    pub artifact_globs:  Vec<String>,
-    pub artifact_sink:   Option<ArtifactSink>,
-    /// Per-attempt state: epoch seconds when the attempt started.
-    attempt_start_epoch: std::sync::Mutex<Option<f64>>,
-    captured_artifacts:  std::sync::Mutex<HashSet<ArtifactIdentity>>,
+    pub sandbox:        Arc<dyn fabro_sandbox::Sandbox>,
+    pub run_store:      RunStoreHandle,
+    pub emitter:        Arc<Emitter>,
+    pub run_id:         RunId,
+    artifact_globs:     std::result::Result<WorkspaceGlobSet, WorkspaceGlobError>,
+    pub artifact_sink:  Option<ArtifactSink>,
+    captured_artifacts: std::sync::Mutex<HashSet<ArtifactIdentity>>,
+    ledger_initialized: OnceCell<()>,
     /// Run-scoped stage execution allocator shared with `RunServices`.
-    stage_executions:    StageExecutionTracker,
+    stage_executions:   StageExecutionTracker,
 }
 
 impl ArtifactLifecycle {
@@ -57,7 +57,7 @@ impl ArtifactLifecycle {
         run_store: RunStoreHandle,
         emitter: Arc<Emitter>,
         run_id: RunId,
-        artifact_globs: Vec<String>,
+        artifact_globs: &[String],
         artifact_sink: Option<ArtifactSink>,
         stage_executions: StageExecutionTracker,
     ) -> Self {
@@ -66,49 +66,46 @@ impl ArtifactLifecycle {
             run_store,
             emitter,
             run_id,
-            artifact_globs,
+            artifact_globs: WorkspaceGlobSet::try_new(artifact_globs),
             artifact_sink,
-            attempt_start_epoch: std::sync::Mutex::new(None),
             captured_artifacts: std::sync::Mutex::new(HashSet::new()),
+            ledger_initialized: OnceCell::new(),
             stage_executions,
         }
+    }
+
+    fn artifact_globs(&self) -> CoreResult<&WorkspaceGlobSet> {
+        self.artifact_globs.as_ref().map_err(|error| {
+            CoreError::Other(format!("invalid run.artifacts.include pattern: {error}"))
+        })
     }
 }
 
 #[async_trait]
 impl RunLifecycle<WorkflowGraph> for ArtifactLifecycle {
     async fn on_run_start(&self, _graph: &WorkflowGraph, _state: &WfRunState) -> CoreResult<()> {
-        *self.attempt_start_epoch.lock().expect(
-            "artifact mutex should not be poisoned: no code panics while holding this lock",
-        ) = None;
-        let ledger = self
-            .rebuild_captured_artifact_ledger()
-            .await
-            .map_err(|err| {
-                let rendered = collect_chain(err.as_ref()).join(": ");
-                CoreError::Other(format!(
-                    "failed to rebuild captured artifact ledger: {rendered}"
-                ))
-            })?;
-        *self.captured_artifacts.lock().expect(
-            "artifact mutex should not be poisoned: no code panics while holding this lock",
-        ) = ledger;
+        let artifact_globs = self.artifact_globs()?;
+        if artifact_globs.is_empty() {
+            return Ok(());
+        }
+        self.ledger_initialized
+            .get_or_try_init(|| async {
+                let ledger = self
+                    .rebuild_captured_artifact_ledger()
+                    .await
+                    .map_err(|err| {
+                        let rendered = collect_chain(err.as_ref()).join(": ");
+                        CoreError::Other(format!(
+                            "failed to rebuild captured artifact ledger: {rendered}"
+                        ))
+                    })?;
+                *self.captured_artifacts.lock().expect(
+                    "artifact mutex should not be poisoned: no code panics while holding this lock",
+                ) = ledger;
+                Ok::<(), CoreError>(())
+            })
+            .await?;
         Ok(())
-    }
-
-    async fn before_attempt(
-        &self,
-        _ctx: &AttemptContext<'_, WorkflowGraph>,
-        _state: &WfRunState,
-    ) -> CoreResult<WfNodeDecision> {
-        // Record epoch seconds (floored to integer for macOS stat mtime parity)
-        let epoch = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0.0, |d| d.as_secs() as f64);
-        *self.attempt_start_epoch.lock().expect(
-            "artifact mutex should not be poisoned: no code panics while holding this lock",
-        ) = Some(epoch);
-        Ok(NodeDecision::Continue)
     }
 
     async fn after_attempt(
@@ -116,14 +113,10 @@ impl RunLifecycle<WorkflowGraph> for ArtifactLifecycle {
         ctx: &AttemptResultContext<'_, WorkflowGraph>,
         state: &WfRunState,
     ) -> CoreResult<()> {
-        if self.artifact_globs.is_empty() {
+        let artifact_globs = self.artifact_globs()?;
+        if artifact_globs.is_empty() {
             return Ok(());
         }
-        let epoch = self
-            .attempt_start_epoch
-            .lock()
-            .expect("artifact mutex should not be poisoned: no code panics while holding this lock")
-            .unwrap_or(0.0);
         let node_id = ctx.node.id();
         // Artifact identity follows the stage execution ordinal so a resumed
         // reexecution stores its captures under the new `StageId`.
@@ -137,14 +130,7 @@ impl RunLifecycle<WorkflowGraph> for ArtifactLifecycle {
         let artifact_capture_dir =
             tempfile::tempdir().map_err(|err| CoreError::Other(err.to_string()))?;
 
-        match collect_artifacts(
-            &*self.sandbox,
-            artifact_capture_dir.path(),
-            &self.artifact_globs,
-            epoch,
-        )
-        .await
-        {
+        match collect_artifacts(&*self.sandbox, artifact_capture_dir.path(), artifact_globs).await {
             Ok(summary) => {
                 self.emit_collection_problem_notice(node_id, &summary);
                 let new_assets = self.new_captured_assets(&summary.captured_assets);

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::Write;
 use std::path::Path;
 use std::sync::Arc;
@@ -27,12 +27,13 @@ use tokio_util::sync::CancellationToken;
 use crate::clone_source::{self, CloneDecision, EmptyWorkspaceReason};
 use crate::redact::redact_auth_url;
 use crate::sandbox::{
-    BASH_ENV_VAR, BASH_PROBE_MARKER, BASH_PROBE_SCRIPT, BASH_PROBE_TIMEOUT_MS, REMOTE_BASH,
-    RefreshOutcome, optional_timeout, resolve_path, validate_bash_probe,
+    self, BASH_ENV_VAR, BASH_PROBE_MARKER, BASH_PROBE_SCRIPT, BASH_PROBE_TIMEOUT_MS, REMOTE_BASH,
+    REMOTE_WALK_TIMEOUT_MS, RefreshOutcome, optional_timeout, resolve_path, validate_bash_probe,
 };
 use crate::{
     CommandOutputCallback, DirEntry, ExecResult, ExecStreamingResult, GrepOptions, Sandbox,
-    SandboxEvent, SandboxEventCallback, StdioProcess, glob_match, managed_labels, shell_quote,
+    SandboxEvent, SandboxEventCallback, SandboxFile, StdioProcess, WalkOptions, managed_labels,
+    shell_quote,
 };
 
 /// Remediation shown when a Daytona sandbox has no usable Bash.
@@ -680,49 +681,6 @@ impl DaytonaSandbox {
         self.sandbox.get().ok_or_else(|| {
             crate::Error::message("Daytona sandbox not initialized — call initialize() first")
         })
-    }
-
-    async fn list_files_recursive(&self, root: &str) -> crate::Result<Vec<String>> {
-        let sandbox = self.sandbox()?;
-        let fs_svc = sandbox
-            .fs()
-            .await
-            .map_err(|e| crate::Error::context("Failed to get Daytona fs service", e))?;
-        let mut candidates = Vec::new();
-        let mut stack = vec![root.to_string()];
-        let mut visited_dirs = HashSet::new();
-
-        while let Some(dir) = stack.pop() {
-            if !visited_dirs.insert(dir.clone()) {
-                continue;
-            }
-
-            let entries = match fs_svc.list_files(&dir).await {
-                Ok(entries) => entries,
-                Err(daytona_sdk::DaytonaError::NotFound { .. }) => continue,
-                Err(err) => {
-                    return Err(crate::Error::context(
-                        format!("Failed to list Daytona directory {dir}"),
-                        err,
-                    ));
-                }
-            };
-
-            for entry in entries {
-                if entry.name.is_empty() || entry.name == "." || entry.name == ".." {
-                    continue;
-                }
-
-                let child_path = glob_match::join_path(&dir, &entry.name);
-                if entry.is_dir {
-                    stack.push(child_path);
-                } else {
-                    candidates.push(child_path);
-                }
-            }
-        }
-
-        Ok(candidates)
     }
 
     /// Read-only access to the SDK sandbox once initialized. Returns `None`
@@ -2081,22 +2039,26 @@ impl Sandbox for DaytonaSandbox {
         Ok(result.stdout.lines().map(String::from).collect())
     }
 
-    async fn glob(&self, pattern: &str, path: Option<&str>) -> crate::Result<Vec<String>> {
-        let base = path.map_or_else(
-            || self.working_directory().to_string(),
-            |p| self.resolve_path(p),
-        );
+    async fn walk_files(
+        &self,
+        base: &str,
+        relative_start: &str,
+        options: &WalkOptions,
+    ) -> crate::Result<Vec<SandboxFile>> {
+        if options.excludes_relative_path(relative_start) {
+            return Ok(Vec::new());
+        }
 
-        let traversal_root = glob_match::traversal_root(&base, pattern);
-        let matcher = glob_match::GlobMatcher::new(&base, pattern)?;
-        let mut matches = self
-            .list_files_recursive(&traversal_root)
-            .await?
-            .into_iter()
-            .filter(|path| matcher.matches(path))
-            .collect::<Vec<_>>();
-        matches.sort();
-        Ok(matches)
+        let base = self.resolve_path(base);
+        let command = sandbox::build_remote_walk_command(&base, relative_start, options);
+        let result = self
+            .exec_command(&command, REMOTE_WALK_TIMEOUT_MS, None, None, None)
+            .await?;
+        if !result.is_success() {
+            return Err(crate::Error::exec("recursive file traversal", result));
+        }
+
+        sandbox::parse_remote_walk_output(&base, relative_start, &result.stdout)
     }
 }
 

@@ -10,6 +10,7 @@ use fabro_types::settings::run::{
     RunIntegrationsSettings, RunInterviewsSettings, RunMetaBranchSettings, RunModelControls,
     RunModelSettings, RunNamespace, RunPrepareSettings, RunScmSettings, ScmGitHubSettings, TlsMode,
 };
+use fabro_util::workspace_glob::WorkspaceGlob;
 
 use super::{ResolveError, resolve_run_environment};
 use crate::{
@@ -83,7 +84,7 @@ pub fn resolve_run(
             .collect(),
         scm: resolve_scm(layer.scm.as_ref()),
         pull_request,
-        artifacts: resolve_artifacts(layer.artifacts.as_ref()),
+        artifacts: resolve_artifacts(layer.artifacts.as_ref(), errors),
         integrations: resolve_integrations(layer.integrations.as_ref()),
     }
 }
@@ -646,7 +647,21 @@ fn resolve_pull_request(pull_request: Option<&RunPullRequestLayer>) -> Option<Pu
     })
 }
 
-fn resolve_artifacts(artifacts: Option<&RunArtifactsLayer>) -> ArtifactsSettings {
+fn resolve_artifacts(
+    artifacts: Option<&RunArtifactsLayer>,
+    errors: &mut Vec<ResolveError>,
+) -> ArtifactsSettings {
+    if let Some(artifacts) = artifacts {
+        for (index, pattern) in artifacts.include.iter().enumerate() {
+            if let Err(error) = WorkspaceGlob::try_new(pattern) {
+                errors.push(ResolveError::Invalid {
+                    path:   format!("run.artifacts.include[{index}]"),
+                    reason: error.to_string(),
+                });
+            }
+        }
+    }
+
     ArtifactsSettings {
         include: artifacts
             .map(|artifacts| artifacts.include.clone())

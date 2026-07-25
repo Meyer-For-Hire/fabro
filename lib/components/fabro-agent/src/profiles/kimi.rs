@@ -31,21 +31,23 @@ exact match and unique unless replace_all is true. If the edit fails with 'old_s
 re-read the file and take the exact text from the fresh output rather than guessing again. \
 Preserve existing indentation.";
 
-const GLOB_DESCRIPTION: &str = "Find files by name using a glob pattern, most recently modified \
-first.
+const GLOB_DESCRIPTION: &str = "Find files by search-root-relative path using a glob pattern. \
+Results are sorted lexicographically by relative path.
 
 Use this instead of `find` or recursive `ls` through Bash. Prefer patterns with a literal anchor \
 — an extension or a subdirectory — over bare wildcards.
 
 Good patterns:
-- `*.rs` — an extension at any depth below the search root
+- `*.rs` — direct children of the search root
+- `**/*.rs` — files at any depth below the search root
 - `src/*.rs` — directly inside `src/`, not recursive
 - `src/**/*.rs` — recursive walk under a subdirectory
-- `{src,tests}/**/*.rs` — brace expansion works
+- `src/[lm]ib.rs` — a bracket expression matches one character
 
 Avoid recursing into dependency or build output (`node_modules/**`, `target/**`): those produce \
 thousands of matches and waste context. Narrow to a specific subpath instead. Results are files, \
-so to locate a directory, glob for something inside it.";
+so to locate a directory, glob for something inside it. Patterns must use `/`, be relative, and \
+cannot contain a `..` segment.";
 
 pub struct KimiProfile {
     base: BaseProfile,
@@ -345,7 +347,8 @@ mod tests {
         // Grep must not promise ripgrep syntax: fabro falls back to POSIX grep.
         let grep = describe("Grep");
         assert!(grep.contains("POSIX"), "{grep}");
-        assert!(describe("Glob").contains("most recently modified"));
+        assert!(describe("Glob").contains("sorted lexicographically"));
+        assert!(describe("Glob").contains("`*.rs` — direct children"));
     }
 
     #[test]

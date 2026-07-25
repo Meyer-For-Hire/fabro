@@ -12,8 +12,8 @@ use tokio_util::sync::CancellationToken;
 use crate::sandbox::{self, StdioProcessControl};
 use crate::{
     DEFAULT_EXEC_OUTPUT_TAIL_BYTES, DirEntry, ExecResult, GrepOptions, Sandbox, SandboxEvent,
-    SandboxEventCallback, StderrCollector, StdioProcess, StdioProcessHandle,
-    StdioProcessTermination,
+    SandboxEventCallback, SandboxFile, StderrCollector, StdioProcess, StdioProcessHandle,
+    StdioProcessTermination, WalkOptions,
 };
 
 // --- MockSandbox ---
@@ -47,6 +47,10 @@ pub struct MockSandbox {
     /// Fails `exec_command` and `exec_command_streaming` before any process
     /// runs, so callers see a transport error rather than an `ExecResult`.
     pub exec_error:            Option<String>,
+    /// Files returned by `walk_files`, before traversal-root and exclusion
+    /// filtering.
+    pub walk_files:            Vec<SandboxFile>,
+    pub walk_files_error:      Option<String>,
     /// Reported by `exec_command_streaming`. Set to `false` to model a
     /// provider that cannot separate stdout from stderr.
     pub streams_separated:     bool,
@@ -82,6 +86,18 @@ impl MockSandbox {
             .stdio_process
             .lock()
             .expect("stdio_process lock poisoned") = Some(process);
+    }
+
+    #[must_use]
+    pub fn with_walk_files(mut self, files: Vec<SandboxFile>) -> Self {
+        self.walk_files = files;
+        self
+    }
+
+    #[must_use]
+    pub fn with_walk_files_error(mut self, error: impl Into<String>) -> Self {
+        self.walk_files_error = Some(error.into());
+        self
     }
 }
 
@@ -123,6 +139,8 @@ impl Default for MockSandbox {
             stdio_process_error:   None,
             stdio_process:         Mutex::new(None),
             exec_error:            None,
+            walk_files:            Vec::new(),
+            walk_files_error:      None,
             streams_separated:     true,
         }
     }
@@ -341,6 +359,38 @@ impl Sandbox for MockSandbox {
 
     async fn glob(&self, _pattern: &str, _path: Option<&str>) -> crate::Result<Vec<String>> {
         Ok(self.glob_results.clone())
+    }
+
+    async fn walk_files(
+        &self,
+        _base: &str,
+        relative_start: &str,
+        options: &WalkOptions,
+    ) -> crate::Result<Vec<SandboxFile>> {
+        if let Some(error) = &self.walk_files_error {
+            return Err(crate::Error::message(error.clone()));
+        }
+
+        Ok(self
+            .walk_files
+            .iter()
+            .filter(|file| {
+                relative_start.is_empty()
+                    || file.relative_path == relative_start
+                    || file
+                        .relative_path
+                        .strip_prefix(relative_start)
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+            })
+            .filter(|file| {
+                let parent = file
+                    .relative_path
+                    .rsplit_once('/')
+                    .map_or("", |(parent, _)| parent);
+                !options.excludes_relative_path(parent)
+            })
+            .cloned()
+            .collect())
     }
 
     async fn download_file_to_local(

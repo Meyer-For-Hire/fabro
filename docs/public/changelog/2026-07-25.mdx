@@ -1,0 +1,23 @@
+---
+title: "Consistent workspace globs"
+date: "2026-07-25"
+---
+
+<Warning>
+**Glob semantics changed.** Artifact patterns are now rooted at the sandbox working directory, and the agent's `glob` tool roots patterns at its `path` argument. Both use the same path-segment semantics.
+
+- Replace `*.trace.zip` with `**/*.trace.zip` when traces may be nested.
+- Replace `test-results/**` with `**/test-results/**` only when `test-results` may appear below any directory instead of at the workspace root.
+- Absolute patterns, backslashes, and patterns containing a `..` segment are now rejected.
+- Agent `glob` results are now sorted lexicographically; local results are no longer ordered by modification time.
+</Warning>
+
+## One glob language in every sandbox
+
+Fabro now compiles workspace globs once and applies them to normalized relative paths in Rust. Local, Docker, and Daytona sandboxes only enumerate files; provider commands and APIs no longer interpret user patterns.
+
+`*` and `?` stay within one path segment, bracket expressions match one character, and a complete `**` segment crosses directories. Matching is case-sensitive, leading dots are ordinary characters, and `/` is the separator everywhere. Artifact capture and the agent `glob` tool therefore agree on patterns such as `.ai/reports/*.md`, `.ai/reports/**/*.md`, and `.ai/plans/????-??-??-*.md`.
+
+Artifact traversal also uses structured provider metadata for file-size limits and prunes dependency, cache, and build directories before matching.
+
+Artifact collection now treats each post-stage workspace state as authoritative instead of relying on modification timestamps. Fabro records the same path and content hash only once per run and captures the path again when its content changes.
