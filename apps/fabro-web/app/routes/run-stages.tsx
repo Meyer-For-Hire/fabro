@@ -178,7 +178,9 @@ type StageActivityAction =
   | { type: "searchChanged"; search: string };
 
 const initialStageActivityState = (): StageActivityState => ({
-  tab: "primary",
+  // Only agent stages offer "chat"; every other renderer resolves this to
+  // "primary" through `availableTabs`, so this is the default for both.
+  tab: "chat",
   selectedKinds: [...EVENT_KINDS],
   selectedDebugCategories: [],
   search: "",
