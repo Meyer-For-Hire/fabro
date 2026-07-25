@@ -12,8 +12,7 @@ use fabro_graphviz::graph;
 use fabro_hooks::{HookContext, HookDecision, HookEvent, HookExecutionContext, HookRunner};
 use fabro_model::Catalog;
 use fabro_sandbox::{
-    GitSetupIntent, ReadBeforeWriteSandbox, SandboxEventCallback, SandboxSpec,
-    reconnect_for_run_with_callback, shell_quote,
+    GitSetupIntent, SandboxEventCallback, SandboxSpec, reconnect_for_run_with_callback, shell_quote,
 };
 use fabro_static::EnvVars;
 use fabro_vault::Vault;
@@ -374,15 +373,13 @@ pub async fn initialize(
         .await
         .map_err(|err| Error::engine_with_anyhow("Failed to reconnect sandbox for resume", err))?;
         sandbox_initialized = false;
-        Arc::new(ReadBeforeWriteSandbox::new(Arc::from(sandbox)))
+        Arc::from(sandbox)
     } else {
-        Arc::new(ReadBeforeWriteSandbox::new(
-            options
-                .sandbox
-                .build(Some(Arc::clone(&sandbox_event_callback)))
-                .await
-                .map_err(|e| Error::engine_with_anyhow("Failed to build sandbox", e))?,
-        ))
+        options
+            .sandbox
+            .build(Some(Arc::clone(&sandbox_event_callback)))
+            .await
+            .map_err(|e| Error::engine_with_anyhow("Failed to build sandbox", e))?
     };
     let cleanup_guard = (!attach_existing).then(|| {
         scopeguard::guard(Arc::clone(&sandbox), |sandbox| {

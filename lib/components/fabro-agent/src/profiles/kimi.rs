@@ -16,16 +16,16 @@ use crate::tools::{WebFetchSummarizer, register_discovery_and_web_tools};
 
 const CORE_PROMPT: &str = include_str!("prompts/kimi.md.j2");
 
-/// Kimi models repeatedly fail the workspace's read-before-write guard: across
-/// two observed K3 implementation stages, 32 of 35 tool failures were writes to
-/// files the model had not read, or `old_string` values reconstructed from
-/// memory. Kimi Code's own tool descriptions drill this rule directly, so the
-/// Kimi profile restates it where the model is most likely to act on it — in
-/// the description of the tool being called — rather than relying only on the
-/// system prompt.
+/// Kimi models repeatedly reconstruct `old_string` from memory rather than from
+/// a fresh read: across two observed K3 implementation stages, 32 of 35 tool
+/// failures were edits against a file the model had not read, or `old_string`
+/// values recalled from an earlier version. Kimi Code's own tool descriptions
+/// drill this rule directly, so the Kimi profile restates it where the model is
+/// most likely to act on it — in the description of the tool being called —
+/// rather than relying only on the system prompt.
 const EDIT_FILE_DESCRIPTION: &str = "Edit a file by replacing an exact string. \
-Read the file with Read before EVERY edit — this workspace refuses writes to files that \
-have not been read, and the call will fail. Take old_string verbatim from the Read output; \
+Read the file with Read before EVERY edit: old_string is matched byte for byte, and only the \
+Read output tells you what it is. Take old_string verbatim from that output; \
 never reconstruct it from memory or from an earlier version of the file. old_string must be an \
 exact match and unique unless replace_all is true. If the edit fails with 'old_string not found', \
 re-read the file and take the exact text from the fresh output rather than guessing again. \
@@ -298,7 +298,7 @@ mod tests {
     }
 
     #[test]
-    fn edit_and_write_descriptions_drill_read_before_write() {
+    fn edit_and_write_descriptions_drill_reading_first() {
         let profile = KimiProfile::new("kimi-k3");
         let describe = |name: &str| {
             profile
@@ -313,11 +313,12 @@ mod tests {
         for name in ["Edit", "Write"] {
             let text = describe(name);
             assert!(
-                text.contains("have not been read") || text.contains("has not been read"),
-                "{name} should warn about the read-before-write guard"
+                text.contains("Read"),
+                "{name} should steer the model to read the file first"
             );
         }
         assert!(describe("Edit").contains("never reconstruct it from memory"));
+        assert!(describe("Write").contains("everything you do not restate"));
 
         // Bash steers shell usage toward the dedicated tools, under the names
         // this profile actually exposes.
@@ -342,8 +343,8 @@ mod tests {
         // Fabro has no background shell; promising one would be a lie.
         assert!(!bash.contains("run_in_background"), "{bash}");
 
-        // Read explains that reading is what clears a file for writing.
-        assert!(describe("Read").contains("refuse a file that has not been read"));
+        // Read explains why reading precedes editing.
+        assert!(describe("Read").contains("matches `old_string` byte for byte"));
         // Grep must not promise ripgrep syntax: fabro falls back to POSIX grep.
         let grep = describe("Grep");
         assert!(grep.contains("POSIX"), "{grep}");

@@ -538,8 +538,8 @@ mod tests {
 
             // The specific Kimi-only phrasing must not appear elsewhere.
             assert!(
-                !anthropic_text.contains("has not been read"),
-                "read-before-write drilling leaked into {tool} for other profiles"
+                !anthropic_text.contains("never reconstruct it from memory"),
+                "Kimi read-before-edit drilling leaked into {tool} for other profiles"
             );
         }
     }

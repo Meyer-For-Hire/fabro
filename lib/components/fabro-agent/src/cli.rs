@@ -556,9 +556,7 @@ pub async fn run_with_args_and_client_and_catalog(
     // Build sandbox
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let cwd_str = cwd.to_string_lossy().to_string();
-    let env: Arc<dyn Sandbox> = Arc::new(crate::ReadBeforeWriteSandbox::new(Arc::new(
-        LocalSandbox::new(cwd),
-    )));
+    let env: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(cwd));
 
     // Build tool approval callback
     let permissions = args.permissions.unwrap_or(PermissionLevel::ReadWrite);

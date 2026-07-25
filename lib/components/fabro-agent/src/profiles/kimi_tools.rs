@@ -15,7 +15,7 @@
 //!
 //! Everything these tools do reaches the environment through the same
 //! [`Sandbox`](crate::sandbox::Sandbox) methods the built-ins use, so sandbox
-//! behavior, path policy, and the read-before-write guard are unchanged.
+//! behavior and path policy are unchanged.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -159,8 +159,8 @@ pub fn make_kimi_read_tool() -> RegisteredTool {
             NativeTool::ReadFile,
             "Read a text file from the workspace.
 
-Reading a file is also what clears it for writing: Edit and Write refuse a file that has not been \
-read in this session.
+Read a file before editing it: Edit matches `old_string` byte for byte, and only the Read output \
+tells you what that string is.
 
 - If you have a concrete path, call Read directly. Do not Glob or `ls` first to check that it \
 exists — a missing path returns an error you can handle.
@@ -238,7 +238,6 @@ returns the last 100 lines.
                 }
                 .map_err(|e| e.display_with_causes())?;
 
-                ctx.env.mark_agent_read(path);
                 Ok(content)
             })
         }),
@@ -262,8 +261,8 @@ pub fn make_kimi_write_tool() -> RegisteredTool {
             NativeTool::WriteFile,
             "Create, append to, or replace a file.
 
-Read an existing file with Read before writing to it — this workspace refuses writes to files \
-that have not been read, and the call will fail.
+Read an existing file with Read before writing to it: overwrite replaces everything you do not \
+restate, so anything you have not seen is what you stand to lose.
 
 - `mode` defaults to `overwrite`, which replaces the whole file. `append` requires an existing file \
 and adds to its end without inserting a newline.
@@ -328,7 +327,7 @@ overwrite replaces everything you did not restate.
 
 /// Kimi Code's `Edit` schema names the target `path`; fabro's shared edit
 /// executor calls it `file_path`. Translate only that adapter field and reuse
-/// the exact-match/read-before-write implementation.
+/// the exact-match implementation.
 #[must_use]
 pub fn make_kimi_edit_tool(description: &str) -> RegisteredTool {
     let shared = make_edit_file_tool();
@@ -513,7 +512,6 @@ mod tests {
     #[tokio::test]
     async fn edit_translates_kimi_path_to_the_shared_executor() {
         let env = sandbox_with("/f.txt", "before");
-        env.mark_agent_read("/f.txt");
         let tool = make_kimi_edit_tool("Edit");
 
         (tool.executor)(

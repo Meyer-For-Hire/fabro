@@ -12,8 +12,6 @@ mod clone_source;
 #[cfg(any(feature = "docker", feature = "daytona", test))]
 mod managed_labels;
 
-pub mod read_guard;
-
 #[cfg(any(feature = "docker", feature = "daytona", test))]
 pub mod redact;
 
@@ -48,7 +46,6 @@ pub use provider::{
     LocalSandboxProvider, SandboxCreateSpec, SandboxLookupError, SandboxProvider,
     SandboxProviderRegistry,
 };
-pub use read_guard::ReadBeforeWriteSandbox;
 pub use reconnect::{reconnect, reconnect_for_run, reconnect_for_run_with_callback};
 pub use sandbox::{
     CommandOutputCallback, DEFAULT_EXEC_OUTPUT_TAIL_BYTES, DirEntry, ExecResult,

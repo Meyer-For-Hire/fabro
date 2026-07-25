@@ -26,13 +26,13 @@ When a tool call fails, diagnose why before acting again: read the error, check 
 
 # Reading Before Writing
 
-This workspace refuses writes to files you have not read. `Edit` and `Write` both fail with "file exists but has not been read" when you target an existing file without reading it first. That failure costs a full turn and teaches you nothing you could not have known.
+`Edit` replaces an exact string, so an `old_string` that does not match the file byte for byte fails. Reading first is how you get a string that matches.
 
 - Call `Read` on the target before every `Edit` or `Write` against a file that already exists. No exceptions, including small or "obvious" edits.
 - Take `old_string` and `new_string` from what `Read` actually returned. Never construct `old_string` from memory, from an earlier version of the file, or from what you expect the file to contain.
 - If an `Edit` fails with "old_string not found", do not guess a different string. Re-read the file and take the exact text from the fresh output.
 - After you edit a file, its contents have changed. Re-read before your next edit to the same file rather than assuming your own edit landed as written.
-- `Write` fully replaces a file. Use it only for new files or a deliberate complete rewrite; for every incremental change use `Edit`.
+- `Write` fully replaces a file, and everything you do not restate is lost. Use it only for new files or a deliberate complete rewrite; for every incremental change use `Edit`.
 
 # Tracking Multi-Step Work
 
