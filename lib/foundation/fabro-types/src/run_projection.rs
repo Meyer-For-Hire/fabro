@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::num::NonZeroU32;
 
 use chrono::{DateTime, Utc};
@@ -354,10 +354,31 @@ pub struct StageProjection {
     /// immutable projections under their own `StageId`s.
     ///
     /// `None` for stages still in flight (`started_at` is set but no terminal
-    /// event has been observed yet). For live wall-time ticking, the UI uses
-    /// `started_at`; once terminal this carries the finalized breakdown.
+    /// event has been observed yet). For a live breakdown while in flight, use
+    /// [`StageProjection::live_timing`]; once terminal this carries the
+    /// finalized, authoritative breakdown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timing:                Option<StageTiming>,
+    /// Inference time accumulated from closed brackets during this attempt.
+    ///
+    /// Live estimate only: the authoritative value arrives with the terminal
+    /// event and lands in `timing`. Excludes the currently-open bracket, which
+    /// [`StageProjection::live_timing`] adds from `inference.started_at`.
+    #[serde(default, skip_serializing_if = "is_zero_ms")]
+    pub live_inference_ms:     u64,
+    /// Tool time accumulated from closed tool batches during this attempt.
+    ///
+    /// A batch spans the first `agent.tool.started` with no outstanding calls
+    /// through the `agent.tool.completed` that drains the last one, so tools
+    /// running concurrently within a turn are counted once. This matches how
+    /// the in-process stopwatch brackets `execute_tool_calls`; summing
+    /// per-call durations would over-count parallel tool use.
+    #[serde(default, skip_serializing_if = "is_zero_ms")]
+    pub live_tool_ms:          u64,
+    /// Open tool batch for this stage: when the current batch started, and the
+    /// `tool_call_id`s that have not yet reported completion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_batch:            Option<StageToolBatchProjection>,
     #[serde(default)]
     pub usage:                 BilledTokenCounts,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -393,6 +414,30 @@ pub struct StageProjection {
     #[serde(default)]
     pub agent_control:         AgentControlState,
     pub state:                 StageState,
+}
+
+/// Serde guard so zero-valued live accumulators stay off the wire.
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if predicates receive fields by reference"
+)]
+fn is_zero_ms(value: &u64) -> bool {
+    *value == 0
+}
+
+/// One open tool batch: tool calls dispatched together that have not all
+/// reported completion.
+///
+/// `open_call_ids` is a set rather than a count because `agent.tool.completed`
+/// identifies its call by id, and a projection replaying a truncated or
+/// duplicated log must not let a repeated completion drain the batch early.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StageToolBatchProjection {
+    /// When the batch opened — the first `agent.tool.started` observed while
+    /// no other calls were outstanding.
+    pub started_at:    DateTime<Utc>,
+    /// Calls dispatched but not yet completed, by `tool_call_id`.
+    pub open_call_ids: BTreeSet<String>,
 }
 
 /// One open inference bracket: a dispatched LLM request that has not yet
@@ -506,6 +551,9 @@ impl StageProjection {
             response: None,
             completion: None,
             timing: None,
+            live_inference_ms: 0,
+            live_tool_ms: 0,
+            tool_batch: None,
             usage: BilledTokenCounts::default(),
             model: None,
             root_agent_todos: None,
@@ -561,6 +609,118 @@ impl StageProjection {
             });
         }
         self.timing.map(|timing| timing.wall_time_ms)
+    }
+
+    /// Live timing breakdown in milliseconds — the active-time twin of
+    /// [`Self::live_wall_time_ms`].
+    ///
+    /// Once terminal, returns the stored `timing` unchanged: the finalized
+    /// breakdown comes from the worker's own stopwatch and is authoritative.
+    ///
+    /// While in flight, returns an estimate reconstructed from the event log:
+    /// accumulated closed brackets plus whatever bracket is open right now.
+    /// The estimate is per-handler, because only agent stages emit brackets at
+    /// all:
+    ///
+    /// - `Agent` — accumulated inference and tool brackets, plus the open
+    ///   inference bracket and open tool batch.
+    /// - `Prompt` — one inference call spanning the stage, so elapsed time
+    ///   since `started_at` counts as inference. Matches the finalized
+    ///   `active_only(inference, 0)`.
+    /// - `Command` — the command *is* the work, so elapsed time counts as tool.
+    ///   Matches the finalized `active_only(0, duration_ms)`.
+    /// - Everything else — zero. Waiting on a human, a timer, a condition, or
+    ///   child branches is wall time, not active time.
+    ///
+    /// Active is clamped to wall. A worker killed mid-turn leaves its bracket
+    /// open forever (see [`StageInferenceProjection`]), and without the clamp
+    /// that bracket would tick up without bound. The clamp does not need to
+    /// know the worker died: a stage cannot have been active longer than it
+    /// has existed. `watchdog.timeout` remains the authority on whether a run
+    /// is actually stuck.
+    #[must_use]
+    pub fn live_timing(&self, now: DateTime<Utc>) -> StageTiming {
+        if let Some(timing) = self.timing {
+            return timing;
+        }
+
+        let wall_time_ms = self.live_wall_time_ms(now).unwrap_or(0);
+        let elapsed = |since: DateTime<Utc>| {
+            u64::try_from(now.signed_duration_since(since).num_milliseconds().max(0)).unwrap_or(0)
+        };
+
+        // `handler` is absent on projections built from events written before
+        // stage execution identity. Treat those as agent stages, matching
+        // `StageHandler::from_handler_type`: the accumulators below are only
+        // ever populated by agent events, so a legacy non-agent stage still
+        // reads zero rather than being credited work it never did.
+        let handler = self.handler.unwrap_or(StageHandler::Agent);
+        let (inference_time_ms, tool_time_ms) = match handler {
+            StageHandler::Agent => {
+                let open_inference = self
+                    .inference
+                    .as_ref()
+                    .map_or(0, |inference| elapsed(inference.started_at));
+                let open_tool = self
+                    .tool_batch
+                    .as_ref()
+                    .map_or(0, |batch| elapsed(batch.started_at));
+                (
+                    self.live_inference_ms.saturating_add(open_inference),
+                    self.live_tool_ms.saturating_add(open_tool),
+                )
+            }
+            StageHandler::Prompt => (wall_time_ms, 0),
+            StageHandler::Command => (0, wall_time_ms),
+            // Waiting on a human, a timer, a condition, or child branches is
+            // wall time, not active time.
+            StageHandler::Human
+            | StageHandler::Wait
+            | StageHandler::Conditional
+            | StageHandler::Parallel
+            | StageHandler::ParallelFanIn
+            | StageHandler::StackManagerLoop
+            | StageHandler::Start
+            | StageHandler::Exit => (0, 0),
+        };
+
+        StageTiming::new(wall_time_ms, inference_time_ms, tool_time_ms).clamped_to_wall()
+    }
+
+    /// Fold a closed inference bracket into the live accumulator.
+    pub fn accumulate_inference_ms(&mut self, elapsed_ms: u64) {
+        self.live_inference_ms = self.live_inference_ms.saturating_add(elapsed_ms);
+    }
+
+    /// Record a dispatched tool call, opening a batch if none is outstanding.
+    pub fn open_tool_call(&mut self, tool_call_id: String, started_at: DateTime<Utc>) {
+        self.tool_batch
+            .get_or_insert_with(|| StageToolBatchProjection {
+                started_at,
+                open_call_ids: BTreeSet::new(),
+            })
+            .open_call_ids
+            .insert(tool_call_id);
+    }
+
+    /// Retire a tool call. Folds the batch into the live accumulator once the
+    /// last outstanding call reports, so concurrent calls count once.
+    pub fn close_tool_call(&mut self, tool_call_id: &str, now: DateTime<Utc>) {
+        let Some(batch) = self.tool_batch.as_mut() else {
+            return;
+        };
+        batch.open_call_ids.remove(tool_call_id);
+        if !batch.open_call_ids.is_empty() {
+            return;
+        }
+        let elapsed = u64::try_from(
+            now.signed_duration_since(batch.started_at)
+                .num_milliseconds()
+                .max(0),
+        )
+        .unwrap_or(0);
+        self.live_tool_ms = self.live_tool_ms.saturating_add(elapsed);
+        self.tool_batch = None;
     }
 
     /// Begin a new automatic attempt within this stage execution: clear every
@@ -709,10 +869,13 @@ impl RunProjection {
     /// terminal conclusion yet.
     ///
     /// Run-level wall time ticks from `run.started` to `now`. Active time sums
-    /// inference and tool timing from stages that have already emitted a
-    /// terminal stage event. Stage projections do not currently track live
-    /// inference/tool time while a stage is still running, so active time steps
-    /// forward when each stage completes while wall time advances continuously.
+    /// [`StageProjection::live_timing`] across every stage, so an in-flight
+    /// stage contributes its live estimate rather than nothing — both halves
+    /// advance continuously. Terminal stages contribute their finalized,
+    /// authoritative breakdown.
+    ///
+    /// Active is not clamped to run wall time here: concurrent branches can
+    /// legitimately sum past it. The clamp applies per stage.
     #[must_use]
     pub fn live_run_timing(&self, now: DateTime<Utc>) -> Option<RunTiming> {
         let start = self.start.as_ref()?;
@@ -720,7 +883,7 @@ impl RunProjection {
         let active = self
             .stages
             .values()
-            .filter_map(|stage| stage.timing)
+            .map(|stage| stage.live_timing(now))
             .fold(RunTiming::default(), |acc, timing| {
                 acc.saturating_add(&RunTiming::from(timing))
             });
@@ -969,5 +1132,288 @@ mod iter_stages_tests {
                 .collect();
             assert_eq!(order, vec!["build@1", "verify@1", "verify@2"]);
         }
+    }
+}
+
+#[cfg(test)]
+mod live_timing_tests {
+    use std::collections::HashMap;
+    use std::num::NonZeroU32;
+
+    use chrono::{DateTime, TimeZone, Utc};
+
+    use super::{RunProjection, StageToolBatchProjection};
+    use crate::{
+        Graph, ModelRef, RunId, RunSpec, StageHandler, StageInferenceProjection, StageProjection,
+        StageState, StageTiming, StartRecord, WorkflowSettings, test_support,
+    };
+
+    fn seq(n: u32) -> NonZeroU32 {
+        NonZeroU32::new(n).unwrap()
+    }
+
+    fn at(seconds: i64) -> DateTime<Utc> {
+        Utc.timestamp_opt(1_700_000_000 + seconds, 0).unwrap()
+    }
+
+    fn projection() -> RunProjection {
+        RunProjection::new(
+            "Test run".to_string(),
+            RunSpec {
+                run_id:           RunId::new(),
+                settings:         WorkflowSettings::default(),
+                graph:            Graph::new("test"),
+                graph_source:     None,
+                workflow_slug:    None,
+                automation:       None,
+                source_directory: None,
+                labels:           HashMap::default(),
+                provenance:       test_support::test_run_provenance(),
+                manifest_blob:    None,
+                definition_blob:  None,
+                git:              None,
+                fork_source_ref:  None,
+            },
+            at(0),
+        )
+    }
+
+    /// In-flight stage that started at `at(0)`.
+    fn running(handler: StageHandler) -> StageProjection {
+        let mut stage = StageProjection::new(seq(1));
+        stage.handler = Some(handler);
+        stage.started_at = Some(at(0));
+        stage.state = StageState::Running;
+        stage
+    }
+
+    fn open_bracket(started_at: DateTime<Utc>) -> StageInferenceProjection {
+        StageInferenceProjection {
+            session_id: "session-1".to_string(),
+            started_at,
+            requested_model: ModelRef {
+                provider: "anthropic".parse().unwrap(),
+                model_id: "claude-sonnet-5".into(),
+                speed:    None,
+            },
+            first_output_at: None,
+            first_output_kind: None,
+            retries: 0,
+        }
+    }
+
+    #[test]
+    fn terminal_stage_returns_stored_timing_unchanged() {
+        let mut stage = running(StageHandler::Agent);
+        stage.state = StageState::Succeeded;
+        stage.timing = Some(StageTiming::new(90_000, 78_000, 7_000));
+        // Live accumulators are stale leftovers; the finalized value wins.
+        stage.live_inference_ms = 5;
+        stage.live_tool_ms = 5;
+
+        assert_eq!(
+            stage.live_timing(at(600)),
+            StageTiming::new(90_000, 78_000, 7_000)
+        );
+    }
+
+    #[test]
+    fn agent_stage_sums_accumulators_and_open_brackets() {
+        let mut stage = running(StageHandler::Agent);
+        stage.live_inference_ms = 30_000;
+        stage.live_tool_ms = 5_000;
+        // Inference open for 20s, tools open for 10s, at t=120s.
+        stage.inference = Some(open_bracket(at(100)));
+        stage.tool_batch = Some(StageToolBatchProjection {
+            started_at:    at(110),
+            open_call_ids: ["call-1".to_string()].into_iter().collect(),
+        });
+
+        assert_eq!(
+            stage.live_timing(at(120)),
+            StageTiming::new(120_000, 50_000, 15_000)
+        );
+    }
+
+    #[test]
+    fn agent_stage_without_brackets_reports_only_accumulators() {
+        let mut stage = running(StageHandler::Agent);
+        stage.live_inference_ms = 30_000;
+        stage.live_tool_ms = 5_000;
+
+        assert_eq!(
+            stage.live_timing(at(120)),
+            StageTiming::new(120_000, 30_000, 5_000)
+        );
+    }
+
+    #[test]
+    fn prompt_stage_counts_elapsed_as_inference() {
+        let stage = running(StageHandler::Prompt);
+
+        assert_eq!(
+            stage.live_timing(at(45)),
+            StageTiming::new(45_000, 45_000, 0)
+        );
+    }
+
+    #[test]
+    fn command_stage_counts_elapsed_as_tool() {
+        let stage = running(StageHandler::Command);
+
+        assert_eq!(
+            stage.live_timing(at(45)),
+            StageTiming::new(45_000, 0, 45_000)
+        );
+    }
+
+    #[test]
+    fn waiting_handlers_report_wall_time_with_zero_active() {
+        for handler in [
+            StageHandler::Human,
+            StageHandler::Wait,
+            StageHandler::Conditional,
+            StageHandler::Parallel,
+            StageHandler::ParallelFanIn,
+            StageHandler::StackManagerLoop,
+            StageHandler::Start,
+            StageHandler::Exit,
+        ] {
+            let stage = running(handler);
+            let timing = stage.live_timing(at(600));
+
+            assert_eq!(
+                timing,
+                StageTiming::new(600_000, 0, 0),
+                "{handler} should report wall time only"
+            );
+        }
+    }
+
+    #[test]
+    fn open_bracket_from_a_killed_worker_is_clamped_to_wall() {
+        let mut stage = running(StageHandler::Agent);
+        // Bracket opened before the stage even started — the pathological
+        // shape a killed worker leaves behind. Without the clamp this would
+        // report 700s of inference against 600s of wall.
+        stage.inference = Some(open_bracket(at(-100)));
+
+        let timing = stage.live_timing(at(600));
+
+        assert_eq!(timing.wall_time_ms, 600_000);
+        assert_eq!(timing.active_time_ms, 600_000);
+    }
+
+    #[test]
+    fn clamping_preserves_the_inference_tool_split() {
+        let mut stage = running(StageHandler::Agent);
+        // 3:1 inference:tool, totalling 200s of active against 100s of wall.
+        stage.live_inference_ms = 150_000;
+        stage.live_tool_ms = 50_000;
+
+        let timing = stage.live_timing(at(100));
+
+        assert_eq!(timing.wall_time_ms, 100_000);
+        assert_eq!(timing.active_time_ms, 100_000);
+        assert_eq!(timing.inference_time_ms, 75_000);
+        assert_eq!(timing.tool_time_ms, 25_000);
+    }
+
+    #[test]
+    fn live_run_timing_counts_in_flight_stages_not_just_terminal_ones() {
+        // The shape that motivated this change: two finished stages and one
+        // long-running agent stage that had been active nearly the whole run.
+        let mut projection = projection();
+        projection.start = Some(StartRecord {
+            start_time: at(0),
+            run_branch: None,
+            base_sha:   None,
+        });
+
+        let baseline = projection.stage_entry("baseline", 1, seq(1));
+        baseline.handler = Some(StageHandler::Command);
+        baseline.state = StageState::Succeeded;
+        baseline.timing = Some(StageTiming::new(42_666, 0, 42_663));
+
+        let assess = projection.stage_entry("assess", 1, seq(2));
+        assess.handler = Some(StageHandler::Agent);
+        assess.state = StageState::Succeeded;
+        assess.timing = Some(StageTiming::new(86_025, 78_230, 7_588));
+
+        let plan = projection.stage_entry("plan", 1, seq(3));
+        plan.handler = Some(StageHandler::Agent);
+        plan.started_at = Some(at(146));
+        plan.state = StageState::Running;
+        plan.live_inference_ms = 700_000;
+        plan.live_tool_ms = 150_000;
+
+        let timing = projection.live_run_timing(at(1_013)).unwrap();
+
+        assert_eq!(timing.wall_time_ms, 1_013_000);
+        assert_eq!(timing.inference_time_ms, 778_230);
+        assert_eq!(timing.tool_time_ms, 200_251);
+        // Before this change the in-flight stage contributed nothing and the
+        // run reported 128,481 ms of active time against 1,013,000 ms of wall.
+        assert_eq!(timing.active_time_ms, 978_481);
+    }
+
+    #[test]
+    fn live_run_timing_may_exceed_run_wall_when_branches_overlap() {
+        let mut projection = projection();
+        projection.start = Some(StartRecord {
+            start_time: at(0),
+            run_branch: None,
+            base_sha:   None,
+        });
+
+        for (index, node) in ["branch-a", "branch-b", "branch-c"].iter().enumerate() {
+            let stage = projection.stage_entry(node, 1, seq(u32::try_from(index).unwrap() + 1));
+            stage.handler = Some(StageHandler::Agent);
+            stage.state = StageState::Succeeded;
+            stage.timing = Some(StageTiming::new(60_000, 60_000, 0));
+        }
+
+        let timing = projection.live_run_timing(at(60)).unwrap();
+
+        assert_eq!(timing.wall_time_ms, 60_000);
+        assert_eq!(
+            timing.active_time_ms, 180_000,
+            "concurrent branches legitimately sum past run wall time"
+        );
+    }
+}
+
+#[cfg(test)]
+mod live_timing_legacy_tests {
+    use chrono::{DateTime, TimeZone, Utc};
+
+    use crate::{StageProjection, StageState, StageTiming, first_event_seq};
+
+    fn at(seconds: i64) -> DateTime<Utc> {
+        Utc.timestamp_opt(1_700_000_000 + seconds, 0).unwrap()
+    }
+
+    #[test]
+    fn a_legacy_stage_without_a_recorded_handler_uses_its_accumulators() {
+        let mut stage = StageProjection::new(first_event_seq(1));
+        stage.handler = None;
+        stage.started_at = Some(at(0));
+        stage.state = StageState::Running;
+        stage.live_inference_ms = 30_000;
+
+        assert_eq!(
+            stage.live_timing(at(120)),
+            StageTiming::new(120_000, 30_000, 0)
+        );
+    }
+
+    #[test]
+    fn a_legacy_stage_with_no_accumulators_reports_no_active_time() {
+        let mut stage = StageProjection::new(first_event_seq(1));
+        stage.handler = None;
+        stage.started_at = Some(at(0));
+        stage.state = StageState::Running;
+
+        assert_eq!(stage.live_timing(at(120)), StageTiming::new(120_000, 0, 0));
     }
 }

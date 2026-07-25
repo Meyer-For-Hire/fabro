@@ -457,6 +457,7 @@ export * from './stage-projection';
 export * from './stage-state';
 export * from './stage-summary';
 export * from './stage-timing';
+export * from './stage-tool-batch-projection';
 export * from './start-record';
 export * from './start-run-request';
 export * from './steer-run-request';

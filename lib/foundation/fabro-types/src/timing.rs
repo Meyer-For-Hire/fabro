@@ -62,6 +62,32 @@ impl StageTiming {
         Self::new(0, inference_time_ms, tool_time_ms)
     }
 
+    /// Scale the breakdown down so `active_time_ms` does not exceed
+    /// `wall_time_ms`, preserving the inference/tool ratio.
+    ///
+    /// Only meaningful for live estimates of a single in-flight stage, where
+    /// an open bracket left behind by a killed worker would otherwise tick up
+    /// without bound. Finalized timings come from the worker's stopwatch and
+    /// already satisfy the invariant.
+    ///
+    /// Deliberately *not* applied at run level: concurrent branches can
+    /// legitimately sum past run wall time.
+    #[must_use]
+    pub fn clamped_to_wall(&self) -> Self {
+        if self.active_time_ms <= self.wall_time_ms {
+            return *self;
+        }
+        // Preserve the split rather than truncating one side, so a clamped
+        // stage still shows where its time went. Widen for the multiply: the
+        // quotient is bounded by `wall_time_ms` because `active_time_ms`
+        // exceeds it here, so it always fits back into u64.
+        let scaled = u128::from(self.inference_time_ms) * u128::from(self.wall_time_ms)
+            / u128::from(self.active_time_ms);
+        let inference_time_ms = u64::try_from(scaled).unwrap_or(self.wall_time_ms);
+        let tool_time_ms = self.wall_time_ms.saturating_sub(inference_time_ms);
+        Self::new(self.wall_time_ms, inference_time_ms, tool_time_ms)
+    }
+
     /// Sum two timings field-by-field. Used to aggregate visits of one node
     /// and to accumulate run-level rollups.
     #[must_use]
