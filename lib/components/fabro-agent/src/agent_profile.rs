@@ -52,6 +52,15 @@ pub trait AgentProfile: Send + Sync {
         self.catalog_model().and_then(Model::max_output)
     }
 
+    fn reasons_by_default(&self) -> bool {
+        let Some(catalog) = self.catalog() else {
+            return false;
+        };
+        catalog
+            .model_settings_on_provider(&self.provider_id(), self.model())
+            .is_some_and(|settings| settings.reasoning_by_default)
+    }
+
     fn register_subagent_tools(
         &mut self,
         supervisor: SubAgentSupervisor,

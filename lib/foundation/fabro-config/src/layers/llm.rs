@@ -244,6 +244,8 @@ pub struct ModelFeatures {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning:                 Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_by_default:      Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort:          Option<ReasoningEffortFeature>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_cache:              Option<bool>,
@@ -647,6 +649,7 @@ provider = "bedrock"
 tools = true
 vision = true
 reasoning = true
+reasoning_by_default = false
 reasoning_effort = "levels"
 prompt_cache = false
 "#;
@@ -663,6 +666,7 @@ prompt_cache = false
             features.reasoning_effort,
             Some(fabro_model::ReasoningEffortFeature::Levels)
         );
+        assert_eq!(features.reasoning_by_default, Some(false));
         assert_eq!(features.prompt_cache, Some(false));
     }
 

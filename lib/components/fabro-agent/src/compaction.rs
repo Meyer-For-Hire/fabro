@@ -13,6 +13,15 @@ use crate::types::{AgentEvent, Message};
 
 const APPROX_CHARS_PER_TOKEN: usize = 4;
 
+/// Maximum output budget for the visible summary text itself.
+const SUMMARY_MAX_TOKENS: i64 = 4096;
+
+/// Extra output budget for models that reason on every request. `max_tokens`
+/// bounds reasoning *plus* visible output, so a reasoning model handed only
+/// `SUMMARY_MAX_TOKENS` can spend the whole budget thinking and return a
+/// successful response with empty content — a silently empty summary.
+const REASONING_HEADROOM_TOKENS: i64 = 16_384;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
 pub(crate) enum ContextEstimateMethod {
@@ -106,6 +115,12 @@ pub(crate) async fn compact_context(
         )
     };
 
+    let max_tokens = summary_max_tokens(
+        provider_profile.reasons_by_default(),
+        provider_profile.max_output_tokens(),
+    );
+    let visible_max_tokens = SUMMARY_MAX_TOKENS.min(max_tokens);
+
     let summarization_prompt = format!(
         "You are creating a handoff document for a different coding assistant that will take over \
 this task. That assistant will only see your summary and the most recent messages — nothing else \
@@ -117,6 +132,7 @@ Write a summary using EXACTLY these sections:\n\n\
 ## Failed Approaches\nWhat was tried and didn't work, and why.\n\n\
 ## Open Issues\nBugs, edge cases, or TODOs that remain.\n\n\
 ## Next Steps\nWhat should happen next to make progress.\n\n\
+Keep the entire response under {visible_max_tokens} tokens.\n\n\
 Be thorough and specific — the assistant taking over has no prior context. Include file paths, \
 function names, error messages, and exact values. Omit pleasantries and conversational filler.\
 {file_ops_section}"
@@ -136,7 +152,7 @@ function names, error messages, and exact values. Omit pleasantries and conversa
         response_format:  None,
         temperature:      None,
         top_p:            None,
-        max_tokens:       Some(4096),
+        max_tokens:       Some(max_tokens),
         stop_sequences:   None,
         reasoning_effort: None,
         speed:            None,
@@ -162,9 +178,10 @@ function names, error messages, and exact values. Omit pleasantries and conversa
         .into());
     }
 
+    let (summary_text, summary_truncated) = truncate_summary_text(summary_text);
     debug!(
         summary_len = summary_text.len(),
-        "Compaction summary generated"
+        summary_truncated, max_tokens, "Compaction summary generated"
     );
     let summary_content = format!(
         "A different assistant began this task and produced the following summary. \
@@ -182,6 +199,43 @@ Build on their progress — do not repeat completed steps.\n\n{summary_text}"
     });
 
     Ok(())
+}
+
+/// Combined reasoning and visible-output budget for the summarization request.
+///
+/// Compaction runs against the session's own model, so a reasoning session
+/// summarizes with reasoning enabled and the budget has to cover the thinking
+/// as well as the summary. Provider routes that reason by default get headroom
+/// on top of the summary allowance. Every known model budget is capped at its
+/// declared `max_output`.
+fn summary_max_tokens(reasoning_by_default: bool, max_output: Option<i64>) -> i64 {
+    let budget = if reasoning_by_default {
+        SUMMARY_MAX_TOKENS + REASONING_HEADROOM_TOKENS
+    } else {
+        SUMMARY_MAX_TOKENS
+    };
+
+    max_output.map_or(budget, |limit| budget.min(limit))
+}
+
+/// Bound retained summary text with the same local bytes-per-token heuristic
+/// used for context estimates. Provider APIs expose only one combined ceiling
+/// for reasoning and visible output, so the larger request budget cannot
+/// enforce this limit itself.
+fn truncate_summary_text(summary: &str) -> (&str, bool) {
+    let max_bytes = summary_max_approx_bytes();
+    if summary.len() <= max_bytes {
+        return (summary, false);
+    }
+
+    let end = summary.floor_char_boundary(max_bytes);
+    (&summary[..end], true)
+}
+
+fn summary_max_approx_bytes() -> usize {
+    usize::try_from(SUMMARY_MAX_TOKENS)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(APPROX_CHARS_PER_TOKEN)
 }
 
 pub(crate) fn estimate_active_context_usage(
@@ -314,6 +368,7 @@ mod tests {
     use std::time::SystemTime;
 
     use fabro_llm::types::{TokenCounts, ToolCall, ToolResult};
+    use fabro_model::{Catalog, Model, ProviderId};
 
     use super::*;
     use crate::event::Emitter;
@@ -321,6 +376,88 @@ mod tests {
     use crate::test_support::{MockLlmProvider, TestProfile, make_client, text_response};
     use crate::tool_registry::ToolRegistry;
     use crate::types::Message;
+
+    fn catalog_model(provider: &ProviderId, id: &str) -> &'static Model {
+        Catalog::builtin()
+            .get_on_provider(provider, id)
+            .unwrap_or_else(|| panic!("{provider}/{id} missing from builtin catalog"))
+    }
+
+    fn builtin_summary_max_tokens(provider: &ProviderId, id: &str) -> i64 {
+        let catalog = Catalog::builtin();
+        let model = catalog_model(provider, id);
+        let settings = catalog
+            .settings_for(model)
+            .unwrap_or_else(|| panic!("{provider}/{id} missing catalog settings"));
+        summary_max_tokens(settings.reasoning_by_default, model.max_output())
+    }
+
+    #[test]
+    fn summary_budget_without_catalog_model_is_summary_allowance() {
+        assert_eq!(summary_max_tokens(false, None), SUMMARY_MAX_TOKENS);
+        // The default agent test profile has no catalog behind it.
+        let profile = TestProfile::new();
+        assert_eq!(
+            summary_max_tokens(profile.reasons_by_default(), profile.max_output_tokens()),
+            SUMMARY_MAX_TOKENS
+        );
+    }
+
+    #[test]
+    fn summary_budget_for_non_reasoning_model_is_summary_allowance() {
+        // claude-haiku-4-5: reasoning = false.
+        assert_eq!(
+            builtin_summary_max_tokens(&ProviderId::anthropic(), "claude-haiku-4-5"),
+            SUMMARY_MAX_TOKENS
+        );
+    }
+
+    #[test]
+    fn summary_budget_for_model_without_effort_feature_is_summary_allowance() {
+        // claude-sonnet-4-5 reasons only when a request asks for it, and
+        // compaction never sends a reasoning effort.
+        let model = catalog_model(&ProviderId::anthropic(), "claude-sonnet-4-5");
+        assert!(model.supports_reasoning());
+        assert!(!model.supports_reasoning_effort());
+        assert_eq!(
+            builtin_summary_max_tokens(&ProviderId::anthropic(), "claude-sonnet-4-5"),
+            SUMMARY_MAX_TOKENS
+        );
+    }
+
+    #[test]
+    fn summary_budget_for_always_adaptive_model_adds_reasoning_headroom() {
+        assert_eq!(
+            builtin_summary_max_tokens(&ProviderId::anthropic(), "claude-fable-5"),
+            SUMMARY_MAX_TOKENS + REASONING_HEADROOM_TOKENS
+        );
+    }
+
+    #[test]
+    fn summary_budget_for_effort_levels_model_adds_reasoning_headroom() {
+        assert_eq!(
+            builtin_summary_max_tokens(&ProviderId::anthropic(), "claude-opus-5"),
+            SUMMARY_MAX_TOKENS + REASONING_HEADROOM_TOKENS
+        );
+    }
+
+    #[test]
+    fn summary_budget_for_always_reasoning_route_without_effort_adds_headroom() {
+        let kimi = ProviderId::new("kimi");
+        let model = catalog_model(&kimi, "kimi-k2.5");
+        assert!(model.supports_reasoning());
+        assert!(!model.supports_reasoning_effort());
+        assert_eq!(
+            builtin_summary_max_tokens(&kimi, "kimi-k2.5"),
+            SUMMARY_MAX_TOKENS + REASONING_HEADROOM_TOKENS
+        );
+    }
+
+    #[test]
+    fn summary_budget_never_exceeds_model_max_output() {
+        assert_eq!(summary_max_tokens(true, Some(8_192)), 8_192);
+        assert_eq!(summary_max_tokens(false, Some(2_048)), 2_048);
+    }
 
     #[test]
     fn render_turns_produces_labeled_text() {
@@ -711,5 +848,30 @@ mod tests {
                 .any(|event| matches!(event, AgentEvent::CompactionCompleted { .. })),
             "CompactionCompleted should be emitted on success"
         );
+    }
+
+    #[tokio::test]
+    async fn compaction_bounds_retained_summary_to_visible_budget() {
+        let max_bytes = summary_max_approx_bytes();
+        let overlong = format!("{}END", "€".repeat(max_bytes / 3 + 1));
+        let CompactionTestResult {
+            result, history, ..
+        } = compact_with_summary(&overlong).await;
+
+        result.expect("an overlong summary should be compacted after truncation");
+
+        let summary_turn = history
+            .turns()
+            .iter()
+            .find_map(|turn| match turn {
+                Message::System { content, .. } => Some(content),
+                _ => None,
+            })
+            .expect("compacted history should contain a summary turn");
+        let (_, retained_summary) = summary_turn
+            .split_once("\n\n")
+            .expect("summary turn should separate its header from the generated text");
+        assert!(retained_summary.len() <= max_bytes);
+        assert!(!retained_summary.contains("END"));
     }
 }
