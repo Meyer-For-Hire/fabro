@@ -160,7 +160,11 @@ pub fn is_question_tool(name: &str) -> bool {
 pub fn register_question_tools(profile_kind: AgentProfileKind, registry: &mut ToolRegistry) {
     match profile_kind {
         AgentProfileKind::OpenAi => registry.register(make_openai_question_tool()),
-        AgentProfileKind::Anthropic => registry.register(make_anthropic_question_tool()),
+        // Kimi Code names this tool `AskUserQuestion` with the same
+        // question/option shape, so the Anthropic-style tool is a match.
+        AgentProfileKind::Anthropic | AgentProfileKind::Kimi => {
+            registry.register(make_anthropic_question_tool());
+        }
         AgentProfileKind::Gemini => {}
     }
 }
@@ -582,6 +586,11 @@ mod tests {
         register_question_tools(AgentProfileKind::Anthropic, &mut anthropic);
         assert!(anthropic.get(ANTHROPIC_ASK_USER_QUESTION_TOOL).is_some());
         assert!(anthropic.get(OPENAI_REQUEST_USER_INPUT_TOOL).is_none());
+
+        let mut kimi = ToolRegistry::new();
+        register_question_tools(AgentProfileKind::Kimi, &mut kimi);
+        assert!(kimi.get(ANTHROPIC_ASK_USER_QUESTION_TOOL).is_some());
+        assert!(kimi.get(OPENAI_REQUEST_USER_INPUT_TOOL).is_none());
 
         let mut gemini = ToolRegistry::new();
         register_question_tools(AgentProfileKind::Gemini, &mut gemini);

@@ -10,11 +10,12 @@ use fabro_static::EnvVars;
 use futures::{StreamExt, stream};
 
 use crate::config::NativeToolOptions;
-use crate::sandbox::GrepOptions;
-use crate::tool_registry::{RegisteredTool, ToolRegistry, ToolSource};
+use crate::sandbox::{ExecResult, GrepOptions};
+use crate::tool_registry::{RegisteredTool, ToolContext, ToolRegistry, ToolSource};
 
 const MAX_WEB_FETCH_BYTES: usize = 100 * 1024;
 const MAX_READ_MANY_FILES_CONCURRENCY: usize = 8;
+pub(crate) const DEFAULT_READ_LINES: usize = 2000;
 
 /// Configuration for the optional LLM-based summarizer used by `web_fetch`.
 #[derive(Clone)]
@@ -65,6 +66,15 @@ pub fn register_core_tools(
     registry.register(make_write_file_tool());
     registry.register(make_shell_tool_with_options(options));
     registry.register(make_grep_tool());
+    register_discovery_and_web_tools(registry, options, summarizer);
+}
+
+/// Register the core tools whose Kimi Code contracts match fabro's own.
+pub(crate) fn register_discovery_and_web_tools(
+    registry: &mut ToolRegistry,
+    options: &NativeToolOptions,
+    summarizer: Option<WebFetchSummarizer>,
+) {
     registry.register(make_glob_tool());
     if let Some(api_key) = &options.secrets.brave_search_api_key {
         registry.register(make_web_search_tool_with_api_key(api_key.clone()));
@@ -78,7 +88,10 @@ pub(crate) fn required_str<'a>(args: &'a serde_json::Value, key: &str) -> Result
         .ok_or_else(|| format!("Missing required parameter: {key}"))
 }
 
-fn optional_usize_arg(args: &serde_json::Value, key: &str) -> Result<Option<usize>, String> {
+pub(crate) fn optional_usize_arg(
+    args: &serde_json::Value,
+    key: &str,
+) -> Result<Option<usize>, String> {
     args.get(key)
         .and_then(serde_json::Value::as_u64)
         .map(|value| {
@@ -107,7 +120,8 @@ pub fn make_read_file_tool() -> RegisteredTool {
             Box::pin(async move {
                 let file_path = required_str(&args, "file_path")?;
                 let offset_usize = optional_usize_arg(&args, "offset")?;
-                let limit_usize = optional_usize_arg(&args, "limit")?;
+                let limit_usize =
+                    optional_usize_arg(&args, "limit")?.or(Some(DEFAULT_READ_LINES));
 
                 let content = ctx
                     .env
@@ -239,29 +253,13 @@ pub fn make_shell_tool_with_options(options: &NativeToolOptions) -> RegisteredTo
         executor:   Arc::new(move |args, ctx| {
             Box::pin(async move {
                 let command = required_str(&args, "command")?;
-                let command = format!("exec 2>&1\n{command}");
                 let timeout_ms = args
                     .get("timeout_ms")
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(default_timeout)
                     .min(max_timeout);
 
-                let tool_env = ctx.resolve_tool_env().await.map_err(|e| format!("{e:#}"))?;
-                tracing::debug!(
-                    env_var_count = tool_env.as_ref().map_or(0, std::collections::HashMap::len),
-                    "Injecting sandbox env vars into tool execution"
-                );
-                let result = ctx
-                    .env
-                    .exec_command(
-                        &command,
-                        timeout_ms,
-                        None,
-                        tool_env.as_ref(),
-                        Some(ctx.cancel),
-                    )
-                    .await
-                    .map_err(|e| e.display_with_causes())?;
+                let result = execute_shell_command(&ctx, command, timeout_ms, None).await?;
 
                 let mut output = String::new();
                 if result.is_timed_out() {
@@ -282,6 +280,33 @@ pub fn make_shell_tool_with_options(options: &NativeToolOptions) -> RegisteredTo
         }),
         source:     ToolSource::Native,
     }
+}
+
+/// Execute a shell command with the session's environment and cancellation
+/// plumbing. Provider profiles can vary their wire schema and result
+/// rendering without accidentally bypassing those shared semantics.
+pub(crate) async fn execute_shell_command(
+    ctx: &ToolContext,
+    command: &str,
+    timeout_ms: u64,
+    cwd: Option<&str>,
+) -> Result<ExecResult, String> {
+    let command = format!("exec 2>&1\n{command}");
+    let tool_env = ctx.resolve_tool_env().await.map_err(|e| format!("{e:#}"))?;
+    tracing::debug!(
+        env_var_count = tool_env.as_ref().map_or(0, std::collections::HashMap::len),
+        "Injecting sandbox env vars into tool execution"
+    );
+    ctx.env
+        .exec_command(
+            &command,
+            timeout_ms,
+            cwd,
+            tool_env.as_ref(),
+            Some(ctx.cancel.clone()),
+        )
+        .await
+        .map_err(|e| e.display_with_causes())
 }
 
 #[must_use]
@@ -329,24 +354,55 @@ pub fn make_grep_tool() -> RegisteredTool {
                     max_results,
                 };
 
-                let results = ctx
-                    .env
-                    .grep(pattern, path, &options)
-                    .await
-                    .map_err(|e| e.display_with_causes())?;
-                let mut seen_files = std::collections::HashSet::new();
-                for line in &results {
-                    if let Some(file_path) = line.split(':').next() {
-                        if !file_path.is_empty() && seen_files.insert(file_path) {
-                            ctx.env.mark_agent_read(file_path);
-                        }
-                    }
-                }
+                let results = execute_grep(&ctx, pattern, path, &options).await?;
                 Ok(results.join("\n"))
             })
         }),
         source:     ToolSource::Native,
     }
+}
+
+/// Run a content search and mark every returned file as observed by the
+/// agent's read-before-write guard.
+pub(crate) async fn execute_grep(
+    ctx: &ToolContext,
+    pattern: &str,
+    path: &str,
+    options: &GrepOptions,
+) -> Result<Vec<String>, String> {
+    let results = ctx
+        .env
+        .grep(pattern, path, options)
+        .await
+        .map_err(|e| e.display_with_causes())?;
+    let mut seen_files = std::collections::HashSet::new();
+    for line in &results {
+        let file_path = grep_result_path(line, path);
+        if !file_path.is_empty() && seen_files.insert(file_path) {
+            ctx.env.mark_agent_read(file_path);
+        }
+    }
+    Ok(results)
+}
+
+/// Extract the file path from `<path>:<line>:<content>` grep output.
+///
+/// A search of one concrete file may omit `<path>`, in which case the searched
+/// path itself is returned. Candidate separators are walked so paths that
+/// contain colons (including Windows drive prefixes) still parse correctly.
+pub(crate) fn grep_result_path<'a>(line: &'a str, searched: &'a str) -> &'a str {
+    let mut rest = line;
+    let mut consumed = 0usize;
+    while let Some(index) = rest.find(':') {
+        let after = &rest[index + 1..];
+        let digit_count = after.chars().take_while(char::is_ascii_digit).count();
+        if digit_count > 0 && after[digit_count..].starts_with(':') {
+            return &line[..consumed + index];
+        }
+        consumed += index + 1;
+        rest = after;
+    }
+    searched
 }
 
 #[must_use]
@@ -769,6 +825,34 @@ mod tests {
         })
         .await;
         assert_eq!(result.unwrap(), "1 | hello\n2 | world\n");
+    }
+
+    #[tokio::test]
+    async fn read_file_applies_the_documented_default_limit() {
+        let tool = make_read_file_tool();
+        let content = (1..=DEFAULT_READ_LINES + 1)
+            .map(|line| format!("line{line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let env: Arc<dyn Sandbox> = Arc::new(MockSandbox {
+            files: HashMap::from([("/test.txt".to_string(), content)]),
+            ..Default::default()
+        });
+
+        let result = (tool.executor)(serde_json::json!({"file_path": "/test.txt"}), ToolContext {
+            env,
+            cancel: CancellationToken::new(),
+            tool_env_provider: None,
+            session_id: None,
+            root_session_id: None,
+            tool_call_id: None,
+            agent_event_emitter: None,
+        })
+        .await
+        .unwrap();
+
+        assert!(result.contains("2000 | line2000"), "{result}");
+        assert!(!result.contains("2001 | line2001"), "{result}");
     }
 
     #[tokio::test]

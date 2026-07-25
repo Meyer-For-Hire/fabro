@@ -8,7 +8,7 @@ use fabro_agent::tool_registry::{RegisteredTool, ToolContext, ToolRegistry, Tool
 use fabro_agent::{
     AgentEvent, AgentProfile, AgentProfileBuilder, CompletionCoordinator, Message as AgentMessage,
     Sandbox, Session, SessionOptions, SessionShutdownReason, StaticEnvProvider, ToolEnvProvider,
-    ToolSecrets, register_question_tools,
+    ToolSecrets, canonical_tool_name, register_question_tools,
 };
 use fabro_auth::{CredentialSource, EnvCredentialSource};
 use fabro_graphviz::graph::{AttrValue, Node};
@@ -445,8 +445,12 @@ fn track_file_event(event: &AgentEvent, state: &mut FileTracking) {
             tool_name,
             tool_call_id,
             arguments,
-        } if tool_name == "write_file" || tool_name == "edit_file" => {
-            if let Some(path) = arguments.get("file_path").and_then(|v| v.as_str()) {
+        } if matches!(canonical_tool_name(tool_name), "write_file" | "edit_file") => {
+            if let Some(path) = arguments
+                .get("file_path")
+                .or_else(|| arguments.get("path"))
+                .and_then(|v| v.as_str())
+            {
                 state.pending.insert(tool_call_id.clone(), path.to_string());
             }
         }
@@ -2621,6 +2625,34 @@ reasoning = false
         );
         assert!(state.touched.contains("/src/lib.rs"));
         assert_eq!(state.last.as_deref(), Some("/src/lib.rs"));
+    }
+
+    #[test]
+    fn track_file_event_tracks_kimi_write_alias() {
+        let mut state = new_file_tracking();
+        track_file_event(
+            &AgentEvent::ToolCallStarted {
+                tool_name:    "Write".to_string(),
+                tool_call_id: "tc-kimi".to_string(),
+                arguments:    serde_json::json!({
+                    "path": "/src/kimi.rs",
+                    "content": "new"
+                }),
+            },
+            &mut state,
+        );
+        track_file_event(
+            &AgentEvent::ToolCallCompleted {
+                tool_call_id: "tc-kimi".to_string(),
+                tool_name:    "Write".to_string(),
+                is_error:     false,
+                output:       serde_json::Value::String("ok".to_string()),
+            },
+            &mut state,
+        );
+
+        assert!(state.touched.contains("/src/kimi.rs"));
+        assert_eq!(state.last.as_deref(), Some("/src/kimi.rs"));
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use crate::config::SessionOptions;
+use crate::tool_permissions::canonical_tool_name;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TruncationMode {
@@ -86,14 +87,16 @@ pub fn truncate_lines(output: &str, max_lines: usize) -> String {
 
 #[must_use]
 pub fn truncate_tool_output(output: &str, tool_name: &str, config: &SessionOptions) -> String {
-    let mode = default_truncation_mode(tool_name);
+    let canonical_name = canonical_tool_name(tool_name);
+    let mode = default_truncation_mode(canonical_name);
 
     // Char truncation first
     let char_limit = config
         .tool_output_limits
         .get(tool_name)
         .copied()
-        .or_else(|| default_char_limit(tool_name));
+        .or_else(|| config.tool_output_limits.get(canonical_name).copied())
+        .or_else(|| default_char_limit(canonical_name));
 
     let after_chars = match char_limit {
         Some(limit) => truncate_output(output, limit, mode),
@@ -105,7 +108,8 @@ pub fn truncate_tool_output(output: &str, tool_name: &str, config: &SessionOptio
         .tool_line_limits
         .get(tool_name)
         .copied()
-        .or_else(|| default_line_limit(tool_name));
+        .or_else(|| config.tool_line_limits.get(canonical_name).copied())
+        .or_else(|| default_line_limit(canonical_name));
 
     match line_limit {
         Some(limit) => truncate_lines(&after_chars, limit),
@@ -170,6 +174,24 @@ mod tests {
         let result = truncate_tool_output(&output, "shell", &config);
         // Should have been char-truncated first (30k limit for shell)
         assert!(result.len() < output.len());
+    }
+
+    #[test]
+    fn kimi_aliases_use_canonical_limits() {
+        let config = SessionOptions::default();
+        let shell_output = "x".repeat(40_000);
+        let write_output = "x".repeat(2_000);
+
+        assert!(truncate_tool_output(&shell_output, "Bash", &config).len() < shell_output.len());
+        assert!(truncate_tool_output(&write_output, "Write", &config).len() < write_output.len());
+    }
+
+    #[test]
+    fn canonical_config_override_applies_to_kimi_alias() {
+        let mut config = SessionOptions::default();
+        config.tool_output_limits.insert("shell".into(), 100);
+        let result = truncate_tool_output(&"x".repeat(1_000), "Bash", &config);
+        assert!(result.contains("Tool output was truncated"));
     }
 
     #[test]

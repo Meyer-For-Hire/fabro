@@ -1,6 +1,7 @@
 [providers.kimi]
 display_name = "Kimi"
 adapter = "openai_compatible"
+agent_profile = "kimi"
 api_key_url = "https://platform.kimi.ai/console/api-keys"
 base_url = "https://api.moonshot.ai/v1"
 priority = 70

@@ -4,6 +4,7 @@ use fabro_llm::types::ToolDefinition;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{Error, InterruptReason};
+use crate::native_tool::{NativeTool, ToolVocabulary};
 use crate::sandbox::Sandbox;
 use crate::tool_registry::{RegisteredTool, ToolSource};
 use crate::tools::required_str;
@@ -160,13 +161,21 @@ pub fn expand_skill(skills: &[Skill], input: &str) -> Result<ExpandedInput, Stri
 }
 
 pub fn make_use_skill_tool(skills: Arc<Vec<Skill>>) -> RegisteredTool {
-    RegisteredTool {
-        definition: ToolDefinition {
-            name:        "use_skill".into(),
-            description: "Load a skill's instructions by name. Call this when the user's \
-                          request matches an available skill."
-                .into(),
-            parameters:  serde_json::json!({
+    make_use_skill_tool_for_vocabulary(skills, ToolVocabulary::Fabro)
+}
+
+/// Build the skill loader with the argument schema used by `vocabulary`.
+///
+/// Kimi Code calls the fields `skill` and `args`; fabro's native surface uses
+/// `skill_name`. The executor keeps one implementation for both.
+pub fn make_use_skill_tool_for_vocabulary(
+    skills: Arc<Vec<Skill>>,
+    vocabulary: ToolVocabulary,
+) -> RegisteredTool {
+    let (name_parameter, parameters) = match vocabulary {
+        ToolVocabulary::Fabro => (
+            "skill_name",
+            serde_json::json!({
                 "type": "object",
                 "properties": {
                     "skill_name": {
@@ -176,11 +185,37 @@ pub fn make_use_skill_tool(skills: Arc<Vec<Skill>>) -> RegisteredTool {
                 },
                 "required": ["skill_name"]
             }),
+        ),
+        ToolVocabulary::KimiCode => (
+            "skill",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "skill": {
+                        "type": "string",
+                        "description": "Exact name of the skill to invoke"
+                    },
+                    "args": {
+                        "type": "string",
+                        "description": "Optional argument string to pass to the skill"
+                    }
+                },
+                "required": ["skill"]
+            }),
+        ),
+    };
+    RegisteredTool {
+        definition: ToolDefinition {
+            name: NativeTool::UseSkill.canonical_name().into(),
+            description: "Load a skill's instructions by name. Call this when the user's \
+                          request matches an available skill."
+                .into(),
+            parameters,
         },
         executor:   Arc::new(move |args, ctx| {
             let skills = skills.clone();
             Box::pin(async move {
-                let name = required_str(&args, "skill_name")?;
+                let name = required_str(&args, name_parameter)?;
                 let skill = skills
                     .iter()
                     .find(|s| s.name == name)
@@ -189,23 +224,34 @@ pub fn make_use_skill_tool(skills: Arc<Vec<Skill>>) -> RegisteredTool {
                     skill_name: name.to_string(),
                     source:     SkillActivationSource::Tool,
                 });
-                Ok(skill.template.clone())
+                let skill_args = args.get("args").and_then(serde_json::Value::as_str);
+                let content = match skill_args.filter(|value| !value.is_empty()) {
+                    Some(value) if skill.template.contains("{{user_input}}") => {
+                        skill.template.replace("{{user_input}}", value)
+                    }
+                    Some(value) => format!("{}\n\nARGUMENTS:\n{value}", skill.template),
+                    None => skill.template.clone(),
+                };
+                Ok(content)
             })
         }),
         source:     ToolSource::Skill,
     }
 }
 
-pub fn format_skills_prompt_section(skills: &[Skill]) -> String {
+/// Render the skills section of a system prompt.
+pub fn format_skills_prompt_section(skills: &[Skill], vocabulary: ToolVocabulary) -> String {
     if skills.is_empty() {
         return String::new();
     }
 
+    let skill_tool = NativeTool::UseSkill.name(vocabulary);
     let mut lines = vec![
         "# Available Skills".to_string(),
-        "When the user's request matches a skill below, call the `use_skill` tool \
-         to load its instructions, then follow them."
-            .to_string(),
+        format!(
+            "When the user's request matches a skill below, call the `{skill_tool}` tool \
+             to load its instructions, then follow them."
+        ),
     ];
     for skill in skills {
         if skill.description.is_empty() {
@@ -452,13 +498,13 @@ name: trimmed
 
     #[test]
     fn format_empty() {
-        assert_eq!(format_skills_prompt_section(&[]), "");
+        assert_eq!(format_skills_prompt_section(&[], ToolVocabulary::Fabro), "");
     }
 
     #[test]
     fn format_lists_skills() {
         let skills = test_skills();
-        let section = format_skills_prompt_section(&skills);
+        let section = format_skills_prompt_section(&skills, ToolVocabulary::Fabro);
         assert!(section.contains("# Available Skills"));
         assert!(section.contains("call the `use_skill` tool"));
         assert!(section.contains("- `commit`: Create a commit"));
@@ -640,5 +686,45 @@ name: trimmed
         let result = (tool.executor)(args, ctx).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Missing required parameter"));
+    }
+
+    #[tokio::test]
+    async fn kimi_skill_schema_and_args_match_kimi_code() {
+        let skills = Arc::new(test_skills());
+        let tool = make_use_skill_tool_for_vocabulary(skills, ToolVocabulary::KimiCode);
+        let env: Arc<dyn Sandbox> = Arc::new(MockSandbox::default());
+        let ctx = ToolContext {
+            env,
+            cancel: CancellationToken::new(),
+            tool_env_provider: None,
+            session_id: None,
+            root_session_id: None,
+            tool_call_id: None,
+            agent_event_emitter: None,
+        };
+
+        let result = (tool.executor)(
+            serde_json::json!({"skill": "commit", "args": "only staged files"}),
+            ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.contains("only staged files"), "{result}");
+        assert!(
+            tool.definition.parameters["properties"]
+                .get("skill")
+                .is_some()
+        );
+        assert!(
+            tool.definition.parameters["properties"]
+                .get("args")
+                .is_some()
+        );
+        assert!(
+            tool.definition.parameters["properties"]
+                .get("skill_name")
+                .is_none()
+        );
     }
 }

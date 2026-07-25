@@ -34,6 +34,9 @@ pub async fn discover_memory(
         AgentProfileKind::Anthropic => vec!["AGENTS.md", "CLAUDE.md"],
         AgentProfileKind::OpenAi => vec!["AGENTS.md", ".codex/instructions.md"],
         AgentProfileKind::Gemini => vec!["AGENTS.md", "GEMINI.md"],
+        // Kimi Code reads only AGENTS.md; it has no vendor-specific
+        // instruction filename of its own.
+        AgentProfileKind::Kimi => vec!["AGENTS.md"],
     };
 
     let mut results: Vec<MemoryDocument> = Vec::new();
@@ -220,7 +223,7 @@ mod tests {
         assert_eq!(openai_docs[1].content, "copilot");
 
         let env: Arc<dyn Sandbox> = Arc::new(MockSandbox {
-            files,
+            files: files.clone(),
             ..Default::default()
         });
         let gemini_docs = discover_memory(
@@ -235,6 +238,22 @@ mod tests {
         assert_eq!(gemini_docs.len(), 2);
         assert_eq!(gemini_docs[0].content, "agents");
         assert_eq!(gemini_docs[1].content, "gemini");
+
+        let env: Arc<dyn Sandbox> = Arc::new(MockSandbox {
+            files,
+            ..Default::default()
+        });
+        let kimi_docs = discover_memory(
+            env.as_ref(),
+            "/repo",
+            "/repo",
+            AgentProfileKind::Kimi,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(kimi_docs.len(), 1);
+        assert_eq!(kimi_docs[0].content, "agents");
     }
 
     #[tokio::test]

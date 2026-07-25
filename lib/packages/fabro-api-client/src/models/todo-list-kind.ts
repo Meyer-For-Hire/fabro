@@ -20,7 +20,8 @@
 
 export const TodoListKind = {
     OPENAI_PLAN: 'openai_plan',
-    ANTHROPIC_TASKS: 'anthropic_tasks'
+    ANTHROPIC_TASKS: 'anthropic_tasks',
+    KIMI_TODOS: 'kimi_todos'
 } as const;
 
 export type TodoListKind = typeof TodoListKind[keyof typeof TodoListKind];
