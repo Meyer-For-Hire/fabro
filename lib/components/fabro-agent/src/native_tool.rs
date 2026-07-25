@@ -27,6 +27,8 @@ pub enum ToolVocabulary {
     Fabro,
     /// The names Kimi Code exposes, for models trained against that harness.
     KimiCode,
+    /// The names Codex exposes, for the GPT-5.6 models trained against it.
+    Codex,
 }
 
 /// A tool fabro implements itself.
@@ -50,7 +52,7 @@ pub enum NativeTool {
     Grep,
     #[strum(to_string = "glob", serialize = "Glob")]
     Glob,
-    #[strum(to_string = "shell", serialize = "Bash")]
+    #[strum(to_string = "shell", serialize = "Bash", serialize = "shell_command")]
     Shell,
     #[strum(to_string = "web_search", serialize = "WebSearch")]
     WebSearch,
@@ -132,6 +134,19 @@ impl NativeTool {
                 Self::SpawnAgent | Self::SendInput | Self::Wait | Self::CloseAgent => {
                     self.canonical_name()
                 }
+                other => other.canonical_name(),
+            },
+            // Codex names its shell `shell_command`. Its remaining tools that
+            // fabro also implements -- apply_patch, update_plan,
+            // request_user_input -- already agree with fabro's names, and the
+            // tools fabro has that Codex does not keep fabro's names.
+            //
+            // Deliberately unmapped: Codex's sub-agent tools differ by
+            // multi-agent protocol version rather than by name alone
+            // (`resume_agent` has no fabro counterpart), and its `web.run` is a
+            // namespaced tool, which fabro's registry cannot express.
+            ToolVocabulary::Codex => match self {
+                Self::Shell => "shell_command",
                 other => other.canonical_name(),
             },
         }
@@ -243,6 +258,45 @@ mod tests {
             NativeTool::SpawnAgent.name(ToolVocabulary::KimiCode),
             "spawn_agent"
         );
+    }
+
+    #[test]
+    fn codex_vocabulary_renames_only_the_shell() {
+        assert_eq!(
+            NativeTool::Shell.name(ToolVocabulary::Codex),
+            "shell_command"
+        );
+        // Already agree with Codex's names.
+        assert_eq!(
+            NativeTool::ApplyPatch.name(ToolVocabulary::Codex),
+            "apply_patch"
+        );
+        assert_eq!(
+            NativeTool::UpdatePlan.name(ToolVocabulary::Codex),
+            "update_plan"
+        );
+        assert_eq!(
+            NativeTool::RequestUserInput.name(ToolVocabulary::Codex),
+            "request_user_input"
+        );
+        // No Codex counterpart: keeps fabro's name.
+        assert_eq!(
+            NativeTool::ReadFile.name(ToolVocabulary::Codex),
+            "read_file"
+        );
+    }
+
+    /// The canonical name is what permissions, categories, and telemetry key
+    /// on, so adding `shell_command` as a parse alias must not change it.
+    #[test]
+    fn shell_keeps_its_canonical_name_alongside_the_codex_alias() {
+        assert_eq!(NativeTool::Shell.canonical_name(), "shell");
+        assert_eq!(NativeTool::Shell.to_string(), "shell");
+        assert_eq!(
+            NativeTool::from_any_name("shell_command"),
+            Some(NativeTool::Shell)
+        );
+        assert_eq!(NativeTool::from_canonical_name("shell_command"), None);
     }
 
     #[test]

@@ -5,12 +5,14 @@ use fabro_model::{AgentProfileKind, Catalog, ProviderId};
 
 pub mod anthropic;
 pub mod gemini;
+pub mod gpt56;
 pub mod kimi;
 pub mod kimi_tools;
 pub mod openai;
 
 pub use anthropic::AnthropicProfile;
 pub use gemini::GeminiProfile;
+pub use gpt56::Gpt56Profile;
 pub use kimi::KimiProfile;
 pub use openai::OpenAiProfile;
 
@@ -91,6 +93,11 @@ impl AgentProfileBuilder {
             ),
             AgentProfileKind::Kimi => Box::new(
                 KimiProfile::with_native_tools(model, options, summarizer)
+                    .with_provider_id(self.provider_id.clone())
+                    .with_catalog(Arc::clone(&self.catalog)),
+            ),
+            AgentProfileKind::Gpt56 => Box::new(
+                Gpt56Profile::with_native_tools(model, options, summarizer)
                     .with_provider_id(self.provider_id.clone())
                     .with_catalog(Arc::clone(&self.catalog)),
             ),
@@ -312,6 +319,11 @@ mod tests {
         OpenAiProfile::with_native_tools("gpt-5.4-mini", &options, None)
     }
 
+    fn gpt56_profile(has_web_search: bool) -> Gpt56Profile {
+        let options = native_tool_options(AgentProfileKind::Gpt56, has_web_search);
+        Gpt56Profile::with_native_tools("gpt-5.6-sol", &options, None)
+    }
+
     fn openai_edit_file_profile(has_web_search: bool) -> OpenAiProfile {
         let options = native_tool_options(AgentProfileKind::OpenAi, has_web_search);
         OpenAiProfile::with_native_tools("kimi-k2.5", &options, None)
@@ -468,6 +480,7 @@ mod tests {
                 ProviderId::gemini(),
                 "gemini-3-flash-preview",
             ),
+            (AgentProfileKind::Gpt56, ProviderId::openai(), "gpt-5.6-sol"),
         ];
 
         for (profile_kind, provider_id, model) in cases {
@@ -553,6 +566,16 @@ mod tests {
     #[test]
     fn openai_apply_patch_and_web_search_prompt_snapshot() {
         insta::assert_snapshot!(system_prompt(&openai_apply_patch_profile(true)));
+    }
+
+    #[test]
+    fn gpt56_default_prompt_snapshot() {
+        insta::assert_snapshot!(system_prompt(&gpt56_profile(false)));
+    }
+
+    #[test]
+    fn gpt56_web_search_prompt_snapshot() {
+        insta::assert_snapshot!(system_prompt(&gpt56_profile(true)));
     }
 
     #[test]

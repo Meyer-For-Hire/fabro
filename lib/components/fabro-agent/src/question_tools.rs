@@ -159,7 +159,10 @@ pub fn is_question_tool(name: &str) -> bool {
 
 pub fn register_question_tools(profile_kind: AgentProfileKind, registry: &mut ToolRegistry) {
     match profile_kind {
-        AgentProfileKind::OpenAi => registry.register(make_openai_question_tool()),
+        // Codex names this tool `request_user_input` for GPT-5.6 too.
+        AgentProfileKind::OpenAi | AgentProfileKind::Gpt56 => {
+            registry.register(make_openai_question_tool());
+        }
         // Kimi Code names this tool `AskUserQuestion` with the same
         // question/option shape, so the Anthropic-style tool is a match.
         AgentProfileKind::Anthropic | AgentProfileKind::Kimi => {

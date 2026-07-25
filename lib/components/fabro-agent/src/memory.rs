@@ -32,7 +32,9 @@ pub async fn discover_memory(
 
     let candidate_filenames: Vec<&str> = match profile_kind {
         AgentProfileKind::Anthropic => vec!["AGENTS.md", "CLAUDE.md"],
-        AgentProfileKind::OpenAi => vec!["AGENTS.md", ".codex/instructions.md"],
+        AgentProfileKind::OpenAi | AgentProfileKind::Gpt56 => {
+            vec!["AGENTS.md", ".codex/instructions.md"]
+        }
         AgentProfileKind::Gemini => vec!["AGENTS.md", "GEMINI.md"],
         // Kimi Code reads only AGENTS.md; it has no vendor-specific
         // instruction filename of its own.

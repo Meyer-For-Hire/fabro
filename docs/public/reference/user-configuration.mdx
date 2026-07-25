@@ -193,7 +193,7 @@ x-team-secret = "{{ secrets.gateway_team_secret }}"
 |---|---|---|---|
 | `display_name` | string | provider ID | Human-readable provider name. |
 | `adapter` | string | built-in value | Adapter registry key, such as `"anthropic"`, `"openai"`, `"gemini"`, or `"openai_compatible"`. Required for new providers. |
-| `agent_profile` | `"anthropic"` \| `"openai"` \| `"gemini"` | derived from `adapter` | Agent profile used for project memory, CLI/ACP command selection, and native session routing. Override only when a provider needs profile behavior different from its adapter. |
+| `agent_profile` | `"anthropic"` \| `"openai"` \| `"gemini"` \| `"kimi"` \| `"gpt56"` | derived from `adapter` | Agent profile used for tool registration, project memory, CLI/ACP command selection, and native session routing. Override only when a provider needs profile behavior different from its adapter. |
 | `billing_policy` | `"openai"` \| `"anthropic"` \| `"gemini"` \| `"none"` | derived from `adapter` | Provider-owned billing algorithm for usage estimates. Override for exceptional providers such as local no-billing runtimes. |
 | `base_url` | string | built-in value or adapter runtime default | Provider API base URL. Required for most custom OpenAI-compatible providers. |
 | `auth` | table | omitted | API-key auth config. Omit the table entirely for providers that need no API key; any `extra_headers` are still attached. |
@@ -253,7 +253,7 @@ cache_input_cost_per_mtok = 0.60
 | Key | Type / values | Default | Description |
 |---|---|---|---|
 | `api_id` | string | model slug | Opaque identifier sent to this provider's API. An explicitly empty value is invalid. |
-| `agent_profile` | `"anthropic"` \| `"openai"` \| `"gemini"` | provider profile | Agent profile override for this model. Model overrides take precedence over provider overrides. |
+| `agent_profile` | `"anthropic"` \| `"openai"` \| `"gemini"` \| `"kimi"` \| `"gpt56"` | provider profile | Agent profile override for this model. Model overrides take precedence over provider overrides — this is how Kimi and GPT-5.6 models keep their profile on every gateway that serves them. |
 | `billing_policy` | `"openai"` \| `"anthropic"` \| `"gemini"` \| `"none"` | provider policy | Billing algorithm override for this model — for models whose billing family differs from their provider's (e.g. Claude served through OpenRouter bills Anthropic-style cache reads/writes). |
 | `display_name` | string | model ID | Human-readable model name. |
 | `family` | string | model ID | Family label used for catalog display and matching. |

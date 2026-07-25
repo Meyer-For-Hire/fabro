@@ -260,7 +260,18 @@ async fn full_http_lifecycle_cancel() {
         format!("POST /api/v1/runs/{run_id}/cancel"),
     )
     .await;
-    assert_eq!(body["lifecycle"]["status"]["kind"], "blocked");
+    // Both fields below are read from the same post-signal projection, so both
+    // race the worker the same way. `status.kind` is "blocked" while the worker
+    // still sits at the gate and "running" once it has been notified and
+    // resumed to process the cancel. What matters here is that cancel reached a
+    // live run rather than racing the in-memory queue transition, so this
+    // asserts "not queued" via the two live states. Durable convergence is
+    // asserted below.
+    let status_kind = &body["lifecycle"]["status"]["kind"];
+    assert!(
+        status_kind == "blocked" || status_kind == "running",
+        "expected status.kind to be \"blocked\" or \"running\", got {status_kind}"
+    );
     // `pending_control` is computed from the store projection after the cancel
     // event is appended AND the worker is signaled. The worker is sitting at a
     // human gate; once notified it can emit a clearing event before this

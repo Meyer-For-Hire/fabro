@@ -931,7 +931,9 @@ fn summarizer_model_id(
                     // Kimi is reached through several providers, so there is
                     // no fixed summarizer model to name; reuse the selected
                     // one, as the OpenAI profile does.
-                    AgentProfileKind::OpenAi | AgentProfileKind::Kimi => selected_model,
+                    AgentProfileKind::OpenAi | AgentProfileKind::Kimi | AgentProfileKind::Gpt56 => {
+                        selected_model
+                    }
                     AgentProfileKind::Gemini => "gemini-2.0-flash",
                 },
                 |model| model.id.as_str(),

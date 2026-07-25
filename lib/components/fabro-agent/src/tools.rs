@@ -78,10 +78,18 @@ pub(crate) fn register_discovery_and_web_tools(
     summarizer: Option<WebFetchSummarizer>,
 ) {
     registry.register(make_glob_tool());
+    register_web_search_tool(registry, options);
+    registry.register(make_web_fetch_tool(summarizer));
+}
+
+/// Register `web_search` when a Brave Search key is configured.
+///
+/// Separate from [`register_discovery_and_web_tools`] for profiles that offer
+/// search without fabro's discovery tools.
+pub(crate) fn register_web_search_tool(registry: &mut ToolRegistry, options: &NativeToolOptions) {
     if let Some(api_key) = &options.secrets.brave_search_api_key {
         registry.register(make_web_search_tool_with_api_key(api_key.clone()));
     }
-    registry.register(make_web_fetch_tool(summarizer));
 }
 
 pub(crate) fn required_str<'a>(args: &'a serde_json::Value, key: &str) -> Result<&'a str, String> {
@@ -351,7 +359,7 @@ pub(crate) async fn emit_shell_process_completed(
 /// Renders the model-facing shell result: termination, exit code, duration,
 /// and provider-honest output sections. Metadata stays at the head and
 /// `stderr` at the tail so head/tail truncation preserves both.
-fn render_shell_result(streaming: &ExecStreamingResult) -> String {
+pub(crate) fn render_shell_result(streaming: &ExecStreamingResult) -> String {
     let result = &streaming.result;
     let mut output = format!(
         "Termination: {}\nExit code: {}\nDuration: {}ms\n",
