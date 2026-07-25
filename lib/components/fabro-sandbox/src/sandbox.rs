@@ -28,6 +28,13 @@ pub(crate) const BASH_PROBE_TIMEOUT_MS: u64 = 10_000;
 #[cfg(any(feature = "docker", feature = "daytona"))]
 pub(crate) const REMOTE_BASH: &str = "/bin/bash";
 
+/// Environment variable Bash consults for non-interactive startup source.
+///
+/// Sandbox providers must remove or blank this before invoking `bash -c`;
+/// otherwise ambient worker or image configuration can execute code before the
+/// requested command.
+pub(crate) const BASH_ENV_VAR: &str = "BASH_ENV";
+
 /// Marker a successful [`BASH_PROBE_SCRIPT`] run prints on stdout.
 ///
 /// Providers validate the marker rather than trusting a zero exit: an image
@@ -38,11 +45,15 @@ pub(crate) const BASH_PROBE_MARKER: &str = "fabro-bash-ready";
 ///
 /// Run as the argument to `bash -c` during fresh initialization and on
 /// resume/start, before the sandbox is reported usable. It fails when the
-/// interpreter is not Bash, when Bash was started as a login shell, and when
-/// Bash is in POSIX mode — an image whose `bash` is really `sh` passes the
-/// `BASH_VERSION` check but changes behavior, so the interpreter contract is
-/// checked rather than assumed.
-pub(crate) const BASH_PROBE_SCRIPT: &str = r#"if [ -z "${BASH_VERSION:-}" ]; then
+/// interpreter has an ambient `BASH_ENV` startup source, is not Bash, was
+/// started as a login shell, or is in POSIX mode — an image whose `bash` is
+/// really `sh` passes the `BASH_VERSION` check but changes behavior, so the
+/// interpreter contract is checked rather than assumed.
+pub(crate) const BASH_PROBE_SCRIPT: &str = r#"if [ -n "${BASH_ENV:-}" ]; then
+  echo 'sandbox interpreter has BASH_ENV startup source configured' >&2
+  exit 1
+fi
+if [ -z "${BASH_VERSION:-}" ]; then
   echo 'sandbox interpreter is not bash' >&2
   exit 1
 fi
@@ -1592,7 +1603,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn bash_probe_passes_under_bash_and_fails_under_sh_or_a_login_shell() {
+    async fn bash_probe_accepts_only_clean_non_login_bash() {
         use tokio::process::Command;
 
         async fn run(program: &str, args: &[&str]) -> (Option<i32>, String) {
@@ -1616,6 +1627,20 @@ mod tests {
         assert!(
             !bash_probe_passed(code, &stdout),
             "a login shell must fail the probe: {stdout}"
+        );
+
+        let output = Command::new("bash")
+            .args(["-c", BASH_PROBE_SCRIPT])
+            .env(BASH_ENV_VAR, "/dev/null")
+            .output()
+            .await
+            .expect("probe with BASH_ENV should run");
+        assert!(
+            !bash_probe_passed(
+                output.status.code(),
+                &String::from_utf8_lossy(&output.stdout)
+            ),
+            "a shell with BASH_ENV must fail the probe"
         );
 
         // Where `/bin/sh` is really Bash (macOS), Bash enters POSIX mode and

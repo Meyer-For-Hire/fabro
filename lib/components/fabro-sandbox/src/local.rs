@@ -13,7 +13,7 @@ use tokio::{fs, time};
 use tokio_util::sync::CancellationToken;
 
 use crate::sandbox::{
-    BASH_PROBE_SCRIPT, BASH_PROBE_TIMEOUT_MS, StdioProcessControl, optional_timeout,
+    BASH_ENV_VAR, BASH_PROBE_SCRIPT, BASH_PROBE_TIMEOUT_MS, StdioProcessControl, optional_timeout,
     validate_bash_probe,
 };
 use crate::{
@@ -229,13 +229,14 @@ fn filtered_env_vars(
 ) -> Vec<(String, String)> {
     let mut filtered_env: Vec<(String, String)> = process_env_vars()
         .into_iter()
-        .filter(|(key, _)| !LocalSandbox::should_filter_env_var(key))
+        .filter(|(key, _)| key != BASH_ENV_VAR && !LocalSandbox::should_filter_env_var(key))
         .collect();
 
     if let Some(extra) = env_vars {
         for (key, value) in extra {
-            if matches!(explicit_policy, ExplicitEnvPolicy::TrustCaller)
-                || !LocalSandbox::should_filter_env_var(key)
+            if key != BASH_ENV_VAR
+                && (matches!(explicit_policy, ExplicitEnvPolicy::TrustCaller)
+                    || !LocalSandbox::should_filter_env_var(key))
             {
                 filtered_env.push((key.clone(), value.clone()));
             }
@@ -1303,12 +1304,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_command_path_observes_a_non_login_shell() {
+    async fn every_command_path_uses_clean_non_login_bash() {
         let dir = temp_dir();
         let sandbox = LocalSandbox::new(dir.clone());
+        let bash_env_path = dir.join("bash-env");
+        std::fs::write(&bash_env_path, "printf 'startup-source-loaded\\n'\n").unwrap();
+        let env_vars = HashMap::from([(
+            BASH_ENV_VAR.to_string(),
+            bash_env_path.to_string_lossy().into_owned(),
+        )]);
 
         let non_streaming = sandbox
-            .exec_command(LOGIN_SHELL_REPORT, 5000, None, None, None)
+            .exec_command(LOGIN_SHELL_REPORT, 5000, None, Some(&env_vars), None)
             .await
             .unwrap();
         assert_eq!(non_streaming.stdout.trim(), "nonlogin");
@@ -1318,7 +1325,7 @@ mod tests {
                 LOGIN_SHELL_REPORT,
                 Some(5000),
                 None,
-                None,
+                Some(&env_vars),
                 None,
                 Arc::new(|_, _| Box::pin(async { Ok(()) })),
             )
@@ -1333,7 +1340,7 @@ mod tests {
             .spawn_stdio_process(
                 &format!("3>&1; {LOGIN_SHELL_REPORT}; exec cat"),
                 None,
-                None,
+                Some(&env_vars),
                 None,
             )
             .await

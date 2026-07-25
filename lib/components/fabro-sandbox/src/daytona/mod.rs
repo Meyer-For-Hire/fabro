@@ -27,8 +27,8 @@ use tokio_util::sync::CancellationToken;
 use crate::clone_source::{self, CloneDecision, EmptyWorkspaceReason};
 use crate::redact::redact_auth_url;
 use crate::sandbox::{
-    BASH_PROBE_SCRIPT, BASH_PROBE_TIMEOUT_MS, REMOTE_BASH, RefreshOutcome, optional_timeout,
-    resolve_path, validate_bash_probe,
+    BASH_ENV_VAR, BASH_PROBE_SCRIPT, BASH_PROBE_TIMEOUT_MS, REMOTE_BASH, RefreshOutcome,
+    optional_timeout, resolve_path, validate_bash_probe,
 };
 use crate::{
     CommandOutputCallback, DirEntry, ExecResult, ExecStreamingResult, GrepOptions, Sandbox,
@@ -642,6 +642,7 @@ impl DaytonaSandbox {
         };
         daytona_sdk::SandboxBaseParams {
             name: Some(name),
+            env_vars: Some(clean_bash_env(None)),
             auto_stop_interval: self.config.auto_stop_interval,
             labels: Some(managed_labels::merge_for_run(
                 self.config.labels.as_ref(),
@@ -1627,9 +1628,10 @@ impl Sandbox for DaytonaSandbox {
             "exec_command: process service acquired, starting select"
         );
 
+        let clean_env = clean_bash_env(env_vars);
         let options = daytona_sdk::ExecuteCommandOptions {
             cwd:     Some(cwd),
-            env:     env_vars.cloned(),
+            env:     Some(clean_env.clone()),
             timeout: Some(std::time::Duration::from_millis(timeout_ms)),
         };
 
@@ -1637,19 +1639,7 @@ impl Sandbox for DaytonaSandbox {
         // process the `envs` field (not in its OpenAPI spec), so we also
         // prepend `export` statements as a fallback until server support
         // lands. The SDK sends `envs` too for forward compatibility.
-        let command_with_env = if let Some(vars) = env_vars {
-            if vars.is_empty() {
-                command.to_string()
-            } else {
-                let exports: Vec<String> = vars
-                    .iter()
-                    .map(|(k, v)| format!("export {}={}", shell_quote(k), shell_quote(v)))
-                    .collect();
-                format!("{}\n{}", exports.join("\n"), command)
-            }
-        } else {
-            command.to_string()
-        };
+        let command_with_env = format!("{}\n{command}", bash_export_lines(&clean_env).join("\n"));
 
         // Wrap with `bash -c` so pipes, env vars, and shell features work.
         // The Daytona API uses direct exec, not a shell.
@@ -2297,6 +2287,22 @@ fn missing_log_suffix_offset(seen: &[u8], final_bytes: &[u8]) -> usize {
     0
 }
 
+/// Override caller or snapshot startup-file injection for a Bash process.
+fn clean_bash_env(env_vars: Option<&HashMap<String, String>>) -> HashMap<String, String> {
+    let mut clean = env_vars.cloned().unwrap_or_default();
+    clean.insert(BASH_ENV_VAR.to_string(), String::new());
+    clean
+}
+
+fn bash_export_lines(env_vars: &HashMap<String, String>) -> Vec<String> {
+    let mut entries: Vec<_> = env_vars.iter().collect();
+    entries.sort_by_key(|(key, _)| *key);
+    entries
+        .into_iter()
+        .map(|(key, value)| format!("export {}={}", shell_quote(key), shell_quote(value)))
+        .collect()
+}
+
 /// Build the inner Bash script a session command evaluates.
 ///
 /// The result is Bash source, not something Daytona can exec directly — it is
@@ -2307,18 +2313,7 @@ fn build_bash_session_script(
     env_vars: Option<&HashMap<String, String>>,
 ) -> String {
     let mut lines = vec![format!("cd {} || exit $?", shell_quote(cwd))];
-
-    if let Some(vars) = env_vars {
-        let mut entries: Vec<_> = vars.iter().collect();
-        entries.sort_by_key(|(key, _)| *key);
-        for (key, value) in entries {
-            lines.push(format!(
-                "export {}={}",
-                shell_quote(key),
-                shell_quote(value)
-            ));
-        }
-    }
+    lines.extend(bash_export_lines(&clean_bash_env(env_vars)));
 
     lines.push("(".to_string());
     lines.push(command.to_string());
@@ -2623,6 +2618,10 @@ mod tests {
 
         assert_eq!(params.ephemeral, Some(false));
         assert_eq!(params.auto_delete_interval, Some(-1));
+        assert_eq!(
+            params.env_vars,
+            Some(HashMap::from([(BASH_ENV_VAR.to_string(), String::new())]))
+        );
         assert_eq!(
             params.labels,
             Some(HashMap::from([(
@@ -2957,6 +2956,10 @@ mod tests {
         let env = HashMap::from([
             ("BETA".to_string(), "two words".to_string()),
             ("ALPHA".to_string(), "one".to_string()),
+            (
+                BASH_ENV_VAR.to_string(),
+                "/tmp/untrusted-startup".to_string(),
+            ),
         ]);
 
         let command = build_bash_session_script("echo $ALPHA $BETA", "/tmp/with space", Some(&env));
@@ -2965,6 +2968,7 @@ mod tests {
             command,
             "cd '/tmp/with space' || exit $?\n\
              export ALPHA=one\n\
+             export BASH_ENV=''\n\
              export BETA='two words'\n\
              (\n\
              echo $ALPHA $BETA\n\

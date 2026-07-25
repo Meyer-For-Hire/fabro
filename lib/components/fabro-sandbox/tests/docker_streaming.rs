@@ -157,7 +157,7 @@ async fn cloned_docker_sandbox_uses_repos_checkout_and_workspace_symlink() {
 // controlled child.
 #[tokio::test]
 #[ignore = "requires real Docker container lifecycle; run explicitly when changing Docker exec integration"]
-async fn docker_runs_bash_only_syntax_through_both_command_paths() {
+async fn docker_runs_clean_bash_through_both_command_paths() {
     let image = "buildpack-deps:noble";
     let Ok(docker) = Docker::connect_with_local_defaults() else {
         return;
@@ -170,6 +170,7 @@ async fn docker_runs_bash_only_syntax_through_both_command_paths() {
         DockerSandboxOptions {
             image: image.to_string(),
             auto_pull: false,
+            env_vars: vec!["BASH_ENV=/tmp/fabro-bash-env".to_string()],
             skip_clone: true,
             ..DockerSandboxOptions::default()
         },
@@ -184,8 +185,23 @@ async fn docker_runs_bash_only_syntax_through_both_command_paths() {
         .await
         .expect("docker sandbox should initialize");
 
+    // If the image-level BASH_ENV survives either exec boundary, every
+    // subsequent Bash process prints this line before the requested command.
+    let setup = sandbox
+        .exec_command(
+            "printf \"printf 'startup-source-loaded\\\\n'\\n\" > /tmp/fabro-bash-env",
+            10_000,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("startup-file fixture should be created");
+    assert!(setup.is_success());
+
     // Arrays, `[[ ]]`, and `${arr[@]}` are Bash-only; `shopt -q login_shell`
-    // proves the command did not run under a login shell.
+    // proves the command did not run under a login shell. Exact output also
+    // proves the image's BASH_ENV startup file was not sourced.
     let command = "arr=(one two three); [[ ${#arr[@]} -eq 3 ]] || exit 1; \
                    shopt -q login_shell && exit 2; echo ${arr[1]}";
 
@@ -225,10 +241,8 @@ async fn docker_runs_bash_only_syntax_through_both_command_paths() {
         streaming.result.stdout,
         streaming.result.stderr
     );
-    assert!(
-        String::from_utf8_lossy(&chunks.lock().await).contains("two"),
-        "streamed output should carry the Bash-only result"
-    );
+    assert_eq!(streaming.result.stdout.trim(), "two");
+    assert_eq!(String::from_utf8_lossy(&chunks.lock().await).trim(), "two");
 }
 
 // Regression test for glob patterns that contain a path separator. Before the

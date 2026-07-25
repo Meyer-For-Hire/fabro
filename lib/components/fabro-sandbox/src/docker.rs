@@ -29,8 +29,8 @@ use crate::clone_source::{self, CloneDecision, EmptyWorkspaceReason};
 use crate::managed_labels::{self, MANAGED_LABEL, RUN_ID_LABEL};
 use crate::redact::redact_auth_url;
 use crate::sandbox::{
-    BASH_PROBE_SCRIPT, BASH_PROBE_TIMEOUT_MS, REMOTE_BASH, RefreshOutcome, StdioProcessControl,
-    optional_timeout, resolve_path, validate_bash_probe,
+    BASH_ENV_VAR, BASH_PROBE_SCRIPT, BASH_PROBE_TIMEOUT_MS, REMOTE_BASH, RefreshOutcome,
+    StdioProcessControl, optional_timeout, resolve_path, validate_bash_probe,
 };
 use crate::{
     CommandOutputCallback, DEFAULT_EXEC_OUTPUT_TAIL_BYTES, DirEntry, ExecResult,
@@ -53,6 +53,30 @@ const EXEC_STOP_POLL_SLEEP_SECONDS: &str = "0.1";
 const EXEC_TERM_GRACE_SECONDS: &str = "0.02";
 #[cfg(not(test))]
 const EXEC_TERM_GRACE_SECONDS: &str = "0.2";
+
+fn env_entry_name(entry: &str) -> &str {
+    entry.split_once('=').map_or(entry, |(name, _)| name)
+}
+
+/// Remove caller/image startup-file injection and explicitly override any
+/// inherited image value for Docker-created processes.
+fn clean_bash_env_entries(entries: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut clean: Vec<String> = entries
+        .into_iter()
+        .filter(|entry| env_entry_name(entry) != BASH_ENV_VAR)
+        .collect();
+    clean.push(format!("{BASH_ENV_VAR}="));
+    clean
+}
+
+fn docker_bash_exec_env(env_vars: Option<&HashMap<String, String>>) -> Vec<String> {
+    let entries = env_vars.map_or_else(Vec::new, |vars| {
+        vars.iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect()
+    });
+    clean_bash_env_entries(entries)
+}
 
 static EXEC_CONTROL_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -413,8 +437,7 @@ impl DockerSandbox {
         let effective_dir = working_dir
             .unwrap_or_else(|| self.working_directory())
             .to_string();
-        let env: Option<Vec<String>> =
-            env_vars.map(|vars| vars.iter().map(|(k, v)| format!("{k}={v}")).collect());
+        let env = Some(docker_bash_exec_env(env_vars));
         let cmd = vec![
             REMOTE_BASH.to_string(),
             "-c".to_string(),
@@ -472,8 +495,7 @@ impl DockerSandbox {
         let effective_dir = working_dir
             .unwrap_or_else(|| self.working_directory())
             .to_string();
-        let env: Option<Vec<String>> =
-            env_vars.map(|vars| vars.iter().map(|(k, v)| format!("{k}={v}")).collect());
+        let env = Some(docker_bash_exec_env(env_vars));
         let (stop_file, pid_file) = docker_exec_control_paths();
         let controlled_command = docker_controlled_shell_command(command, &stop_file, &pid_file);
         let cmd = vec![
@@ -910,6 +932,7 @@ fn docker_stdio_exec_options(
     working_dir: String,
     env: Option<Vec<String>>,
 ) -> (CreateExecOptions<String>, StartExecOptions) {
+    let env = clean_bash_env_entries(env.unwrap_or_default());
     (
         CreateExecOptions {
             attach_stdin: Some(true),
@@ -918,7 +941,7 @@ fn docker_stdio_exec_options(
             tty: Some(false),
             cmd: Some(vec![REMOTE_BASH.to_string(), "-c".to_string(), command]),
             working_dir: Some(working_dir),
-            env,
+            env: Some(env),
             ..Default::default()
         },
         StartExecOptions {
@@ -960,6 +983,7 @@ fn docker_stop_request_exec_options(stop_file: &str) -> CreateExecOptions<String
         attach_stdout: Some(true),
         attach_stderr: Some(true),
         working_dir: Some("/".to_string()),
+        env: Some(clean_bash_env_entries(Vec::new())),
         ..Default::default()
     }
 }
@@ -1172,11 +1196,7 @@ fn container_config(config: &DockerSandboxOptions, run_id: Option<&RunId>) -> Co
             ),
         ]),
         working_dir: Some(WORKING_DIRECTORY.to_string()),
-        env: if config.env_vars.is_empty() {
-            None
-        } else {
-            Some(config.env_vars.clone())
-        },
+        env: Some(clean_bash_env_entries(config.env_vars.clone())),
         labels: Some(managed_labels::for_run(run_id)),
         host_config: Some(host_config(config)),
         ..Default::default()
@@ -1584,8 +1604,11 @@ impl Sandbox for DockerSandbox {
             || self.working_directory().to_string(),
             |path| self.resolve_container_path(path),
         );
-        let env: Option<Vec<String>> =
-            env_vars.map(|vars| vars.iter().map(|(k, v)| format!("{k}={v}")).collect());
+        let env = env_vars.map(|vars| {
+            vars.iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect()
+        });
         let (stop_file, pid_file) = docker_exec_control_paths();
         let controlled_command = docker_controlled_shell_command(command, &stop_file, &pid_file);
         let (create_opts, start_opts) =
@@ -2017,6 +2040,7 @@ mod tests {
             config.cmd.as_ref().map(|cmd| &cmd[..2]),
             Some(&["/bin/bash".to_string(), "-c".to_string()][..])
         );
+        assert_eq!(config.env, Some(vec!["BASH_ENV=".to_string()]));
     }
 
     #[test]
@@ -2032,6 +2056,27 @@ mod tests {
                 "-c".to_string(),
                 "touch '/tmp/fabro exec.stop'".to_string(),
             ])
+        );
+        assert_eq!(options.env, Some(vec!["BASH_ENV=".to_string()]));
+    }
+
+    #[test]
+    fn bash_exec_env_blanks_caller_bash_env() {
+        let env = docker_bash_exec_env(Some(&HashMap::from([
+            (
+                BASH_ENV_VAR.to_string(),
+                "/tmp/untrusted-startup".to_string(),
+            ),
+            ("MODE".to_string(), "test".to_string()),
+        ])));
+
+        assert!(env.contains(&"MODE=test".to_string()));
+        assert_eq!(
+            env.iter()
+                .filter(|entry| env_entry_name(entry) == BASH_ENV_VAR)
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["BASH_ENV="]
         );
     }
 
@@ -2107,7 +2152,10 @@ mod tests {
     #[test]
     fn container_config_has_no_bind_mounts_or_socket() {
         let options = DockerSandboxOptions {
-            env_vars: vec!["FOO=bar".to_string()],
+            env_vars: vec![
+                "FOO=bar".to_string(),
+                "BASH_ENV=/tmp/untrusted-startup".to_string(),
+            ],
             memory_limit: Some(4_000_000_000),
             cpu_quota: Some(200_000),
             ..DockerSandboxOptions::default()
@@ -2118,7 +2166,10 @@ mod tests {
         assert_eq!(host_config.memory, Some(4_000_000_000));
         assert_eq!(host_config.cpu_quota, Some(200_000));
         assert_eq!(config.working_dir.as_deref(), Some(WORKING_DIRECTORY));
-        assert_eq!(config.env, Some(vec!["FOO=bar".to_string()]));
+        assert_eq!(
+            config.env,
+            Some(vec!["FOO=bar".to_string(), "BASH_ENV=".to_string()])
+        );
         assert!(
             config
                 .env
@@ -2167,7 +2218,10 @@ mod tests {
         let (create, start) = docker_stdio_exec_options(
             "python fake_agent.py".to_string(),
             WORKING_DIRECTORY.to_string(),
-            Some(vec!["MODE=test".to_string()]),
+            Some(vec![
+                "MODE=test".to_string(),
+                "BASH_ENV=/tmp/untrusted-startup".to_string(),
+            ]),
         );
 
         assert_eq!(create.attach_stdin, Some(true));
@@ -2175,7 +2229,10 @@ mod tests {
         assert_eq!(create.attach_stderr, Some(true));
         assert_eq!(create.tty, Some(false));
         assert_eq!(create.working_dir.as_deref(), Some(WORKING_DIRECTORY));
-        assert_eq!(create.env, Some(vec!["MODE=test".to_string()]));
+        assert_eq!(
+            create.env,
+            Some(vec!["MODE=test".to_string(), "BASH_ENV=".to_string()])
+        );
         assert_eq!(
             create.cmd,
             Some(vec![
