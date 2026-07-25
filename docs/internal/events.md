@@ -974,9 +974,10 @@ An inference request is about to be dispatched for this round. Emitted once
 per round, after the request is built and compaction has run, immediately
 before the stream is opened.
 
-`provider` and `model` are the *requested* target. Failover can re-target
-mid-stage, so `agent.message` remains authoritative for what actually
-answered. No usage or cost fields: neither exists yet at this point.
+`requested_model` is the canonical requested target, including an optional
+speed tier. Failover can re-target mid-stage, so `agent.message` remains
+authoritative for what actually answered. No usage or cost fields: neither
+exists yet at this point.
 
 ```json
 {
@@ -985,8 +986,11 @@ answered. No usage or cost fields: neither exists yet at this point.
   "node_id": "code", "node_label": "code",
   "session_id": "ses_abc",
   "properties": {
-    "provider": "anthropic",
-    "model": "claude-fable-5",
+    "requested_model": {
+      "provider": "anthropic",
+      "model_id": "claude-fable-5",
+      "speed": "fast"
+    },
     "visit": 1
   }
 }
@@ -994,8 +998,7 @@ answered. No usage or cost fields: neither exists yet at this point.
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `provider` | string | Requested provider |
-| `model` | string | Requested model |
+| `requested_model` | object | Requested provider, model ID, and optional speed tier |
 | `visit` | number | Graph visit |
 
 ### `agent.llm.first_output`

@@ -168,7 +168,6 @@ export * from './interview-provider-settings';
 export * from './interview-question-record';
 export * from './link-run-pull-request-request';
 export * from './llm-output-kind';
-export * from './llm-retry-phase';
 export * from './log-destination';
 export * from './manifest-args';
 export * from './manifest-config';

@@ -312,7 +312,7 @@ struct EventStreamLoop {
     response:       fabro_http::Response,
     frames:         FrameDecoder,
     decoder:        Box<dyn StreamDecoder>,
-    pending:        VecDeque<StreamEvent>,
+    pending:        VecDeque<Result<StreamEvent, Error>>,
     done:           bool,
     /// `finish()` already drained.
     finished:       bool,
@@ -343,7 +343,7 @@ fn decode_eventstream(
         move |mut state| async move {
             loop {
                 if let Some(event) = state.pending.pop_front() {
-                    return Some((Ok(event), state));
+                    return Some((event, state));
                 }
 
                 if state.done {
@@ -351,7 +351,9 @@ fn decode_eventstream(
                         return None;
                     }
                     state.finished = true;
-                    state.pending.extend(state.decoder.finish());
+                    state
+                        .pending
+                        .extend(state.decoder.finish().into_iter().map(Ok));
                     if state.pending.is_empty() {
                         return None;
                     }
@@ -378,11 +380,14 @@ fn decode_eventstream(
                             // type the provider happens to open with.
                             if !state.stream_started {
                                 state.stream_started = true;
-                                state.pending.push_back(StreamEvent::StreamStart);
+                                state.pending.push_back(Ok(StreamEvent::StreamStart));
                             }
                             match state.decoder.on_event(raw) {
-                                Ok(events) => state.pending.extend(events),
-                                Err(e) => return Some((Err(e), state)),
+                                Ok(events) => state.pending.extend(events.into_iter().map(Ok)),
+                                Err(error) => {
+                                    state.pending.push_back(Err(error));
+                                    break;
+                                }
                             }
                         }
                     }

@@ -632,6 +632,16 @@ impl RunProjection {
         self.stages.iter()
     }
 
+    /// Mutable counterpart of [`Self::iter_stages_unordered`].
+    ///
+    /// Use this only for order-independent mutation. Presentation and
+    /// serialization callers should use [`Self::iter_stages_mut`] instead.
+    pub fn iter_stages_unordered_mut(
+        &mut self,
+    ) -> impl Iterator<Item = (&StageId, &mut StageProjection)> {
+        self.stages.iter_mut()
+    }
+
     /// Iterate stages in `first_event_seq` order (the chronological order in
     /// which each stage's first lifecycle event was recorded). Internal
     /// storage is a `HashMap`, so presentation callers sort through this

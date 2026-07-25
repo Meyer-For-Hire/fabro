@@ -542,17 +542,25 @@ async fn stream_text_happy_path_request() {
 #[tokio::test]
 async fn stream_text_happy_path_events() {
     let (_, events) = stream_text_happy_path_capture().await;
+    support::assert_stream_starts(&events);
     fabro_test::fabro_json_snapshot!(events);
 }
 
-/// Every dialect's stream opens with `StreamStart`, emitted by the driving
-/// loop rather than the decoder. Asserted outside the snapshot because a
-/// snapshot can be re-accepted silently, and this is the one event a liveness
-/// consumer needs to be able to rely on from every provider.
 #[tokio::test]
-async fn stream_opens_with_stream_start() {
-    let (_, events) = stream_text_happy_path_capture().await;
-    assert_eq!(events[0]["type"], "stream_start");
+async fn stream_first_frame_error_still_opens_with_stream_start() {
+    let sse = support::sse_data_transcript(&[
+        r#"{"type":"response.failed","response":{"id":"resp_stream","error":{"code":"server_error","message":"boom"}}}"#,
+    ]);
+    let (_capture, events) = stream_capture(adapter(), &base_request(MODEL), &sse).await;
+
+    support::assert_stream_starts(&events);
+    assert!(
+        events
+            .get(1)
+            .and_then(|event| event.get("stream_item_error"))
+            .is_some(),
+        "the decoder error should follow stream_start: {events:?}"
+    );
 }
 
 #[tokio::test]

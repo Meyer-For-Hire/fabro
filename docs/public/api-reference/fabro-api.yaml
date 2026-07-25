@@ -10786,16 +10786,6 @@ components:
         - text
         - tool_call
 
-    LlmRetryPhase:
-      description: >
-        Which retry loop produced the `attempt` index on an `agent.llm.retry`
-        event: `open` for a stream that failed to open, `consume` for one that
-        broke or ended without a finish event.
-      type: string
-      enum:
-        - open
-        - consume
-
     SubAgentProjection:
       description: Current projected state for one subagent spawned by an agent stage.
       type: object

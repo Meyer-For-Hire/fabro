@@ -15,7 +15,7 @@ use fabro_llm::{Error as LlmError, retry};
 use fabro_mcp::config::{McpServerSettings, McpTransport};
 use fabro_mcp::connection_manager::McpConnectionManager;
 use fabro_mcp::http_transport;
-use fabro_model::{AgentProfileKind, Catalog, ModelRef, Speed, UsdMicros};
+use fabro_model::{AgentProfileKind, Catalog, ModelId, ModelRef, Speed, UsdMicros};
 use fabro_types::{
     AgentToolSummary, LlmOutputKind, LlmRetryPhase, PermissionLevel, Principal, SessionMessage,
     SessionRecord, StageContextWindowProjection, SteeringMessage,
@@ -95,9 +95,9 @@ fn record_elapsed(start: &mut Option<Instant>, total: &mut Duration) {
 /// Classify a stream event as the first unit of provider output, or `None`
 /// when it carries no output.
 ///
-/// `StreamStart` is deliberately excluded: `openai_compatible` never emits it,
-/// so latching on it would leave whole providers silent. The start/delta/end
-/// events below are emitted by every codec that produces that kind of output.
+/// `StreamStart` is deliberately excluded because it proves only that the
+/// provider responded, not what kind of output followed. The start/delta/end
+/// events below identify the first observed content kind.
 fn first_output_kind(event: &StreamEvent) -> Option<LlmOutputKind> {
     match event {
         StreamEvent::ReasoningStart | StreamEvent::ReasoningDelta { .. } => {
@@ -1498,8 +1498,11 @@ impl Session {
             let local_context_window = built_request.context_window.clone();
             let request = built_request.request;
 
-            let requested_provider = self.provider_profile.provider_id().to_string();
-            let requested_model = self.provider_profile.model().to_string();
+            let requested_model = ModelRef {
+                provider: self.provider_profile.provider_id(),
+                model_id: ModelId::new(self.provider_profile.model()),
+                speed:    self.config.speed,
+            };
 
             // Open the inference bracket for this round. The request is built
             // and compaction has run, so this is the last point before the
@@ -1507,15 +1510,14 @@ impl Session {
             // response.
             self.event_emitter
                 .emit(self.id.clone(), AgentEvent::LlmRequestStarted {
-                    provider: requested_provider.clone(),
-                    model:    requested_model.clone(),
+                    requested_model: requested_model.clone(),
                 });
 
             // Call LLM (streaming) with retry for transient errors
             let retry_emitter = self.event_emitter.clone();
             let retry_session_id = self.id.clone();
-            let retry_provider = requested_provider.clone();
-            let retry_model = requested_model.clone();
+            let retry_provider = requested_model.provider.to_string();
+            let retry_model = requested_model.model_id.to_string();
             let retry_policy = RetryPolicy {
                 max_retries: 3,
                 on_retry: Some(std::sync::Arc::new(move |err, attempt, delay| {
@@ -1525,7 +1527,7 @@ impl Session {
                         attempt:    attempt as usize,
                         delay_secs: delay.as_secs_f64(),
                         error:      err.clone(),
-                        phase:      Some(LlmRetryPhase::Open),
+                        phase:      LlmRetryPhase::Open,
                     });
                 })),
                 ..Default::default()
@@ -1684,12 +1686,12 @@ impl Session {
                         // callback only ever runs for stream-open failures.
                         self.event_emitter
                             .emit(self.id.clone(), AgentEvent::LlmRetry {
-                                provider:   requested_provider.clone(),
-                                model:      requested_model.clone(),
+                                provider:   requested_model.provider.to_string(),
+                                model:      requested_model.model_id.to_string(),
                                 attempt:    stream_attempt,
                                 delay_secs: delay.as_secs_f64(),
-                                error:      err.clone(),
-                                phase:      Some(LlmRetryPhase::Consume),
+                                error:      err,
+                                phase:      LlmRetryPhase::Consume,
                             });
 
                         let delay_outcome = tokio::select! {
@@ -1762,15 +1764,15 @@ impl Session {
                     // with nothing on the durable stream to show for it.
                     self.event_emitter
                         .emit(self.id.clone(), AgentEvent::LlmRetry {
-                            provider:   requested_provider.clone(),
-                            model:      requested_model.clone(),
+                            provider:   requested_model.provider.to_string(),
+                            model:      requested_model.model_id.to_string(),
                             attempt:    stream_attempt,
                             delay_secs: 0.0,
                             error:      LlmError::Stream {
                                 message: "Stream ended without a finish event".to_string(),
                                 source:  None,
                             },
-                            phase:      Some(LlmRetryPhase::Consume),
+                            phase:      LlmRetryPhase::Consume,
                         });
                     let cancel_token_for_select = self.cancel_token.clone();
                     let retry_outcome: Option<Result<StreamEventStream, Error>> = tokio::select! {
@@ -4276,8 +4278,11 @@ mod tests {
         let mut observed = Vec::new();
         while let Ok(event) = rx.try_recv() {
             match event.event {
-                AgentEvent::LlmRequestStarted { provider, model } => {
-                    observed.push(("started".to_string(), format!("{provider}/{model}")));
+                AgentEvent::LlmRequestStarted { requested_model } => {
+                    observed.push((
+                        "started".to_string(),
+                        format!("{}/{}", requested_model.provider, requested_model.model_id),
+                    ));
                 }
                 AgentEvent::LlmFirstOutput { kind } => {
                     observed.push(("first_output".to_string(), kind.to_string()));
@@ -4430,7 +4435,7 @@ mod tests {
         assert_eq!(assistant_messages, vec!["Recovered".to_string()]);
         // The finish-less restart is the one mid-turn path with no error to
         // report; without this event it would be invisible downstream.
-        assert_eq!(consume_retries, vec![(0, Some(LlmRetryPhase::Consume))]);
+        assert_eq!(consume_retries, vec![(0, LlmRetryPhase::Consume)]);
     }
 
     #[tokio::test]
@@ -4461,7 +4466,7 @@ mod tests {
                     observed.push(format!("replace:{text}:{reasoning:?}"));
                 }
                 AgentEvent::LlmRetry { phase, .. } => {
-                    observed.push(format!("retry:{}", phase.expect("phase is always set")));
+                    observed.push(format!("retry:{phase}"));
                 }
                 AgentEvent::AssistantMessage { text, .. } => {
                     observed.push(format!("message:{text}"));

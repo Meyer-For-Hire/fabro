@@ -11,15 +11,14 @@ use fabro_types::settings::run::{EnvironmentProvider, RunEnvironmentSettings};
 use fabro_types::{
     ActivatedSkill, AgentControlState, AskFabro, BilledModelUsage, BilledTokenCounts, Checkpoint,
     CheckpointRecord, CommandTermination, Conclusion, EventBody, FailureCategory, FailureSignature,
-    InterviewQuestionRecord, McpServerProjection, McpServerStatus, ModelId, ModelRef, Outcome,
-    PendingInterviewRecord, PendingReason, ProviderId, PullRequestLink, RepositoryRef, Run,
-    RunApproval, RunApprovalState, RunBillingSummary, RunControlAction, RunDiff, RunEvent, RunId,
-    RunLifecycle, RunLinks, RunModel, RunOrigin, RunProjection, RunSandbox, RunSandboxFailure,
-    RunSandboxInstance, RunSandboxPlan, RunSandboxRuntime, RunSize, RunSpec, RunStatus,
-    RunTimestamps, SandboxProviderKind, StageCompletion, StageHandler, StageId,
-    StageInferenceProjection, StageModelUsage, StageOutcome, StageProjection, StageState,
-    StartRecord, SubAgentProjection, SubAgentStatus, TodoListKind, TodoListProjection,
-    TodoProjection, WorkflowRef, first_event_seq,
+    InterviewQuestionRecord, McpServerProjection, McpServerStatus, Outcome, PendingInterviewRecord,
+    PendingReason, PullRequestLink, RepositoryRef, Run, RunApproval, RunApprovalState,
+    RunBillingSummary, RunControlAction, RunDiff, RunEvent, RunId, RunLifecycle, RunLinks,
+    RunModel, RunOrigin, RunProjection, RunSandbox, RunSandboxFailure, RunSandboxInstance,
+    RunSandboxPlan, RunSandboxRuntime, RunSize, RunSpec, RunStatus, RunTimestamps,
+    SandboxProviderKind, StageCompletion, StageHandler, StageId, StageInferenceProjection,
+    StageModelUsage, StageOutcome, StageProjection, StageState, StartRecord, SubAgentProjection,
+    SubAgentStatus, TodoListKind, TodoListProjection, TodoProjection, WorkflowRef, first_event_seq,
 };
 use fabro_util::error::render_compact_with_causes;
 
@@ -1024,11 +1023,7 @@ fn open_inference_bracket(
     stage.inference = Some(StageInferenceProjection {
         session_id,
         started_at: ts,
-        requested_model: ModelRef {
-            provider: ProviderId::new(props.provider.clone()),
-            model_id: ModelId::new(props.model.clone()),
-            speed:    None,
-        },
+        requested_model: props.requested_model.clone(),
         first_output_at: None,
         first_output_kind: None,
         retries: 0,
@@ -1099,7 +1094,7 @@ fn close_inference_brackets_for_session(state: &mut RunProjection, stored: &RunE
     let Some(session_id) = stored.session_id.as_deref() else {
         return;
     };
-    for (_, stage) in state.iter_stages_mut() {
+    for (_, stage) in state.iter_stages_unordered_mut() {
         let opened_here = stage
             .inference
             .as_ref()
@@ -6291,7 +6286,9 @@ mod tests {
         use fabro_types::run_event::{
             AgentErrorProps, AgentLlmFirstOutputProps, AgentLlmRetryProps, AgentLlmStartedProps,
         };
-        use fabro_types::{LlmOutputKind, LlmRetryPhase, StageInferenceProjection};
+        use fabro_types::{
+            LlmOutputKind, LlmRetryPhase, ModelRef, Speed, StageInferenceProjection,
+        };
 
         use super::*;
 
@@ -6330,9 +6327,12 @@ mod tests {
 
         fn started() -> EventBody {
             EventBody::AgentLlmStarted(AgentLlmStartedProps {
-                provider: "anthropic".to_string(),
-                model:    "claude-fable-5".to_string(),
-                visit:    1,
+                requested_model: ModelRef {
+                    provider: "anthropic".parse().unwrap(),
+                    model_id: "claude-fable-5".into(),
+                    speed:    Some(Speed::Fast),
+                },
+                visit:           1,
             })
         }
 
@@ -6368,6 +6368,7 @@ mod tests {
                 inference.requested_model.model_id.as_str(),
                 "claude-fable-5"
             );
+            assert_eq!(inference.requested_model.speed, Some(Speed::Fast));
             assert_eq!(inference.first_output_at, None);
             assert_eq!(inference.first_output_kind, None);
             assert_eq!(inference.retries, 0);

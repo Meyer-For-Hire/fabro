@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import TestRenderer, { act } from "react-test-renderer";
 
 import { LlmOutputKind } from "@qltysh/fabro-api-client";
@@ -17,7 +17,7 @@ function makeInference(
     requested_model: {
       provider: "anthropic",
       model_id: "claude-fable-5",
-    } as StageInferenceProjection["requested_model"],
+    },
     retries:         0,
     ...overrides,
   };
@@ -27,17 +27,35 @@ function render(
   inference: StageInferenceProjection | null | undefined,
   settled = false,
 ): string {
-  (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   let renderer!: TestRenderer.ReactTestRenderer;
   act(() => {
     renderer = TestRenderer.create(
       <StageInferenceIndicator inference={inference} settled={settled} />,
     );
   });
-  return JSON.stringify(renderer.toJSON());
+  const output = JSON.stringify(renderer.toJSON());
+  act(() => renderer.unmount());
+  return output;
 }
 
 describe("StageInferenceIndicator", () => {
+  const actGlobal = globalThis as {
+    IS_REACT_ACT_ENVIRONMENT?: boolean;
+  };
+  const previousActEnvironment = actGlobal.IS_REACT_ACT_ENVIRONMENT;
+
+  beforeEach(() => {
+    actGlobal.IS_REACT_ACT_ENVIRONMENT = true;
+  });
+
+  afterEach(() => {
+    if (previousActEnvironment === undefined) {
+      delete actGlobal.IS_REACT_ACT_ENVIRONMENT;
+    } else {
+      actGlobal.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;
+    }
+  });
+
   test("renders nothing without an open bracket", () => {
     expect(render(undefined)).toBe("null");
     expect(render(null)).toBe("null");
@@ -47,6 +65,8 @@ describe("StageInferenceIndicator", () => {
     const output = render(makeInference());
     expect(output).toContain("Model request");
     expect(output).toContain("waiting on claude-fable-5");
+    expect(output).toContain('"aria-live":"polite"');
+    expect(output).toContain('"aria-hidden":"true"');
     // No completion estimate exists, so none may be shown.
     expect(output).not.toContain("%");
   });

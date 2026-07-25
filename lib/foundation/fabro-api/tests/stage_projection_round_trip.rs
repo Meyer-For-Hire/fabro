@@ -7,10 +7,9 @@ use fabro_api::types::{
     AgentSkillSummary as ApiAgentSkillSummary, AgentToolCategory as ApiAgentToolCategory,
     AgentToolSource as ApiAgentToolSource, AgentToolSummary as ApiAgentToolSummary,
     AgentToolsAvailableProps as ApiAgentToolsAvailableProps, LlmOutputKind as ApiLlmOutputKind,
-    LlmRetryPhase as ApiLlmRetryPhase, McpServerProjection as ApiMcpServerProjection,
-    McpServerStatus as ApiMcpServerStatus, ParallelBranchResult as ApiParallelBranchResult,
-    PermissionLevel as ApiPermissionLevel, SkillsProjection as ApiSkillsProjection,
-    StageContextWindow as ApiStageContextWindow,
+    McpServerProjection as ApiMcpServerProjection, McpServerStatus as ApiMcpServerStatus,
+    ParallelBranchResult as ApiParallelBranchResult, PermissionLevel as ApiPermissionLevel,
+    SkillsProjection as ApiSkillsProjection, StageContextWindow as ApiStageContextWindow,
     StageContextWindowBreakdownItem as ApiStageContextWindowBreakdownItem,
     StageContextWindowCategory as ApiStageContextWindowCategory,
     StageContextWindowCountMethod as ApiStageContextWindowCountMethod,
@@ -22,15 +21,16 @@ use fabro_api::types::{
     SubAgentProjection as ApiSubAgentProjection, SubAgentStatus as ApiSubAgentStatus,
     TodoListProjection as ApiTodoListProjection,
 };
+use fabro_model::{ModelId, ModelRef, ProviderId, Speed};
 use fabro_types::{
     ActivatedSkill, AgentControlState, AgentMcpToolSummary, AgentSkillActivationSource,
     AgentSkillSummary, AgentToolCategory, AgentToolSource, AgentToolSummary,
-    AgentToolsAvailableProps, LlmOutputKind, LlmRetryPhase, McpServerProjection, McpServerStatus,
-    ModelId, ModelRef, ParallelBranchResult, PermissionLevel, ProviderId, SkillsProjection,
-    StageContextWindow, StageContextWindowBreakdownItem, StageContextWindowCategory,
-    StageContextWindowCountMethod, StageContextWindowProjection, StageContextWindowStaleness,
-    StageContextWindowUnavailableReason, StageContextWindowWarning, StageInferenceProjection,
-    StageProjection, SubAgentProjection, SubAgentStatus, TodoListKind, TodoListProjection,
+    AgentToolsAvailableProps, LlmOutputKind, McpServerProjection, McpServerStatus,
+    ParallelBranchResult, PermissionLevel, SkillsProjection, StageContextWindow,
+    StageContextWindowBreakdownItem, StageContextWindowCategory, StageContextWindowCountMethod,
+    StageContextWindowProjection, StageContextWindowStaleness, StageContextWindowUnavailableReason,
+    StageContextWindowWarning, StageInferenceProjection, StageProjection, SubAgentProjection,
+    SubAgentStatus, TodoListKind, TodoListProjection,
 };
 use serde_json::json;
 
@@ -69,7 +69,6 @@ fn stage_projection_reuses_nested_agent_state_types() {
     assert_same_type::<ApiStageContextWindowWarning, StageContextWindowWarning>();
     assert_same_type::<ApiStageInferenceProjection, StageInferenceProjection>();
     assert_same_type::<ApiLlmOutputKind, LlmOutputKind>();
-    assert_same_type::<ApiLlmRetryPhase, LlmRetryPhase>();
 }
 
 #[test]
@@ -80,7 +79,7 @@ fn stage_inference_projection_matches_openapi_json_shape() {
         requested_model:   ModelRef {
             provider: ProviderId::new("anthropic"),
             model_id: ModelId::new("claude-fable-5"),
-            speed:    None,
+            speed:    Some(Speed::Fast),
         },
         first_output_at:   Some("2026-04-29T12:34:07Z".parse().unwrap()),
         first_output_kind: Some(LlmOutputKind::Reasoning),
@@ -94,7 +93,8 @@ fn stage_inference_projection_matches_openapi_json_shape() {
             "started_at": "2026-04-29T12:34:00Z",
             "requested_model": {
                 "provider": "anthropic",
-                "model_id": "claude-fable-5"
+                "model_id": "claude-fable-5",
+                "speed": "fast"
             },
             "first_output_at": "2026-04-29T12:34:07Z",
             "first_output_kind": "reasoning",
@@ -116,16 +116,6 @@ fn llm_enums_match_openapi_json_shape() {
         assert_eq!(value, json!(wire));
         let api_kind: ApiLlmOutputKind = serde_json::from_value(value).unwrap();
         assert_eq!(api_kind, kind);
-    }
-
-    for (phase, wire) in [
-        (LlmRetryPhase::Open, "open"),
-        (LlmRetryPhase::Consume, "consume"),
-    ] {
-        let value = serde_json::to_value(phase).unwrap();
-        assert_eq!(value, json!(wire));
-        let api_phase: ApiLlmRetryPhase = serde_json::from_value(value).unwrap();
-        assert_eq!(api_phase, phase);
     }
 }
 

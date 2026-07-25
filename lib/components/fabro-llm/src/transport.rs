@@ -247,8 +247,8 @@ pub(crate) async fn stream_via_http(
 struct StreamLoop {
     decoder:          Box<dyn StreamDecoder>,
     line_reader:      LineReader,
-    /// Events decoded but not yet yielded.
-    pending:          VecDeque<StreamEvent>,
+    /// Events or decoder errors not yet yielded.
+    pending:          VecDeque<Result<StreamEvent, Error>>,
     /// Byte stream exhausted.
     done:             bool,
     /// `finish()` already drained.
@@ -278,7 +278,7 @@ fn decode_sse_stream(
         move |mut state| async move {
             loop {
                 if let Some(event) = state.pending.pop_front() {
-                    return Some((Ok(event), state));
+                    return Some((event, state));
                 }
 
                 if state.done {
@@ -286,7 +286,9 @@ fn decode_sse_stream(
                         return None;
                     }
                     state.finished_emitted = true;
-                    state.pending.extend(state.decoder.finish());
+                    state
+                        .pending
+                        .extend(state.decoder.finish().into_iter().map(Ok));
                     if state.pending.is_empty() {
                         return None;
                     }
@@ -305,11 +307,11 @@ fn decode_sse_stream(
                         // particular opening frame.
                         if !state.stream_started {
                             state.stream_started = true;
-                            state.pending.push_back(StreamEvent::StreamStart);
+                            state.pending.push_back(Ok(StreamEvent::StreamStart));
                         }
                         match state.decoder.on_event(RawEvent { event, data: &data }) {
-                            Ok(events) => state.pending.extend(events),
-                            Err(e) => return Some((Err(e), state)),
+                            Ok(events) => state.pending.extend(events.into_iter().map(Ok)),
+                            Err(error) => state.pending.push_back(Err(error)),
                         }
                     }
                     Ok(None) => state.done = true,

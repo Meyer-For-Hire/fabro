@@ -884,6 +884,18 @@ describe("buildChatItems", () => {
 });
 
 describe("buildStageActivity pending tools", () => {
+  test("records watchdog settlement during the activity pass", () => {
+    const events: EventEnvelope[] = [
+      envelope(1, {
+        event: "watchdog.timeout",
+        stage_id: "plan@1",
+        node_id: "plan",
+      }),
+    ];
+
+    expect(buildStageActivity(events, "plan@1").watchdogTimedOut).toBe(true);
+  });
+
   test("returns started-but-not-completed calls for the stage", () => {
     const events: EventEnvelope[] = [
       envelope(1, {

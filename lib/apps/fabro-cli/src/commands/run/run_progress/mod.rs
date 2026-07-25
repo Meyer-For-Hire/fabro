@@ -256,7 +256,11 @@ impl ProgressUI {
             ProgressEvent::AssistantMessage {
                 stage_node_id,
                 model,
+                root_session,
             } => {
+                if root_session {
+                    self.stage.on_llm_request_finished(&stage_node_id);
+                }
                 self.stage
                     .on_assistant_message(renderer, &stage_node_id, &model);
             }
@@ -344,6 +348,9 @@ impl ProgressUI {
                     delay_ms,
                     &error,
                 );
+            }
+            ProgressEvent::LlmRequestFinished { stage_node_id } => {
+                self.stage.on_llm_request_finished(&stage_node_id);
             }
             ProgressEvent::SubagentSpawned {
                 stage_node_id,
@@ -521,6 +528,17 @@ mod tests {
         }
     }
 
+    fn child_agent_event(stage: &str, event: AgentEvent) -> Event {
+        Event::Agent {
+            stage: stage.into(),
+            visit: 1,
+            event,
+            session_id: Some("ses_child".into()),
+            parent_session_id: Some("ses_root".into()),
+            tool_call_id: None,
+        }
+    }
+
     fn stage_started(node_id: &str, name: &str) -> Event {
         Event::StageStarted {
             graph_visit:           None,
@@ -534,9 +552,9 @@ mod tests {
         }
     }
 
-    fn assistant_message(stage: &str, model: &str) -> Event {
-        agent_event(stage, AgentEvent::AssistantMessage {
-            text:            "done".into(),
+    fn assistant_event(model: &str, text: &str) -> AgentEvent {
+        AgentEvent::AssistantMessage {
+            text:            text.into(),
             model:           ModelRef {
                 provider: ProviderId::openai(),
                 model_id: model.into(),
@@ -548,6 +566,24 @@ mod tests {
             tool_call_count: 0,
             context_window:  None,
             reasoning:       None,
+        }
+    }
+
+    fn assistant_message(stage: &str, model: &str) -> Event {
+        agent_event(stage, assistant_event(model, "done"))
+    }
+
+    fn child_assistant_message(stage: &str, model: &str) -> Event {
+        child_agent_event(stage, assistant_event(model, "child done"))
+    }
+
+    fn llm_request_started(stage: &str, model: &str) -> Event {
+        agent_event(stage, AgentEvent::LlmRequestStarted {
+            requested_model: ModelRef {
+                provider: ProviderId::anthropic(),
+                model_id: model.into(),
+                speed:    None,
+            },
         })
     }
 
@@ -699,13 +735,7 @@ mod tests {
         emit(&mut ui, stage_started("s1", "Build"));
         assert!(ui.stage.active_stages["s1"].inference_bar.is_none());
 
-        emit(
-            &mut ui,
-            agent_event("s1", AgentEvent::LlmRequestStarted {
-                provider: "anthropic".into(),
-                model:    "claude-fable-5".into(),
-            }),
-        );
+        emit(&mut ui, llm_request_started("s1", "claude-fable-5"));
         let message = ui.stage.active_stages["s1"]
             .inference_bar
             .as_ref()
@@ -731,6 +761,80 @@ mod tests {
             message.contains("calling tools"),
             "expected the observed output kind, got: {message:?}"
         );
+
+        emit(&mut ui, assistant_message("s1", "claude-fable-5"));
+        assert!(ui.stage.active_stages["s1"].inference_bar.is_none());
+    }
+
+    #[test]
+    fn inference_retry_resets_the_live_line_before_verbose_output() {
+        let mut ui = ProgressUI::new(true, false);
+
+        emit(&mut ui, stage_started("s1", "Build"));
+        emit(&mut ui, llm_request_started("s1", "claude-fable-5"));
+        emit(
+            &mut ui,
+            agent_event("s1", AgentEvent::LlmFirstOutput {
+                kind: fabro_types::LlmOutputKind::Text,
+            }),
+        );
+        emit(
+            &mut ui,
+            agent_event("s1", AgentEvent::LlmRetry {
+                provider:   "anthropic".into(),
+                model:      "claude-fable-5".into(),
+                attempt:    1,
+                delay_secs: 0.1,
+                phase:      fabro_types::LlmRetryPhase::Consume,
+                error:      fabro_llm::Error::Configuration {
+                    message: "retry".into(),
+                    source:  None,
+                },
+            }),
+        );
+
+        let message = ui.stage.active_stages["s1"]
+            .inference_bar
+            .as_ref()
+            .expect("retry keeps the bracket open")
+            .message();
+        assert!(message.contains("waiting on claude-fable-5"));
+    }
+
+    #[test]
+    fn inference_interrupt_clears_the_live_line() {
+        let mut ui = ProgressUI::new(true, false);
+
+        emit(&mut ui, stage_started("s1", "Build"));
+        emit(&mut ui, llm_request_started("s1", "claude-fable-5"));
+        emit(
+            &mut ui,
+            agent_event("s1", AgentEvent::RoundInterrupted { generation: 1 }),
+        );
+
+        assert!(ui.stage.active_stages["s1"].inference_bar.is_none());
+    }
+
+    #[test]
+    fn child_session_events_do_not_mutate_the_root_inference_line() {
+        let mut ui = ProgressUI::new(true, false);
+
+        emit(&mut ui, stage_started("s1", "Build"));
+        emit(&mut ui, llm_request_started("s1", "claude-fable-5"));
+        emit(
+            &mut ui,
+            child_agent_event("s1", AgentEvent::LlmFirstOutput {
+                kind: fabro_types::LlmOutputKind::ToolCall,
+            }),
+        );
+        emit(&mut ui, child_assistant_message("s1", "child-model"));
+
+        let message = ui.stage.active_stages["s1"]
+            .inference_bar
+            .as_ref()
+            .expect("child output must not close the root bracket")
+            .message();
+        assert!(message.contains("waiting on claude-fable-5"));
 
         emit(&mut ui, assistant_message("s1", "claude-fable-5"));
         assert!(ui.stage.active_stages["s1"].inference_bar.is_none());
@@ -800,7 +904,7 @@ mod tests {
                 model:      "gpt-5-mini".into(),
                 attempt:    2,
                 delay_secs: 1.5,
-                phase:      Some(fabro_types::LlmRetryPhase::Open),
+                phase:      fabro_types::LlmRetryPhase::Open,
                 error:      fabro_llm::Error::Configuration {
                     message: "busy".into(),
                     source:  None,
@@ -1159,7 +1263,7 @@ mod tests {
                 model:      "gpt-5-mini".into(),
                 attempt:    2,
                 delay_secs: 1.5,
-                phase:      Some(fabro_types::LlmRetryPhase::Open),
+                phase:      fabro_types::LlmRetryPhase::Open,
                 error:      fabro_llm::Error::Configuration {
                     message: "busy".into(),
                     source:  None,

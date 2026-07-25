@@ -242,8 +242,7 @@ pub enum AgentEvent {
     /// failover can re-target, so `AssistantMessage` stays authoritative for
     /// what actually answered.
     LlmRequestStarted {
-        provider: String,
-        model:    String,
+        requested_model: ModelRef,
     },
     /// The provider produced its first output for the current attempt.
     /// Edge-triggered: emitted once per stream attempt, re-armed when a
@@ -336,8 +335,7 @@ pub enum AgentEvent {
         attempt:    usize,
         delay_secs: f64,
         error:      LlmError,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        phase:      Option<LlmRetryPhase>,
+        phase:      LlmRetryPhase,
     },
     SubAgentSpawned {
         agent_id: String,
@@ -427,8 +425,14 @@ impl AgentEvent {
             Self::UserInput { text } => {
                 debug!(session_id, text_len = text.len(), "User input received");
             }
-            Self::LlmRequestStarted { provider, model } => {
-                debug!(session_id, provider, model, "LLM request started");
+            Self::LlmRequestStarted { requested_model } => {
+                debug!(
+                    session_id,
+                    provider = %requested_model.provider,
+                    model = %requested_model.model_id,
+                    speed = requested_model.speed.map_or("", <&'static str>::from),
+                    "LLM request started"
+                );
             }
             Self::LlmFirstOutput { kind } => {
                 debug!(session_id, kind = %kind, "LLM produced first output");
@@ -537,7 +541,7 @@ impl AgentEvent {
                     model,
                     attempt,
                     delay_secs,
-                    phase = phase.map_or("", <&'static str>::from),
+                    phase = %phase,
                     error = %error,
                     "LLM request failed, retrying"
                 );
@@ -987,7 +991,7 @@ mod tests {
             model:      "gpt-4".into(),
             attempt:    1,
             delay_secs: 2.0,
-            phase:      Some(LlmRetryPhase::Open),
+            phase:      LlmRetryPhase::Open,
             error:      LlmError::Provider {
                 kind:   ProviderErrorKind::RateLimit,
                 detail: Box::new(ProviderErrorDetail {

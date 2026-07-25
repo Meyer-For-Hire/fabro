@@ -20,6 +20,7 @@ import {
   cancelRun,
   deleteRuns,
   isTerminalCancelledRun,
+  isTerminalRunStatus,
   isCancellationPending,
   isCancellationPendingState,
   mapError,
@@ -424,6 +425,8 @@ describe("run lifecycle actions", () => {
     expect(canArchive("failed")).toBe(true);
     expect(canArchive("dead")).toBe(true);
     expect(canArchive("archived")).toBe(false);
+    expect(isTerminalRunStatus("succeeded")).toBe(true);
+    expect(isTerminalRunStatus("running")).toBe(false);
 
     expect(canUnarchive("archived")).toBe(true);
     expect(canUnarchive("failed")).toBe(false);

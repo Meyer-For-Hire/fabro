@@ -136,6 +136,18 @@ pub(crate) async fn collect_stream_events(
     events
 }
 
+/// Pin the transport-level liveness contract independently of snapshots.
+pub(crate) fn assert_stream_starts(events: &[serde_json::Value]) {
+    assert_eq!(
+        events
+            .first()
+            .and_then(|event| event.get("type"))
+            .and_then(serde_json::Value::as_str),
+        Some("stream_start"),
+        "the first decoded provider frame must open with stream_start"
+    );
+}
+
 /// Builds a catalog from inline TOML (same `LlmCatalogSettings` schema as the
 /// shipped catalog files).
 pub(crate) fn catalog_from_toml(source: &str) -> Arc<Catalog> {

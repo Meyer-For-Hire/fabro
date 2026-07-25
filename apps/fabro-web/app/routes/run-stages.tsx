@@ -73,6 +73,7 @@ import {
   useRunStages,
   useRunState,
 } from "../lib/queries";
+import { isTerminalRunStatus } from "../lib/run-actions";
 import {
   STAGE_ACTIVITY_EVENT_TYPES,
   type StageActivityEventType,
@@ -270,6 +271,7 @@ export interface PendingToolCall {
 interface StageActivity {
   turns: TurnType[];
   pendingTools: PendingToolCall[];
+  watchdogTimedOut: boolean;
 }
 
 interface PendingCommand {
@@ -285,9 +287,14 @@ export function buildStageActivity(
   const pendingTools = new Map<string, PendingTool>();
   let pendingCommand: PendingCommand | undefined;
   let sawAssistantMessage = false;
+  let watchdogTimedOut = false;
 
   for (const e of events) {
     const eventName = e.event;
+    if (eventName === "watchdog.timeout") {
+      watchdogTimedOut = true;
+      continue;
+    }
     if (
       activityEventStageId(e) !== stageId ||
       !eventName ||
@@ -443,6 +450,7 @@ export function buildStageActivity(
 
   return {
     turns,
+    watchdogTimedOut,
     pendingTools: Array.from(pendingTools, ([toolCallId, tool]) => ({
       toolCallId,
       toolName: tool.toolName,
@@ -2096,19 +2104,12 @@ function RunStageActivityStage({
   // An open bracket on a run that can no longer advance means we never learned
   // how the request ended, not that it is still working. The watchdog stays
   // the authority on "actually stuck", so its timeout settles the readout too.
-  const inferenceSettled = useMemo(
-    () =>
-      runSettled ||
-      (stageEventsQuery.data ?? []).some(
-        (event) => event.event === "watchdog.timeout",
-      ),
-    [runSettled, stageEventsQuery.data],
-  );
   const activity = useMemo(
     () => buildStageActivity(stageEventsQuery.data ?? [], selectedStageId),
     [stageEventsQuery.data, selectedStageId],
   );
   const { turns } = activity;
+  const inferenceSettled = runSettled || activity.watchdogTimedOut;
   const renderer: StageRenderer = selectStageRenderer(selectedStage.handler);
   const debugEvents = useMemo<EventEnvelope[]>(() => {
     return (stageEventsQuery.data ?? []).filter(
@@ -2436,10 +2437,7 @@ export default function RunStages() {
       ? runStateQuery.data?.stages[selectedStageId]
       : undefined;
   const runStatusKind = runQuery.data?.lifecycle.status.kind;
-  const runSettled =
-    runStatusKind === "succeeded" ||
-    runStatusKind === "failed" ||
-    runStatusKind === "dead";
+  const runSettled = isTerminalRunStatus(runStatusKind);
 
   if (!id || !selectedStage) {
     return (

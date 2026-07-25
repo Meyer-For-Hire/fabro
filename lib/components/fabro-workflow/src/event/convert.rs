@@ -704,11 +704,10 @@ fn event_body_from_event(event: &Event) -> EventBody {
                 tracked_file_count:     *tracked_file_count,
                 visit:                  *visit,
             }),
-            AgentEvent::LlmRequestStarted { provider, model } => {
+            AgentEvent::LlmRequestStarted { requested_model } => {
                 EventBody::AgentLlmStarted(fabro_types::AgentLlmStartedProps {
-                    provider: provider.clone(),
-                    model:    model.clone(),
-                    visit:    *visit,
+                    requested_model: requested_model.clone(),
+                    visit:           *visit,
                 })
             }
             AgentEvent::LlmFirstOutput { kind } => {
@@ -730,7 +729,7 @@ fn event_body_from_event(event: &Event) -> EventBody {
                 attempt:    *attempt,
                 delay_secs: *delay_secs,
                 error:      serde_json::to_value(error).expect("LLM SDK error derives Serialize with no custom logic that can fail"),
-                phase:      *phase,
+                phase:      Some(*phase),
                 visit:      *visit,
             }),
             AgentEvent::SubAgentSpawned {

@@ -362,7 +362,6 @@ fn main() {
             &[],
         ),
         ("LlmOutputKind", "fabro_types::LlmOutputKind", &[]),
-        ("LlmRetryPhase", "fabro_types::LlmRetryPhase", &[]),
         ("PermissionLevel", "fabro_types::PermissionLevel", &[]),
         (
             "AgentSessionActivatedProps",

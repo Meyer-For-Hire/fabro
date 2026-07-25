@@ -340,14 +340,13 @@ pub enum LlmOutputKind {
 
 /// An inference request is about to be dispatched for this round.
 ///
-/// `provider` and `model` are the *requested* target from the session's
-/// provider profile. Failover can re-target mid-stage, so `agent.message`
-/// remains authoritative for what actually answered.
+/// `requested_model` is the requested target from the session's provider
+/// profile. Failover can re-target mid-stage, so `agent.message` remains
+/// authoritative for what actually answered.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentLlmStartedProps {
-    pub provider: String,
-    pub model:    String,
-    pub visit:    u32,
+    pub requested_model: ModelRef,
+    pub visit:           u32,
 }
 
 /// The provider produced its first output for the current attempt.

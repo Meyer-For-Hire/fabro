@@ -57,13 +57,14 @@ export function StageInferenceIndicator({
     ? ACTIVITY_LABEL[inference.first_output_kind]
     : `waiting on ${inference.requested_model.model_id}`;
 
-  const parts = ["Model request", activity];
-  if (elapsedSecs !== null) parts.push(formatDurationSecs(elapsedSecs));
+  const statusParts = ["Model request", activity];
   // A retry that later succeeds is normal, so this is a count, not a failure.
-  if (inference.retries > 0) parts.push(`retry ${inference.retries}`);
+  if (inference.retries > 0) {
+    statusParts.push(`retry ${inference.retries}`);
+  }
 
   return (
-    <p className="pb-2 text-xs text-fg-muted" aria-live="polite">
+    <p className="pb-2 text-xs text-fg-muted">
       <Tooltip
         label={`Model request opened ${formatAbsoluteTs(inference.started_at)}`}
       >
@@ -72,7 +73,13 @@ export function StageInferenceIndicator({
             className="size-1.5 animate-pulse rounded-full bg-teal-500"
             aria-hidden="true"
           />
-          {parts.join(" · ")}
+          <span aria-live="polite">{statusParts.join(" · ")}</span>
+          {elapsedSecs !== null && (
+            <span aria-hidden="true">
+              {" · "}
+              {formatDurationSecs(elapsedSecs)}
+            </span>
+          )}
         </span>
       </Tooltip>
     </p>

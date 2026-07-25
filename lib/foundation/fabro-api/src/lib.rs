@@ -47,7 +47,7 @@ pub mod types {
         DirtyStatus, EventEnvelope, ExecOutputTail, FailureCategory, FailureDetail,
         FailureSignature, GitContext, IdpIdentity, IntegrationConnectionKind,
         IntegrationConnectionState, IntegrationConnectionStatus, IntegrationProvider,
-        IntegrationStatus, InterviewOption, InterviewQuestionRecord, LlmOutputKind, LlmRetryPhase,
+        IntegrationStatus, InterviewOption, InterviewQuestionRecord, LlmOutputKind,
         McpServerDraft as CreateMcpServerRequest, McpServerProjection,
         McpServerReplace as ReplaceMcpServerRequest, McpServerStatus, McpServerView as McpServer,
         McpTransportView, Message, PairId, PairMessageId, PairMessageRecord, PairMessageRequest,

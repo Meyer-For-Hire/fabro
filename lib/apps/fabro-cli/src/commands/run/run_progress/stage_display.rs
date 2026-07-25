@@ -301,8 +301,6 @@ impl StageDisplay {
         stage_node_id: &str,
         model: &str,
     ) {
-        self.on_llm_request_finished(stage_node_id);
-
         if let Some(counts) = self.stage_counts.get_mut(stage_node_id) {
             counts.0 += 1;
         }
@@ -556,6 +554,16 @@ impl StageDisplay {
         delay_ms: u64,
         error: &str,
     ) {
+        if let Some(bar) = self
+            .active_stages
+            .get(stage_node_id)
+            .and_then(|stage| stage.inference_bar.as_ref())
+        {
+            bar.set_message(format!(
+                "\u{27f3} model request: waiting on {model}\u{2026}"
+            ));
+        }
+
         if !self.verbose {
             return;
         }

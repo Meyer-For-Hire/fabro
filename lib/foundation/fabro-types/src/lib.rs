@@ -59,9 +59,8 @@ pub use auth::{IdpIdentity, IdpIdentityError};
 pub use billing::{
     AnthropicBillingFacts, AnthropicModelPricing, BilledModelUsage, BilledTokenCounts,
     GeminiBillingFacts, GeminiModelPricing, GeminiStoragePricing, GeminiStorageSegment,
-    ModelBillingFacts, ModelBillingInput, ModelId, ModelPricing, ModelPricingPolicy, ModelRef,
-    ModelUsage, OpenAiBillingFacts, OpenAiModelPricing, PricePerMTok, ProviderId, Speed,
-    TokenCounts, UsdMicros,
+    ModelBillingFacts, ModelBillingInput, ModelPricing, ModelPricingPolicy, ModelRef, ModelUsage,
+    OpenAiBillingFacts, OpenAiModelPricing, PricePerMTok, Speed, TokenCounts, UsdMicros,
 };
 pub use blob_ref::{format_blob_ref, parse_blob_ref, parse_managed_blob_file_ref};
 pub use checkpoint::Checkpoint;
