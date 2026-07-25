@@ -27,8 +27,8 @@ use tokio_util::sync::CancellationToken;
 use crate::clone_source::{self, CloneDecision, EmptyWorkspaceReason};
 use crate::redact::redact_auth_url;
 use crate::sandbox::{
-    BASH_ENV_VAR, BASH_PROBE_SCRIPT, BASH_PROBE_TIMEOUT_MS, REMOTE_BASH, RefreshOutcome,
-    optional_timeout, resolve_path, validate_bash_probe,
+    BASH_ENV_VAR, BASH_PROBE_MARKER, BASH_PROBE_SCRIPT, BASH_PROBE_TIMEOUT_MS, REMOTE_BASH,
+    RefreshOutcome, optional_timeout, resolve_path, validate_bash_probe,
 };
 use crate::{
     CommandOutputCallback, DirEntry, ExecResult, ExecStreamingResult, GrepOptions, Sandbox,
@@ -38,6 +38,19 @@ use crate::{
 /// Remediation shown when a Daytona sandbox has no usable Bash.
 const DAYTONA_BASH_REMEDIATION: &str = "Daytona sandboxes require /bin/bash for every command, with no `sh` fallback. Use the \
      built-in Daytona snapshot, or a custom snapshot whose Dockerfile installs bash.";
+
+/// Remediation shown when the session transport reaches Bash but never
+/// completes.
+///
+/// The direct transport is probed first, so a sandbox that reaches this failure
+/// already has a usable Bash. What is left is the session contract: Daytona
+/// sources the submitted command inside a wrapper that resumes afterward to
+/// drain the log labelers and persist the exit code, so the command has to
+/// return control to it.
+const DAYTONA_BASH_SESSION_REMEDIATION: &str = "Daytona ran the direct command transport but not its streaming session transport. \
+     A session command must leave Daytona's wrapper shell in place so the provider can \
+     record the exit code; replacing that shell reports no completion and stalls every \
+     streaming command until its timeout.";
 
 pub(crate) const WORKING_DIRECTORY: &str = "/home/daytona/workspace";
 pub(crate) const REPOS_ROOT: &str = "/home/daytona/repos";
@@ -498,7 +511,20 @@ impl DaytonaSandbox {
     /// Runs on a freshly created sandbox before any Fabro-owned setup, and
     /// again after a reconnected sandbox starts, so a snapshot without Bash
     /// fails at the lifecycle boundary rather than on some later command.
+    ///
+    /// Both transports are probed. They build different requests — a direct
+    /// process exec and a toolbox session — so neither is evidence for the
+    /// other, and a session transport that never yields an exit code otherwise
+    /// surfaces as every streaming command timing out rather than as an init
+    /// failure. The direct probe runs first because it isolates "no usable
+    /// Bash" from "Bash runs but the session contract is broken".
     async fn probe_bash(sandbox: &daytona_sdk::Sandbox) -> crate::Result<()> {
+        Self::probe_bash_exec(sandbox).await?;
+        Self::probe_bash_session(sandbox).await
+    }
+
+    /// Probe Bash over the direct process-exec transport.
+    async fn probe_bash_exec(sandbox: &daytona_sdk::Sandbox) -> crate::Result<()> {
         let start = Instant::now();
         let execution = time::timeout(Duration::from_millis(BASH_PROBE_TIMEOUT_MS), async {
             let process_svc = sandbox
@@ -533,6 +559,85 @@ impl DaytonaSandbox {
         };
 
         daytona_bash_probe_outcome(execution)
+    }
+
+    /// Probe Bash over the streaming toolbox-session transport.
+    ///
+    /// Builds, submits, and awaits the command exactly the way
+    /// [`Sandbox::exec_command_streaming`] does, so the provider's exit-code
+    /// bookkeeping is part of what passes or fails here. The probe script's
+    /// `BASH_ENV` assertion is vacuous on this path — the generated session
+    /// script blanks `BASH_ENV` itself — but the interpreter, non-login,
+    /// non-POSIX, and completion assertions all hold.
+    ///
+    /// Costs one session round trip plus a single status poll per sandbox
+    /// lifecycle transition. `DAYTONA_PROBE_TIMEOUT` is the outer backstop for
+    /// a stalled REST call; the inner [`BASH_PROBE_TIMEOUT_MS`] is the deadline
+    /// for the command itself and lets the session close cleanly.
+    async fn probe_bash_session(sandbox: &daytona_sdk::Sandbox) -> crate::Result<()> {
+        let execution =
+            match time::timeout(DAYTONA_PROBE_TIMEOUT, Self::run_bash_session_probe(sandbox)).await
+            {
+                Ok(result) => result,
+                Err(_) => Err(crate::Error::message(format!(
+                    "Daytona Bash session check timed out after {}s",
+                    DAYTONA_PROBE_TIMEOUT.as_secs()
+                ))),
+            };
+
+        daytona_bash_session_probe_outcome(execution)
+    }
+
+    /// Run one probe command through a Daytona session and collect its result.
+    async fn run_bash_session_probe(sandbox: &daytona_sdk::Sandbox) -> crate::Result<ExecResult> {
+        let start = Instant::now();
+        let mut session = DaytonaSession::create(sandbox).await?;
+
+        let session_exec = match session
+            .execute(&bash_session_probe_command(), true, true)
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => {
+                session.close("bash session probe start failure").await;
+                return Err(crate::Error::context(
+                    "Failed to execute Daytona session command",
+                    err,
+                ));
+            }
+        };
+        let command_id = session_exec.cmd_id;
+
+        let outcome = match wait_for_completion(
+            &session,
+            &command_id,
+            session_exec.exit_code,
+            Some(BASH_PROBE_TIMEOUT_MS),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                session.close("bash session probe poll failure").await;
+                return Err(err);
+            }
+        };
+
+        let logs = match outcome.final_logs {
+            Some(logs) => Some(logs),
+            None => session.fetch_logs(&command_id).await,
+        };
+        session.close("bash session probe finished").await;
+
+        Ok(ExecResult {
+            stdout:      logs.as_ref().map(|l| l.stdout.clone()).unwrap_or_default(),
+            stderr:      logs.as_ref().map(|l| l.stderr.clone()).unwrap_or_default(),
+            exit_code:   outcome.exit_code,
+            termination: outcome.termination,
+            duration_ms: elapsed_ms(start),
+        })
     }
 
     /// Discard a sandbox that failed its Bash probe.
@@ -1802,7 +1907,7 @@ impl Sandbox for DaytonaSandbox {
             session_exec.exit_code,
             timeout_ms,
             cancel_token.unwrap_or_default(),
-            &mut stream_task,
+            Some(&mut stream_task),
         )
         .await
         {
@@ -2173,13 +2278,16 @@ struct WaitOutcome {
 /// Wait for the session command to terminate by polling status, the timeout
 /// timer, and the cancel token. On status-poll failure, aborts `stream_task`
 /// and returns an error; the caller is responsible for closing the session.
+///
+/// `stream_task` is `None` for callers that collect logs after the fact rather
+/// than streaming them, such as the session Bash probe.
 async fn wait_for_completion(
     session: &DaytonaSession,
     command_id: &str,
     initial_exit_code: Option<i32>,
     timeout_ms: Option<u64>,
     cancel_token: CancellationToken,
-    stream_task: &mut JoinHandle<Result<(), DaytonaError>>,
+    mut stream_task: Option<&mut JoinHandle<Result<(), DaytonaError>>>,
 ) -> crate::Result<WaitOutcome> {
     if let Some(code) = initial_exit_code {
         return Ok(WaitOutcome {
@@ -2197,7 +2305,9 @@ async fn wait_for_completion(
                 let status = match session.get_command_status(command_id).await {
                     Ok(status) => status,
                     Err(err) => {
-                        stream_task.abort();
+                        if let Some(stream_task) = stream_task.as_mut() {
+                            stream_task.abort();
+                        }
                         return Err(crate::Error::context(
                             "Failed to get Daytona session command status",
                             err,
@@ -2328,7 +2438,7 @@ fn build_bash_session_script(
     lines.join("\n")
 }
 
-/// Interpret the outcome of a Daytona Bash probe execution.
+/// Interpret the outcome of the direct-exec Daytona Bash probe.
 ///
 /// A failure to run the probe at all, a nonzero exit, and a zero exit without
 /// the marker are all probe failures, and all carry the snapshot remediation.
@@ -2337,6 +2447,38 @@ fn daytona_bash_probe_outcome(execution: crate::Result<ExecResult>) -> crate::Re
         Err(err) => Err(crate::Error::context(DAYTONA_BASH_REMEDIATION, err)),
         Ok(result) => validate_bash_probe(result, DAYTONA_BASH_REMEDIATION),
     }
+}
+
+/// Interpret the outcome of the session Daytona Bash probe.
+///
+/// The marker has to be its own line rather than the whole of stdout: session
+/// output arrives through Daytona's log labelers rather than as a single
+/// captured buffer, and a probe that rejected any surrounding transport bytes
+/// would fail every sandbox creation instead of the transport defect it exists
+/// to catch. Substring matching would be too weak in the other direction —
+/// [`BASH_PROBE_SCRIPT`] contains the marker literal, so a transport that
+/// echoed the submitted script back would pass.
+fn daytona_bash_session_probe_outcome(execution: crate::Result<ExecResult>) -> crate::Result<()> {
+    let result = match execution {
+        Ok(result) => result,
+        Err(err) => {
+            return Err(crate::Error::context(DAYTONA_BASH_SESSION_REMEDIATION, err));
+        }
+    };
+
+    if result.is_success()
+        && result
+            .stdout
+            .lines()
+            .any(|line| line.trim() == BASH_PROBE_MARKER)
+    {
+        return Ok(());
+    }
+
+    Err(crate::Error::context(
+        DAYTONA_BASH_SESSION_REMEDIATION,
+        result.into_exec_error("Sandbox Bash session probe"),
+    ))
 }
 
 fn daytona_symlink_command(layout: &clone_source::GitHubRepoLayout) -> String {
@@ -2375,6 +2517,16 @@ fn wrap_bash_command(command: &str) -> String {
 /// code.
 fn wrap_bash_session_script(script: &str) -> String {
     format!("{REMOTE_BASH} -c {}", shell_quote(script))
+}
+
+/// Build the session command the streaming Bash probe submits.
+///
+/// Shares [`build_bash_session_script`] and [`wrap_bash_session_script`] with
+/// [`Sandbox::exec_command_streaming`] so the probe cannot pass against a
+/// transport the real path no longer uses. `/` is the working directory
+/// because a freshly created sandbox has no workspace yet.
+fn bash_session_probe_command() -> String {
+    wrap_bash_session_script(&build_bash_session_script(BASH_PROBE_SCRIPT, "/", None))
 }
 
 #[cfg(test)]
@@ -3079,6 +3231,79 @@ mod tests {
                 "raw process output must not enter lifecycle errors: {err}"
             );
         }
+    }
+
+    /// The session probe exists to catch a transport that runs the command but
+    /// never returns control to Daytona's bookkeeping. That failure arrives as
+    /// a timeout with no exit code — with the marker already on stdout — not as
+    /// a nonzero exit.
+    #[test]
+    fn bash_session_probe_outcome_rejects_a_command_that_never_reports_completion() {
+        let never_completed = ExecResult {
+            stdout:      format!("{BASH_PROBE_MARKER}\n"),
+            stderr:      String::new(),
+            exit_code:   None,
+            termination: CommandTermination::TimedOut,
+            duration_ms: BASH_PROBE_TIMEOUT_MS,
+        };
+
+        let err = daytona_bash_session_probe_outcome(Ok(never_completed))
+            .expect_err("a command with no recorded exit code must fail the probe")
+            .display_with_causes();
+
+        assert!(
+            err.contains("wrapper shell") && err.contains("exit code"),
+            "session probe failure should explain the completion contract: {err}"
+        );
+    }
+
+    #[test]
+    fn bash_session_probe_outcome_accepts_a_marker_line_amid_transport_output() {
+        assert!(
+            daytona_bash_session_probe_outcome(Ok(bash_probe_result(
+                0,
+                format!("\n{BASH_PROBE_MARKER}\r\n"),
+            )))
+            .is_ok()
+        );
+    }
+
+    /// The probe script contains the marker literal, so a session transport
+    /// that echoed the submitted script instead of running it must not pass.
+    #[test]
+    fn bash_session_probe_outcome_rejects_echoed_script_source() {
+        let echoed = daytona_bash_session_probe_outcome(Ok(bash_probe_result(
+            0,
+            bash_session_probe_command(),
+        )));
+
+        assert!(echoed.is_err());
+    }
+
+    /// A probe that built its own command could pass while the streaming path
+    /// used something else entirely, which is how the `exec` regression reached
+    /// a release with a green lifecycle check.
+    #[test]
+    fn bash_session_probe_uses_the_streaming_command_construction() {
+        assert_eq!(
+            bash_session_probe_command(),
+            wrap_bash_session_script(&build_bash_session_script(BASH_PROBE_SCRIPT, "/", None)),
+        );
+    }
+
+    #[test]
+    fn bash_session_probe_command_enters_bash_once_without_exec() {
+        let command = bash_session_probe_command();
+
+        assert!(
+            command.starts_with(&format!("{REMOTE_BASH} -c ")),
+            "{command}"
+        );
+        assert!(
+            !command.contains("exec "),
+            "the session probe must leave Daytona's wrapper shell in place: {command}"
+        );
+        assert_eq!(command.matches(REMOTE_BASH).count(), 1, "{command}");
     }
 
     #[test]
