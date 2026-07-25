@@ -1211,12 +1211,6 @@ pub trait Sandbox: Send + Sync {
     ) -> crate::Result<Option<(String, HashMap<String, String>)>> {
         Ok(None)
     }
-
-    /// Record that the agent has explicitly read (seen) the given file path.
-    /// Called by tool executors after agent-visible reads (e.g. `read_file`,
-    /// `grep`). Default is a no-op; `ReadBeforeWriteSandbox` overrides to
-    /// populate its read set.
-    fn mark_agent_read(&self, _path: &str) {}
 }
 
 /// Resolve a path: relative paths are prepended with the working directory.

@@ -15,7 +15,7 @@
 //!
 //! Everything these tools do reaches the environment through the same
 //! [`Sandbox`](crate::sandbox::Sandbox) methods the built-ins use, so sandbox
-//! behavior, path policy, and the read-before-write guard are unchanged.
+//! behavior and path policy are unchanged.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -159,9 +159,6 @@ pub fn make_kimi_read_tool() -> RegisteredTool {
             NativeTool::ReadFile,
             "Read a text file from the workspace.
 
-Reading a file is also what clears it for writing: Edit and Write refuse a file that has not been \
-read in this session.
-
 - If you have a concrete path, call Read directly. Do not Glob or `ls` first to check that it \
 exists — a missing path returns an error you can handle.
 - When you need several files, emit multiple Read calls in one response rather than one per turn.
@@ -170,7 +167,9 @@ an Edit `old_string`.
 - `line_offset` is the 1-based first line to read. A NEGATIVE value reads from the end, so -100 \
 returns the last 100 lines.
 - `n_lines` defaults to 2000 lines.
-- Use Bash or an MCP tool for binary formats; this tool reads text.",
+- Use Bash or an MCP tool for binary formats; this tool reads text.
+- After a successful Edit or Write, do not re-read solely to prove the write landed. When the task \
+depends on an exact file, API, or output shape, inspect the final result before finishing.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -238,7 +237,6 @@ returns the last 100 lines.
                 }
                 .map_err(|e| e.display_with_causes())?;
 
-                ctx.env.mark_agent_read(path);
                 Ok(content)
             })
         }),
@@ -260,16 +258,16 @@ pub fn make_kimi_write_tool() -> RegisteredTool {
     RegisteredTool {
         definition: definition(
             NativeTool::WriteFile,
-            "Create, append to, or replace a file.
-
-Read an existing file with Read before writing to it — this workspace refuses writes to files \
-that have not been read, and the call will fail.
+            "Create, append to, or replace a file entirely.
 
 - `mode` defaults to `overwrite`, which replaces the whole file. `append` requires an existing file \
 and adds to its end without inserting a newline.
-- Write is NOT for incremental changes to an existing file, however small. Use Edit instead: \
-overwrite replaces everything you did not restate.
-- Use `overwrite` when the file does not exist, or when you intend a complete replacement.
+- Write is NOT ALLOWED for incremental changes to existing files, including trivial, one-line, \
+quick, or cosmetic edits. Use Edit instead.
+- Use Write only when the file does not exist, you intend a complete replacement, or the new \
+contents have little continuity with the old contents.
+- Read before overwriting an existing file.
+- Write ignores the Read/Edit line-number view. NEVER include line prefixes.
 - Do not create documentation files that were not asked for.",
             serde_json::json!({
                 "type": "object",
@@ -328,7 +326,7 @@ overwrite replaces everything you did not restate.
 
 /// Kimi Code's `Edit` schema names the target `path`; fabro's shared edit
 /// executor calls it `file_path`. Translate only that adapter field and reuse
-/// the exact-match/read-before-write implementation.
+/// the exact-match implementation.
 #[must_use]
 pub fn make_kimi_edit_tool(description: &str) -> RegisteredTool {
     let shared = make_edit_file_tool();
@@ -513,7 +511,6 @@ mod tests {
     #[tokio::test]
     async fn edit_translates_kimi_path_to_the_shared_executor() {
         let env = sandbox_with("/f.txt", "before");
-        env.mark_agent_read("/f.txt");
         let tool = make_kimi_edit_tool("Edit");
 
         (tool.executor)(

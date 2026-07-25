@@ -76,7 +76,7 @@ Creates or overwrites a file.
 | `content` | string | yes | Content to write |
 
 <Note>
-The [read-before-write guardrail](#read-before-write-guardrail) prevents writing to existing files that haven't been read first. Writing to new files is always allowed.
+`write_file` replaces the entire file. For changes to an existing file, prefer `edit_file`, which only replaces the string you name.
 </Note>
 
 ### edit_file
@@ -92,11 +92,11 @@ Replaces a string in an existing file. Available for Anthropic and Gemini provid
 
 If `old_string` is not found, the tool returns an error. If multiple occurrences exist and `replace_all` is false, the tool returns an error asking for more context or to set `replace_all`.
 
-The tool reads the file internally before writing, so it satisfies the read-before-write guardrail automatically.
+Because `old_string` must match the file exactly, an edit built from a stale or remembered version of the file fails rather than silently applying somewhere unintended.
 
 ### grep
 
-Searches file contents with a regex pattern, powered by ripgrep in the sandbox.
+Searches file contents with a regex pattern. The sandbox uses ripgrep when `rg` is on the path and falls back to POSIX `grep` otherwise, detected once and cached per sandbox. Keep patterns portable across both rather than relying on ripgrep-only syntax.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
@@ -106,7 +106,7 @@ Searches file contents with a regex pattern, powered by ripgrep in the sandbox.
 | `case_insensitive` | boolean | no | Case-insensitive search (default: false) |
 | `max_results` | integer | no | Maximum number of results |
 
-Results are returned as `file:line:content` lines. Files that appear in grep results are marked as "read" for the [read-before-write guardrail](#read-before-write-guardrail).
+Results are returned as `file:line:content` lines.
 
 ### glob
 
@@ -120,10 +120,6 @@ Finds files matching a glob pattern.
 Returns matching file paths, one per line, sorted lexicographically by their path relative to the search root.
 
 Patterns are case-sensitive and relative to `path`: `*` and `?` stay within one path segment, bracket expressions such as `[abc]` match one character, and `**` crosses directories when used as a complete segment. Leading dots are matched normally. For example, `*.rs` searches only the root of `path`, and `**/*.rs` searches recursively. Patterns must use `/`, be relative, and cannot contain a backslash or `..` segment.
-
-<Note>
-Unlike `grep`, `glob` does **not** mark files as read for the read-before-write guardrail. To modify a file found via glob, the agent must read it first.
-</Note>
 
 ### web_search
 
@@ -202,23 +198,6 @@ Like `update_plan`, task changes are persisted as `todo.created`, `todo.updated`
 
 When an Anthropic session has not used `TaskCreate` or `TaskUpdate` for ten assistant turns, Fabro may inject a system reminder asking the agent to keep task state current. The reminder is only added when both tools are available and resets after the agent uses either tool.
 
-## Read-before-write guardrail
-
-Fabro wraps every sandbox in a `ReadBeforeWriteSandbox` decorator that tracks which files the agent has seen. The rules are:
-
-1. **Writing to a new file** (one that doesn't exist yet) is always allowed
-2. **Writing to an existing file** requires that the agent has previously read it via `read_file` or seen it in `grep` results
-3. **Deleting an existing file** follows the same rule as writing
-
-If an agent attempts to write to an existing file it hasn't read, the tool returns an error:
-
-```
-Cannot write to 'src/main.rs': file exists but has not been read.
-Use read_file to read the file before writing to it.
-```
-
-This prevents agents from blindly overwriting files they haven't inspected. The guardrail normalizes paths so that reading `src/main.rs` (relative) and `/workspace/src/main.rs` (absolute) both satisfy the check.
-
 ## Tool execution
 
 ### Parallel execution
@@ -256,7 +235,7 @@ Common error cases:
 | Argument validation failure | Arguments don't match the tool's JSON Schema |
 | File not found | The target file doesn't exist |
 | Command timeout | A shell command exceeded its timeout |
-| Read-before-write | The agent tried to write to a file it hasn't read (see [guardrail](#read-before-write-guardrail)) |
+| `old_string` not found | An `edit_file` anchor didn't match the file's current contents |
 
 ### Timeouts
 
