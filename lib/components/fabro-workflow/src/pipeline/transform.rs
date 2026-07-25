@@ -157,7 +157,7 @@ mod tests {
         let transformed = transform(parsed, &transform_options()).unwrap();
         assert_eq!(
             transformed.graph.nodes["work"].attrs.get("model"),
-            Some(&AttrValue::String("claude-sonnet-4-6".into()))
+            Some(&AttrValue::String("claude-sonnet-5".into()))
         );
     }
 
@@ -252,7 +252,7 @@ mod tests {
         );
         assert_eq!(
             lint.attrs.get("model"),
-            Some(&AttrValue::String("claude-sonnet-4-6".into()))
+            Some(&AttrValue::String("claude-sonnet-5".into()))
         );
     }
 

@@ -8,7 +8,7 @@ use fabro_agent::tool_registry::{RegisteredTool, ToolContext, ToolRegistry, Tool
 use fabro_agent::{
     AgentEvent, AgentProfile, AgentProfileBuilder, CompletionCoordinator, Message as AgentMessage,
     Sandbox, Session, SessionOptions, SessionShutdownReason, StaticEnvProvider, ToolEnvProvider,
-    ToolSecrets, canonical_tool_name, register_question_tools,
+    ToolSecrets, WebFetchSummarizer, canonical_tool_name, register_question_tools,
 };
 use fabro_auth::{CredentialSource, EnvCredentialSource};
 use fabro_graphviz::graph::{AttrValue, Node};
@@ -19,10 +19,10 @@ use fabro_llm::types::{
 };
 use fabro_mcp::config::McpServerSettings;
 #[cfg(test)]
-use fabro_model::AgentProfileKind;
-#[cfg(test)]
 use fabro_model::catalog::LlmCatalogSettings;
-use fabro_model::{Catalog, FallbackTarget, ModelRef, ProviderId, UsdMicros};
+use fabro_model::{
+    AgentProfileKind, Catalog, FallbackTarget, ModelHandle, ModelRef, ProviderId, UsdMicros,
+};
 use fabro_types::settings::run::RunModelControls;
 use fabro_types::{PermissionLevel, RunId, SessionCapability, StageId, StageTiming};
 use serde::de::DeserializeOwned;
@@ -823,6 +823,17 @@ impl AgentApiBackend {
             Arc::clone(&catalog),
         )
         .with_tool_secrets(tool_secrets);
+        let profile_builder = if provider.profile_kind == AgentProfileKind::Claude5 {
+            profile_builder.with_web_fetch_summarizer(Some(WebFetchSummarizer {
+                client:   client.clone(),
+                model_id: ModelHandle::ByName {
+                    provider: provider.provider_id.clone(),
+                    model:    model.to_string(),
+                },
+            }))
+        } else {
+            profile_builder
+        };
         let mut profile = profile_builder.build();
 
         let config = SessionOptions {
@@ -2841,6 +2852,25 @@ reasoning = false
 
         assert_eq!(provider.provider_id, ProviderId::from("acme"));
         assert_eq!(provider.profile_kind, AgentProfileKind::Anthropic);
+    }
+
+    #[test]
+    fn api_backend_selects_claude5_profile_for_sonnet5() {
+        let backend = AgentApiBackend::new_with_catalog(
+            "claude-sonnet-5".to_string(),
+            ProviderId::anthropic(),
+            Vec::new(),
+            Arc::new(EnvCredentialSource::new()),
+            SteeringHub::for_tests(),
+            Arc::new(Catalog::from_builtin().unwrap()),
+        );
+
+        let provider = backend
+            .resolve_provider_context("claude-sonnet-5", None)
+            .unwrap();
+
+        assert_eq!(provider.provider_id, ProviderId::anthropic());
+        assert_eq!(provider.profile_kind, AgentProfileKind::Claude5);
     }
 
     #[test]

@@ -4,6 +4,8 @@ use std::sync::Arc;
 use fabro_model::{AgentProfileKind, Catalog, CodecKind, ProviderId};
 
 pub mod anthropic;
+pub mod claude5;
+pub(crate) mod claude5_tools;
 pub mod gemini;
 pub mod gpt56;
 pub mod kimi;
@@ -11,6 +13,7 @@ pub mod kimi_tools;
 pub mod openai;
 
 pub use anthropic::AnthropicProfile;
+pub use claude5::Claude5Profile;
 pub use gemini::GeminiProfile;
 pub use gpt56::Gpt56Profile;
 pub use kimi::KimiProfile;
@@ -22,6 +25,7 @@ use crate::config::{NativeToolOptions, ToolSecrets};
 use crate::native_tool::{NativeTool, ToolVocabulary};
 use crate::sandbox::Sandbox;
 use crate::skills::{Skill, format_skills_prompt_section};
+use crate::todo_runtime::TodoRuntime;
 use crate::tool_registry::ToolRegistry;
 use crate::tools::{self, WebFetchSummarizer};
 
@@ -39,6 +43,7 @@ pub struct AgentProfileBuilder {
     catalog:             Arc<Catalog>,
     native_tool_options: NativeToolOptions,
     summarizer:          Option<WebFetchSummarizer>,
+    todo_runtime:        Arc<TodoRuntime>,
 }
 
 impl AgentProfileBuilder {
@@ -56,6 +61,7 @@ impl AgentProfileBuilder {
             catalog,
             native_tool_options: NativeToolOptions::for_profile(profile_kind),
             summarizer: None,
+            todo_runtime: Arc::new(TodoRuntime::new()),
         }
     }
 
@@ -98,6 +104,16 @@ impl AgentProfileBuilder {
                 AnthropicProfile::with_native_tools(model, options, summarizer)
                     .with_provider_id(self.provider_id.clone())
                     .with_catalog(Arc::clone(&self.catalog)),
+            ),
+            AgentProfileKind::Claude5 => Box::new(
+                Claude5Profile::with_native_tools_and_todo_runtime(
+                    model,
+                    options,
+                    summarizer,
+                    Arc::clone(&self.todo_runtime),
+                )
+                .with_provider_id(self.provider_id.clone())
+                .with_catalog(Arc::clone(&self.catalog)),
             ),
             AgentProfileKind::Kimi => Box::new(
                 KimiProfile::with_native_tools(model, options, summarizer)
@@ -374,11 +390,13 @@ pub fn build_env_context_block_with(env: &dyn Sandbox, ctx: &EnvContext) -> Stri
 mod tests {
     use fabro_llm::types::ToolDefinition;
     use fabro_model::catalog::LlmCatalogSettings;
+    use tokio_util::sync::CancellationToken;
 
     use super::*;
+    use crate::question_tools;
     use crate::subagent::{SessionFactory, SubAgentSupervisor};
     use crate::test_support::MockSandbox;
-    use crate::tools::WEB_SEARCH_TOOL_NAME;
+    use crate::tool_registry::ToolContext;
 
     fn native_tool_options(
         profile_kind: AgentProfileKind,
@@ -407,6 +425,25 @@ mod tests {
         let mut profile = AnthropicProfile::with_native_tools("claude-haiku-4-5", &options, None);
         if has_subagents {
             register_test_subagent_tools(&mut profile);
+        }
+        profile
+    }
+
+    fn claude5_profile(
+        has_web_search: bool,
+        has_subagents: bool,
+        has_question: bool,
+    ) -> Claude5Profile {
+        let options = native_tool_options(AgentProfileKind::Claude5, has_web_search);
+        let mut profile = Claude5Profile::with_native_tools("claude-sonnet-5", &options, None);
+        if has_subagents {
+            register_test_subagent_tools(&mut profile);
+        }
+        if has_question {
+            question_tools::register_question_tools(
+                AgentProfileKind::Claude5,
+                profile.tool_registry_mut(),
+            );
         }
         profile
     }
@@ -595,6 +632,11 @@ mod tests {
                 ProviderId::gemini(),
                 "gemini-3-flash-preview",
             ),
+            (
+                AgentProfileKind::Claude5,
+                ProviderId::anthropic(),
+                "claude-sonnet-5",
+            ),
             (AgentProfileKind::Gpt56, ProviderId::openai(), "gpt-5.6-sol"),
         ];
 
@@ -606,12 +648,13 @@ mod tests {
                 Arc::clone(&catalog),
             )
             .build();
+            let web_search_name = NativeTool::WebSearch.name(profile.tool_registry().vocabulary());
             assert_eq!(profile.profile_kind(), profile_kind);
             assert_eq!(profile.provider_id(), provider_id);
-            assert!(profile.tool_registry().get(WEB_SEARCH_TOOL_NAME).is_none());
+            assert!(profile.tool_registry().get(web_search_name).is_none());
             let prompt = profile.build_system_prompt(&env, &EnvContext::default(), &[], None, &[]);
             assert!(
-                !prompt.contains("web_search"),
+                !prompt.contains(web_search_name),
                 "{profile_kind:?} prompt advertised an unavailable tool"
             );
 
@@ -627,20 +670,77 @@ mod tests {
             // Built twice: one configured builder must outfit both a root
             // session and the child sessions it spawns.
             for configured in [configured_builder.build(), configured_builder.build()] {
-                assert!(
-                    configured
-                        .tool_registry()
-                        .get(WEB_SEARCH_TOOL_NAME)
-                        .is_some()
-                );
+                assert!(configured.tool_registry().get(web_search_name).is_some());
                 let prompt =
                     configured.build_system_prompt(&env, &EnvContext::default(), &[], None, &[]);
                 assert!(
-                    prompt.contains("web_search"),
+                    prompt.contains(web_search_name),
                     "{profile_kind:?} prompt omitted guidance for an available tool"
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn claude5_builder_shares_tasks_across_root_and_child_profiles() {
+        let builder = AgentProfileBuilder::new(
+            AgentProfileKind::Claude5,
+            ProviderId::anthropic(),
+            "claude-sonnet-5",
+            Arc::new(Catalog::from_builtin().unwrap()),
+        );
+        let root = builder.build();
+        let child = builder.build();
+        let root_create = Arc::clone(
+            &root
+                .tool_registry()
+                .get("TaskCreate")
+                .expect("root should expose TaskCreate")
+                .executor,
+        );
+        let child_create = Arc::clone(
+            &child
+                .tool_registry()
+                .get("TaskCreate")
+                .expect("child should expose TaskCreate")
+                .executor,
+        );
+        let child_list = Arc::clone(
+            &child
+                .tool_registry()
+                .get("TaskList")
+                .expect("child should expose TaskList")
+                .executor,
+        );
+        let env: Arc<dyn Sandbox> = Arc::new(MockSandbox::default());
+        let context = |session_id: &str| ToolContext {
+            env:                 Arc::clone(&env),
+            cancel:              CancellationToken::new(),
+            tool_env_provider:   None,
+            session_id:          Some(session_id.to_string()),
+            root_session_id:     Some("root-session".to_string()),
+            tool_call_id:        None,
+            agent_event_emitter: None,
+        };
+
+        root_create(
+            serde_json::json!({"subject": "Parent task", "description": "Root work"}),
+            context("root-session"),
+        )
+        .await
+        .unwrap();
+        child_create(
+            serde_json::json!({"subject": "Child task", "description": "Child work"}),
+            context("child-session"),
+        )
+        .await
+        .unwrap();
+        let tasks = child_list(serde_json::json!({}), context("child-session"))
+            .await
+            .unwrap();
+
+        assert!(tasks.contains("#1 [pending] Parent task"), "{tasks}");
+        assert!(tasks.contains("#2 [pending] Child task"), "{tasks}");
     }
 
     #[test]
@@ -678,6 +778,46 @@ mod tests {
     #[test]
     fn anthropic_web_search_and_subagents_prompt_snapshot() {
         insta::assert_snapshot!(system_prompt(&anthropic_profile(true, true)));
+    }
+
+    #[test]
+    fn claude5_default_prompt_snapshot() {
+        insta::assert_snapshot!(system_prompt(&claude5_profile(false, false, false)));
+    }
+
+    #[test]
+    fn claude5_web_search_prompt_snapshot() {
+        insta::assert_snapshot!(system_prompt(&claude5_profile(true, false, false)));
+    }
+
+    #[test]
+    fn claude5_subagents_prompt_snapshot() {
+        insta::assert_snapshot!(system_prompt(&claude5_profile(false, true, false)));
+    }
+
+    #[test]
+    fn claude5_question_prompt_snapshot() {
+        insta::assert_snapshot!(system_prompt(&claude5_profile(false, false, true)));
+    }
+
+    #[test]
+    fn claude5_web_search_and_subagents_prompt_snapshot() {
+        insta::assert_snapshot!(system_prompt(&claude5_profile(true, true, false)));
+    }
+
+    #[test]
+    fn claude5_web_search_and_question_prompt_snapshot() {
+        insta::assert_snapshot!(system_prompt(&claude5_profile(true, false, true)));
+    }
+
+    #[test]
+    fn claude5_subagents_and_question_prompt_snapshot() {
+        insta::assert_snapshot!(system_prompt(&claude5_profile(false, true, true)));
+    }
+
+    #[test]
+    fn claude5_all_conditionals_prompt_snapshot() {
+        insta::assert_snapshot!(system_prompt(&claude5_profile(true, true, true)));
     }
 
     #[test]

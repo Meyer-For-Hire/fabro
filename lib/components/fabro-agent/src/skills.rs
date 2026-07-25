@@ -189,6 +189,24 @@ pub fn make_use_skill_tool_for_vocabulary(
                 "required": ["skill_name"]
             }),
         ),
+        ToolVocabulary::Claude5 => (
+            "skill",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "skill": {
+                        "type": "string",
+                        "description": "Exact name of the skill to invoke"
+                    },
+                    "args": {
+                        "type": "string",
+                        "description": "Optional argument string to pass to the skill"
+                    }
+                },
+                "required": ["skill"],
+                "additionalProperties": false
+            }),
+        ),
         ToolVocabulary::KimiCode => (
             "skill",
             serde_json::json!({
@@ -714,6 +732,48 @@ name: trimmed
         .unwrap();
 
         assert!(result.contains("only staged files"), "{result}");
+        assert!(
+            tool.definition.parameters["properties"]
+                .get("skill")
+                .is_some()
+        );
+        assert!(
+            tool.definition.parameters["properties"]
+                .get("args")
+                .is_some()
+        );
+        assert!(
+            tool.definition.parameters["properties"]
+                .get("skill_name")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn claude5_skill_schema_uses_skill_and_optional_args() {
+        let skills = Arc::new(test_skills());
+        let tool = make_use_skill_tool_for_vocabulary(skills, ToolVocabulary::Claude5);
+        let result = (tool.executor)(
+            serde_json::json!({"skill": "commit", "args": "only staged files"}),
+            ToolContext {
+                env:                 Arc::new(MockSandbox::default()),
+                cancel:              CancellationToken::new(),
+                tool_env_provider:   None,
+                session_id:          None,
+                root_session_id:     None,
+                tool_call_id:        None,
+                agent_event_emitter: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(result.contains("only staged files"), "{result}");
+        assert_eq!(
+            tool.definition.parameters["required"],
+            serde_json::json!(["skill"])
+        );
+        assert_eq!(tool.definition.parameters["additionalProperties"], false);
         assert!(
             tool.definition.parameters["properties"]
                 .get("skill")

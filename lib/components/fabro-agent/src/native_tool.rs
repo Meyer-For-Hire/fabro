@@ -9,8 +9,8 @@
 //!
 //! A [`NativeTool`] is an identity, not a name. The same tool is expressed
 //! under different names depending on the [`ToolVocabulary`] a profile speaks:
-//! fabro's own names by default, Kimi Code's names for the Kimi profile, and
-//! Codex's names for the GPT-5.6 profile.
+//! fabro's own names by default, Anthropic's names for Claude 5, Kimi Code's
+//! names for the Kimi profile, and Codex's names for the GPT-5.6 profile.
 //! Permissions, categories, and telemetry resolve any name back to the
 //! identity, so behavior never depends on which vocabulary is in play.
 //!
@@ -26,6 +26,8 @@ pub enum ToolVocabulary {
     /// Fabro's own names, and the canonical identity used internally.
     #[default]
     Fabro,
+    /// The names Anthropic's Claude 5 coding harness exposes.
+    Claude5,
     /// The names Kimi Code exposes, for models trained against that harness.
     KimiCode,
     /// The names Codex exposes, for the GPT-5.6 models trained against it.
@@ -57,7 +59,11 @@ pub enum NativeTool {
     Shell,
     #[strum(to_string = "web_search", serialize = "WebSearch")]
     WebSearch,
-    #[strum(to_string = "web_fetch", serialize = "FetchURL")]
+    #[strum(
+        to_string = "web_fetch",
+        serialize = "FetchURL",
+        serialize = "WebFetch"
+    )]
     WebFetch,
     #[strum(to_string = "spawn_agent")]
     SpawnAgent,
@@ -67,6 +73,14 @@ pub enum NativeTool {
     Wait,
     #[strum(to_string = "close_agent")]
     CloseAgent,
+    #[strum(to_string = "Agent")]
+    ClaudeAgent,
+    #[strum(to_string = "TaskOutput")]
+    TaskOutput,
+    #[strum(to_string = "TaskStop")]
+    TaskStop,
+    #[strum(to_string = "SendMessage")]
+    SendMessage,
     #[strum(to_string = "use_skill", serialize = "Skill")]
     UseSkill,
     #[strum(to_string = "update_plan")]
@@ -116,6 +130,16 @@ impl NativeTool {
     pub fn name(self, vocabulary: ToolVocabulary) -> &'static str {
         match vocabulary {
             ToolVocabulary::Fabro => self.canonical_name(),
+            ToolVocabulary::Claude5 => match self {
+                Self::ReadFile => "Read",
+                Self::WriteFile => "Write",
+                Self::EditFile => "Edit",
+                Self::Shell => "Bash",
+                Self::WebSearch => "WebSearch",
+                Self::WebFetch => "WebFetch",
+                Self::UseSkill => "Skill",
+                other => other.canonical_name(),
+            },
             ToolVocabulary::KimiCode => match self {
                 Self::ReadFile => "Read",
                 Self::WriteFile => "Write",
@@ -177,9 +201,14 @@ impl NativeTool {
             }
             Self::WriteFile | Self::EditFile | Self::ApplyPatch => Some(AgentToolCategory::Write),
             Self::Shell => Some(AgentToolCategory::Shell),
-            Self::SpawnAgent | Self::SendInput | Self::Wait | Self::CloseAgent => {
-                Some(AgentToolCategory::Subagent)
-            }
+            Self::SpawnAgent
+            | Self::SendInput
+            | Self::Wait
+            | Self::CloseAgent
+            | Self::ClaudeAgent
+            | Self::TaskOutput
+            | Self::TaskStop
+            | Self::SendMessage => Some(AgentToolCategory::Subagent),
             // Uncategorized today. Giving these a category would change the CLI
             // permission gate, which is a behavior change rather than a
             // classification cleanup, so they keep their existing answer.
@@ -258,6 +287,20 @@ mod tests {
         assert_eq!(
             NativeTool::SpawnAgent.name(ToolVocabulary::KimiCode),
             "spawn_agent"
+        );
+    }
+
+    #[test]
+    fn claude5_vocabulary_uses_anthropic_harness_names() {
+        assert_eq!(NativeTool::ReadFile.name(ToolVocabulary::Claude5), "Read");
+        assert_eq!(NativeTool::Shell.name(ToolVocabulary::Claude5), "Bash");
+        assert_eq!(
+            NativeTool::WebFetch.name(ToolVocabulary::Claude5),
+            "WebFetch"
+        );
+        assert_eq!(
+            NativeTool::ClaudeAgent.name(ToolVocabulary::Claude5),
+            "Agent"
         );
     }
 

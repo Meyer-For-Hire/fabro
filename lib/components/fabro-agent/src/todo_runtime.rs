@@ -21,15 +21,31 @@ use crate::types::AgentEvent;
 /// `Arc` into each tool closure that needs it.
 #[derive(Debug, Default)]
 pub struct TodoRuntime {
-    lists: Mutex<BTreeMap<String, TodoListProjection>>,
+    lists:         Mutex<BTreeMap<String, TodoListProjection>>,
+    task_counters: Mutex<BTreeMap<String, u64>>,
 }
 
 impl TodoRuntime {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            lists: Mutex::new(BTreeMap::new()),
+            lists:         Mutex::new(BTreeMap::new()),
+            task_counters: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// Allocate the next monotonically increasing Claude task ID for a list.
+    ///
+    /// Keeping the counter beside the projection lets root and child profiles
+    /// safely create tasks in the same shared list.
+    pub(crate) fn next_task_id(&self, list_id: &str) -> u64 {
+        let mut counters = self
+            .task_counters
+            .lock()
+            .expect("task counter lock poisoned");
+        let counter = counters.entry(list_id.to_string()).or_default();
+        *counter = counter.saturating_add(1);
+        *counter
     }
 
     /// Snapshot the projection for `list_id`. Used by tests and by the

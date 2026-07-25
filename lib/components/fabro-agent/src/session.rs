@@ -47,7 +47,10 @@ use crate::skills::{
     ExpandedInput, Skill, default_skill_dirs, discover_skills, expand_skill,
     make_use_skill_tool_for_vocabulary,
 };
-use crate::subagent::{SubAgentCallbackEvent, SubAgentEventCallback, SubAgentSupervisor};
+use crate::subagent::{
+    SubAgentCallbackEvent, SubAgentEventCallback, SubAgentSupervisor,
+    format_parent_notification_batch,
+};
 use crate::tool_execution::execute_tool_calls;
 use crate::tool_permissions::canonical_tool_name;
 use crate::tool_registry::ToolDefinitionWithSource;
@@ -1318,7 +1321,10 @@ impl Session {
             })
         });
 
-        // Process the initial input, then drain any followups
+        // Process the initial input, then drain followups. Claude-compatible
+        // background-agent results join this same boundary queue: they never
+        // interrupt inference or a tool call, and all results already ready at
+        // a boundary are delivered in one additional parent turn.
         let mut result = self
             .run_single_input(
                 input,
@@ -1336,10 +1342,33 @@ impl Session {
                     .lock()
                     .expect("followup queue lock poisoned")
                     .pop_front();
-                let Some(followup) = followup else { break };
+                let next_input = if let Some(followup) = followup {
+                    Some(followup)
+                } else if let Some(supervisor) = self.subagent_supervisor.clone() {
+                    match supervisor
+                        .next_parent_notification_batch(&self.cancel_token)
+                        .await
+                    {
+                        Ok(Some(notifications)) => {
+                            Some(format_parent_notification_batch(&notifications))
+                        }
+                        Ok(None) => None,
+                        Err(Error::Interrupted(InterruptReason::Cancelled)) => {
+                            result = Err(self.interrupted_error());
+                            None
+                        }
+                        Err(error) => {
+                            result = Err(error);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                let Some(next_input) = next_input else { break };
                 result = self
                     .run_single_input(
-                        &followup,
+                        &next_input,
                         &agent_tool_runtime,
                         &mut timing,
                         &mut usage,
@@ -3038,6 +3067,70 @@ mod tests {
         assert!(
             matches!(&turns[3], Message::Assistant { content, .. } if content == "Followup response")
         );
+    }
+
+    #[tokio::test]
+    async fn background_agent_notifications_are_batched_into_one_parent_turn() {
+        let supervisor = SubAgentSupervisor::new(3);
+        let first = make_session(vec![text_response("first result")]).await;
+        let second = make_session(vec![text_response("second result")]).await;
+        let first_id = supervisor
+            .spawn_with_parent_notification(
+                first,
+                "first task".to_string(),
+                "Inspect first".to_string(),
+                0,
+            )
+            .unwrap();
+        let second_id = supervisor
+            .spawn_with_parent_notification(
+                second,
+                "second task".to_string(),
+                "Inspect second".to_string(),
+                0,
+            )
+            .unwrap();
+
+        // Make both results ready before the parent reaches its safe turn
+        // boundary so batching is deterministic.
+        supervisor
+            .wait_with_cancel(&first_id, &CancellationToken::new())
+            .await
+            .unwrap();
+        supervisor
+            .wait_with_cancel(&second_id, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        let provider = Arc::new(ScriptedStreamProvider::new(vec![
+            ScriptedStreamCall::Response(Box::new(text_response("Parent is waiting"))),
+            ScriptedStreamCall::Response(Box::new(text_response("Synthesized both results"))),
+        ]));
+        let mut parent =
+            make_session_with_provider_and_manager(provider, Some(supervisor.clone())).await;
+
+        let output = parent
+            .process_input_with_output("Delegate both tasks")
+            .await
+            .unwrap();
+
+        assert_eq!(output.as_deref(), Some("Synthesized both results"));
+        let turns = parent.history().turns();
+        assert_eq!(turns.len(), 4);
+        let Message::User {
+            content: notification,
+            ..
+        } = &turns[2]
+        else {
+            panic!("third turn should deliver the background results");
+        };
+        assert_eq!(notification.matches("<task-notification>").count(), 2);
+        assert!(notification.contains(&first_id));
+        assert!(notification.contains(&second_id));
+        assert!(notification.contains("first result"));
+        assert!(notification.contains("second result"));
+
+        supervisor.shutdown_all().await;
     }
 
     #[tokio::test]

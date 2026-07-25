@@ -656,7 +656,7 @@ fn format_brave_results(body: &serde_json::Value) -> String {
     output
 }
 
-fn make_web_search_tool_with_api_key(api_key: String) -> RegisteredTool {
+pub(crate) fn make_web_search_tool_with_api_key(api_key: String) -> RegisteredTool {
     use std::sync::OnceLock;
     static CLIENT: OnceLock<fabro_http::HttpClient> = OnceLock::new();
 
