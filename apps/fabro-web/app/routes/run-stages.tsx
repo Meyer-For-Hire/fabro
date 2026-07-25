@@ -1586,13 +1586,21 @@ export function StageChatView({
               </p>
             );
           case "assistant": {
+            const hasText = turn.content.trim().length > 0;
             const metric = turnMetric(turn);
             const isFinal =
               turnIndex === lastAssistantTurnIndex && !stageActive;
+            const showFooter = isFinal && Boolean(metric || duration);
+            // A text-free assistant turn is the boundary between two batches
+            // of tool calls, kept in the turn stream so those batches stay
+            // separate chips. It has nothing to show, and an empty node would
+            // still take a slot in this gap-4 column, doubling the space
+            // between the chips on either side of it.
+            if (!hasText && !showFooter) return null;
             return (
               <div key={`turn-${turnIndex}`} className="flex flex-col gap-1.5">
-                <Markdown content={turn.content} />
-                {isFinal && (metric || duration) && (
+                {hasText && <Markdown content={turn.content} />}
+                {showFooter && (
                   <div className="flex gap-3 font-mono text-[11px] text-fg-muted tabular-nums">
                     {metric && <span>{metric}</span>}
                     {duration && <span>{duration}</span>}
