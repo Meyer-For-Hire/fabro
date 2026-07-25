@@ -316,6 +316,66 @@ mod tests {
             .with_catalog(Arc::new(Catalog::from_builtin().unwrap()))
     }
 
+    /// Per-profile tool descriptions must stay per-profile. The Kimi profile
+    /// rewrites several built-in descriptions; every other profile shares the
+    /// registry factories, so a leak would silently reword tools for models
+    /// that were never meant to see the change.
+    #[test]
+    fn kimi_tool_descriptions_do_not_leak_into_other_profiles() {
+        use crate::agent_profile::AgentProfile;
+        use crate::native_tool::NativeTool;
+
+        let describe = |profile: &dyn AgentProfile, tool: NativeTool| {
+            let vocabulary = profile.tool_registry().vocabulary();
+            profile
+                .tool_registry()
+                .get(tool.name(vocabulary))
+                .map(|t| t.definition.description.clone())
+        };
+
+        let anthropic = AnthropicProfile::new("claude-sonnet-4-6");
+        let openai = OpenAiProfile::new("gpt-5.5");
+        let gemini = GeminiProfile::new("gemini-3-flash-preview");
+        let kimi = KimiProfile::new("kimi-k3");
+
+        for tool in [
+            NativeTool::ReadFile,
+            NativeTool::WriteFile,
+            NativeTool::EditFile,
+            NativeTool::Shell,
+            NativeTool::Grep,
+            NativeTool::Glob,
+        ] {
+            let (Some(kimi_text), Some(anthropic_text)) =
+                (describe(&kimi, tool), describe(&anthropic, tool))
+            else {
+                continue;
+            };
+            assert_ne!(
+                kimi_text, anthropic_text,
+                "{tool} should be reworded for Kimi only"
+            );
+
+            // The other three share the stock wording.
+            for (label, other) in [
+                ("openai", describe(&openai, tool)),
+                ("gemini", describe(&gemini, tool)),
+            ] {
+                let Some(other) = other else { continue };
+                assert_eq!(
+                    other, anthropic_text,
+                    "{label} should keep the stock {tool} description"
+                );
+            }
+
+            // The specific Kimi-only phrasing must not appear elsewhere.
+            assert!(
+                !anthropic_text.contains("has not been read"),
+                "read-before-write drilling leaked into {tool} for other profiles"
+            );
+        }
+    }
+
     #[test]
     fn env_context_block_contains_platform() {
         let env = MockSandbox::linux();
