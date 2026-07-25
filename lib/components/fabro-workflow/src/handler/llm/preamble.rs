@@ -115,16 +115,6 @@ fn format_value(val: &serde_json::Value) -> String {
     }
 }
 
-fn format_token_count(tokens: i64) -> String {
-    if tokens >= 1_000_000 {
-        format!("{:.1}m", tokens as f64 / 1_000_000.0)
-    } else if tokens >= 1000 {
-        format!("{:.1}k", tokens as f64 / 1000.0)
-    } else {
-        tokens.to_string()
-    }
-}
-
 fn tail_lines(text: &str, max_lines: usize, indent: &str) -> String {
     use std::fmt::Write;
 
@@ -197,14 +187,7 @@ fn render_compact_stage_details(
         h if is_llm_handler_type(h) => {
             let mut lines = Vec::new();
             if let Some(usage) = &outcome.usage {
-                let input = format_token_count(usage.tokens().input_tokens);
-                let output = format_token_count(usage.tokens().billable_output_tokens());
-                lines.push(format!(
-                    "  - Model: {}, {} tokens in / {} out",
-                    usage.model_id(),
-                    input,
-                    output
-                ));
+                lines.push(format!("  - Model: {}", usage.model_id()));
             }
             if !outcome.files_touched.is_empty() {
                 lines.push(format!("  - Files: {}", outcome.files_touched.join(", ")));
@@ -265,11 +248,6 @@ fn render_summary_high_stage_section(
         h if is_llm_handler_type(h) => {
             if let Some(usage) = &outcome.usage {
                 lines.push(format!("- Model: {}", usage.model_id()));
-                lines.push(format!(
-                    "- Tokens: {} in / {} out",
-                    format_token_count(usage.tokens().input_tokens),
-                    format_token_count(usage.tokens().billable_output_tokens())
-                ));
             }
             if !outcome.files_touched.is_empty() {
                 lines.push(format!(
@@ -928,8 +906,9 @@ mod tests {
             "should show model name"
         );
         assert!(
-            preamble.contains("1.2k tokens in"),
-            "should show token count"
+            !preamble.contains("tokens"),
+            "token accounting must stay out of the agent-facing preamble; agents \
+             read it as a budget signal, got:\n{preamble}"
         );
         assert!(
             preamble.contains("src/lib.rs, src/main.rs"),
@@ -1566,7 +1545,11 @@ mod tests {
             preamble.contains("Model: claude-sonnet-4-20250514"),
             "should show model"
         );
-        assert!(preamble.contains("1.5k in"), "should show formatted tokens");
+        assert!(
+            !preamble.contains("tokens"),
+            "token accounting must stay out of the agent-facing preamble; agents \
+             read it as a budget signal, got:\n{preamble}"
+        );
         assert!(
             preamble.contains("Files touched: src/lib.rs"),
             "should show files"
@@ -1639,20 +1622,6 @@ mod tests {
             preamble.contains("2 of 4 stages completed"),
             "should show pipeline progress with total node count, got:\n{preamble}"
         );
-    }
-
-    // --- format_token_count ---
-
-    #[test]
-    fn format_token_count_formatting() {
-        assert_eq!(format_token_count(500), "500");
-        assert_eq!(format_token_count(999), "999");
-        assert_eq!(format_token_count(1000), "1.0k");
-        assert_eq!(format_token_count(1234), "1.2k");
-        assert_eq!(format_token_count(1500), "1.5k");
-        assert_eq!(format_token_count(10000), "10.0k");
-        assert_eq!(format_token_count(1_000_000), "1.0m");
-        assert_eq!(format_token_count(3_456_789), "3.5m");
     }
 
     // --- is_context_key_excluded ---
