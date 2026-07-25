@@ -13,7 +13,7 @@ use crate::types::{AgentEvent, Message};
 
 const APPROX_CHARS_PER_TOKEN: usize = 4;
 
-/// Output budget for the visible summary text itself.
+/// Maximum output budget for the visible summary text itself.
 const SUMMARY_MAX_TOKENS: i64 = 4096;
 
 /// Extra output budget for models that reason on every request. `max_tokens`
@@ -115,6 +115,12 @@ pub(crate) async fn compact_context(
         )
     };
 
+    let max_tokens = summary_max_tokens(
+        provider_profile.reasons_by_default(),
+        provider_profile.max_output_tokens(),
+    );
+    let visible_max_tokens = SUMMARY_MAX_TOKENS.min(max_tokens);
+
     let summarization_prompt = format!(
         "You are creating a handoff document for a different coding assistant that will take over \
 this task. That assistant will only see your summary and the most recent messages — nothing else \
@@ -126,15 +132,10 @@ Write a summary using EXACTLY these sections:\n\n\
 ## Failed Approaches\nWhat was tried and didn't work, and why.\n\n\
 ## Open Issues\nBugs, edge cases, or TODOs that remain.\n\n\
 ## Next Steps\nWhat should happen next to make progress.\n\n\
-Keep the entire response under {SUMMARY_MAX_TOKENS} tokens.\n\n\
+Keep the entire response under {visible_max_tokens} tokens.\n\n\
 Be thorough and specific — the assistant taking over has no prior context. Include file paths, \
 function names, error messages, and exact values. Omit pleasantries and conversational filler.\
 {file_ops_section}"
-    );
-
-    let max_tokens = summary_max_tokens(
-        provider_profile.reasons_by_default(),
-        provider_profile.max_output_tokens(),
     );
 
     let summary_request = Request {
