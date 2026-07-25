@@ -1022,28 +1022,6 @@ replays the turn.
 | `kind` | string | `reasoning`, `text`, or `tool_call` — observed, not inferred |
 | `visit` | number | Graph visit |
 
-### `agent.output.replace`
-
-Replaces the current in-progress assistant output buffers.
-
-```json
-{
-  "id": "...", "ts": "...", "run_id": "...",
-  "event": "agent.output.replace",
-  "node_id": "code", "node_label": "code",
-  "session_id": "ses_abc",
-  "properties": {
-    "text": "I'll fix the login bug by...",
-    "reasoning": "The user wants..."
-  }
-}
-```
-
-| Property | Type | Description |
-|----------|------|-------------|
-| `text` | string | Replacement assistant text |
-| `reasoning` | string? | Replacement reasoning text |
-
 ### `agent.message`
 
 Emitted when the assistant produces a complete message.
@@ -1085,46 +1063,6 @@ Emitted when the assistant produces a complete message.
 | `usage.raw` | object? | Raw provider-specific usage |
 | `tool_call_count` | number | Number of tool calls in this turn |
 
-### `agent.text.delta`
-
-Streaming text chunk from the assistant.
-
-```json
-{
-  "id": "...", "ts": "...", "run_id": "...",
-  "event": "agent.text.delta",
-  "node_id": "code", "node_label": "code",
-  "session_id": "ses_abc",
-  "properties": {
-    "delta": "I'll start by reading"
-  }
-}
-```
-
-| Property | Type | Description |
-|----------|------|-------------|
-| `delta` | string | Text chunk |
-
-### `agent.reasoning.delta`
-
-Streaming reasoning/thinking chunk from the assistant.
-
-```json
-{
-  "id": "...", "ts": "...", "run_id": "...",
-  "event": "agent.reasoning.delta",
-  "node_id": "code", "node_label": "code",
-  "session_id": "ses_abc",
-  "properties": {
-    "delta": "The user needs me to..."
-  }
-}
-```
-
-| Property | Type | Description |
-|----------|------|-------------|
-| `delta` | string | Reasoning text chunk |
-
 ### `agent.tool.started`
 
 Emitted when the agent begins a tool call.
@@ -1148,26 +1086,6 @@ Emitted when the agent begins a tool call.
 | `tool_name` | string | Tool name |
 | `tool_call_id` | string | Unique tool call id |
 | `arguments` | object | Tool call arguments |
-
-### `agent.tool.output.delta`
-
-Streaming tool output chunk.
-
-```json
-{
-  "id": "...", "ts": "...", "run_id": "...",
-  "event": "agent.tool.output.delta",
-  "node_id": "code", "node_label": "code",
-  "session_id": "ses_abc",
-  "properties": {
-    "delta": "fn login(user: &str)..."
-  }
-}
-```
-
-| Property | Type | Description |
-|----------|------|-------------|
-| `delta` | string | Output text chunk |
 
 ### `agent.tool.completed`
 
@@ -1252,24 +1170,6 @@ Emitted when the agent detects a tool-use loop.
 ```
 
 No properties.
-
-### `agent.skill.expanded`
-
-```json
-{
-  "id": "...", "ts": "...", "run_id": "...",
-  "event": "agent.skill.expanded",
-  "node_id": "code", "node_label": "code",
-  "session_id": "ses_abc",
-  "properties": {
-    "skill_name": "read_file"
-  }
-}
-```
-
-| Property | Type | Description |
-|----------|------|-------------|
-| `skill_name` | string | Expanded skill name |
 
 ### `agent.steering.injected`
 
@@ -1618,10 +1518,10 @@ Emitted whenever a skill is activated in the running session. Sources:
 | `source` | string | `"slash"` for `/skill-name` expansion, `"tool"` for `use_skill` activations |
 | `visit` | number | Stage visit count |
 
-> `agent.skill.expanded` is no longer surfaced as a durable run event. The
-> internal `AgentEvent::SkillExpanded` variant remains classified as streaming
-> noise and is not persisted; slash-skill expansion is reported through
-> `agent.skill.activated` with `source == "slash"` instead.
+> `agent.skill.expanded` does not exist. The `AgentEvent::SkillExpanded`
+> variant this note once described has since been removed from the code
+> entirely; slash-skill expansion is reported through `agent.skill.activated`
+> with `source == "slash"` instead.
 
 ### `agent.failover`
 
@@ -1650,6 +1550,25 @@ Emitted when the agent fails over to a different LLM provider/model.
 | `to_provider` | string | Failover provider |
 | `to_model` | string | Failover model |
 | `error` | string | Error that triggered failover |
+
+### Agent events that are never serialized
+
+`AgentEvent` also has variants that exist only on the agent session's
+in-process broadcast channel. `is_streaming_noise()` filters them out before
+the workflow emitter builds a `RunEvent`, so they never reach the run store,
+SSE, `fabro events`, or a JSONL sink — they have no envelope, and no external
+consumer can observe them:
+
+- `AssistantOutputReplace` — clears in-progress output buffers when a turn is
+  replayed
+- `TextDelta`, `ReasoningDelta` — streaming assistant chunks
+- `ToolCallOutputDelta` — streaming tool output chunks
+
+They were previously documented here as though they were durable events, with
+full envelope examples. If any of them ever needs to be durable, it belongs in
+a separate transient stream rather than the canonical persisted contract —
+long autonomous runs would generate orders of magnitude more delta traffic
+than the interactive sessions surface handles.
 
 ---
 
@@ -2225,14 +2144,14 @@ These legacy events may appear in older run logs. Current CLI backend runs do no
 |----------|------|-------------|
 | `error` | string | Error message |
 
-## Asset events
+## Artifact events
 
-### `asset.captured`
+### `artifact.captured`
 
 ```json
 {
   "id": "...", "ts": "...", "run_id": "...",
-  "event": "asset.captured",
+  "event": "artifact.captured",
   "node_id": "code",
   "node_label": "code",
   "properties": {

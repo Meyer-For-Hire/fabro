@@ -423,9 +423,10 @@ These stay outside the durable persisted contract:
 - `agent.text.delta`
 - `agent.reasoning.delta`
 - `agent.tool.output.delta`
-- `agent.skill.expanded`
 
-`agent.skill.expanded` stays in this non-durable bucket because it is display-oriented expansion metadata, not a durable workflow fact.
+(`agent.skill.expanded` was previously listed here. No such event exists — the
+`AgentEvent::SkillExpanded` variant was removed, and slash-skill expansion is
+reported through the durable `agent.skill.activated` with `source == "slash"`.)
 
 If Fabro needs those for UI, they belong in a separate transient stream, not in the canonical persisted Rust event contract.
 
