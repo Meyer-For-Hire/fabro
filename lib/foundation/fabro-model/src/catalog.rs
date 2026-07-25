@@ -3084,6 +3084,19 @@ enabled = true
                 BillingPolicy::OpenAi,
             ),
             (
+                "claude-opus-5",
+                "anthropic/claude-opus-5",
+                "claude-5",
+                1_000_000,
+                5.0,
+                25.0,
+                0.5,
+                ReasoningEffortFeature::Levels,
+                false,
+                true,
+                BillingPolicy::Anthropic,
+            ),
+            (
                 "claude-opus-4-8",
                 "anthropic/claude-opus-4.8",
                 "claude-4",
@@ -3160,6 +3173,13 @@ enabled = true
                 ReasoningEffort::VARIANTS,
                 "{id}"
             );
+        }
+
+        for alias in ["opus", "claude-opus"] {
+            let model = catalog
+                .resolve_on_provider(&ProviderId::new("openrouter"), alias)
+                .unwrap_or_else(|error| panic!("{alias} should resolve on OpenRouter: {error}"));
+            assert_eq!(model.id, "claude-opus-5", "{alias}");
         }
     }
 
