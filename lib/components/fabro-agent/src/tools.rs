@@ -12,11 +12,12 @@ use tokio::task;
 
 use crate::config::NativeToolOptions;
 use crate::sandbox::{ExecStreamingResult, GrepOptions};
-use crate::tool_registry::{RegisteredTool, ToolRegistry, ToolSource};
+use crate::tool_registry::{RegisteredTool, ToolContext, ToolRegistry, ToolSource};
 use crate::types::AgentEvent;
 
 const MAX_WEB_FETCH_BYTES: usize = 100 * 1024;
 const MAX_READ_MANY_FILES_CONCURRENCY: usize = 8;
+pub(crate) const DEFAULT_READ_LINES: usize = 2000;
 
 /// Configuration for the optional LLM-based summarizer used by `web_fetch`.
 #[derive(Clone)]
@@ -67,6 +68,15 @@ pub fn register_core_tools(
     registry.register(make_write_file_tool());
     registry.register(make_shell_tool_with_options(options));
     registry.register(make_grep_tool());
+    register_discovery_and_web_tools(registry, options, summarizer);
+}
+
+/// Register the core tools whose Kimi Code contracts match fabro's own.
+pub(crate) fn register_discovery_and_web_tools(
+    registry: &mut ToolRegistry,
+    options: &NativeToolOptions,
+    summarizer: Option<WebFetchSummarizer>,
+) {
     registry.register(make_glob_tool());
     if let Some(api_key) = &options.secrets.brave_search_api_key {
         registry.register(make_web_search_tool_with_api_key(api_key.clone()));
@@ -80,7 +90,10 @@ pub(crate) fn required_str<'a>(args: &'a serde_json::Value, key: &str) -> Result
         .ok_or_else(|| format!("Missing required parameter: {key}"))
 }
 
-fn optional_usize_arg(args: &serde_json::Value, key: &str) -> Result<Option<usize>, String> {
+pub(crate) fn optional_usize_arg(
+    args: &serde_json::Value,
+    key: &str,
+) -> Result<Option<usize>, String> {
     args.get(key)
         .and_then(serde_json::Value::as_u64)
         .map(|value| {
@@ -109,7 +122,8 @@ pub fn make_read_file_tool() -> RegisteredTool {
             Box::pin(async move {
                 let file_path = required_str(&args, "file_path")?;
                 let offset_usize = optional_usize_arg(&args, "offset")?;
-                let limit_usize = optional_usize_arg(&args, "limit")?;
+                let limit_usize =
+                    optional_usize_arg(&args, "limit")?.or(Some(DEFAULT_READ_LINES));
 
                 let content = ctx
                     .env
@@ -247,59 +261,11 @@ pub fn make_shell_tool_with_options(options: &NativeToolOptions) -> RegisteredTo
                     .unwrap_or(default_timeout)
                     .min(max_timeout);
 
-                let tool_env = ctx
-                    .resolve_tool_env()
-                    .await
-                    .map_err(|e| format!("{SHELL_NO_PROCESS_RESULT}: {e:#}"))?;
-                tracing::debug!(
-                    env_var_count = tool_env.as_ref().map_or(0, std::collections::HashMap::len),
-                    "Injecting sandbox env vars into tool execution"
-                );
-                let streaming = ctx
-                    .env
-                    .exec_command_streaming(
-                        command,
-                        Some(timeout_ms),
-                        None,
-                        tool_env.as_ref(),
-                        Some(ctx.cancel.clone()),
-                        None,
-                    )
-                    .await
-                    .map_err(|e| {
-                        format!("{SHELL_NO_PROCESS_RESULT}: {}", e.display_with_causes())
-                    })?;
+                let streaming = execute_shell_command(&ctx, command, timeout_ms, None).await?;
 
                 let text = render_shell_result(&streaming);
                 let is_success = streaming.result.is_success();
-                if let Some(emitter) = ctx.agent_event_emitter {
-                    let exit_code = streaming.result.exit_code;
-                    let termination = streaming.result.termination;
-                    let duration_ms = streaming.result.duration_ms;
-                    let streams_separated = streaming.streams_separated;
-                    let result = streaming.result;
-                    let exec_output_tail = match task::spawn_blocking(move || {
-                        result.default_redacted_output_tail()
-                    })
-                    .await
-                    {
-                        Ok(exec_output_tail) => exec_output_tail,
-                        Err(err) => {
-                            tracing::warn!(
-                                error = ?err,
-                                "Failed to redact shell process output tail"
-                            );
-                            None
-                        }
-                    };
-                    emitter.emit(AgentEvent::ToolProcessCompleted {
-                        exit_code,
-                        termination,
-                        duration_ms,
-                        streams_separated,
-                        exec_output_tail,
-                    });
-                }
+                emit_shell_process_completed(&ctx, streaming).await;
 
                 if is_success {
                     Ok(text)
@@ -315,6 +281,72 @@ pub fn make_shell_tool_with_options(options: &NativeToolOptions) -> RegisteredTo
 /// Prefix for shell failures that never produced an `ExecResult`, so the model
 /// can distinguish missing process diagnostics from a reported process failure.
 const SHELL_NO_PROCESS_RESULT: &str = "Shell command produced no process result";
+
+/// Execute a shell command with the session's environment and cancellation
+/// plumbing. Provider profiles can vary their wire schema and result
+/// rendering without accidentally bypassing those shared semantics.
+pub(crate) async fn execute_shell_command(
+    ctx: &ToolContext,
+    command: &str,
+    timeout_ms: u64,
+    cwd: Option<&str>,
+) -> Result<ExecStreamingResult, String> {
+    let tool_env = ctx
+        .resolve_tool_env()
+        .await
+        .map_err(|e| format!("{SHELL_NO_PROCESS_RESULT}: {e:#}"))?;
+    tracing::debug!(
+        env_var_count = tool_env.as_ref().map_or(0, std::collections::HashMap::len),
+        "Injecting sandbox env vars into tool execution"
+    );
+    ctx.env
+        .exec_command_streaming(
+            command,
+            Some(timeout_ms),
+            cwd,
+            tool_env.as_ref(),
+            Some(ctx.cancel.clone()),
+            None,
+        )
+        .await
+        .map_err(|e| format!("{SHELL_NO_PROCESS_RESULT}: {}", e.display_with_causes()))
+}
+
+/// Emit the subordinate process outcome after model-facing output has been
+/// rendered. Consumes the raw result so redaction does not require cloning
+/// potentially large process output.
+pub(crate) async fn emit_shell_process_completed(
+    ctx: &ToolContext,
+    streaming: ExecStreamingResult,
+) {
+    if ctx.agent_event_emitter.is_none() {
+        return;
+    }
+
+    let exit_code = streaming.result.exit_code;
+    let termination = streaming.result.termination;
+    let duration_ms = streaming.result.duration_ms;
+    let streams_separated = streaming.streams_separated;
+    let result = streaming.result;
+    let exec_output_tail =
+        match task::spawn_blocking(move || result.default_redacted_output_tail()).await {
+            Ok(exec_output_tail) => exec_output_tail,
+            Err(err) => {
+                tracing::warn!(
+                    error = ?err,
+                    "Failed to redact shell process output tail"
+                );
+                None
+            }
+        };
+    ctx.emit_agent_event(AgentEvent::ToolProcessCompleted {
+        exit_code,
+        termination,
+        duration_ms,
+        streams_separated,
+        exec_output_tail,
+    });
+}
 
 /// Renders the model-facing shell result: termination, exit code, duration,
 /// and provider-honest output sections. Metadata stays at the head and
@@ -387,24 +419,55 @@ pub fn make_grep_tool() -> RegisteredTool {
                     max_results,
                 };
 
-                let results = ctx
-                    .env
-                    .grep(pattern, path, &options)
-                    .await
-                    .map_err(|e| e.display_with_causes())?;
-                let mut seen_files = std::collections::HashSet::new();
-                for line in &results {
-                    if let Some(file_path) = line.split(':').next() {
-                        if !file_path.is_empty() && seen_files.insert(file_path) {
-                            ctx.env.mark_agent_read(file_path);
-                        }
-                    }
-                }
+                let results = execute_grep(&ctx, pattern, path, &options).await?;
                 Ok(results.join("\n"))
             })
         }),
         source:     ToolSource::Native,
     }
+}
+
+/// Run a content search and mark every returned file as observed by the
+/// agent's read-before-write guard.
+pub(crate) async fn execute_grep(
+    ctx: &ToolContext,
+    pattern: &str,
+    path: &str,
+    options: &GrepOptions,
+) -> Result<Vec<String>, String> {
+    let results = ctx
+        .env
+        .grep(pattern, path, options)
+        .await
+        .map_err(|e| e.display_with_causes())?;
+    let mut seen_files = std::collections::HashSet::new();
+    for line in &results {
+        let file_path = grep_result_path(line, path);
+        if !file_path.is_empty() && seen_files.insert(file_path) {
+            ctx.env.mark_agent_read(file_path);
+        }
+    }
+    Ok(results)
+}
+
+/// Extract the file path from `<path>:<line>:<content>` grep output.
+///
+/// A search of one concrete file may omit `<path>`, in which case the searched
+/// path itself is returned. Candidate separators are walked so paths that
+/// contain colons (including Windows drive prefixes) still parse correctly.
+pub(crate) fn grep_result_path<'a>(line: &'a str, searched: &'a str) -> &'a str {
+    let mut rest = line;
+    let mut consumed = 0usize;
+    while let Some(index) = rest.find(':') {
+        let after = &rest[index + 1..];
+        let digit_count = after.chars().take_while(char::is_ascii_digit).count();
+        if digit_count > 0 && after[digit_count..].starts_with(':') {
+            return &line[..consumed + index];
+        }
+        consumed += index + 1;
+        rest = after;
+    }
+    searched
 }
 
 #[must_use]
@@ -832,6 +895,34 @@ mod tests {
         })
         .await;
         assert_eq!(result.unwrap(), "1 | hello\n2 | world\n");
+    }
+
+    #[tokio::test]
+    async fn read_file_applies_the_documented_default_limit() {
+        let tool = make_read_file_tool();
+        let content = (1..=DEFAULT_READ_LINES + 1)
+            .map(|line| format!("line{line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let env: Arc<dyn Sandbox> = Arc::new(MockSandbox {
+            files: HashMap::from([("/test.txt".to_string(), content)]),
+            ..Default::default()
+        });
+
+        let result = (tool.executor)(serde_json::json!({"file_path": "/test.txt"}), ToolContext {
+            env,
+            cancel: CancellationToken::new(),
+            tool_env_provider: None,
+            session_id: None,
+            root_session_id: None,
+            tool_call_id: None,
+            agent_event_emitter: None,
+        })
+        .await
+        .unwrap();
+
+        assert!(result.contains("2000 | line2000"), "{result}");
+        assert!(!result.contains("2001 | line2001"), "{result}");
     }
 
     #[tokio::test]
