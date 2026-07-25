@@ -370,7 +370,7 @@ impl DockerSandbox {
         cmd: Vec<String>,
         working_dir: Option<String>,
         env: Option<Vec<String>>,
-        output_callback: CommandOutputCallback,
+        output_callback: Option<CommandOutputCallback>,
     ) -> crate::Result<(Vec<u8>, Vec<u8>, i32)> {
         let exec_opts = CreateExecOptions {
             cmd: Some(cmd),
@@ -399,11 +399,15 @@ impl DockerSandbox {
                 match chunk {
                     Ok(LogOutput::StdOut { message }) => {
                         stdout.extend_from_slice(&message);
-                        output_callback(CommandOutputStream::Stdout, message.to_vec()).await?;
+                        if let Some(output_callback) = output_callback.as_ref() {
+                            output_callback(CommandOutputStream::Stdout, message.to_vec()).await?;
+                        }
                     }
                     Ok(LogOutput::StdErr { message }) => {
                         stderr.extend_from_slice(&message);
-                        output_callback(CommandOutputStream::Stderr, message.to_vec()).await?;
+                        if let Some(output_callback) = output_callback.as_ref() {
+                            output_callback(CommandOutputStream::Stderr, message.to_vec()).await?;
+                        }
                     }
                     Ok(_) => {}
                     Err(e) => {
@@ -489,7 +493,7 @@ impl DockerSandbox {
         working_dir: Option<&str>,
         env_vars: Option<&HashMap<String, String>>,
         cancel_token: Option<CancellationToken>,
-        output_callback: CommandOutputCallback,
+        output_callback: Option<CommandOutputCallback>,
     ) -> crate::Result<ExecStreamingResult> {
         let start = Instant::now();
         let effective_dir = working_dir
@@ -1579,7 +1583,7 @@ impl Sandbox for DockerSandbox {
         working_dir: Option<&str>,
         env_vars: Option<&HashMap<String, String>>,
         cancel_token: Option<CancellationToken>,
-        output_callback: CommandOutputCallback,
+        output_callback: Option<CommandOutputCallback>,
     ) -> crate::Result<ExecStreamingResult> {
         let dir = working_dir.map(|path| self.resolve_container_path(path));
         self.docker_exec_shell_streaming(

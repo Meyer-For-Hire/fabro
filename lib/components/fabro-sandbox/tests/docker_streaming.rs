@@ -55,7 +55,7 @@ async fn streaming_timeout_terminates_docker_exec_before_returning() {
             None,
             None,
             None,
-            capture_bytes(Arc::clone(&chunks)),
+            Some(capture_bytes(Arc::clone(&chunks))),
         )
         .await
         .expect("streaming command should return a timeout result");
@@ -218,7 +218,7 @@ async fn docker_runs_clean_bash_through_both_command_paths() {
             None,
             None,
             None,
-            capture_bytes(Arc::clone(&chunks)),
+            Some(capture_bytes(Arc::clone(&chunks))),
         )
         .await
         .expect("streaming command should run");

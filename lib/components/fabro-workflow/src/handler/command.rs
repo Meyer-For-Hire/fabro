@@ -128,7 +128,7 @@ impl Handler for CommandHandler {
                 None,
                 env_vars,
                 Some(cancel_token.clone()),
-                output_callback,
+                Some(output_callback),
             )
             .await;
         cancel_token.cancel();

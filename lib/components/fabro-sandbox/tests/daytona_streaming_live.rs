@@ -335,7 +335,7 @@ mod daytona_streaming_live {
                     None,
                     None,
                     Some(cancel_for_exec),
-                    callback,
+                    Some(callback),
                 )
                 .await
         });
@@ -460,7 +460,7 @@ mod daytona_streaming_live {
                 None,
                 None,
                 cancel_token,
-                callback,
+                Some(callback),
             )
             .await?;
         let chunks = chunks.lock().await.clone();

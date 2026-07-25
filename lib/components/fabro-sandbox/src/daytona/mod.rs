@@ -1707,7 +1707,7 @@ impl Sandbox for DaytonaSandbox {
         working_dir: Option<&str>,
         env_vars: Option<&HashMap<String, String>>,
         cancel_token: Option<CancellationToken>,
-        output_callback: CommandOutputCallback,
+        output_callback: Option<CommandOutputCallback>,
     ) -> crate::Result<ExecStreamingResult> {
         let sandbox = self.sandbox()?;
         let start = Instant::now();
@@ -1765,9 +1765,11 @@ impl Sandbox for DaytonaSandbox {
                             if !bytes.is_empty() {
                                 saw_live_chunk.store(true, Ordering::Relaxed);
                                 stdout_seen.lock().await.extend_from_slice(&bytes);
-                                callback(CommandOutputStream::Stdout, bytes)
-                                    .await
-                                    .map_err(|err| daytona_callback_error(&err))?;
+                                if let Some(callback) = callback {
+                                    callback(CommandOutputStream::Stdout, bytes)
+                                        .await
+                                        .map_err(|err| daytona_callback_error(&err))?;
+                                }
                             }
                             Ok(())
                         }
@@ -1781,9 +1783,11 @@ impl Sandbox for DaytonaSandbox {
                             if !bytes.is_empty() {
                                 saw_live_chunk.store(true, Ordering::Relaxed);
                                 stderr_seen.lock().await.extend_from_slice(&bytes);
-                                callback(CommandOutputStream::Stderr, bytes)
-                                    .await
-                                    .map_err(|err| daytona_callback_error(&err))?;
+                                if let Some(callback) = callback {
+                                    callback(CommandOutputStream::Stderr, bytes)
+                                        .await
+                                        .map_err(|err| daytona_callback_error(&err))?;
+                                }
                             }
                             Ok(())
                         }
@@ -1840,14 +1844,14 @@ impl Sandbox for DaytonaSandbox {
                 CommandOutputStream::Stdout,
                 logs.stdout.as_bytes(),
                 &stdout_seen,
-                &output_callback,
+                output_callback.as_ref(),
             )
             .await?;
             append_missing_log_suffix(
                 CommandOutputStream::Stderr,
                 logs.stderr.as_bytes(),
                 &stderr_seen,
-                &output_callback,
+                output_callback.as_ref(),
             )
             .await?;
         }
@@ -2252,7 +2256,7 @@ async fn append_missing_log_suffix(
     stream: CommandOutputStream,
     final_bytes: &[u8],
     seen: &Arc<Mutex<Vec<u8>>>,
-    output_callback: &CommandOutputCallback,
+    output_callback: Option<&CommandOutputCallback>,
 ) -> crate::Result<()> {
     if final_bytes.is_empty() {
         return Ok(());
@@ -2267,7 +2271,10 @@ async fn append_missing_log_suffix(
     let missing = final_bytes[offset..].to_vec();
     seen.extend_from_slice(&missing);
     drop(seen);
-    output_callback(stream, missing).await
+    match output_callback {
+        Some(output_callback) => output_callback(stream, missing).await,
+        None => Ok(()),
+    }
 }
 
 fn missing_log_suffix_offset(seen: &[u8], final_bytes: &[u8]) -> usize {

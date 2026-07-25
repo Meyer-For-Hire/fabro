@@ -184,7 +184,7 @@ macro_rules! delegate_sandbox {
                 working_dir: Option<&str>,
                 env_vars: Option<&std::collections::HashMap<String, String>>,
                 cancel_token: Option<tokio_util::sync::CancellationToken>,
-                output_callback: $crate::CommandOutputCallback,
+                output_callback: Option<$crate::CommandOutputCallback>,
             ) -> $crate::Result<$crate::ExecStreamingResult> {
                 self.$field
                     .exec_command_streaming(
@@ -753,6 +753,34 @@ pub type CommandOutputCallback = Arc<
         + Sync,
 >;
 
+pub(crate) async fn replay_exec_result(
+    result: ExecResult,
+    streams_separated: bool,
+    output_callback: Option<&CommandOutputCallback>,
+) -> crate::Result<ExecStreamingResult> {
+    if let Some(output_callback) = output_callback {
+        if !result.stdout.is_empty() {
+            output_callback(
+                CommandOutputStream::Stdout,
+                result.stdout.as_bytes().to_vec(),
+            )
+            .await?;
+        }
+        if !result.stderr.is_empty() {
+            output_callback(
+                CommandOutputStream::Stderr,
+                result.stderr.as_bytes().to_vec(),
+            )
+            .await?;
+        }
+    }
+    Ok(ExecStreamingResult {
+        result,
+        streams_separated,
+        live_streaming: false,
+    })
+}
+
 pub struct StdioProcess {
     pub stdin:  Pin<Box<dyn AsyncWrite + Send>>,
     pub stdout: Pin<Box<dyn AsyncRead + Send>>,
@@ -949,11 +977,13 @@ pub trait Sandbox: Send + Sync {
     ///
     /// **Production sandboxes must override this.** The default falls back to
     /// the non-streaming [`exec_command`](Self::exec_command) and replays its
-    /// output through `output_callback` at the end, marking
-    /// `live_streaming: false`. That's the right behavior for test mocks but
-    /// silently drops live output for any real sandbox that wraps another —
-    /// decorators in particular must forward to the inner sandbox's streaming
-    /// implementation rather than relying on this default.
+    /// output through `output_callback` at the end when one is supplied,
+    /// marking `live_streaming: false`. Passing `None` captures the final
+    /// result without paying per-chunk callback costs. That's the right
+    /// behavior for test mocks but silently drops live output for any real
+    /// sandbox that wraps another — decorators in particular must forward to
+    /// the inner sandbox's streaming implementation rather than relying on
+    /// this default.
     async fn exec_command_streaming(
         &self,
         command: &str,
@@ -961,7 +991,7 @@ pub trait Sandbox: Send + Sync {
         working_dir: Option<&str>,
         env_vars: Option<&std::collections::HashMap<String, String>>,
         cancel_token: Option<CancellationToken>,
-        output_callback: CommandOutputCallback,
+        output_callback: Option<CommandOutputCallback>,
     ) -> crate::Result<ExecStreamingResult> {
         let fallback_timeout_ms = timeout_ms.unwrap_or(u64::MAX);
         let result = self
@@ -973,25 +1003,7 @@ pub trait Sandbox: Send + Sync {
                 cancel_token,
             )
             .await?;
-        if !result.stdout.is_empty() {
-            output_callback(
-                CommandOutputStream::Stdout,
-                result.stdout.as_bytes().to_vec(),
-            )
-            .await?;
-        }
-        if !result.stderr.is_empty() {
-            output_callback(
-                CommandOutputStream::Stderr,
-                result.stderr.as_bytes().to_vec(),
-            )
-            .await?;
-        }
-        Ok(ExecStreamingResult {
-            result,
-            streams_separated: true,
-            live_streaming: false,
-        })
+        replay_exec_result(result, true, output_callback.as_ref()).await
     }
 
     /// Launch a long-lived process with bidirectional stdio attached.
