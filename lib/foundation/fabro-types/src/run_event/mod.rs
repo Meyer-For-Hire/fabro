@@ -234,6 +234,10 @@ pub enum EventBody {
     AgentCompactionStarted(AgentCompactionStartedProps),
     #[serde(rename = "agent.compaction.completed")]
     AgentCompactionCompleted(AgentCompactionCompletedProps),
+    #[serde(rename = "agent.llm.started")]
+    AgentLlmStarted(AgentLlmStartedProps),
+    #[serde(rename = "agent.llm.first_output")]
+    AgentLlmFirstOutput(AgentLlmFirstOutputProps),
     #[serde(rename = "agent.llm.retry")]
     AgentLlmRetry(AgentLlmRetryProps),
     #[serde(rename = "agent.sub.spawned")]
@@ -502,6 +506,8 @@ impl EventBody {
             Self::AgentSteerDropped(_) => "agent.steer.dropped",
             Self::AgentCompactionStarted(_) => "agent.compaction.started",
             Self::AgentCompactionCompleted(_) => "agent.compaction.completed",
+            Self::AgentLlmStarted(_) => "agent.llm.started",
+            Self::AgentLlmFirstOutput(_) => "agent.llm.first_output",
             Self::AgentLlmRetry(_) => "agent.llm.retry",
             Self::AgentSubSpawned(_) => "agent.sub.spawned",
             Self::AgentSubCompleted(_) => "agent.sub.completed",
@@ -672,6 +678,8 @@ fn is_known_event_name(event: &str) -> bool {
             | "agent.steer.dropped"
             | "agent.compaction.started"
             | "agent.compaction.completed"
+            | "agent.llm.started"
+            | "agent.llm.first_output"
             | "agent.llm.retry"
             | "agent.sub.spawned"
             | "agent.sub.completed"

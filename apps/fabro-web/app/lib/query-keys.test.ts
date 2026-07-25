@@ -87,7 +87,6 @@ describe("queryKeys", () => {
   test("agent activity events invalidate per-stage resources", () => {
     for (const event of [
       "stage.prompt",
-      "agent.message",
       "agent.tool.started",
       "agent.tool.completed",
       "command.started",
@@ -98,9 +97,16 @@ describe("queryKeys", () => {
         queryKeys.runs.stageContextWindow("run-1", "stage-1"),
       ]);
     }
+    expect(queryKeysForRunEvent("run-1", "agent.message", "stage-1")).toEqual([
+      queryKeys.runs.state("run-1"),
+      queryKeys.runs.stageEvents("run-1", "stage-1"),
+      queryKeys.runs.stageContextWindow("run-1", "stage-1"),
+    ]);
   });
 
-  test("agent activity events without a node_id invalidate nothing", () => {
-    expect(queryKeysForRunEvent("run-1", "agent.message")).toEqual([]);
+  test("agent message without a node_id still invalidates projected state", () => {
+    expect(queryKeysForRunEvent("run-1", "agent.message")).toEqual([
+      queryKeys.runs.state("run-1"),
+    ]);
   });
 });

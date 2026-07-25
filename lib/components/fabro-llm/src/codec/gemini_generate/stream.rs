@@ -21,8 +21,6 @@ pub(super) struct SseAccumulator {
     model:                  String,
     /// Configured provider name stamped into the final `Response.provider`.
     provider:               String,
-    /// Whether we have emitted a `StreamStart` event.
-    stream_started:         bool,
     /// Whether we have emitted a `TextStart` event.
     text_started:           bool,
     /// Whether we are currently inside a reasoning (thought) segment.
@@ -50,7 +48,6 @@ impl SseAccumulator {
         Self {
             model: ctx.request.model.clone(),
             provider: ctx.provider_name.to_string(),
-            stream_started: false,
             text_started: false,
             reasoning_started: false,
             accumulated_thinking: String::new(),
@@ -67,11 +64,6 @@ impl SseAccumulator {
     /// Extract stream events from a parsed SSE chunk.
     fn process_chunk(&mut self, chunk: &ApiResponse) -> Vec<StreamEvent> {
         let mut events = Vec::new();
-
-        if !self.stream_started {
-            self.stream_started = true;
-            events.push(StreamEvent::StreamStart);
-        }
 
         let parts = chunk
             .candidates
@@ -254,13 +246,11 @@ mod tests {
 
     /// Build an accumulator without threading a `CodecCtx`/`Request`: the test
     /// module sees the private fields, so the few that matter are set
-    /// directly. `stream_started` is true so event assertions don't see the
-    /// initial `StreamStart`.
+    /// directly.
     fn empty_accumulator() -> SseAccumulator {
         SseAccumulator {
             model:                  "gemini-2.0-flash".to_string(),
             provider:               "gemini".to_string(),
-            stream_started:         true,
             text_started:           false,
             reasoning_started:      false,
             accumulated_thinking:   String::new(),
@@ -279,9 +269,8 @@ mod tests {
     }
 
     #[test]
-    fn first_chunk_emits_stream_start() {
+    fn first_chunk_opens_text_without_a_decoder_level_stream_start() {
         let mut acc = empty_accumulator();
-        acc.stream_started = false;
 
         let events = on_data(
             &mut acc,
@@ -289,8 +278,10 @@ mod tests {
         )
         .expect("chunk should parse");
 
-        assert!(matches!(events[0], StreamEvent::StreamStart));
-        assert!(matches!(events[1], StreamEvent::TextStart { .. }));
+        // `StreamStart` is the driving loop's, so the decoder's first event
+        // is the content itself.
+        assert!(matches!(events[0], StreamEvent::TextStart { .. }));
+        assert!(matches!(events[1], StreamEvent::TextDelta { .. }));
     }
 
     #[test]

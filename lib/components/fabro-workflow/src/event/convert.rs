@@ -720,18 +720,32 @@ fn event_body_from_event(event: &Event) -> EventBody {
                 tracked_file_count:     *tracked_file_count,
                 visit:                  *visit,
             }),
+            AgentEvent::LlmRequestStarted { requested_model } => {
+                EventBody::AgentLlmStarted(fabro_types::AgentLlmStartedProps {
+                    requested_model: requested_model.clone(),
+                    visit:           *visit,
+                })
+            }
+            AgentEvent::LlmFirstOutput { kind } => {
+                EventBody::AgentLlmFirstOutput(fabro_types::AgentLlmFirstOutputProps {
+                    kind:  *kind,
+                    visit: *visit,
+                })
+            }
             AgentEvent::LlmRetry {
                 provider,
                 model,
                 attempt,
                 delay_secs,
                 error,
+                phase,
             } => EventBody::AgentLlmRetry(fabro_types::AgentLlmRetryProps {
                 provider:   provider.clone(),
                 model:      model.clone(),
                 attempt:    *attempt,
                 delay_secs: *delay_secs,
                 error:      serde_json::to_value(error).expect("LLM SDK error derives Serialize with no custom logic that can fail"),
+                phase:      Some(*phase),
                 visit:      *visit,
             }),
             AgentEvent::SubAgentSpawned {
@@ -849,8 +863,7 @@ fn event_body_from_event(event: &Event) -> EventBody {
             AgentEvent::TodoCreated(props) => EventBody::TodoCreated(props.clone()),
             AgentEvent::TodoUpdated(props) => EventBody::TodoUpdated(props.clone()),
             AgentEvent::TodoDeleted(props) => EventBody::TodoDeleted(props.clone()),
-            AgentEvent::AssistantTextStart
-            | AgentEvent::AssistantOutputReplace { .. }
+            AgentEvent::AssistantOutputReplace { .. }
             | AgentEvent::TextDelta { .. }
             | AgentEvent::ReasoningDelta { .. }
             | AgentEvent::ToolCallOutputDelta { .. }

@@ -968,43 +968,62 @@ No properties.
 |----------|------|-------------|
 | `text` | string | User input text |
 
-### `agent.output.start`
+### `agent.llm.started`
 
-Signals the beginning of assistant text output.
+An inference request is about to be dispatched for this round. Emitted once
+per round, after the request is built and compaction has run, immediately
+before the stream is opened.
 
-```json
-{
-  "id": "...", "ts": "...", "run_id": "...",
-  "event": "agent.output.start",
-  "node_id": "code", "node_label": "code",
-  "session_id": "ses_abc",
-  "properties": {}
-}
-```
-
-No properties.
-
-### `agent.output.replace`
-
-Replaces the current in-progress assistant output buffers.
+`requested_model` is the canonical requested target, including an optional
+speed tier. Failover can re-target mid-stage, so `agent.message` remains
+authoritative for what actually answered. No usage or cost fields: neither
+exists yet at this point.
 
 ```json
 {
   "id": "...", "ts": "...", "run_id": "...",
-  "event": "agent.output.replace",
+  "event": "agent.llm.started",
   "node_id": "code", "node_label": "code",
   "session_id": "ses_abc",
   "properties": {
-    "text": "I'll fix the login bug by...",
-    "reasoning": "The user wants..."
+    "requested_model": {
+      "provider": "anthropic",
+      "model_id": "claude-fable-5",
+      "speed": "fast"
+    },
+    "visit": 1
   }
 }
 ```
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `text` | string | Replacement assistant text |
-| `reasoning` | string? | Replacement reasoning text |
+| `requested_model` | object | Requested provider, model ID, and optional speed tier |
+| `visit` | number | Graph visit |
+
+### `agent.llm.first_output`
+
+The provider produced its first output for the current attempt. Edge-triggered
+once per stream attempt; the latch re-arms when a broken or finish-less stream
+replays the turn.
+
+```json
+{
+  "id": "...", "ts": "...", "run_id": "...",
+  "event": "agent.llm.first_output",
+  "node_id": "code", "node_label": "code",
+  "session_id": "ses_abc",
+  "properties": {
+    "kind": "reasoning",
+    "visit": 1
+  }
+}
+```
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `kind` | string | `reasoning`, `text`, or `tool_call` — observed, not inferred |
+| `visit` | number | Graph visit |
 
 ### `agent.message`
 
@@ -1047,46 +1066,6 @@ Emitted when the assistant produces a complete message.
 | `usage.raw` | object? | Raw provider-specific usage |
 | `tool_call_count` | number | Number of tool calls in this turn |
 
-### `agent.text.delta`
-
-Streaming text chunk from the assistant.
-
-```json
-{
-  "id": "...", "ts": "...", "run_id": "...",
-  "event": "agent.text.delta",
-  "node_id": "code", "node_label": "code",
-  "session_id": "ses_abc",
-  "properties": {
-    "delta": "I'll start by reading"
-  }
-}
-```
-
-| Property | Type | Description |
-|----------|------|-------------|
-| `delta` | string | Text chunk |
-
-### `agent.reasoning.delta`
-
-Streaming reasoning/thinking chunk from the assistant.
-
-```json
-{
-  "id": "...", "ts": "...", "run_id": "...",
-  "event": "agent.reasoning.delta",
-  "node_id": "code", "node_label": "code",
-  "session_id": "ses_abc",
-  "properties": {
-    "delta": "The user needs me to..."
-  }
-}
-```
-
-| Property | Type | Description |
-|----------|------|-------------|
-| `delta` | string | Reasoning text chunk |
-
 ### `agent.tool.started`
 
 Emitted when the agent begins a tool call.
@@ -1110,26 +1089,6 @@ Emitted when the agent begins a tool call.
 | `tool_name` | string | Tool name |
 | `tool_call_id` | string | Unique tool call id |
 | `arguments` | object | Tool call arguments |
-
-### `agent.tool.output.delta`
-
-Streaming tool output chunk.
-
-```json
-{
-  "id": "...", "ts": "...", "run_id": "...",
-  "event": "agent.tool.output.delta",
-  "node_id": "code", "node_label": "code",
-  "session_id": "ses_abc",
-  "properties": {
-    "delta": "fn login(user: &str)..."
-  }
-}
-```
-
-| Property | Type | Description |
-|----------|------|-------------|
-| `delta` | string | Output text chunk |
 
 ### `agent.tool.completed`
 
@@ -1254,24 +1213,6 @@ Emitted when the agent detects a tool-use loop.
 
 No properties.
 
-### `agent.skill.expanded`
-
-```json
-{
-  "id": "...", "ts": "...", "run_id": "...",
-  "event": "agent.skill.expanded",
-  "node_id": "code", "node_label": "code",
-  "session_id": "ses_abc",
-  "properties": {
-    "skill_name": "read_file"
-  }
-}
-```
-
-| Property | Type | Description |
-|----------|------|-------------|
-| `skill_name` | string | Expanded skill name |
-
 ### `agent.steering.injected`
 
 ```json
@@ -1336,7 +1277,9 @@ No properties.
 
 ### `agent.llm.retry`
 
-Emitted when an LLM API call is retried.
+Emitted when an attempt fails to open **or sustain** a stream and the turn is
+replayed. The finish-less-stream case carries a synthetic `Stream` error and a
+zero delay: the turn restarts even though no error was reported.
 
 ```json
 {
@@ -1349,6 +1292,7 @@ Emitted when an LLM API call is retried.
     "model": "claude-sonnet-4-20250514",
     "attempt": 2,
     "delay_secs": 1.5,
+    "phase": "open",
     "error": { ... }
   }
 }
@@ -1358,8 +1302,9 @@ Emitted when an LLM API call is retried.
 |----------|------|-------------|
 | `provider` | string | LLM provider name |
 | `model` | string | Model identifier |
-| `attempt` | number | Retry attempt number |
+| `attempt` | number | Retry attempt number, 0-based within the loop named by `phase` |
 | `delay_secs` | number | Delay before retry in seconds |
+| `phase` | string? | `open` (stream failed to open) or `consume` (stream broke or ended without a finish event). Absent on events stored before the discriminator existed |
 | `error` | object | SdkError (serialized) |
 
 ### `agent.sub.spawned`
@@ -1615,10 +1560,10 @@ Emitted whenever a skill is activated in the running session. Sources:
 | `source` | string | `"slash"` for `/skill-name` expansion, `"tool"` for `use_skill` activations |
 | `visit` | number | Stage visit count |
 
-> `agent.skill.expanded` is no longer surfaced as a durable run event. The
-> internal `AgentEvent::SkillExpanded` variant remains classified as streaming
-> noise and is not persisted; slash-skill expansion is reported through
-> `agent.skill.activated` with `source == "slash"` instead.
+> `agent.skill.expanded` does not exist. The `AgentEvent::SkillExpanded`
+> variant this note once described has since been removed from the code
+> entirely; slash-skill expansion is reported through `agent.skill.activated`
+> with `source == "slash"` instead.
 
 ### `agent.failover`
 
@@ -1647,6 +1592,25 @@ Emitted when the agent fails over to a different LLM provider/model.
 | `to_provider` | string | Failover provider |
 | `to_model` | string | Failover model |
 | `error` | string | Error that triggered failover |
+
+### Agent events that are never serialized
+
+`AgentEvent` also has variants that exist only on the agent session's
+in-process broadcast channel. `is_streaming_noise()` filters them out before
+the workflow emitter builds a `RunEvent`, so they never reach the run store,
+SSE, `fabro events`, or a JSONL sink — they have no envelope, and no external
+consumer can observe them:
+
+- `AssistantOutputReplace` — clears in-progress output buffers when a turn is
+  replayed
+- `TextDelta`, `ReasoningDelta` — streaming assistant chunks
+- `ToolCallOutputDelta` — streaming tool output chunks
+
+They were previously documented here as though they were durable events, with
+full envelope examples. If any of them ever needs to be durable, it belongs in
+a separate transient stream rather than the canonical persisted contract —
+long autonomous runs would generate orders of magnitude more delta traffic
+than the interactive sessions surface handles.
 
 ---
 
@@ -2222,14 +2186,14 @@ These legacy events may appear in older run logs. Current CLI backend runs do no
 |----------|------|-------------|
 | `error` | string | Error message |
 
-## Asset events
+## Artifact events
 
-### `asset.captured`
+### `artifact.captured`
 
 ```json
 {
   "id": "...", "ts": "...", "run_id": "...",
-  "event": "asset.captured",
+  "event": "artifact.captured",
   "node_id": "code",
   "node_label": "code",
   "properties": {

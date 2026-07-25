@@ -283,7 +283,6 @@ Current style is already decent, but V2 should be stricter.
 
 Examples:
 
-- `agent.output.start` -> `message.part.started`
 - `agent.text.delta` -> `message.part.delta`
 - `agent.tool.output.delta` -> `tool.output.delta`
 - `agent.processing.end` -> `turn.completed` or `session.idle`, depending on actual semantics

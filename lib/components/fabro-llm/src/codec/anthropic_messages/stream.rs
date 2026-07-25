@@ -121,7 +121,8 @@ impl SseAccumulator {
                     .unwrap_or(0);
             }
         }
-        vec![StreamEvent::StreamStart]
+        // `StreamStart` is the driver's; this handler only captures metadata.
+        vec![]
     }
 
     fn handle_content_block_start(&mut self, data: &serde_json::Value) -> Vec<StreamEvent> {

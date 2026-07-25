@@ -112,9 +112,10 @@ pub use run_blob_id::RunBlobId;
 pub use run_event::{
     AgentMcpToolSummary, AgentMemoryFileProps, AgentSkillActivationSource, AgentSkillSummary,
     AgentToolCategory, AgentToolSource, AgentToolSummary, AgentToolsAvailableProps, EventBody,
-    ExecOutputTail, InterviewOption, MetadataSnapshotFailureKind, MetadataSnapshotPhase, RunEvent,
-    RunNoticeCode, RunNoticeLevel, RunPairEndedReason, RunPairFailedReason, RunRunnableSource,
-    SessionCapability, TodoCreatedProps, TodoDeletedProps, TodoUpdatedProps,
+    ExecOutputTail, InterviewOption, LlmOutputKind, LlmRetryPhase, MetadataSnapshotFailureKind,
+    MetadataSnapshotPhase, RunEvent, RunNoticeCode, RunNoticeLevel, RunPairEndedReason,
+    RunPairFailedReason, RunRunnableSource, SessionCapability, TodoCreatedProps, TodoDeletedProps,
+    TodoUpdatedProps,
 };
 pub use run_failure::RunFailure;
 pub use run_id::{RunId, fixtures};
@@ -123,8 +124,8 @@ pub use run_projection::{
     PendingInterviewRecord, RunProjection, SkillsProjection, StageContextWindow,
     StageContextWindowBreakdownItem, StageContextWindowCategory, StageContextWindowCountMethod,
     StageContextWindowProjection, StageContextWindowStaleness, StageContextWindowUnavailableReason,
-    StageContextWindowWarning, StageModelUsage, StageProjection, SubAgentProjection,
-    SubAgentStatus, first_event_seq,
+    StageContextWindowWarning, StageInferenceProjection, StageModelUsage, StageProjection,
+    SubAgentProjection, SubAgentStatus, first_event_seq,
 };
 pub use run_sandbox::{
     RunSandbox, RunSandboxFailure, RunSandboxInstance, RunSandboxKind, RunSandboxPlan,

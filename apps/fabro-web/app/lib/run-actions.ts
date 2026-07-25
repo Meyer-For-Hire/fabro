@@ -41,7 +41,7 @@ const CANCELABLE_STATUSES = new Set<RunStatus>([
   "blocked",
 ]);
 
-const ARCHIVABLE_STATUSES = new Set<RunStatus>([
+const TERMINAL_RUN_STATUSES = new Set<RunStatus>([
   "succeeded",
   "failed",
   "dead",
@@ -143,7 +143,7 @@ export function canApprove(run: Run | null | undefined): boolean {
 }
 
 export function canArchive(status: string | null | undefined): boolean {
-  return !!status && ARCHIVABLE_STATUSES.has(status as RunStatus);
+  return isTerminalRunStatus(status);
 }
 
 export function canUnarchive(status: string | null | undefined): boolean {
@@ -152,8 +152,13 @@ export function canUnarchive(status: string | null | undefined): boolean {
 
 export function canRetry(run: Pick<Run, "lifecycle"> | null | undefined): boolean {
   if (!run || run.lifecycle.archived) return false;
-  const status = run.lifecycle.status;
-  return status.kind === "succeeded" || status.kind === "failed" || status.kind === "dead";
+  return isTerminalRunStatus(run.lifecycle.status.kind);
+}
+
+export function isTerminalRunStatus(
+  status: string | null | undefined,
+): boolean {
+  return !!status && TERMINAL_RUN_STATUSES.has(status as RunStatus);
 }
 
 export function canDelete(status: string | null | undefined): boolean {

@@ -110,6 +110,14 @@ const AGENT_CONTROL_STATE_EVENTS = new Set([
   "agent.steering.injected",
   "agent.session.deactivated",
 ]);
+const INFERENCE_EVENTS = new Set([
+  "agent.llm.started",
+  "agent.llm.first_output",
+  "agent.llm.retry",
+  "agent.message",
+  "agent.error",
+  "agent.session.ended",
+]);
 // Todo / task mutation events refresh `getRunState` consumers (so per-stage
 // todo projections update live) and the run events list.
 const TODO_EVENTS = new Set([
@@ -181,6 +189,21 @@ export function queryKeysForRunEvent(
       keys.push(queryKeys.runs.stageContextWindow(runId, stageId));
     }
     return keys;
+  }
+
+  if (INFERENCE_EVENTS.has(event)) {
+    const keys: Key[] = [queryKeys.runs.state(runId)];
+    if (stageId) {
+      keys.push(queryKeys.runs.stageEvents(runId, stageId));
+      if (event === "agent.message") {
+        keys.push(queryKeys.runs.stageContextWindow(runId, stageId));
+      }
+    }
+    return keys;
+  }
+
+  if (event === "watchdog.timeout") {
+    return stageId ? [queryKeys.runs.stageEvents(runId, stageId)] : [];
   }
 
   if (STAGE_ACTIVITY_EVENTS.has(event)) {

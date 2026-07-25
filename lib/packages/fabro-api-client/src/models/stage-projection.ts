@@ -48,6 +48,9 @@ import type { StageCompletion } from './stage-completion';
 import type { StageContextWindowProjection } from './stage-context-window-projection';
 // May contain unused imports in some cases
 // @ts-ignore
+import type { StageInferenceProjection } from './stage-inference-projection';
+// May contain unused imports in some cases
+// @ts-ignore
 import type { StageModelUsage } from './stage-model-usage';
 // May contain unused imports in some cases
 // @ts-ignore
@@ -114,6 +117,7 @@ export interface StageProjection {
      */
     'mcp_servers'?: Array<McpServerProjection>;
     'context_window'?: StageContextWindowProjection | null;
+    'inference'?: StageInferenceProjection | null;
     /**
      * Whether the agent is executing normally or waiting for steering after an interrupt.
      */

@@ -290,6 +290,33 @@ pub struct AgentCompactionCompletedProps {
     pub visit:                  u32,
 }
 
+/// Which loop produced the `attempt` index on an `agent.llm.retry` event.
+///
+/// `attempt` is a 0-based counter fed by two independent loops: the retry
+/// policy inside `open_stream_with_retry` (`Open`) and the stream-consume
+/// loop that replays a turn whose stream broke or ended without a finish
+/// event (`Consume`). Without this discriminator a reader cannot tell which
+/// counter an index belongs to.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Display,
+    EnumString,
+    IntoStaticStr,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum LlmRetryPhase {
+    Open,
+    Consume,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentLlmRetryProps {
     pub provider:   String,
@@ -297,7 +324,56 @@ pub struct AgentLlmRetryProps {
     pub attempt:    usize,
     pub delay_secs: f64,
     pub error:      Value,
+    /// Which retry loop `attempt` counts. Absent on events stored before the
+    /// discriminator existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase:      Option<LlmRetryPhase>,
     pub visit:      u32,
+}
+
+/// Kind of output a provider produced first for an inference attempt.
+///
+/// Observed, never inferred: a turn that opens with a tool call emits no text
+/// or reasoning delta, so all three variants are required for the first-output
+/// edge to fire on every turn.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Display,
+    EnumString,
+    IntoStaticStr,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum LlmOutputKind {
+    Reasoning,
+    Text,
+    ToolCall,
+}
+
+/// An inference request is about to be dispatched for this round.
+///
+/// `requested_model` is the requested target from the session's provider
+/// profile. Failover can re-target mid-stage, so `agent.message` remains
+/// authoritative for what actually answered.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentLlmStartedProps {
+    pub requested_model: ModelRef,
+    pub visit:           u32,
+}
+
+/// The provider produced its first output for the current attempt.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentLlmFirstOutputProps {
+    /// Which kind of output arrived first — observed, not inferred.
+    pub kind:  LlmOutputKind,
+    pub visit: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

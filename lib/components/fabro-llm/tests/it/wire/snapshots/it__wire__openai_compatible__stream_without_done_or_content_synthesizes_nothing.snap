@@ -2,4 +2,8 @@
 source: lib/components/fabro-llm/tests/it/wire/openai_compatible.rs
 expression: rendered
 ---
-[]
+[
+  {
+    "type": "stream_start"
+  }
+]

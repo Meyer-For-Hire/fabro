@@ -95,7 +95,6 @@ pub(super) struct SseAccumulator {
     message_items:           Vec<serde_json::Value>,
     usage:                   TokenCounts,
     finish_reason:           FinishReason,
-    emitted_start:           bool,
     emitted_text_start:      bool,
     emitted_reasoning_start: bool,
     rate_limit:              Option<RateLimitInfo>,
@@ -114,7 +113,6 @@ impl SseAccumulator {
             message_items: Vec::new(),
             usage: TokenCounts::default(),
             finish_reason: FinishReason::Stop,
-            emitted_start: false,
             emitted_text_start: false,
             emitted_reasoning_start: false,
             rate_limit,
@@ -129,11 +127,6 @@ impl SseAccumulator {
         data: &str,
     ) -> Result<Vec<StreamEvent>, Error> {
         let mut events = Vec::new();
-
-        if !self.emitted_start {
-            self.emitted_start = true;
-            events.push(StreamEvent::StreamStart);
-        }
 
         let json: serde_json::Value = match serde_json::from_str(data) {
             Ok(v) => v,
@@ -446,8 +439,7 @@ mod tests {
 
     /// Build an accumulator without threading a `CodecCtx`/`Request`: the test
     /// module sees the private fields, so the few that matter are set
-    /// directly. `emitted_start` is true so event assertions don't see the
-    /// initial `StreamStart`.
+    /// directly.
     fn empty_accumulator() -> SseAccumulator {
         SseAccumulator {
             model:                   String::new(),
@@ -460,7 +452,6 @@ mod tests {
             message_items:           Vec::new(),
             usage:                   TokenCounts::default(),
             finish_reason:           FinishReason::Stop,
-            emitted_start:           true,
             emitted_text_start:      false,
             emitted_reasoning_start: false,
             rate_limit:              None,

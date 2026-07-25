@@ -125,6 +125,36 @@ describe("queryKeysForRunEvent", () => {
       queryKeys.runs.stageEvents("run-1", "code@1"),
     ]);
   });
+
+  test("every inference projection transition invalidates live run state", () => {
+    for (const event of [
+      "agent.llm.started",
+      "agent.llm.first_output",
+      "agent.llm.retry",
+      "agent.error",
+    ]) {
+      expect(queryKeysForRunEvent("run-1", event, "code@1")).toEqual([
+        queryKeys.runs.state("run-1"),
+        queryKeys.runs.stageEvents("run-1", "code@1"),
+      ]);
+    }
+    expect(
+      queryKeysForRunEvent("run-1", "agent.message", "code@1"),
+    ).toEqual([
+      queryKeys.runs.state("run-1"),
+      queryKeys.runs.stageEvents("run-1", "code@1"),
+      queryKeys.runs.stageContextWindow("run-1", "code@1"),
+    ]);
+    expect(queryKeysForRunEvent("run-1", "agent.session.ended")).toEqual([
+      queryKeys.runs.state("run-1"),
+    ]);
+  });
+
+  test("watchdog timeout refreshes the stage events that settle inference", () => {
+    expect(
+      queryKeysForRunEvent("run-1", "watchdog.timeout", "code@1"),
+    ).toEqual([queryKeys.runs.stageEvents("run-1", "code@1")]);
+  });
 });
 
 describe("subscribeToRunEvents", () => {

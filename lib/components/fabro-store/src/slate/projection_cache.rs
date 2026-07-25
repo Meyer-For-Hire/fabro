@@ -72,12 +72,36 @@ impl RunProjectionCacheState {
         let Some(parent_id) = entry.summary.parent_id else {
             return;
         };
-        let Some(children) = self.children_by_parent.get_mut(&parent_id) else {
+        self.remove_parent_link(&parent_id, &entry.run_id);
+    }
+
+    fn remove_parent_link(&mut self, parent_id: &RunId, run_id: &RunId) {
+        let Some(children) = self.children_by_parent.get_mut(parent_id) else {
             return;
         };
-        children.remove(&entry.run_id);
+        children.remove(run_id);
         if children.is_empty() {
-            self.children_by_parent.remove(&parent_id);
+            self.children_by_parent.remove(parent_id);
+        }
+    }
+
+    fn update_parent_index(
+        &mut self,
+        run_id: RunId,
+        previous_parent_id: Option<RunId>,
+        parent_id: Option<RunId>,
+    ) {
+        if previous_parent_id == parent_id {
+            return;
+        }
+        if let Some(previous_parent_id) = previous_parent_id {
+            self.remove_parent_link(&previous_parent_id, &run_id);
+        }
+        if let Some(parent_id) = parent_id {
+            self.children_by_parent
+                .entry(parent_id)
+                .or_default()
+                .insert(run_id);
         }
     }
 
@@ -204,7 +228,7 @@ impl RunProjectionCache {
         event: &EventEnvelope,
     ) -> Result<CachedRunProjection> {
         let mut state = self.state.lock().await;
-        let Some(entry) = state.entries.get(run_id).cloned() else {
+        let Some(entry) = state.entries.get(run_id) else {
             if event.seq == 1 {
                 let projection = RunProjection::apply_events(std::slice::from_ref(event))?;
                 let entry = CachedRunProjection::from_projection(*run_id, projection, event.seq);
@@ -217,20 +241,29 @@ impl RunProjectionCache {
             )));
         };
 
-        if event.seq <= entry.last_seq {
-            return Ok(entry);
+        let last_seq = entry.last_seq;
+        if event.seq <= last_seq {
+            return Ok(entry.clone());
         }
-        if event.seq != entry.last_seq.saturating_add(1) {
+        if event.seq != last_seq.saturating_add(1) {
             return Err(Error::Other(format!(
                 "projection cache sequence gap for run {run_id}: last_seq={}, event_seq={}",
-                entry.last_seq, event.seq
+                last_seq, event.seq
             )));
         }
 
-        let mut projection = (*entry.projection).clone();
-        projection.apply_event(event)?;
-        let entry = CachedRunProjection::from_projection(*run_id, projection, event.seq);
-        state.insert(entry.clone());
+        let (previous_parent_id, parent_id, entry) = {
+            let entry = state
+                .entries
+                .get_mut(run_id)
+                .expect("entry was read from the same locked map");
+            let previous_parent_id = entry.summary.parent_id;
+            Arc::make_mut(&mut entry.projection).apply_event(event)?;
+            entry.summary = build_summary(&entry.projection, run_id);
+            entry.last_seq = event.seq;
+            (previous_parent_id, entry.summary.parent_id, entry.clone())
+        };
+        state.update_parent_index(*run_id, previous_parent_id, parent_id);
         Ok(entry)
     }
 

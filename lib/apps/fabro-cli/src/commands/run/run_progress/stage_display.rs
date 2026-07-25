@@ -3,6 +3,7 @@ use std::convert::TryFrom;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use fabro_types::LlmOutputKind;
 use fabro_workflow::outcome::{StageOutcome, format_cost};
 use indicatif::ProgressBar;
 
@@ -37,6 +38,9 @@ pub(super) struct ActiveStage {
     pub(super) spinner:        ProgressBar,
     pub(super) tool_calls:     VecDeque<ToolCallEntry>,
     pub(super) compaction_bar: Option<ProgressBar>,
+    /// Live line for the open inference bracket. Cleared when the round ends,
+    /// so a stale "waiting on model" never outlives the request.
+    pub(super) inference_bar:  Option<ProgressBar>,
 }
 
 impl ActiveStage {
@@ -75,6 +79,9 @@ impl StageDisplay {
     pub(super) fn finish(&mut self) {
         for (_node_id, stage) in self.active_stages.drain() {
             if let Some(bar) = stage.compaction_bar {
+                bar.finish_and_clear();
+            }
+            if let Some(bar) = stage.inference_bar {
                 bar.finish_and_clear();
             }
             for entry in &stage.tool_calls {
@@ -123,6 +130,7 @@ impl StageDisplay {
             spinner: bar,
             tool_calls: VecDeque::new(),
             compaction_bar: None,
+            inference_bar: None,
         });
     }
 
@@ -501,6 +509,69 @@ impl StageDisplay {
         }
     }
 
+    /// Open the live line for an inference request.
+    ///
+    /// It says only what is provable: a request is open and nothing has come
+    /// back yet. No percentage, no ETA — the elapsed time ticks from the
+    /// steady tick, and it is time since the request opened, not a claim
+    /// about how much longer it will take.
+    pub(super) fn on_llm_request_started(
+        &mut self,
+        renderer: &ProgressRenderer,
+        stage_node_id: &str,
+        model: &str,
+    ) {
+        if !renderer.is_tty() {
+            return;
+        }
+        let Some(stage) = self.active_stages.get_mut(stage_node_id) else {
+            return;
+        };
+
+        if let Some(old) = stage.inference_bar.take() {
+            old.finish_and_clear();
+        }
+        let bar = renderer.insert_after(stage.last_bar());
+        bar.set_style(styles::style_tool_running());
+        bar.set_message(format!(
+            "\u{27f3} model request: waiting on {model}\u{2026}"
+        ));
+        bar.enable_steady_tick(Duration::from_millis(100));
+        stage.inference_bar = Some(bar);
+    }
+
+    /// Replace the waiting message once the provider produces output.
+    ///
+    /// "thinking" is used only for reasoning, because that is the only case
+    /// where the provider said so.
+    pub(super) fn on_llm_first_output(&mut self, stage_node_id: &str, kind: LlmOutputKind) {
+        let Some(bar) = self
+            .active_stages
+            .get(stage_node_id)
+            .and_then(|stage| stage.inference_bar.as_ref())
+        else {
+            return;
+        };
+
+        let activity = match kind {
+            LlmOutputKind::Reasoning => "reasoning",
+            LlmOutputKind::Text => "writing",
+            LlmOutputKind::ToolCall => "calling tools",
+        };
+        bar.set_message(format!("\u{27f3} model request: {activity}\u{2026}"));
+    }
+
+    /// Close the live line for a round that produced a message.
+    pub(super) fn on_llm_request_finished(&mut self, stage_node_id: &str) {
+        if let Some(bar) = self
+            .active_stages
+            .get_mut(stage_node_id)
+            .and_then(|stage| stage.inference_bar.take())
+        {
+            bar.finish_and_clear();
+        }
+    }
+
     pub(super) fn on_llm_retry(
         &mut self,
         renderer: &ProgressRenderer,
@@ -510,6 +581,16 @@ impl StageDisplay {
         delay_ms: u64,
         error: &str,
     ) {
+        if let Some(bar) = self
+            .active_stages
+            .get(stage_node_id)
+            .and_then(|stage| stage.inference_bar.as_ref())
+        {
+            bar.set_message(format!(
+                "\u{27f3} model request: waiting on {model}\u{2026}"
+            ));
+        }
+
         if !self.verbose {
             return;
         }
@@ -590,6 +671,9 @@ impl StageDisplay {
         };
 
         if let Some(bar) = stage.compaction_bar {
+            bar.finish_and_clear();
+        }
+        if let Some(bar) = stage.inference_bar {
             bar.finish_and_clear();
         }
         for entry in &stage.tool_calls {

@@ -4,6 +4,9 @@ expression: rendered
 ---
 [
   {
+    "type": "stream_start"
+  },
+  {
     "type": "tool_call_start",
     "tool_call": {
       "id": "call_abc",

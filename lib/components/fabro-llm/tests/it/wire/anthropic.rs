@@ -648,6 +648,7 @@ async fn stream_text_happy_path_request() {
 #[tokio::test]
 async fn stream_text_happy_path_events() {
     let (_, events) = stream_text_happy_path_capture().await;
+    support::assert_stream_starts(&events);
     fabro_test::fabro_json_snapshot!(events);
 }
 

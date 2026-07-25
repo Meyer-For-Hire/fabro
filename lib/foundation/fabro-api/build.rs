@@ -356,6 +356,12 @@ fn main() {
             &[],
         ),
         ("StageProjection", "fabro_types::StageProjection", &[]),
+        (
+            "StageInferenceProjection",
+            "fabro_types::StageInferenceProjection",
+            &[],
+        ),
+        ("LlmOutputKind", "fabro_types::LlmOutputKind", &[]),
         ("PermissionLevel", "fabro_types::PermissionLevel", &[]),
         (
             "AgentSessionActivatedProps",

@@ -2,7 +2,7 @@ use std::convert::TryFrom;
 
 use chrono::{DateTime, Utc};
 use fabro_agent::Error as AgentError;
-use fabro_types::{BilledModelUsage, EventBody, RunEvent};
+use fabro_types::{BilledModelUsage, EventBody, LlmOutputKind, RunEvent};
 use fabro_util::error;
 use fabro_workflow::event::RunNoticeLevel;
 use serde_json::Value;
@@ -137,6 +137,7 @@ pub(super) enum ProgressEvent {
     AssistantMessage {
         stage_node_id: String,
         model:         String,
+        root_session:  bool,
     },
     ToolCallStarted {
         stage_node_id: String,
@@ -168,6 +169,15 @@ pub(super) enum ProgressEvent {
     CompactionFailed {
         stage_node_id: String,
         error:         String,
+        root_session:  bool,
+    },
+    LlmRequestStarted {
+        stage_node_id: String,
+        model:         String,
+    },
+    LlmFirstOutput {
+        stage_node_id: String,
+        kind:          LlmOutputKind,
     },
     LlmRetry {
         stage_node_id: String,
@@ -175,6 +185,9 @@ pub(super) enum ProgressEvent {
         attempt:       u64,
         delay_ms:      u64,
         error:         String,
+    },
+    LlmRequestFinished {
+        stage_node_id: String,
     },
     SubagentSpawned {
         stage_node_id: String,
@@ -329,6 +342,7 @@ pub(super) fn from_run_event(stored: &RunEvent) -> Option<ProgressEvent> {
         EventBody::AgentMessage(props) => Some(ProgressEvent::AssistantMessage {
             stage_node_id: node_id,
             model:         props.model.model_id.to_string(),
+            root_session:  stored.parent_session_id.is_none(),
         }),
         EventBody::AgentToolStarted(props) => Some(ProgressEvent::ToolCallStarted {
             stage_node_id: node_id,
@@ -365,13 +379,30 @@ pub(super) fn from_run_event(stored: &RunEvent) -> Option<ProgressEvent> {
             preserved_turn_count: props.preserved_turn_count as u64,
             tracked_file_count:   props.tracked_file_count as u64,
         }),
-        EventBody::AgentError(props) => {
-            display_compaction_error(&props.error).map(|error| ProgressEvent::CompactionFailed {
+        EventBody::AgentError(props) => match display_compaction_error(&props.error) {
+            Some(error) => Some(ProgressEvent::CompactionFailed {
                 stage_node_id: node_id,
                 error,
+                root_session: stored.parent_session_id.is_none(),
+            }),
+            None if stored.parent_session_id.is_none() => Some(ProgressEvent::LlmRequestFinished {
+                stage_node_id: node_id,
+            }),
+            None => None,
+        },
+        EventBody::AgentLlmStarted(props) if stored.parent_session_id.is_none() => {
+            Some(ProgressEvent::LlmRequestStarted {
+                stage_node_id: node_id,
+                model:         props.requested_model.model_id.to_string(),
             })
         }
-        EventBody::AgentLlmRetry(props) => {
+        EventBody::AgentLlmFirstOutput(props) if stored.parent_session_id.is_none() => {
+            Some(ProgressEvent::LlmFirstOutput {
+                stage_node_id: node_id,
+                kind:          props.kind,
+            })
+        }
+        EventBody::AgentLlmRetry(props) if stored.parent_session_id.is_none() => {
             #[allow(
                 clippy::cast_possible_truncation,
                 clippy::cast_sign_loss,
@@ -384,6 +415,11 @@ pub(super) fn from_run_event(stored: &RunEvent) -> Option<ProgressEvent> {
                 attempt: props.attempt as u64,
                 delay_ms,
                 error: display_value(&props.error).unwrap_or_else(|| "unknown error".to_string()),
+            })
+        }
+        EventBody::AgentRoundInterrupted(_) if stored.parent_session_id.is_none() => {
+            Some(ProgressEvent::LlmRequestFinished {
+                stage_node_id: node_id,
             })
         }
         EventBody::AgentSubSpawned(props) => Some(ProgressEvent::SubagentSpawned {

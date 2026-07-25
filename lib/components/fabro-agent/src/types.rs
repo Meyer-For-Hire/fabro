@@ -5,8 +5,8 @@ use fabro_llm::Error as LlmError;
 use fabro_llm::types::{ContentPart, ThinkingData, TokenCounts, ToolCall, ToolResult};
 use fabro_model::{CostSource, ModelRef};
 use fabro_types::{
-    CommandTermination, ExecOutputTail, ReasoningOutput, SessionMessage,
-    StageContextWindowProjection,
+    CommandTermination, ExecOutputTail, LlmOutputKind, LlmRetryPhase, ReasoningOutput,
+    SessionMessage, StageContextWindowProjection,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -237,7 +237,20 @@ pub enum AgentEvent {
     UserInput {
         text: String,
     },
-    AssistantTextStart,
+    /// An inference request is about to be dispatched for this round. Emitted
+    /// after the request is built and compaction has run, immediately before
+    /// the stream is opened. `provider` and `model` are the requested target;
+    /// failover can re-target, so `AssistantMessage` stays authoritative for
+    /// what actually answered.
+    LlmRequestStarted {
+        requested_model: ModelRef,
+    },
+    /// The provider produced its first output for the current attempt.
+    /// Edge-triggered: emitted once per stream attempt, re-armed when a
+    /// broken or finish-less stream restarts the turn.
+    LlmFirstOutput {
+        kind: LlmOutputKind,
+    },
     /// Replaces the current in-progress assistant output buffers.
     AssistantOutputReplace {
         text:      String,
@@ -328,12 +341,15 @@ pub enum AgentEvent {
         summary_token_estimate: usize,
         tracked_file_count:     usize,
     },
+    /// An attempt failed to open **or sustain** a stream and the turn is
+    /// being replayed. `phase` names which retry loop `attempt` counts.
     LlmRetry {
         provider:   String,
         model:      String,
         attempt:    usize,
         delay_secs: f64,
         error:      LlmError,
+        phase:      LlmRetryPhase,
     },
     SubAgentSpawned {
         agent_id: String,
@@ -396,8 +412,7 @@ impl AgentEvent {
     pub fn is_streaming_noise(&self) -> bool {
         matches!(
             self,
-            Self::AssistantTextStart
-                | Self::AssistantOutputReplace { .. }
+            Self::AssistantOutputReplace { .. }
                 | Self::TextDelta { .. }
                 | Self::ReasoningDelta { .. }
                 | Self::ToolCallOutputDelta { .. }
@@ -424,8 +439,17 @@ impl AgentEvent {
             Self::UserInput { text } => {
                 debug!(session_id, text_len = text.len(), "User input received");
             }
-            Self::AssistantTextStart => {
-                debug!(session_id, "Assistant response started");
+            Self::LlmRequestStarted { requested_model } => {
+                debug!(
+                    session_id,
+                    provider = %requested_model.provider,
+                    model = %requested_model.model_id,
+                    speed = requested_model.speed.map_or("", <&'static str>::from),
+                    "LLM request started"
+                );
+            }
+            Self::LlmFirstOutput { kind } => {
+                debug!(session_id, kind = %kind, "LLM produced first output");
             }
             Self::AssistantMessage {
                 model,
@@ -545,6 +569,7 @@ impl AgentEvent {
                 attempt,
                 delay_secs,
                 error,
+                phase,
             } => {
                 warn!(
                     session_id,
@@ -552,6 +577,7 @@ impl AgentEvent {
                     model,
                     attempt,
                     delay_secs,
+                    phase = %phase,
                     error = %error,
                     "LLM request failed, retrying"
                 );
@@ -1001,6 +1027,7 @@ mod tests {
             model:      "gpt-4".into(),
             attempt:    1,
             delay_secs: 2.0,
+            phase:      LlmRetryPhase::Open,
             error:      LlmError::Provider {
                 kind:   ProviderErrorKind::RateLimit,
                 detail: Box::new(ProviderErrorDetail {

@@ -197,6 +197,7 @@ models/interview-option.ts
 models/interview-provider-settings.ts
 models/interview-question-record.ts
 models/link-run-pull-request-request.ts
+models/llm-output-kind.ts
 models/log-destination.ts
 models/manifest-args.ts
 models/manifest-config.ts
@@ -479,6 +480,7 @@ models/stage-context-window-unavailable-reason.ts
 models/stage-context-window-warning.ts
 models/stage-context-window.ts
 models/stage-handler.ts
+models/stage-inference-projection.ts
 models/stage-model-usage.ts
 models/stage-outcome.ts
 models/stage-projection.ts

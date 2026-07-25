@@ -247,12 +247,14 @@ pub(crate) async fn stream_via_http(
 struct StreamLoop {
     decoder:          Box<dyn StreamDecoder>,
     line_reader:      LineReader,
-    /// Events decoded but not yet yielded.
-    pending:          VecDeque<StreamEvent>,
+    /// Events or decoder errors not yet yielded.
+    pending:          VecDeque<Result<StreamEvent, Error>>,
     /// Byte stream exhausted.
     done:             bool,
     /// `finish()` already drained.
     finished_emitted: bool,
+    /// [`StreamEvent::StreamStart`] already emitted for this stream.
+    stream_started:   bool,
 }
 
 /// Drive `decoder` over the SSE byte stream of `response`: frame each chunk,
@@ -271,11 +273,12 @@ fn decode_sse_stream(
             pending: VecDeque::new(),
             done: false,
             finished_emitted: false,
+            stream_started: false,
         },
         move |mut state| async move {
             loop {
                 if let Some(event) = state.pending.pop_front() {
-                    return Some((Ok(event), state));
+                    return Some((event, state));
                 }
 
                 if state.done {
@@ -283,7 +286,9 @@ fn decode_sse_stream(
                         return None;
                     }
                     state.finished_emitted = true;
-                    state.pending.extend(state.decoder.finish());
+                    state
+                        .pending
+                        .extend(state.decoder.finish().into_iter().map(Ok));
                     if state.pending.is_empty() {
                         return None;
                     }
@@ -295,9 +300,18 @@ fn decode_sse_stream(
                         let Some((event, data)) = frame_sse_chunk(framing, &chunk) else {
                             continue;
                         };
+                        // Provider-independent liveness edge: the first framed
+                        // event proves the provider is responding, whatever it
+                        // turns out to contain. Owned here rather than in each
+                        // decoder so it cannot depend on a provider sending a
+                        // particular opening frame.
+                        if !state.stream_started {
+                            state.stream_started = true;
+                            state.pending.push_back(Ok(StreamEvent::StreamStart));
+                        }
                         match state.decoder.on_event(RawEvent { event, data: &data }) {
-                            Ok(events) => state.pending.extend(events),
-                            Err(e) => return Some((Err(e), state)),
+                            Ok(events) => state.pending.extend(events.into_iter().map(Ok)),
+                            Err(error) => state.pending.push_back(Err(error)),
                         }
                     }
                     Ok(None) => state.done = true,

@@ -309,14 +309,16 @@ impl ProviderAdapter for Adapter {
 /// State driving the event-stream byte loop: the codec's decoder plus the
 /// frame decoder, with a buffer that flattens batched events.
 struct EventStreamLoop {
-    response: fabro_http::Response,
-    frames:   FrameDecoder,
-    decoder:  Box<dyn StreamDecoder>,
-    pending:  VecDeque<StreamEvent>,
-    done:     bool,
+    response:       fabro_http::Response,
+    frames:         FrameDecoder,
+    decoder:        Box<dyn StreamDecoder>,
+    pending:        VecDeque<Result<StreamEvent, Error>>,
+    done:           bool,
     /// `finish()` already drained.
-    finished: bool,
-    timeout:  Option<Duration>,
+    finished:       bool,
+    /// [`StreamEvent::StreamStart`] already emitted for this stream.
+    stream_started: bool,
+    timeout:        Option<Duration>,
 }
 
 /// Drive `decoder` over the AWS event-stream byte stream of `response`: the
@@ -335,12 +337,13 @@ fn decode_eventstream(
             pending: VecDeque::new(),
             done: false,
             finished: false,
+            stream_started: false,
             timeout,
         },
         move |mut state| async move {
             loop {
                 if let Some(event) = state.pending.pop_front() {
-                    return Some((Ok(event), state));
+                    return Some((event, state));
                 }
 
                 if state.done {
@@ -348,7 +351,9 @@ fn decode_eventstream(
                         return None;
                     }
                     state.finished = true;
-                    state.pending.extend(state.decoder.finish());
+                    state
+                        .pending
+                        .extend(state.decoder.finish().into_iter().map(Ok));
                     if state.pending.is_empty() {
                         return None;
                     }
@@ -370,9 +375,19 @@ fn decode_eventstream(
                                 event: Some(frame.event_type.as_str()),
                                 data:  frame.payload.as_str(),
                             };
+                            // Mirrors the SSE loop: the first decoded frame is
+                            // the liveness edge, independent of which event
+                            // type the provider happens to open with.
+                            if !state.stream_started {
+                                state.stream_started = true;
+                                state.pending.push_back(Ok(StreamEvent::StreamStart));
+                            }
                             match state.decoder.on_event(raw) {
-                                Ok(events) => state.pending.extend(events),
-                                Err(e) => return Some((Err(e), state)),
+                                Ok(events) => state.pending.extend(events.into_iter().map(Ok)),
+                                Err(error) => {
+                                    state.pending.push_back(Err(error));
+                                    break;
+                                }
                             }
                         }
                     }
