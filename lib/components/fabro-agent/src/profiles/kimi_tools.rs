@@ -262,11 +262,11 @@ pub fn make_kimi_write_tool() -> RegisteredTool {
 Read an existing file with Read before writing to it — this workspace refuses writes to files \
 that have not been read, and the call will fail.
 
-- `mode` defaults to `overwrite`, which replaces the whole file. `append` adds to the end without \
-inserting a newline.
+- `mode` defaults to `overwrite`, which replaces the whole file. `append` requires an existing file \
+and adds to its end without inserting a newline.
 - Write is NOT for incremental changes to an existing file, however small. Use Edit instead: \
 overwrite replaces everything you did not restate.
-- Use Write when the file does not exist, or when you intend a complete replacement.
+- Use `overwrite` when the file does not exist, or when you intend a complete replacement.
 - Do not create documentation files that were not asked for.",
             serde_json::json!({
                 "type": "object",
