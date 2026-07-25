@@ -15380,7 +15380,11 @@ async fn cancel_before_run_transitions_to_running_returns_empty_attach_stream() 
         .unwrap();
     let response = app.oneshot(req).await.unwrap();
     let body = response_bytes!(response, StatusCode::OK).await;
-    assert!(body.is_empty(), "expected an empty attach stream");
+    assert!(
+        body.is_empty(),
+        "expected an empty attach stream, got {}",
+        String::from_utf8_lossy(&body)
+    );
 }
 
 /// Reasoning has to survive the whole durable path, not just the local

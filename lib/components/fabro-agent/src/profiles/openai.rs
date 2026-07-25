@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use fabro_model::{AgentProfileKind, Catalog, CodecKind, ProviderId};
+use fabro_model::{AgentProfileKind, Catalog, ProviderId};
 
 use super::EnvContext;
 use crate::agent_profile::AgentProfile;
@@ -16,26 +16,8 @@ use crate::tools::{self, WebFetchSummarizer, register_core_tools};
 
 const CORE_PROMPT: &str = include_str!("prompts/openai.md.j2");
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, strum::IntoStaticStr)]
-#[strum(serialize_all = "snake_case")]
-enum FileEditToolKind {
-    ApplyPatch,
-    EditFile,
-}
-
-impl FileEditToolKind {
-    fn for_codec(codec: CodecKind) -> Self {
-        if codec == CodecKind::OpenAiResponses {
-            Self::ApplyPatch
-        } else {
-            Self::EditFile
-        }
-    }
-}
-
 pub struct OpenAiProfile {
-    base:           BaseProfile,
-    file_edit_tool: FileEditToolKind,
+    base: BaseProfile,
 }
 
 impl OpenAiProfile {
@@ -59,67 +41,23 @@ impl OpenAiProfile {
         registry.register(make_update_plan_tool(todo_runtime));
 
         Self {
-            base:           BaseProfile {
+            base: BaseProfile {
                 profile_kind: AgentProfileKind::OpenAi,
                 provider_id: ProviderId::openai(),
                 model: model.into(),
                 catalog: None,
                 registry,
             },
-            file_edit_tool: FileEditToolKind::ApplyPatch,
         }
     }
 
-    /// Override the provider ID while retaining the adapter/profile behavior.
+    /// Configure the provider and catalog together so the route's codec
+    /// determines which file editor is registered.
     #[must_use]
-    pub fn with_provider_id(mut self, provider_id: ProviderId) -> Self {
-        self.base.provider_id = provider_id;
-        self.configure_file_edit_tool();
+    pub fn with_route(mut self, provider_id: ProviderId, catalog: Arc<Catalog>) -> Self {
+        self.base.set_route(provider_id, catalog);
+        self.base.configure_file_edit_tool();
         self
-    }
-
-    #[must_use]
-    pub fn with_catalog(mut self, catalog: Arc<Catalog>) -> Self {
-        self.base.catalog = Some(catalog);
-        self.configure_file_edit_tool();
-        self
-    }
-
-    fn configure_file_edit_tool(&mut self) {
-        let Some(codec) = self.base.catalog.as_ref().and_then(|catalog| {
-            catalog.effective_codec(&self.base.provider_id, Some(&self.base.model))
-        }) else {
-            return;
-        };
-        let desired = FileEditToolKind::for_codec(codec);
-        if desired == self.file_edit_tool {
-            return;
-        }
-
-        match desired {
-            FileEditToolKind::ApplyPatch => {
-                self.base.registry.unregister("edit_file");
-                self.base
-                    .registry
-                    .register(apply_patch::make_apply_patch_tool());
-            }
-            FileEditToolKind::EditFile => {
-                self.base.registry.unregister("apply_patch");
-                self.base.registry.register(tools::make_edit_file_tool());
-            }
-        }
-        self.file_edit_tool = desired;
-    }
-
-    fn provider_display_name(&self) -> String {
-        self.base
-            .catalog
-            .as_ref()
-            .and_then(|catalog| catalog.provider(&self.base.provider_id))
-            .map_or_else(
-                || self.base.provider_id.display_name(),
-                |provider| provider.display_name.clone(),
-            )
     }
 }
 
@@ -156,14 +94,18 @@ impl AgentProfile for OpenAiProfile {
         user_instructions: Option<&str>,
         skills: &[Skill],
     ) -> String {
-        let file_edit_tool: &'static str = self.file_edit_tool.into();
+        let file_edit_tool: &'static str = self
+            .base
+            .file_edit_tool()
+            .expect("OpenAI profile should register exactly one file-editing tool")
+            .into();
         let has_web_search = self
             .base
             .registry
             .get(tools::WEB_SEARCH_TOOL_NAME)
             .is_some();
         let template = EmbeddedPrompt::new("openai.md.j2", CORE_PROMPT)
-            .with_string("provider_name", self.provider_display_name())
+            .with_string("provider_name", self.base.provider_display_name())
             .with_string("file_edit_tool", file_edit_tool)
             .with_bool("has_web_search", has_web_search);
 
@@ -311,9 +253,8 @@ mod tests {
 
     #[test]
     fn kimi_provider_prompt_uses_catalog_display_name() {
-        let profile = OpenAiProfile::new("kimi-k2.5")
-            .with_provider_id(ProviderId::new("kimi"))
-            .with_catalog(test_catalog());
+        let profile =
+            OpenAiProfile::new("kimi-k2.5").with_route(ProviderId::new("kimi"), test_catalog());
         let env = MockSandbox::linux();
         let prompt = profile.build_system_prompt(&env, &EnvContext::default(), &[], None, &[]);
         assert!(prompt.contains("powered by Kimi"));
@@ -322,9 +263,8 @@ mod tests {
 
     #[test]
     fn openai_compatible_profile_uses_json_schema_edit_tool() {
-        let profile = OpenAiProfile::new("kimi-k2.5")
-            .with_provider_id(ProviderId::new("kimi"))
-            .with_catalog(test_catalog());
+        let profile =
+            OpenAiProfile::new("kimi-k2.5").with_route(ProviderId::new("kimi"), test_catalog());
 
         let names = profile.tool_registry().names();
         assert!(names.contains(&"edit_file".to_string()));
@@ -349,20 +289,9 @@ mod tests {
     }
 
     #[test]
-    fn file_edit_tool_selection_is_builder_order_independent() {
-        let profile = OpenAiProfile::new("kimi-k2.5")
-            .with_catalog(test_catalog())
-            .with_provider_id(ProviderId::new("kimi"));
-
-        assert!(profile.tool_registry().get("edit_file").is_some());
-        assert!(profile.tool_registry().get("apply_patch").is_none());
-    }
-
-    #[test]
     fn zai_provider_prompt_uses_catalog_display_name() {
-        let profile = OpenAiProfile::new("glm-4.7")
-            .with_provider_id(ProviderId::new("zai"))
-            .with_catalog(test_catalog());
+        let profile =
+            OpenAiProfile::new("glm-4.7").with_route(ProviderId::new("zai"), test_catalog());
         let env = MockSandbox::linux();
         let prompt = profile.build_system_prompt(&env, &EnvContext::default(), &[], None, &[]);
         assert!(prompt.contains("powered by Z.ai"));
@@ -371,8 +300,7 @@ mod tests {
     #[test]
     fn minimax_provider_prompt_uses_catalog_display_name() {
         let profile = OpenAiProfile::new("minimax-m2.5")
-            .with_provider_id(ProviderId::new("minimax"))
-            .with_catalog(test_catalog());
+            .with_route(ProviderId::new("minimax"), test_catalog());
         let env = MockSandbox::linux();
         let prompt = profile.build_system_prompt(&env, &EnvContext::default(), &[], None, &[]);
         assert!(prompt.contains("powered by MiniMax"));
@@ -381,8 +309,7 @@ mod tests {
     #[test]
     fn inception_provider_prompt_uses_catalog_display_name() {
         let profile = OpenAiProfile::new("mercury-2")
-            .with_provider_id(ProviderId::new("inception"))
-            .with_catalog(test_catalog());
+            .with_route(ProviderId::new("inception"), test_catalog());
         let env = MockSandbox::linux();
         let prompt = profile.build_system_prompt(&env, &EnvContext::default(), &[], None, &[]);
         assert!(prompt.contains("powered by Inception"));

@@ -78,10 +78,18 @@ pub(crate) fn register_discovery_and_web_tools(
     summarizer: Option<WebFetchSummarizer>,
 ) {
     registry.register(make_glob_tool());
+    register_web_search_tool(registry, options);
+    registry.register(make_web_fetch_tool(summarizer));
+}
+
+/// Register `web_search` when a Brave Search key is configured.
+///
+/// Separate from [`register_discovery_and_web_tools`] for profiles that offer
+/// search without fabro's discovery tools.
+pub(crate) fn register_web_search_tool(registry: &mut ToolRegistry, options: &NativeToolOptions) {
     if let Some(api_key) = &options.secrets.brave_search_api_key {
         registry.register(make_web_search_tool_with_api_key(api_key.clone()));
     }
-    registry.register(make_web_fetch_tool(summarizer));
 }
 
 pub(crate) fn required_str<'a>(args: &'a serde_json::Value, key: &str) -> Result<&'a str, String> {
@@ -261,17 +269,7 @@ pub fn make_shell_tool_with_options(options: &NativeToolOptions) -> RegisteredTo
                     .unwrap_or(default_timeout)
                     .min(max_timeout);
 
-                let streaming = execute_shell_command(&ctx, command, timeout_ms, None).await?;
-
-                let text = render_shell_result(&streaming);
-                let is_success = streaming.result.is_success();
-                emit_shell_process_completed(&ctx, streaming).await;
-
-                if is_success {
-                    Ok(text)
-                } else {
-                    Err(text)
-                }
+                run_shell_command(&ctx, command, timeout_ms, None).await
             })
         }),
         source:     ToolSource::Native,
@@ -310,6 +308,22 @@ pub(crate) async fn execute_shell_command(
         )
         .await
         .map_err(|e| format!("{SHELL_NO_PROCESS_RESULT}: {}", e.display_with_causes()))
+}
+
+/// Execute a shell command, render its standard model-facing output, and emit
+/// the subordinate process result.
+pub(crate) async fn run_shell_command(
+    ctx: &ToolContext,
+    command: &str,
+    timeout_ms: u64,
+    cwd: Option<&str>,
+) -> Result<String, String> {
+    let streaming = execute_shell_command(ctx, command, timeout_ms, cwd).await?;
+    let text = render_shell_result(&streaming);
+    let is_success = streaming.result.is_success();
+    emit_shell_process_completed(ctx, streaming).await;
+
+    if is_success { Ok(text) } else { Err(text) }
 }
 
 /// Emit the subordinate process outcome after model-facing output has been

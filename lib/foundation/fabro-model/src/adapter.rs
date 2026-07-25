@@ -76,6 +76,13 @@ pub enum AgentProfileKind {
     /// gateway such as OpenRouter gets the same profile as one reached
     /// directly at `api.moonshot.ai`.
     Kimi,
+    /// GPT-5.6 models (Sol, Terra, Luna), which Codex drives with a narrower
+    /// core tool set than earlier GPT models: a shell, a file editor, and
+    /// `update_plan`, plus optional web search. The profile omits dedicated
+    /// file-read, discovery, and fetch tools. Selected per model rather than
+    /// per provider, so other models on the `openai` provider keep
+    /// [`Self::OpenAi`].
+    Gpt56,
 }
 
 #[cfg(test)]

@@ -209,8 +209,11 @@ mod tests {
     #[test]
     fn openrouter_non_kimi_models_keep_the_provider_profile() {
         let catalog = catalog_with_openrouter();
+        // Deliberately not a GPT-5.6 model: those carry their own per-model
+        // profile override, so they would not show that the provider default
+        // is what applies here.
         let profile =
-            catalog.effective_agent_profile(&ProviderId::new("openrouter"), Some("gpt-5.6-sol"));
+            catalog.effective_agent_profile(&ProviderId::new("openrouter"), Some("gpt-5.4"));
         assert_eq!(profile, Some(AgentProfileKind::OpenAi));
     }
 

@@ -159,7 +159,10 @@ pub fn is_question_tool(name: &str) -> bool {
 
 pub fn register_question_tools(profile_kind: AgentProfileKind, registry: &mut ToolRegistry) {
     match profile_kind {
-        AgentProfileKind::OpenAi => registry.register(make_openai_question_tool()),
+        // Codex names this tool `request_user_input` for GPT-5.6 too.
+        AgentProfileKind::OpenAi | AgentProfileKind::Gpt56 => {
+            registry.register(make_openai_question_tool());
+        }
         // Kimi Code names this tool `AskUserQuestion` with the same
         // question/option shape, so the Anthropic-style tool is a match.
         AgentProfileKind::Anthropic | AgentProfileKind::Kimi => {
@@ -468,6 +471,7 @@ fn format_anthropic_answers(answers: &[AgentQuestionAnswer]) -> Result<String, S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native_tool::ToolVocabulary;
 
     fn answered(
         original_id: Option<&str>,
@@ -581,6 +585,11 @@ mod tests {
         register_question_tools(AgentProfileKind::OpenAi, &mut openai);
         assert!(openai.get(OPENAI_REQUEST_USER_INPUT_TOOL).is_some());
         assert!(openai.get(ANTHROPIC_ASK_USER_QUESTION_TOOL).is_none());
+
+        let mut gpt56 = ToolRegistry::with_vocabulary(ToolVocabulary::Codex);
+        register_question_tools(AgentProfileKind::Gpt56, &mut gpt56);
+        assert!(gpt56.get(OPENAI_REQUEST_USER_INPUT_TOOL).is_some());
+        assert!(gpt56.get(ANTHROPIC_ASK_USER_QUESTION_TOOL).is_none());
 
         let mut anthropic = ToolRegistry::new();
         register_question_tools(AgentProfileKind::Anthropic, &mut anthropic);

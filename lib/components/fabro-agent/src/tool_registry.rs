@@ -184,9 +184,20 @@ impl ToolRegistry {
         self.tools.remove(name)
     }
 
+    /// Remove a built-in tool by identity, regardless of the registry's
+    /// exposed vocabulary.
+    pub(crate) fn unregister_native(&mut self, tool: NativeTool) -> Option<RegisteredTool> {
+        self.tools.remove(tool.name(self.vocabulary))
+    }
+
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&RegisteredTool> {
         self.tools.get(name)
+    }
+
+    #[must_use]
+    pub(crate) fn get_native(&self, tool: NativeTool) -> Option<&RegisteredTool> {
+        self.tools.get(tool.name(self.vocabulary))
     }
 
     #[must_use]
@@ -348,6 +359,21 @@ mod tests {
     fn unregister_missing_returns_none() {
         let mut registry = ToolRegistry::new();
         assert!(registry.unregister("nonexistent").is_none());
+    }
+
+    #[test]
+    fn unregister_native_resolves_the_exposed_vocabulary() {
+        let mut registry = ToolRegistry::with_vocabulary(ToolVocabulary::Codex);
+        registry.register(make_tool("shell"));
+        assert!(registry.get("shell_command").is_some());
+
+        let removed = registry.unregister_native(NativeTool::Shell);
+
+        assert_eq!(
+            removed.map(|tool| tool.definition.name),
+            Some("shell_command".to_string())
+        );
+        assert!(registry.get("shell_command").is_none());
     }
 
     #[test]

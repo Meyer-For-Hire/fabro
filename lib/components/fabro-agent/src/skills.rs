@@ -173,7 +173,10 @@ pub fn make_use_skill_tool_for_vocabulary(
     vocabulary: ToolVocabulary,
 ) -> RegisteredTool {
     let (name_parameter, parameters) = match vocabulary {
-        ToolVocabulary::Fabro => (
+        // Codex has no skill-loading tool of its own -- it reads `SKILL.md`
+        // through the shell -- so there is no contract to match and the Codex
+        // vocabulary keeps fabro's.
+        ToolVocabulary::Fabro | ToolVocabulary::Codex => (
             "skill_name",
             serde_json::json!({
                 "type": "object",

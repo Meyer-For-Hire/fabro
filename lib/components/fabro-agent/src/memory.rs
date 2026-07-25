@@ -32,7 +32,9 @@ pub async fn discover_memory(
 
     let candidate_filenames: Vec<&str> = match profile_kind {
         AgentProfileKind::Anthropic => vec!["AGENTS.md", "CLAUDE.md"],
-        AgentProfileKind::OpenAi => vec!["AGENTS.md", ".codex/instructions.md"],
+        AgentProfileKind::OpenAi | AgentProfileKind::Gpt56 => {
+            vec!["AGENTS.md", ".codex/instructions.md"]
+        }
         AgentProfileKind::Gemini => vec!["AGENTS.md", "GEMINI.md"],
         // Kimi Code reads only AGENTS.md; it has no vendor-specific
         // instruction filename of its own.
@@ -221,6 +223,23 @@ mod tests {
         assert_eq!(openai_docs.len(), 2);
         assert_eq!(openai_docs[0].content, "agents");
         assert_eq!(openai_docs[1].content, "copilot");
+
+        let env: Arc<dyn Sandbox> = Arc::new(MockSandbox {
+            files: files.clone(),
+            ..Default::default()
+        });
+        let gpt56_docs = discover_memory(
+            env.as_ref(),
+            "/repo",
+            "/repo",
+            AgentProfileKind::Gpt56,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(gpt56_docs.len(), 2);
+        assert_eq!(gpt56_docs[0].content, "agents");
+        assert_eq!(gpt56_docs[1].content, "copilot");
 
         let env: Arc<dyn Sandbox> = Arc::new(MockSandbox {
             files: files.clone(),
