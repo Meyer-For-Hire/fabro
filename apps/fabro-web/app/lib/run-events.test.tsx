@@ -150,7 +150,7 @@ describe("queryKeysForRunEvent", () => {
     ]);
   });
 
-  test("watchdog timeout refreshes the stage events that settle inference", () => {
+  test("watchdog timeout refreshes the stage events for that stage", () => {
     expect(
       queryKeysForRunEvent("run-1", "watchdog.timeout", "code@1"),
     ).toEqual([queryKeys.runs.stageEvents("run-1", "code@1")]);
