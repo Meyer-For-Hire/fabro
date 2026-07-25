@@ -309,14 +309,16 @@ impl ProviderAdapter for Adapter {
 /// State driving the event-stream byte loop: the codec's decoder plus the
 /// frame decoder, with a buffer that flattens batched events.
 struct EventStreamLoop {
-    response: fabro_http::Response,
-    frames:   FrameDecoder,
-    decoder:  Box<dyn StreamDecoder>,
-    pending:  VecDeque<StreamEvent>,
-    done:     bool,
+    response:       fabro_http::Response,
+    frames:         FrameDecoder,
+    decoder:        Box<dyn StreamDecoder>,
+    pending:        VecDeque<StreamEvent>,
+    done:           bool,
     /// `finish()` already drained.
-    finished: bool,
-    timeout:  Option<Duration>,
+    finished:       bool,
+    /// [`StreamEvent::StreamStart`] already emitted for this stream.
+    stream_started: bool,
+    timeout:        Option<Duration>,
 }
 
 /// Drive `decoder` over the AWS event-stream byte stream of `response`: the
@@ -335,6 +337,7 @@ fn decode_eventstream(
             pending: VecDeque::new(),
             done: false,
             finished: false,
+            stream_started: false,
             timeout,
         },
         move |mut state| async move {
@@ -370,6 +373,13 @@ fn decode_eventstream(
                                 event: Some(frame.event_type.as_str()),
                                 data:  frame.payload.as_str(),
                             };
+                            // Mirrors the SSE loop: the first decoded frame is
+                            // the liveness edge, independent of which event
+                            // type the provider happens to open with.
+                            if !state.stream_started {
+                                state.stream_started = true;
+                                state.pending.push_back(StreamEvent::StreamStart);
+                            }
                             match state.decoder.on_event(raw) {
                                 Ok(events) => state.pending.extend(events),
                                 Err(e) => return Some((Err(e), state)),

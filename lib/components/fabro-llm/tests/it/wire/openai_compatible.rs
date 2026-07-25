@@ -826,6 +826,16 @@ async fn stream_text_happy_path_events() {
     fabro_test::fabro_json_snapshot!(events);
 }
 
+/// Every dialect's stream opens with `StreamStart`, emitted by the driving
+/// loop rather than the decoder. Asserted outside the snapshot because a
+/// snapshot can be re-accepted silently, and this is the one event a liveness
+/// consumer needs to be able to rely on from every provider.
+#[tokio::test]
+async fn stream_opens_with_stream_start() {
+    let (_, events) = stream_text_happy_path_capture().await;
+    assert_eq!(events[0]["type"], "stream_start");
+}
+
 /// OpenRouter streams report `cost` in the usage chunk; the Finish response
 /// carries it as authoritative, with cached tokens in their own bucket.
 #[tokio::test]
@@ -881,7 +891,9 @@ async fn stream_without_done_synthesizes_finish_when_content_started() {
 }
 
 /// The other half of the minimax contract: no content started and no
-/// `[DONE]` — nothing is synthesized.
+/// `[DONE]` — nothing is synthesized. `StreamStart` is not synthesis: the
+/// provider did send a chunk, so the liveness edge is a fact about this
+/// stream even though nothing usable followed.
 #[tokio::test]
 async fn stream_without_done_or_content_synthesizes_nothing() {
     let sse = support::sse_data_transcript(&[

@@ -271,7 +271,6 @@ impl StreamDecoder for ConverseStreamDecoder {
             .map_err(|e| Error::stream_error(format!("converse stream event json: {e}"), e))?;
 
         Ok(match event_type {
-            "messageStart" => vec![StreamEvent::StreamStart],
             "contentBlockStart" => self.on_block_start(&payload),
             "contentBlockDelta" => self.on_block_delta(&payload),
             "contentBlockStop" => self.on_block_stop(&payload),
@@ -284,7 +283,9 @@ impl StreamDecoder for ConverseStreamDecoder {
                 self.usage = token_counts_from_usage(payload.get("usage"));
                 vec![self.finish_event()]
             }
-            // Tolerate unknown event types — the union grows.
+            // `messageStart` carries nothing this decoder needs — the driving
+            // loop owns `StreamStart` — and unknown event types are tolerated
+            // because the union grows.
             _ => Vec::new(),
         })
     }
@@ -347,10 +348,8 @@ mod tests {
     #[test]
     fn text_happy_path_finishes_on_metadata() {
         let mut d = decoder();
-        assert!(matches!(
-            feed(&mut d, "messageStart", r#"{"role":"assistant"}"#)[0],
-            StreamEvent::StreamStart
-        ));
+        // `StreamStart` belongs to the driving loop, not the decoder.
+        assert!(feed(&mut d, "messageStart", r#"{"role":"assistant"}"#).is_empty());
         let events = feed(
             &mut d,
             "contentBlockDelta",

@@ -222,6 +222,14 @@ pub(crate) trait StreamDecoder: Send + 'static {
     /// One framed event → zero or more canonical `StreamEvent`s. Returns
     /// `Err` for dialect error events (anthropic `error`, openai
     /// `response.failed`), which the transport yields as a stream error.
+    ///
+    /// Decoders must **not** emit [`StreamEvent::StreamStart`]. The driving
+    /// loop emits exactly one, immediately before handing over the first
+    /// framed event, so `StreamStart` means the same thing for every
+    /// provider: the provider is responding, whatever it turns out to say.
+    /// Leaving it to decoders made it depend on each dialect's opening frame
+    /// — anthropic and bedrock keyed it on `message_start`/`messageStart`,
+    /// and `openai_compatible` had no such frame and so emitted it never.
     fn on_event(&mut self, ev: RawEvent<'_>) -> Result<Vec<StreamEvent>, Error>;
 
     /// Byte-stream-end hook. Semantics are per-decoder, not shared:

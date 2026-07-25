@@ -253,6 +253,8 @@ struct StreamLoop {
     done:             bool,
     /// `finish()` already drained.
     finished_emitted: bool,
+    /// [`StreamEvent::StreamStart`] already emitted for this stream.
+    stream_started:   bool,
 }
 
 /// Drive `decoder` over the SSE byte stream of `response`: frame each chunk,
@@ -271,6 +273,7 @@ fn decode_sse_stream(
             pending: VecDeque::new(),
             done: false,
             finished_emitted: false,
+            stream_started: false,
         },
         move |mut state| async move {
             loop {
@@ -295,6 +298,15 @@ fn decode_sse_stream(
                         let Some((event, data)) = frame_sse_chunk(framing, &chunk) else {
                             continue;
                         };
+                        // Provider-independent liveness edge: the first framed
+                        // event proves the provider is responding, whatever it
+                        // turns out to contain. Owned here rather than in each
+                        // decoder so it cannot depend on a provider sending a
+                        // particular opening frame.
+                        if !state.stream_started {
+                            state.stream_started = true;
+                            state.pending.push_back(StreamEvent::StreamStart);
+                        }
                         match state.decoder.on_event(RawEvent { event, data: &data }) {
                             Ok(events) => state.pending.extend(events),
                             Err(e) => return Some((Err(e), state)),
