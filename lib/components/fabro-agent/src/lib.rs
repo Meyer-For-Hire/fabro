@@ -15,6 +15,7 @@ pub mod local_sandbox;
 pub mod loop_detection;
 pub mod mcp_integration;
 pub mod memory;
+pub mod native_tool;
 pub mod profiles;
 pub mod question_tools;
 pub mod read_before_write_sandbox;
@@ -47,6 +48,7 @@ pub use history::History;
 pub use local_sandbox::LocalSandbox;
 pub use loop_detection::detect_loop;
 pub use memory::{MemoryDocument, discover_memory};
+pub use native_tool::{NativeTool, ToolVocabulary};
 pub use profiles::{
     AgentProfileBuilder, AnthropicProfile, EnvContext, GeminiProfile, OpenAiProfile,
 };
@@ -72,6 +74,7 @@ pub use todo_tools::{
     make_task_create_tool, make_task_get_tool, make_task_list_tool, make_task_update_tool,
     make_update_plan_tool,
 };
+pub use tool_permissions::canonical_tool_name;
 pub use tool_registry::{AgentEventEmitter, ToolRegistry};
 pub use tools::{
     WebFetchSummarizer, make_edit_file_tool, make_glob_tool, make_grep_tool, make_read_file_tool,

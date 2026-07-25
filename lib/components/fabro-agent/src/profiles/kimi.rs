@@ -2,10 +2,12 @@ use std::sync::Arc;
 
 use fabro_llm::types::ToolDefinition;
 use fabro_model::{AgentProfileKind, Catalog, ProviderId};
+use strum::VariantArray;
 
 use super::EnvContext;
 use crate::agent_profile::AgentProfile;
 use crate::config::NativeToolOptions;
+use crate::native_tool::{NativeTool, ToolVocabulary};
 use crate::profiles::{self, BaseProfile, EmbeddedPrompt};
 use crate::sandbox::Sandbox;
 use crate::skills::Skill;
@@ -26,25 +28,50 @@ const CORE_PROMPT: &str = include_str!("prompts/kimi.md.j2");
 /// the description of the tool being called — rather than relying only on the
 /// system prompt.
 const EDIT_FILE_DESCRIPTION: &str = "Edit a file by replacing an exact string. \
-Read the file with read_file before EVERY edit — this workspace refuses writes to files that \
-have not been read, and the call will fail. Take old_string verbatim from the read_file output; \
+Read the file with Read before EVERY edit — this workspace refuses writes to files that \
+have not been read, and the call will fail. Take old_string verbatim from the Read output; \
 never reconstruct it from memory or from an earlier version of the file. old_string must be an \
 exact match and unique unless replace_all is true. If the edit fails with 'old_string not found', \
 re-read the file and take the exact text from the fresh output rather than guessing again. \
 Preserve existing indentation.";
 
 const WRITE_FILE_DESCRIPTION: &str = "Create a new file, or completely replace an existing one. \
-Read an existing file with read_file before writing to it — this workspace refuses writes to \
-files that have not been read, and the call will fail. Prefer edit_file for any incremental \
-change: write_file replaces the entire file, so using it to make a small edit discards \
+Read an existing file with Read before writing to it — this workspace refuses writes to \
+files that have not been read, and the call will fail. Prefer Edit for any incremental \
+change: Write replaces the entire file, so using it to make a small edit discards \
 everything you did not restate.";
+
+/// Expose every registered built-in tool under Kimi Code's names.
+///
+/// Only the exposed name changes: executors, schemas, and the identity that
+/// permissions and telemetry resolve through are untouched, because
+/// `canonical_tool_name` maps every vocabulary back to the same
+/// [`NativeTool`].
+fn apply_vocabulary(registry: &mut ToolRegistry, vocabulary: ToolVocabulary) {
+    for tool in NativeTool::VARIANTS {
+        let exposed = tool.name(vocabulary);
+        if exposed == tool.canonical_name() {
+            continue;
+        }
+        let Some(registered) = registry.unregister(tool.canonical_name()) else {
+            continue;
+        };
+        registry.register(RegisteredTool {
+            definition: ToolDefinition {
+                name: exposed.to_string(),
+                ..registered.definition
+            },
+            ..registered
+        });
+    }
+}
 
 /// Replace a registered tool's description, keeping its executor and schema.
 ///
 /// Profiles own their registries, so tailoring wording per model is a local
 /// change and does not affect what other profiles expose.
-fn redescribe(registry: &mut ToolRegistry, name: &str, description: &str) {
-    let Some(tool) = registry.unregister(name) else {
+fn redescribe(registry: &mut ToolRegistry, tool: NativeTool, description: &str) {
+    let Some(tool) = registry.unregister(tool.canonical_name()) else {
         return;
     };
     registry.register(RegisteredTool {
@@ -76,8 +103,8 @@ impl KimiProfile {
 
         register_core_tools(&mut registry, options, summarizer);
         registry.register(make_edit_file_tool());
-        redescribe(&mut registry, "edit_file", EDIT_FILE_DESCRIPTION);
-        redescribe(&mut registry, "write_file", WRITE_FILE_DESCRIPTION);
+        redescribe(&mut registry, NativeTool::EditFile, EDIT_FILE_DESCRIPTION);
+        redescribe(&mut registry, NativeTool::WriteFile, WRITE_FILE_DESCRIPTION);
 
         // Kimi Code exposes a single TodoList tool; fabro's four task tools
         // cover the same ground over one runtime, so reuse them rather than
@@ -87,6 +114,9 @@ impl KimiProfile {
         registry.register(make_task_update_tool(todo_runtime.clone()));
         registry.register(make_task_get_tool(todo_runtime.clone()));
         registry.register(make_task_list_tool(todo_runtime));
+
+        // Applied last so every built-in registered above is renamed.
+        apply_vocabulary(&mut registry, ToolVocabulary::KimiCode);
 
         Self {
             base: BaseProfile {
@@ -165,9 +195,11 @@ impl AgentProfile for KimiProfile {
 #[cfg(test)]
 mod tests {
     use fabro_model::catalog::LlmCatalogSettings;
+    use fabro_types::AgentToolCategory;
 
     use super::*;
     use crate::test_support::MockSandbox;
+    use crate::tool_permissions::{known_tool_category, tool_category};
 
     fn catalog() -> Arc<Catalog> {
         Arc::new(Catalog::from_builtin().unwrap())
@@ -209,6 +241,51 @@ mod tests {
         assert_eq!(profile, Some(AgentProfileKind::OpenAi));
     }
 
+    /// The rename must not change what a tool is allowed to do. An exposed
+    /// name that fails to resolve would fall back to `Shell` in the CLI gate,
+    /// silently demanding approval for reads.
+    #[test]
+    fn renamed_tools_keep_their_permission_category() {
+        let profile = KimiProfile::new("kimi-k3");
+        for name in profile.tool_registry().names() {
+            let Some(tool) = NativeTool::from_any_name(&name) else {
+                continue;
+            };
+            assert_eq!(
+                known_tool_category(&name),
+                tool.category(),
+                "exposed name '{name}' must categorize as its canonical identity"
+            );
+        }
+        // The specific regression: reads stay reads, not Shell.
+        assert_eq!(tool_category("Read"), AgentToolCategory::Read);
+        assert_eq!(tool_category("Bash"), AgentToolCategory::Shell);
+    }
+
+    #[test]
+    fn tools_are_exposed_under_kimi_code_names() {
+        let profile = KimiProfile::new("kimi-k3");
+        let names = profile.tool_registry().names();
+        for expected in ["Read", "Write", "Edit", "Bash", "Grep", "Glob", "FetchURL"] {
+            assert!(names.contains(&expected.to_string()), "missing {expected}");
+        }
+        for canonical in [
+            "read_file",
+            "write_file",
+            "edit_file",
+            "shell",
+            "grep",
+            "glob",
+        ] {
+            assert!(
+                !names.contains(&canonical.to_string()),
+                "{canonical} should have been renamed"
+            );
+        }
+        // No Kimi Code counterpart, so these keep fabro's names.
+        assert!(names.contains(&"TaskCreate".to_string()));
+    }
+
     #[test]
     fn edit_and_write_descriptions_drill_read_before_write() {
         let profile = KimiProfile::new("kimi-k3");
@@ -222,16 +299,16 @@ mod tests {
                 .clone()
         };
 
-        for name in ["edit_file", "write_file"] {
+        for name in ["Edit", "Write"] {
             let text = describe(name);
             assert!(
                 text.contains("have not been read") || text.contains("has not been read"),
                 "{name} should warn about the read-before-write guard"
             );
         }
-        assert!(describe("edit_file").contains("never reconstruct it from memory"));
+        assert!(describe("Edit").contains("never reconstruct it from memory"));
         // The shared description is untouched for other profiles.
-        assert!(!describe("read_file").contains("refuses writes"));
+        assert!(!describe("Read").contains("refuses writes"));
     }
 
     #[test]
