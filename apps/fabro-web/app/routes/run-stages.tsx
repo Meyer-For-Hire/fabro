@@ -1481,11 +1481,18 @@ function ChatUserCard({ content }: { content: string }) {
   const isLong = content.length > CHAT_PROMPT_PREVIEW_CHARS;
   return (
     <div className="flex w-fit max-w-[85%] flex-col items-start gap-1.5 self-end rounded-2xl rounded-br-md bg-panel px-4 py-3">
-      <div id={contentId}>
+      {/*
+        `w-full` is load-bearing. `items-start` keeps the expand button hugging
+        its label, but it also leaves this wrapper intrinsically sized, and the
+        bubble's own `w-fit` width is only clamped to `max-w-[85%]` after that
+        intrinsic pass. The text then keeps the wider pre-clamp measurement and
+        spills past the bubble. Filling the resolved width sidesteps it.
+      */}
+      <div id={contentId} className="w-full">
         {expanded ? (
           <Markdown content={content} />
         ) : (
-          <p className="text-sm whitespace-pre-wrap text-fg-2">
+          <p className="text-sm break-words whitespace-pre-wrap text-fg-2">
             {isLong
               ? `${content.slice(0, CHAT_PROMPT_PREVIEW_CHARS).trimEnd()}…`
               : content}
