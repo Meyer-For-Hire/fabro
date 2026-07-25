@@ -119,6 +119,18 @@ impl LocalSandbox {
         validate_bash_probe(result, remediation)
     }
 
+    /// Ensure command execution has a working directory and a usable Bash.
+    ///
+    /// Fresh initialization and resumed starts share this path so they report
+    /// directory failures with the same context before attempting the Bash
+    /// probe.
+    async fn prepare_command_environment(&self) -> crate::Result<()> {
+        fs::create_dir_all(&self.working_directory)
+            .await
+            .map_err(|error| crate::Error::context("Failed to create working directory", error))?;
+        self.probe_bash().await
+    }
+
     pub fn set_event_callback(&mut self, cb: SandboxEventCallback) {
         self.event_callback = Some(cb);
     }
@@ -786,13 +798,7 @@ impl Sandbox for LocalSandbox {
             provider: "local".into(),
         });
         let start = Instant::now();
-        let result = match fs::create_dir_all(&self.working_directory).await {
-            Ok(()) => self.probe_bash().await,
-            Err(e) => Err(crate::Error::context(
-                "Failed to create working directory",
-                e,
-            )),
-        };
+        let result = self.prepare_command_environment().await;
         let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
         match &result {
             Ok(()) => self.emit(SandboxEvent::Ready {
@@ -823,7 +829,7 @@ impl Sandbox for LocalSandbox {
             provider: "local".into(),
         });
         let start = Instant::now();
-        let result = self.probe_bash().await;
+        let result = self.prepare_command_environment().await;
         match &result {
             Ok(()) => self.emit(SandboxEvent::StartCompleted {
                 provider:    "local".into(),
@@ -1420,6 +1426,21 @@ mod tests {
             "non-Bash interpreter should be named as the problem: {}",
             err.display_with_causes()
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn start_recreates_missing_working_directory_before_bash_probe() {
+        let dir = temp_dir();
+        std::fs::remove_dir_all(&dir).unwrap();
+        let sandbox = LocalSandbox::new(dir.clone());
+
+        sandbox
+            .start()
+            .await
+            .expect("resume should recreate the working directory before probing Bash");
+
+        assert!(dir.is_dir());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
