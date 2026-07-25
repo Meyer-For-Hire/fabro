@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use fabro_static::EnvVars;
@@ -18,8 +18,8 @@ use crate::sandbox::{
 };
 use crate::{
     CommandOutputCallback, DEFAULT_EXEC_OUTPUT_TAIL_BYTES, DirEntry, ExecResult,
-    ExecStreamingResult, GrepOptions, Sandbox, SandboxEvent, SandboxEventCallback, StderrCollector,
-    StdioProcess, StdioProcessHandle, StdioProcessTermination, glob_match,
+    ExecStreamingResult, GrepOptions, Sandbox, SandboxEvent, SandboxEventCallback, SandboxFile,
+    StderrCollector, StdioProcess, StdioProcessHandle, StdioProcessTermination, WalkOptions,
 };
 
 /// Remediation shown when the worker has no usable Bash.
@@ -726,22 +726,14 @@ impl Sandbox for LocalSandbox {
         Ok(results)
     }
 
-    async fn glob(&self, pattern: &str, path: Option<&str>) -> crate::Result<Vec<String>> {
-        let base_dir =
-            path.map_or_else(|| self.working_directory.clone(), |p| self.resolve_path(p));
-        let base = base_dir.to_string_lossy().into_owned();
-        let traversal_root = PathBuf::from(glob_match::traversal_root(&base, pattern));
-        let matcher = glob_match::GlobMatcher::new(&base, pattern)?;
-        let mut matches = collect_local_files(traversal_root)
-            .await?
-            .into_iter()
-            .filter(|(path, _)| matcher.matches(path))
-            .collect::<Vec<_>>();
-
-        // Sort by mtime (newest first) using the metadata collected during traversal.
-        matches.sort_by_key(|(_, modified)| std::cmp::Reverse(*modified));
-
-        Ok(matches.into_iter().map(|(path, _)| path).collect())
+    async fn walk_files(
+        &self,
+        base: &str,
+        relative_start: &str,
+        options: &WalkOptions,
+    ) -> crate::Result<Vec<SandboxFile>> {
+        let base = self.resolve_path(base);
+        walk_local_files(&base, relative_start, options).await
     }
 
     async fn download_file_to_local(
@@ -981,29 +973,71 @@ where
     }
 }
 
-async fn collect_local_files(root: PathBuf) -> crate::Result<Vec<(String, SystemTime)>> {
-    let mut files = Vec::new();
-    let mut stack = vec![root];
+async fn walk_local_files(
+    base: &Path,
+    relative_start: &str,
+    options: &WalkOptions,
+) -> crate::Result<Vec<SandboxFile>> {
+    if relative_start.split('/').any(|segment| {
+        options
+            .excluded_directory_names
+            .iter()
+            .any(|name| name == segment)
+    }) {
+        return Ok(Vec::new());
+    }
 
-    while let Some(path) = stack.pop() {
-        let metadata = match fs::symlink_metadata(&path).await {
-            Ok(metadata) => metadata,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => {
-                return Err(crate::Error::context(
-                    format!("Failed to stat {}", path.display()),
-                    err,
-                ));
-            }
+    let Some((root, root_metadata)) = resolve_local_walk_root(base, relative_start).await? else {
+        return Ok(Vec::new());
+    };
+    let mut files = Vec::new();
+    let mut stack = vec![(root, Some(root_metadata))];
+
+    while let Some((path, known_metadata)) = stack.pop() {
+        let metadata = match known_metadata {
+            Some(metadata) => metadata,
+            None => match fs::symlink_metadata(&path).await {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => {
+                    return Err(crate::Error::context(
+                        format!("Failed to stat {}", path.display()),
+                        err,
+                    ));
+                }
+            },
         };
 
         let file_type = metadata.file_type();
         if file_type.is_file() {
-            files.push((
-                path.to_string_lossy().into_owned(),
-                metadata.modified().unwrap_or(UNIX_EPOCH),
-            ));
+            let relative_path = path.strip_prefix(base).map_err(|error| {
+                crate::Error::context(
+                    format!(
+                        "Failed to make {} relative to {}",
+                        path.display(),
+                        base.display()
+                    ),
+                    error,
+                )
+            })?;
+            files.push(SandboxFile {
+                path:          path.to_string_lossy().into_owned(),
+                relative_path: relative_path
+                    .to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/"),
+                size:          metadata.len(),
+            });
         } else if file_type.is_dir() {
+            if path != base
+                && path.file_name().is_some_and(|file_name| {
+                    options
+                        .excluded_directory_names
+                        .iter()
+                        .any(|name| file_name == name.as_str())
+                })
+            {
+                continue;
+            }
             let mut entries = match fs::read_dir(&path).await {
                 Ok(entries) => entries,
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
@@ -1020,12 +1054,65 @@ async fn collect_local_files(root: PathBuf) -> crate::Result<Vec<(String, System
                     err,
                 )
             })? {
-                stack.push(entry.path());
+                stack.push((entry.path(), None));
             }
         }
     }
 
+    files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     Ok(files)
+}
+
+async fn resolve_local_walk_root(
+    base: &Path,
+    relative_start: &str,
+) -> crate::Result<Option<(PathBuf, std::fs::Metadata)>> {
+    if relative_start.is_empty() {
+        return match fs::metadata(base).await {
+            Ok(metadata) => Ok(Some((base.to_path_buf(), metadata))),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(crate::Error::context(
+                format!("Failed to stat traversal base {}", base.display()),
+                error,
+            )),
+        };
+    }
+
+    let mut root = base.to_path_buf();
+    let mut metadata = None;
+    for segment in relative_start.split('/') {
+        root.push(segment);
+        let component_metadata = match fs::symlink_metadata(&root).await {
+            Ok(metadata) => metadata,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(crate::Error::context(
+                    format!("Failed to stat traversal root component {}", root.display()),
+                    error,
+                ));
+            }
+        };
+        if component_metadata.file_type().is_symlink() {
+            return Ok(None);
+        }
+        metadata = Some(component_metadata);
+    }
+
+    Ok(metadata.map(|metadata| (root, metadata)))
 }
 
 #[cfg(test)]
@@ -1856,6 +1943,62 @@ mod tests {
         let results = env.glob("linked/**/*.rs", None).await.unwrap();
 
         assert!(results.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn glob_follows_the_declared_symlinked_search_root_only() {
+        let parent = temp_dir();
+        let workspace = parent.join("workspace");
+        let outside = parent.join("outside");
+        let search_root = parent.join("workspace-link");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(workspace.join("README.md"), "").unwrap();
+        std::fs::write(outside.join("outside.md"), "").unwrap();
+        std::os::unix::fs::symlink(&outside, workspace.join("linked")).unwrap();
+        std::os::unix::fs::symlink(&workspace, &search_root).unwrap();
+
+        let env = LocalSandbox::new(search_root.clone());
+        let results = env.glob("**/*.md", None).await.unwrap();
+
+        assert_eq!(results, vec![
+            search_root.join("README.md").to_string_lossy().into_owned()
+        ]);
+        std::fs::remove_dir_all(&parent).unwrap();
+    }
+
+    #[tokio::test]
+    async fn walk_files_returns_relative_paths_and_prunes_directories() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(dir.join(".ai/reports")).unwrap();
+        std::fs::create_dir_all(dir.join(".ai/target")).unwrap();
+        std::fs::write(dir.join(".ai/reports/result.md"), "report").unwrap();
+        std::fs::write(dir.join(".ai/reports/empty.md"), "").unwrap();
+        std::fs::write(dir.join(".ai/target/ignored.md"), "ignored").unwrap();
+
+        let sandbox = LocalSandbox::new(dir.clone());
+        let files = sandbox
+            .walk_files(sandbox.working_directory(), ".ai", &WalkOptions {
+                excluded_directory_names: vec!["target".to_string()],
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            files
+                .iter()
+                .map(|file| (file.relative_path.as_str(), file.size))
+                .collect::<Vec<_>>(),
+            vec![(".ai/reports/empty.md", 0), (".ai/reports/result.md", 6),]
+        );
+        let root = dir.to_string_lossy();
+        assert!(
+            files
+                .iter()
+                .all(|file| file.path.starts_with(root.as_ref()))
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

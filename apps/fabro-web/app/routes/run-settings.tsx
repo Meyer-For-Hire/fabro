@@ -206,7 +206,7 @@ function ArtifactsPanel({ snapshot }: { snapshot: WorkflowSettings }) {
   const include = getArray(artifacts, "include");
   return (
     <Panel title="Artifacts">
-      <Row title="Include" help="Globs collected from the sandbox at run end.">
+      <Row title="Include" help="Workspace-relative globs collected after each stage.">
         {include && include.length > 0 ? (
           <GlobList globs={include.filter((e): e is string => typeof e === "string")} />
         ) : (

@@ -30,13 +30,13 @@ use crate::managed_labels::{self, MANAGED_LABEL, RUN_ID_LABEL};
 use crate::redact::redact_auth_url;
 use crate::sandbox::{
     BASH_ENV_VAR, BASH_PROBE_SCRIPT, BASH_PROBE_TIMEOUT_MS, REMOTE_BASH, RefreshOutcome,
-    StdioProcessControl, optional_timeout, resolve_path, validate_bash_probe,
+    StdioProcessControl, join_sandbox_path, optional_timeout, resolve_path, validate_bash_probe,
 };
 use crate::{
     CommandOutputCallback, DEFAULT_EXEC_OUTPUT_TAIL_BYTES, DirEntry, ExecResult,
-    ExecStreamingResult, GrepOptions, Sandbox, SandboxEvent, SandboxEventCallback, StderrCollector,
-    StdioProcess, StdioProcessHandle, StdioProcessTermination, format_lines_numbered, glob_match,
-    shell_quote,
+    ExecStreamingResult, GrepOptions, Sandbox, SandboxEvent, SandboxEventCallback, SandboxFile,
+    StderrCollector, StdioProcess, StdioProcessHandle, StdioProcessTermination, WalkOptions,
+    format_lines_numbered, shell_quote,
 };
 
 const DOCKER_BASH_REQUIREMENT: &str = "Docker sandboxes require /bin/bash for every command, with no `sh` fallback; use an \
@@ -1881,34 +1881,31 @@ impl Sandbox for DockerSandbox {
             .collect())
     }
 
-    async fn glob(&self, pattern: &str, path: Option<&str>) -> crate::Result<Vec<String>> {
-        let base_dir = path.map_or_else(
-            || self.working_directory().to_string(),
-            |path| self.resolve_container_path(path),
-        );
-        let traversal_root = glob_match::traversal_root(&base_dir, pattern);
-        let quoted_root = shell_quote(&traversal_root);
-        let command = format!("if [ -e {quoted_root} ]; then find {quoted_root} -type f; fi");
+    async fn walk_files(
+        &self,
+        base: &str,
+        relative_start: &str,
+        options: &WalkOptions,
+    ) -> crate::Result<Vec<SandboxFile>> {
+        if relative_start.split('/').any(|segment| {
+            options
+                .excluded_directory_names
+                .iter()
+                .any(|name| name == segment)
+        }) {
+            return Ok(Vec::new());
+        }
+
+        let base = self.resolve_container_path(base);
+        let command = docker_walk_command(&base, relative_start, options);
         let result = self
             .docker_exec_shell(&command, 30_000, None, None, None)
             .await?;
         if !result.is_success() {
-            return Err(crate::Error::message(format!(
-                "glob failed (exit {}): {}",
-                result.display_exit_code(),
-                result.stderr
-            )));
+            return Err(crate::Error::exec("recursive file traversal", result));
         }
 
-        let matcher = glob_match::GlobMatcher::new(&base_dir, pattern)?;
-        let mut matches = result
-            .stdout
-            .lines()
-            .filter(|line| !line.is_empty() && matcher.matches(line))
-            .map(String::from)
-            .collect::<Vec<_>>();
-        matches.sort();
-        Ok(matches)
+        parse_docker_walk_output(&base, relative_start, &result.stdout)
     }
 
     fn working_directory(&self) -> &str {
@@ -2020,6 +2017,72 @@ impl Sandbox for DockerSandbox {
     }
 }
 
+fn docker_walk_command(base: &str, relative_start: &str, options: &WalkOptions) -> String {
+    let traversal_root = join_sandbox_path(base, relative_start);
+    let quoted_root = shell_quote(&traversal_root);
+    let mut command = format!("if [ -e {quoted_root} ]");
+    let mut component_path = base.to_string();
+    for segment in relative_start
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+    {
+        component_path = join_sandbox_path(&component_path, segment);
+        let _ = write!(command, " && [ ! -L {} ]", shell_quote(&component_path));
+    }
+    let _ = write!(command, "; then find -H {quoted_root}");
+
+    if !options.excluded_directory_names.is_empty() {
+        command.push_str(" \\( -type d \\(");
+        for (index, directory_name) in options.excluded_directory_names.iter().enumerate() {
+            if index > 0 {
+                command.push_str(" -o");
+            }
+            let _ = write!(command, " -name {}", shell_quote(directory_name));
+        }
+        command.push_str(" \\) -prune \\) -o");
+    }
+
+    command.push_str(" -not -type l -type f -printf '%s\\0%P\\0'; fi");
+    command
+}
+
+fn parse_docker_walk_output(
+    base: &str,
+    relative_start: &str,
+    output: &str,
+) -> crate::Result<Vec<SandboxFile>> {
+    let mut fields = output.split('\0');
+    let mut files = Vec::new();
+
+    while let Some(size) = fields.next() {
+        if size.is_empty() {
+            break;
+        }
+        let relative_to_start = fields.next().ok_or_else(|| {
+            crate::Error::message("Malformed Docker file traversal output: missing path")
+        })?;
+        let size = size.parse::<u64>().map_err(|error| {
+            crate::Error::context(
+                format!("Malformed Docker file traversal size {size:?}"),
+                error,
+            )
+        })?;
+        let relative_path = if relative_to_start.is_empty() {
+            relative_start.to_string()
+        } else {
+            join_sandbox_path(relative_start, relative_to_start)
+        };
+        files.push(SandboxFile {
+            path: join_sandbox_path(base, &relative_path),
+            relative_path,
+            size,
+        });
+    }
+
+    files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    Ok(files)
+}
+
 #[cfg(test)]
 mod tests {
     #[expect(
@@ -2035,6 +2098,32 @@ mod tests {
 
     use super::*;
     use crate::sandbox::{BASH_PROBE_MARKER, bash_probe_passed};
+
+    #[test]
+    fn docker_walk_command_only_uses_find_for_traversal() {
+        let command = docker_walk_command("/workspace", ".ai", &WalkOptions {
+            excluded_directory_names: vec!["target".to_string(), "node_modules".to_string()],
+        });
+
+        assert!(command.contains("[ ! -L /workspace/.ai ]"));
+        assert!(command.contains("find -H /workspace/.ai"));
+        assert!(command.contains("-name target"));
+        assert!(command.contains("-name node_modules"));
+        assert!(command.contains("-printf '%s\\0%P\\0'"));
+        assert!(!command.contains("*.md"));
+    }
+
+    #[test]
+    fn docker_walk_output_is_relative_to_the_declared_base() {
+        let files =
+            parse_docker_walk_output("/workspace", ".ai/reports", "12\0result.md\0").unwrap();
+
+        assert_eq!(files, vec![SandboxFile {
+            path:          "/workspace/.ai/reports/result.md".to_string(),
+            relative_path: ".ai/reports/result.md".to_string(),
+            size:          12,
+        }]);
+    }
 
     #[test]
     fn per_run_container_idle_command_uses_non_login_bash() {

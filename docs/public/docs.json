@@ -295,6 +295,7 @@
             "group": "July 2026",
             "icon": "clock-rotate-left",
             "pages": [
+              "changelog/2026-07-25",
               "changelog/2026-07-24",
               "changelog/2026-07-23",
               "changelog/2026-07-22",

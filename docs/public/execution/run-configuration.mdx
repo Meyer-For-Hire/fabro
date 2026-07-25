@@ -102,7 +102,7 @@ repo_name = "fabro"
 repo_url = "https://github.com/fabro-sh/fabro"
 
 [run.artifacts]
-include = ["test-results/**", "playwright-report/**"]
+include = ["test-results/**", "playwright-report/**", "**/*.trace.zip"]
 
 [run.agent.mcps.playwright]
 type = "sandbox"
@@ -416,14 +416,29 @@ Configure automatic collection of test artifacts (Playwright reports, JUnit XML,
 
 ```toml title="run.toml"
 [run.artifacts]
-include = ["test-results/**", "playwright-report/**", "*.trace.zip"]
+include = ["test-results/**", "playwright-report/**", "**/*.trace.zip"]
 ```
 
 | Field | Description |
 |---|---|
-| `include` | Glob patterns for files to collect as assets. Matched against the working directory after each stage completes. |
+| `include` | Workspace-relative glob patterns for regular files to collect as assets after each stage. |
 
 Artifact collection is opt-in — when no `[run.artifacts]` section is present, no file scanning occurs.
+
+Artifact globs use `/` as the separator and have the same semantics in every sandbox:
+
+- `*` and `?` match within one path segment.
+- Bracket expressions such as `[abc]` and `[!abc]` match one character.
+- `**` matches across directories when used as a complete segment.
+- Leading dots are matched normally.
+- Patterns are relative to the sandbox working directory and case-sensitive.
+- Absolute patterns and patterns containing a `..` segment are invalid.
+
+For example, `.ai/reports/*.md` matches direct Markdown children of `.ai/reports`, while `.ai/reports/**/*.md` also matches nested reports. `*.trace.zip` matches only the working-directory root; use `**/*.trace.zip` to match at any depth. To collect date-named implementation plans, use `.ai/plans/????-??-??-*.md`.
+
+Each collection reflects the post-stage workspace state rather than filesystem modification timestamps. A path with unchanged content is recorded only once per run; if its content changes, Fabro captures the new version.
+
+Fabro resolves the configured workspace root but does not recurse through symlinks below it while collecting artifacts. Dependency, cache, and build directories such as `.git`, `node_modules`, `target`, `.venv`, `.cache`, and `dist` are pruned. A collection is limited to 100 files, 10 MB per file, and 50 MB total.
 
 ### `[run.agent]`
 

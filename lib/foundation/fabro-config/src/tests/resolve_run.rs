@@ -61,6 +61,30 @@ fn run_model_controls_default_to_none() {
 }
 
 #[test]
+fn run_artifact_globs_are_validated_during_resolve() {
+    let error = workflow_settings_from_toml(
+        r#"
+_version = 1
+
+[run.artifacts]
+include = ["/tmp/*.md", "../reports/*.md", "src/[abc"]
+"#,
+    )
+    .expect_err("invalid artifact workspace globs should not resolve");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("run.artifacts.include[0]")
+            && message.contains("must be relative")
+            && message.contains("run.artifacts.include[1]")
+            && message.contains("parent directory")
+            && message.contains("run.artifacts.include[2]")
+            && message.contains("invalid workspace glob"),
+        "unexpected error: {message}"
+    );
+}
+
+#[test]
 fn resolves_run_defaults_from_empty_settings() {
     let settings = super::workflow_settings_from_layer(SettingsLayer::default())
         .expect("empty settings should resolve")

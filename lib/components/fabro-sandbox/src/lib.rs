@@ -2,7 +2,6 @@ pub mod config;
 pub mod error;
 #[cfg(any(feature = "docker", feature = "daytona"))]
 pub mod from_environment;
-mod glob_match;
 pub mod provider;
 pub mod sandbox;
 pub mod sandbox_spec;
@@ -54,9 +53,9 @@ pub use reconnect::{reconnect, reconnect_for_run, reconnect_for_run_with_callbac
 pub use sandbox::{
     CommandOutputCallback, DEFAULT_EXEC_OUTPUT_TAIL_BYTES, DirEntry, ExecResult,
     ExecStreamingResult, GitRunInfo, GitSetupIntent, GrepOptions, RefreshOutcome, Sandbox,
-    SandboxEvent, SandboxEventCallback, StderrCollector, StdioProcess, StdioProcessHandle,
-    StdioProcessTermination, format_lines_numbered, git_push_via_exec, redacted_output_tail,
-    setup_git_via_exec, shell_quote,
+    SandboxEvent, SandboxEventCallback, SandboxFile, StderrCollector, StdioProcess,
+    StdioProcessHandle, StdioProcessTermination, WalkOptions, format_lines_numbered,
+    git_push_via_exec, redacted_output_tail, setup_git_via_exec, shell_quote,
 };
 pub use sandbox_spec::SandboxSpec;
 pub use terminal::{TerminalSession, TerminalSize, open_terminal_for_run};
