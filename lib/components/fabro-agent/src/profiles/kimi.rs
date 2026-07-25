@@ -31,17 +31,6 @@ exact match and unique unless replace_all is true. If the edit fails with 'old_s
 re-read the file and take the exact text from the fresh output rather than guessing again. \
 Preserve existing indentation.";
 
-const GREP_DESCRIPTION: &str = "Search file contents with a regular expression.
-
-Use Grep when you are looking for unknown content or an unknown location. If you already know the \
-path, use Read instead. Prefer this over running `grep` or `rg` through Bash: it caps its output, \
-so it will not flood the conversation.
-
-- Backed by ripgrep when available and POSIX `grep` otherwise, so keep patterns portable across \
-both rather than relying on ripgrep-only syntax.
-- `path` chooses the search root, `glob_filter` limits which files are searched, \
-`case_insensitive` folds case, and `max_results` caps the output.";
-
 const GLOB_DESCRIPTION: &str = "Find files by name using a glob pattern, most recently modified \
 first.
 
@@ -87,12 +76,12 @@ impl KimiProfile {
         // replace it.
         registry.register(kimi_tools::make_kimi_read_tool());
         registry.register(kimi_tools::make_kimi_write_tool());
+        registry.register(kimi_tools::make_kimi_grep_tool());
         registry.register(kimi_tools::make_kimi_bash_tool(
             options.default_command_timeout_ms,
             options.max_command_timeout_ms,
         ));
         registry.redescribe(NativeTool::EditFile, EDIT_FILE_DESCRIPTION);
-        registry.redescribe(NativeTool::Grep, GREP_DESCRIPTION);
         registry.redescribe(NativeTool::Glob, GLOB_DESCRIPTION);
 
         // Kimi Code drives todos with one replace-whole-list call. The

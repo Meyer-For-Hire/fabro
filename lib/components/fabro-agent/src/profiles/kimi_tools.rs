@@ -24,6 +24,7 @@ use fabro_llm::types::ToolDefinition;
 use serde_json::Value;
 
 use crate::native_tool::NativeTool;
+use crate::sandbox::GrepOptions;
 use crate::tool_registry::{RegisteredTool, ToolSource};
 use crate::tools::{optional_usize_arg, required_str};
 
@@ -297,7 +298,7 @@ mod tests {
 
     use super::*;
     use crate::sandbox::Sandbox;
-    use crate::test_support::MutableMockSandbox;
+    use crate::test_support::{MockSandbox, MutableMockSandbox};
     use crate::tool_registry::ToolContext;
 
     fn ctx(env: Arc<dyn Sandbox>) -> ToolContext {
@@ -399,6 +400,96 @@ mod tests {
         assert!(err.contains("expected overwrite|append"), "{err}");
     }
 
+    /// `files_with_matches` and `count` both need the file path, which the
+    /// underlying search only prefixes when scanning a directory.
+    #[test]
+    fn grep_result_path_handles_both_output_shapes() {
+        // Directory scan: `<path>:<line>:<content>`.
+        assert_eq!(
+            grep_result_path("src/main.rs:42:fn main() {", "src"),
+            "src/main.rs"
+        );
+        // A colon in the content must not be mistaken for the line field.
+        assert_eq!(
+            grep_result_path("src/a.rs:7:let x: u8 = 1;", "src"),
+            "src/a.rs"
+        );
+        // Single-file scan omits the path, so fall back to what was searched.
+        assert_eq!(
+            grep_result_path("42:fn main() {", "src/main.rs"),
+            "src/main.rs"
+        );
+    }
+
+    async fn grep_with(args: serde_json::Value, lines: Vec<String>) -> Result<String, String> {
+        let env: Arc<dyn Sandbox> = Arc::new(MockSandbox {
+            grep_results: lines,
+            ..MockSandbox::default()
+        });
+        let tool = make_kimi_grep_tool();
+        (tool.executor)(args, ctx(env)).await
+    }
+
+    #[tokio::test]
+    async fn grep_content_mode_returns_matching_lines() {
+        let out = grep_with(json!({"pattern": "x"}), vec![
+            "a.rs:1:x".into(),
+            "b.rs:2:x".into(),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(out, "a.rs:1:x\nb.rs:2:x");
+    }
+
+    #[tokio::test]
+    async fn grep_files_with_matches_deduplicates_paths_in_order() {
+        let out = grep_with(
+            json!({"pattern": "x", "output_mode": "files_with_matches"}),
+            vec!["a.rs:1:x".into(), "a.rs:9:x".into(), "b.rs:2:x".into()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(out, "a.rs\nb.rs");
+    }
+
+    #[tokio::test]
+    async fn grep_count_mode_counts_per_file() {
+        let out = grep_with(json!({"pattern": "x", "output_mode": "count"}), vec![
+            "a.rs:1:x".into(),
+            "a.rs:9:x".into(),
+            "b.rs:2:x".into(),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(out, "a.rs:2\nb.rs:1");
+    }
+
+    #[tokio::test]
+    async fn grep_offset_and_head_limit_page_results() {
+        let lines: Vec<String> = (1..=6).map(|n| format!("f{n}.rs:1:x")).collect();
+        let out = grep_with(json!({"pattern": "x", "offset": 2, "head_limit": 2}), lines)
+            .await
+            .unwrap();
+        assert_eq!(out, "f3.rs:1:x\nf4.rs:1:x");
+    }
+
+    #[tokio::test]
+    async fn grep_rejects_an_unknown_output_mode() {
+        let err = grep_with(json!({"pattern": "x", "output_mode": "json"}), vec![])
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("expected content|files_with_matches|count"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_reports_no_matches_plainly() {
+        let out = grep_with(json!({"pattern": "x"}), vec![]).await.unwrap();
+        assert_eq!(out, "No matches found");
+    }
+
     /// The reason Bash is a separate tool: `timeout` is seconds, not
     /// milliseconds. A rename would have made every timeout 1000x wrong.
     #[test]
@@ -419,5 +510,167 @@ mod tests {
         );
         // Fabro has no background shell, so none is promised.
         assert!(!tool.definition.description.contains("run_in_background"));
+    }
+}
+
+/// Output shapes Kimi Code's `Grep` supports.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GrepOutputMode {
+    Content,
+    FilesWithMatches,
+    Count,
+}
+
+impl GrepOutputMode {
+    fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value.unwrap_or("content") {
+            "content" => Ok(Self::Content),
+            "files_with_matches" => Ok(Self::FilesWithMatches),
+            "count" => Ok(Self::Count),
+            other => Err(format!(
+                "Invalid output_mode `{other}` (expected content|files_with_matches|count)"
+            )),
+        }
+    }
+}
+
+/// Extract the file path from a grep result line.
+///
+/// The underlying search emits `<path>:<line>:<content>` when scanning a
+/// directory, but omits the path when scanning a single file, so fall back to
+/// the path that was searched.
+fn grep_result_path<'a>(line: &'a str, searched: &'a str) -> &'a str {
+    // Walk candidate separators so absolute Windows-style paths and paths
+    // containing colons still split at the line-number field.
+    let mut rest = line;
+    let mut consumed = 0usize;
+    while let Some(idx) = rest.find(':') {
+        let after = &rest[idx + 1..];
+        let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+        if !digits.is_empty() && after[digits.len()..].starts_with(':') {
+            return &line[..consumed + idx];
+        }
+        consumed += idx + 1;
+        rest = after;
+    }
+    searched
+}
+
+/// `Grep` with Kimi Code's `output_mode`, `head_limit`, and `offset`.
+///
+/// These are all shapes of the result list the sandbox already returns, so no
+/// provider work is needed. Kimi Code's `type`, `multiline`, and
+/// `include_ignored` are deliberately absent: they would have to reach ripgrep
+/// flags through new `Sandbox` trait methods, and advertising a parameter that
+/// is ignored is worse than omitting it.
+#[must_use]
+pub fn make_kimi_grep_tool() -> RegisteredTool {
+    RegisteredTool {
+        definition: definition(
+            NativeTool::Grep,
+            "Search file contents with a regular expression.
+
+Use Grep when looking for unknown content or an unknown location. If you already know the path, \
+use Read instead. Prefer this over running `grep` or `rg` through Bash: it caps its output, so it \
+will not flood the conversation.
+
+- Backed by ripgrep when available and POSIX `grep` otherwise, so keep patterns portable across \
+both rather than relying on ripgrep-only syntax.
+- `output_mode` selects what comes back: `content` (matching lines, the default), \
+`files_with_matches` (just the paths), or `count` (matches per file).
+- `head_limit` caps how many results are returned and `offset` skips that many first, so you can \
+page through a large result set.
+- `glob` limits which files are searched; `case_insensitive` folds case.",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Regular expression to search for."},
+                    "path": {"type": "string", "description": "Directory or file to search. Defaults to the working directory."},
+                    "glob": {"type": "string", "description": "Only search files matching this glob."},
+                    "output_mode": {
+                        "type": "string",
+                        "enum": ["content", "files_with_matches", "count"],
+                        "description": "Shape of the results (default content)."
+                    },
+                    "head_limit": {"type": "integer", "description": "Return at most this many results."},
+                    "offset": {"type": "integer", "description": "Skip this many results before returning."},
+                    "case_insensitive": {"type": "boolean", "description": "Fold case when matching."}
+                },
+                "required": ["pattern"]
+            }),
+        ),
+        executor:   Arc::new(|args, ctx| {
+            Box::pin(async move {
+                let pattern = required_str(&args, "pattern")?;
+                // The trait requires a search root; "." is the working directory.
+                let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
+                let mode = GrepOutputMode::parse(args.get("output_mode").and_then(Value::as_str))?;
+                let head_limit = optional_usize_arg(&args, "head_limit")?;
+                let offset = optional_usize_arg(&args, "offset")?.unwrap_or(0);
+
+                let options = GrepOptions {
+                    glob_filter:      args.get("glob").and_then(Value::as_str).map(str::to_string),
+                    case_insensitive: args
+                        .get("case_insensitive")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    // Only push the cap down for `content`, where results and
+                    // lines are the same thing. Capping lines early would
+                    // undercount files for the other modes.
+                    max_results:      match mode {
+                        GrepOutputMode::Content => head_limit.map(|n| n.saturating_add(offset)),
+                        _ => None,
+                    },
+                };
+
+                let lines = ctx
+                    .env
+                    .grep(pattern, path, &options)
+                    .await
+                    .map_err(|e| e.display_with_causes())?;
+
+                let searched = path;
+                let mut results: Vec<String> = match mode {
+                    GrepOutputMode::Content => lines,
+                    GrepOutputMode::FilesWithMatches => {
+                        let mut seen: Vec<String> = Vec::new();
+                        for line in &lines {
+                            let file = grep_result_path(line, searched).to_string();
+                            if !seen.contains(&file) {
+                                seen.push(file);
+                            }
+                        }
+                        seen
+                    }
+                    GrepOutputMode::Count => {
+                        let mut counts: Vec<(String, usize)> = Vec::new();
+                        for line in &lines {
+                            let file = grep_result_path(line, searched).to_string();
+                            match counts.iter_mut().find(|(name, _)| *name == file) {
+                                Some((_, count)) => *count += 1,
+                                None => counts.push((file, 1)),
+                            }
+                        }
+                        counts
+                            .into_iter()
+                            .map(|(file, count)| format!("{file}:{count}"))
+                            .collect()
+                    }
+                };
+
+                if offset > 0 {
+                    results = results.into_iter().skip(offset).collect();
+                }
+                if let Some(limit) = head_limit {
+                    results.truncate(limit);
+                }
+
+                if results.is_empty() {
+                    return Ok("No matches found".to_string());
+                }
+                Ok(results.join("\n"))
+            })
+        }),
+        source:     ToolSource::Native,
     }
 }
