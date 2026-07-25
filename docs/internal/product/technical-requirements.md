@@ -4,7 +4,8 @@ This note captures stable constraints that product changes should respect.
 
 ## Core constraints
 
-- Fabro ships primarily as a single Rust binary with CLI and server modes.
+- Fabro ships primarily as a single Rust binary providing both the CLI and the server.
+- Runs always execute in a server-managed worker process. There is no CLI-local run execution, so "CLI vs server" is a matter of which subcommand you invoked, not two execution modes.
 - Workflows are defined in Graphviz DOT and should remain reviewable as source files.
 - The workflow engine must support loops, branching, parallel stages, commands, agent stages, and human gates.
 - Model routing is per-stage and provider-agnostic through stylesheets and config.

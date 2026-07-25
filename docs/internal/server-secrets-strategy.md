@@ -2,13 +2,18 @@
 
 This document defines how Fabro handles server-level secrets.
 
+Fabro always runs as a server process plus one worker process per run. There is no CLI-local run
+execution, so the operative question for any credential is **which process holds the value, and
+when does it resolve** — see [Which process resolves what](#which-process-resolves-what).
+
 ## Core Rules
 
 - `ServerSecrets` is the canonical reader for **bootstrap** server secrets only.
 - It reads bootstrap secrets from `process env` and `<storage>/server.env`.
 - Resolution is snapshot-based: env and file are read once at construction, then treated as immutable for the life of the process.
 - `process env` wins over `server.env` on conflicts.
-- Optional integration secrets are vault-only in server runtime. Do not add optional server integrations to `ServerSecrets` or add new runtime env fallback paths.
+- Optional integration secrets are vault-only in the **server process**. Do not add optional server integrations to `ServerSecrets`, and do not add bespoke env fallback paths to it.
+- Not every credential is a `ServerSecrets` or vault lookup. A third mechanism exists: **settings-declared credentials** in `InterpString` fields, resolved at consumption time from `{{ env.NAME }}` or `{{ secrets.NAME }}`. See [Settings-declared credentials](#settings-declared-credentials).
 - `fabro server start` never generates secrets. Missing required secrets are a startup error.
 - `std::env::set_var` and `std::env::remove_var` are banned workspace-wide. Tests are not exempt. Enforced by clippy via `disallowed_methods` in `clippy.toml`; intentional exceptions must be annotated with a scoped `#[expect(clippy::disallowed_methods, reason = "...")]` at the call site.
 
@@ -22,7 +27,8 @@ These values may be read via `state.server_secret(...)` because the server can n
 | `FABRO_DEV_TOKEN` | Dev-token user auth when `server.auth.methods` includes `dev-token` |
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` | Static S3 object-store credentials for server storage builders |
 
-These optional integration secrets are **not** server bootstrap secrets. They are read from the vault only:
+These optional integration secrets are **not** server bootstrap secrets. They are provisioned into
+the vault:
 
 - LLM provider API keys and OAuth credential records
 - `GITHUB_TOKEN`
@@ -35,6 +41,65 @@ These optional integration secrets are **not** server bootstrap secrets. They ar
 - `BRAVE_SEARCH_API_KEY`
 
 `FABRO_JWT_PRIVATE_KEY` and `FABRO_JWT_PUBLIC_KEY` are removed. `SESSION_SECRET` is the single auth root.
+
+Provisioning into the vault is not the same as the resolver being vault-only. `CredentialResolver`
+owns a documented process-env fallback that runs after the vault lookup
+(`lib/foundation/fabro-auth/src/resolve.rs:198-204`), and `CredentialRef::Env(name)` is a
+first-class credential source (`resolve.rs:350`). Which paths that fallback is live on is a
+per-process question:
+
+- **Server process** — inert. `lib/apps/fabro-server/src/server.rs:2453` builds
+  `SqlVaultCredentialSource::vault_only(...)`, so the env lookup always returns `None`.
+- **Worker process** — wired but effectively inert for provider keys. `build_llm_source`
+  (`lib/components/fabro-workflow/src/pipeline/initialize.rs:275`) builds the run's credential
+  source with `VaultCredentialSource::new`, which carries the process-env fallback; the
+  provider-listing path does the same via `with_env_lookup(process_env_var)`
+  (`operations/start.rs:529`). But the worker's env was cleared and repopulated from
+  `WORKER_ENV_ALLOWLIST` (`lib/apps/fabro-server/src/spawn_env.rs:6`), which does not include
+  provider API keys. Exporting a provider key in the server's shell therefore has no effect on runs.
+- **`fabro exec` and direct `fabro-llm` SDK usage** — live. These have no vault and read process
+  env deliberately.
+
+## Which process resolves what
+
+Both the server and per-run workers always exist. Name the resolving process and the timing rather
+than saying "server runtime", which is ambiguous.
+
+| Value | Resolved by | When |
+|---|---|---|
+| Bootstrap server secret | Server process, via `ServerSecrets` | Once at construction, then immutable |
+| Optional integration secret | Server process or worker, via the vault | At use |
+| `{{ vars.NAME }}` | Server process | When the run is created, from that run's variable snapshot |
+| `{{ env.NAME }}` | The process that owns the value (usually the worker) | At consumption time |
+| `{{ secrets.NAME }}` | The process that owns the value, against the server vault | At consumption time |
+
+`docs/public/agents/mcp.mdx` documents the same split for MCP server configuration and is a good
+worked example of the shape.
+
+## Settings-declared credentials
+
+Some credentials are declared in settings rather than looked up by name. Those fields are
+`InterpString` (`lib/foundation/fabro-types/src/settings/interp.rs`), which supports narrow
+`{{ namespace.NAME }}` tokens with no template logic. Three namespaces resolve: `env` (process
+environment, consumption time), `secrets` (vault, consumption time), and `vars` (non-sensitive run
+variables, substituted early at run creation). A token whose namespace is unavailable in the
+resolution context fails loudly.
+
+The reference implementation is LLM provider `extra_headers`, resolved against env plus vault at
+`lib/foundation/fabro-auth/src/resolve.rs:376-378`:
+
+```toml
+[llm.providers.example.extra_headers]
+authorization = "Bearer {{ secrets.EXAMPLE_TOKEN }}"
+x-tenant      = "{{ env.EXAMPLE_TENANT }}"
+```
+
+Use this mechanism when the credential belongs to an operator-configured integration declared in
+`settings.toml`, rather than being a fixed secret name the code looks up. It is not a `ServerSecrets`
+field and is not covered by the bootstrap rules above.
+
+When such a value is passed to a subprocess, treat it like any other authority-bearing value: see
+[Subprocess Boundaries](#subprocess-boundaries).
 
 ## Startup
 
@@ -78,8 +143,19 @@ There is no startup-time secret generation. A temporary startup migration moves 
 
 ## Adding A New Server Secret
 
-1. Classify it in `fabro-static` as `Bootstrap` or `OptionalVault`.
+First pick the mechanism. These are the only three:
+
+| Kind | Provisioned via | Read via |
+|---|---|---|
+| Bootstrap server secret | Platform env or install-written `server.env` | `state.server_secret(...)` |
+| Optional integration secret | Vault (`fabro secret set`, `fabro install`) | `state.vault_secret(...)` |
+| Settings-declared credential | `{{ secrets.* }}` or `{{ env.* }}` in an `InterpString` settings field | Resolved at consumption time by the owning process |
+
+Then:
+
+1. For the first two kinds, classify it in `fabro-static` as `Bootstrap` or `OptionalVault`. Settings-declared credentials are not classified there — they have no fixed secret name.
 2. For bootstrap secrets, provision through platform env or install-written `server.env`, then read through `state.server_secret(...)`.
 3. For optional integration secrets, provision through the vault and read through `state.vault_secret(...)`.
-4. Decide explicitly whether startup should fail when it is absent.
-5. If a worker or render subprocess needs it, re-inject it explicitly rather than broadening inheritance casually.
+4. For settings-declared credentials, follow [Settings-declared credentials](#settings-declared-credentials) and model the field on provider `extra_headers`.
+5. Decide explicitly whether startup should fail when it is absent.
+6. If a worker or render subprocess needs it, re-inject it explicitly rather than broadening inheritance casually. If the injected value is a credential, scrub it at worker startup the way `FABRO_WORKER_TOKEN` is scrubbed, so descendants do not inherit it.
