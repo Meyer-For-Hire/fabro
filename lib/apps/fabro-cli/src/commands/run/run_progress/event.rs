@@ -1,6 +1,7 @@
 use std::convert::TryFrom;
 
 use chrono::{DateTime, Utc};
+use fabro_agent::Error as AgentError;
 use fabro_types::{BilledModelUsage, EventBody, RunEvent};
 use fabro_util::error;
 use fabro_workflow::event::RunNoticeLevel;
@@ -433,8 +434,11 @@ pub(super) fn from_json_line(line: &str) -> Option<ProgressEvent> {
 }
 
 fn display_compaction_error(value: &Value) -> Option<String> {
-    let error = serde_json::from_value::<fabro_agent::Error>(value.clone()).ok()?;
-    matches!(&error, fabro_agent::Error::Compaction(_)).then(|| error.to_string())
+    let error = serde_json::from_value::<AgentError>(value.clone()).ok()?;
+    match error {
+        AgentError::Compaction(error) => Some(error.to_string()),
+        _ => None,
+    }
 }
 
 fn display_value(value: &Value) -> Option<String> {
