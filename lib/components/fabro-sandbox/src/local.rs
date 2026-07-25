@@ -92,8 +92,7 @@ impl LocalSandbox {
             }
         };
 
-        let _ = self.bash_path.set(resolved.clone());
-        Ok(resolved)
+        Ok(self.bash_path.get_or_init(|| resolved).clone())
     }
 
     /// Verify the resolved executable is non-login Bash.
