@@ -159,9 +159,6 @@ pub fn make_kimi_read_tool() -> RegisteredTool {
             NativeTool::ReadFile,
             "Read a text file from the workspace.
 
-Read a file before editing it: Edit matches `old_string` byte for byte, and only the Read output \
-tells you what that string is.
-
 - If you have a concrete path, call Read directly. Do not Glob or `ls` first to check that it \
 exists — a missing path returns an error you can handle.
 - When you need several files, emit multiple Read calls in one response rather than one per turn.
@@ -170,7 +167,9 @@ an Edit `old_string`.
 - `line_offset` is the 1-based first line to read. A NEGATIVE value reads from the end, so -100 \
 returns the last 100 lines.
 - `n_lines` defaults to 2000 lines.
-- Use Bash or an MCP tool for binary formats; this tool reads text.",
+- Use Bash or an MCP tool for binary formats; this tool reads text.
+- After a successful Edit or Write, do not re-read solely to prove the write landed. When the task \
+depends on an exact file, API, or output shape, inspect the final result before finishing.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -259,16 +258,16 @@ pub fn make_kimi_write_tool() -> RegisteredTool {
     RegisteredTool {
         definition: definition(
             NativeTool::WriteFile,
-            "Create, append to, or replace a file.
-
-Read an existing file with Read before writing to it: overwrite replaces everything you do not \
-restate, so anything you have not seen is what you stand to lose.
+            "Create, append to, or replace a file entirely.
 
 - `mode` defaults to `overwrite`, which replaces the whole file. `append` requires an existing file \
 and adds to its end without inserting a newline.
-- Write is NOT for incremental changes to an existing file, however small. Use Edit instead: \
-overwrite replaces everything you did not restate.
-- Use `overwrite` when the file does not exist, or when you intend a complete replacement.
+- Write is NOT ALLOWED for incremental changes to existing files, including trivial, one-line, \
+quick, or cosmetic edits. Use Edit instead.
+- Use Write only when the file does not exist, you intend a complete replacement, or the new \
+contents have little continuity with the old contents.
+- Read before overwriting an existing file.
+- Write ignores the Read/Edit line-number view. NEVER include line prefixes.
 - Do not create documentation files that were not asked for.",
             serde_json::json!({
                 "type": "object",

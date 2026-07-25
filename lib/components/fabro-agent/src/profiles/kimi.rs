@@ -19,17 +19,25 @@ const CORE_PROMPT: &str = include_str!("prompts/kimi.md.j2");
 /// Kimi models repeatedly reconstruct `old_string` from memory rather than from
 /// a fresh read: across two observed K3 implementation stages, 32 of 35 tool
 /// failures were edits against a file the model had not read, or `old_string`
-/// values recalled from an earlier version. Kimi Code's own tool descriptions
-/// drill this rule directly, so the Kimi profile restates it where the model is
-/// most likely to act on it — in the description of the tool being called —
-/// rather than relying only on the system prompt.
-const EDIT_FILE_DESCRIPTION: &str = "Edit a file by replacing an exact string. \
-Read the file with Read before EVERY edit: old_string is matched byte for byte, and only the \
-Read output tells you what it is. Take old_string verbatim from that output; \
-never reconstruct it from memory or from an earlier version of the file. old_string must be an \
-exact match and unique unless replace_all is true. If the edit fails with 'old_string not found', \
-re-read the file and take the exact text from the fresh output rather than guessing again. \
-Preserve existing indentation.";
+/// values recalled from an earlier version. Kimi Code carries this guidance in
+/// its tool descriptions and nowhere in its system prompt, so this profile does
+/// the same — the rule lands in the description of the tool being called.
+const EDIT_FILE_DESCRIPTION: &str = "Perform exact replacements in existing files.
+
+- Edit is mandatory for every incremental change, especially small edits. DO NOT use Write or \
+Bash `sed`.
+- Read the target file before every Edit. DO NOT call Edit from memory, stale context, or a \
+guessed `old_string`.
+- Take `old_string` and `new_string` from the Read output view, dropping the line-number prefix \
+and separator; match only file content.
+- `old_string` must be unique unless `replace_all` is set. If it is ambiguous, add surrounding \
+context. Use `replace_all` only when every occurrence should change — for example, renaming a \
+symbol throughout the file.
+- DO NOT issue consecutive Edit calls on the same file. A previous Edit can invalidate a later \
+Edit's `old_string`, causing `old_string not found`. Read the file again before the next Edit.
+- If an Edit fails with `old_string not found`, re-read the file and take the exact text from the \
+fresh output rather than guessing again.
+- Preserve existing indentation.";
 
 const GLOB_DESCRIPTION: &str = "Find files by search-root-relative path using a glob pattern. \
 Results are sorted lexicographically by relative path.
@@ -310,6 +318,8 @@ mod tests {
                 .clone()
         };
 
+        // Kimi Code carries read-before-edit guidance in the tool descriptions
+        // and nowhere in its system prompt, so this is where it must land.
         for name in ["Edit", "Write"] {
             let text = describe(name);
             assert!(
@@ -317,8 +327,13 @@ mod tests {
                 "{name} should steer the model to read the file first"
             );
         }
-        assert!(describe("Edit").contains("never reconstruct it from memory"));
-        assert!(describe("Write").contains("everything you do not restate"));
+        assert!(
+            describe("Edit").contains("DO NOT call Edit from memory, stale context, or a guessed")
+        );
+        assert!(describe("Edit").contains("DO NOT issue consecutive Edit calls on the same file"));
+        assert!(describe("Write").contains("Read before overwriting an existing file"));
+        // Re-reading only to confirm a write landed is waste, not diligence.
+        assert!(describe("Read").contains("do not re-read solely to prove the write landed"));
 
         // Bash steers shell usage toward the dedicated tools, under the names
         // this profile actually exposes.
@@ -343,8 +358,8 @@ mod tests {
         // Fabro has no background shell; promising one would be a lie.
         assert!(!bash.contains("run_in_background"), "{bash}");
 
-        // Read explains why reading precedes editing.
-        assert!(describe("Read").contains("matches `old_string` byte for byte"));
+        // Read tells the model how to turn its output into an Edit old_string.
+        assert!(describe("Read").contains("Drop the number and separator"));
         // Grep must not promise ripgrep syntax: fabro falls back to POSIX grep.
         let grep = describe("Grep");
         assert!(grep.contains("POSIX"), "{grep}");
@@ -381,7 +396,10 @@ mod tests {
         let env = MockSandbox::linux();
         let prompt = profile.build_system_prompt(&env, &EnvContext::default(), &[], None, &[]);
         assert!(prompt.contains("You are Kimi"));
-        assert!(prompt.contains("# Reading Before Writing"));
+        assert!(prompt.contains("# Tracking Multi-Step Work"));
         assert!(prompt.contains("<environment>"));
+        // Kimi Code keeps read-before-edit mechanics out of its system prompt
+        // and in the tool descriptions; the profile follows that split.
+        assert!(!prompt.contains("Reading Before Writing"));
     }
 }
