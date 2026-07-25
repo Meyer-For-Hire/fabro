@@ -12,7 +12,7 @@ use fabro_types::{
 };
 
 use crate::memory::MemoryDocument;
-use crate::native_tool::NativeTool;
+use crate::native_tool::ToolVocabulary;
 use crate::skills::{Skill, format_skills_prompt_section};
 use crate::tool_registry::{ToolDefinitionWithSource, ToolSource};
 
@@ -23,6 +23,7 @@ pub(crate) struct ContextWindowInput<'a> {
     pub system_prompt: &'a str,
     pub memory: &'a [MemoryDocument],
     pub skills: &'a [Skill],
+    pub tool_vocabulary: ToolVocabulary,
     pub activated_skill_context_observed: bool,
     pub provider: &'a str,
     pub model: &'a str,
@@ -159,7 +160,7 @@ fn add_message_breakdown(
     input: &ContextWindowInput<'_>,
 ) {
     let memory_text = memory_prompt_suffix(input.memory);
-    let skills_text = skills_prompt_suffix(input.skills);
+    let skills_text = skills_prompt_suffix(input.skills, input.tool_vocabulary);
     let memory_tokens = estimate_text_tokens(&memory_text);
     let skills_tokens = estimate_text_tokens(&skills_text);
     let mut system_parts_seen = false;
@@ -221,8 +222,8 @@ fn memory_prompt_suffix(memory: &[MemoryDocument]) -> String {
     }
 }
 
-fn skills_prompt_suffix(skills: &[Skill]) -> String {
-    let section = format_skills_prompt_section(skills, NativeTool::UseSkill.canonical_name());
+fn skills_prompt_suffix(skills: &[Skill], vocabulary: ToolVocabulary) -> String {
+    let section = format_skills_prompt_section(skills, vocabulary);
     if section.is_empty() {
         String::new()
     } else {
@@ -391,7 +392,7 @@ mod tests {
         let system_prompt = format!(
             "core prompt{}{}",
             memory_prompt_suffix(&memory),
-            skills_prompt_suffix(&skills)
+            skills_prompt_suffix(&skills, ToolVocabulary::Fabro)
         );
         let tools = vec![
             tool("read_file", ToolSource::Native),
@@ -415,6 +416,7 @@ mod tests {
             system_prompt: &system_prompt,
             memory: &memory,
             skills: &skills,
+            tool_vocabulary: ToolVocabulary::Fabro,
             activated_skill_context_observed: true,
             provider: "test",
             model: "model-a",
@@ -445,6 +447,18 @@ mod tests {
                 warning.code == "activated_skill_context_counted_as_conversation"
             })
         );
+    }
+
+    #[test]
+    fn skills_suffix_uses_the_profile_tool_vocabulary() {
+        let skills = vec![Skill {
+            name:        "commit".to_string(),
+            description: "Commit changes".to_string(),
+            template:    "commit template".to_string(),
+        }];
+
+        assert!(skills_prompt_suffix(&skills, ToolVocabulary::Fabro).contains("`use_skill`"));
+        assert!(skills_prompt_suffix(&skills, ToolVocabulary::KimiCode).contains("`Skill`"));
     }
 
     #[test]

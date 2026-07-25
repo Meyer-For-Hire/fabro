@@ -11333,7 +11333,7 @@ components:
 
     TodoListKind:
       type: string
-      enum: [openai_plan, anthropic_tasks]
+      enum: [openai_plan, anthropic_tasks, kimi_todos]
       description: |-
         Tool surface a todo list belongs to. Determines the `list_id`
         prefix and scoping convention.

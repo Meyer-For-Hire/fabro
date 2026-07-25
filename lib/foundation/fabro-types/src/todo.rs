@@ -1,10 +1,12 @@
-//! Shared todo / task domain types used by `update_plan` (OpenAI) and the
-//! Claude task tools (`TaskCreate`, `TaskUpdate`, `TaskList`).
+//! Shared todo / task domain types used by `update_plan` (OpenAI), `TodoList`
+//! (Kimi Code), and the Claude task tools (`TaskCreate`, `TaskUpdate`,
+//! `TaskList`).
 //!
 //! Both tool families share the same event-sourced projection. The only
 //! difference is the scoping convention captured by [`TodoListKind`]:
 //!
 //! - `openai_plan:<session_id>` — one list per emitting session.
+//! - `kimi_todos:<session_id>` — one list per emitting session.
 //! - `anthropic_tasks:<root_session_id>` — one list shared by a root session
 //!   and all of its subagent sessions.
 //!

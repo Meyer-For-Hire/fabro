@@ -587,6 +587,11 @@ mod tests {
         assert!(anthropic.get(ANTHROPIC_ASK_USER_QUESTION_TOOL).is_some());
         assert!(anthropic.get(OPENAI_REQUEST_USER_INPUT_TOOL).is_none());
 
+        let mut kimi = ToolRegistry::new();
+        register_question_tools(AgentProfileKind::Kimi, &mut kimi);
+        assert!(kimi.get(ANTHROPIC_ASK_USER_QUESTION_TOOL).is_some());
+        assert!(kimi.get(OPENAI_REQUEST_USER_INPUT_TOOL).is_none());
+
         let mut gemini = ToolRegistry::new();
         register_question_tools(AgentProfileKind::Gemini, &mut gemini);
         assert!(gemini.names().is_empty());

@@ -5260,35 +5260,34 @@ mod tests {
         }
 
         #[test]
-        fn child_openai_plan_does_not_project_when_root_has_no_plan() {
-            let mut state = initialized_projection();
-            let stage_id = stage_id();
-            state
-                .apply_event(&test_stage_event(
-                    1,
-                    EventBody::StageStarted(started_props()),
-                    stage_id.clone(),
-                ))
-                .unwrap();
-            state
-                .apply_event(&child_stage_event(
-                    2,
-                    created(
-                        "openai_plan:child_session",
-                        TodoListKind::OpenAiPlan,
-                        "c-a",
-                        0,
-                        "child work",
-                    ),
-                    stage_id.clone(),
-                ))
-                .unwrap();
+        fn child_session_whole_lists_do_not_project_when_root_has_no_list() {
+            for (kind, child_list) in [
+                (TodoListKind::OpenAiPlan, "openai_plan:child_session"),
+                (TodoListKind::KimiTodos, "kimi_todos:child_session"),
+            ] {
+                let mut state = initialized_projection();
+                let stage_id = stage_id();
+                state
+                    .apply_event(&test_stage_event(
+                        1,
+                        EventBody::StageStarted(started_props()),
+                        stage_id.clone(),
+                    ))
+                    .unwrap();
+                state
+                    .apply_event(&child_stage_event(
+                        2,
+                        created(child_list, kind, "c-a", 0, "child work"),
+                        stage_id.clone(),
+                    ))
+                    .unwrap();
 
-            let stage = state.stage(&stage_id).expect("stage projection present");
-            assert!(
-                stage.root_agent_todos.is_none(),
-                "a child session's plan must not become the stage's root plan"
-            );
+                let stage = state.stage(&stage_id).expect("stage projection present");
+                assert!(
+                    stage.root_agent_todos.is_none(),
+                    "a child session's {kind} list must not become the stage's root list"
+                );
+            }
         }
 
         #[test]

@@ -67,7 +67,7 @@ Apply the same care beyond git: weigh the reversibility and blast radius of any 
 
 If the codebase has tests or the ability to build or run, use them to verify your work. Start as specific as possible to the code you changed to catch issues efficiently, then widen to broader tests as you build confidence.
 
-Long-running commands need a raised timeout rather than a retry. `Bash` takes a `timeout_ms` argument; use it for builds, test suites, and installs instead of letting the default elapse and trying again.
+Long-running commands need a raised timeout rather than a retry. `Bash` takes a `timeout` argument in seconds; use it for builds, test suites, and installs instead of letting the default elapse and trying again.
 
 # Ultimate Reminders
 

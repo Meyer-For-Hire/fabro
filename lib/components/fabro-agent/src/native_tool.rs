@@ -34,27 +34,27 @@ pub enum ToolVocabulary {
     Debug, Clone, Copy, PartialEq, Eq, Hash, Display, EnumString, IntoStaticStr, VariantArray,
 )]
 pub enum NativeTool {
-    #[strum(to_string = "read_file")]
+    #[strum(to_string = "read_file", serialize = "Read")]
     ReadFile,
     #[strum(to_string = "read_many_files")]
     ReadManyFiles,
-    #[strum(to_string = "write_file")]
+    #[strum(to_string = "write_file", serialize = "Write")]
     WriteFile,
-    #[strum(to_string = "edit_file")]
+    #[strum(to_string = "edit_file", serialize = "Edit")]
     EditFile,
     #[strum(to_string = "apply_patch")]
     ApplyPatch,
     #[strum(to_string = "list_dir")]
     ListDir,
-    #[strum(to_string = "grep")]
+    #[strum(to_string = "grep", serialize = "Grep")]
     Grep,
-    #[strum(to_string = "glob")]
+    #[strum(to_string = "glob", serialize = "Glob")]
     Glob,
-    #[strum(to_string = "shell")]
+    #[strum(to_string = "shell", serialize = "Bash")]
     Shell,
-    #[strum(to_string = "web_search")]
+    #[strum(to_string = "web_search", serialize = "WebSearch")]
     WebSearch,
-    #[strum(to_string = "web_fetch")]
+    #[strum(to_string = "web_fetch", serialize = "FetchURL")]
     WebFetch,
     #[strum(to_string = "spawn_agent")]
     SpawnAgent,
@@ -64,7 +64,7 @@ pub enum NativeTool {
     Wait,
     #[strum(to_string = "close_agent")]
     CloseAgent,
-    #[strum(to_string = "use_skill")]
+    #[strum(to_string = "use_skill", serialize = "Skill")]
     UseSkill,
     #[strum(to_string = "update_plan")]
     UpdatePlan,
@@ -91,6 +91,19 @@ impl NativeTool {
     #[must_use]
     pub fn canonical_name(self) -> &'static str {
         self.into()
+    }
+
+    /// Resolve a canonical fabro name to its built-in identity.
+    ///
+    /// Unlike [`Self::from_any_name`], this deliberately ignores provider
+    /// aliases. Registries use it while registering tools so an unrelated
+    /// extension named `Read` is not silently treated as fabro's file reader.
+    #[must_use]
+    pub fn from_canonical_name(name: &str) -> Option<Self> {
+        Self::VARIANTS
+            .iter()
+            .copied()
+            .find(|tool| tool.canonical_name() == name)
     }
 
     /// The name this tool is exposed under in `vocabulary`.
@@ -130,11 +143,7 @@ impl NativeTool {
     /// not drawn from this set.
     #[must_use]
     pub fn from_any_name(name: &str) -> Option<Self> {
-        Self::VARIANTS.iter().copied().find(|tool| {
-            ToolVocabulary::VARIANTS
-                .iter()
-                .any(|vocabulary| tool.name(*vocabulary) == name)
-        })
+        name.parse().ok()
     }
 
     /// Coarse access category, or `None` when the tool is not part of the

@@ -331,11 +331,14 @@ mod tests {
     fn native_tool_options_have_expected_profile_defaults() {
         let openai = NativeToolOptions::for_profile(AgentProfileKind::OpenAi);
         let anthropic = NativeToolOptions::for_profile(AgentProfileKind::Anthropic);
+        let kimi = NativeToolOptions::for_profile(AgentProfileKind::Kimi);
 
         assert_eq!(openai.default_command_timeout_ms, 10_000);
         assert_eq!(openai.max_command_timeout_ms, 600_000);
         assert_eq!(anthropic.default_command_timeout_ms, 120_000);
         assert_eq!(anthropic.max_command_timeout_ms, 600_000);
+        assert_eq!(kimi.default_command_timeout_ms, 60_000);
+        assert_eq!(kimi.max_command_timeout_ms, 600_000);
     }
 
     #[test]

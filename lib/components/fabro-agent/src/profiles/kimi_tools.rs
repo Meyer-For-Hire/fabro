@@ -17,20 +17,26 @@
 //! [`Sandbox`](crate::sandbox::Sandbox) methods the built-ins use, so sandbox
 //! behavior, path policy, and the read-before-write guard are unchanged.
 
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use fabro_llm::types::ToolDefinition;
 use serde_json::Value;
+use strum::EnumString;
 
 use crate::native_tool::NativeTool;
-use crate::sandbox::GrepOptions;
+use crate::sandbox::{GrepOptions, format_lines_numbered};
 use crate::tool_registry::{RegisteredTool, ToolSource};
-use crate::tools::{optional_usize_arg, required_str};
+use crate::tools::{
+    DEFAULT_READ_LINES, execute_grep, execute_shell_command, grep_result_path, make_edit_file_tool,
+    optional_usize_arg, required_str,
+};
 
-/// Largest `n_lines` a single `Read` call returns, matching fabro's built-in
-/// read default so the two tools cannot disagree about how much is "a page".
-const DEFAULT_READ_LINES: usize = 2000;
+const DEFAULT_GREP_RESULTS: usize = 250;
+const MAX_GREP_RESULTS: usize = 2000;
+const MAX_GREP_MATCHES_SCANNED: usize = 20_000;
 
 fn definition(tool: NativeTool, description: &str, parameters: Value) -> ToolDefinition {
     ToolDefinition {
@@ -114,13 +120,15 @@ explicitly asked. Never run commands requiring superuser privileges unless expli
                     None => default_timeout_ms,
                 };
 
-                let result = ctx
-                    .env
-                    .exec_command(command, timeout_ms, cwd, None, Some(ctx.cancel.clone()))
-                    .await
-                    .map_err(|e| e.display_with_causes())?;
+                let result = execute_shell_command(&ctx, command, timeout_ms, cwd).await?;
 
-                let mut out = result.stdout;
+                let mut out = String::new();
+                if result.is_timed_out() {
+                    out.push_str("Command timed out.\n");
+                } else if result.is_cancelled() {
+                    out.push_str("Command cancelled.\n");
+                }
+                out.push_str(&result.stdout);
                 if !result.stderr.is_empty() {
                     if !out.is_empty() {
                         out.push('\n');
@@ -154,8 +162,8 @@ read in this session.
 - If you have a concrete path, call Read directly. Do not Glob or `ls` first to check that it \
 exists — a missing path returns an error you can handle.
 - When you need several files, emit multiple Read calls in one response rather than one per turn.
-- Returns `<line-number>\\t<content>` per line. Drop the number and tab when taking text for an \
-Edit `old_string`.
+- Returns `<line-number> | <content>` per line. Drop the number and separator when taking text for \
+an Edit `old_string`.
 - `line_offset` is the 1-based first line to read. A NEGATIVE value reads from the end, so -100 \
 returns the last 100 lines.
 - `n_lines` defaults to 2000 lines.
@@ -166,11 +174,14 @@ returns the last 100 lines.
                     "path": {"type": "string", "description": "Path to the file to read."},
                     "line_offset": {
                         "type": "integer",
+                        "minimum": -2000,
                         "description": "1-based first line to read. Negative reads from the end \
-            of the file (-100 reads the last 100 lines)."
+            of the file (-100 reads the last 100 lines); zero is invalid."
                     },
                     "n_lines": {
                         "type": "integer",
+                        "minimum": 1,
+                        "maximum": 2000,
                         "description": "Number of lines to read (default 2000)."
                     }
                 },
@@ -180,8 +191,16 @@ returns the last 100 lines.
         executor:   Arc::new(|args, ctx| {
             Box::pin(async move {
                 let path = required_str(&args, "path")?;
-                let n_lines = optional_usize_arg(&args, "n_lines")?;
+                let n_lines = optional_usize_arg(&args, "n_lines")?.unwrap_or(DEFAULT_READ_LINES);
+                if n_lines == 0 || n_lines > DEFAULT_READ_LINES {
+                    return Err(format!(
+                        "n_lines must be between 1 and {DEFAULT_READ_LINES}"
+                    ));
+                }
                 let line_offset = args.get("line_offset").and_then(Value::as_i64);
+                if line_offset == Some(0) {
+                    return Err("line_offset must not be zero".to_string());
+                }
 
                 let content = match line_offset {
                     // Negative offset: count the file's lines, then start that
@@ -189,28 +208,30 @@ returns the last 100 lines.
                     Some(offset) if offset < 0 => {
                         let from_end = usize::try_from(offset.unsigned_abs())
                             .map_err(|_| "line_offset is too large".to_string())?;
-                        let total = ctx
+                        if from_end > DEFAULT_READ_LINES {
+                            return Err(format!(
+                                "negative line_offset must be at least -{DEFAULT_READ_LINES}"
+                            ));
+                        }
+                        let raw = ctx
                             .env
-                            .read_file(path, None, None)
+                            .read_file_text(path)
                             .await
-                            .map_err(|e| e.display_with_causes())?
-                            .lines()
-                            .count();
+                            .map_err(|e| e.display_with_causes())?;
+                        let total = raw.lines().count();
                         let start = total.saturating_sub(from_end).saturating_add(1);
-                        ctx.env
-                            .read_file(path, Some(start), n_lines.or(Some(from_end)))
-                            .await
+                        Ok(format_lines_numbered(
+                            &raw,
+                            Some(start),
+                            Some(n_lines.min(from_end)),
+                        ))
                     }
                     Some(offset) => {
                         let start = usize::try_from(offset)
                             .map_err(|_| "line_offset must fit in usize".to_string())?;
-                        ctx.env.read_file(path, Some(start), n_lines).await
+                        ctx.env.read_file(path, Some(start), Some(n_lines)).await
                     }
-                    None => {
-                        ctx.env
-                            .read_file(path, None, n_lines.or(Some(DEFAULT_READ_LINES)))
-                            .await
-                    }
+                    None => ctx.env.read_file(path, None, Some(n_lines)).await,
                 }
                 .map_err(|e| e.display_with_causes())?;
 
@@ -220,6 +241,14 @@ returns the last 100 lines.
         }),
         source:     ToolSource::Native,
     }
+}
+
+#[derive(Clone, Copy, Default, EnumString)]
+#[strum(serialize_all = "snake_case")]
+enum KimiWriteMode {
+    #[default]
+    Overwrite,
+    Append,
 }
 
 /// `Write`, with Kimi Code's `mode` so it can append.
@@ -261,28 +290,75 @@ overwrite replaces everything you did not restate.
                 let mode = args
                     .get("mode")
                     .and_then(Value::as_str)
-                    .unwrap_or("overwrite");
+                    .unwrap_or("overwrite")
+                    .parse::<KimiWriteMode>()
+                    .map_err(|_| "Invalid mode (expected overwrite|append)".to_string())?;
 
-                let payload = match mode {
-                    "overwrite" => content.to_string(),
+                match mode {
+                    KimiWriteMode::Overwrite => {
+                        ctx.env
+                            .write_file(path, content)
+                            .await
+                            .map_err(|e| e.display_with_causes())?;
+                    }
                     // The sandbox trait has no append; read-modify-write keeps
                     // every provider working and stays inside path policy.
-                    "append" => {
-                        let existing = ctx.env.read_file_text(path).await.unwrap_or_default();
-                        format!("{existing}{content}")
+                    KimiWriteMode::Append => {
+                        let mut existing = ctx
+                            .env
+                            .read_file_text(path)
+                            .await
+                            .map_err(|e| e.display_with_causes())?;
+                        existing.push_str(content);
+                        ctx.env
+                            .write_file(path, &existing)
+                            .await
+                            .map_err(|e| e.display_with_causes())?;
                     }
-                    other => {
-                        return Err(format!(
-                            "Invalid mode `{other}` (expected overwrite|append)"
-                        ));
-                    }
-                };
-
-                ctx.env
-                    .write_file(path, &payload)
-                    .await
-                    .map_err(|e| e.display_with_causes())?;
+                }
                 Ok(format!("Wrote {path}"))
+            })
+        }),
+        source:     ToolSource::Native,
+    }
+}
+
+/// Kimi Code's `Edit` schema names the target `path`; fabro's shared edit
+/// executor calls it `file_path`. Translate only that adapter field and reuse
+/// the exact-match/read-before-write implementation.
+#[must_use]
+pub fn make_kimi_edit_tool(description: &str) -> RegisteredTool {
+    let shared = make_edit_file_tool();
+    let shared_executor = shared.executor;
+    RegisteredTool {
+        definition: definition(
+            NativeTool::EditFile,
+            description,
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the text file to edit."},
+                    "old_string": {"type": "string", "description": "Exact content to replace."},
+                    "new_string": {"type": "string", "description": "Replacement text."},
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": "Replace every occurrence (default false)."
+                    }
+                },
+                "required": ["path", "old_string", "new_string"]
+            }),
+        ),
+        executor:   Arc::new(move |mut args, ctx| {
+            let shared_executor = shared_executor.clone();
+            Box::pin(async move {
+                let object = args
+                    .as_object_mut()
+                    .ok_or_else(|| "Edit arguments must be an object".to_string())?;
+                let path = object
+                    .remove("path")
+                    .ok_or_else(|| "Missing required parameter: path".to_string())?;
+                object.insert("file_path".to_string(), path);
+                shared_executor(args, ctx).await
             })
         }),
         source:     ToolSource::Native,
@@ -297,7 +373,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
-    use crate::sandbox::Sandbox;
+    use crate::sandbox::{ExecResult, Sandbox};
     use crate::test_support::{MockSandbox, MutableMockSandbox};
     use crate::tool_registry::ToolContext;
 
@@ -358,6 +434,22 @@ mod tests {
         assert!(!out.contains("line8"), "{out}");
     }
 
+    #[tokio::test]
+    async fn read_positive_offset_still_applies_the_default_limit() {
+        let lines: Vec<String> = (1..=DEFAULT_READ_LINES + 5)
+            .map(|n| format!("line{n}"))
+            .collect();
+        let env = sandbox_with("/f.txt", &lines.join("\n"));
+        let tool = make_kimi_read_tool();
+
+        let out = (tool.executor)(json!({"path": "/f.txt", "line_offset": 2}), ctx(env))
+            .await
+            .unwrap();
+
+        assert!(out.contains("2001 | line2001"), "{out}");
+        assert!(!out.contains("2002 | line2002"), "{out}");
+    }
+
     /// The reason Write is a separate tool: it has a mode, so it can append.
     #[tokio::test]
     async fn write_append_mode_preserves_existing_content() {
@@ -400,6 +492,47 @@ mod tests {
         assert!(err.contains("expected overwrite|append"), "{err}");
     }
 
+    #[tokio::test]
+    async fn write_append_propagates_a_missing_file_error() {
+        let env = Arc::new(MutableMockSandbox::new(HashMap::new()));
+        let tool = make_kimi_write_tool();
+
+        let err = (tool.executor)(
+            json!({"path": "/missing.txt", "content": "new", "mode": "append"}),
+            ctx(env),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.contains("missing.txt"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn edit_translates_kimi_path_to_the_shared_executor() {
+        let env = sandbox_with("/f.txt", "before");
+        env.mark_agent_read("/f.txt");
+        let tool = make_kimi_edit_tool("Edit");
+
+        (tool.executor)(
+            json!({"path": "/f.txt", "old_string": "before", "new_string": "after"}),
+            ctx(env.clone()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(env.read_file_text("/f.txt").await.unwrap(), "after");
+        assert!(
+            tool.definition.parameters["properties"]
+                .get("path")
+                .is_some()
+        );
+        assert!(
+            tool.definition.parameters["properties"]
+                .get("file_path")
+                .is_none()
+        );
+    }
+
     /// `files_with_matches` and `count` both need the file path, which the
     /// underlying search only prefixes when scanning a directory.
     #[test]
@@ -432,13 +565,25 @@ mod tests {
 
     #[tokio::test]
     async fn grep_content_mode_returns_matching_lines() {
-        let out = grep_with(json!({"pattern": "x"}), vec![
+        let out = grep_with(json!({"pattern": "x", "output_mode": "content"}), vec![
             "a.rs:1:x".into(),
             "b.rs:2:x".into(),
         ])
         .await
         .unwrap();
         assert_eq!(out, "a.rs:1:x\nb.rs:2:x");
+    }
+
+    #[tokio::test]
+    async fn grep_defaults_to_files_with_matches() {
+        let out = grep_with(json!({"pattern": "x"}), vec![
+            "a.rs:1:x".into(),
+            "a.rs:2:x".into(),
+            "b.rs:2:x".into(),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(out, "a.rs\nb.rs");
     }
 
     #[tokio::test]
@@ -454,11 +599,10 @@ mod tests {
 
     #[tokio::test]
     async fn grep_count_mode_counts_per_file() {
-        let out = grep_with(json!({"pattern": "x", "output_mode": "count"}), vec![
-            "a.rs:1:x".into(),
-            "a.rs:9:x".into(),
-            "b.rs:2:x".into(),
-        ])
+        let out = grep_with(
+            json!({"pattern": "x", "output_mode": "count_matches"}),
+            vec!["a.rs:1:x".into(), "a.rs:9:x".into(), "b.rs:2:x".into()],
+        )
         .await
         .unwrap();
         assert_eq!(out, "a.rs:2\nb.rs:1");
@@ -467,9 +611,17 @@ mod tests {
     #[tokio::test]
     async fn grep_offset_and_head_limit_page_results() {
         let lines: Vec<String> = (1..=6).map(|n| format!("f{n}.rs:1:x")).collect();
-        let out = grep_with(json!({"pattern": "x", "offset": 2, "head_limit": 2}), lines)
-            .await
-            .unwrap();
+        let out = grep_with(
+            json!({
+                "pattern": "x",
+                "output_mode": "content",
+                "offset": 2,
+                "head_limit": 2
+            }),
+            lines,
+        )
+        .await
+        .unwrap();
         assert_eq!(out, "f3.rs:1:x\nf4.rs:1:x");
     }
 
@@ -479,7 +631,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            err.contains("expected content|files_with_matches|count"),
+            err.contains("expected content|files_with_matches|count_matches"),
             "{err}"
         );
     }
@@ -488,6 +640,17 @@ mod tests {
     async fn grep_reports_no_matches_plainly() {
         let out = grep_with(json!({"pattern": "x"}), vec![]).await.unwrap();
         assert_eq!(out, "No matches found");
+    }
+
+    #[test]
+    fn grep_schema_uses_kimi_code_modes_and_flags() {
+        let parameters = make_kimi_grep_tool().definition.parameters;
+        assert_eq!(
+            parameters["properties"]["output_mode"]["enum"],
+            json!(["content", "files_with_matches", "count_matches"])
+        );
+        assert!(parameters["properties"].get("-i").is_some());
+        assert!(parameters["properties"].get("case_insensitive").is_none());
     }
 
     /// The reason Bash is a separate tool: `timeout` is seconds, not
@@ -511,49 +674,57 @@ mod tests {
         // Fabro has no background shell, so none is promised.
         assert!(!tool.definition.description.contains("run_in_background"));
     }
+
+    #[tokio::test]
+    async fn bash_reuses_session_env_cwd_and_timeout_rendering() {
+        use fabro_types::CommandTermination;
+
+        let tool = make_kimi_bash_tool(60_000, 600_000);
+        let env = Arc::new(MockSandbox {
+            exec_result: ExecResult {
+                stdout:      String::new(),
+                stderr:      String::new(),
+                exit_code:   None,
+                termination: CommandTermination::TimedOut,
+                duration_ms: 7_000,
+            },
+            ..MockSandbox::default()
+        });
+        let mut tool_ctx = ctx(env.clone());
+        let tool_env = HashMap::from([("TOKEN".to_string(), "value".to_string())]);
+        tool_ctx.tool_env_provider = Some(Arc::new(crate::StaticEnvProvider(tool_env.clone())));
+
+        let output = (tool.executor)(
+            json!({"command": "echo $TOKEN", "cwd": "/repo", "timeout": 7}),
+            tool_ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(output.starts_with("Command timed out.\n"), "{output}");
+        assert_eq!(*env.captured_timeout.lock().unwrap(), Some(7_000));
+        assert_eq!(env.captured_working_dirs.lock().unwrap().as_slice(), &[
+            Some("/repo".to_string())
+        ]);
+        assert_eq!(*env.captured_env_vars.lock().unwrap(), Some(tool_env));
+        assert!(
+            env.captured_command
+                .lock()
+                .unwrap()
+                .as_deref()
+                .is_some_and(|command| command.starts_with("exec 2>&1\n"))
+        );
+    }
 }
 
 /// Output shapes Kimi Code's `Grep` supports.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, EnumString)]
+#[strum(serialize_all = "snake_case")]
 enum GrepOutputMode {
     Content,
+    #[default]
     FilesWithMatches,
-    Count,
-}
-
-impl GrepOutputMode {
-    fn parse(value: Option<&str>) -> Result<Self, String> {
-        match value.unwrap_or("content") {
-            "content" => Ok(Self::Content),
-            "files_with_matches" => Ok(Self::FilesWithMatches),
-            "count" => Ok(Self::Count),
-            other => Err(format!(
-                "Invalid output_mode `{other}` (expected content|files_with_matches|count)"
-            )),
-        }
-    }
-}
-
-/// Extract the file path from a grep result line.
-///
-/// The underlying search emits `<path>:<line>:<content>` when scanning a
-/// directory, but omits the path when scanning a single file, so fall back to
-/// the path that was searched.
-fn grep_result_path<'a>(line: &'a str, searched: &'a str) -> &'a str {
-    // Walk candidate separators so absolute Windows-style paths and paths
-    // containing colons still split at the line-number field.
-    let mut rest = line;
-    let mut consumed = 0usize;
-    while let Some(idx) = rest.find(':') {
-        let after = &rest[idx + 1..];
-        let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
-        if !digits.is_empty() && after[digits.len()..].starts_with(':') {
-            return &line[..consumed + idx];
-        }
-        consumed += idx + 1;
-        rest = after;
-    }
-    searched
+    CountMatches,
 }
 
 /// `Grep` with Kimi Code's `output_mode`, `head_limit`, and `offset`.
@@ -576,11 +747,11 @@ will not flood the conversation.
 
 - Backed by ripgrep when available and POSIX `grep` otherwise, so keep patterns portable across \
 both rather than relying on ripgrep-only syntax.
-- `output_mode` selects what comes back: `content` (matching lines, the default), \
-`files_with_matches` (just the paths), or `count` (matches per file).
+- `output_mode` selects what comes back: `files_with_matches` (just the paths, the default), \
+`content` (matching lines), or `count_matches` (matches per file).
 - `head_limit` caps how many results are returned and `offset` skips that many first, so you can \
 page through a large result set.
-- `glob` limits which files are searched; `case_insensitive` folds case.",
+- `glob` limits which files are searched; `-i` folds case.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -589,12 +760,22 @@ page through a large result set.
                     "glob": {"type": "string", "description": "Only search files matching this glob."},
                     "output_mode": {
                         "type": "string",
-                        "enum": ["content", "files_with_matches", "count"],
-                        "description": "Shape of the results (default content)."
+                        "enum": ["content", "files_with_matches", "count_matches"],
+                        "description": "Shape of the results (default files_with_matches)."
                     },
-                    "head_limit": {"type": "integer", "description": "Return at most this many results."},
-                    "offset": {"type": "integer", "description": "Skip this many results before returning."},
-                    "case_insensitive": {"type": "boolean", "description": "Fold case when matching."}
+                    "head_limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 2000,
+                        "description": "Return at most this many results (default 250)."
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 20000,
+                        "description": "Skip this many results before returning."
+                    },
+                    "-i": {"type": "boolean", "description": "Perform a case-insensitive search."}
                 },
                 "required": ["pattern"]
             }),
@@ -604,66 +785,88 @@ page through a large result set.
                 let pattern = required_str(&args, "pattern")?;
                 // The trait requires a search root; "." is the working directory.
                 let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-                let mode = GrepOutputMode::parse(args.get("output_mode").and_then(Value::as_str))?;
-                let head_limit = optional_usize_arg(&args, "head_limit")?;
+                let mode = GrepOutputMode::from_str(
+                    args.get("output_mode")
+                        .and_then(Value::as_str)
+                        .unwrap_or("files_with_matches"),
+                )
+                .map_err(|_| {
+                    "Invalid output_mode (expected content|files_with_matches|count_matches)"
+                        .to_string()
+                })?;
+                let head_limit =
+                    optional_usize_arg(&args, "head_limit")?.unwrap_or(DEFAULT_GREP_RESULTS);
+                if head_limit == 0 || head_limit > MAX_GREP_RESULTS {
+                    return Err(format!(
+                        "head_limit must be between 1 and {MAX_GREP_RESULTS}"
+                    ));
+                }
                 let offset = optional_usize_arg(&args, "offset")?.unwrap_or(0);
+                if offset > MAX_GREP_MATCHES_SCANNED {
+                    return Err(format!("offset must be at most {MAX_GREP_MATCHES_SCANNED}"));
+                }
+                if offset.saturating_add(head_limit) > MAX_GREP_MATCHES_SCANNED {
+                    return Err(format!(
+                        "offset + head_limit must be at most {MAX_GREP_MATCHES_SCANNED}"
+                    ));
+                }
 
                 let options = GrepOptions {
                     glob_filter:      args.get("glob").and_then(Value::as_str).map(str::to_string),
-                    case_insensitive: args
-                        .get("case_insensitive")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                    // Only push the cap down for `content`, where results and
-                    // lines are the same thing. Capping lines early would
-                    // undercount files for the other modes.
+                    case_insensitive: args.get("-i").and_then(Value::as_bool).unwrap_or(false),
                     max_results:      match mode {
-                        GrepOutputMode::Content => head_limit.map(|n| n.saturating_add(offset)),
-                        _ => None,
+                        GrepOutputMode::Content => Some(
+                            head_limit
+                                .saturating_add(offset)
+                                .min(MAX_GREP_MATCHES_SCANNED),
+                        ),
+                        GrepOutputMode::FilesWithMatches | GrepOutputMode::CountMatches => {
+                            Some(MAX_GREP_MATCHES_SCANNED)
+                        }
                     },
                 };
 
-                let lines = ctx
-                    .env
-                    .grep(pattern, path, &options)
-                    .await
-                    .map_err(|e| e.display_with_causes())?;
+                let lines = execute_grep(&ctx, pattern, path, &options).await?;
 
                 let searched = path;
-                let mut results: Vec<String> = match mode {
+                let results: Vec<String> = match mode {
                     GrepOutputMode::Content => lines,
                     GrepOutputMode::FilesWithMatches => {
-                        let mut seen: Vec<String> = Vec::new();
-                        for line in &lines {
-                            let file = grep_result_path(line, searched).to_string();
-                            if !seen.contains(&file) {
-                                seen.push(file);
+                        let mut seen = HashSet::new();
+                        let mut files = Vec::new();
+                        for line in lines {
+                            let file = grep_result_path(&line, searched).to_string();
+                            if seen.insert(file.clone()) {
+                                files.push(file);
                             }
                         }
-                        seen
+                        files
                     }
-                    GrepOutputMode::Count => {
-                        let mut counts: Vec<(String, usize)> = Vec::new();
-                        for line in &lines {
-                            let file = grep_result_path(line, searched).to_string();
-                            match counts.iter_mut().find(|(name, _)| *name == file) {
-                                Some((_, count)) => *count += 1,
-                                None => counts.push((file, 1)),
+                    GrepOutputMode::CountMatches => {
+                        let mut counts: HashMap<String, usize> = HashMap::new();
+                        let mut order = Vec::new();
+                        for line in lines {
+                            let file = grep_result_path(&line, searched).to_string();
+                            if let Some(count) = counts.get_mut(&file) {
+                                *count += 1;
+                            } else {
+                                counts.insert(file.clone(), 1);
+                                order.push(file);
                             }
                         }
-                        counts
+                        order
                             .into_iter()
-                            .map(|(file, count)| format!("{file}:{count}"))
+                            .map(|file| {
+                                let count = counts[&file];
+                                format!("{file}:{count}")
+                            })
                             .collect()
                     }
-                };
-
-                if offset > 0 {
-                    results = results.into_iter().skip(offset).collect();
                 }
-                if let Some(limit) = head_limit {
-                    results.truncate(limit);
-                }
+                .into_iter()
+                .skip(offset)
+                .take(head_limit)
+                .collect();
 
                 if results.is_empty() {
                     return Ok("No matches found".to_string());

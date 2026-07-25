@@ -1,8 +1,9 @@
 //! Model-facing todo / task tools.
 //!
-//! Two surfaces share one engine ([`TodoRuntime`]):
+//! Three surfaces share one engine ([`TodoRuntime`]):
 //!
 //! - [`make_update_plan_tool`] — Codex-compatible OpenAI `update_plan`.
+//! - [`make_todo_list_tool`] — Kimi Code-compatible whole-list `TodoList`.
 //! - [`make_task_create_tool`] / [`make_task_update_tool`] /
 //!   [`make_task_get_tool`] / [`make_task_list_tool`] — Claude task tools.
 
@@ -15,17 +16,22 @@ use std::sync::{Arc, Mutex};
 use fabro_llm::types::ToolDefinition;
 use fabro_types::{TodoListKind, TodoProjection, TodoStatus, TodoUpdatedProps};
 use serde_json::Value;
+use strum::{EnumString, IntoStaticStr};
 
 use crate::todo_runtime::TodoRuntime;
 use crate::tool_registry::{RegisteredTool, ToolContext, ToolSource};
 
-/// Compute the OpenAI plan scope (`openai_plan:<session_id>`). Returns an
-/// error string the model can see if no session ID is bound to the call.
-fn openai_plan_scope(ctx: &ToolContext) -> Result<String, String> {
+/// Compute a session-scoped todo-list ID. Returns an error the model can see
+/// when a tool is invoked without an active session.
+fn session_todo_scope(
+    ctx: &ToolContext,
+    kind: TodoListKind,
+    tool_name: &str,
+) -> Result<String, String> {
     ctx.session_id
         .as_ref()
-        .map(|sid| TodoListKind::OpenAiPlan.list_id(sid))
-        .ok_or_else(|| "update_plan requires an active session".to_string())
+        .map(|session_id| kind.list_id(session_id))
+        .ok_or_else(|| format!("{tool_name} requires an active session"))
 }
 
 /// Compute the Anthropic task scope
@@ -72,21 +78,74 @@ description and dependency details.";
 const TASK_GET_DESCRIPTION: &str = "Get one task by taskId, including subject, status, \
 description, owner, blockedBy, and blocks.";
 
-/// Deterministic todo id derived from `<list_id>::<step>`. Codex identifies
-/// a plan step by the exact step text, so the projection ID is the
-/// `sha256(list_id, step)` truncated for compactness.
-fn openai_step_id(list_id: &str, step: &str) -> String {
+/// Deterministic todo id derived from `<list_id>::<text>`. Whole-list tools
+/// identify an item by its exact text, so unchanged entries preserve identity.
+fn todo_text_id(list_id: &str, text: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(list_id.as_bytes());
     hasher.update(b"\x00");
-    hasher.update(step.as_bytes());
+    hasher.update(text.as_bytes());
     let digest = hasher.finalize();
     let mut out = String::with_capacity(16);
     for byte in &digest[..8] {
         let _ = write!(out, "{byte:02x}");
     }
     out
+}
+
+struct ReplacementTodo {
+    id:      String,
+    subject: String,
+    status:  TodoStatus,
+}
+
+fn reconcile_replacement_list(
+    runtime: &TodoRuntime,
+    ctx: &ToolContext,
+    kind: TodoListKind,
+    list_id: &str,
+    incoming: &[ReplacementTodo],
+) {
+    let previous = runtime
+        .snapshot(list_id)
+        .map(|list| list.items)
+        .unwrap_or_default();
+    let previous_by_id: HashMap<&str, &TodoProjection> = previous
+        .iter()
+        .map(|todo| (todo.id.as_str(), todo))
+        .collect();
+    let incoming_ids: HashSet<&str> = incoming.iter().map(|todo| todo.id.as_str()).collect();
+
+    for todo in &previous {
+        if !incoming_ids.contains(todo.id.as_str()) {
+            runtime.delete(ctx, kind, list_id.to_string(), todo.id.clone());
+        }
+    }
+
+    for (index, todo) in incoming.iter().enumerate() {
+        let order = u32::try_from(index).unwrap_or(u32::MAX);
+        match previous_by_id.get(todo.id.as_str()) {
+            Some(previous)
+                if previous.status == todo.status
+                    && previous.order == order
+                    && previous.subject == todo.subject => {}
+            Some(_) => {
+                runtime.update(ctx, TodoUpdatedProps {
+                    status: Some(todo.status),
+                    order: Some(order),
+                    subject: Some(todo.subject.clone()),
+                    ..TodoUpdatedProps::new(list_id, kind, &todo.id)
+                });
+            }
+            None => {
+                let mut projection =
+                    TodoProjection::new(todo.id.clone(), order, todo.subject.clone());
+                projection.status = todo.status;
+                runtime.create(ctx, kind, list_id.to_string(), projection);
+            }
+        }
+    }
 }
 
 /// OpenAI `update_plan` tool. See plan summary for semantics.
@@ -127,15 +186,14 @@ pub fn make_update_plan_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
         executor:   Arc::new(move |args, ctx| {
             let runtime = runtime.clone();
             Box::pin(async move {
-                let list_id = openai_plan_scope(&ctx)?;
+                let list_id = session_todo_scope(&ctx, TodoListKind::OpenAiPlan, "update_plan")?;
                 let plan = args
                     .get("plan")
                     .and_then(Value::as_array)
                     .ok_or_else(|| "Missing required parameter: plan".to_string())?;
 
                 // Parse incoming steps, precompute ids, and enforce step-text uniqueness.
-                let mut incoming: Vec<(String, String, TodoStatus)> =
-                    Vec::with_capacity(plan.len());
+                let mut incoming = Vec::with_capacity(plan.len());
                 let mut seen_steps: HashSet<&str> = HashSet::with_capacity(plan.len());
                 for (index, entry) in plan.iter().enumerate() {
                     let step = entry
@@ -152,57 +210,20 @@ pub fn make_update_plan_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
                             "Duplicate plan step `{step}` — step text must be unique"
                         ));
                     }
-                    let todo_id = openai_step_id(&list_id, step);
-                    incoming.push((todo_id, step.to_string(), status));
+                    incoming.push(ReplacementTodo {
+                        id: todo_text_id(&list_id, step),
+                        subject: step.to_string(),
+                        status,
+                    });
                 }
 
-                // Snapshot previous state into a HashMap for O(1) lookup.
-                let previous: HashMap<String, TodoProjection> = runtime
-                    .snapshot(&list_id)
-                    .map(|list| list.items.into_iter().map(|t| (t.id.clone(), t)).collect())
-                    .unwrap_or_default();
-                let incoming_ids: HashSet<&str> =
-                    incoming.iter().map(|(id, _, _)| id.as_str()).collect();
-
-                // Deletes: anything in previous but not in incoming.
-                for id in previous.keys() {
-                    if !incoming_ids.contains(id.as_str()) {
-                        runtime.delete(&ctx, TodoListKind::OpenAiPlan, list_id.clone(), id.clone());
-                    }
-                }
-
-                // Upserts: each incoming step becomes a create (new) or update.
-                for (index, (todo_id, step, status)) in incoming.iter().enumerate() {
-                    let order = u32::try_from(index).unwrap_or(u32::MAX);
-                    match previous.get(todo_id) {
-                        Some(prev)
-                            if prev.status == *status
-                                && prev.order == order
-                                && prev.subject == *step =>
-                        {
-                            // No change.
-                        }
-                        Some(_) => {
-                            runtime.update(&ctx, TodoUpdatedProps {
-                                status: Some(*status),
-                                order: Some(order),
-                                subject: Some(step.clone()),
-                                ..TodoUpdatedProps::new(&list_id, TodoListKind::OpenAiPlan, todo_id)
-                            });
-                        }
-                        None => {
-                            let mut projection =
-                                TodoProjection::new(todo_id.clone(), order, step.clone());
-                            projection.status = *status;
-                            runtime.create(
-                                &ctx,
-                                TodoListKind::OpenAiPlan,
-                                list_id.clone(),
-                                projection,
-                            );
-                        }
-                    }
-                }
+                reconcile_replacement_list(
+                    &runtime,
+                    &ctx,
+                    TodoListKind::OpenAiPlan,
+                    &list_id,
+                    &incoming,
+                );
 
                 Ok("Plan updated".to_string())
             })
@@ -211,42 +232,56 @@ pub fn make_update_plan_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
     }
 }
 
-/// Compute the Kimi todo scope (`kimi_todos:<session_id>`).
-fn kimi_todo_scope(ctx: &ToolContext) -> Result<String, String> {
-    ctx.session_id
-        .as_ref()
-        .map(|sid| TodoListKind::KimiTodos.list_id(sid))
-        .ok_or_else(|| "TodoList requires an active session".to_string())
+#[derive(Clone, Copy, EnumString, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+enum KimiTodoStatus {
+    Pending,
+    InProgress,
+    #[strum(to_string = "done")]
+    Done,
+}
+
+impl From<KimiTodoStatus> for TodoStatus {
+    fn from(status: KimiTodoStatus) -> Self {
+        match status {
+            KimiTodoStatus::Pending => Self::Pending,
+            KimiTodoStatus::InProgress => Self::InProgress,
+            KimiTodoStatus::Done => Self::Completed,
+        }
+    }
+}
+
+impl From<TodoStatus> for KimiTodoStatus {
+    fn from(status: TodoStatus) -> Self {
+        match status {
+            TodoStatus::Pending => Self::Pending,
+            TodoStatus::InProgress => Self::InProgress,
+            TodoStatus::Completed | TodoStatus::Deleted => Self::Done,
+        }
+    }
 }
 
 /// Kimi Code spells the terminal status `done`; internally it is
 /// [`TodoStatus::Completed`].
 fn parse_kimi_status(value: &str) -> Result<TodoStatus, String> {
-    match value {
-        "pending" => Ok(TodoStatus::Pending),
-        "in_progress" => Ok(TodoStatus::InProgress),
-        "done" => Ok(TodoStatus::Completed),
-        other => Err(format!(
-            "Invalid status `{other}` (expected pending|in_progress|done)"
-        )),
-    }
+    value
+        .parse::<KimiTodoStatus>()
+        .map(TodoStatus::from)
+        .map_err(|_| format!("Invalid status `{value}` (expected pending|in_progress|done)"))
 }
 
 fn kimi_status_name(status: TodoStatus) -> &'static str {
-    match status {
-        TodoStatus::Pending => "pending",
-        TodoStatus::InProgress => "in_progress",
-        TodoStatus::Completed | TodoStatus::Deleted => "done",
-    }
+    KimiTodoStatus::from(status).into()
 }
 
-fn render_kimi_todos(items: &[TodoProjection]) -> String {
-    if items.is_empty() {
+fn render_kimi_todos<'a>(items: impl IntoIterator<Item = (TodoStatus, &'a str)>) -> String {
+    let mut items = items.into_iter().peekable();
+    if items.peek().is_none() {
         return "The todo list is empty.".to_string();
     }
     let mut out = String::new();
-    for todo in items {
-        let _ = writeln!(out, "[{}] {}", kimi_status_name(todo.status), todo.subject);
+    for (status, subject) in items {
+        let _ = writeln!(out, "[{}] {subject}", kimi_status_name(status));
     }
     out.truncate(out.trim_end().len());
     out
@@ -302,7 +337,7 @@ pub fn make_todo_list_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
         executor:   Arc::new(move |args, ctx| {
             let runtime = runtime.clone();
             Box::pin(async move {
-                let list_id = kimi_todo_scope(&ctx)?;
+                let list_id = session_todo_scope(&ctx, TodoListKind::KimiTodos, "TodoList")?;
 
                 // Read mode: `todos` omitted entirely.
                 let Some(todos) = args.get("todos") else {
@@ -310,14 +345,17 @@ pub fn make_todo_list_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
                         .snapshot(&list_id)
                         .map(|l| l.items)
                         .unwrap_or_default();
-                    return Ok(render_kimi_todos(&items));
+                    return Ok(render_kimi_todos(
+                        items
+                            .iter()
+                            .map(|todo| (todo.status, todo.subject.as_str())),
+                    ));
                 };
                 let todos = todos
                     .as_array()
                     .ok_or_else(|| "`todos` must be an array".to_string())?;
 
-                let mut incoming: Vec<(String, String, TodoStatus)> =
-                    Vec::with_capacity(todos.len());
+                let mut incoming = Vec::with_capacity(todos.len());
                 let mut seen: HashSet<&str> = HashSet::with_capacity(todos.len());
                 for (index, entry) in todos.iter().enumerate() {
                     let title = entry
@@ -332,56 +370,25 @@ pub fn make_todo_list_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
                     if !seen.insert(title) {
                         return Err(format!("Duplicate todo `{title}` — titles must be unique"));
                     }
-                    incoming.push((openai_step_id(&list_id, title), title.to_string(), status));
+                    incoming.push(ReplacementTodo {
+                        id: todo_text_id(&list_id, title),
+                        subject: title.to_string(),
+                        status,
+                    });
                 }
 
-                let previous: HashMap<String, TodoProjection> = runtime
-                    .snapshot(&list_id)
-                    .map(|list| list.items.into_iter().map(|t| (t.id.clone(), t)).collect())
-                    .unwrap_or_default();
-                let incoming_ids: HashSet<&str> =
-                    incoming.iter().map(|(id, _, _)| id.as_str()).collect();
-
-                for id in previous.keys() {
-                    if !incoming_ids.contains(id.as_str()) {
-                        runtime.delete(&ctx, TodoListKind::KimiTodos, list_id.clone(), id.clone());
-                    }
-                }
-
-                for (index, (todo_id, title, status)) in incoming.iter().enumerate() {
-                    let order = u32::try_from(index).unwrap_or(u32::MAX);
-                    match previous.get(todo_id) {
-                        Some(prev)
-                            if prev.status == *status
-                                && prev.order == order
-                                && prev.subject == *title => {}
-                        Some(_) => {
-                            runtime.update(&ctx, TodoUpdatedProps {
-                                status: Some(*status),
-                                order: Some(order),
-                                subject: Some(title.clone()),
-                                ..TodoUpdatedProps::new(&list_id, TodoListKind::KimiTodos, todo_id)
-                            });
-                        }
-                        None => {
-                            let mut projection =
-                                TodoProjection::new(todo_id.clone(), order, title.clone());
-                            projection.status = *status;
-                            runtime.create(
-                                &ctx,
-                                TodoListKind::KimiTodos,
-                                list_id.clone(),
-                                projection,
-                            );
-                        }
-                    }
-                }
-
-                let items = runtime
-                    .snapshot(&list_id)
-                    .map(|l| l.items)
-                    .unwrap_or_default();
-                Ok(render_kimi_todos(&items))
+                reconcile_replacement_list(
+                    &runtime,
+                    &ctx,
+                    TodoListKind::KimiTodos,
+                    &list_id,
+                    &incoming,
+                );
+                Ok(render_kimi_todos(
+                    incoming
+                        .iter()
+                        .map(|todo| (todo.status, todo.subject.as_str())),
+                ))
             })
         }),
         source:     ToolSource::Native,

@@ -156,7 +156,14 @@ impl ToolRegistry {
     }
 
     pub fn register(&mut self, mut tool: RegisteredTool) {
-        if let Some(native) = NativeTool::from_any_name(&tool.definition.name) {
+        let native = match &tool.source {
+            ToolSource::Native => NativeTool::from_canonical_name(&tool.definition.name),
+            ToolSource::Skill if tool.definition.name == NativeTool::UseSkill.canonical_name() => {
+                Some(NativeTool::UseSkill)
+            }
+            ToolSource::Skill | ToolSource::Mcp { .. } => None,
+        };
+        if let Some(native) = native {
             tool.definition.name = native.name(self.vocabulary).to_string();
         }
         self.tools.insert(tool.definition.name.clone(), tool);
@@ -168,9 +175,8 @@ impl ToolRegistry {
     /// identity rather than by whatever string it is currently exposed under.
     pub fn redescribe(&mut self, tool: NativeTool, description: impl Into<String>) {
         let exposed = tool.name(self.vocabulary);
-        if let Some(mut registered) = self.tools.remove(exposed) {
+        if let Some(registered) = self.tools.get_mut(exposed) {
             registered.definition.description = description.into();
-            self.tools.insert(exposed.to_string(), registered);
         }
     }
 
@@ -296,6 +302,31 @@ mod tests {
         let tool = registry.get("read_file");
         assert!(tool.is_some());
         assert_eq!(tool.unwrap().definition.name, "read_file");
+    }
+
+    #[test]
+    fn kimi_registry_renames_canonical_native_tools_only() {
+        let mut registry = ToolRegistry::with_vocabulary(ToolVocabulary::KimiCode);
+        registry.register(make_tool("read_file"));
+        registry.register(make_tool("Read"));
+
+        assert!(registry.get("Read").is_some());
+        assert!(registry.get("read_file").is_none());
+    }
+
+    #[test]
+    fn registry_does_not_reinterpret_mcp_names_as_native_tools() {
+        let mut registry = ToolRegistry::with_vocabulary(ToolVocabulary::KimiCode);
+        let mut tool = make_tool("read_file");
+        tool.source = ToolSource::Mcp {
+            server_name:   "files".to_string(),
+            original_name: "read_file".to_string(),
+        };
+
+        registry.register(tool);
+
+        assert!(registry.get("read_file").is_some());
+        assert!(registry.get("Read").is_none());
     }
 
     #[test]

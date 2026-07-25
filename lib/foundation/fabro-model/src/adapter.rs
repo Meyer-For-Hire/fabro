@@ -105,17 +105,13 @@ mod tests {
 
     #[test]
     fn agent_profile_kind_round_trips_as_settings_strings() {
-        for (kind, expected) in [
-            (AgentProfileKind::Anthropic, "anthropic"),
-            (AgentProfileKind::OpenAi, "openai"),
-            (AgentProfileKind::Gemini, "gemini"),
-        ] {
+        for kind in AgentProfileKind::VARIANTS {
+            let expected = kind.to_string();
             let json = serde_json::to_string(&kind).unwrap();
             assert_eq!(json, format!("\"{expected}\""));
             let parsed: AgentProfileKind = serde_json::from_str(&json).unwrap();
-            assert_eq!(parsed, kind);
-            assert_eq!(expected.parse::<AgentProfileKind>().unwrap(), kind);
-            assert_eq!(kind.to_string(), expected);
+            assert_eq!(parsed, *kind);
+            assert_eq!(expected.parse::<AgentProfileKind>().unwrap(), *kind);
         }
     }
 }

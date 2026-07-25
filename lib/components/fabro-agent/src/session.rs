@@ -38,14 +38,17 @@ use crate::file_tracker::FileTracker;
 use crate::history::History;
 use crate::loop_detection::detect_loop;
 use crate::memory::{BUDGET_BYTES, MemoryDocument, discover_memory};
+use crate::native_tool::NativeTool;
 use crate::profiles::EnvContext;
 use crate::question_tools::AgentToolRuntime;
 use crate::sandbox::Sandbox;
 use crate::skills::{
-    ExpandedInput, Skill, default_skill_dirs, discover_skills, expand_skill, make_use_skill_tool,
+    ExpandedInput, Skill, default_skill_dirs, discover_skills, expand_skill,
+    make_use_skill_tool_for_vocabulary,
 };
 use crate::subagent::{SubAgentCallbackEvent, SubAgentEventCallback, SubAgentSupervisor};
 use crate::tool_execution::execute_tool_calls;
+use crate::tool_permissions::canonical_tool_name;
 use crate::tool_registry::ToolDefinitionWithSource;
 use crate::types::{
     AgentEvent, McpToolSummary, MemoryFileSummary, Message, SessionEvent, SessionState,
@@ -649,9 +652,10 @@ impl Session {
         if !self.skills.is_empty() {
             let skills_arc = Arc::new(self.skills.clone());
             if let Some(profile) = Arc::get_mut(&mut self.provider_profile) {
+                let vocabulary = profile.tool_registry().vocabulary();
                 profile
                     .tool_registry_mut()
-                    .register(make_use_skill_tool(skills_arc));
+                    .register(make_use_skill_tool_for_vocabulary(skills_arc, vocabulary));
             }
         }
 
@@ -1866,10 +1870,10 @@ impl Session {
             .await;
             timing.tool = timing.tool.saturating_add(tool_start.elapsed());
             composite_watcher.abort();
-            if tool_calls
-                .iter()
-                .any(|tool_call| tool_call.name == "use_skill")
-            {
+            if tool_calls.iter().zip(&results).any(|(tool_call, result)| {
+                !result.is_error
+                    && canonical_tool_name(&tool_call.name) == NativeTool::UseSkill.canonical_name()
+            }) {
                 self.activated_skill_context_observed = true;
             }
 
@@ -2052,6 +2056,7 @@ impl Session {
             system_prompt: &self.system_prompt,
             memory: &self.memory,
             skills: &self.skills,
+            tool_vocabulary: self.provider_profile.tool_registry().vocabulary(),
             activated_skill_context_observed: self.activated_skill_context_observed,
             provider: &provider,
             model: &model,

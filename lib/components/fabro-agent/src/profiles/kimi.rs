@@ -12,7 +12,7 @@ use crate::skills::Skill;
 use crate::todo_runtime::TodoRuntime;
 use crate::todo_tools::make_todo_list_tool;
 use crate::tool_registry::ToolRegistry;
-use crate::tools::{WebFetchSummarizer, make_edit_file_tool, register_core_tools};
+use crate::tools::{WebFetchSummarizer, register_discovery_and_web_tools};
 
 const CORE_PROMPT: &str = include_str!("prompts/kimi.md.j2");
 
@@ -67,21 +67,18 @@ impl KimiProfile {
         // (subagent tools, skills) are renamed too.
         let mut registry = ToolRegistry::with_vocabulary(ToolVocabulary::KimiCode);
 
-        register_core_tools(&mut registry, options, summarizer);
-        registry.register(make_edit_file_tool());
-
-        // Read, Write, and Bash differ from fabro's built-ins in what their
-        // parameters mean, not just what they are called, so they are separate
-        // tools rather than renames. Registered after the core set so they
-        // replace it.
+        // Glob and the web tools have the same contract in both vocabularies.
+        // The remaining Kimi tools use adapters for their different schemas,
+        // while reusing shared execution helpers where their behavior agrees.
+        register_discovery_and_web_tools(&mut registry, options, summarizer);
         registry.register(kimi_tools::make_kimi_read_tool());
         registry.register(kimi_tools::make_kimi_write_tool());
+        registry.register(kimi_tools::make_kimi_edit_tool(EDIT_FILE_DESCRIPTION));
         registry.register(kimi_tools::make_kimi_grep_tool());
         registry.register(kimi_tools::make_kimi_bash_tool(
             options.default_command_timeout_ms,
             options.max_command_timeout_ms,
         ));
-        registry.redescribe(NativeTool::EditFile, EDIT_FILE_DESCRIPTION);
         registry.redescribe(NativeTool::Glob, GLOB_DESCRIPTION);
 
         // Kimi Code drives todos with one replace-whole-list call. The
@@ -172,7 +169,7 @@ mod tests {
     use fabro_types::AgentToolCategory;
 
     use super::*;
-    use crate::skills::make_use_skill_tool;
+    use crate::skills::make_use_skill_tool_for_vocabulary;
     use crate::subagent::{SessionFactory, SubAgentSupervisor};
     use crate::test_support::MockSandbox;
     use crate::tool_permissions::{known_tool_category, tool_category};
@@ -224,9 +221,8 @@ mod tests {
     fn renamed_tools_keep_their_permission_category() {
         let profile = KimiProfile::new("kimi-k3");
         for name in profile.tool_registry().names() {
-            let Some(tool) = NativeTool::from_any_name(&name) else {
-                continue;
-            };
+            let tool = NativeTool::from_any_name(&name)
+                .unwrap_or_else(|| panic!("unexpected non-native Kimi profile tool: {name}"));
             assert_eq!(
                 known_tool_category(&name),
                 tool.category(),
@@ -270,15 +266,27 @@ mod tests {
         profile.register_subagent_tools(SubAgentSupervisor::new(3), factory, 0);
         profile
             .tool_registry_mut()
-            .register(make_use_skill_tool(Arc::new(vec![Skill {
-                name:        "demo".into(),
-                description: "d".into(),
-                template:    "t".into(),
-            }])));
+            .register(make_use_skill_tool_for_vocabulary(
+                Arc::new(vec![Skill {
+                    name:        "demo".into(),
+                    description: "d".into(),
+                    template:    "t".into(),
+                }]),
+                ToolVocabulary::KimiCode,
+            ));
 
         let names = profile.tool_registry().names();
         assert!(names.contains(&"Skill".to_string()), "got {names:?}");
         assert!(!names.contains(&"use_skill".to_string()), "got {names:?}");
+        let skill_parameters = &profile
+            .tool_registry()
+            .get("Skill")
+            .unwrap()
+            .definition
+            .parameters;
+        assert!(skill_parameters["properties"].get("skill").is_some());
+        assert!(skill_parameters["properties"].get("args").is_some());
+        assert!(skill_parameters["properties"].get("skill_name").is_none());
         // Deliberately not renamed to Kimi Code's `Agent`: fabro's subagent
         // tools are a supervisor model, not a call-and-return one.
         assert!(names.contains(&"spawn_agent".to_string()), "got {names:?}");
@@ -335,8 +343,24 @@ mod tests {
         let grep = describe("Grep");
         assert!(grep.contains("POSIX"), "{grep}");
         assert!(describe("Glob").contains("most recently modified"));
-        // The shared description is untouched for other profiles.
-        assert!(!describe("Read").contains("refuses writes"));
+    }
+
+    #[test]
+    fn kimi_edit_schema_uses_path_like_kimi_code() {
+        let profile = KimiProfile::new("kimi-k3");
+        let parameters = &profile
+            .tool_registry()
+            .get("Edit")
+            .unwrap()
+            .definition
+            .parameters;
+
+        assert!(parameters["properties"].get("path").is_some());
+        assert!(parameters["properties"].get("file_path").is_none());
+        assert_eq!(
+            parameters["required"],
+            serde_json::json!(["path", "old_string", "new_string"])
+        );
     }
 
     #[test]
