@@ -2365,14 +2365,16 @@ fn wrap_bash_command(command: &str) -> String {
     format!("{REMOTE_BASH} -c \"echo '{encoded}' | base64 -d | {REMOTE_BASH}\"")
 }
 
-/// Enter the canonical Bash interpreter from a Daytona streaming session.
+/// Invoke the canonical Bash interpreter from a Daytona streaming session.
 ///
 /// Session commands already pass through the provider's shell parser, so an
 /// audited shell-quoted argument avoids the direct-exec path's base64 process
 /// and second Bash while keeping caller source inert until `/bin/bash -c`
-/// evaluates it.
+/// evaluates it. Bash must remain a child process: Daytona sources this command
+/// inside a wrapper that resumes afterward to drain logs and persist the exit
+/// code.
 fn wrap_bash_session_script(script: &str) -> String {
-    format!("exec {REMOTE_BASH} -c {}", shell_quote(script))
+    format!("{REMOTE_BASH} -c {}", shell_quote(script))
 }
 
 #[cfg(test)]
@@ -2990,10 +2992,51 @@ mod tests {
 
         assert_eq!(
             wrapped,
-            format!("exec /bin/bash -c {}", shell_quote(&script)),
+            format!("/bin/bash -c {}", shell_quote(&script)),
             "the streaming path must enter the canonical Bash exactly once"
         );
         assert!(!wrapped.contains("base64"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test executes the generated shell transport to verify provider bookkeeping resumes"
+    )]
+    fn streaming_session_script_returns_to_provider_bookkeeping() {
+        let dir = tempfile::tempdir().expect("create session transport temp dir");
+        let command_file = dir.path().join("cmd.sh");
+        let exit_code_file = dir.path().join("exit_code");
+        let script = build_bash_session_script("printf 'command-finished\\n'; exit 7", "/", None);
+        std::fs::write(&command_file, wrap_bash_session_script(&script))
+            .expect("write generated session command");
+
+        // Daytona sources the command file, then records the exit code. The
+        // generated command must return control so that bookkeeping can run.
+        let provider_wrapper = format!(
+            "{{ . {}; }}\n\
+             command_exit_code=$?\n\
+             printf '%s\\n' \"$command_exit_code\" > {}",
+            shell_quote(&command_file.to_string_lossy()),
+            shell_quote(&exit_code_file.to_string_lossy()),
+        );
+        let output = std::process::Command::new(REMOTE_BASH)
+            .args(["-c", &provider_wrapper])
+            .env_remove(BASH_ENV_VAR)
+            .output()
+            .expect("execute generated session command");
+
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "command-finished\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(exit_code_file)
+                .expect("provider bookkeeping should record the exit code"),
+            "7\n"
+        );
+        assert!(output.status.success(), "{output:?}");
     }
 
     fn bash_probe_result(exit_code: i32, stdout: impl Into<String>) -> ExecResult {
