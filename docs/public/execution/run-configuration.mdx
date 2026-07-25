@@ -192,7 +192,7 @@ env = { NPM_TOKEN = "{{ secrets.NPM_TOKEN }}" }
 
 | Field | Description |
 |---|---|
-| `script` | Shell-evaluated command (runs through `sh -c`). Supports `{{ vars.* }}`, `{{ env.* }}`, and `{{ secrets.* }}` interpolation. |
+| `script` | Bash source, evaluated by the sandbox's non-login Bash (`bash -c`). Supports `{{ vars.* }}`, `{{ env.* }}`, and `{{ secrets.* }}` interpolation. |
 | `command` | Argv-style command, mutually exclusive with `script`. Each resolved element is shell-quoted as one argument. |
 | `env` | Additional environment variables for this step. Values support the same interpolation as `script` and `command`. |
 

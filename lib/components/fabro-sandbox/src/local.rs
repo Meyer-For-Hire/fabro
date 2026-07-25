@@ -12,17 +12,40 @@ use tokio::task::spawn_blocking;
 use tokio::{fs, time};
 use tokio_util::sync::CancellationToken;
 
-use crate::sandbox::{StdioProcessControl, optional_timeout};
+use crate::sandbox::{BASH_PROBE_SCRIPT, StdioProcessControl, bash_probe_passed, optional_timeout};
 use crate::{
     CommandOutputCallback, DEFAULT_EXEC_OUTPUT_TAIL_BYTES, DirEntry, ExecResult,
     ExecStreamingResult, GrepOptions, Sandbox, SandboxEvent, SandboxEventCallback, StderrCollector,
     StdioProcess, StdioProcessHandle, StdioProcessTermination, glob_match,
 };
 
+/// Remediation shown when the worker has no usable Bash.
+///
+/// Local sandboxes resolve `bash` through `PATH` rather than requiring
+/// `/bin/bash`, which is what keeps them working on NixOS.
+const LOCAL_BASH_REMEDIATION: &str = "Local sandboxes require Bash on the worker PATH. Install bash, or run this workflow in a \
+     Docker or Daytona sandbox.";
+
+/// Where [`LocalSandbox`] gets its Bash executable.
+///
+/// The non-default variants exist so tests can exercise missing and non-Bash
+/// interpreters without mutating the process-global `PATH`, which would make
+/// parallel tests racy.
+enum BashExecutable {
+    /// Resolve `bash` through the worker's `PATH`.
+    ResolveFromPath,
+    #[cfg(test)]
+    Fixed(PathBuf),
+    #[cfg(test)]
+    Unavailable,
+}
+
 pub struct LocalSandbox {
     working_directory: PathBuf,
     event_callback:    Option<SandboxEventCallback>,
     rg_available:      std::sync::OnceLock<bool>,
+    bash_executable:   BashExecutable,
+    bash_path:         std::sync::OnceLock<PathBuf>,
 }
 
 impl LocalSandbox {
@@ -32,7 +55,75 @@ impl LocalSandbox {
             working_directory,
             event_callback: None,
             rg_available: std::sync::OnceLock::new(),
+            bash_executable: BashExecutable::ResolveFromPath,
+            bash_path: std::sync::OnceLock::new(),
         }
+    }
+
+    #[cfg(test)]
+    fn with_bash_executable(working_directory: PathBuf, bash_executable: BashExecutable) -> Self {
+        Self {
+            bash_executable,
+            ..Self::new(working_directory)
+        }
+    }
+
+    /// Resolve, and then remember, the Bash executable this sandbox runs
+    /// commands with.
+    ///
+    /// Every command path — non-streaming, streaming, and stdio — goes through
+    /// here so a single sandbox can never split across two interpreters.
+    fn bash(&self) -> crate::Result<PathBuf> {
+        if let Some(path) = self.bash_path.get() {
+            return Ok(path.clone());
+        }
+
+        let resolved = match &self.bash_executable {
+            BashExecutable::ResolveFromPath => Self::binary_path_on_path("bash")
+                .ok_or_else(|| crate::Error::message(LOCAL_BASH_REMEDIATION))?,
+            #[cfg(test)]
+            BashExecutable::Fixed(path) => path.clone(),
+            #[cfg(test)]
+            BashExecutable::Unavailable => {
+                return Err(crate::Error::message(LOCAL_BASH_REMEDIATION));
+            }
+        };
+
+        let _ = self.bash_path.set(resolved.clone());
+        Ok(resolved)
+    }
+
+    /// Verify the resolved executable is non-login Bash.
+    ///
+    /// Runs on fresh initialization and again on resume, so a worker that lost
+    /// its Bash between runs fails before the first command instead of during
+    /// it.
+    async fn probe_bash(&self) -> crate::Result<()> {
+        let bash = self.bash()?;
+        let output = Command::new(&bash)
+            .arg("-c")
+            .arg(BASH_PROBE_SCRIPT)
+            .env_clear()
+            .envs(filtered_env_vars(None, ExplicitEnvPolicy::FilterSensitive))
+            .output()
+            .await
+            .map_err(|e| {
+                crate::Error::context(
+                    format!("{LOCAL_BASH_REMEDIATION} Failed to run {}", bash.display()),
+                    e,
+                )
+            })?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if bash_probe_passed(output.status.code(), &stdout) {
+            return Ok(());
+        }
+
+        Err(crate::Error::message(format!(
+            "{LOCAL_BASH_REMEDIATION} {} is not usable as non-login Bash: {}",
+            bash.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )))
     }
 
     pub fn set_event_callback(&mut self, cb: SandboxEventCallback) {
@@ -80,14 +171,16 @@ impl LocalSandbox {
         }
     }
 
+    fn binary_on_path(binary: &str) -> bool {
+        Self::binary_path_on_path(binary).is_some()
+    }
+
     #[expect(
         clippy::disallowed_methods,
         reason = "Local sandbox command execution checks PATH/PATHEXT to select optional helpers."
     )]
-    fn binary_on_path(binary: &str) -> bool {
-        let Some(paths) = std::env::var_os(EnvVars::PATH) else {
-            return false;
-        };
+    fn binary_path_on_path(binary: &str) -> Option<PathBuf> {
+        let paths = std::env::var_os(EnvVars::PATH)?;
 
         #[cfg(windows)]
         let extensions: Vec<String> = std::env::var_os(EnvVars::PATHEXT)
@@ -103,22 +196,23 @@ impl LocalSandbox {
         for dir in std::env::split_paths(&paths) {
             let candidate = dir.join(binary);
             if candidate.is_file() {
-                return true;
+                return Some(candidate);
             }
 
             #[cfg(windows)]
             {
                 if candidate.extension().is_none() {
                     for ext in &extensions {
-                        if dir.join(format!("{binary}{ext}")).is_file() {
-                            return true;
+                        let with_ext = dir.join(format!("{binary}{ext}"));
+                        if with_ext.is_file() {
+                            return Some(with_ext);
                         }
                     }
                 }
             }
         }
 
-        false
+        None
     }
 }
 
@@ -351,7 +445,7 @@ impl Sandbox for LocalSandbox {
         let effective_dir =
             working_dir.map_or_else(|| self.working_directory.clone(), std::path::PathBuf::from);
 
-        let mut cmd = Command::new("bash");
+        let mut cmd = Command::new(self.bash()?);
         cmd.arg("-c")
             .arg(command)
             .current_dir(&effective_dir)
@@ -428,7 +522,7 @@ impl Sandbox for LocalSandbox {
         let effective_dir =
             working_dir.map_or_else(|| self.working_directory.clone(), std::path::PathBuf::from);
 
-        let mut cmd = Command::new("bash");
+        let mut cmd = Command::new(self.bash()?);
         cmd.arg("-c")
             .arg(command)
             .current_dir(&effective_dir)
@@ -508,8 +602,8 @@ impl Sandbox for LocalSandbox {
         let effective_dir =
             working_dir.map_or_else(|| self.working_directory.clone(), std::path::PathBuf::from);
 
-        let mut cmd = Command::new("bash");
-        cmd.arg("-lc")
+        let mut cmd = Command::new(self.bash()?);
+        cmd.arg("-c")
             .arg(format!("exec {command}"))
             .current_dir(&effective_dir)
             .env_clear()
@@ -696,9 +790,13 @@ impl Sandbox for LocalSandbox {
             provider: "local".into(),
         });
         let start = Instant::now();
-        let result = fs::create_dir_all(&self.working_directory)
-            .await
-            .map_err(|e| crate::Error::context("Failed to create working directory", e));
+        let result = match fs::create_dir_all(&self.working_directory).await {
+            Ok(()) => self.probe_bash().await,
+            Err(e) => Err(crate::Error::context(
+                "Failed to create working directory",
+                e,
+            )),
+        };
         let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
         match &result {
             Ok(()) => self.emit(SandboxEvent::Ready {
@@ -717,6 +815,15 @@ impl Sandbox for LocalSandbox {
             }),
         }
         result
+    }
+
+    /// Re-verify Bash before a resumed workflow can issue commands.
+    ///
+    /// A worker that was rebuilt or reprovisioned between runs can lose the
+    /// Bash it initialized with; there is deliberately no fallback interpreter
+    /// when that happens.
+    async fn start(&self) -> crate::Result<()> {
+        self.probe_bash().await
     }
 
     async fn git_push_ref(&self, refspec: &str) -> crate::Result<()> {
@@ -912,6 +1019,7 @@ mod tests {
     use std::io;
     use std::path::PathBuf;
     use std::pin::Pin;
+    use std::sync::Arc;
     use std::task::{Context as TaskContext, Poll};
 
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadBuf};
@@ -1099,6 +1207,216 @@ mod tests {
         assert_eq!(line.trim_end(), "test-key");
 
         process.handle.wait().await.unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Bash-only syntax: `[[ ]]`, arrays, and `${arr[@]}` all fail under `sh`.
+    const BASH_ONLY_COMMAND: &str = "arr=(one two three); [[ ${#arr[@]} -eq 3 ]] && echo \
+                                     ${arr[1]}";
+
+    /// Prints `login` or `nonlogin` for the shell evaluating it.
+    const LOGIN_SHELL_REPORT: &str = "shopt -q login_shell && echo login || echo nonlogin";
+
+    #[tokio::test]
+    async fn exec_command_runs_bash_only_syntax() {
+        let dir = temp_dir();
+        let sandbox = LocalSandbox::new(dir.clone());
+
+        let result = sandbox
+            .exec_command(BASH_ONLY_COMMAND, 5000, None, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(result.exit_code, Some(0), "stderr: {}", result.stderr);
+        assert_eq!(result.stdout.trim(), "two");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn exec_command_streaming_runs_bash_only_syntax() {
+        let dir = temp_dir();
+        let sandbox = LocalSandbox::new(dir.clone());
+
+        let result = sandbox
+            .exec_command_streaming(
+                BASH_ONLY_COMMAND,
+                Some(5000),
+                None,
+                None,
+                None,
+                Arc::new(|_, _| Box::pin(async { Ok(()) })),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.result.exit_code,
+            Some(0),
+            "stderr: {}",
+            result.result.stderr
+        );
+        assert_eq!(result.result.stdout.trim(), "two");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stdio_process_evaluates_bash_before_exec() {
+        let dir = temp_dir();
+        let sandbox = LocalSandbox::new(dir.clone());
+
+        // The sandbox prepends `exec`; `exec` with only a redirection applies
+        // it without replacing the shell, so the Bash-only guard runs in the
+        // wrapping shell before it execs the requested process.
+        let process = sandbox
+            .spawn_stdio_process(
+                "3>&1; [[ -d / ]] || exit 9; exec python3 -u -c 'import sys; \
+                 [print(line.strip()[::-1], flush=True) for line in sys.stdin]'",
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut stdin = process.stdin;
+        let mut stdout = BufReader::new(process.stdout);
+        stdin.write_all(b"abc\n").await.unwrap();
+        stdin.flush().await.unwrap();
+
+        let mut line = String::new();
+        stdout.read_line(&mut line).await.unwrap();
+        assert_eq!(line.trim_end(), "cba");
+
+        process.handle.terminate().await.unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn every_command_path_observes_a_non_login_shell() {
+        let dir = temp_dir();
+        let sandbox = LocalSandbox::new(dir.clone());
+
+        let non_streaming = sandbox
+            .exec_command(LOGIN_SHELL_REPORT, 5000, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(non_streaming.stdout.trim(), "nonlogin");
+
+        let streaming = sandbox
+            .exec_command_streaming(
+                LOGIN_SHELL_REPORT,
+                Some(5000),
+                None,
+                None,
+                None,
+                Arc::new(|_, _| Box::pin(async { Ok(()) })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(streaming.result.stdout.trim(), "nonlogin");
+
+        // `spawn_stdio_process` prepends `exec`, and `exec` with only a
+        // redirection applies it without replacing the shell — so the rest of
+        // this script reports on the wrapping shell itself.
+        let process = sandbox
+            .spawn_stdio_process(
+                &format!("3>&1; {LOGIN_SHELL_REPORT}; exec cat"),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let mut stdout = BufReader::new(process.stdout);
+        let mut line = String::new();
+        stdout.read_line(&mut line).await.unwrap();
+        assert_eq!(line.trim_end(), "nonlogin");
+        process.handle.terminate().await.unwrap();
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn initialize_fails_without_bash_instead_of_reporting_ready() {
+        use std::sync::Mutex;
+
+        use crate::SandboxEvent;
+
+        let dir = temp_dir();
+        let events: Arc<Mutex<Vec<SandboxEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_clone = Arc::clone(&events);
+
+        let mut sandbox =
+            LocalSandbox::with_bash_executable(dir.clone(), BashExecutable::Unavailable);
+        sandbox.set_event_callback(Arc::new(move |e| {
+            events_clone.lock().unwrap().push(e);
+        }));
+
+        let err = sandbox
+            .initialize()
+            .await
+            .expect_err("initialize should fail without Bash");
+        assert!(
+            err.display_with_causes()
+                .contains("Bash on the worker PATH"),
+            "missing Bash should be actionable: {}",
+            err.display_with_causes()
+        );
+
+        let captured = events.lock().unwrap();
+        assert!(
+            matches!(&captured[0], SandboxEvent::Initializing { provider } if provider == "local")
+        );
+        assert!(matches!(
+            &captured[1],
+            SandboxEvent::InitializeFailed { provider, .. } if provider == "local"
+        ));
+        assert!(
+            !captured
+                .iter()
+                .any(|event| matches!(event, SandboxEvent::Ready { .. })),
+            "a sandbox without Bash must never report ready: {captured:?}"
+        );
+        drop(captured);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn initialize_fails_when_the_resolved_executable_is_not_bash() {
+        let dir = temp_dir();
+        let sandbox = LocalSandbox::with_bash_executable(
+            dir.clone(),
+            BashExecutable::Fixed(PathBuf::from("/usr/bin/true")),
+        );
+
+        let err = sandbox
+            .initialize()
+            .await
+            .expect_err("a non-Bash interpreter should fail the probe");
+
+        assert!(
+            err.display_with_causes().contains("non-login Bash"),
+            "non-Bash interpreter should be named as the problem: {}",
+            err.display_with_causes()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn start_repeats_the_bash_probe_on_resume() {
+        let dir = temp_dir();
+
+        LocalSandbox::new(dir.clone())
+            .start()
+            .await
+            .expect("resume should succeed when Bash is present");
+
+        LocalSandbox::with_bash_executable(dir.clone(), BashExecutable::Unavailable)
+            .start()
+            .await
+            .expect_err("resume should fail when Bash disappeared between runs");
+
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

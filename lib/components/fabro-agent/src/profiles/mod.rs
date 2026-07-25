@@ -244,6 +244,8 @@ pub fn build_env_context_block_with(env: &dyn Sandbox, ctx: &EnvContext) -> Stri
 
 #[cfg(test)]
 mod tests {
+    use fabro_llm::types::ToolDefinition;
+
     use super::*;
     use crate::subagent::{SessionFactory, SubAgentSupervisor};
     use crate::test_support::MockSandbox;
@@ -295,6 +297,39 @@ mod tests {
         OpenAiProfile::with_native_tools("kimi-k2.5", &options, None)
             .with_provider_id(ProviderId::new("kimi"))
             .with_catalog(Arc::new(Catalog::from_builtin().unwrap()))
+    }
+
+    /// Every provider gets the one shared `shell` definition, so the Bash
+    /// contract is stated identically to OpenAI, Anthropic, and Gemini rather
+    /// than drifting per provider.
+    #[test]
+    fn every_profile_advertises_the_same_bash_shell_tool() {
+        let profiles: [Box<dyn AgentProfile>; 3] = [
+            Box::new(anthropic_profile(false, false)),
+            Box::new(gemini_profile(false)),
+            Box::new(openai_apply_patch_profile(false)),
+        ];
+
+        let definitions: Vec<ToolDefinition> = profiles
+            .iter()
+            .map(|profile| {
+                profile
+                    .tools()
+                    .into_iter()
+                    .find(|tool| tool.name == "shell")
+                    .expect("every profile should register the shell tool")
+            })
+            .collect();
+
+        for definition in &definitions {
+            assert_eq!(definition.parameters, definitions[0].parameters);
+            assert_eq!(definition.description, definitions[0].description);
+            assert!(
+                definition.description.contains("Bash"),
+                "shell tool should identify Bash: {}",
+                definition.description
+            );
+        }
     }
 
     #[test]

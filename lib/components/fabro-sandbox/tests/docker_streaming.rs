@@ -148,6 +148,88 @@ async fn cloned_docker_sandbox_uses_repos_checkout_and_workspace_symlink() {
     assert!(result.stdout.contains("true"));
 }
 
+// Both command paths must evaluate the same interpreter, so Bash-only syntax
+// that `sh` rejects has to behave identically through `exec_command` and
+// `exec_command_streaming`. Neither path is evidence for the other: they build
+// separate exec invocations, and the streaming one wraps the user command in a
+// controlled child.
+#[tokio::test]
+#[ignore = "requires real Docker container lifecycle; run explicitly when changing Docker exec integration"]
+async fn docker_runs_bash_only_syntax_through_both_command_paths() {
+    let image = "buildpack-deps:noble";
+    let Ok(docker) = Docker::connect_with_local_defaults() else {
+        return;
+    };
+    if docker.inspect_image(image).await.is_err() {
+        return;
+    }
+
+    let sandbox = DockerSandbox::new(
+        DockerSandboxOptions {
+            image: image.to_string(),
+            auto_pull: false,
+            skip_clone: true,
+            ..DockerSandboxOptions::default()
+        },
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("docker sandbox should construct");
+    sandbox
+        .initialize()
+        .await
+        .expect("docker sandbox should initialize");
+
+    // Arrays, `[[ ]]`, and `${arr[@]}` are Bash-only; `shopt -q login_shell`
+    // proves the command did not run under a login shell.
+    let command = "arr=(one two three); [[ ${#arr[@]} -eq 3 ]] || exit 1; \
+                   shopt -q login_shell && exit 2; echo ${arr[1]}";
+
+    let non_streaming = sandbox
+        .exec_command(command, 10_000, None, None, None)
+        .await
+        .expect("non-streaming command should run");
+
+    let chunks = Arc::new(Mutex::new(Vec::new()));
+    let callback_chunks = Arc::clone(&chunks);
+    let callback: CommandOutputCallback = Arc::new(move |_stream, bytes| {
+        let callback_chunks = Arc::clone(&callback_chunks);
+        Box::pin(async move {
+            callback_chunks.lock().await.extend(bytes);
+            Ok(())
+        })
+    });
+    let streaming = sandbox
+        .exec_command_streaming(command, Some(10_000), None, None, None, callback)
+        .await
+        .expect("streaming command should run");
+
+    sandbox
+        .cleanup()
+        .await
+        .expect("docker cleanup should succeed");
+
+    assert!(
+        non_streaming.is_success(),
+        "non-streaming Bash-only command failed: stdout={} stderr={}",
+        non_streaming.stdout,
+        non_streaming.stderr
+    );
+    assert_eq!(non_streaming.stdout.trim(), "two");
+    assert!(
+        streaming.result.is_success(),
+        "streaming Bash-only command failed: stdout={} stderr={}",
+        streaming.result.stdout,
+        streaming.result.stderr
+    );
+    assert!(
+        String::from_utf8_lossy(&chunks.lock().await).contains("two"),
+        "streamed output should carry the Bash-only result"
+    );
+}
+
 // Regression test for glob patterns that contain a path separator. Before the
 // glob fix, the remote providers ran `find <base> -name <pattern>`, and
 // `find -name` matches only the basename and rejects patterns containing `/`.

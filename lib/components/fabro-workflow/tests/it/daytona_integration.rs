@@ -1796,7 +1796,7 @@ async fn daytona_playwright_mcp_sandbox_transport() {
             let (url, headers) = {
                 let cmd_str = command.join(" ");
                 let launch_script = format!(
-                    "setsid sh -c '{cmd_str} > /tmp/mcp_server_stdout.log 2>/tmp/mcp_server_stderr.log' \
+                    "setsid bash -c '{cmd_str} > /tmp/mcp_server_stdout.log 2>/tmp/mcp_server_stderr.log' \
                      </dev/null >/dev/null 2>&1 &\necho $!"
                 );
                 let launch_result = sandbox

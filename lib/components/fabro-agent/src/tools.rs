@@ -225,11 +225,11 @@ pub fn make_shell_tool_with_options(options: &NativeToolOptions) -> RegisteredTo
     RegisteredTool {
         definition: ToolDefinition {
             name:        "shell".into(),
-            description: "Execute shell commands for terminal operations, package managers, tests and builds. Use dedicated tools for file reads, file edits, filename searches, and content searches. Provide timeout_ms for long-running commands.".into(),
+            description: "Execute Bash commands for terminal operations, package managers, tests and builds. Use dedicated tools for file reads, file edits, filename searches, and content searches. Provide timeout_ms for long-running commands.".into(),
             parameters:  serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "command": {"type": "string", "description": "The shell command to execute"},
+                    "command": {"type": "string", "description": "Bash source to evaluate, run by a non-login Bash shell"},
                     "timeout_ms": {"type": "integer", "description": "Timeout in milliseconds"},
                     "description": {"type": "string", "description": "Description of what this command does"}
                 },
@@ -747,6 +747,34 @@ mod tests {
             assert!(!text.contains("PDF"), "unsupported PDF reads in {text}");
             assert!(!text.contains("image"), "unsupported image reads in {text}");
         }
+    }
+
+    /// The `shell` tool's wire shape is deliberately unchanged by the Bash
+    /// contract: only its prose became explicit about the interpreter. A model
+    /// that learned `shell({command, timeout_ms, description})` must keep
+    /// seeing exactly that.
+    #[test]
+    fn shell_tool_schema_is_unchanged_and_names_bash() {
+        let tool = make_shell_tool();
+
+        assert_eq!(tool.definition.name, "shell");
+        assert_eq!(
+            tool.definition.parameters,
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Bash source to evaluate, run by a non-login Bash shell"},
+                    "timeout_ms": {"type": "integer", "description": "Timeout in milliseconds"},
+                    "description": {"type": "string", "description": "Description of what this command does"}
+                },
+                "required": ["command"]
+            })
+        );
+        assert!(
+            tool.definition.description.contains("Bash"),
+            "the shell tool should identify its interpreter: {}",
+            tool.definition.description
+        );
     }
 
     #[tokio::test]

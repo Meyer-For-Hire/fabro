@@ -7,6 +7,20 @@ date: "2026-07-24"
 **Parallel branches now share one checkout, and `join_policy` was removed.** Remove `join_policy` from parallel nodes; fan-out now waits for every branch. Keep file-writing branches read-only or assign disjoint paths, and update fan-in logic to consume `parallel.results` instead of a selected branch workspace or `parallel_results.json`.
 </Warning>
 
+<Warning>
+**Sandbox commands no longer load login-shell profiles.** Environment set in `/etc/profile.d/*.sh`, `~/.bash_profile`, or `nvm`/`rbenv`/`sdkman` initializers is gone, so commands that relied on it now fail mid-run with command-not-found. Move those exports into your Dockerfile's `ENV` (or your Daytona snapshot image).
+</Warning>
+
+## Sandbox commands are Bash everywhere
+
+Every sandbox now evaluates command strings as **non-login Bash** — `bash -c`, with no `sh` fallback and no ambient provider shell. Previously the three backends disagreed: Daytona ran commands through `sh`, and Docker's streaming, stdio, and setup paths used a login shell. Bash-only syntax such as `[[ ... ]]` and arrays now behaves identically across local, Docker, and Daytona, through both buffered and streaming execution.
+
+The `shell` tool's name and JSON schema are unchanged; only its description became explicit that `command` is Bash source. Fabro still adds no shell options of its own — there is no implicit `errexit` or `pipefail`, so `false | true` still succeeds. A workflow that wants different semantics writes them into the command (`sh -c ...`, a `#!/bin/sh` shebang, an explicit `set -o pipefail`).
+
+Both fresh initialization and resume now verify Bash before reporting the sandbox usable, so a missing or non-Bash interpreter fails at the lifecycle boundary with provider-specific remediation instead of on the first command. Docker and Daytona require `/bin/bash`; local sandboxes resolve `bash` through the worker's `PATH`, which keeps NixOS working.
+
+Prepare-step `script` values and sandbox MCP `script` values run under the same contract. Hooks, host-side stdio MCP scripts, and interactive terminals are separate executors and keep their existing behavior.
+
 ## Shared-checkout parallel execution
 
 Parallel branches now run concurrently in the run's existing sandbox and working directory instead of creating branch-specific Git worktrees. Each branch still receives isolated context updates, returned in outgoing-edge order under `parallel.results`, while a prompted fan-in can synthesize the complete typed result array. Promptless fan-in nodes act as barriers and never select, restore, or merge workspace state.

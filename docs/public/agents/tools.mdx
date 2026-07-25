@@ -15,7 +15,7 @@ These tools are registered for every provider profile:
 
 | Tool | Category | Description |
 |---|---|---|
-| `shell` | shell | Run shell commands via `/bin/bash -c` |
+| `shell` | shell | Run commands as Bash source via `bash -c` |
 | `read_file` | read | Read file contents with optional offset and limit |
 | `write_file` | write | Create or overwrite a file |
 | `grep` | read | Search file contents with regex patterns |
@@ -40,11 +40,13 @@ Some tools are only available with certain LLM providers:
 
 ### shell
 
-Executes a shell command via `/bin/bash -c` in the sandbox's working directory.
+Executes the command as Bash source in the sandbox's working directory, equivalent to `bash -c <command>`. The shell is not a login shell, and Fabro adds no shell options of its own — no `errexit`, no `pipefail`. Docker and Daytona sandboxes require `/bin/bash`; local sandboxes resolve `bash` through the worker's `PATH`.
+
+To run something under a different interpreter, say so in the command itself (`sh -c ...`, a script with a `#!/bin/sh` shebang, or an explicit `set -o pipefail`); those run beneath Fabro's Bash boundary.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `command` | string | yes | The shell command to execute |
+| `command` | string | yes | Bash source to evaluate |
 | `timeout_ms` | integer | no | Timeout in milliseconds |
 | `description` | string | no | Description of what the command does |
 
