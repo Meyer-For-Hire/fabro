@@ -39,14 +39,17 @@ use crate::file_tracker::FileTracker;
 use crate::history::History;
 use crate::loop_detection::detect_loop;
 use crate::memory::{BUDGET_BYTES, MemoryDocument, discover_memory};
+use crate::native_tool::NativeTool;
 use crate::profiles::EnvContext;
 use crate::question_tools::AgentToolRuntime;
 use crate::sandbox::Sandbox;
 use crate::skills::{
-    ExpandedInput, Skill, default_skill_dirs, discover_skills, expand_skill, make_use_skill_tool,
+    ExpandedInput, Skill, default_skill_dirs, discover_skills, expand_skill,
+    make_use_skill_tool_for_vocabulary,
 };
 use crate::subagent::{SubAgentCallbackEvent, SubAgentEventCallback, SubAgentSupervisor};
 use crate::tool_execution::execute_tool_calls;
+use crate::tool_permissions::canonical_tool_name;
 use crate::tool_registry::ToolDefinitionWithSource;
 use crate::types::{
     AgentEvent, McpToolSummary, MemoryFileSummary, Message, SessionEvent, SessionState,
@@ -650,9 +653,10 @@ impl Session {
         if !self.skills.is_empty() {
             let skills_arc = Arc::new(self.skills.clone());
             if let Some(profile) = Arc::get_mut(&mut self.provider_profile) {
+                let vocabulary = profile.tool_registry().vocabulary();
                 profile
                     .tool_registry_mut()
-                    .register(make_use_skill_tool(skills_arc));
+                    .register(make_use_skill_tool_for_vocabulary(skills_arc, vocabulary));
             }
         }
 
@@ -1396,6 +1400,12 @@ impl Session {
                 text: expanded_input.clone(),
             });
 
+        // A failed summarization is unlikely to improve within the same agent
+        // turn. Suppress further attempts until the next user/follow-up input
+        // so a provider returning empty responses cannot create a paid retry
+        // loop at both compaction checkpoints.
+        let mut compaction_failed = false;
+
         loop {
             // Top-of-loop: if the previous round's interrupt token fired,
             // swap in a fresh one before draining and rebuilding state.
@@ -1458,7 +1468,9 @@ impl Session {
                 .clone();
 
             // Pre-turn compaction: trim context before building the request
-            self.compact_if_needed().await;
+            if !compaction_failed {
+                compaction_failed = self.compact_if_needed().await;
+            }
 
             self.inject_task_reminder_if_needed();
 
@@ -1799,7 +1811,9 @@ impl Session {
                 });
 
             // Post-response compaction: trim context after appending assistant turn
-            self.compact_if_needed().await;
+            if !compaction_failed {
+                compaction_failed = self.compact_if_needed().await;
+            }
 
             // If no tool calls, natural completion. Consult the optional
             // completion coordinator: it can return `true` to force one more
@@ -1854,10 +1868,10 @@ impl Session {
             .await;
             timing.tool = timing.tool.saturating_add(tool_start.elapsed());
             composite_watcher.abort();
-            if tool_calls
-                .iter()
-                .any(|tool_call| tool_call.name == "use_skill")
-            {
+            if tool_calls.iter().zip(&results).any(|(tool_call, result)| {
+                !result.is_error
+                    && canonical_tool_name(&tool_call.name) == NativeTool::UseSkill.canonical_name()
+            }) {
                 self.activated_skill_context_observed = true;
             }
 
@@ -1901,7 +1915,12 @@ impl Session {
         }
     }
 
-    async fn compact_if_needed(&mut self) {
+    /// Attempt context compaction when the configured threshold is exceeded.
+    ///
+    /// Returns `true` when an attempted compaction failed so the current input
+    /// loop can suppress repeated paid summary calls. The next input starts
+    /// with a fresh retry opportunity.
+    async fn compact_if_needed(&mut self) -> bool {
         let Some(estimate) = check_context_usage(
             &self.system_prompt,
             &self.history,
@@ -1910,12 +1929,12 @@ impl Session {
             &self.event_emitter,
             &self.id,
         ) else {
-            return;
+            return false;
         };
         if !self.config.enable_context_compaction {
-            return;
+            return false;
         }
-        if let Err(e) = compact_context(
+        if let Err(error) = compact_context(
             &mut self.history,
             &self.llm_client,
             self.provider_profile.as_ref(),
@@ -1927,10 +1946,11 @@ impl Session {
         )
         .await
         {
-            self.event_emitter.emit(self.id.clone(), AgentEvent::Error {
-                error: Error::InvalidState(format!("Context compaction failed: {e}")),
-            });
+            self.event_emitter
+                .emit(self.id.clone(), AgentEvent::Error { error });
+            return true;
         }
+        false
     }
 
     fn drain_steering(&mut self) {
@@ -2040,6 +2060,7 @@ impl Session {
             system_prompt: &self.system_prompt,
             memory: &self.memory,
             skills: &self.skills,
+            tool_vocabulary: self.provider_profile.tool_registry().vocabulary(),
             activated_skill_context_observed: self.activated_skill_context_observed,
             provider: &provider,
             model: &model,
@@ -2127,6 +2148,7 @@ mod tests {
 
     use super::*;
     use crate::config::{ToolAccess, ToolAccessPolicy, ToolApprovalAdapter, ToolExposureMode};
+    use crate::error::CompactionError;
     use crate::skills::{Skill, make_use_skill_tool};
     use crate::subagent::{SubAgentStatus, make_wait_tool};
     use crate::test_support::*;
@@ -4642,8 +4664,9 @@ mod tests {
         // provider that errors on complete() but succeeds on stream().
 
         struct StreamOnlyProvider {
-            responses:  Vec<Response>,
-            call_index: AtomicUsize,
+            responses:      Vec<Response>,
+            stream_index:   AtomicUsize,
+            complete_calls: AtomicUsize,
         }
 
         #[async_trait::async_trait]
@@ -4653,6 +4676,7 @@ mod tests {
             }
 
             async fn complete(&self, _request: &Request) -> Result<Response, LlmError> {
+                self.complete_calls.fetch_add(1, Ordering::SeqCst);
                 Err(LlmError::Stream {
                     message: "summarization failed".into(),
                     source:  None,
@@ -4660,7 +4684,7 @@ mod tests {
             }
 
             async fn stream(&self, _request: &Request) -> Result<StreamEventStream, LlmError> {
-                let idx = self.call_index.fetch_add(1, Ordering::SeqCst);
+                let idx = self.stream_index.fetch_add(1, Ordering::SeqCst);
                 let response = if idx < self.responses.len() {
                     self.responses[idx].clone()
                 } else {
@@ -4689,16 +4713,20 @@ mod tests {
         }
 
         let large_input = "x".repeat(400);
-        let responses = vec![response_with_usage(
+        let responses = vec![
+            response_with_input_tokens(
+                tool_call_response("nonexistent_tool", "call_1", serde_json::json!({})),
+                90,
+            ),
             text_response("OK"),
-            TokenCounts::default(),
-        )];
+        ];
 
         let provider = Arc::new(StreamOnlyProvider {
             responses,
-            call_index: AtomicUsize::new(0),
+            stream_index: AtomicUsize::new(0),
+            complete_calls: AtomicUsize::new(0),
         });
-        let client = make_client(provider as Arc<dyn ProviderAdapter>).await;
+        let client = make_client(provider.clone() as Arc<dyn ProviderAdapter>).await;
         let registry = ToolRegistry::new();
         let profile = Arc::new(TestProfile::with_context_window(registry, 100));
         let env = Arc::new(MockSandbox::default());
@@ -4716,15 +4744,20 @@ mod tests {
             result.is_ok(),
             "Session should continue despite compaction failure"
         );
+        assert_eq!(
+            provider.complete_calls.load(Ordering::SeqCst),
+            1,
+            "a failed compaction should suppress retries for the rest of the input"
+        );
 
-        // Should emit an Error event for the failed compaction
+        // Should emit the structured compaction error without flattening the
+        // underlying LLM failure.
         let mut found_error = false;
         while let Ok(event) = rx.try_recv() {
-            if let AgentEvent::Error { error } = &event.event {
-                let msg = error.to_string();
-                if msg.contains("compaction") || msg.contains("summarization") {
-                    found_error = true;
-                }
+            if matches!(event.event, AgentEvent::Error {
+                error: Error::Compaction(CompactionError::Llm(_)),
+            }) {
+                found_error = true;
             }
         }
         assert!(found_error, "Should emit Error event for failed compaction");

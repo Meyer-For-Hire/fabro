@@ -1,8 +1,9 @@
 //! Model-facing todo / task tools.
 //!
-//! Two surfaces share one engine ([`TodoRuntime`]):
+//! Three surfaces share one engine ([`TodoRuntime`]):
 //!
 //! - [`make_update_plan_tool`] — Codex-compatible OpenAI `update_plan`.
+//! - [`make_todo_list_tool`] — Kimi Code-compatible whole-list `TodoList`.
 //! - [`make_task_create_tool`] / [`make_task_update_tool`] /
 //!   [`make_task_get_tool`] / [`make_task_list_tool`] — Claude task tools.
 
@@ -15,17 +16,22 @@ use std::sync::{Arc, Mutex};
 use fabro_llm::types::ToolDefinition;
 use fabro_types::{TodoListKind, TodoProjection, TodoStatus, TodoUpdatedProps};
 use serde_json::Value;
+use strum::{EnumString, IntoStaticStr};
 
 use crate::todo_runtime::TodoRuntime;
 use crate::tool_registry::{RegisteredTool, ToolContext, ToolSource};
 
-/// Compute the OpenAI plan scope (`openai_plan:<session_id>`). Returns an
-/// error string the model can see if no session ID is bound to the call.
-fn openai_plan_scope(ctx: &ToolContext) -> Result<String, String> {
+/// Compute a session-scoped todo-list ID. Returns an error the model can see
+/// when a tool is invoked without an active session.
+fn session_todo_scope(
+    ctx: &ToolContext,
+    kind: TodoListKind,
+    tool_name: &str,
+) -> Result<String, String> {
     ctx.session_id
         .as_ref()
-        .map(|sid| TodoListKind::OpenAiPlan.list_id(sid))
-        .ok_or_else(|| "update_plan requires an active session".to_string())
+        .map(|session_id| kind.list_id(session_id))
+        .ok_or_else(|| format!("{tool_name} requires an active session"))
 }
 
 /// Compute the Anthropic task scope
@@ -72,21 +78,74 @@ description and dependency details.";
 const TASK_GET_DESCRIPTION: &str = "Get one task by taskId, including subject, status, \
 description, owner, blockedBy, and blocks.";
 
-/// Deterministic todo id derived from `<list_id>::<step>`. Codex identifies
-/// a plan step by the exact step text, so the projection ID is the
-/// `sha256(list_id, step)` truncated for compactness.
-fn openai_step_id(list_id: &str, step: &str) -> String {
+/// Deterministic todo id derived from `<list_id>::<text>`. Whole-list tools
+/// identify an item by its exact text, so unchanged entries preserve identity.
+fn todo_text_id(list_id: &str, text: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(list_id.as_bytes());
     hasher.update(b"\x00");
-    hasher.update(step.as_bytes());
+    hasher.update(text.as_bytes());
     let digest = hasher.finalize();
     let mut out = String::with_capacity(16);
     for byte in &digest[..8] {
         let _ = write!(out, "{byte:02x}");
     }
     out
+}
+
+struct ReplacementTodo {
+    id:      String,
+    subject: String,
+    status:  TodoStatus,
+}
+
+fn reconcile_replacement_list(
+    runtime: &TodoRuntime,
+    ctx: &ToolContext,
+    kind: TodoListKind,
+    list_id: &str,
+    incoming: &[ReplacementTodo],
+) {
+    let previous = runtime
+        .snapshot(list_id)
+        .map(|list| list.items)
+        .unwrap_or_default();
+    let previous_by_id: HashMap<&str, &TodoProjection> = previous
+        .iter()
+        .map(|todo| (todo.id.as_str(), todo))
+        .collect();
+    let incoming_ids: HashSet<&str> = incoming.iter().map(|todo| todo.id.as_str()).collect();
+
+    for todo in &previous {
+        if !incoming_ids.contains(todo.id.as_str()) {
+            runtime.delete(ctx, kind, list_id.to_string(), todo.id.clone());
+        }
+    }
+
+    for (index, todo) in incoming.iter().enumerate() {
+        let order = u32::try_from(index).unwrap_or(u32::MAX);
+        match previous_by_id.get(todo.id.as_str()) {
+            Some(previous)
+                if previous.status == todo.status
+                    && previous.order == order
+                    && previous.subject == todo.subject => {}
+            Some(_) => {
+                runtime.update(ctx, TodoUpdatedProps {
+                    status: Some(todo.status),
+                    order: Some(order),
+                    subject: Some(todo.subject.clone()),
+                    ..TodoUpdatedProps::new(list_id, kind, &todo.id)
+                });
+            }
+            None => {
+                let mut projection =
+                    TodoProjection::new(todo.id.clone(), order, todo.subject.clone());
+                projection.status = todo.status;
+                runtime.create(ctx, kind, list_id.to_string(), projection);
+            }
+        }
+    }
 }
 
 /// OpenAI `update_plan` tool. See plan summary for semantics.
@@ -127,15 +186,14 @@ pub fn make_update_plan_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
         executor:   Arc::new(move |args, ctx| {
             let runtime = runtime.clone();
             Box::pin(async move {
-                let list_id = openai_plan_scope(&ctx)?;
+                let list_id = session_todo_scope(&ctx, TodoListKind::OpenAiPlan, "update_plan")?;
                 let plan = args
                     .get("plan")
                     .and_then(Value::as_array)
                     .ok_or_else(|| "Missing required parameter: plan".to_string())?;
 
                 // Parse incoming steps, precompute ids, and enforce step-text uniqueness.
-                let mut incoming: Vec<(String, String, TodoStatus)> =
-                    Vec::with_capacity(plan.len());
+                let mut incoming = Vec::with_capacity(plan.len());
                 let mut seen_steps: HashSet<&str> = HashSet::with_capacity(plan.len());
                 for (index, entry) in plan.iter().enumerate() {
                     let step = entry
@@ -152,59 +210,185 @@ pub fn make_update_plan_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
                             "Duplicate plan step `{step}` — step text must be unique"
                         ));
                     }
-                    let todo_id = openai_step_id(&list_id, step);
-                    incoming.push((todo_id, step.to_string(), status));
+                    incoming.push(ReplacementTodo {
+                        id: todo_text_id(&list_id, step),
+                        subject: step.to_string(),
+                        status,
+                    });
                 }
 
-                // Snapshot previous state into a HashMap for O(1) lookup.
-                let previous: HashMap<String, TodoProjection> = runtime
-                    .snapshot(&list_id)
-                    .map(|list| list.items.into_iter().map(|t| (t.id.clone(), t)).collect())
-                    .unwrap_or_default();
-                let incoming_ids: HashSet<&str> =
-                    incoming.iter().map(|(id, _, _)| id.as_str()).collect();
-
-                // Deletes: anything in previous but not in incoming.
-                for id in previous.keys() {
-                    if !incoming_ids.contains(id.as_str()) {
-                        runtime.delete(&ctx, TodoListKind::OpenAiPlan, list_id.clone(), id.clone());
-                    }
-                }
-
-                // Upserts: each incoming step becomes a create (new) or update.
-                for (index, (todo_id, step, status)) in incoming.iter().enumerate() {
-                    let order = u32::try_from(index).unwrap_or(u32::MAX);
-                    match previous.get(todo_id) {
-                        Some(prev)
-                            if prev.status == *status
-                                && prev.order == order
-                                && prev.subject == *step =>
-                        {
-                            // No change.
-                        }
-                        Some(_) => {
-                            runtime.update(&ctx, TodoUpdatedProps {
-                                status: Some(*status),
-                                order: Some(order),
-                                subject: Some(step.clone()),
-                                ..TodoUpdatedProps::new(&list_id, TodoListKind::OpenAiPlan, todo_id)
-                            });
-                        }
-                        None => {
-                            let mut projection =
-                                TodoProjection::new(todo_id.clone(), order, step.clone());
-                            projection.status = *status;
-                            runtime.create(
-                                &ctx,
-                                TodoListKind::OpenAiPlan,
-                                list_id.clone(),
-                                projection,
-                            );
-                        }
-                    }
-                }
+                reconcile_replacement_list(
+                    &runtime,
+                    &ctx,
+                    TodoListKind::OpenAiPlan,
+                    &list_id,
+                    &incoming,
+                );
 
                 Ok("Plan updated".to_string())
+            })
+        }),
+        source:     ToolSource::Native,
+    }
+}
+
+#[derive(Clone, Copy, EnumString, IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+enum KimiTodoStatus {
+    Pending,
+    InProgress,
+    #[strum(to_string = "done")]
+    Done,
+}
+
+impl From<KimiTodoStatus> for TodoStatus {
+    fn from(status: KimiTodoStatus) -> Self {
+        match status {
+            KimiTodoStatus::Pending => Self::Pending,
+            KimiTodoStatus::InProgress => Self::InProgress,
+            KimiTodoStatus::Done => Self::Completed,
+        }
+    }
+}
+
+impl From<TodoStatus> for KimiTodoStatus {
+    fn from(status: TodoStatus) -> Self {
+        match status {
+            TodoStatus::Pending => Self::Pending,
+            TodoStatus::InProgress => Self::InProgress,
+            TodoStatus::Completed | TodoStatus::Deleted => Self::Done,
+        }
+    }
+}
+
+/// Kimi Code spells the terminal status `done`; internally it is
+/// [`TodoStatus::Completed`].
+fn parse_kimi_status(value: &str) -> Result<TodoStatus, String> {
+    value
+        .parse::<KimiTodoStatus>()
+        .map(TodoStatus::from)
+        .map_err(|_| format!("Invalid status `{value}` (expected pending|in_progress|done)"))
+}
+
+fn kimi_status_name(status: TodoStatus) -> &'static str {
+    KimiTodoStatus::from(status).into()
+}
+
+fn render_kimi_todos<'a>(items: impl IntoIterator<Item = (TodoStatus, &'a str)>) -> String {
+    let mut items = items.into_iter().peekable();
+    if items.peek().is_none() {
+        return "The todo list is empty.".to_string();
+    }
+    let mut out = String::new();
+    for (status, subject) in items {
+        let _ = writeln!(out, "[{}] {subject}", kimi_status_name(status));
+    }
+    out.truncate(out.trim_end().len());
+    out
+}
+
+/// Kimi Code-compatible `TodoList`.
+///
+/// A single tool serves reads and writes, matching the surface Kimi models are
+/// trained against: omit `todos` to read, pass `[]` to clear, pass a list to
+/// replace the whole thing. Items carry only `title` and `status`, and the
+/// terminal status is spelled `done`.
+///
+/// Reconciliation mirrors `update_plan` — items are identified by their text,
+/// so a re-submitted list preserves identity for unchanged entries — and the
+/// same [`TodoRuntime`] backs it, so projections and events are unchanged.
+pub fn make_todo_list_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
+    RegisteredTool {
+        definition: ToolDefinition {
+            name:        "TodoList".into(),
+            description: "Maintain a structured TODO list for the current task. Use it \
+                          proactively for multi-step work. Pass `todos` to replace the entire \
+                          list, omit `todos` to read the current list without changing it, and \
+                          pass an empty array to clear it. Keep exactly one item `in_progress` \
+                          while work is underway, and mark an item `done` as soon as it is \
+                          finished rather than batching completions at the end."
+                .into(),
+            parameters:  serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "todos": {
+                        "type": "array",
+                        "description": "The updated todo list. Omit to read the current list \
+            without making changes. Pass an empty array to clear the list.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "title": {
+                                    "type": "string",
+                                    "description": "Short, actionable title for the todo."
+                                },
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "done"],
+                                    "description": "Current status of the todo."
+                                }
+                            },
+                            "required": ["title", "status"]
+                        }
+                    }
+                }
+            }),
+        },
+        executor:   Arc::new(move |args, ctx| {
+            let runtime = runtime.clone();
+            Box::pin(async move {
+                let list_id = session_todo_scope(&ctx, TodoListKind::KimiTodos, "TodoList")?;
+
+                // Read mode: `todos` omitted entirely.
+                let Some(todos) = args.get("todos") else {
+                    let items = runtime
+                        .snapshot(&list_id)
+                        .map(|l| l.items)
+                        .unwrap_or_default();
+                    return Ok(render_kimi_todos(
+                        items
+                            .iter()
+                            .map(|todo| (todo.status, todo.subject.as_str())),
+                    ));
+                };
+                let todos = todos
+                    .as_array()
+                    .ok_or_else(|| "`todos` must be an array".to_string())?;
+
+                let mut incoming = Vec::with_capacity(todos.len());
+                let mut seen: HashSet<&str> = HashSet::with_capacity(todos.len());
+                for (index, entry) in todos.iter().enumerate() {
+                    let title = entry
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| format!("todos[{index}] is missing `title`"))?;
+                    let status = entry
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| format!("todos[{index}] is missing `status`"))?;
+                    let status = parse_kimi_status(status)?;
+                    if !seen.insert(title) {
+                        return Err(format!("Duplicate todo `{title}` — titles must be unique"));
+                    }
+                    incoming.push(ReplacementTodo {
+                        id: todo_text_id(&list_id, title),
+                        subject: title.to_string(),
+                        status,
+                    });
+                }
+
+                reconcile_replacement_list(
+                    &runtime,
+                    &ctx,
+                    TodoListKind::KimiTodos,
+                    &list_id,
+                    &incoming,
+                );
+                Ok(render_kimi_todos(
+                    incoming
+                        .iter()
+                        .map(|todo| (todo.status, todo.subject.as_str())),
+                ))
             })
         }),
         source:     ToolSource::Native,
@@ -498,6 +682,120 @@ pub fn make_task_list_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
 }
 
 #[cfg(test)]
+mod kimi_todo_tests {
+    use std::sync::Arc;
+
+    use serde_json::json;
+    use tokio_util::sync::CancellationToken;
+
+    use super::tests::SilentEmitter;
+    use super::*;
+    use crate::sandbox::Sandbox;
+    use crate::test_support::MockSandbox;
+
+    fn ctx() -> ToolContext {
+        let env: Arc<dyn Sandbox> = Arc::new(MockSandbox::default());
+        ToolContext {
+            env,
+            cancel: CancellationToken::new(),
+            tool_env_provider: None,
+            session_id: Some("ses_kimi".to_string()),
+            root_session_id: Some("ses_kimi".to_string()),
+            tool_call_id: None,
+            agent_event_emitter: Some(Arc::new(SilentEmitter)),
+        }
+    }
+
+    async fn call(tool: &RegisteredTool, args: serde_json::Value) -> Result<String, String> {
+        (tool.executor)(args, ctx()).await
+    }
+
+    #[tokio::test]
+    async fn replaces_the_whole_list_and_reads_it_back() {
+        let runtime = Arc::new(TodoRuntime::new());
+        let tool = make_todo_list_tool(runtime);
+
+        call(
+            &tool,
+            json!({"todos": [
+                {"title": "read the config", "status": "done"},
+                {"title": "patch the parser", "status": "in_progress"},
+                {"title": "add a test", "status": "pending"}
+            ]}),
+        )
+        .await
+        .unwrap();
+
+        // Read mode: `todos` omitted entirely.
+        let listed = call(&tool, json!({})).await.unwrap();
+        assert!(listed.contains("[done] read the config"), "{listed}");
+        assert!(
+            listed.contains("[in_progress] patch the parser"),
+            "{listed}"
+        );
+
+        // Re-submitting a shorter list drops the missing entries.
+        call(
+            &tool,
+            json!({"todos": [{"title": "add a test", "status": "done"}]}),
+        )
+        .await
+        .unwrap();
+        let listed = call(&tool, json!({})).await.unwrap();
+        assert!(listed.contains("[done] add a test"), "{listed}");
+        assert!(!listed.contains("patch the parser"), "{listed}");
+    }
+
+    #[tokio::test]
+    async fn empty_array_clears_the_list() {
+        let runtime = Arc::new(TodoRuntime::new());
+        let tool = make_todo_list_tool(runtime);
+        call(
+            &tool,
+            json!({"todos": [{"title": "x", "status": "pending"}]}),
+        )
+        .await
+        .unwrap();
+        call(&tool, json!({"todos": []})).await.unwrap();
+        assert_eq!(
+            call(&tool, json!({})).await.unwrap(),
+            "The todo list is empty."
+        );
+    }
+
+    /// Kimi Code spells the terminal status `done`; `completed` is the
+    /// Anthropic/Codex spelling and must not be silently accepted.
+    #[tokio::test]
+    async fn status_vocabulary_is_kimi_codes() {
+        let runtime = Arc::new(TodoRuntime::new());
+        let tool = make_todo_list_tool(runtime);
+        let err = call(
+            &tool,
+            json!({"todos": [{"title": "x", "status": "completed"}]}),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("expected pending|in_progress|done"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn duplicate_titles_are_rejected() {
+        let runtime = Arc::new(TodoRuntime::new());
+        let tool = make_todo_list_tool(runtime);
+        let err = call(
+            &tool,
+            json!({"todos": [
+                {"title": "same", "status": "pending"},
+                {"title": "same", "status": "done"}
+            ]}),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("must be unique"), "{err}");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
@@ -510,7 +808,7 @@ mod tests {
     use crate::types::AgentEvent;
 
     #[derive(Default)]
-    struct SilentEmitter;
+    pub(super) struct SilentEmitter;
     impl AgentEventEmitter for SilentEmitter {
         fn emit(&self, _event: AgentEvent) {}
     }

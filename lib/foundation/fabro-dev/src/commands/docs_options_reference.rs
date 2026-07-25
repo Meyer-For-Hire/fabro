@@ -326,6 +326,7 @@ cache_input_cost_per_mtok = 0.60
 | `tools` | boolean | `false` | Whether the model supports tool calls. |
 | `vision` | boolean | `false` | Whether the model accepts image inputs. |
 | `reasoning` | boolean | `false` | Whether the model has reasoning behavior. |
+| `reasoning_by_default` | boolean | effort-capable models: `true`; other models: `false` | Whether requests reason when no `reasoning_effort` is supplied. Set this explicitly for always-reasoning routes that do not expose an effort control, or for effort-capable routes whose provider defaults reasoning off. |
 | `reasoning_effort` | `"levels"` \| `"always_adaptive"` \| `"none"` | `"none"` | Whether the model endpoint supports a native reasoning-effort parameter. `levels` accepts discrete effort levels; `always_adaptive` accepts effort levels with natively always-on adaptive thinking; `none` has no native effort parameter. |
 | `prompt_cache` | boolean | `false` | Whether prompt cache pricing/usage applies. |
 | `sampling_params` | boolean | `true` | Whether the model accepts classic sampling parameters (`temperature`, `top_p`). |

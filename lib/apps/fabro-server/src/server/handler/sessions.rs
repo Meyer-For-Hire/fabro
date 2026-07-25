@@ -928,7 +928,10 @@ fn summarizer_model_id(
             .map_or_else(
                 || match profile_kind {
                     AgentProfileKind::Anthropic => "claude-haiku-4-5",
-                    AgentProfileKind::OpenAi => selected_model,
+                    // Kimi is reached through several providers, so there is
+                    // no fixed summarizer model to name; reuse the selected
+                    // one, as the OpenAI profile does.
+                    AgentProfileKind::OpenAi | AgentProfileKind::Kimi => selected_model,
                     AgentProfileKind::Gemini => "gemini-2.0-flash",
                 },
                 |model| model.id.as_str(),
@@ -941,7 +944,10 @@ struct AskFabroToolAccessPolicy;
 
 impl ToolAccessPolicy for AskFabroToolAccessPolicy {
     fn access_for_tool(&self, tool_name: &str) -> ToolAccess {
-        match tool_name {
+        // Resolve through the canonical name so a profile that exposes its own
+        // vocabulary (the Kimi profile uses `Read`/`Grep`/`Glob`) is not denied
+        // its whole tool set.
+        match fabro_agent::canonical_tool_name(tool_name) {
             "read_file" | "grep" | "glob" => ToolAccess::Allowed,
             name if ASK_FABRO_RUN_TOOL_NAMES.contains(&name) => ToolAccess::Allowed,
             _ => ToolAccess::Denied,

@@ -3,6 +3,16 @@ use std::fmt::Write;
 
 use fabro_llm::types::{ToolCall, ToolResult};
 
+use crate::native_tool::NativeTool;
+use crate::tool_permissions::canonical_tool_name;
+
+fn file_path(arguments: &serde_json::Value) -> Option<&str> {
+    arguments
+        .get("file_path")
+        .or_else(|| arguments.get("path"))
+        .and_then(serde_json::Value::as_str)
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct FileOps {
     read:    bool,
@@ -59,23 +69,23 @@ impl FileTracker {
             if result.is_error {
                 continue;
             }
-            match tc.name.as_str() {
-                "read_file" => {
-                    if let Some(path) = tc.arguments.get("file_path").and_then(|v| v.as_str()) {
+            match canonical_tool_name(&tc.name) {
+                name if name == NativeTool::ReadFile.canonical_name() => {
+                    if let Some(path) = file_path(&tc.arguments) {
                         self.record_read(path);
                     }
                 }
-                "write_file" => {
-                    if let Some(path) = tc.arguments.get("file_path").and_then(|v| v.as_str()) {
+                name if name == NativeTool::WriteFile.canonical_name() => {
+                    if let Some(path) = file_path(&tc.arguments) {
                         self.record_write(path);
                     }
                 }
-                "edit_file" => {
-                    if let Some(path) = tc.arguments.get("file_path").and_then(|v| v.as_str()) {
+                name if name == NativeTool::EditFile.canonical_name() => {
+                    if let Some(path) = file_path(&tc.arguments) {
                         self.record_edit(path);
                     }
                 }
-                "apply_patch" => {
+                name if name == NativeTool::ApplyPatch.canonical_name() => {
                     let content = match result.content.as_str() {
                         Some(s) => s.to_string(),
                         None => result.content.to_string(),
@@ -164,6 +174,31 @@ mod tests {
         let results = vec![ToolResult::success("tc1", serde_json::json!("ok"))];
         tracker.record_from_tool_calls(&tool_calls, &results);
         assert_eq!(tracker.render(), "- /tmp/baz.rs (edited)\n");
+    }
+
+    #[test]
+    fn record_from_kimi_tool_calls_uses_path_argument() {
+        let mut tracker = FileTracker::default();
+        let tool_calls = vec![
+            ToolCall::new("tc1", "Read", serde_json::json!({"path": "/tmp/a.rs"})),
+            ToolCall::new(
+                "tc2",
+                "Write",
+                serde_json::json!({"path": "/tmp/b.rs", "content": "x"}),
+            ),
+            ToolCall::new("tc3", "Edit", serde_json::json!({"path": "/tmp/c.rs"})),
+        ];
+        let results = ["tc1", "tc2", "tc3"]
+            .into_iter()
+            .map(|id| ToolResult::success(id, serde_json::json!("ok")))
+            .collect::<Vec<_>>();
+
+        tracker.record_from_tool_calls(&tool_calls, &results);
+
+        assert_eq!(
+            tracker.render(),
+            "- /tmp/a.rs (read)\n- /tmp/b.rs (written)\n- /tmp/c.rs (edited)\n"
+        );
     }
 
     #[test]

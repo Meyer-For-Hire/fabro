@@ -19,9 +19,25 @@ impl std::fmt::Display for InterruptReason {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, thiserror::Error)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum CompactionError {
+    #[error("summary request failed: {0}")]
+    Llm(#[source] LlmError),
+
+    #[error(
+        "generated summary was empty after trimming; refused to replace \
+         {summarized_turn_count} turns and left history intact"
+    )]
+    EmptySummary { summarized_turn_count: usize },
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, thiserror::Error)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum Error {
     #[error("LLM error: {0}")]
     Llm(#[from] LlmError),
+
+    #[error("Context compaction failed: {0}")]
+    Compaction(#[from] CompactionError),
 
     #[error("Session is closed")]
     SessionClosed,
@@ -41,6 +57,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[cfg(test)]
 mod tests {
     use fabro_llm::{ProviderErrorDetail, ProviderErrorKind};
+    use fabro_util::error;
 
     use super::*;
 
@@ -53,6 +70,39 @@ mod tests {
         let agent_err = Error::from(sdk_err);
         assert!(matches!(agent_err, Error::Llm(_)));
         assert!(agent_err.to_string().contains("connection refused"));
+    }
+
+    #[test]
+    fn compaction_error_preserves_llm_source_chain() {
+        let err = Error::Compaction(CompactionError::Llm(LlmError::Network {
+            message: "connection refused".into(),
+            source:  None,
+        }));
+
+        let chain = error::collect_chain(&err);
+
+        assert!(
+            chain.len() >= 3,
+            "expected agent, compaction, and LLM errors in the source chain: {chain:?}"
+        );
+        assert!(
+            chain
+                .last()
+                .is_some_and(|cause| cause.contains("connection refused")),
+            "underlying LLM failure missing from source chain: {chain:?}"
+        );
+    }
+
+    #[test]
+    fn empty_compaction_summary_display() {
+        let err = Error::Compaction(CompactionError::EmptySummary {
+            summarized_turn_count: 3,
+        });
+        assert_eq!(
+            err.to_string(),
+            "Context compaction failed: generated summary was empty after trimming; \
+             refused to replace 3 turns and left history intact"
+        );
     }
 
     #[test]
@@ -117,6 +167,16 @@ mod tests {
     }
 
     #[test]
+    fn serde_roundtrip_compaction() {
+        let err = Error::Compaction(CompactionError::EmptySummary {
+            summarized_turn_count: 3,
+        });
+        let json = serde_json::to_string(&err).unwrap();
+        let deserialized: Error = serde_json::from_str(&json).unwrap();
+        assert_eq!(err.to_string(), deserialized.to_string());
+    }
+
+    #[test]
     fn serde_roundtrip_session_closed() {
         let err = Error::SessionClosed;
         let json = serde_json::to_string(&err).unwrap();
@@ -157,6 +217,9 @@ mod tests {
                 message: "refused".into(),
                 source:  None,
             }),
+            Error::Compaction(CompactionError::EmptySummary {
+                summarized_turn_count: 3,
+            }),
             Error::SessionClosed,
             Error::InvalidState("reason".into()),
             Error::ToolExecution("reason".into()),
@@ -178,6 +241,18 @@ mod tests {
         let json = serde_json::to_string(&err).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["type"], "llm");
+    }
+
+    #[test]
+    fn serde_tag_format_compaction() {
+        let err = Error::Compaction(CompactionError::EmptySummary {
+            summarized_turn_count: 3,
+        });
+        let json = serde_json::to_string(&err).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "compaction");
+        assert_eq!(v["data"]["type"], "empty_summary");
+        assert_eq!(v["data"]["data"]["summarized_turn_count"], 3);
     }
 
     #[test]

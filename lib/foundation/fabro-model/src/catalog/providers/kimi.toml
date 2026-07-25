@@ -1,6 +1,7 @@
 [providers.kimi]
 display_name = "Kimi"
 adapter = "openai_compatible"
+agent_profile = "kimi"
 api_key_url = "https://platform.kimi.ai/console/api-keys"
 base_url = "https://api.moonshot.ai/v1"
 priority = 70
@@ -23,6 +24,7 @@ max_output = 32768
 tools = true
 vision = true
 reasoning = true
+reasoning_by_default = true
 prompt_cache = true
 sampling_params = false
 
