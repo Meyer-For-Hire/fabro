@@ -8,7 +8,7 @@ date: "2026-07-25"
 
 - Replace `*.trace.zip` with `**/*.trace.zip` when traces may be nested.
 - Replace `test-results/**` with `**/test-results/**` only when `test-results` may appear below any directory instead of at the workspace root.
-- Absolute patterns and patterns containing a `..` segment are now rejected.
+- Absolute patterns, backslashes, and patterns containing a `..` segment are now rejected.
 - Agent `glob` results are now sorted lexicographically; local results are no longer ordered by modification time.
 </Warning>
 

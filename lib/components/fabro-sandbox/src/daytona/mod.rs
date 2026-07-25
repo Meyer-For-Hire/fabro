@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::Write;
 use std::path::Path;
 use std::sync::Arc;
@@ -27,8 +27,8 @@ use tokio_util::sync::CancellationToken;
 use crate::clone_source::{self, CloneDecision, EmptyWorkspaceReason};
 use crate::redact::redact_auth_url;
 use crate::sandbox::{
-    BASH_ENV_VAR, BASH_PROBE_SCRIPT, BASH_PROBE_TIMEOUT_MS, REMOTE_BASH, RefreshOutcome,
-    join_sandbox_path, optional_timeout, resolve_path, validate_bash_probe,
+    self, BASH_ENV_VAR, BASH_PROBE_SCRIPT, BASH_PROBE_TIMEOUT_MS, REMOTE_BASH,
+    REMOTE_WALK_TIMEOUT_MS, RefreshOutcome, optional_timeout, resolve_path, validate_bash_probe,
 };
 use crate::{
     CommandOutputCallback, DirEntry, ExecResult, ExecStreamingResult, GrepOptions, Sandbox,
@@ -559,84 +559,6 @@ impl DaytonaSandbox {
         self.sandbox.get().ok_or_else(|| {
             crate::Error::message("Daytona sandbox not initialized — call initialize() first")
         })
-    }
-
-    async fn walk_files_recursive(
-        &self,
-        base: &str,
-        relative_start: &str,
-        options: &WalkOptions,
-    ) -> crate::Result<Vec<SandboxFile>> {
-        if relative_start.split('/').any(|segment| {
-            options
-                .excluded_directory_names
-                .iter()
-                .any(|name| name == segment)
-        }) {
-            return Ok(Vec::new());
-        }
-
-        let sandbox = self.sandbox()?;
-        let fs_svc = sandbox
-            .fs()
-            .await
-            .map_err(|e| crate::Error::context("Failed to get Daytona fs service", e))?;
-        let Some(root) = resolve_daytona_walk_root(&fs_svc, base, relative_start).await? else {
-            return Ok(Vec::new());
-        };
-        let mut files = Vec::new();
-        let mut stack = vec![(root, relative_start.to_string())];
-        let mut visited_dirs = HashSet::new();
-
-        while let Some((dir, relative_dir)) = stack.pop() {
-            if !visited_dirs.insert(dir.clone()) {
-                continue;
-            }
-
-            let entries = match fs_svc.list_files(&dir).await {
-                Ok(entries) => entries,
-                Err(daytona_sdk::DaytonaError::NotFound { .. }) => continue,
-                Err(err) => {
-                    return Err(crate::Error::context(
-                        format!("Failed to list Daytona directory {dir}"),
-                        err,
-                    ));
-                }
-            };
-
-            for entry in entries {
-                if entry.name.is_empty() || entry.name == "." || entry.name == ".." {
-                    continue;
-                }
-
-                let child_path = join_sandbox_path(&dir, &entry.name);
-                let relative_path = join_sandbox_path(&relative_dir, &entry.name);
-                if entry.is_dir {
-                    if !options
-                        .excluded_directory_names
-                        .iter()
-                        .any(|name| name == &entry.name)
-                    {
-                        stack.push((child_path, relative_path));
-                    }
-                } else {
-                    let size = u64::try_from(entry.size).map_err(|error| {
-                        crate::Error::context(
-                            format!("Invalid Daytona file size for {child_path}"),
-                            error,
-                        )
-                    })?;
-                    files.push(SandboxFile {
-                        path: child_path,
-                        relative_path,
-                        size,
-                    });
-                }
-            }
-        }
-
-        files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-        Ok(files)
     }
 
     /// Read-only access to the SDK sandbox once initialized. Returns `None`
@@ -2002,41 +1924,21 @@ impl Sandbox for DaytonaSandbox {
         relative_start: &str,
         options: &WalkOptions,
     ) -> crate::Result<Vec<SandboxFile>> {
-        let base = self.resolve_path(base);
-        self.walk_files_recursive(&base, relative_start, options)
-            .await
-    }
-}
-
-async fn resolve_daytona_walk_root(
-    fs_svc: &daytona_sdk::FileSystemService,
-    base: &str,
-    relative_start: &str,
-) -> crate::Result<Option<String>> {
-    let mut root = base.to_string();
-    for segment in relative_start
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-    {
-        let entries = match fs_svc.list_files(&root).await {
-            Ok(entries) => entries,
-            Err(daytona_sdk::DaytonaError::NotFound { .. }) => return Ok(None),
-            Err(error) => {
-                return Err(crate::Error::context(
-                    format!("Failed to inspect Daytona traversal root {root}"),
-                    error,
-                ));
-            }
-        };
-        let Some(entry) = entries.into_iter().find(|entry| entry.name == segment) else {
-            return Ok(None);
-        };
-        if !entry.is_dir {
-            return Ok(None);
+        if options.excludes_relative_path(relative_start) {
+            return Ok(Vec::new());
         }
-        root = join_sandbox_path(&root, segment);
+
+        let base = self.resolve_path(base);
+        let command = sandbox::build_remote_walk_command(&base, relative_start, options);
+        let result = self
+            .exec_command(&command, REMOTE_WALK_TIMEOUT_MS, None, None, None)
+            .await?;
+        if !result.is_success() {
+            return Err(crate::Error::exec("recursive file traversal", result));
+        }
+
+        sandbox::parse_remote_walk_output(&base, relative_start, &result.stdout)
     }
-    Ok(Some(root))
 }
 
 fn daytona_callback_error(err: &crate::Error) -> DaytonaError {

@@ -1,12 +1,13 @@
-use std::collections::BTreeMap;
 use std::path::Path;
 
 use fabro_agent::Sandbox;
 use fabro_sandbox::{SandboxFile, WalkOptions};
 use fabro_types::ArtifactUpload;
 use fabro_util::workspace_glob::WorkspaceGlobSet;
+use futures::{StreamExt as _, TryStreamExt as _, stream};
 use sha2::{Digest, Sha256};
 use tokio::fs;
+use tokio::io::AsyncReadExt as _;
 use tracing::warn;
 
 /// Summary of an artifact collection run.
@@ -47,12 +48,15 @@ const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024;
 /// Maximum total size for all collected files (50 MB).
 const MAX_TOTAL_SIZE: u64 = 50 * 1024 * 1024;
 
+/// Independent traversal roots may run concurrently, but remote providers
+/// should not receive an unbounded burst of file-walk operations.
+const MAX_CONCURRENT_ARTIFACT_WALKS: usize = 4;
+
 /// Select which files should be collected based on size budgets.
-pub fn select_files_to_collect(discovered: &[SandboxFile]) -> Vec<SandboxFile> {
+pub fn select_files_to_collect(discovered: Vec<SandboxFile>) -> Vec<SandboxFile> {
     let mut candidates: Vec<SandboxFile> = discovered
-        .iter()
+        .into_iter()
         .filter(|file| file.size <= MAX_FILE_SIZE)
-        .cloned()
         .collect();
 
     candidates.sort_by(|left, right| {
@@ -77,23 +81,31 @@ pub fn select_files_to_collect(discovered: &[SandboxFile]) -> Vec<SandboxFile> {
 async fn compute_artifact_info(
     relative_path: &str,
     local_path: &Path,
-) -> std::result::Result<ArtifactUpload, String> {
+) -> std::result::Result<Option<ArtifactUpload>, String> {
     let mime = mime_guess::from_path(relative_path)
         .first_or_octet_stream()
         .to_string();
-    let data = fs::read(local_path)
+    let file = fs::File::open(local_path)
+        .await
+        .map_err(|error| format!("failed to open {}: {error}", local_path.display()))?;
+    let mut data = Vec::new();
+    file.take(MAX_FILE_SIZE + 1)
+        .read_to_end(&mut data)
         .await
         .map_err(|error| format!("failed to read {}: {error}", local_path.display()))?;
     let bytes = u64::try_from(data.len()).unwrap_or(u64::MAX);
+    if bytes > MAX_FILE_SIZE {
+        return Ok(None);
+    }
     let content_md5 = format!("{:x}", md5::compute(&data));
     let content_sha256 = hex::encode(Sha256::digest(&data));
-    Ok(ArtifactUpload {
+    Ok(Some(ArtifactUpload {
         path: relative_path.to_string(),
         mime,
         content_md5,
         content_sha256,
         bytes,
-    })
+    }))
 }
 
 /// Collect artifact files matching the configured workspace globs.
@@ -108,48 +120,55 @@ pub async fn collect_artifacts(
             .map(|directory| (*directory).to_string())
             .collect(),
     };
-    let mut discovered_by_path = BTreeMap::new();
-    for traversal_root in globs.traversal_roots() {
-        let files = sandbox
-            .walk_files(sandbox.working_directory(), traversal_root, &walk_options)
-            .await
-            .map_err(|error| {
-                format!(
-                    "artifact file traversal failed below {traversal_root:?}: {}",
-                    error.display_with_causes()
-                )
-            })?;
-        for file in files {
-            if globs.is_match(&file.relative_path) {
-                discovered_by_path
-                    .entry(file.relative_path.clone())
-                    .or_insert(file);
-            }
-        }
-    }
-    let discovered = discovered_by_path.into_values().collect::<Vec<_>>();
+    let walk_options = &walk_options;
+    let traversal_roots = globs
+        .traversal_roots()
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let walks = stream::iter(traversal_roots)
+        .map(|traversal_root| async move {
+            sandbox
+                .walk_files(sandbox.working_directory(), &traversal_root, walk_options)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "artifact file traversal failed below {traversal_root:?}: {}",
+                        error.display_with_causes()
+                    )
+                })
+        })
+        .buffer_unordered(MAX_CONCURRENT_ARTIFACT_WALKS)
+        .try_collect::<Vec<_>>()
+        .await?;
+    let discovered = walks
+        .into_iter()
+        .flatten()
+        .filter(|file| globs.is_match(&file.relative_path))
+        .collect::<Vec<_>>();
 
     let total_discovered = discovered.len();
-    let to_collect = select_files_to_collect(&discovered);
-    let files_skipped = total_discovered - to_collect.len();
+    let to_collect = select_files_to_collect(discovered);
+    let mut files_skipped = total_discovered - to_collect.len();
 
     let mut files_copied = 0;
-    let mut total_bytes = 0;
+    let mut total_bytes: u64 = 0;
     let mut download_errors = 0;
     let mut hash_errors = 0;
     let mut captured_assets = Vec::new();
 
     for file in &to_collect {
         let dest = artifact_capture_dir.join(&file.relative_path);
-        match sandbox
-            .download_file_to_local(&file.relative_path, &dest)
-            .await
-        {
+        match sandbox.download_file_to_local(&file.path, &dest).await {
             Ok(()) => match compute_artifact_info(&file.relative_path, &dest).await {
-                Ok(info) => {
+                Ok(Some(info)) if total_bytes.saturating_add(info.bytes) <= MAX_TOTAL_SIZE => {
                     files_copied += 1;
                     total_bytes += info.bytes;
                     captured_assets.push(info);
+                }
+                Ok(Some(_) | None) => {
+                    let _ = fs::remove_file(&dest).await;
+                    files_skipped += 1;
                 }
                 Err(error) => {
                     warn!(
@@ -188,171 +207,9 @@ pub async fn collect_artifacts(
 mod tests {
     use std::collections::{BTreeSet, HashMap};
 
-    use fabro_agent::sandbox::{DirEntry, ExecResult, GrepOptions};
-    use fabro_types::CommandTermination;
+    use fabro_sandbox::test_support::MockSandbox;
 
     use super::*;
-
-    struct AssetMockSandbox {
-        contents:   HashMap<String, String>,
-        discovered: Vec<SandboxFile>,
-        walk_error: Option<String>,
-    }
-
-    impl AssetMockSandbox {
-        fn new(contents: HashMap<String, String>) -> Self {
-            let discovered = contents
-                .iter()
-                .map(|(relative_path, content)| sandbox_file(relative_path, content.len() as u64))
-                .collect();
-            Self {
-                contents,
-                discovered,
-                walk_error: None,
-            }
-        }
-
-        fn with_discovered(mut self, discovered: Vec<SandboxFile>) -> Self {
-            self.discovered = discovered;
-            self
-        }
-
-        fn with_walk_error(mut self, error: &str) -> Self {
-            self.walk_error = Some(error.to_string());
-            self
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl Sandbox for AssetMockSandbox {
-        async fn read_file_bytes(&self, _: &str) -> fabro_sandbox::Result<Vec<u8>> {
-            Err("not implemented".into())
-        }
-
-        async fn write_file(&self, _: &str, _: &str) -> fabro_sandbox::Result<()> {
-            Ok(())
-        }
-
-        async fn delete_file(&self, _: &str) -> fabro_sandbox::Result<()> {
-            Ok(())
-        }
-
-        async fn file_exists(&self, _: &str) -> fabro_sandbox::Result<bool> {
-            Ok(false)
-        }
-
-        async fn list_directory(
-            &self,
-            _: &str,
-            _: Option<usize>,
-        ) -> fabro_sandbox::Result<Vec<DirEntry>> {
-            Ok(Vec::new())
-        }
-
-        async fn exec_command(
-            &self,
-            _: &str,
-            _: u64,
-            _: Option<&str>,
-            _: Option<&std::collections::HashMap<String, String>>,
-            _: Option<tokio_util::sync::CancellationToken>,
-        ) -> fabro_sandbox::Result<ExecResult> {
-            Ok(ExecResult {
-                stdout:      String::new(),
-                stderr:      String::new(),
-                exit_code:   Some(0),
-                termination: CommandTermination::Exited,
-                duration_ms: 0,
-            })
-        }
-
-        async fn grep(
-            &self,
-            _: &str,
-            _: &str,
-            _: &GrepOptions,
-        ) -> fabro_sandbox::Result<Vec<String>> {
-            Ok(Vec::new())
-        }
-
-        async fn walk_files(
-            &self,
-            _: &str,
-            relative_start: &str,
-            options: &WalkOptions,
-        ) -> fabro_sandbox::Result<Vec<SandboxFile>> {
-            if let Some(error) = &self.walk_error {
-                return Err(fabro_sandbox::Error::message(error.clone()));
-            }
-
-            Ok(self
-                .discovered
-                .iter()
-                .filter(|file| {
-                    relative_start.is_empty()
-                        || file
-                            .relative_path
-                            .starts_with(&format!("{relative_start}/"))
-                })
-                .filter(|file| {
-                    let parent = file
-                        .relative_path
-                        .rsplit_once('/')
-                        .map_or("", |(parent, _)| parent);
-                    !parent.split('/').any(|segment| {
-                        options
-                            .excluded_directory_names
-                            .iter()
-                            .any(|name| name == segment)
-                    })
-                })
-                .cloned()
-                .collect())
-        }
-
-        async fn download_file_to_local(
-            &self,
-            remote_path: &str,
-            local_path: &Path,
-        ) -> fabro_sandbox::Result<()> {
-            let content = self.contents.get(remote_path).ok_or_else(|| {
-                fabro_sandbox::Error::message(format!("File not found: {remote_path}"))
-            })?;
-            if let Some(parent) = local_path.parent() {
-                fs::create_dir_all(parent).await.map_err(|error| {
-                    fabro_sandbox::Error::context("Failed to create dirs", error)
-                })?;
-            }
-            fs::write(local_path, content.as_bytes())
-                .await
-                .map_err(|error| fabro_sandbox::Error::context("Failed to write", error))?;
-            Ok(())
-        }
-
-        async fn upload_file_from_local(&self, _: &Path, _: &str) -> fabro_sandbox::Result<()> {
-            Ok(())
-        }
-
-        async fn initialize(&self) -> fabro_sandbox::Result<()> {
-            Ok(())
-        }
-
-        async fn cleanup(&self) -> fabro_sandbox::Result<()> {
-            Ok(())
-        }
-
-        fn working_directory(&self) -> &str {
-            "/home/test"
-        }
-
-        fn platform(&self) -> &str {
-            "linux"
-        }
-
-        fn os_version(&self) -> String {
-            "Linux 6.1.0".to_string()
-        }
-    }
 
     fn sandbox_file(relative_path: &str, size: u64) -> SandboxFile {
         SandboxFile {
@@ -362,13 +219,29 @@ mod tests {
         }
     }
 
+    fn asset_sandbox(contents: HashMap<String, String>) -> MockSandbox {
+        let mut files = HashMap::new();
+        let mut discovered = Vec::new();
+        for (relative_path, content) in contents {
+            let file = sandbox_file(&relative_path, content.len() as u64);
+            files.insert(file.path.clone(), content);
+            discovered.push(file);
+        }
+
+        MockSandbox {
+            files,
+            ..MockSandbox::linux()
+        }
+        .with_walk_files(discovered)
+    }
+
     fn workspace_globs(patterns: &[&str]) -> WorkspaceGlobSet {
         WorkspaceGlobSet::try_new(patterns).unwrap()
     }
 
     #[test]
     fn select_files_skips_oversized_files() {
-        let selected = select_files_to_collect(&[sandbox_file("huge.xml", MAX_FILE_SIZE + 1)]);
+        let selected = select_files_to_collect(vec![sandbox_file("huge.xml", MAX_FILE_SIZE + 1)]);
 
         assert!(selected.is_empty());
     }
@@ -381,7 +254,7 @@ mod tests {
             sandbox_file("c.xml", 2000),
         ];
 
-        let selected = select_files_to_collect(&discovered);
+        let selected = select_files_to_collect(discovered);
 
         assert_eq!(
             selected
@@ -398,7 +271,7 @@ mod tests {
             .map(|index| sandbox_file(&format!("file{index}.xml"), 9 * 1024 * 1024))
             .collect::<Vec<_>>();
 
-        let selected = select_files_to_collect(&discovered);
+        let selected = select_files_to_collect(discovered);
 
         assert_eq!(selected.len(), 5);
     }
@@ -409,7 +282,7 @@ mod tests {
             .map(|index| sandbox_file(&format!("file{index}.txt"), 100))
             .collect::<Vec<_>>();
 
-        let selected = select_files_to_collect(&discovered);
+        let selected = select_files_to_collect(discovered);
 
         assert_eq!(selected.len(), MAX_FILE_COUNT);
     }
@@ -430,7 +303,7 @@ mod tests {
             (".ai/plans/DRAFTING.md".to_string(), "drafting".to_string()),
             ("README.md".to_string(), "readme".to_string()),
         ]);
-        let sandbox = AssetMockSandbox::new(contents);
+        let sandbox = asset_sandbox(contents);
         let globs = workspace_globs(&[".ai/reports/*.md", ".ai/plans/????-??-??-*.md"]);
 
         let summary = collect_artifacts(&sandbox, stage_dir.path(), &globs)
@@ -452,7 +325,7 @@ mod tests {
     #[tokio::test]
     async fn collect_artifacts_preserves_content_metadata() {
         let stage_dir = tempfile::tempdir().unwrap();
-        let sandbox = AssetMockSandbox::new(HashMap::from([(
+        let sandbox = asset_sandbox(HashMap::from([(
             "test-results/r.xml".to_string(),
             "<test/>".to_string(),
         )]));
@@ -483,9 +356,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collect_artifacts_downloads_provider_resolved_paths() {
+        let stage_dir = tempfile::tempdir().unwrap();
+        let file = SandboxFile {
+            path:          "provider-object:report-1".to_string(),
+            relative_path: "test-results/r.xml".to_string(),
+            size:          7,
+        };
+        let sandbox = MockSandbox {
+            files: HashMap::from([(file.path.clone(), "<test/>".to_string())]),
+            ..MockSandbox::linux()
+        }
+        .with_walk_files(vec![file]);
+        let globs = workspace_globs(&["test-results/**"]);
+
+        let summary = collect_artifacts(&sandbox, stage_dir.path(), &globs)
+            .await
+            .unwrap();
+
+        assert_eq!(summary.files_copied, 1);
+        assert_eq!(summary.captured_assets[0].path, "test-results/r.xml");
+    }
+
+    #[tokio::test]
+    async fn collect_artifacts_rechecks_downloaded_file_size() {
+        let stage_dir = tempfile::tempdir().unwrap();
+        let content = "x".repeat(usize::try_from(MAX_FILE_SIZE + 1).unwrap());
+        let file = sandbox_file("test-results/grew.bin", 1);
+        let sandbox = MockSandbox {
+            files: HashMap::from([(file.path.clone(), content)]),
+            ..MockSandbox::linux()
+        }
+        .with_walk_files(vec![file]);
+        let globs = workspace_globs(&["test-results/**"]);
+
+        let summary = collect_artifacts(&sandbox, stage_dir.path(), &globs)
+            .await
+            .unwrap();
+
+        assert_eq!(summary.files_copied, 0);
+        assert_eq!(summary.files_skipped, 1);
+        assert!(summary.captured_assets.is_empty());
+        assert!(!stage_dir.path().join("test-results/grew.bin").exists());
+    }
+
+    #[tokio::test]
     async fn collect_artifacts_prunes_dependency_and_build_directories() {
         let stage_dir = tempfile::tempdir().unwrap();
-        let sandbox = AssetMockSandbox::new(HashMap::from([
+        let sandbox = asset_sandbox(HashMap::from([
             (".ai/reports/keep.md".to_string(), "keep".to_string()),
             ("target/report.md".to_string(), "target".to_string()),
             (
@@ -506,7 +424,7 @@ mod tests {
     #[tokio::test]
     async fn collect_artifacts_deduplicates_overlapping_patterns() {
         let stage_dir = tempfile::tempdir().unwrap();
-        let sandbox = AssetMockSandbox::new(HashMap::from([(
+        let sandbox = asset_sandbox(HashMap::from([(
             ".ai/reports/summary.md".to_string(),
             "summary".to_string(),
         )]));
@@ -523,7 +441,7 @@ mod tests {
     #[tokio::test]
     async fn collect_artifacts_reports_traversal_errors() {
         let stage_dir = tempfile::tempdir().unwrap();
-        let sandbox = AssetMockSandbox::new(HashMap::new()).with_walk_error("permission denied");
+        let sandbox = asset_sandbox(HashMap::new()).with_walk_files_error("permission denied");
         let globs = workspace_globs(&["test-results/**"]);
 
         let error = collect_artifacts(&sandbox, stage_dir.path(), &globs)
@@ -537,7 +455,7 @@ mod tests {
     #[tokio::test]
     async fn collect_artifacts_keeps_download_errors_non_fatal() {
         let stage_dir = tempfile::tempdir().unwrap();
-        let sandbox = AssetMockSandbox::new(HashMap::new()).with_discovered(vec![
+        let sandbox = asset_sandbox(HashMap::new()).with_walk_files(vec![
             sandbox_file("test-results/missing.xml", 100),
             sandbox_file("test-results/also-missing.xml", 200),
         ]);

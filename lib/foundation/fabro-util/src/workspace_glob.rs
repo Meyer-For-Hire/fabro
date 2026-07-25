@@ -14,7 +14,6 @@ const MATCH_OPTIONS: glob::MatchOptions = glob::MatchOptions {
 /// path segment; `**` crosses directory boundaries.
 #[derive(Clone, Debug)]
 pub struct WorkspaceGlob {
-    source:         String,
     pattern:        glob::Pattern,
     traversal_root: String,
 }
@@ -24,6 +23,11 @@ impl WorkspaceGlob {
         let source = strip_current_dir_prefix(source);
         if source.is_empty() {
             return Err(WorkspaceGlobError::Empty);
+        }
+        if source.contains('\\') {
+            return Err(WorkspaceGlobError::BackslashSeparator {
+                pattern: source.to_string(),
+            });
         }
         if is_absolute(source) {
             return Err(WorkspaceGlobError::Absolute {
@@ -43,15 +47,9 @@ impl WorkspaceGlob {
             })?;
 
         Ok(Self {
-            source: source.to_string(),
             pattern,
             traversal_root: literal_traversal_root(source),
         })
-    }
-
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.source
     }
 
     #[must_use]
@@ -137,6 +135,9 @@ pub enum WorkspaceGlobError {
     #[error("workspace glob cannot be empty")]
     Empty,
 
+    #[error("workspace glob must use '/' as its path separator: {pattern:?}")]
+    BackslashSeparator { pattern: String },
+
     #[error("workspace glob must be relative: {pattern:?}")]
     Absolute { pattern: String },
 
@@ -161,7 +162,6 @@ fn strip_current_dir_prefix(mut path: &str) -> &str {
 fn is_absolute(path: &str) -> bool {
     let bytes = path.as_bytes();
     path.starts_with('/')
-        || path.starts_with("//")
         || Path::new(path).is_absolute()
         || matches!(bytes, [drive, b':', ..] if drive.is_ascii_alphabetic())
 }
@@ -257,7 +257,6 @@ mod tests {
     fn workspace_glob_normalizes_a_leading_current_directory() {
         let glob = WorkspaceGlob::try_new("./src/*.rs").unwrap();
 
-        assert_eq!(glob.as_str(), "src/*.rs");
         assert!(glob.is_match("./src/lib.rs"));
         assert_eq!(glob.traversal_root(), "src");
     }
@@ -275,6 +274,14 @@ mod tests {
         assert!(matches!(
             WorkspaceGlob::try_new("C:/tmp/*.md"),
             Err(WorkspaceGlobError::Absolute { .. })
+        ));
+        assert!(matches!(
+            WorkspaceGlob::try_new(r"dir\*.rs"),
+            Err(WorkspaceGlobError::BackslashSeparator { .. })
+        ));
+        assert!(matches!(
+            WorkspaceGlob::try_new(r"\\server\share\*.md"),
+            Err(WorkspaceGlobError::BackslashSeparator { .. })
         ));
         assert!(matches!(
             WorkspaceGlob::try_new("../*.md"),

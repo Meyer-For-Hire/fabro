@@ -978,12 +978,7 @@ async fn walk_local_files(
     relative_start: &str,
     options: &WalkOptions,
 ) -> crate::Result<Vec<SandboxFile>> {
-    if relative_start.split('/').any(|segment| {
-        options
-            .excluded_directory_names
-            .iter()
-            .any(|name| name == segment)
-    }) {
+    if options.excludes_relative_path(relative_start) {
         return Ok(Vec::new());
     }
 
@@ -1029,12 +1024,10 @@ async fn walk_local_files(
             });
         } else if file_type.is_dir() {
             if path != base
-                && path.file_name().is_some_and(|file_name| {
-                    options
-                        .excluded_directory_names
-                        .iter()
-                        .any(|name| file_name == name.as_str())
-                })
+                && path
+                    .file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .is_some_and(|file_name| options.excludes_name(file_name))
             {
                 continue;
             }
@@ -1059,7 +1052,6 @@ async fn walk_local_files(
         }
     }
 
-    files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     Ok(files)
 }
 
@@ -1897,8 +1889,7 @@ mod tests {
         std::fs::write(dir.join("src/nested/readme.md"), "").unwrap();
 
         let env = LocalSandbox::new(dir.clone());
-        let mut results = env.glob("**/*.rs", None).await.unwrap();
-        results.sort();
+        let results = env.glob("**/*.rs", None).await.unwrap();
 
         assert_eq!(results, vec![
             dir.join("a.rs").to_string_lossy().into_owned(),
@@ -1986,13 +1977,15 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            files
-                .iter()
-                .map(|file| (file.relative_path.as_str(), file.size))
-                .collect::<Vec<_>>(),
-            vec![(".ai/reports/empty.md", 0), (".ai/reports/result.md", 6),]
-        );
+        let mut file_metadata = files
+            .iter()
+            .map(|file| (file.relative_path.as_str(), file.size))
+            .collect::<Vec<_>>();
+        file_metadata.sort_unstable();
+        assert_eq!(file_metadata, vec![
+            (".ai/reports/empty.md", 0),
+            (".ai/reports/result.md", 6),
+        ]);
         let root = dir.to_string_lossy();
         assert!(
             files

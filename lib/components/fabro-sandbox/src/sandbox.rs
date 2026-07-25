@@ -29,6 +29,10 @@ pub(crate) const BASH_PROBE_TIMEOUT_MS: u64 = 10_000;
 #[cfg(any(feature = "docker", feature = "daytona"))]
 pub(crate) const REMOTE_BASH: &str = "/bin/bash";
 
+/// Timeout for provider-neutral remote file traversal.
+#[cfg(any(feature = "docker", feature = "daytona"))]
+pub(crate) const REMOTE_WALK_TIMEOUT_MS: u64 = 30_000;
+
 /// Environment variable Bash consults for non-interactive startup source.
 ///
 /// Sandbox providers must remove or blank this before invoking `bash -c`;
@@ -925,6 +929,22 @@ pub struct WalkOptions {
     pub excluded_directory_names: Vec<String>,
 }
 
+impl WalkOptions {
+    #[must_use]
+    pub fn excludes_name(&self, name: &str) -> bool {
+        self.excluded_directory_names
+            .iter()
+            .any(|excluded| excluded == name)
+    }
+
+    #[must_use]
+    pub fn excludes_relative_path(&self, relative_path: &str) -> bool {
+        relative_path
+            .split('/')
+            .any(|segment| self.excludes_name(segment))
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct GrepOptions {
     pub glob_filter:      Option<String>,
@@ -1206,7 +1226,7 @@ pub(crate) fn resolve_path(path: &str, working_dir: &str) -> String {
     if std::path::Path::new(path).is_absolute() {
         path.to_string()
     } else {
-        format!("{working_dir}/{path}")
+        join_sandbox_path(working_dir, path)
     }
 }
 
@@ -1222,6 +1242,77 @@ pub(crate) fn join_sandbox_path(base: &str, relative_path: &str) -> String {
         return format!("/{relative_path}");
     }
     format!("{}/{relative_path}", base.trim_end_matches('/'))
+}
+
+#[cfg(any(feature = "docker", feature = "daytona"))]
+pub(crate) fn build_remote_walk_command(
+    base: &str,
+    relative_start: &str,
+    options: &WalkOptions,
+) -> String {
+    let traversal_root = join_sandbox_path(base, relative_start);
+    let quoted_root = shell_quote(&traversal_root);
+    let mut command = format!("if [ -e {quoted_root} ]");
+    let mut component_path = base.to_string();
+    for segment in relative_start
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+    {
+        component_path = join_sandbox_path(&component_path, segment);
+        let _ = write!(command, " && [ ! -L {} ]", shell_quote(&component_path));
+    }
+    let _ = write!(command, "; then find -H {quoted_root}");
+
+    if !options.excluded_directory_names.is_empty() {
+        command.push_str(" \\( -type d \\(");
+        for (index, directory_name) in options.excluded_directory_names.iter().enumerate() {
+            if index > 0 {
+                command.push_str(" -o");
+            }
+            let _ = write!(command, " -name {}", shell_quote(directory_name));
+        }
+        command.push_str(" \\) -prune \\) -o");
+    }
+
+    command.push_str(" -not -type l -type f -printf '%s\\0%P\\0'; fi");
+    command
+}
+
+#[cfg(any(feature = "docker", feature = "daytona"))]
+pub(crate) fn parse_remote_walk_output(
+    base: &str,
+    relative_start: &str,
+    output: &str,
+) -> crate::Result<Vec<SandboxFile>> {
+    let mut fields = output.split('\0');
+    let mut files = Vec::new();
+
+    while let Some(size) = fields.next() {
+        if size.is_empty() {
+            break;
+        }
+        let relative_to_start = fields.next().ok_or_else(|| {
+            crate::Error::message("Malformed recursive file traversal output: missing path")
+        })?;
+        let size = size.parse::<u64>().map_err(|error| {
+            crate::Error::context(
+                format!("Malformed recursive file traversal size {size:?}"),
+                error,
+            )
+        })?;
+        let relative_path = if relative_to_start.is_empty() {
+            relative_start.to_string()
+        } else {
+            join_sandbox_path(relative_start, relative_to_start)
+        };
+        files.push(SandboxFile {
+            path: join_sandbox_path(base, &relative_path),
+            relative_path,
+            size,
+        });
+    }
+
+    Ok(files)
 }
 
 /// Shell-quote a string using `shlex::try_quote`, with a fallback for edge

@@ -119,7 +119,7 @@ Finds files matching a glob pattern.
 
 Returns matching file paths, one per line, sorted lexicographically by their path relative to the search root.
 
-Patterns are case-sensitive and relative to `path`: `*` and `?` stay within one path segment, bracket expressions such as `[abc]` match one character, and `**` crosses directories when used as a complete segment. Leading dots are matched normally. For example, `*.rs` searches only the root of `path`, and `**/*.rs` searches recursively. Patterns must be relative and cannot contain a `..` segment.
+Patterns are case-sensitive and relative to `path`: `*` and `?` stay within one path segment, bracket expressions such as `[abc]` match one character, and `**` crosses directories when used as a complete segment. Leading dots are matched normally. For example, `*.rs` searches only the root of `path`, and `**/*.rs` searches recursively. Patterns must use `/`, be relative, and cannot contain a backslash or `..` segment.
 
 <Note>
 Unlike `grep`, `glob` does **not** mark files as read for the read-before-write guardrail. To modify a file found via glob, the agent must read it first.

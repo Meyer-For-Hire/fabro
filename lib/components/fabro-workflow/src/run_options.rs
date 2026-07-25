@@ -58,8 +58,8 @@ impl RunOptions {
         git_author_from_settings(&self.settings)
     }
 
-    pub fn artifact_globs(&self) -> Vec<String> {
-        self.settings.run.artifacts.include.clone()
+    pub fn artifact_glob_patterns(&self) -> &[String] {
+        &self.settings.run.artifacts.include
     }
 
     /// Run branch name from git checkpoint options, if set.

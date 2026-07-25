@@ -431,7 +431,7 @@ Artifact globs use `/` as the separator and have the same semantics in every san
 - Bracket expressions such as `[abc]` and `[!abc]` match one character.
 - `**` matches across directories when used as a complete segment.
 - Leading dots are matched normally.
-- Patterns are relative to the sandbox working directory and case-sensitive.
+- Patterns use `/`, are relative to the sandbox working directory, and are case-sensitive. Backslashes are invalid.
 - Absolute patterns and patterns containing a `..` segment are invalid.
 
 For example, `.ai/reports/*.md` matches direct Markdown children of `.ai/reports`, while `.ai/reports/**/*.md` also matches nested reports. `*.trace.zip` matches only the working-directory root; use `**/*.trace.zip` to match at any depth. To collect date-named implementation plans, use `.ai/plans/????-??-??-*.md`.

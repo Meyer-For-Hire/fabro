@@ -14,6 +14,7 @@ use fabro_types::{ArtifactUpload, EventBody, RunId, StageId};
 use fabro_util::error::collect_chain;
 use fabro_util::workspace_glob::{WorkspaceGlobError, WorkspaceGlobSet};
 use tokio::fs;
+use tokio::sync::OnceCell;
 use tokio::time::sleep;
 
 use crate::artifact::{normalize_durable_updates, offload_large_values, sync_artifacts_to_env};
@@ -45,6 +46,7 @@ pub(crate) struct ArtifactLifecycle {
     artifact_globs:     std::result::Result<WorkspaceGlobSet, WorkspaceGlobError>,
     pub artifact_sink:  Option<ArtifactSink>,
     captured_artifacts: std::sync::Mutex<HashSet<ArtifactIdentity>>,
+    ledger_initialized: OnceCell<()>,
     /// Run-scoped stage execution allocator shared with `RunServices`.
     stage_executions:   StageExecutionTracker,
 }
@@ -55,7 +57,7 @@ impl ArtifactLifecycle {
         run_store: RunStoreHandle,
         emitter: Arc<Emitter>,
         run_id: RunId,
-        artifact_globs: Vec<String>,
+        artifact_globs: &[String],
         artifact_sink: Option<ArtifactSink>,
         stage_executions: StageExecutionTracker,
     ) -> Self {
@@ -67,6 +69,7 @@ impl ArtifactLifecycle {
             artifact_globs: WorkspaceGlobSet::try_new(artifact_globs),
             artifact_sink,
             captured_artifacts: std::sync::Mutex::new(HashSet::new()),
+            ledger_initialized: OnceCell::new(),
             stage_executions,
         }
     }
@@ -81,19 +84,27 @@ impl ArtifactLifecycle {
 #[async_trait]
 impl RunLifecycle<WorkflowGraph> for ArtifactLifecycle {
     async fn on_run_start(&self, _graph: &WorkflowGraph, _state: &WfRunState) -> CoreResult<()> {
-        let _ = self.artifact_globs()?;
-        let ledger = self
-            .rebuild_captured_artifact_ledger()
-            .await
-            .map_err(|err| {
-                let rendered = collect_chain(err.as_ref()).join(": ");
-                CoreError::Other(format!(
-                    "failed to rebuild captured artifact ledger: {rendered}"
-                ))
-            })?;
-        *self.captured_artifacts.lock().expect(
-            "artifact mutex should not be poisoned: no code panics while holding this lock",
-        ) = ledger;
+        let artifact_globs = self.artifact_globs()?;
+        if artifact_globs.is_empty() {
+            return Ok(());
+        }
+        self.ledger_initialized
+            .get_or_try_init(|| async {
+                let ledger = self
+                    .rebuild_captured_artifact_ledger()
+                    .await
+                    .map_err(|err| {
+                        let rendered = collect_chain(err.as_ref()).join(": ");
+                        CoreError::Other(format!(
+                            "failed to rebuild captured artifact ledger: {rendered}"
+                        ))
+                    })?;
+                *self.captured_artifacts.lock().expect(
+                    "artifact mutex should not be poisoned: no code panics while holding this lock",
+                ) = ledger;
+                Ok::<(), CoreError>(())
+            })
+            .await?;
         Ok(())
     }
 

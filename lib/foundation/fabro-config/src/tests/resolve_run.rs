@@ -72,16 +72,31 @@ include = ["/tmp/*.md", "../reports/*.md", "src/[abc"]
     )
     .expect_err("invalid artifact workspace globs should not resolve");
 
-    let message = error.to_string();
-    assert!(
-        message.contains("run.artifacts.include[0]")
-            && message.contains("must be relative")
-            && message.contains("run.artifacts.include[1]")
-            && message.contains("parent directory")
-            && message.contains("run.artifacts.include[2]")
-            && message.contains("invalid workspace glob"),
-        "unexpected error: {message}"
+    let errors = match error {
+        crate::Error::Resolve { errors, .. } => errors,
+        other => panic!("expected structured resolve errors, got {other:#}"),
+    };
+    let invalid = errors
+        .into_iter()
+        .map(|error| match error {
+            crate::ResolveError::Invalid { path, reason } => (path, reason),
+            other => panic!("expected invalid-value error, got {other}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        invalid
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "run.artifacts.include[0]",
+            "run.artifacts.include[1]",
+            "run.artifacts.include[2]",
+        ]
     );
+    assert!(invalid[0].1.contains("must be relative"));
+    assert!(invalid[1].1.contains("parent directory"));
+    assert!(invalid[2].1.contains("invalid workspace glob"));
 }
 
 #[test]
