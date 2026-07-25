@@ -269,17 +269,7 @@ pub fn make_shell_tool_with_options(options: &NativeToolOptions) -> RegisteredTo
                     .unwrap_or(default_timeout)
                     .min(max_timeout);
 
-                let streaming = execute_shell_command(&ctx, command, timeout_ms, None).await?;
-
-                let text = render_shell_result(&streaming);
-                let is_success = streaming.result.is_success();
-                emit_shell_process_completed(&ctx, streaming).await;
-
-                if is_success {
-                    Ok(text)
-                } else {
-                    Err(text)
-                }
+                run_shell_command(&ctx, command, timeout_ms, None).await
             })
         }),
         source:     ToolSource::Native,
@@ -318,6 +308,22 @@ pub(crate) async fn execute_shell_command(
         )
         .await
         .map_err(|e| format!("{SHELL_NO_PROCESS_RESULT}: {}", e.display_with_causes()))
+}
+
+/// Execute a shell command, render its standard model-facing output, and emit
+/// the subordinate process result.
+pub(crate) async fn run_shell_command(
+    ctx: &ToolContext,
+    command: &str,
+    timeout_ms: u64,
+    cwd: Option<&str>,
+) -> Result<String, String> {
+    let streaming = execute_shell_command(ctx, command, timeout_ms, cwd).await?;
+    let text = render_shell_result(&streaming);
+    let is_success = streaming.result.is_success();
+    emit_shell_process_completed(ctx, streaming).await;
+
+    if is_success { Ok(text) } else { Err(text) }
 }
 
 /// Emit the subordinate process outcome after model-facing output has been
@@ -359,7 +365,7 @@ pub(crate) async fn emit_shell_process_completed(
 /// Renders the model-facing shell result: termination, exit code, duration,
 /// and provider-honest output sections. Metadata stays at the head and
 /// `stderr` at the tail so head/tail truncation preserves both.
-pub(crate) fn render_shell_result(streaming: &ExecStreamingResult) -> String {
+fn render_shell_result(streaming: &ExecStreamingResult) -> String {
     let result = &streaming.result;
     let mut output = format!(
         "Termination: {}\nExit code: {}\nDuration: {}ms\n",

@@ -15,15 +15,13 @@ use fabro_agent::profiles::{self, EmbeddedPrompt};
 use fabro_agent::tool_registry::ToolRegistry;
 use fabro_agent::{
     AgentEvent, AgentProfile, AgentProfileBuilder, Error as AgentError, Session, SessionEvent,
-    SessionOptions, WebFetchSummarizer,
+    SessionOptions,
 };
 use fabro_api::types::{
     CreateRunSessionRequest, PaginatedEventList, PaginationMeta, SubmitTurnRequest,
 };
 use fabro_llm::types::ToolDefinition;
-use fabro_model::{
-    AgentProfileKind, Catalog, ModelHandle, ModelSelectionError, ProviderId, catalog,
-};
+use fabro_model::{AgentProfileKind, Catalog, ModelSelectionError, ProviderId, catalog};
 use fabro_sandbox::reconnect::reconnect_for_run;
 use fabro_static::EnvVars;
 use fabro_store::{
@@ -733,17 +731,11 @@ async fn build_agent_session(
         .await
         .map_err(AskFabroBuildError::SandboxUnavailable)?;
     let sandbox: Arc<dyn fabro_agent::Sandbox> = Arc::from(sandbox);
-    let summarizer = WebFetchSummarizer {
-        client:   llm_result.client.clone(),
-        model_id: summarizer_model_id(&provider_id, profile_kind, &catalog, &model),
-    };
-    // No tool secrets: `AskFabroToolAccessPolicy` denies `web_search`, and both
-    // `tools()` and the prompt are filtered through that policy, so a Brave key
-    // here would only register a tool this session can never call.
+    // No optional web-tool dependencies: `AskFabroToolAccessPolicy` denies
+    // `web_search` and `web_fetch`, and both `tools()` and the prompt are
+    // filtered through that policy.
     let mut profile =
-        AgentProfileBuilder::new(profile_kind, provider_id, &model, Arc::clone(&catalog))
-            .with_web_fetch_summarizer(Some(summarizer))
-            .build();
+        AgentProfileBuilder::new(profile_kind, provider_id, &model, Arc::clone(&catalog)).build();
 
     // Give the Ask Fabro agent access to read-only run-inspection tools scoped
     // to its owning run. The session reaches the local HTTP API via a same-run
@@ -913,33 +905,6 @@ fn canonical_session_model(
 
 fn session_selection_error(error: &ModelSelectionError) -> ApiError {
     ApiError::bad_request(error.to_string())
-}
-
-fn summarizer_model_id(
-    provider_id: &ProviderId,
-    profile_kind: AgentProfileKind,
-    catalog: &Catalog,
-    selected_model: &str,
-) -> ModelHandle {
-    ModelHandle::ByName {
-        provider: provider_id.clone(),
-        model:    catalog
-            .default_for_provider(provider_id)
-            .map_or_else(
-                || match profile_kind {
-                    AgentProfileKind::Anthropic => "claude-haiku-4-5",
-                    // Kimi is reached through several providers, so there is
-                    // no fixed summarizer model to name; reuse the selected
-                    // one, as the OpenAI profile does.
-                    AgentProfileKind::OpenAi | AgentProfileKind::Kimi | AgentProfileKind::Gpt56 => {
-                        selected_model
-                    }
-                    AgentProfileKind::Gemini => "gemini-2.0-flash",
-                },
-                |model| model.id.as_str(),
-            )
-            .to_string(),
-    }
 }
 
 struct AskFabroToolAccessPolicy;

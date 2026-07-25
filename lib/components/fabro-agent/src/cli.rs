@@ -539,14 +539,18 @@ pub async fn run_with_args_and_client_and_catalog(
         provider_id.clone(),
         &model,
         Arc::clone(&catalog),
-    )
-    .with_web_fetch_summarizer(Some(build_summarizer(
-        &provider_id,
-        &model,
-        &catalog,
-        client.clone(),
-    )))
-    .with_tool_secrets(tool_secrets);
+    );
+    let profile_builder = if profile_kind == AgentProfileKind::Gpt56 {
+        profile_builder
+    } else {
+        profile_builder.with_web_fetch_summarizer(Some(build_summarizer(
+            &provider_id,
+            &model,
+            &catalog,
+            client.clone(),
+        )))
+    };
+    let profile_builder = profile_builder.with_tool_secrets(tool_secrets);
     let mut profile = profile_builder.build();
 
     // Build sandbox

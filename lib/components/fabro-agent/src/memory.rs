@@ -228,6 +228,23 @@ mod tests {
             files: files.clone(),
             ..Default::default()
         });
+        let gpt56_docs = discover_memory(
+            env.as_ref(),
+            "/repo",
+            "/repo",
+            AgentProfileKind::Gpt56,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(gpt56_docs.len(), 2);
+        assert_eq!(gpt56_docs[0].content, "agents");
+        assert_eq!(gpt56_docs[1].content, "copilot");
+
+        let env: Arc<dyn Sandbox> = Arc::new(MockSandbox {
+            files: files.clone(),
+            ..Default::default()
+        });
         let gemini_docs = discover_memory(
             env.as_ref(),
             "/repo",

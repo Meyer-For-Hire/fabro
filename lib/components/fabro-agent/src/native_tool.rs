@@ -9,7 +9,8 @@
 //!
 //! A [`NativeTool`] is an identity, not a name. The same tool is expressed
 //! under different names depending on the [`ToolVocabulary`] a profile speaks:
-//! fabro's own names by default, Kimi Code's names for the Kimi profile.
+//! fabro's own names by default, Kimi Code's names for the Kimi profile, and
+//! Codex's names for the GPT-5.6 profile.
 //! Permissions, categories, and telemetry resolve any name back to the
 //! identity, so behavior never depends on which vocabulary is in play.
 //!

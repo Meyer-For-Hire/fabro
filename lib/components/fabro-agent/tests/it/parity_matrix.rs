@@ -180,11 +180,8 @@ fn make_openai_compatible_twin_session(
         Catalog::from_builtin_with_overrides(&settings)
             .expect("OpenAI-compatible twin catalog should build"),
     );
-    let profile: Arc<dyn AgentProfile> = Arc::new(
-        OpenAiProfile::new(model)
-            .with_provider_id(provider)
-            .with_catalog(catalog),
-    );
+    let profile: Arc<dyn AgentProfile> =
+        Arc::new(OpenAiProfile::new(model).with_route(provider, catalog));
     let env = Arc::new(LocalSandbox::new(cwd.to_path_buf()));
     Session::new(client, profile, env, config, None)
 }

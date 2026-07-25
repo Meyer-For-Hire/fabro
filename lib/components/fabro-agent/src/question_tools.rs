@@ -471,6 +471,7 @@ fn format_anthropic_answers(answers: &[AgentQuestionAnswer]) -> Result<String, S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native_tool::ToolVocabulary;
 
     fn answered(
         original_id: Option<&str>,
@@ -584,6 +585,11 @@ mod tests {
         register_question_tools(AgentProfileKind::OpenAi, &mut openai);
         assert!(openai.get(OPENAI_REQUEST_USER_INPUT_TOOL).is_some());
         assert!(openai.get(ANTHROPIC_ASK_USER_QUESTION_TOOL).is_none());
+
+        let mut gpt56 = ToolRegistry::with_vocabulary(ToolVocabulary::Codex);
+        register_question_tools(AgentProfileKind::Gpt56, &mut gpt56);
+        assert!(gpt56.get(OPENAI_REQUEST_USER_INPUT_TOOL).is_some());
+        assert!(gpt56.get(ANTHROPIC_ASK_USER_QUESTION_TOOL).is_none());
 
         let mut anthropic = ToolRegistry::new();
         register_question_tools(AgentProfileKind::Anthropic, &mut anthropic);

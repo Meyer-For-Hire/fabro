@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use fabro_model::{AgentProfileKind, Catalog, ProviderId};
+use fabro_model::{AgentProfileKind, Catalog, CodecKind, ProviderId};
 
 pub mod anthropic;
 pub mod gemini;
@@ -17,12 +17,13 @@ pub use kimi::KimiProfile;
 pub use openai::OpenAiProfile;
 
 use crate::agent_profile::AgentProfile;
+use crate::apply_patch;
 use crate::config::{NativeToolOptions, ToolSecrets};
-use crate::native_tool::ToolVocabulary;
+use crate::native_tool::{NativeTool, ToolVocabulary};
 use crate::sandbox::Sandbox;
 use crate::skills::{Skill, format_skills_prompt_section};
 use crate::tool_registry::ToolRegistry;
-use crate::tools::WebFetchSummarizer;
+use crate::tools::{self, WebFetchSummarizer};
 
 /// Builds a provider profile and its native tools from one configuration.
 ///
@@ -64,9 +65,13 @@ impl AgentProfileBuilder {
         self
     }
 
+    /// Configure the optional `web_fetch` summarizer. Profiles without
+    /// `web_fetch` discard it instead of retaining an unused LLM client.
     #[must_use]
     pub fn with_web_fetch_summarizer(mut self, summarizer: Option<WebFetchSummarizer>) -> Self {
-        self.summarizer = summarizer;
+        if self.profile_kind != AgentProfileKind::Gpt56 {
+            self.summarizer = summarizer;
+        }
         self
     }
 
@@ -74,12 +79,15 @@ impl AgentProfileBuilder {
     pub fn build(&self) -> Box<dyn AgentProfile> {
         let model = self.model.as_str();
         let options = &self.native_tool_options;
-        let summarizer = self.summarizer.clone();
+        let summarizer = if self.profile_kind == AgentProfileKind::Gpt56 {
+            None
+        } else {
+            self.summarizer.clone()
+        };
         match self.profile_kind {
             AgentProfileKind::OpenAi => Box::new(
                 OpenAiProfile::with_native_tools(model, options, summarizer)
-                    .with_provider_id(self.provider_id.clone())
-                    .with_catalog(Arc::clone(&self.catalog)),
+                    .with_route(self.provider_id.clone(), Arc::clone(&self.catalog)),
             ),
             AgentProfileKind::Gemini => Box::new(
                 GeminiProfile::with_native_tools(model, options, summarizer)
@@ -97,10 +105,56 @@ impl AgentProfileBuilder {
                     .with_catalog(Arc::clone(&self.catalog)),
             ),
             AgentProfileKind::Gpt56 => Box::new(
-                Gpt56Profile::with_native_tools(model, options, summarizer)
-                    .with_provider_id(self.provider_id.clone())
-                    .with_catalog(Arc::clone(&self.catalog)),
+                Gpt56Profile::with_native_tools(model, options)
+                    .with_route(self.provider_id.clone(), Arc::clone(&self.catalog)),
             ),
+        }
+    }
+}
+
+/// Which file-editing tool a profile exposes.
+///
+/// `apply_patch` is a freeform grammar tool, and only the OpenAI Responses
+/// codec can carry one: the `openai_compatible` codec rejects custom tool
+/// definitions outright with a configuration error. A model reached through a
+/// gateway such as OpenRouter therefore has to be offered the JSON-schema
+/// `edit_file` instead, or every request it makes fails.
+///
+/// Shared by the profiles reachable over more than one codec so the rule
+/// cannot drift between them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, strum::IntoStaticStr)]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum FileEditToolKind {
+    ApplyPatch,
+    EditFile,
+}
+
+impl FileEditToolKind {
+    pub(crate) fn for_codec(codec: CodecKind) -> Self {
+        if codec == CodecKind::OpenAiResponses {
+            Self::ApplyPatch
+        } else {
+            Self::EditFile
+        }
+    }
+
+    fn native_tool(self) -> NativeTool {
+        match self {
+            Self::ApplyPatch => NativeTool::ApplyPatch,
+            Self::EditFile => NativeTool::EditFile,
+        }
+    }
+
+    fn registered_in(registry: &ToolRegistry) -> Option<Self> {
+        match (
+            registry
+                .get_native(Self::ApplyPatch.native_tool())
+                .is_some(),
+            registry.get_native(Self::EditFile.native_tool()).is_some(),
+        ) {
+            (true, false) => Some(Self::ApplyPatch),
+            (false, true) => Some(Self::EditFile),
+            (false, false) | (true, true) => None,
         }
     }
 }
@@ -115,6 +169,53 @@ pub struct BaseProfile {
     pub model:        String,
     pub catalog:      Option<Arc<Catalog>>,
     pub registry:     ToolRegistry,
+}
+
+impl BaseProfile {
+    fn set_route(&mut self, provider_id: ProviderId, catalog: Arc<Catalog>) {
+        self.provider_id = provider_id;
+        self.catalog = Some(catalog);
+    }
+
+    fn provider_display_name(&self) -> String {
+        self.catalog
+            .as_ref()
+            .and_then(|catalog| catalog.provider(&self.provider_id))
+            .map_or_else(
+                || self.provider_id.display_name(),
+                |provider| provider.display_name.clone(),
+            )
+    }
+
+    fn file_edit_tool(&self) -> Option<FileEditToolKind> {
+        FileEditToolKind::registered_in(&self.registry)
+    }
+
+    /// Select the file editor supported by this route's wire codec.
+    ///
+    /// Returns the newly selected editor when the registry changed.
+    fn configure_file_edit_tool(&mut self) -> Option<FileEditToolKind> {
+        let codec = self
+            .catalog
+            .as_ref()?
+            .effective_codec(&self.provider_id, Some(&self.model))?;
+        let desired = FileEditToolKind::for_codec(codec);
+        if self.file_edit_tool() == Some(desired) {
+            return None;
+        }
+
+        self.registry.unregister_native(NativeTool::ApplyPatch);
+        self.registry.unregister_native(NativeTool::EditFile);
+        match desired {
+            FileEditToolKind::ApplyPatch => {
+                self.registry.register(apply_patch::make_apply_patch_tool());
+            }
+            FileEditToolKind::EditFile => {
+                self.registry.register(tools::make_edit_file_tool());
+            }
+        }
+        Some(desired)
+    }
 }
 
 /// Additional context for building environment blocks
@@ -272,6 +373,7 @@ pub fn build_env_context_block_with(env: &dyn Sandbox, ctx: &EnvContext) -> Stri
 #[cfg(test)]
 mod tests {
     use fabro_llm::types::ToolDefinition;
+    use fabro_model::catalog::LlmCatalogSettings;
 
     use super::*;
     use crate::subagent::{SessionFactory, SubAgentSupervisor};
@@ -321,14 +423,27 @@ mod tests {
 
     fn gpt56_profile(has_web_search: bool) -> Gpt56Profile {
         let options = native_tool_options(AgentProfileKind::Gpt56, has_web_search);
-        Gpt56Profile::with_native_tools("gpt-5.6-sol", &options, None)
+        Gpt56Profile::with_native_tools("gpt-5.6-sol", &options)
+    }
+
+    /// GPT-5.6 through an OpenAI-compatible gateway, where `apply_patch`
+    /// cannot be carried and `edit_file` takes its place.
+    fn gpt56_edit_file_profile(has_web_search: bool) -> Gpt56Profile {
+        let options = native_tool_options(AgentProfileKind::Gpt56, has_web_search);
+        let overrides: LlmCatalogSettings =
+            toml::from_str("[providers.openrouter]\nenabled = true\n").unwrap();
+        Gpt56Profile::with_native_tools("gpt-5.6-sol", &options).with_route(
+            ProviderId::new("openrouter"),
+            Arc::new(Catalog::from_builtin_with_overrides(&overrides).unwrap()),
+        )
     }
 
     fn openai_edit_file_profile(has_web_search: bool) -> OpenAiProfile {
         let options = native_tool_options(AgentProfileKind::OpenAi, has_web_search);
-        OpenAiProfile::with_native_tools("kimi-k2.5", &options, None)
-            .with_provider_id(ProviderId::new("kimi"))
-            .with_catalog(Arc::new(Catalog::from_builtin().unwrap()))
+        OpenAiProfile::with_native_tools("kimi-k2.5", &options, None).with_route(
+            ProviderId::new("kimi"),
+            Arc::new(Catalog::from_builtin().unwrap()),
+        )
     }
 
     /// Profiles using fabro's native tool vocabulary get the same `shell`
@@ -529,6 +644,23 @@ mod tests {
     }
 
     #[test]
+    fn profile_builder_selects_a_codec_compatible_gpt56_editor() {
+        let overrides: LlmCatalogSettings =
+            toml::from_str("[providers.openrouter]\nenabled = true\n").unwrap();
+        let catalog = Arc::new(Catalog::from_builtin_with_overrides(&overrides).unwrap());
+        let profile = AgentProfileBuilder::new(
+            AgentProfileKind::Gpt56,
+            ProviderId::new("openrouter"),
+            "gpt-5.6-sol",
+            catalog,
+        )
+        .build();
+
+        assert!(profile.tool_registry().get("edit_file").is_some());
+        assert!(profile.tool_registry().get("apply_patch").is_none());
+    }
+
+    #[test]
     fn anthropic_default_prompt_snapshot() {
         insta::assert_snapshot!(system_prompt(&anthropic_profile(false, false)));
     }
@@ -576,6 +708,16 @@ mod tests {
     #[test]
     fn gpt56_web_search_prompt_snapshot() {
         insta::assert_snapshot!(system_prompt(&gpt56_profile(true)));
+    }
+
+    #[test]
+    fn gpt56_edit_file_prompt_snapshot() {
+        insta::assert_snapshot!(system_prompt(&gpt56_edit_file_profile(false)));
+    }
+
+    #[test]
+    fn gpt56_edit_file_and_web_search_prompt_snapshot() {
+        insta::assert_snapshot!(system_prompt(&gpt56_edit_file_profile(true)));
     }
 
     #[test]

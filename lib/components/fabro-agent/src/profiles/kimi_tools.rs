@@ -40,8 +40,8 @@ const MAX_GREP_MATCHES_SCANNED: usize = 20_000;
 
 fn definition(tool: NativeTool, description: &str, parameters: Value) -> ToolDefinition {
     ToolDefinition {
-        // Registered under the canonical name; the registry's vocabulary
-        // renames it on the way in.
+        // Supply the canonical identity; registry insertion rewrites the
+        // stored and wire name for the active vocabulary.
         name: tool.canonical_name().to_string(),
         description: description.to_string(),
         parameters,
