@@ -396,7 +396,11 @@ pub(crate) fn resolve_mcp_entry(name: &str, entry: &McpEntryLayer) -> McpServerS
             env,
             ..
         } => McpTransport::Stdio {
-            command: resolve_mcp_command(script.as_ref(), command.as_ref()),
+            command: resolve_mcp_command(
+                script.as_ref(),
+                command.as_ref(),
+                ScriptInterpreter::HostShell,
+            ),
             env:     env
                 .iter()
                 .map(|(key, value)| (key.clone(), value.as_source()))
@@ -424,7 +428,11 @@ pub(crate) fn resolve_mcp_entry(name: &str, entry: &McpEntryLayer) -> McpServerS
             ..
         } => McpTransport::Sandbox {
             protocol: *protocol,
-            command:  resolve_mcp_command(script.as_ref(), command.as_ref()),
+            command:  resolve_mcp_command(
+                script.as_ref(),
+                command.as_ref(),
+                ScriptInterpreter::SandboxBash,
+            ),
             port:     *port,
             env:      env
                 .iter()
@@ -479,13 +487,31 @@ pub(crate) fn resolve_mcp_entry(name: &str, entry: &McpEntryLayer) -> McpServerS
 fn resolve_mcp_command(
     script: Option<&InterpString>,
     command: Option<&Vec<InterpString>>,
+    interpreter: ScriptInterpreter,
 ) -> Vec<String> {
     if let Some(script) = script {
-        return vec!["sh".to_string(), "-c".to_string(), script.as_source()];
+        let executable: &'static str = interpreter.into();
+        return vec![executable.to_string(), "-c".to_string(), script.as_source()];
     }
     command
         .map(|command| command.iter().map(InterpString::as_source).collect())
         .unwrap_or_default()
+}
+
+/// Which interpreter evaluates an MCP `script`.
+///
+/// The two transports run in different places, so they keep different
+/// contracts: a stdio script runs on the host outside the sandbox API, while a
+/// sandbox script is evaluated by the sandbox's Bash.
+#[derive(Clone, Copy, strum::IntoStaticStr)]
+enum ScriptInterpreter {
+    /// Host shell, unchanged for `type = "stdio"` servers.
+    #[strum(serialize = "sh")]
+    HostShell,
+    /// The sandbox's non-login Bash. Resolved through `PATH` rather than
+    /// spelled `/bin/bash` so local sandboxes keep working on NixOS.
+    #[strum(serialize = "bash")]
+    SandboxBash,
 }
 
 fn resolve_hook(hook: &HookEntry, index: usize, errors: &mut Vec<ResolveError>) -> HookDefinition {

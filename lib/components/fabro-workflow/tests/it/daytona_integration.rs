@@ -28,6 +28,7 @@ use fabro_sandbox::daytona::{DaytonaConfig, DaytonaSandbox};
 use fabro_static::EnvVars;
 use fabro_store::{ArtifactKey, ArtifactStore, Database};
 use fabro_types::{RunId, StageId, WorkflowSettings};
+use fabro_util::shell;
 use fabro_workflow::artifact::sync_artifacts_to_env;
 use fabro_workflow::context::Context;
 use fabro_workflow::error::Error;
@@ -1794,10 +1795,12 @@ async fn daytona_playwright_mcp_sandbox_transport() {
             ..
         } => {
             let (url, headers) = {
-                let cmd_str = command.join(" ");
+                let cmd_str = shell::shell_join(command);
+                let inner =
+                    format!("{cmd_str} > /tmp/mcp_server_stdout.log 2>/tmp/mcp_server_stderr.log");
                 let launch_script = format!(
-                    "setsid sh -c '{cmd_str} > /tmp/mcp_server_stdout.log 2>/tmp/mcp_server_stderr.log' \
-                     </dev/null >/dev/null 2>&1 &\necho $!"
+                    "setsid \"$BASH\" -c {} </dev/null >/dev/null 2>&1 &\necho $!",
+                    shell::shell_quote(&inner)
                 );
                 let launch_result = sandbox
                     .exec_command(&launch_script, 30_000, None, None, None)

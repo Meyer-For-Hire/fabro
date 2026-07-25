@@ -26,11 +26,18 @@ use tokio_util::sync::CancellationToken;
 
 use crate::clone_source::{self, CloneDecision, EmptyWorkspaceReason};
 use crate::redact::redact_auth_url;
-use crate::sandbox::{RefreshOutcome, optional_timeout, resolve_path};
+use crate::sandbox::{
+    BASH_ENV_VAR, BASH_PROBE_SCRIPT, BASH_PROBE_TIMEOUT_MS, REMOTE_BASH, RefreshOutcome,
+    optional_timeout, resolve_path, validate_bash_probe,
+};
 use crate::{
     CommandOutputCallback, DirEntry, ExecResult, ExecStreamingResult, GrepOptions, Sandbox,
     SandboxEvent, SandboxEventCallback, StdioProcess, glob_match, managed_labels, shell_quote,
 };
+
+/// Remediation shown when a Daytona sandbox has no usable Bash.
+const DAYTONA_BASH_REMEDIATION: &str = "Daytona sandboxes require /bin/bash for every command, with no `sh` fallback. Use the \
+     built-in Daytona snapshot, or a custom snapshot whose Dockerfile installs bash.";
 
 pub(crate) const WORKING_DIRECTORY: &str = "/home/daytona/workspace";
 pub(crate) const REPOS_ROOT: &str = "/home/daytona/repos";
@@ -486,6 +493,66 @@ impl DaytonaSandbox {
         resolve_path(path, self.working_directory())
     }
 
+    /// Verify a Daytona sandbox evaluates commands as non-login Bash.
+    ///
+    /// Runs on a freshly created sandbox before any Fabro-owned setup, and
+    /// again after a reconnected sandbox starts, so a snapshot without Bash
+    /// fails at the lifecycle boundary rather than on some later command.
+    async fn probe_bash(sandbox: &daytona_sdk::Sandbox) -> crate::Result<()> {
+        let start = Instant::now();
+        let execution = time::timeout(Duration::from_millis(BASH_PROBE_TIMEOUT_MS), async {
+            let process_svc = sandbox
+                .process()
+                .await
+                .map_err(|e| crate::Error::context("Failed to get Daytona process service", e))?;
+            let result = process_svc
+                .execute_command(
+                    &wrap_bash_command(BASH_PROBE_SCRIPT),
+                    daytona_sdk::ExecuteCommandOptions {
+                        cwd: Some("/".to_string()),
+                        timeout: Some(Duration::from_millis(BASH_PROBE_TIMEOUT_MS)),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|e| crate::Error::context("Failed to run Daytona Bash check", e))?;
+            Ok(ExecResult {
+                stdout:      result.result,
+                stderr:      String::new(),
+                exit_code:   Some(result.exit_code),
+                termination: CommandTermination::Exited,
+                duration_ms: elapsed_ms(start),
+            })
+        })
+        .await;
+        let execution = match execution {
+            Ok(result) => result,
+            Err(_) => Err(crate::Error::message(format!(
+                "Daytona Bash check timed out after {BASH_PROBE_TIMEOUT_MS}ms"
+            ))),
+        };
+
+        daytona_bash_probe_outcome(execution)
+    }
+
+    /// Discard a sandbox that failed its Bash probe.
+    ///
+    /// A failed cleanup is logged rather than returned: the Bash failure is
+    /// what the operator needs to act on.
+    async fn delete_unusable_sandbox(
+        sandbox: &daytona_sdk::Sandbox,
+        bash_error: crate::Error,
+    ) -> crate::Error {
+        if let Err(cleanup_error) = sandbox.delete().await {
+            tracing::warn!(
+                error = %cleanup_error,
+                sandbox = %sandbox.name,
+                "Failed to delete Daytona sandbox after its Bash check failed"
+            );
+        }
+        bash_error
+    }
+
     /// Get the sandbox, returning an error if not yet initialized.
     fn sandbox(&self) -> crate::Result<&daytona_sdk::Sandbox> {
         self.sandbox.get().ok_or_else(|| {
@@ -575,6 +642,7 @@ impl DaytonaSandbox {
         };
         daytona_sdk::SandboxBaseParams {
             name: Some(name),
+            env_vars: Some(clean_bash_env(None)),
             auto_stop_interval: self.config.auto_stop_interval,
             labels: Some(managed_labels::merge_for_run(
                 self.config.labels.as_ref(),
@@ -862,6 +930,11 @@ impl Sandbox for DaytonaSandbox {
                     crate::Error::context("Failed to create Daytona sandbox", e),
                 )
             })?;
+
+        if let Err(bash_error) = Self::probe_bash(&sandbox).await {
+            let err = Self::delete_unusable_sandbox(&sandbox, bash_error).await;
+            return Err(self.fail_init(init_start, err));
+        }
 
         let clone_decision = clone_source::decide_clone(
             self.config.skip_clone,
@@ -1191,6 +1264,14 @@ impl Sandbox for DaytonaSandbox {
         let sandbox = self.sandbox()?;
         if let Err(e) = self.client.start(&sandbox.name).await {
             let err = crate::Error::context("Failed to start Daytona sandbox", e);
+            self.emit(SandboxEvent::StartFailed {
+                provider: "daytona".into(),
+                error:    err.to_string(),
+                causes:   err.causes(),
+            });
+            return Err(err);
+        }
+        if let Err(err) = Self::probe_bash(sandbox).await {
             self.emit(SandboxEvent::StartFailed {
                 provider: "daytona".into(),
                 error:    err.to_string(),
@@ -1547,9 +1628,10 @@ impl Sandbox for DaytonaSandbox {
             "exec_command: process service acquired, starting select"
         );
 
+        let clean_env = clean_bash_env(env_vars);
         let options = daytona_sdk::ExecuteCommandOptions {
             cwd:     Some(cwd),
-            env:     env_vars.cloned(),
+            env:     Some(clean_env.clone()),
             timeout: Some(std::time::Duration::from_millis(timeout_ms)),
         };
 
@@ -1557,19 +1639,7 @@ impl Sandbox for DaytonaSandbox {
         // process the `envs` field (not in its OpenAPI spec), so we also
         // prepend `export` statements as a fallback until server support
         // lands. The SDK sends `envs` too for forward compatibility.
-        let command_with_env = if let Some(vars) = env_vars {
-            if vars.is_empty() {
-                command.to_string()
-            } else {
-                let exports: Vec<String> = vars
-                    .iter()
-                    .map(|(k, v)| format!("export {}={}", shell_quote(k), shell_quote(v)))
-                    .collect();
-                format!("{}\n{}", exports.join("\n"), command)
-            }
-        } else {
-            command.to_string()
-        };
+        let command_with_env = format!("{}\n{command}", bash_export_lines(&clean_env).join("\n"));
 
         // Wrap with `bash -c` so pipes, env vars, and shell features work.
         // The Daytona API uses direct exec, not a shell.
@@ -1648,7 +1718,8 @@ impl Sandbox for DaytonaSandbox {
 
         let mut session = DaytonaSession::create(sandbox).await?;
 
-        let session_command = build_session_command(command, &cwd, env_vars);
+        let session_command =
+            wrap_bash_session_script(&build_bash_session_script(command, &cwd, env_vars));
         let session_exec = match session.execute(&session_command, true, true).await {
             Ok(result) => result,
             Err(err) => {
@@ -2223,29 +2294,49 @@ fn missing_log_suffix_offset(seen: &[u8], final_bytes: &[u8]) -> usize {
     0
 }
 
-fn build_session_command(
+/// Override caller or snapshot startup-file injection for a Bash process.
+fn clean_bash_env(env_vars: Option<&HashMap<String, String>>) -> HashMap<String, String> {
+    let mut clean = env_vars.cloned().unwrap_or_default();
+    clean.insert(BASH_ENV_VAR.to_string(), String::new());
+    clean
+}
+
+fn bash_export_lines(env_vars: &HashMap<String, String>) -> Vec<String> {
+    let mut entries: Vec<_> = env_vars.iter().collect();
+    entries.sort_by_key(|(key, _)| *key);
+    entries
+        .into_iter()
+        .map(|(key, value)| format!("export {}={}", shell_quote(key), shell_quote(value)))
+        .collect()
+}
+
+/// Build the inner Bash script a session command evaluates.
+///
+/// The result is Bash source, not something Daytona can exec directly — it is
+/// passed through [`wrap_bash_session_script`] before reaching the toolbox.
+fn build_bash_session_script(
     command: &str,
     cwd: &str,
     env_vars: Option<&HashMap<String, String>>,
 ) -> String {
     let mut lines = vec![format!("cd {} || exit $?", shell_quote(cwd))];
-
-    if let Some(vars) = env_vars {
-        let mut entries: Vec<_> = vars.iter().collect();
-        entries.sort_by_key(|(key, _)| *key);
-        for (key, value) in entries {
-            lines.push(format!(
-                "export {}={}",
-                shell_quote(key),
-                shell_quote(value)
-            ));
-        }
-    }
+    lines.extend(bash_export_lines(&clean_bash_env(env_vars)));
 
     lines.push("(".to_string());
     lines.push(command.to_string());
     lines.push(")".to_string());
     lines.join("\n")
+}
+
+/// Interpret the outcome of a Daytona Bash probe execution.
+///
+/// A failure to run the probe at all, a nonzero exit, and a zero exit without
+/// the marker are all probe failures, and all carry the snapshot remediation.
+fn daytona_bash_probe_outcome(execution: crate::Result<ExecResult>) -> crate::Result<()> {
+    match execution {
+        Err(err) => Err(crate::Error::context(DAYTONA_BASH_REMEDIATION, err)),
+        Ok(result) => validate_bash_probe(result, DAYTONA_BASH_REMEDIATION),
+    }
 }
 
 fn daytona_symlink_command(layout: &clone_source::GitHubRepoLayout) -> String {
@@ -2256,18 +2347,32 @@ fn daytona_symlink_command(layout: &clone_source::GitHubRepoLayout) -> String {
     )
 }
 
-/// Wrap a command string with `bash -c '...'`, escaping single quotes.
+/// Wrap Bash source in the canonical non-login Bash transport.
 ///
 /// The Daytona API uses direct exec (not a shell), so pipes, env vars,
-/// semicolons, etc. won't work without this wrapper.
+/// semicolons, etc. won't work without this wrapper. Every path that sends a
+/// caller-supplied or Fabro-built command to Daytona goes through here, so
+/// there is exactly one interpreter on both sides of the transport.
 ///
 /// Uses base64 encoding (matching the TypeScript/Python/Ruby Daytona SDKs)
-/// to avoid shell escaping issues with quotes and special characters.
+/// to avoid shell escaping issues with quotes and special characters. The
+/// pipeline's exit status is the inner Bash's, so command exit codes survive
+/// the transport.
 fn wrap_bash_command(command: &str) -> String {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
     let encoded = STANDARD.encode(command);
-    format!("sh -c \"echo '{encoded}' | base64 -d | sh\"")
+    format!("{REMOTE_BASH} -c \"echo '{encoded}' | base64 -d | {REMOTE_BASH}\"")
+}
+
+/// Enter the canonical Bash interpreter from a Daytona streaming session.
+///
+/// Session commands already pass through the provider's shell parser, so an
+/// audited shell-quoted argument avoids the direct-exec path's base64 process
+/// and second Bash while keeping caller source inert until `/bin/bash -c`
+/// evaluates it.
+fn wrap_bash_session_script(script: &str) -> String {
+    format!("exec {REMOTE_BASH} -c {}", shell_quote(script))
 }
 
 #[cfg(test)]
@@ -2278,6 +2383,7 @@ mod tests {
     use httpmock::MockServer;
 
     use super::*;
+    use crate::sandbox::BASH_PROBE_MARKER;
 
     fn api_key_body(permissions: &[&str]) -> serde_json::Value {
         serde_json::json!({
@@ -2520,6 +2626,10 @@ mod tests {
         assert_eq!(params.ephemeral, Some(false));
         assert_eq!(params.auto_delete_interval, Some(-1));
         assert_eq!(
+            params.env_vars,
+            Some(HashMap::from([(BASH_ENV_VAR.to_string(), String::new())]))
+        );
+        assert_eq!(
             params.labels,
             Some(HashMap::from([(
                 managed_labels::MANAGED_LABEL.to_string(),
@@ -2759,17 +2869,37 @@ mod tests {
         auth.assert_async().await;
     }
 
+    /// Recover the inner command a wrapper carries, proving it survives the
+    /// base64 transport byte-for-byte.
+    fn decode_wrapped_command(wrapped: &str) -> String {
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD;
+
+        let prefix = "/bin/bash -c \"echo '";
+        let suffix = "' | base64 -d | /bin/bash\"";
+        let encoded = wrapped
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix(suffix))
+            .unwrap_or_else(|| panic!("wrapper should have the canonical bash shape: {wrapped}"));
+        String::from_utf8(
+            STANDARD
+                .decode(encoded)
+                .expect("wrapper payload should be base64"),
+        )
+        .expect("wrapper payload should be UTF-8")
+    }
+
     #[test]
-    fn wrap_bash_uses_base64_encoding() {
+    fn wrap_bash_uses_bash_on_both_sides_of_the_transport() {
         let wrapped = wrap_bash_command("echo hello");
-        // Should use base64 pipe to sh
+
         assert!(
-            wrapped.starts_with("sh -c \"echo '"),
-            "should start with sh -c wrapper"
+            wrapped.starts_with("/bin/bash -c \"echo '"),
+            "should start with a non-login /bin/bash wrapper: {wrapped}"
         );
         assert!(
-            wrapped.ends_with("' | base64 -d | sh\""),
-            "should end with base64 -d | sh"
+            wrapped.ends_with("' | base64 -d | /bin/bash\""),
+            "should pipe the decoded payload into /bin/bash: {wrapped}"
         );
         // The base64 of "echo hello" is "ZWNobyBoZWxsbw=="
         assert!(
@@ -2779,12 +2909,47 @@ mod tests {
     }
 
     #[test]
+    fn wrap_bash_never_names_sh_as_an_interpreter() {
+        for command in ["echo hello", "ls | grep foo", "sh -c 'echo explicit'"] {
+            let wrapped = wrap_bash_command(command);
+            let transport = wrapped
+                .strip_suffix('"')
+                .and_then(|rest| rest.split_once("| base64 -d | "))
+                .map(|(_, interpreter)| interpreter)
+                .expect("wrapper should end with its inner interpreter");
+
+            assert_eq!(transport, "/bin/bash", "inner interpreter for {command:?}");
+            assert!(
+                !wrapped.starts_with("sh ") && !wrapped.starts_with("/bin/sh"),
+                "outer interpreter for {command:?} should not be sh: {wrapped}"
+            );
+        }
+    }
+
+    #[test]
+    fn wrap_bash_passes_arbitrary_text_through_unchanged() {
+        for command in [
+            "echo 'hello world'",
+            "printf '%s\\n' \"quoted\"",
+            "ls | grep foo",
+            "echo line1\necho line2",
+            "echo \"it's mixed 'quotes'\"",
+        ] {
+            assert_eq!(
+                decode_wrapped_command(&wrap_bash_command(command)),
+                command,
+                "inner command should reach bash unchanged"
+            );
+        }
+    }
+
+    #[test]
     fn wrap_bash_handles_single_quotes_safely() {
         // Single quotes in the original command are safely encoded in base64
         let wrapped = wrap_bash_command("echo 'hello world'");
         assert!(
-            wrapped.starts_with("sh -c \"echo '"),
-            "should use sh -c wrapper"
+            wrapped.starts_with("/bin/bash -c \"echo '"),
+            "should use the /bin/bash wrapper"
         );
         // No raw single quotes from the original command should appear in the base64
         assert!(
@@ -2794,36 +2959,83 @@ mod tests {
     }
 
     #[test]
-    fn wrap_bash_handles_pipes() {
-        let wrapped = wrap_bash_command("ls | grep foo");
-        assert!(
-            wrapped.starts_with("sh -c \"echo '"),
-            "should use sh -c wrapper"
-        );
-        assert!(
-            wrapped.ends_with("' | base64 -d | sh\""),
-            "should end with base64 -d | sh"
-        );
-    }
-
-    #[test]
-    fn build_session_command_adds_cwd_and_sorted_exports() {
+    fn build_bash_session_script_adds_cwd_and_sorted_exports() {
         let env = HashMap::from([
             ("BETA".to_string(), "two words".to_string()),
             ("ALPHA".to_string(), "one".to_string()),
+            (
+                BASH_ENV_VAR.to_string(),
+                "/tmp/untrusted-startup".to_string(),
+            ),
         ]);
 
-        let command = build_session_command("echo $ALPHA $BETA", "/tmp/with space", Some(&env));
+        let command = build_bash_session_script("echo $ALPHA $BETA", "/tmp/with space", Some(&env));
 
         assert_eq!(
             command,
             "cd '/tmp/with space' || exit $?\n\
              export ALPHA=one\n\
+             export BASH_ENV=''\n\
              export BETA='two words'\n\
              (\n\
              echo $ALPHA $BETA\n\
              )"
         );
+    }
+
+    #[test]
+    fn streaming_session_script_reaches_bash_through_the_canonical_wrapper() {
+        let script = build_bash_session_script("[[ -d / ]] && echo ok", "/tmp", None);
+        let wrapped = wrap_bash_session_script(&script);
+
+        assert_eq!(
+            wrapped,
+            format!("exec /bin/bash -c {}", shell_quote(&script)),
+            "the streaming path must enter the canonical Bash exactly once"
+        );
+        assert!(!wrapped.contains("base64"));
+    }
+
+    fn bash_probe_result(exit_code: i32, stdout: impl Into<String>) -> ExecResult {
+        ExecResult {
+            stdout:      stdout.into(),
+            stderr:      String::new(),
+            exit_code:   Some(exit_code),
+            termination: CommandTermination::Exited,
+            duration_ms: 1,
+        }
+    }
+
+    #[test]
+    fn bash_probe_outcome_accepts_a_marked_zero_exit() {
+        assert!(
+            daytona_bash_probe_outcome(Ok(bash_probe_result(0, format!("{BASH_PROBE_MARKER}\n"))))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn bash_probe_outcome_rejects_failures_with_snapshot_remediation() {
+        let failures = [
+            Err(crate::Error::message("connection reset")),
+            Ok(bash_probe_result(1, "bash: not found")),
+            Ok(bash_probe_result(0, "ready")),
+        ];
+
+        for failure in failures {
+            let err = daytona_bash_probe_outcome(failure)
+                .expect_err("probe should fail")
+                .display_with_causes();
+
+            assert!(
+                err.contains("/bin/bash") && err.contains("snapshot"),
+                "probe failure should carry the Daytona snapshot remediation: {err}"
+            );
+            assert!(
+                !err.contains("bash: not found"),
+                "raw process output must not enter lifecycle errors: {err}"
+            );
+        }
     }
 
     #[test]

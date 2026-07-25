@@ -1108,6 +1108,101 @@ mod run_agent_mcps {
         })])
     }
 
+    fn sandbox_command(entry: &ResolvedMcpEntry) -> &[String] {
+        let server = entry.as_resolved().expect("expected resolved inline entry");
+        match &server.transport {
+            McpTransport::Sandbox { command, .. } => command,
+            other => panic!("expected sandbox transport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn script_interpreter_differs_between_stdio_and_sandbox_transports() {
+        // A stdio script runs on the host, outside the sandbox API, and keeps
+        // its documented `sh -c` contract. A sandbox script is evaluated by the
+        // sandbox's Bash, and uses the PATH-resolved `bash` token so local
+        // sandboxes keep working on NixOS.
+        let mcps = super::workflow_settings_from_toml(
+            r#"
+_version = 1
+
+[run.agent.mcps.host]
+type = "stdio"
+script = "exec my-server --stdio"
+
+[run.agent.mcps.inside]
+type = "sandbox"
+script = "exec my-server --port 3100"
+port = 3100
+"#,
+        )
+        .expect("settings should resolve")
+        .run
+        .agent
+        .mcps;
+
+        assert_eq!(stdio_command(&mcps["host"]), &[
+            "sh".to_string(),
+            "-c".to_string(),
+            "exec my-server --stdio".to_string(),
+        ]);
+        assert_eq!(sandbox_command(&mcps["inside"]), &[
+            "bash".to_string(),
+            "-c".to_string(),
+            "exec my-server --port 3100".to_string(),
+        ]);
+    }
+
+    #[test]
+    fn argv_commands_are_unchanged_by_the_script_interpreter() {
+        let mcps = super::workflow_settings_from_toml(
+            r#"
+_version = 1
+
+[run.agent.mcps.inside]
+type = "sandbox"
+command = ["npx", "@playwright/mcp@latest", "--port", "3100"]
+port = 3100
+"#,
+        )
+        .expect("settings should resolve")
+        .run
+        .agent
+        .mcps;
+
+        assert_eq!(sandbox_command(&mcps["inside"]), &[
+            "npx".to_string(),
+            "@playwright/mcp@latest".to_string(),
+            "--port".to_string(),
+            "3100".to_string(),
+        ]);
+    }
+
+    #[test]
+    fn sandbox_script_keeps_interpolation_tokens_in_source_form() {
+        // Interpolation still resolves at the run boundary, not at config
+        // resolution — switching the interpreter must not change that timing.
+        let mcps = super::workflow_settings_from_toml(
+            r#"
+_version = 1
+
+[run.agent.mcps.inside]
+type = "sandbox"
+script = "exec my-server --token {{ env.MY_TOKEN }}"
+port = 3100
+"#,
+        )
+        .expect("settings should resolve")
+        .run
+        .agent
+        .mcps;
+
+        assert_eq!(
+            sandbox_command(&mcps["inside"])[2],
+            "exec my-server --token {{ env.MY_TOKEN }}"
+        );
+    }
+
     #[test]
     fn higher_layer_replaces_same_key_mcp_entry() {
         // Both layers define `[run.agent.mcps.fs]`; the higher (workflow)

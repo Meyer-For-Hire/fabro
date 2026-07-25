@@ -464,7 +464,7 @@ tool_timeout = "90s"
 |---|---|---|---|
 | `type` | `"stdio"` \| `"http"` \| `"sandbox"` | None | MCP transport type. |
 | `command` | array<string> | None | Command and arguments for `stdio` or `sandbox` transports. |
-| `script` | string | None | Shell script alternative to `command` for process-launching transports. |
+| `script` | string | None | Shell script alternative to `command` for process-launching transports. A `stdio` script runs on the host through `sh -c`; a `sandbox` script is evaluated inside the sandbox by non-login Bash. |
 | `url` | string | None | Remote MCP URL for `http` transport. |
 | `port` | integer | None | Sandbox port for `sandbox` transport. |
 | `env` | table | `{}` | Additional environment variables for process-launching transports. |

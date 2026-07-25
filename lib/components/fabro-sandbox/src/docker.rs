@@ -28,13 +28,19 @@ use tokio_util::sync::CancellationToken;
 use crate::clone_source::{self, CloneDecision, EmptyWorkspaceReason};
 use crate::managed_labels::{self, MANAGED_LABEL, RUN_ID_LABEL};
 use crate::redact::redact_auth_url;
-use crate::sandbox::{RefreshOutcome, StdioProcessControl, optional_timeout, resolve_path};
+use crate::sandbox::{
+    BASH_ENV_VAR, BASH_PROBE_SCRIPT, BASH_PROBE_TIMEOUT_MS, REMOTE_BASH, RefreshOutcome,
+    StdioProcessControl, optional_timeout, resolve_path, validate_bash_probe,
+};
 use crate::{
     CommandOutputCallback, DEFAULT_EXEC_OUTPUT_TAIL_BYTES, DirEntry, ExecResult,
     ExecStreamingResult, GrepOptions, Sandbox, SandboxEvent, SandboxEventCallback, StderrCollector,
     StdioProcess, StdioProcessHandle, StdioProcessTermination, format_lines_numbered, glob_match,
     shell_quote,
 };
+
+const DOCKER_BASH_REQUIREMENT: &str = "Docker sandboxes require /bin/bash for every command, with no `sh` fallback; use an \
+     image with bash and git, such as buildpack-deps:noble.";
 
 pub(crate) const WORKING_DIRECTORY: &str = "/workspace";
 pub(crate) const REPOS_ROOT: &str = "/repos";
@@ -47,6 +53,30 @@ const EXEC_STOP_POLL_SLEEP_SECONDS: &str = "0.1";
 const EXEC_TERM_GRACE_SECONDS: &str = "0.02";
 #[cfg(not(test))]
 const EXEC_TERM_GRACE_SECONDS: &str = "0.2";
+
+fn env_entry_name(entry: &str) -> &str {
+    entry.split_once('=').map_or(entry, |(name, _)| name)
+}
+
+/// Remove caller/image startup-file injection and explicitly override any
+/// inherited image value for Docker-created processes.
+fn clean_bash_env_entries(entries: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut clean: Vec<String> = entries
+        .into_iter()
+        .filter(|entry| env_entry_name(entry) != BASH_ENV_VAR)
+        .collect();
+    clean.push(format!("{BASH_ENV_VAR}="));
+    clean
+}
+
+fn docker_bash_exec_env(env_vars: Option<&HashMap<String, String>>) -> Vec<String> {
+    let entries = env_vars.map_or_else(Vec::new, |vars| {
+        vars.iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect()
+    });
+    clean_bash_env_entries(entries)
+}
 
 static EXEC_CONTROL_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -411,10 +441,9 @@ impl DockerSandbox {
         let effective_dir = working_dir
             .unwrap_or_else(|| self.working_directory())
             .to_string();
-        let env: Option<Vec<String>> =
-            env_vars.map(|vars| vars.iter().map(|(k, v)| format!("{k}={v}")).collect());
+        let env = Some(docker_bash_exec_env(env_vars));
         let cmd = vec![
-            "/bin/bash".to_string(),
+            REMOTE_BASH.to_string(),
             "-c".to_string(),
             command.to_string(),
         ];
@@ -470,13 +499,12 @@ impl DockerSandbox {
         let effective_dir = working_dir
             .unwrap_or_else(|| self.working_directory())
             .to_string();
-        let env: Option<Vec<String>> =
-            env_vars.map(|vars| vars.iter().map(|(k, v)| format!("{k}={v}")).collect());
+        let env = Some(docker_bash_exec_env(env_vars));
         let (stop_file, pid_file) = docker_exec_control_paths();
         let controlled_command = docker_controlled_shell_command(command, &stop_file, &pid_file);
         let cmd = vec![
-            "/bin/bash".to_string(),
-            "-lc".to_string(),
+            REMOTE_BASH.to_string(),
+            "-c".to_string(),
             controlled_command,
         ];
 
@@ -593,6 +621,25 @@ impl DockerSandbox {
         }
         self.set_working_directory(WORKING_DIRECTORY)?;
         Ok(())
+    }
+
+    /// Verify the container evaluates commands as non-login Bash.
+    ///
+    /// Shared by fresh initialization and by `start` after a reconnect, so a
+    /// resumed container cannot pass startup and then fail on its first
+    /// command.
+    async fn probe_bash(&self, working_dir: Option<&str>) -> crate::Result<()> {
+        let result = self
+            .docker_exec_shell(
+                BASH_PROBE_SCRIPT,
+                BASH_PROBE_TIMEOUT_MS,
+                Some(working_dir.unwrap_or("/")),
+                None,
+                None,
+            )
+            .await
+            .map_err(|err| crate::Error::context(DOCKER_BASH_REQUIREMENT, err))?;
+        validate_bash_probe(result, DOCKER_BASH_REQUIREMENT)
     }
 
     async fn verify_git_available(&self) -> crate::Result<()> {
@@ -861,9 +908,9 @@ fi; \
   kill -KILL \"-$child\" 2>/dev/null || kill -KILL \"$child\" 2>/dev/null || true; \
 ) & watcher=$!; \
 if command -v setsid >/dev/null 2>&1; then \
-  setsid /bin/bash -lc \"$user_command\" <&3 & \
+  setsid {bash} -c \"$user_command\" <&3 & \
 else \
-  /bin/bash -lc \"$user_command\" <&3 & \
+  {bash} -c \"$user_command\" <&3 & \
 fi; \
 child=$!; \
 exec 3<&-; \
@@ -875,6 +922,7 @@ wait \"$watcher\" 2>/dev/null || true; \
 rm -f \"$stop_file\" \"$pid_file\"; \
 exit \"$status\"\
 ",
+        bash = REMOTE_BASH,
         stop_file = shell_quote(stop_file),
         pid_file = shell_quote(pid_file),
         command = shell_quote(command),
@@ -888,15 +936,16 @@ fn docker_stdio_exec_options(
     working_dir: String,
     env: Option<Vec<String>>,
 ) -> (CreateExecOptions<String>, StartExecOptions) {
+    let env = clean_bash_env_entries(env.unwrap_or_default());
     (
         CreateExecOptions {
             attach_stdin: Some(true),
             attach_stdout: Some(true),
             attach_stderr: Some(true),
             tty: Some(false),
-            cmd: Some(vec!["/bin/bash".to_string(), "-lc".to_string(), command]),
+            cmd: Some(vec![REMOTE_BASH.to_string(), "-c".to_string(), command]),
             working_dir: Some(working_dir),
-            env,
+            env: Some(env),
             ..Default::default()
         },
         StartExecOptions {
@@ -928,23 +977,30 @@ async fn create_and_start_exec(
     Ok((exec_id, start_result))
 }
 
+fn docker_stop_request_exec_options(stop_file: &str) -> CreateExecOptions<String> {
+    CreateExecOptions {
+        cmd: Some(vec![
+            REMOTE_BASH.to_string(),
+            "-c".to_string(),
+            format!("touch {}", shell_quote(stop_file)),
+        ]),
+        attach_stdout: Some(true),
+        attach_stderr: Some(true),
+        working_dir: Some("/".to_string()),
+        env: Some(clean_bash_env_entries(Vec::new())),
+        ..Default::default()
+    }
+}
+
 async fn request_docker_exec_stop_with(
     docker: &Docker,
     container_id: &str,
     stop_file: &str,
 ) -> crate::Result<()> {
-    let command = format!("touch {}", shell_quote(stop_file));
-    let exec_opts = CreateExecOptions {
-        cmd: Some(vec!["/bin/bash".to_string(), "-lc".to_string(), command]),
-        attach_stdout: Some(true),
-        attach_stderr: Some(true),
-        working_dir: Some("/".to_string()),
-        ..Default::default()
-    };
     let (exec_id, start_result) = create_and_start_exec(
         docker,
         container_id,
-        exec_opts,
+        docker_stop_request_exec_options(stop_file),
         None,
         "Failed to create Docker exec stop request",
         "Failed to start Docker exec stop request",
@@ -1136,19 +1192,15 @@ fn container_config(config: &DockerSandboxOptions, run_id: Option<&RunId>) -> Co
     Config {
         image: Some(config.image.clone()),
         cmd: Some(vec![
-            "/bin/bash".to_string(),
-            "-lc".to_string(),
+            REMOTE_BASH.to_string(),
+            "-c".to_string(),
             format!(
                 "mkdir -p {} && sleep infinity",
                 shell_quote(WORKING_DIRECTORY)
             ),
         ]),
         working_dir: Some(WORKING_DIRECTORY.to_string()),
-        env: if config.env_vars.is_empty() {
-            None
-        } else {
-            Some(config.env_vars.clone())
-        },
+        env: Some(clean_bash_env_entries(config.env_vars.clone())),
         labels: Some(managed_labels::for_run(run_id)),
         host_config: Some(host_config(config)),
         ..Default::default()
@@ -1191,10 +1243,8 @@ fn docker_not_modified(error: &DockerError) -> bool {
     })
 }
 
-fn bash_remediation(error: &DockerError, image: &str) -> String {
-    format!(
-        "Failed to start Docker container from image '{image}': {error}. Docker sandboxes require /bin/bash for internal commands; use an image with bash and git, such as buildpack-deps:noble."
-    )
+fn bash_remediation(image: &str) -> String {
+    format!("Failed to start Docker container from image '{image}'. {DOCKER_BASH_REQUIREMENT}")
 }
 
 fn build_single_file_tar(file_name: &str, bytes: &[u8]) -> crate::Result<Vec<u8>> {
@@ -1309,26 +1359,12 @@ impl Sandbox for DockerSandbox {
             .start_container(&id, None::<StartContainerOptions<String>>)
             .await
             .map_err(|e| {
-                let err = crate::Error::context(bash_remediation(&e, &self.config.image), e);
+                let err = crate::Error::context(bash_remediation(&self.config.image), e);
                 self.fail_init(init_start, err)
             })?;
 
-        let (stdout, stderr, exit_code) = self
-            .docker_exec(
-                vec![
-                    "/bin/bash".to_string(),
-                    "-lc".to_string(),
-                    "echo ready".to_string(),
-                ],
-                Some(WORKING_DIRECTORY),
-                None,
-            )
-            .await?;
-        if exit_code != 0 || !stdout.contains("ready") {
-            let err = crate::Error::message(format!(
-                "Docker container health check failed. Docker sandboxes require /bin/bash; use an image with bash and git, such as buildpack-deps:noble. {stderr}"
-            ));
-            return Err(self.fail_init(init_start, err));
+        if let Err(e) = self.probe_bash(Some(WORKING_DIRECTORY)).await {
+            return Err(self.fail_init(init_start, e));
         }
 
         let (uname_output, _, _) = self
@@ -1409,16 +1445,11 @@ impl Sandbox for DockerSandbox {
             }
         }
 
-        let (_, stderr, exit_code) = self
-            .docker_exec(vec!["true".to_string()], None, None)
-            .await
-            .map_err(|e| {
-                crate::Error::context(format!("Docker container '{container_id}' health check"), e)
-            })?;
-        if exit_code != 0 {
-            return self.start_error(crate::Error::message(format!(
-                "Docker container '{container_id}' health check failed: {stderr}"
-            )));
+        if let Err(e) = self.probe_bash(None).await {
+            return self.start_error(crate::Error::context(
+                format!("Docker container '{container_id}' health check"),
+                e,
+            ));
         }
 
         let duration_ms = elapsed_ms(start);
@@ -1577,8 +1608,11 @@ impl Sandbox for DockerSandbox {
             || self.working_directory().to_string(),
             |path| self.resolve_container_path(path),
         );
-        let env: Option<Vec<String>> =
-            env_vars.map(|vars| vars.iter().map(|(k, v)| format!("{k}={v}")).collect());
+        let env = env_vars.map(|vars| {
+            vars.iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect()
+        });
         let (stop_file, pid_file) = docker_exec_control_paths();
         let controlled_command = docker_controlled_shell_command(command, &stop_file, &pid_file);
         let (create_opts, start_opts) =
@@ -2000,6 +2034,86 @@ mod tests {
     use tokio::process::Command;
 
     use super::*;
+    use crate::sandbox::{BASH_PROBE_MARKER, bash_probe_passed};
+
+    #[test]
+    fn per_run_container_idle_command_uses_non_login_bash() {
+        let config = container_config(&DockerSandboxOptions::default(), None);
+
+        assert_eq!(
+            config.cmd.as_ref().map(|cmd| &cmd[..2]),
+            Some(&["/bin/bash".to_string(), "-c".to_string()][..])
+        );
+        assert_eq!(config.env, Some(vec!["BASH_ENV=".to_string()]));
+    }
+
+    #[test]
+    fn stop_request_exec_uses_non_login_bash() {
+        // Provider-control commands share the interpreter contract, so a
+        // profile file can't change how a stop request behaves.
+        let options = docker_stop_request_exec_options("/tmp/fabro exec.stop");
+
+        assert_eq!(
+            options.cmd,
+            Some(vec![
+                "/bin/bash".to_string(),
+                "-c".to_string(),
+                "touch '/tmp/fabro exec.stop'".to_string(),
+            ])
+        );
+        assert_eq!(options.env, Some(vec!["BASH_ENV=".to_string()]));
+    }
+
+    #[test]
+    fn bash_exec_env_blanks_caller_bash_env() {
+        let env = docker_bash_exec_env(Some(&HashMap::from([
+            (
+                BASH_ENV_VAR.to_string(),
+                "/tmp/untrusted-startup".to_string(),
+            ),
+            ("MODE".to_string(), "test".to_string()),
+        ])));
+
+        assert!(env.contains(&"MODE=test".to_string()));
+        assert_eq!(
+            env.iter()
+                .filter(|entry| env_entry_name(entry) == BASH_ENV_VAR)
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["BASH_ENV="]
+        );
+    }
+
+    #[test]
+    fn controlled_shell_command_starts_its_child_with_non_login_bash() {
+        let script = docker_controlled_shell_command("echo hi", "/tmp/stop", "/tmp/pid");
+
+        assert!(
+            script.contains("setsid /bin/bash -c \"$user_command\"")
+                && script.contains("/bin/bash -c \"$user_command\""),
+            "controlled child should run the user command under non-login bash: {script}"
+        );
+        assert!(
+            !script.contains("-lc") && !script.contains("bash -l"),
+            "controlled shell script should contain no login invocation: {script}"
+        );
+    }
+
+    #[test]
+    fn bash_probe_is_shared_by_fresh_initialization_and_resumed_start() {
+        // Both lifecycle paths call `probe_bash`, so they cannot drift: a
+        // resumed container is checked exactly as strictly as a fresh one.
+        assert!(BASH_PROBE_SCRIPT.contains("BASH_VERSION"));
+        assert!(BASH_PROBE_SCRIPT.contains("login_shell"));
+        assert!(
+            !bash_probe_passed(Some(0), "ready"),
+            "a zero exit without the marker is not a successful probe"
+        );
+        assert!(bash_probe_passed(
+            Some(0),
+            &format!("{BASH_PROBE_MARKER}\n")
+        ));
+    }
 
     #[test]
     fn default_options_are_clone_based() {
@@ -2042,7 +2156,10 @@ mod tests {
     #[test]
     fn container_config_has_no_bind_mounts_or_socket() {
         let options = DockerSandboxOptions {
-            env_vars: vec!["FOO=bar".to_string()],
+            env_vars: vec![
+                "FOO=bar".to_string(),
+                "BASH_ENV=/tmp/untrusted-startup".to_string(),
+            ],
             memory_limit: Some(4_000_000_000),
             cpu_quota: Some(200_000),
             ..DockerSandboxOptions::default()
@@ -2053,7 +2170,10 @@ mod tests {
         assert_eq!(host_config.memory, Some(4_000_000_000));
         assert_eq!(host_config.cpu_quota, Some(200_000));
         assert_eq!(config.working_dir.as_deref(), Some(WORKING_DIRECTORY));
-        assert_eq!(config.env, Some(vec!["FOO=bar".to_string()]));
+        assert_eq!(
+            config.env,
+            Some(vec!["FOO=bar".to_string(), "BASH_ENV=".to_string()])
+        );
         assert!(
             config
                 .env
@@ -2102,7 +2222,10 @@ mod tests {
         let (create, start) = docker_stdio_exec_options(
             "python fake_agent.py".to_string(),
             WORKING_DIRECTORY.to_string(),
-            Some(vec!["MODE=test".to_string()]),
+            Some(vec![
+                "MODE=test".to_string(),
+                "BASH_ENV=/tmp/untrusted-startup".to_string(),
+            ]),
         );
 
         assert_eq!(create.attach_stdin, Some(true));
@@ -2110,12 +2233,15 @@ mod tests {
         assert_eq!(create.attach_stderr, Some(true));
         assert_eq!(create.tty, Some(false));
         assert_eq!(create.working_dir.as_deref(), Some(WORKING_DIRECTORY));
-        assert_eq!(create.env, Some(vec!["MODE=test".to_string()]));
+        assert_eq!(
+            create.env,
+            Some(vec!["MODE=test".to_string(), "BASH_ENV=".to_string()])
+        );
         assert_eq!(
             create.cmd,
             Some(vec![
                 "/bin/bash".to_string(),
-                "-lc".to_string(),
+                "-c".to_string(),
                 "python fake_agent.py".to_string()
             ])
         );
@@ -2148,7 +2274,7 @@ mod tests {
             .await
             .expect("early stop file should be written");
         let mut child = Command::new("/bin/bash");
-        child.arg("-lc").arg(command).kill_on_drop(true);
+        child.arg("-c").arg(command).kill_on_drop(true);
         let output = if let Ok(output) = time::timeout(Duration::from_secs(5), child.output()).await
         {
             output.expect("controlled shell command should run")
@@ -2178,7 +2304,7 @@ mod tests {
         let command = docker_controlled_shell_command("cat", &stop_file, &pid_file);
 
         let mut child = Command::new("/bin/bash")
-            .arg("-lc")
+            .arg("-c")
             .arg(command)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -2240,7 +2366,7 @@ mod tests {
             .await
             .expect("early stop file should be written");
         let output = Command::new("/bin/bash")
-            .arg("-lc")
+            .arg("-c")
             .arg(command)
             .output()
             .await

@@ -264,6 +264,8 @@ pub fn build_env_context_block_with(env: &dyn Sandbox, ctx: &EnvContext) -> Stri
 
 #[cfg(test)]
 mod tests {
+    use fabro_llm::types::ToolDefinition;
+
     use super::*;
     use crate::subagent::{SessionFactory, SubAgentSupervisor};
     use crate::test_support::MockSandbox;
@@ -317,6 +319,38 @@ mod tests {
             .with_catalog(Arc::new(Catalog::from_builtin().unwrap()))
     }
 
+    /// Profiles using fabro's native tool vocabulary get the same `shell`
+    /// definition, so the Bash contract does not drift between providers.
+    #[test]
+    fn stock_profiles_advertise_the_same_bash_shell_tool() {
+        let profiles: [Box<dyn AgentProfile>; 3] = [
+            Box::new(anthropic_profile(false, false)),
+            Box::new(gemini_profile(false)),
+            Box::new(openai_apply_patch_profile(false)),
+        ];
+
+        let definitions: Vec<ToolDefinition> = profiles
+            .iter()
+            .map(|profile| {
+                profile
+                    .tools()
+                    .into_iter()
+                    .find(|tool| tool.name == "shell")
+                    .expect("every profile should register the shell tool")
+            })
+            .collect();
+
+        for definition in &definitions {
+            assert_eq!(definition.parameters, definitions[0].parameters);
+            assert_eq!(definition.description, definitions[0].description);
+            assert!(
+                definition.description.contains("Bash"),
+                "shell tool should identify Bash: {}",
+                definition.description
+            );
+        }
+    }
+
     /// Per-profile tool descriptions must stay per-profile. The Kimi profile
     /// rewrites several built-in descriptions; every other profile shares the
     /// registry factories, so a leak would silently reword tools for models
@@ -356,6 +390,12 @@ mod tests {
                 kimi_text, anthropic_text,
                 "{tool} should be reworded for Kimi only"
             );
+            if tool == NativeTool::Shell {
+                assert!(
+                    kimi_text.to_ascii_lowercase().contains("bash"),
+                    "Kimi's shell tool should still identify Bash: {kimi_text}"
+                );
+            }
 
             // The other three share the stock wording.
             for (label, other) in [

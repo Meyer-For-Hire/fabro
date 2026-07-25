@@ -260,6 +260,8 @@ mode = "block"
 
 Docker and Daytona are clone-based providers. When a run has a GitHub origin, Fabro clones it into the provider workspace. Set `[run.clone] enabled = false` to start with an empty workspace. Docker and Daytona ignore `cwd`; use the provider-owned workspace layout and `run.working_dir` for repository-relative commands.
 
+The image must provide `/bin/bash`; Fabro evaluates every sandbox command with it and has no `sh` fallback. Commands run in a **non-login** shell, so login profiles (`/etc/profile.d/*.sh`, `~/.bash_profile`, and `nvm`/`rbenv`/`sdkman` initializers) are not sourced — put anything they set into the Dockerfile's `ENV` instead. Fabro verifies Bash during initialization and again on resume, and fails with remediation rather than reporting the sandbox ready.
+
 ## Daytona
 
 Daytona runs tools in a cloud sandbox. Without `image.dockerfile`, Fabro uses Daytona's built-in `daytona-medium` snapshot. With `image.dockerfile`, Fabro computes a deterministic internal snapshot name from the Dockerfile, resource hints, a single-tenant scope, and the Daytona API key.

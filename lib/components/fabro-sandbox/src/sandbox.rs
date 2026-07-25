@@ -21,6 +21,79 @@ const GIT: &str = "git -c maintenance.auto=0 -c gc.auto=0";
 
 pub const DEFAULT_EXEC_OUTPUT_TAIL_BYTES: usize = 8 * 1024;
 
+/// Maximum time a sandbox lifecycle check may spend proving Bash is usable.
+pub(crate) const BASH_PROBE_TIMEOUT_MS: u64 = 10_000;
+
+/// Bash path required by Linux-backed remote sandbox providers.
+#[cfg(any(feature = "docker", feature = "daytona"))]
+pub(crate) const REMOTE_BASH: &str = "/bin/bash";
+
+/// Environment variable Bash consults for non-interactive startup source.
+///
+/// Sandbox providers must remove or blank this before invoking `bash -c`;
+/// otherwise ambient worker or image configuration can execute code before the
+/// requested command.
+pub(crate) const BASH_ENV_VAR: &str = "BASH_ENV";
+
+/// Marker a successful [`BASH_PROBE_SCRIPT`] run prints on stdout.
+///
+/// Providers validate the marker rather than trusting a zero exit: a non-Bash
+/// shell can exit zero for simple scripts without satisfying the contract.
+pub(crate) const BASH_PROBE_MARKER: &str = "fabro-bash-ready";
+
+/// Deterministic probe proving a sandbox's interpreter is non-login Bash.
+///
+/// Run as the argument to `bash -c` during fresh initialization and on
+/// resume/start, before the sandbox is reported usable. It fails when the
+/// interpreter has an ambient `BASH_ENV` startup source, is not Bash, was
+/// started as a login shell, or is in POSIX mode. Bash invoked under the name
+/// `sh` still sets `BASH_VERSION` while enabling POSIX behavior, so the full
+/// interpreter contract is checked rather than assumed.
+pub(crate) const BASH_PROBE_SCRIPT: &str = r#"if [ -n "${BASH_ENV:-}" ]; then
+  echo 'sandbox interpreter has BASH_ENV startup source configured' >&2
+  exit 1
+fi
+if [ -z "${BASH_VERSION:-}" ]; then
+  echo 'sandbox interpreter is not bash' >&2
+  exit 1
+fi
+if shopt -q login_shell; then
+  echo 'sandbox interpreter is a login shell' >&2
+  exit 1
+fi
+if shopt -qo posix; then
+  echo 'sandbox interpreter is bash in posix mode' >&2
+  exit 1
+fi
+printf '%s\n' 'fabro-bash-ready'"#;
+
+/// Whether a [`BASH_PROBE_SCRIPT`] run succeeded.
+///
+/// A zero exit without exactly the marker is not a successful probe.
+pub(crate) fn bash_probe_passed(exit_code: Option<i32>, stdout: &str) -> bool {
+    exit_code == Some(0) && stdout.trim() == BASH_PROBE_MARKER
+}
+
+/// Validate a completed Bash probe without flattening its raw output into an
+/// error message.
+///
+/// [`Error::Exec`](crate::Error::Exec) retains stdout/stderr for the existing
+/// redacted-tail diagnostics while its display form exposes only bounded,
+/// classified metadata safe for lifecycle events and tracing.
+pub(crate) fn validate_bash_probe(
+    result: ExecResult,
+    remediation: impl Into<String>,
+) -> crate::Result<()> {
+    if result.is_success() && bash_probe_passed(result.exit_code, &result.stdout) {
+        return Ok(());
+    }
+
+    Err(crate::Error::context(
+        remediation,
+        result.into_exec_error("Sandbox Bash probe"),
+    ))
+}
+
 /// Sleep for `timeout_ms` if `Some`, otherwise never resolves. Used by
 /// streaming `exec_command` impls to model "no timeout" without scheduling a
 /// `Duration::from_millis(u64::MAX)` sleep.
@@ -872,6 +945,21 @@ pub trait Sandbox: Send + Sync {
         path: &str,
         depth: Option<usize>,
     ) -> crate::Result<Vec<DirEntry>>;
+    /// Run `command` to completion and return its captured output.
+    ///
+    /// On Unix production sandboxes `command` is **Bash source**: it is
+    /// evaluated as a non-login Bash program, equivalent to `bash -c
+    /// <command>`. Implementations select the interpreter, not its options —
+    /// they must not add login mode, `errexit`, `pipefail`, or any other
+    /// implicit shell option, and must never fall back to `sh` or delegate
+    /// evaluation to a provider's ambient shell. A caller that wants different
+    /// semantics writes them into the command itself (`sh -c ...`, a
+    /// `#!/bin/sh` script, an explicit `set -o pipefail`), which then runs
+    /// beneath this Bash boundary.
+    ///
+    /// Providers resolve the Bash executable differently: the local sandbox
+    /// resolves `bash` through the worker's `PATH` (NixOS has no `/bin/bash`),
+    /// while the Linux remote providers require `/bin/bash`.
     async fn exec_command(
         &self,
         command: &str,
@@ -881,6 +969,11 @@ pub trait Sandbox: Send + Sync {
         cancel_token: Option<CancellationToken>,
     ) -> crate::Result<ExecResult>;
     /// Stream a command's output as it runs.
+    ///
+    /// `command` carries exactly the same interpreter semantics as
+    /// [`exec_command`](Self::exec_command) — the two paths must not differ in
+    /// interpreter or shell options, so Bash-only syntax behaves identically
+    /// through both.
     ///
     /// **Production sandboxes must override this.** The default falls back to
     /// the non-streaming [`exec_command`](Self::exec_command) and replays its
@@ -913,6 +1006,13 @@ pub trait Sandbox: Send + Sync {
         replay_exec_result(result, true, output_callback.as_ref()).await
     }
 
+    /// Launch a long-lived process with bidirectional stdio attached.
+    ///
+    /// Where supported, `_command` is evaluated under the same non-login Bash
+    /// contract as [`exec_command`](Self::exec_command) before the shell
+    /// replaces itself with the requested process. Providers without
+    /// bidirectional stdio keep this default and report the capability as
+    /// unsupported rather than substituting another interpreter.
     async fn spawn_stdio_process(
         &self,
         _command: &str,
@@ -1503,6 +1603,104 @@ mod tests {
     fn shell_quote_basic() {
         assert_eq!(shell_quote("hello"), "hello");
         assert_eq!(shell_quote("hello world"), "'hello world'");
+    }
+
+    #[test]
+    fn bash_probe_script_prints_the_marker_callers_validate() {
+        assert!(
+            BASH_PROBE_SCRIPT.contains(BASH_PROBE_MARKER),
+            "the probe must print the marker providers check for"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_probe_accepts_only_clean_non_login_bash() {
+        use tokio::process::Command;
+
+        async fn run(program: &str, args: &[&str]) -> (Option<i32>, String) {
+            let output = Command::new(program)
+                .args(args)
+                .arg(BASH_PROBE_SCRIPT)
+                .env_remove("BASH_ENV")
+                .output()
+                .await
+                .expect("probe should run");
+            (
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout).into_owned(),
+            )
+        }
+
+        let (code, stdout) = run("bash", &["-c"]).await;
+        assert!(bash_probe_passed(code, &stdout), "non-login bash: {stdout}");
+
+        let (code, stdout) = run("bash", &["--noprofile", "-lc"]).await;
+        assert!(
+            !bash_probe_passed(code, &stdout),
+            "a login shell must fail the probe: {stdout}"
+        );
+
+        let output = Command::new("bash")
+            .args(["-c", BASH_PROBE_SCRIPT])
+            .env(BASH_ENV_VAR, "/dev/null")
+            .output()
+            .await
+            .expect("probe with BASH_ENV should run");
+        assert!(
+            !bash_probe_passed(
+                output.status.code(),
+                &String::from_utf8_lossy(&output.stdout)
+            ),
+            "a shell with BASH_ENV must fail the probe"
+        );
+
+        // Where `/bin/sh` is really Bash (macOS), Bash enters POSIX mode and
+        // changes behavior; where it is dash (most Linux images),
+        // `BASH_VERSION` is unset. The probe rejects both.
+        let (code, stdout) = run("sh", &["-c"]).await;
+        assert!(
+            !bash_probe_passed(code, &stdout),
+            "sh must fail the probe: {stdout}"
+        );
+    }
+
+    #[test]
+    fn bash_probe_requires_the_exact_marker_output() {
+        assert!(bash_probe_passed(
+            Some(0),
+            &format!("  {BASH_PROBE_MARKER}\n")
+        ));
+        assert!(!bash_probe_passed(
+            Some(0),
+            &format!("prefix-{BASH_PROBE_MARKER}-suffix")
+        ));
+        assert!(!bash_probe_passed(
+            Some(0),
+            &format!("{BASH_PROBE_MARKER}\nunexpected output")
+        ));
+    }
+
+    #[test]
+    fn bash_probe_failure_keeps_raw_output_out_of_the_error_chain() {
+        let err = validate_bash_probe(
+            ExecResult {
+                stdout:      String::new(),
+                stderr:      "raw-probe-output".to_string(),
+                exit_code:   Some(1),
+                termination: CommandTermination::Exited,
+                duration_ms: 1,
+            },
+            "Install Bash",
+        )
+        .expect_err("failed probe should return remediation");
+
+        assert!(!err.display_with_causes().contains("raw-probe-output"));
+        assert_eq!(
+            err.default_redacted_output_tail()
+                .and_then(|tail| tail.stderr),
+            Some("raw-probe-output".to_string())
+        );
     }
 
     #[expect(

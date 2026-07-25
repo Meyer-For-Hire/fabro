@@ -69,7 +69,7 @@ Example:
 Use for creating new files. For modifications, prefer apply_patch.
 
 ## shell
-Execute shell commands. Default timeout is 10 seconds. Use timeout_ms parameter for longer-running commands. When searching for text or files, prefer `rg` (ripgrep) because it is much faster than alternatives like `grep`.
+Execute commands as Bash source, evaluated by a non-login Bash shell. Default timeout is 10 seconds. Use timeout_ms parameter for longer-running commands. When searching for text or files, prefer `rg` (ripgrep) because it is much faster than alternatives like `grep`.
 
 ## grep
 Search file contents with regex. Use glob_filter to narrow results.

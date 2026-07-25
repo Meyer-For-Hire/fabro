@@ -52,6 +52,76 @@ mod daytona_streaming_live {
         Ok(())
     }
 
+    /// Both command paths must reach the same interpreter, so Bash-only syntax
+    /// that `sh` rejects has to behave identically through them. The two paths
+    /// build different requests — a direct process exec and a toolbox session —
+    /// so neither is evidence for the other.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires live Daytona credentials and provisions a sandbox"]
+    async fn daytona_runs_bash_only_syntax_through_both_command_paths() -> Result<()> {
+        ensure!(
+            daytona_api_key_present(),
+            "DAYTONA_API_KEY must be set to run this live smoke test"
+        );
+
+        let sandbox = DaytonaSandbox::new(
+            DaytonaConfig {
+                skip_clone: true,
+                ..Default::default()
+            },
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await?;
+        sandbox.initialize().await?;
+
+        // Arrays, `[[ ]]`, and `${arr[@]}` are Bash-only; `shopt -q
+        // login_shell` proves neither path ran under a login shell.
+        let command = "arr=(one two three); [[ ${#arr[@]} -eq 3 ]] || exit 1; \
+                       shopt -q login_shell && exit 2; echo ${arr[1]}";
+
+        let checks: Result<()> = async {
+            let non_streaming = sandbox
+                .exec_command(command, 30_000, None, None, None)
+                .await?;
+            ensure_eq(
+                &non_streaming.exit_code,
+                &Some(0),
+                &format!("exec_command should run Bash-only syntax: {non_streaming:?}"),
+            )?;
+            ensure_contains(
+                &non_streaming.stdout,
+                "two",
+                "exec_command should report the Bash-only result",
+            )?;
+
+            let (streaming, _) = run_captured(&sandbox, command, 30_000, None).await?;
+            ensure_eq(
+                &streaming.result.exit_code,
+                &Some(0),
+                &format!("exec_command_streaming should run Bash-only syntax: {streaming:?}"),
+            )?;
+            ensure_contains(
+                &streaming.result.stdout,
+                "two",
+                "exec_command_streaming should report the Bash-only result",
+            )?;
+
+            Ok(())
+        }
+        .await;
+
+        let cleanup_result = sandbox.cleanup().await.context("clean up Daytona sandbox");
+
+        checks?;
+        cleanup_result?;
+
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires live Daytona credentials and provisions a sandbox"]
     async fn daytona_managed_labels_live_smoke() -> Result<()> {

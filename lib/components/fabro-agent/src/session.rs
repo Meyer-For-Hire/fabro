@@ -20,6 +20,7 @@ use fabro_types::{
     AgentToolSummary, LlmOutputKind, LlmRetryPhase, PermissionLevel, Principal, SessionMessage,
     SessionRecord, StageContextWindowProjection, SteeringMessage,
 };
+use fabro_util::shell;
 use futures::StreamExt;
 use tokio::sync::{Notify, broadcast};
 use tokio::time;
@@ -832,20 +833,7 @@ impl Session {
     ) -> Result<Result<(String, std::collections::HashMap<String, String>), String>, Error> {
         let sandbox = self.sandbox.as_ref();
 
-        let cmd_str = command
-            .iter()
-            .map(|arg| fabro_sandbox::shell_quote(arg))
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        // Launch the server detached with setsid so Daytona's exec doesn't block.
-        // shell_quote the inner command for the outer `sh -c` so a single quote
-        // or metacharacter in any argv element can't break out of the wrapper.
-        let inner = format!("{cmd_str} > /tmp/mcp_server_stdout.log 2>/tmp/mcp_server_stderr.log");
-        let launch_script = format!(
-            "setsid sh -c {quoted} </dev/null >/dev/null 2>&1 &\necho $!",
-            quoted = fabro_sandbox::shell_quote(&inner)
-        );
+        let launch_script = sandbox_mcp_launch_script(command);
         let env_ref = if env.is_empty() { None } else { Some(env) };
 
         if cancel_token.is_cancelled() {
@@ -2174,6 +2162,35 @@ const fn is_auth_error(err: &LlmError) -> bool {
     )
 }
 
+/// Build the script that launches a sandbox MCP server detached and echoes its
+/// PID.
+///
+/// `setsid` fully detaches the server so Daytona's exec doesn't block on it.
+/// The inner command is shell-quoted for the wrapper so a single quote or
+/// metacharacter in any argv element can't break out, and the wrapper itself is
+/// the current `$BASH` because the sandbox evaluates this string as non-login
+/// Bash and may resolve that executable outside `/bin` (for example on NixOS).
+fn sandbox_mcp_launch_script(command: &[String]) -> String {
+    let command_source = match command {
+        // Sandbox MCP `script` entries resolve to this exact argv shape. The
+        // surrounding launcher is already the provider-selected Bash, so
+        // evaluate the source in that process instead of PATH-resolving a
+        // second interpreter. Grouping keeps the log redirections scoped to
+        // the whole script, including multi-command and trailing-comment
+        // forms.
+        [interpreter, flag, source] if interpreter == "bash" && flag == "-c" => {
+            format!("{{\n{source}\n}}")
+        }
+        _ => shell::shell_join(command),
+    };
+    let inner =
+        format!("{command_source} > /tmp/mcp_server_stdout.log 2>/tmp/mcp_server_stderr.log");
+    format!(
+        "setsid \"$BASH\" -c {quoted} </dev/null >/dev/null 2>&1 &\necho $!",
+        quoted = shell::shell_quote(&inner)
+    )
+}
+
 /// Best-effort kill of a sandbox MCP server process group. Used when
 /// `start_sandbox_mcp_server` is cancelled after spawning a detached
 /// `setsid` child but before reporting readiness. Errors from the sandbox
@@ -2215,6 +2232,86 @@ mod tests {
     use crate::subagent::{SubAgentStatus, make_wait_tool};
     use crate::test_support::*;
     use crate::tool_registry::{RegisteredTool, ToolContext, ToolRegistry, ToolSource};
+
+    #[test]
+    fn sandbox_mcp_launch_wrapper_uses_bash() {
+        // The sandbox evaluates this string as non-login Bash, so the detached
+        // wrapper reuses the executable selected by the provider.
+        let script = sandbox_mcp_launch_script(&[
+            "npx".to_string(),
+            "@playwright/mcp@latest".to_string(),
+            "--port".to_string(),
+            "3100".to_string(),
+        ]);
+
+        assert!(
+            script.starts_with("setsid \"$BASH\" -c "),
+            "launch wrapper should detach through the provider-selected Bash: {script}"
+        );
+        assert!(
+            script.ends_with(" </dev/null >/dev/null 2>&1 &\necho $!"),
+            "launch wrapper should stay detached and report its PID: {script}"
+        );
+        assert!(
+            script.contains("/tmp/mcp_server_stdout.log")
+                && script.contains("2>/tmp/mcp_server_stderr.log"),
+            "launch wrapper should keep its log redirection: {script}"
+        );
+    }
+
+    #[test]
+    fn sandbox_mcp_launch_wrapper_evaluates_scripts_in_the_selected_bash() {
+        let source =
+            "PATH=/mcp-only\nprintf 'starting server\\n'\nexec my-server --port 3100 # ready";
+        let script =
+            sandbox_mcp_launch_script(&["bash".to_string(), "-c".to_string(), source.to_string()]);
+
+        let wrapper_argument = script
+            .strip_prefix("setsid \"$BASH\" -c ")
+            .and_then(|rest| rest.strip_suffix(" </dev/null >/dev/null 2>&1 &\necho $!"))
+            .expect("launch wrapper should have the canonical shape");
+        let unwrapped = shlex::split(wrapper_argument).expect("wrapper argument should parse");
+
+        assert_eq!(unwrapped, vec![format!(
+            "{{\n{source}\n}} > /tmp/mcp_server_stdout.log 2>/tmp/mcp_server_stderr.log"
+        )]);
+        assert!(
+            !unwrapped[0].contains("bash -c"),
+            "script entries must not PATH-resolve a nested Bash: {}",
+            unwrapped[0]
+        );
+    }
+
+    #[test]
+    fn sandbox_mcp_launch_wrapper_quotes_arbitrary_argv() {
+        // A quote or metacharacter in any argv element must not break out of
+        // the wrapper; it has to arrive as one argument.
+        let script = sandbox_mcp_launch_script(&[
+            "my-server".to_string(),
+            "--flag=it's a value".to_string(),
+            "$(touch /tmp/pwned)".to_string(),
+        ]);
+
+        let wrapper_argument = script
+            .strip_prefix("setsid \"$BASH\" -c ")
+            .and_then(|rest| rest.strip_suffix(" </dev/null >/dev/null 2>&1 &\necho $!"))
+            .expect("launch wrapper should have the canonical shape");
+
+        // Unwrap the wrapper's own quoting: the whole inner script must arrive
+        // as one argument to `bash -c`, with each argv element still quoted so
+        // the substitution stays inert.
+        let unwrapped = shlex::split(wrapper_argument).expect("wrapper argument should parse");
+        assert_eq!(
+            unwrapped.len(),
+            1,
+            "the command must stay a single argument"
+        );
+        assert_eq!(
+            unwrapped[0],
+            "my-server \"--flag=it's a value\" '$(touch /tmp/pwned)' > \
+             /tmp/mcp_server_stdout.log 2>/tmp/mcp_server_stderr.log"
+        );
+    }
 
     struct NamedToolAccessPolicy {
         decisions: Vec<(&'static str, ToolAccess)>,

@@ -178,7 +178,7 @@ NODE_ENV = "production"
 | `enabled` | Whether to connect to this server. | `true` |
 | `type` | Must be `"stdio"`. | — |
 | `command` | Array: the executable followed by its arguments. | — |
-| `script` | Shell script alternative to `command`. | — |
+| `script` | Shell script alternative to `command`. Runs on the host through `sh -c`. | — |
 | `env` | Additional environment variables for the child process. | `{}` |
 | `startup_timeout` | Max duration to wait for the MCP handshake. | `"10s"` |
 | `tool_timeout` | Max duration for a single tool call. | `"60s"` |
@@ -226,7 +226,7 @@ tool_timeout = "2m"
 | `type` | Must be `"sandbox"`. | — |
 | `protocol` | HTTP MCP protocol exposed by the sandbox server: `"streamable_http"` or legacy `"sse"`. | `"streamable_http"` |
 | `command` | Array: the command to run inside the sandbox. Must include a flag that makes the server listen on `port`. | — |
-| `script` | Shell script alternative to `command`. | — |
+| `script` | Shell script alternative to `command`. Evaluated inside the sandbox by non-login Bash (`bash -c`), like every other sandbox command. | — |
 | `port` | The port the MCP server listens on inside the sandbox. | — |
 | `env` | Additional environment variables for the server process. | `{}` |
 | `startup_timeout` | Max duration to wait for the server to start listening and complete the MCP handshake. | `"10s"` |
@@ -234,7 +234,7 @@ tool_timeout = "2m"
 
 The sandbox transport requires a remote sandbox provider (Daytona) that supports preview URLs. During session initialization, Fabro:
 
-1. Launches the server inside the sandbox using `setsid` to fully detach the process
+1. Launches the server inside the sandbox with `setsid "$BASH" -c` to fully detach the process while reusing the provider-selected Bash
 2. Polls until the server is listening on the configured port (up to 30 seconds)
 3. Obtains an authenticated preview URL from the sandbox provider
 4. Connects to the server over HTTP using the preview URL

@@ -51,7 +51,7 @@ Use search-and-replace editing. The old_string must exactly match existing text 
 Use for creating new files or completely rewriting files.
 
 ## shell
-Execute shell commands. Default timeout is 10 seconds. Use timeout_ms parameter for longer-running commands. Always prefer non-interactive commands (e.g., using CI flags for test runners to avoid persistent watch modes or `git --no-pager`).
+Execute commands as Bash source, evaluated by a non-login Bash shell. Default timeout is 10 seconds. Use timeout_ms parameter for longer-running commands. Always prefer non-interactive commands (e.g., using CI flags for test runners to avoid persistent watch modes or `git --no-pager`).
 
 ## grep
 Search file contents with regex patterns. Use conservative result counts and narrow scope (include/exclude parameters). Use context/before/after to request enough context to avoid needing to read the file before editing matches.
