@@ -374,7 +374,7 @@ fabro secret set OPENAI_API_KEY sk-...
 fabro secret set GEMINI_API_KEY AI...
 ```
 
-Standalone CLI/library usage can still opt into env-backed credential sources explicitly, but the Fabro server runtime reads provider keys from the vault after the temporary startup migration.
+`fabro exec` and direct library usage can opt into env-backed credential sources explicitly. Runs cannot: the Fabro server reads provider keys from the vault after the temporary startup migration, and workers start from a cleared environment that does not inherit provider keys.
 
 | Variable | Provider |
 |---|---|
