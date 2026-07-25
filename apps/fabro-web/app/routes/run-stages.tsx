@@ -1,4 +1,10 @@
-import { useId, useMemo, useReducer, useState } from "react";
+import {
+  useId,
+  useMemo,
+  useReducer,
+  useState,
+  type ReactNode,
+} from "react";
 import { Link, useParams } from "react-router";
 import {
   ArrowDownTrayIcon,
@@ -31,7 +37,6 @@ import type {
   ThreadDnaSelection,
 } from "../components/event-debug";
 import { StageContext } from "../components/stage-context";
-import { StageInferenceIndicator } from "../components/stage-inference-indicator";
 import { StageInsightsSidebar } from "../components/stage-insights-sidebar";
 import { StageSidebar } from "../components/stage-sidebar";
 import type { Stage } from "../components/stage-sidebar";
@@ -73,7 +78,6 @@ import {
   useRunStages,
   useRunState,
 } from "../lib/queries";
-import { isTerminalRunStatus } from "../lib/run-actions";
 import {
   STAGE_ACTIVITY_EVENT_TYPES,
   type StageActivityEventType,
@@ -82,11 +86,16 @@ import {
   ACTIVE_STAGE_STATES,
   mapRunStagesToSidebarStages,
 } from "../lib/stage-sidebar";
-import { getNumber, getString, type UnknownRecord } from "../lib/unknown";
+import {
+  getNumber,
+  getObject,
+  getString,
+  type UnknownRecord,
+} from "../lib/unknown";
 import type {
   EventEnvelope,
+  ReasoningOutput,
   StageHandler,
-  StageInferenceProjection,
   StageModelUsage,
 } from "@qltysh/fabro-api-client";
 
@@ -105,6 +114,7 @@ type TurnType =
       inputTokens: number;
       outputTokens: number;
       toolCallCount: number | null;
+      reasoning: ReasoningOutput | null;
     }
   | {
       kind: "tool";
@@ -181,7 +191,9 @@ type StageActivityAction =
   | { type: "searchChanged"; search: string };
 
 const initialStageActivityState = (): StageActivityState => ({
-  tab: "primary",
+  // Only agent stages offer "chat"; every other renderer resolves this to
+  // "primary" through `availableTabs`, so this is the default for both.
+  tab: "chat",
   selectedKinds: [...EVENT_KINDS],
   selectedDebugCategories: [],
   search: "",
@@ -271,12 +283,22 @@ export interface PendingToolCall {
 interface StageActivity {
   turns: TurnType[];
   pendingTools: PendingToolCall[];
-  watchdogTimedOut: boolean;
 }
 
 interface PendingCommand {
   ts: string;
   script: string;
+}
+
+function readTurnReasoning(props: UnknownRecord): ReasoningOutput | null {
+  const reasoning = getObject(props, "reasoning");
+  if (!reasoning) return null;
+  // getString treats "" as absent, so a provider that sends an empty field
+  // reads the same as one that sends nothing.
+  const summary = getString(reasoning, "summary") ?? null;
+  const trace = getString(reasoning, "trace") ?? null;
+  if (summary) return trace ? { summary, trace } : { summary };
+  return trace ? { trace } : null;
 }
 
 export function buildStageActivity(
@@ -287,15 +309,10 @@ export function buildStageActivity(
   const pendingTools = new Map<string, PendingTool>();
   let pendingCommand: PendingCommand | undefined;
   let sawAssistantMessage = false;
-  let watchdogTimedOut = false;
 
   for (const e of events) {
     const eventName = e.event;
     if (activityEventStageId(e) !== stageId) {
-      continue;
-    }
-    if (eventName === "watchdog.timeout") {
-      watchdogTimedOut = true;
       continue;
     }
     if (
@@ -327,6 +344,7 @@ export function buildStageActivity(
           inputTokens: getNumber(billing, "input_tokens") ?? 0,
           outputTokens: getNumber(billing, "output_tokens") ?? 0,
           toolCallCount: getNumber(props, "tool_call_count") ?? null,
+          reasoning: readTurnReasoning(props),
         });
         break;
       }
@@ -340,6 +358,8 @@ export function buildStageActivity(
             inputTokens: getNumber(billing, "input_tokens") ?? 0,
             outputTokens: getNumber(billing, "output_tokens") ?? 0,
             toolCallCount: null,
+            // Only agent.message carries reasoning; prompt stages have none.
+            reasoning: null,
           });
         }
         break;
@@ -452,7 +472,6 @@ export function buildStageActivity(
 
   return {
     turns,
-    watchdogTimedOut,
     pendingTools: Array.from(pendingTools, ([toolCallId, tool]) => ({
       toolCallId,
       toolName: tool.toolName,
@@ -1154,7 +1173,65 @@ function ToolGroupRow({
   );
 }
 
-function EventDetails({
+const COLLAPSIBLE_PREVIEW_CHARS = 280;
+
+/**
+ * Shared disclosure for long stage text. By default it preserves raw text;
+ * callers may supply a full-content renderer for authored formats such as
+ * Markdown while retaining the same plain-text preview and accessible toggle.
+ */
+function CollapsibleContent({
+  text,
+  className = "",
+  textClassName = "",
+  renderFull,
+}: {
+  text: string;
+  className?: string;
+  textClassName?: string;
+  renderFull?: (text: string) => ReactNode;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const contentId = useId();
+  const isLong = text.length > COLLAPSIBLE_PREVIEW_CHARS;
+  const preview = isLong
+    ? `${text.slice(0, COLLAPSIBLE_PREVIEW_CHARS).trimEnd()}…`
+    : text;
+
+  return (
+    <div
+      className={`flex flex-col items-start gap-1.5 ${className}`.trim()}
+    >
+      {/*
+        `w-full` is load-bearing for ChatUserCard. Its `w-fit max-w-[85%]`
+        bubble is measured intrinsically before being clamped, so this wrapper
+        must fill the resolved width to keep prompt text inside the bubble.
+      */}
+      <div id={contentId} className="w-full">
+        {renderFull && (!isLong || expanded) ? (
+          renderFull(text)
+        ) : (
+          <p className={textClassName}>{expanded ? text : preview}</p>
+        )}
+      </div>
+      {isLong && (
+        <button
+          type="button"
+          aria-controls={contentId}
+          aria-expanded={expanded}
+          onClick={() => setExpanded((current) => !current)}
+          className="text-xs text-teal-500 hover:underline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-teal-500"
+        >
+          {expanded
+            ? "Collapse"
+            : `Show all (${text.length.toLocaleString()} characters)`}
+        </button>
+      )}
+    </div>
+  );
+}
+
+export function EventDetails({
   turn,
   runStart,
   hideMeta = false,
@@ -1171,6 +1248,9 @@ function EventDetails({
   })();
   const assistantContent =
     turn.kind === "assistant" ? nonBlankAssistantContent(turn) : null;
+  const reasoning = turn.kind === "assistant" ? turn.reasoning : null;
+  const reasoningSummary =
+    reasoning && "summary" in reasoning ? reasoning.summary : null;
 
   return (
     <div className="space-y-5">
@@ -1199,6 +1279,29 @@ function EventDetails({
               <span className="text-fg-muted">{turnSummary(turn)}</span>
             )}
           </DetailField>
+          {/*
+            Reasoning follows the message rather than preceding it, the way it
+            ran: a trace can be thousands of characters, and leading with one
+            would push the answer the user clicked on below the fold.
+          */}
+          {reasoningSummary && (
+            <DetailField label="Reasoning">
+              <CollapsibleContent
+                text={reasoningSummary}
+                textClassName="wrap-break-word whitespace-pre-wrap"
+              />
+            </DetailField>
+          )}
+          {reasoning?.trace && (
+            <DetailField
+              label={reasoningSummary ? "Reasoning trace" : "Reasoning"}
+            >
+              <CollapsibleContent
+                text={reasoning.trace}
+                textClassName="wrap-break-word whitespace-pre-wrap"
+              />
+            </DetailField>
+          )}
           {turn.toolCallCount != null && turn.toolCallCount > 0 && (
             <DetailField label="Tool calls" mono>
               {turn.toolCallCount}
@@ -1478,42 +1581,17 @@ function ToolGroupChildRow({
   );
 }
 
-const CHAT_PROMPT_PREVIEW_CHARS = 280;
-
 // User-side bubble. The stage prompt (and any steer / pair-user message over
 // the preview limit) collapses to a preview with an expand toggle; expanded
 // content renders as markdown.
 function ChatUserCard({ content }: { content: string }) {
-  const [expanded, setExpanded] = useState(false);
-  const contentId = useId();
-  const isLong = content.length > CHAT_PROMPT_PREVIEW_CHARS;
   return (
-    <div className="flex w-fit max-w-[85%] flex-col items-start gap-1.5 self-end rounded-2xl rounded-br-md bg-panel px-4 py-3">
-      <div id={contentId}>
-        {expanded ? (
-          <Markdown content={content} />
-        ) : (
-          <p className="text-sm whitespace-pre-wrap text-fg-2">
-            {isLong
-              ? `${content.slice(0, CHAT_PROMPT_PREVIEW_CHARS).trimEnd()}…`
-              : content}
-          </p>
-        )}
-      </div>
-      {isLong && (
-        <button
-          type="button"
-          aria-controls={contentId}
-          aria-expanded={expanded}
-          onClick={() => setExpanded((current) => !current)}
-          className="text-xs text-teal-500 hover:underline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-teal-500"
-        >
-          {expanded
-            ? "Collapse"
-            : `Show all (${content.length.toLocaleString()} characters)`}
-        </button>
-      )}
-    </div>
+    <CollapsibleContent
+      text={content}
+      className="w-fit max-w-[85%] self-end rounded-2xl rounded-br-md bg-panel px-4 py-3"
+      textClassName="text-sm wrap-break-word whitespace-pre-wrap text-fg-2"
+      renderFull={(text) => <Markdown content={text} />}
+    />
   );
 }
 
@@ -1594,13 +1672,21 @@ export function StageChatView({
               </p>
             );
           case "assistant": {
+            const assistantContent = nonBlankAssistantContent(turn);
             const metric = turnMetric(turn);
             const isFinal =
               turnIndex === lastAssistantTurnIndex && !stageActive;
+            const showFooter = isFinal && Boolean(metric || duration);
+            // A text-free assistant turn is the boundary between two batches
+            // of tool calls, kept in the turn stream so those batches stay
+            // separate chips. It has nothing to show, and an empty node would
+            // still take a slot in this gap-4 column, doubling the space
+            // between the chips on either side of it.
+            if (!assistantContent && !showFooter) return null;
             return (
               <div key={`turn-${turnIndex}`} className="flex flex-col gap-1.5">
-                <Markdown content={turn.content} />
-                {isFinal && (metric || duration) && (
+                {assistantContent && <Markdown content={assistantContent} />}
+                {showFooter && (
                   <div className="flex gap-3 font-mono text-[11px] text-fg-muted tabular-nums">
                     {metric && <span>{metric}</span>}
                     {duration && <span>{duration}</span>}
@@ -2075,8 +2161,6 @@ function RunStageActivityStage({
   selectedStage,
   stages,
   runStart,
-  inference,
-  runSettled,
   tab,
   selectedKinds,
   selectedDebugCategories,
@@ -2090,8 +2174,6 @@ function RunStageActivityStage({
   selectedStage: Stage;
   stages: Stage[];
   runStart: string | undefined;
-  inference: StageInferenceProjection | null | undefined;
-  runSettled: boolean;
   tab: EventsTab;
   selectedKinds: EventKind[];
   selectedDebugCategories: DebugCategory[];
@@ -2103,15 +2185,11 @@ function RunStageActivityStage({
 }) {
   const selectedStageId = selectedStage.id;
   const stageEventsQuery = useRunStageEvents(runId, selectedStageId);
-  // An open bracket on a run that can no longer advance means we never learned
-  // how the request ended, not that it is still working. The watchdog stays
-  // the authority on "actually stuck", so its timeout settles the readout too.
   const activity = useMemo(
     () => buildStageActivity(stageEventsQuery.data ?? [], selectedStageId),
     [stageEventsQuery.data, selectedStageId],
   );
   const { turns } = activity;
-  const inferenceSettled = runSettled || activity.watchdogTimedOut;
   const renderer: StageRenderer = selectStageRenderer(selectedStage.handler);
   const debugEvents = useMemo<EventEnvelope[]>(() => {
     return (stageEventsQuery.data ?? []).filter(
@@ -2259,11 +2337,6 @@ function RunStageActivityStage({
                 </Link>
               </p>
             )}
-            <StageInferenceIndicator
-              inference={inference}
-              settled={inferenceSettled}
-            />
-
             <EventsToolbar
               tab={effectiveTab}
               renderer={renderer}
@@ -2361,15 +2434,11 @@ function RunStageActivity({
   selectedStage,
   stages,
   runStart,
-  inference,
-  runSettled,
 }: {
   runId: string;
   selectedStage: Stage;
   stages: Stage[];
   runStart: string | undefined;
-  inference: StageInferenceProjection | null | undefined;
-  runSettled: boolean;
 }) {
   const [activityState, dispatchActivity] = useReducer(
     stageActivityReducer,
@@ -2385,8 +2454,6 @@ function RunStageActivity({
       selectedStage={selectedStage}
       stages={stages}
       runStart={runStart}
-      inference={inference}
-      runSettled={runSettled}
       tab={tab}
       selectedKinds={selectedKinds}
       selectedDebugCategories={selectedDebugCategories}
@@ -2438,8 +2505,6 @@ export default function RunStages() {
     isAgentStage && selectedStageId
       ? runStateQuery.data?.stages[selectedStageId]
       : undefined;
-  const runStatusKind = runQuery.data?.lifecycle.status.kind;
-  const runSettled = isTerminalRunStatus(runStatusKind);
 
   if (!id || !selectedStage) {
     return (
@@ -2491,8 +2556,6 @@ export default function RunStages() {
         selectedStage={selectedStage}
         stages={stages}
         runStart={runStart}
-        inference={stageProjection?.inference}
-        runSettled={runSettled}
       />
     </div>
   );

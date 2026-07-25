@@ -114,6 +114,7 @@ describe("eventsToActivity", () => {
         inputTokens: 0,
         outputTokens: 0,
         toolCallCount: null,
+        reasoning: null,
       },
     ]);
 
@@ -131,6 +132,7 @@ describe("eventsToActivity", () => {
         inputTokens: 0,
         outputTokens: 0,
         toolCallCount: null,
+        reasoning: null,
       },
     ]);
   });
@@ -390,6 +392,7 @@ describe("eventsToActivity", () => {
         inputTokens: 120,
         outputTokens: 30,
         toolCallCount: null,
+        reasoning: null,
       },
     ]);
   });
@@ -438,6 +441,7 @@ describe("eventsToActivity", () => {
         inputTokens: 10,
         outputTokens: 5,
         toolCallCount: null,
+        reasoning: null,
       },
     ]);
   });
@@ -465,8 +469,52 @@ describe("eventsToActivity", () => {
         inputTokens: 0,
         outputTokens: 4,
         toolCallCount: null,
+        reasoning: null,
       },
     ]);
+  });
+
+  test("reads disclosed reasoning off agent.message", () => {
+    function reasoningOf(properties: Record<string, unknown>) {
+      const turns = eventsToActivity(
+        [
+          envelope(1, {
+            event: "agent.message",
+            stage_id: "plan@1",
+            node_id: "plan",
+            properties,
+          }),
+        ],
+        "plan@1",
+      );
+      expect(turns[0].kind).toBe("assistant");
+      return turns[0].kind === "assistant" ? turns[0].reasoning : undefined;
+    }
+
+    expect(
+      reasoningOf({
+        text: "Done.",
+        reasoning: { summary: "Checked the config", trace: "step one…" },
+      }),
+    ).toEqual({ summary: "Checked the config", trace: "step one…" });
+
+    // Anthropic thinking arrives as a trace with no summary.
+    expect(
+      reasoningOf({ text: "Done.", reasoning: { trace: "step one…" } }),
+    ).toEqual({ trace: "step one…" });
+    expect(
+      reasoningOf({
+        text: "Done.",
+        reasoning: { summary: "Checked the config" },
+      }),
+    ).toEqual({ summary: "Checked the config" });
+
+    expect(reasoningOf({ text: "Done." })).toBe(null);
+    // A provider that sends the key but nothing usable reads as "none".
+    expect(reasoningOf({ text: "Done.", reasoning: {} })).toBe(null);
+    expect(
+      reasoningOf({ text: "Done.", reasoning: { summary: "", trace: "" } }),
+    ).toBe(null);
   });
 
   test("formatStageModelUsageLabel includes reasoning effort when present", () => {
@@ -738,6 +786,7 @@ describe("groupConsecutiveTools", () => {
       inputTokens: 0,
       outputTokens: 0,
       toolCallCount: null,
+      reasoning: null,
     };
     const c = toolTurn({ ts: "2026-04-09T12:00:03Z", toolName: "shell" });
     const result = groupConsecutiveTools([
@@ -815,6 +864,8 @@ describe("buildChatItems", () => {
       content,
       inputTokens: 0,
       outputTokens: 0,
+      toolCallCount: null,
+      reasoning: null,
     };
   }
 
@@ -884,19 +935,6 @@ describe("buildChatItems", () => {
 });
 
 describe("buildStageActivity pending tools", () => {
-  test("records watchdog settlement only for the selected stage", () => {
-    const events: EventEnvelope[] = [
-      envelope(1, {
-        event: "watchdog.timeout",
-        stage_id: "plan@1",
-        node_id: "plan",
-      }),
-    ];
-
-    expect(buildStageActivity(events, "plan@1").watchdogTimedOut).toBe(true);
-    expect(buildStageActivity(events, "code@1").watchdogTimedOut).toBe(false);
-  });
-
   test("returns started-but-not-completed calls for the stage", () => {
     const events: EventEnvelope[] = [
       envelope(1, {
@@ -1045,6 +1083,7 @@ describe("buildThreadDnaItems", () => {
         inputTokens: 0,
         outputTokens: 0,
         toolCallCount: null,
+        reasoning: null,
       },
       selection: { kind: "single" as const, turnIndex },
     };
@@ -1229,6 +1268,7 @@ describe("tool-call-only agent responses", () => {
         inputTokens: 4200,
         outputTokens: 96,
         toolCallCount: 2,
+        reasoning: null,
       },
     ]);
   });
@@ -1265,6 +1305,7 @@ describe("tool-call-only agent responses", () => {
       inputTokens: 0,
       outputTokens: 0,
       toolCallCount: 3,
+      reasoning: null,
     };
     const withOneTool = { ...withTools, toolCallCount: 1 };
     const withoutCount = { ...withTools, toolCallCount: null };
