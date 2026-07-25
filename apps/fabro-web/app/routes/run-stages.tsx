@@ -31,7 +31,6 @@ import type {
   ThreadDnaSelection,
 } from "../components/event-debug";
 import { StageContext } from "../components/stage-context";
-import { StageInferenceIndicator } from "../components/stage-inference-indicator";
 import { StageInsightsSidebar } from "../components/stage-insights-sidebar";
 import { StageSidebar } from "../components/stage-sidebar";
 import type { Stage } from "../components/stage-sidebar";
@@ -73,7 +72,6 @@ import {
   useRunStages,
   useRunState,
 } from "../lib/queries";
-import { isTerminalRunStatus } from "../lib/run-actions";
 import {
   STAGE_ACTIVITY_EVENT_TYPES,
   type StageActivityEventType,
@@ -86,7 +84,6 @@ import { getNumber, getString, type UnknownRecord } from "../lib/unknown";
 import type {
   EventEnvelope,
   StageHandler,
-  StageInferenceProjection,
   StageModelUsage,
 } from "@qltysh/fabro-api-client";
 
@@ -271,7 +268,6 @@ export interface PendingToolCall {
 interface StageActivity {
   turns: TurnType[];
   pendingTools: PendingToolCall[];
-  watchdogTimedOut: boolean;
 }
 
 interface PendingCommand {
@@ -287,15 +283,10 @@ export function buildStageActivity(
   const pendingTools = new Map<string, PendingTool>();
   let pendingCommand: PendingCommand | undefined;
   let sawAssistantMessage = false;
-  let watchdogTimedOut = false;
 
   for (const e of events) {
     const eventName = e.event;
     if (activityEventStageId(e) !== stageId) {
-      continue;
-    }
-    if (eventName === "watchdog.timeout") {
-      watchdogTimedOut = true;
       continue;
     }
     if (
@@ -452,7 +443,6 @@ export function buildStageActivity(
 
   return {
     turns,
-    watchdogTimedOut,
     pendingTools: Array.from(pendingTools, ([toolCallId, tool]) => ({
       toolCallId,
       toolName: tool.toolName,
@@ -2075,8 +2065,6 @@ function RunStageActivityStage({
   selectedStage,
   stages,
   runStart,
-  inference,
-  runSettled,
   tab,
   selectedKinds,
   selectedDebugCategories,
@@ -2090,8 +2078,6 @@ function RunStageActivityStage({
   selectedStage: Stage;
   stages: Stage[];
   runStart: string | undefined;
-  inference: StageInferenceProjection | null | undefined;
-  runSettled: boolean;
   tab: EventsTab;
   selectedKinds: EventKind[];
   selectedDebugCategories: DebugCategory[];
@@ -2103,15 +2089,11 @@ function RunStageActivityStage({
 }) {
   const selectedStageId = selectedStage.id;
   const stageEventsQuery = useRunStageEvents(runId, selectedStageId);
-  // An open bracket on a run that can no longer advance means we never learned
-  // how the request ended, not that it is still working. The watchdog stays
-  // the authority on "actually stuck", so its timeout settles the readout too.
   const activity = useMemo(
     () => buildStageActivity(stageEventsQuery.data ?? [], selectedStageId),
     [stageEventsQuery.data, selectedStageId],
   );
   const { turns } = activity;
-  const inferenceSettled = runSettled || activity.watchdogTimedOut;
   const renderer: StageRenderer = selectStageRenderer(selectedStage.handler);
   const debugEvents = useMemo<EventEnvelope[]>(() => {
     return (stageEventsQuery.data ?? []).filter(
@@ -2259,11 +2241,6 @@ function RunStageActivityStage({
                 </Link>
               </p>
             )}
-            <StageInferenceIndicator
-              inference={inference}
-              settled={inferenceSettled}
-            />
-
             <EventsToolbar
               tab={effectiveTab}
               renderer={renderer}
@@ -2361,15 +2338,11 @@ function RunStageActivity({
   selectedStage,
   stages,
   runStart,
-  inference,
-  runSettled,
 }: {
   runId: string;
   selectedStage: Stage;
   stages: Stage[];
   runStart: string | undefined;
-  inference: StageInferenceProjection | null | undefined;
-  runSettled: boolean;
 }) {
   const [activityState, dispatchActivity] = useReducer(
     stageActivityReducer,
@@ -2385,8 +2358,6 @@ function RunStageActivity({
       selectedStage={selectedStage}
       stages={stages}
       runStart={runStart}
-      inference={inference}
-      runSettled={runSettled}
       tab={tab}
       selectedKinds={selectedKinds}
       selectedDebugCategories={selectedDebugCategories}
@@ -2438,8 +2409,6 @@ export default function RunStages() {
     isAgentStage && selectedStageId
       ? runStateQuery.data?.stages[selectedStageId]
       : undefined;
-  const runStatusKind = runQuery.data?.lifecycle.status.kind;
-  const runSettled = isTerminalRunStatus(runStatusKind);
 
   if (!id || !selectedStage) {
     return (
@@ -2491,8 +2460,6 @@ export default function RunStages() {
         selectedStage={selectedStage}
         stages={stages}
         runStart={runStart}
-        inference={stageProjection?.inference}
-        runSettled={runSettled}
       />
     </div>
   );
