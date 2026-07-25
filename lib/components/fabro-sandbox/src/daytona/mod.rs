@@ -60,8 +60,8 @@ pub(crate) const DAYTONA_DASHBOARD_SANDBOXES_URL: &str =
     "https://app.daytona.io/dashboard/sandboxes";
 const FABRO_SANDBOX_USER_AGENT: &str = concat!("fabro-sandbox/", env!("CARGO_PKG_VERSION"));
 const DAYTONA_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
-/// Upper bound on `DaytonaSession::close` so a stalled Daytona REST call cannot
-/// block cancellation/timeout paths from returning.
+/// Upper bound on explicit and Drop-triggered Daytona session deletion so a
+/// stalled REST call cannot block cancellation/timeout paths indefinitely.
 const DAYTONA_SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Permissions a Daytona API key needs for Fabro's snapshot and sandbox flow.
@@ -573,68 +573,85 @@ impl DaytonaSandbox {
     /// Costs one session round trip plus a single status poll per sandbox
     /// lifecycle transition. `DAYTONA_PROBE_TIMEOUT` is the outer backstop for
     /// a stalled REST call; the inner [`BASH_PROBE_TIMEOUT_MS`] is the deadline
-    /// for the command itself and lets the session close cleanly.
+    /// for the command itself. Session cleanup runs outside that deadline under
+    /// its own bounded timeout.
     async fn probe_bash_session(sandbox: &daytona_sdk::Sandbox) -> crate::Result<()> {
-        let execution =
-            match time::timeout(DAYTONA_PROBE_TIMEOUT, Self::run_bash_session_probe(sandbox)).await
-            {
-                Ok(result) => result,
-                Err(_) => Err(crate::Error::message(format!(
-                    "Daytona Bash session check timed out after {}s",
-                    DAYTONA_PROBE_TIMEOUT.as_secs()
-                ))),
-            };
+        let deadline = time::Instant::now() + DAYTONA_PROBE_TIMEOUT;
+        let timeout_error = || {
+            crate::Error::message(format!(
+                "Daytona Bash session check timed out after {}s",
+                DAYTONA_PROBE_TIMEOUT.as_secs()
+            ))
+        };
+        let mut session = match time::timeout_at(deadline, DaytonaSession::create(sandbox)).await {
+            Ok(Ok(session)) => session,
+            Ok(Err(err)) => return daytona_bash_session_probe_outcome(Err(err)),
+            Err(_) => return daytona_bash_session_probe_outcome(Err(timeout_error())),
+        };
 
+        let execution =
+            match time::timeout_at(deadline, Self::run_bash_session_probe(&session)).await {
+                Ok(result) => result,
+                Err(_) => Err(timeout_error()),
+            };
+        let close_reason = if execution.is_ok() {
+            "bash session probe finished"
+        } else {
+            "bash session probe failure"
+        };
+        session.close(close_reason).await;
         daytona_bash_session_probe_outcome(execution)
     }
 
     /// Run one probe command through a Daytona session and collect its result.
-    async fn run_bash_session_probe(sandbox: &daytona_sdk::Sandbox) -> crate::Result<ExecResult> {
+    async fn run_bash_session_probe(session: &DaytonaSession) -> crate::Result<ExecResult> {
         let start = Instant::now();
-        let mut session = DaytonaSession::create(sandbox).await?;
-
-        let session_exec = match session
-            .execute(&bash_session_probe_command(), true, true)
+        let session_exec = session
+            .execute(
+                &build_bash_session_command(BASH_PROBE_SCRIPT, "/", None),
+                true,
+                true,
+            )
             .await
-        {
-            Ok(result) => result,
-            Err(err) => {
-                session.close("bash session probe start failure").await;
-                return Err(crate::Error::context(
-                    "Failed to execute Daytona session command",
-                    err,
-                ));
-            }
-        };
+            .map_err(|err| {
+                crate::Error::context("Failed to execute Daytona session command", err)
+            })?;
+
+        if let Some(exit_code) = session_exec.exit_code {
+            return Ok(ExecResult {
+                stdout:      session_exec
+                    .stdout
+                    .or(session_exec.output)
+                    .unwrap_or_default(),
+                stderr:      session_exec.stderr.unwrap_or_default(),
+                exit_code:   Some(exit_code),
+                termination: CommandTermination::Exited,
+                duration_ms: elapsed_ms(start),
+            });
+        }
         let command_id = session_exec.cmd_id;
 
-        let outcome = match wait_for_completion(
-            &session,
+        let outcome = wait_for_completion(
+            session,
             &command_id,
-            session_exec.exit_code,
+            None,
             Some(BASH_PROBE_TIMEOUT_MS),
             CancellationToken::new(),
-            None,
         )
-        .await
-        {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                session.close("bash session probe poll failure").await;
-                return Err(err);
-            }
-        };
+        .await?;
 
         let logs = match outcome.final_logs {
             Some(logs) => Some(logs),
             None => session.fetch_logs(&command_id).await,
         };
-        session.close("bash session probe finished").await;
+        let (stdout, stderr) = logs
+            .map(|logs| (logs.stdout, logs.stderr))
+            .unwrap_or_default();
 
         Ok(ExecResult {
-            stdout:      logs.as_ref().map(|l| l.stdout.clone()).unwrap_or_default(),
-            stderr:      logs.as_ref().map(|l| l.stderr.clone()).unwrap_or_default(),
-            exit_code:   outcome.exit_code,
+            stdout,
+            stderr,
+            exit_code: outcome.exit_code,
             termination: outcome.termination,
             duration_ms: elapsed_ms(start),
         })
@@ -1823,8 +1840,7 @@ impl Sandbox for DaytonaSandbox {
 
         let mut session = DaytonaSession::create(sandbox).await?;
 
-        let session_command =
-            wrap_bash_session_script(&build_bash_session_script(command, &cwd, env_vars));
+        let session_command = build_bash_session_command(command, &cwd, env_vars);
         let session_exec = match session.execute(&session_command, true, true).await {
             Ok(result) => result,
             Err(err) => {
@@ -1907,12 +1923,12 @@ impl Sandbox for DaytonaSandbox {
             session_exec.exit_code,
             timeout_ms,
             cancel_token.unwrap_or_default(),
-            Some(&mut stream_task),
         )
         .await
         {
             Ok(outcome) => outcome,
             Err(err) => {
+                stream_task.abort();
                 session.close("status poll failure").await;
                 return Err(err);
             }
@@ -2139,16 +2155,15 @@ async fn finish_daytona_log_stream(
 
 /// RAII wrapper around a Daytona toolbox session.
 ///
-/// Holds the per-session [`ProcessService`] handle and the session id, and
-/// guarantees the session is deleted exactly once. Callers should invoke
-/// [`close`] on every path. If a `DaytonaSession` is dropped while still
-/// active, [`Drop`] spawns a cleanup task on the current Tokio runtime as a
-/// safety net (matching the [`DetachedRunBootstrapGuard`] pattern in
-/// `fabro-workflow`).
+/// Holds the per-session [`ProcessService`] handle and the session id. Callers
+/// should invoke [`close`] on every path. If that future is cancelled, or a
+/// `DaytonaSession` is otherwise dropped while it still owns its process
+/// service, [`Drop`] spawns a bounded cleanup task on the current Tokio runtime
+/// as a safety net (matching the
+/// [`DetachedRunBootstrapGuard`] pattern in `fabro-workflow`).
 struct DaytonaSession {
     process_svc: Option<daytona_sdk::ProcessService>,
     session_id:  String,
-    active:      bool,
 }
 
 impl DaytonaSession {
@@ -2165,7 +2180,6 @@ impl DaytonaSession {
         Ok(Self {
             process_svc: Some(process_svc),
             session_id,
-            active: true,
         })
     }
 
@@ -2204,40 +2218,43 @@ impl DaytonaSession {
         fetch_daytona_session_logs(svc, &self.session_id, command_id).await
     }
 
-    /// Idempotent: a second call after `active=false` is a no-op.
+    /// Idempotent: a second call after the process service is consumed is a
+    /// no-op.
     ///
     /// `delete_session` is bounded by [`DAYTONA_SESSION_CLOSE_TIMEOUT`] so a
     /// stalled Daytona REST call cannot block cancellation paths indefinitely.
     async fn close(&mut self, reason: &'static str) {
-        if !self.active {
+        let Some(svc) = self.process_svc.as_ref() else {
             return;
-        }
-        self.active = false;
-        if let Some(svc) = self.process_svc.take() {
-            match time::timeout(
-                DAYTONA_SESSION_CLOSE_TIMEOUT,
-                svc.delete_session(&self.session_id),
-            )
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => {
-                    tracing::warn!(
-                        error = %err,
-                        session_id = %self.session_id,
-                        reason,
-                        "failed to delete Daytona session"
-                    );
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        session_id = %self.session_id,
-                        reason,
-                        timeout_ms = u64::try_from(DAYTONA_SESSION_CLOSE_TIMEOUT.as_millis())
-                            .unwrap_or(u64::MAX),
-                        "timed out deleting Daytona session"
-                    );
-                }
+        };
+        let deletion = time::timeout(
+            DAYTONA_SESSION_CLOSE_TIMEOUT,
+            svc.delete_session(&self.session_id),
+        )
+        .await;
+
+        // Keep the service owned until the delete future completes. If this
+        // method is cancelled at the await above, Drop still has everything it
+        // needs to retry cleanup.
+        self.process_svc.take();
+        match deletion {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    error = %err,
+                    session_id = %self.session_id,
+                    reason,
+                    "failed to delete Daytona session"
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    session_id = %self.session_id,
+                    reason,
+                    timeout_ms = u64::try_from(DAYTONA_SESSION_CLOSE_TIMEOUT.as_millis())
+                        .unwrap_or(u64::MAX),
+                    "timed out deleting Daytona session"
+                );
             }
         }
     }
@@ -2245,24 +2262,40 @@ impl DaytonaSession {
 
 impl Drop for DaytonaSession {
     fn drop(&mut self) {
-        if !self.active {
+        let Some(svc) = self.process_svc.take() else {
             return;
-        }
-        let svc = self.process_svc.take();
+        };
         let session_id = std::mem::take(&mut self.session_id);
-        match (svc, Handle::try_current()) {
-            (Some(svc), Ok(handle)) => {
+        match Handle::try_current() {
+            Ok(handle) => {
                 handle.spawn(async move {
-                    if let Err(err) = svc.delete_session(&session_id).await {
-                        tracing::warn!(
-                            error = %err,
-                            session_id,
-                            "Daytona session leaked; deleted from Drop"
-                        );
+                    match time::timeout(
+                        DAYTONA_SESSION_CLOSE_TIMEOUT,
+                        svc.delete_session(&session_id),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            tracing::warn!(
+                                error = %err,
+                                session_id,
+                                "Daytona session leaked; failed to delete from Drop"
+                            );
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                session_id,
+                                timeout_ms =
+                                    u64::try_from(DAYTONA_SESSION_CLOSE_TIMEOUT.as_millis())
+                                        .unwrap_or(u64::MAX),
+                                "Daytona session leaked; timed out deleting from Drop"
+                            );
+                        }
                     }
                 });
             }
-            _ => {
+            Err(_) => {
                 tracing::error!(session_id, "Daytona session leaked; no runtime to clean up");
             }
         }
@@ -2276,18 +2309,14 @@ struct WaitOutcome {
 }
 
 /// Wait for the session command to terminate by polling status, the timeout
-/// timer, and the cancel token. On status-poll failure, aborts `stream_task`
-/// and returns an error; the caller is responsible for closing the session.
-///
-/// `stream_task` is `None` for callers that collect logs after the fact rather
-/// than streaming them, such as the session Bash probe.
+/// timer, and the cancel token. The caller owns any associated log-stream task
+/// and is responsible for aborting it and closing the session on poll failure.
 async fn wait_for_completion(
     session: &DaytonaSession,
     command_id: &str,
     initial_exit_code: Option<i32>,
     timeout_ms: Option<u64>,
     cancel_token: CancellationToken,
-    mut stream_task: Option<&mut JoinHandle<Result<(), DaytonaError>>>,
 ) -> crate::Result<WaitOutcome> {
     if let Some(code) = initial_exit_code {
         return Ok(WaitOutcome {
@@ -2305,9 +2334,6 @@ async fn wait_for_completion(
                 let status = match session.get_command_status(command_id).await {
                     Ok(status) => status,
                     Err(err) => {
-                        if let Some(stream_task) = stream_task.as_mut() {
-                            stream_task.abort();
-                        }
                         return Err(crate::Error::context(
                             "Failed to get Daytona session command status",
                             err,
@@ -2519,14 +2545,17 @@ fn wrap_bash_session_script(script: &str) -> String {
     format!("{REMOTE_BASH} -c {}", shell_quote(script))
 }
 
-/// Build the session command the streaming Bash probe submits.
+/// Build a command for Daytona's streaming session transport.
 ///
-/// Shares [`build_bash_session_script`] and [`wrap_bash_session_script`] with
-/// [`Sandbox::exec_command_streaming`] so the probe cannot pass against a
-/// transport the real path no longer uses. `/` is the working directory
-/// because a freshly created sandbox has no workspace yet.
-fn bash_session_probe_command() -> String {
-    wrap_bash_session_script(&build_bash_session_script(BASH_PROBE_SCRIPT, "/", None))
+/// Both [`Sandbox::exec_command_streaming`] and the lifecycle probe call this
+/// helper, so they cannot drift onto different script construction or Bash
+/// wrappers.
+fn build_bash_session_command(
+    command: &str,
+    cwd: &str,
+    env_vars: Option<&HashMap<String, String>>,
+) -> String {
+    wrap_bash_session_script(&build_bash_session_script(command, cwd, env_vars))
 }
 
 #[cfg(test)]
@@ -3274,26 +3303,15 @@ mod tests {
     fn bash_session_probe_outcome_rejects_echoed_script_source() {
         let echoed = daytona_bash_session_probe_outcome(Ok(bash_probe_result(
             0,
-            bash_session_probe_command(),
+            build_bash_session_command(BASH_PROBE_SCRIPT, "/", None),
         )));
 
         assert!(echoed.is_err());
     }
 
-    /// A probe that built its own command could pass while the streaming path
-    /// used something else entirely, which is how the `exec` regression reached
-    /// a release with a green lifecycle check.
     #[test]
-    fn bash_session_probe_uses_the_streaming_command_construction() {
-        assert_eq!(
-            bash_session_probe_command(),
-            wrap_bash_session_script(&build_bash_session_script(BASH_PROBE_SCRIPT, "/", None)),
-        );
-    }
-
-    #[test]
-    fn bash_session_probe_command_enters_bash_once_without_exec() {
-        let command = bash_session_probe_command();
+    fn bash_session_command_enters_bash_once_without_exec() {
+        let command = build_bash_session_command(BASH_PROBE_SCRIPT, "/", None);
 
         assert!(
             command.starts_with(&format!("{REMOTE_BASH} -c ")),
