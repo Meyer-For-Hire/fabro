@@ -164,6 +164,10 @@ pub(super) enum ProgressEvent {
         preserved_turn_count: u64,
         tracked_file_count:   u64,
     },
+    CompactionFailed {
+        stage_node_id: String,
+        error:         String,
+    },
     LlmRetry {
         stage_node_id: String,
         model:         String,
@@ -360,6 +364,12 @@ pub(super) fn from_run_event(stored: &RunEvent) -> Option<ProgressEvent> {
             preserved_turn_count: props.preserved_turn_count as u64,
             tracked_file_count:   props.tracked_file_count as u64,
         }),
+        EventBody::AgentError(props) => {
+            display_compaction_error(&props.error).map(|error| ProgressEvent::CompactionFailed {
+                stage_node_id: node_id,
+                error,
+            })
+        }
         EventBody::AgentLlmRetry(props) => {
             #[allow(
                 clippy::cast_possible_truncation,
@@ -420,6 +430,11 @@ pub(super) fn from_run_event(stored: &RunEvent) -> Option<ProgressEvent> {
 pub(super) fn from_json_line(line: &str) -> Option<ProgressEvent> {
     let stored = RunEvent::from_json_str(line).ok()?;
     from_run_event(&stored)
+}
+
+fn display_compaction_error(value: &Value) -> Option<String> {
+    let error = serde_json::from_value::<fabro_agent::Error>(value.clone()).ok()?;
+    matches!(&error, fabro_agent::Error::Compaction(_)).then(|| error.to_string())
 }
 
 fn display_value(value: &Value) -> Option<String> {

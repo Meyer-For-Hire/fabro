@@ -316,6 +316,13 @@ impl ProgressUI {
                     tracked_file_count,
                 );
             }
+            ProgressEvent::CompactionFailed {
+                stage_node_id,
+                error,
+            } => {
+                self.stage
+                    .on_compaction_failed(renderer, &stage_node_id, &error);
+            }
             ProgressEvent::LlmRetry {
                 stage_node_id,
                 model,
@@ -676,6 +683,32 @@ mod tests {
                 tracked_file_count:     3,
             }),
         );
+        assert!(ui.stage.active_stages["s1"].compaction_bar.is_none());
+    }
+
+    #[test]
+    fn compaction_failure_clears_bar() {
+        let mut ui = ProgressUI::new(true, false);
+
+        emit(&mut ui, stage_started("s1", "Build"));
+        emit(
+            &mut ui,
+            agent_event("s1", AgentEvent::CompactionStarted {
+                estimated_tokens:    5000,
+                context_window_size: 8000,
+            }),
+        );
+        assert!(ui.stage.active_stages["s1"].compaction_bar.is_some());
+
+        emit(
+            &mut ui,
+            agent_event("s1", AgentEvent::Error {
+                error: fabro_agent::Error::Compaction(fabro_agent::CompactionError::EmptySummary {
+                    summarized_turn_count: 14,
+                }),
+            }),
+        );
+
         assert!(ui.stage.active_stages["s1"].compaction_bar.is_none());
     }
 

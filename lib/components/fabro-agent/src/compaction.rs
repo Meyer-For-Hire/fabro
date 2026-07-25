@@ -5,24 +5,13 @@ use fabro_llm::types::{Message as LlmMessage, Request};
 use tracing::debug;
 
 use crate::agent_profile::AgentProfile;
-use crate::error::Error;
+use crate::error::{CompactionError, Error};
 use crate::event::Emitter;
 use crate::file_tracker::FileTracker;
 use crate::history::History;
 use crate::types::{AgentEvent, Message};
 
 const APPROX_CHARS_PER_TOKEN: usize = 4;
-
-/// Minimum length, in bytes, of a usable compaction summary after trimming.
-///
-/// A summary is traded for many turns of conversation, so anything shorter
-/// than a single source file path
-/// (`lib/components/fabro-agent/src/compaction.rs` is 43 bytes) cannot be
-/// carrying that context forward. The bar is set far below any genuine summary
-/// on purpose: this exists to catch degenerate responses, not to judge summary
-/// quality. A false refusal leaves the context to keep growing, so the check
-/// must never fire on a real summary.
-const MIN_SUMMARY_LEN: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
@@ -158,25 +147,19 @@ function names, error messages, and exact values. Omit pleasantries and conversa
     let response = llm_client
         .complete(&summary_request)
         .await
-        .map_err(Error::Llm)?;
+        .map_err(CompactionError::Llm)?;
 
     let response_text = response.text();
     let summary_text = response_text.trim();
 
-    // Refuse to compact on a degenerate summary. `compact_from` discards the
-    // summarized turns irreversibly, so an empty or near-empty summary must not
-    // be traded for them: the preamble below would tell the model a handoff
-    // summary exists while it actually runs with no history at all. Empty
-    // completions are provider-independent — a truncated stream, a reasoning
-    // model that spent its whole budget on reasoning, or a rate-limit edge all
-    // produce one. Returning here leaves the history intact; the caller turns
-    // this into an `AgentEvent::Error` and continues the session.
-    if summary_text.len() < MIN_SUMMARY_LEN {
-        return Err(Error::InvalidState(format!(
-            "compaction summary was empty or too short to replace {preserve_start} turns \
-             ({} bytes, minimum {MIN_SUMMARY_LEN}); history left intact",
-            summary_text.len()
-        )));
+    // `compact_from` discards summarized turns irreversibly. Refuse an empty
+    // response before mutating history; trimming also prevents a
+    // whitespace-only response from masquerading as a summary.
+    if summary_text.is_empty() {
+        return Err(CompactionError::EmptySummary {
+            summarized_turn_count: preserve_start,
+        }
+        .into());
     }
 
     debug!(
@@ -601,9 +584,16 @@ mod tests {
                 if details["estimate_method"] == "local_estimate"));
     }
 
+    struct CompactionTestResult {
+        result:         Result<(), Error>,
+        history:        History,
+        original_turns: Vec<fabro_types::SessionMessage>,
+        events:         Vec<AgentEvent>,
+    }
+
     /// Run `compact_context` over a fixed four-turn history against a mock
     /// provider that returns `summary` from the summarization call.
-    async fn compact_with_summary(summary: &str) -> (Result<(), Error>, History, Vec<AgentEvent>) {
+    async fn compact_with_summary(summary: &str) -> CompactionTestResult {
         let mut history = History::default();
         for index in 0..4 {
             history.push(Message::User {
@@ -611,6 +601,7 @@ mod tests {
                 timestamp: SystemTime::now(),
             });
         }
+        let original_turns = history.to_session_messages();
 
         let provider = Arc::new(MockLlmProvider::new(vec![text_response(summary)]));
         let client = make_client(provider).await;
@@ -639,70 +630,69 @@ mod tests {
             events.push(event.event);
         }
 
-        (result, history, events)
+        CompactionTestResult {
+            result,
+            history,
+            original_turns,
+            events,
+        }
     }
 
-    fn assert_history_untouched(history: &History) {
+    fn assert_history_untouched(history: &History, original_turns: &[fabro_types::SessionMessage]) {
         assert_eq!(
-            history.turns().len(),
-            4,
-            "history must not be truncated when the summary is rejected"
-        );
-        assert!(
-            history
-                .turns()
-                .iter()
-                .all(|turn| matches!(turn, Message::User { .. })),
-            "no summary turn should be inserted when the summary is rejected"
+            history.to_session_messages(),
+            original_turns,
+            "history must remain exactly unchanged when the summary is rejected"
         );
     }
 
     #[tokio::test]
-    async fn compaction_refuses_to_truncate_on_empty_summary() {
-        let (result, history, events) = compact_with_summary("").await;
+    async fn compaction_refuses_to_truncate_on_blank_summary() {
+        for summary in ["", "   \n\t  \n "] {
+            let CompactionTestResult {
+                result,
+                history,
+                original_turns,
+                events,
+            } = compact_with_summary(summary).await;
 
-        let err = result.expect_err("empty summary must not report success");
-        assert!(
-            matches!(&err, Error::InvalidState(message) if message.contains("empty or too short")),
-            "unexpected error: {err}"
-        );
+            let err = result.expect_err("blank summary must not report success");
+            assert!(
+                matches!(
+                    &err,
+                    Error::Compaction(CompactionError::EmptySummary {
+                        summarized_turn_count: 3,
+                    })
+                ),
+                "unexpected error: {err}"
+            );
 
-        assert_history_untouched(&history);
-        assert!(
-            !events
-                .iter()
-                .any(|event| matches!(event, AgentEvent::CompactionCompleted { .. })),
-            "CompactionCompleted must not be emitted for a rejected summary"
-        );
+            assert_history_untouched(&history, &original_turns);
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::CompactionStarted { .. })),
+                "CompactionStarted should record the attempted summary request"
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::CompactionCompleted { .. })),
+                "CompactionCompleted must not be emitted for a rejected summary"
+            );
+        }
     }
 
     #[tokio::test]
-    async fn compaction_refuses_to_truncate_on_whitespace_only_summary() {
-        let (result, history, events) = compact_with_summary("   \n\t  \n ").await;
+    async fn compaction_accepts_concise_nonempty_summary() {
+        let CompactionTestResult {
+            result,
+            history,
+            events,
+            ..
+        } = compact_with_summary("Brief handoff.").await;
 
-        let err = result.expect_err("whitespace-only summary must not report success");
-        assert!(
-            matches!(&err, Error::InvalidState(message) if message.contains("empty or too short")),
-            "unexpected error: {err}"
-        );
-
-        assert_history_untouched(&history);
-        assert!(
-            !events
-                .iter()
-                .any(|event| matches!(event, AgentEvent::CompactionCompleted { .. })),
-            "CompactionCompleted must not be emitted for a rejected summary"
-        );
-    }
-
-    #[tokio::test]
-    async fn compaction_replaces_history_on_normal_summary() {
-        let (result, history, events) = compact_with_summary(
-            "## Goal\nAdd a compaction guard.\n\n## Next Steps\nRun the test suite.",
-        )
-        .await;
-
-        result.expect("a normal summary should compact");
+        result.expect("a nonempty summary should compact");
 
         let summary_turn = history
             .turns()
@@ -713,7 +703,7 @@ mod tests {
             })
             .expect("compacted history should contain a summary turn");
         assert!(summary_turn.contains("A different assistant began this task"));
-        assert!(summary_turn.contains("Add a compaction guard."));
+        assert!(summary_turn.contains("Brief handoff."));
 
         assert!(
             events

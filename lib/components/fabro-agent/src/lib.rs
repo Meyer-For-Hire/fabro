@@ -39,7 +39,7 @@ pub use config::{
 };
 #[cfg(feature = "docker")]
 pub use docker_sandbox::{DockerSandbox, DockerSandboxOptions};
-pub use error::{Error, InterruptReason, Result};
+pub use error::{CompactionError, Error, InterruptReason, Result};
 pub use event::Emitter;
 pub use fabro_mcp::config::McpServerSettings;
 pub use fabro_types::SteeringMessage;
