@@ -137,6 +137,7 @@ fn classify_agent_error(err: fabro_agent::Error, allow_failover: bool) -> AgentA
         }
         fabro_agent::Error::Llm(err) => AgentApiErrorDisposition::Terminal(Error::Llm(err)),
         other @ (fabro_agent::Error::SessionClosed
+        | fabro_agent::Error::Compaction(_)
         | fabro_agent::Error::InvalidState(_)
         | fabro_agent::Error::ToolExecution(_)) => AgentApiErrorDisposition::Terminal(
             Error::Precondition(format!("Agent session failed: {other}")),
