@@ -12,6 +12,7 @@ use fabro_types::{
 };
 
 use crate::memory::MemoryDocument;
+use crate::native_tool::NativeTool;
 use crate::skills::{Skill, format_skills_prompt_section};
 use crate::tool_registry::{ToolDefinitionWithSource, ToolSource};
 
@@ -221,7 +222,7 @@ fn memory_prompt_suffix(memory: &[MemoryDocument]) -> String {
 }
 
 fn skills_prompt_suffix(skills: &[Skill]) -> String {
-    let section = format_skills_prompt_section(skills);
+    let section = format_skills_prompt_section(skills, NativeTool::UseSkill.canonical_name());
     if section.is_empty() {
         String::new()
     } else {

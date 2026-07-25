@@ -109,9 +109,16 @@ impl NativeTool {
                 Self::Glob => "Glob",
                 Self::WebSearch => "WebSearch",
                 Self::WebFetch => "FetchURL",
-                // Kimi Code has no counterpart with these semantics: its
-                // TodoList replaces a whole list rather than mutating tasks,
-                // and it has no equivalent of the remaining tools.
+                Self::UseSkill => "Skill",
+                // Deliberately unmapped. Kimi Code's `Agent` launches a
+                // subagent and returns its result; fabro's spawn_agent returns
+                // a handle that send_input, wait, and close_agent then drive.
+                // Borrowing the name without the semantics would promise a
+                // result the tool does not return -- the same mistake as
+                // exposing incremental task tools under a whole-list name.
+                Self::SpawnAgent | Self::SendInput | Self::Wait | Self::CloseAgent => {
+                    self.canonical_name()
+                }
                 other => other.canonical_name(),
             },
         }

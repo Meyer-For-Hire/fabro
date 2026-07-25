@@ -8,6 +8,7 @@ use fabro_types::{AgentToolCategory, AgentToolSource, AgentToolSummary};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{ToolAccessPolicy, ToolExposureMode};
+use crate::native_tool::{NativeTool, ToolVocabulary};
 use crate::sandbox::Sandbox;
 use crate::session::ToolEnvProvider;
 use crate::tool_permissions;
@@ -125,19 +126,52 @@ fn agent_tool_source(source: &ToolSource) -> AgentToolSource {
 }
 
 pub struct ToolRegistry {
-    tools: HashMap<String, RegisteredTool>,
+    tools:      HashMap<String, RegisteredTool>,
+    /// Naming scheme applied to built-in tools as they are registered.
+    ///
+    /// Held by the registry rather than applied as a pass after construction,
+    /// so tools registered later — subagent tools, skills — cannot miss it and
+    /// leave the model with a mixed-vocabulary tool set.
+    vocabulary: ToolVocabulary,
 }
 
 impl ToolRegistry {
     #[must_use]
     pub fn new() -> Self {
+        Self::with_vocabulary(ToolVocabulary::Fabro)
+    }
+
+    /// A registry that exposes built-in tools under `vocabulary`.
+    #[must_use]
+    pub fn with_vocabulary(vocabulary: ToolVocabulary) -> Self {
         Self {
             tools: HashMap::new(),
+            vocabulary,
         }
     }
 
-    pub fn register(&mut self, tool: RegisteredTool) {
+    #[must_use]
+    pub fn vocabulary(&self) -> ToolVocabulary {
+        self.vocabulary
+    }
+
+    pub fn register(&mut self, mut tool: RegisteredTool) {
+        if let Some(native) = NativeTool::from_any_name(&tool.definition.name) {
+            tool.definition.name = native.name(self.vocabulary).to_string();
+        }
         self.tools.insert(tool.definition.name.clone(), tool);
+    }
+
+    /// Replace a built-in tool's description, keeping its executor and schema.
+    ///
+    /// Resolves through the registry's vocabulary, so callers name the tool by
+    /// identity rather than by whatever string it is currently exposed under.
+    pub fn redescribe(&mut self, tool: NativeTool, description: impl Into<String>) {
+        let exposed = tool.name(self.vocabulary);
+        if let Some(mut registered) = self.tools.remove(exposed) {
+            registered.definition.description = description.into();
+            self.tools.insert(exposed.to_string(), registered);
+        }
     }
 
     pub fn unregister(&mut self, name: &str) -> Option<RegisteredTool> {

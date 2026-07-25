@@ -196,16 +196,22 @@ pub fn make_use_skill_tool(skills: Arc<Vec<Skill>>) -> RegisteredTool {
     }
 }
 
-pub fn format_skills_prompt_section(skills: &[Skill]) -> String {
+/// Render the skills section of a system prompt.
+///
+/// `skill_tool` is the name the skill tool is exposed under, which depends on
+/// the profile's vocabulary — telling a model to call a tool it was not given
+/// is worse than omitting the guidance.
+pub fn format_skills_prompt_section(skills: &[Skill], skill_tool: &str) -> String {
     if skills.is_empty() {
         return String::new();
     }
 
     let mut lines = vec![
         "# Available Skills".to_string(),
-        "When the user's request matches a skill below, call the `use_skill` tool \
-         to load its instructions, then follow them."
-            .to_string(),
+        format!(
+            "When the user's request matches a skill below, call the `{skill_tool}` tool \
+             to load its instructions, then follow them."
+        ),
     ];
     for skill in skills {
         if skill.description.is_empty() {
@@ -452,13 +458,13 @@ name: trimmed
 
     #[test]
     fn format_empty() {
-        assert_eq!(format_skills_prompt_section(&[]), "");
+        assert_eq!(format_skills_prompt_section(&[], "use_skill"), "");
     }
 
     #[test]
     fn format_lists_skills() {
         let skills = test_skills();
-        let section = format_skills_prompt_section(&skills);
+        let section = format_skills_prompt_section(&skills, "use_skill");
         assert!(section.contains("# Available Skills"));
         assert!(section.contains("call the `use_skill` tool"));
         assert!(section.contains("- `commit`: Create a commit"));

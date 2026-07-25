@@ -1,8 +1,6 @@
 use std::sync::Arc;
 
-use fabro_llm::types::ToolDefinition;
 use fabro_model::{AgentProfileKind, Catalog, ProviderId};
-use strum::VariantArray;
 
 use super::EnvContext;
 use crate::agent_profile::AgentProfile;
@@ -13,7 +11,7 @@ use crate::sandbox::Sandbox;
 use crate::skills::Skill;
 use crate::todo_runtime::TodoRuntime;
 use crate::todo_tools::make_todo_list_tool;
-use crate::tool_registry::{RegisteredTool, ToolRegistry};
+use crate::tool_registry::ToolRegistry;
 use crate::tools::{WebFetchSummarizer, make_edit_file_tool, register_core_tools};
 
 const CORE_PROMPT: &str = include_str!("prompts/kimi.md.j2");
@@ -39,48 +37,6 @@ files that have not been read, and the call will fail. Prefer Edit for any incre
 change: Write replaces the entire file, so using it to make a small edit discards \
 everything you did not restate.";
 
-/// Expose every registered built-in tool under Kimi Code's names.
-///
-/// Only the exposed name changes: executors, schemas, and the identity that
-/// permissions and telemetry resolve through are untouched, because
-/// `canonical_tool_name` maps every vocabulary back to the same
-/// [`NativeTool`].
-fn apply_vocabulary(registry: &mut ToolRegistry, vocabulary: ToolVocabulary) {
-    for tool in NativeTool::VARIANTS {
-        let exposed = tool.name(vocabulary);
-        if exposed == tool.canonical_name() {
-            continue;
-        }
-        let Some(registered) = registry.unregister(tool.canonical_name()) else {
-            continue;
-        };
-        registry.register(RegisteredTool {
-            definition: ToolDefinition {
-                name: exposed.to_string(),
-                ..registered.definition
-            },
-            ..registered
-        });
-    }
-}
-
-/// Replace a registered tool's description, keeping its executor and schema.
-///
-/// Profiles own their registries, so tailoring wording per model is a local
-/// change and does not affect what other profiles expose.
-fn redescribe(registry: &mut ToolRegistry, tool: NativeTool, description: &str) {
-    let Some(tool) = registry.unregister(tool.canonical_name()) else {
-        return;
-    };
-    registry.register(RegisteredTool {
-        definition: ToolDefinition {
-            description: description.to_string(),
-            ..tool.definition
-        },
-        ..tool
-    });
-}
-
 pub struct KimiProfile {
     base: BaseProfile,
 }
@@ -97,12 +53,14 @@ impl KimiProfile {
         options: &NativeToolOptions,
         summarizer: Option<WebFetchSummarizer>,
     ) -> Self {
-        let mut registry = ToolRegistry::new();
+        // The registry carries the vocabulary, so tools registered later
+        // (subagent tools, skills) are renamed too.
+        let mut registry = ToolRegistry::with_vocabulary(ToolVocabulary::KimiCode);
 
         register_core_tools(&mut registry, options, summarizer);
         registry.register(make_edit_file_tool());
-        redescribe(&mut registry, NativeTool::EditFile, EDIT_FILE_DESCRIPTION);
-        redescribe(&mut registry, NativeTool::WriteFile, WRITE_FILE_DESCRIPTION);
+        registry.redescribe(NativeTool::EditFile, EDIT_FILE_DESCRIPTION);
+        registry.redescribe(NativeTool::WriteFile, WRITE_FILE_DESCRIPTION);
 
         // Kimi Code drives todos with one replace-whole-list call. The
         // Anthropic task tools model the opposite interaction -- incremental
@@ -110,9 +68,6 @@ impl KimiProfile {
         // even though both persist through the same runtime.
         let todo_runtime = Arc::new(TodoRuntime::new());
         registry.register(make_todo_list_tool(todo_runtime));
-
-        // Applied last so every built-in registered above is renamed.
-        apply_vocabulary(&mut registry, ToolVocabulary::KimiCode);
 
         Self {
             base: BaseProfile {
@@ -175,7 +130,8 @@ impl AgentProfile for KimiProfile {
         user_instructions: Option<&str>,
         skills: &[Skill],
     ) -> String {
-        let template = EmbeddedPrompt::new("kimi.md.j2", CORE_PROMPT);
+        let template = EmbeddedPrompt::new("kimi.md.j2", CORE_PROMPT)
+            .with_vocabulary(self.base.registry.vocabulary());
 
         profiles::assemble_system_prompt(
             template,
@@ -194,6 +150,8 @@ mod tests {
     use fabro_types::AgentToolCategory;
 
     use super::*;
+    use crate::skills::make_use_skill_tool;
+    use crate::subagent::{SessionFactory, SubAgentSupervisor};
     use crate::test_support::MockSandbox;
     use crate::tool_permissions::{known_tool_category, tool_category};
 
@@ -278,8 +236,30 @@ mod tests {
                 "{canonical} should have been renamed"
             );
         }
-        // No Kimi Code counterpart, so these keep fabro's names.
         assert!(names.contains(&"TodoList".to_string()));
+    }
+
+    /// Tools registered after the profile is constructed must also land in the
+    /// Kimi vocabulary, or the model sees a mixed-case tool set.
+    #[test]
+    fn post_construction_tools_also_use_kimi_names() {
+        let mut profile = KimiProfile::new("kimi-k3");
+        let factory: SessionFactory = Arc::new(|| panic!("unused"));
+        profile.register_subagent_tools(SubAgentSupervisor::new(3), factory, 0);
+        profile
+            .tool_registry_mut()
+            .register(make_use_skill_tool(Arc::new(vec![Skill {
+                name:        "demo".into(),
+                description: "d".into(),
+                template:    "t".into(),
+            }])));
+
+        let names = profile.tool_registry().names();
+        assert!(names.contains(&"Skill".to_string()), "got {names:?}");
+        assert!(!names.contains(&"use_skill".to_string()), "got {names:?}");
+        // Deliberately not renamed to Kimi Code's `Agent`: fabro's subagent
+        // tools are a supervisor model, not a call-and-return one.
+        assert!(names.contains(&"spawn_agent".to_string()), "got {names:?}");
     }
 
     #[test]

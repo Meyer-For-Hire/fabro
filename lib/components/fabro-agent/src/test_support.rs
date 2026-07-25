@@ -15,6 +15,7 @@ use futures::stream;
 
 use crate::agent_profile::AgentProfile;
 use crate::config::SessionOptions;
+use crate::native_tool::NativeTool;
 use crate::profiles::EnvContext;
 use crate::sandbox::*;
 use crate::session::Session;
@@ -80,7 +81,8 @@ impl AgentProfile for TestProfile {
         user_instructions: Option<&str>,
         skills: &[Skill],
     ) -> String {
-        let skills_section = format_skills_prompt_section(skills);
+        let skills_section =
+            format_skills_prompt_section(skills, NativeTool::UseSkill.canonical_name());
         let skills_part = if skills_section.is_empty() {
             String::new()
         } else {

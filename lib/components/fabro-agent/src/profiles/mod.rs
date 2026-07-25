@@ -15,6 +15,7 @@ pub use openai::OpenAiProfile;
 
 use crate::agent_profile::AgentProfile;
 use crate::config::{NativeToolOptions, ToolSecrets};
+use crate::native_tool::{NativeTool, ToolVocabulary};
 use crate::sandbox::Sandbox;
 use crate::skills::{Skill, format_skills_prompt_section};
 use crate::tool_registry::ToolRegistry;
@@ -125,9 +126,11 @@ pub struct EnvContext {
 /// The environment block is supplied by [`assemble_system_prompt`] and cannot
 /// be overridden by callers.
 pub struct EmbeddedPrompt {
-    name:   &'static str,
-    source: &'static str,
-    inputs: HashMap<String, toml::Value>,
+    name:       &'static str,
+    source:     &'static str,
+    inputs:     HashMap<String, toml::Value>,
+    /// Vocabulary the surrounding prompt sections should name tools in.
+    vocabulary: ToolVocabulary,
 }
 
 impl EmbeddedPrompt {
@@ -137,7 +140,15 @@ impl EmbeddedPrompt {
             name,
             source,
             inputs: HashMap::new(),
+            vocabulary: ToolVocabulary::Fabro,
         }
+    }
+
+    /// Name tools in `vocabulary` in the generated sections.
+    #[must_use]
+    pub fn with_vocabulary(mut self, vocabulary: ToolVocabulary) -> Self {
+        self.vocabulary = vocabulary;
+        self
     }
 
     #[must_use]
@@ -184,6 +195,7 @@ pub fn assemble_system_prompt(
     skills: &[Skill],
 ) -> String {
     let env_block = build_env_context_block_with(env, env_context);
+    let skill_tool = NativeTool::UseSkill.name(template.vocabulary);
     let prompt = template.render(env_block);
 
     let docs_section = if memory.is_empty() {
@@ -192,7 +204,7 @@ pub fn assemble_system_prompt(
         format!("\n\n{}", memory.join("\n\n"))
     };
     let skills_section = {
-        let s = format_skills_prompt_section(skills);
+        let s = format_skills_prompt_section(skills, skill_tool);
         if s.is_empty() {
             String::new()
         } else {
