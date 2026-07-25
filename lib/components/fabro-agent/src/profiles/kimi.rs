@@ -6,7 +6,7 @@ use super::EnvContext;
 use crate::agent_profile::AgentProfile;
 use crate::config::NativeToolOptions;
 use crate::native_tool::{NativeTool, ToolVocabulary};
-use crate::profiles::{self, BaseProfile, EmbeddedPrompt};
+use crate::profiles::{self, BaseProfile, EmbeddedPrompt, kimi_tools};
 use crate::sandbox::Sandbox;
 use crate::skills::Skill;
 use crate::todo_runtime::TodoRuntime;
@@ -30,55 +30,6 @@ never reconstruct it from memory or from an earlier version of the file. old_str
 exact match and unique unless replace_all is true. If the edit fails with 'old_string not found', \
 re-read the file and take the exact text from the fresh output rather than guessing again. \
 Preserve existing indentation.";
-
-const WRITE_FILE_DESCRIPTION: &str = "Create a new file, or completely replace an existing one. \
-Read an existing file with Read before writing to it — this workspace refuses writes to \
-files that have not been read, and the call will fail. Prefer Edit for any incremental \
-change: Write replaces the entire file, so using it to make a small edit discards \
-everything you did not restate.";
-
-const BASH_DESCRIPTION: &str = "Execute a bash command. Use this for shell semantics — pipes, \
-env, processes, git, package managers, build and test runners.
-
-Translate these to a dedicated tool instead:
-- `cat` / `head` / `tail` on a known path → Read
-- `sed` / `awk` for an in-place edit → Edit
-- `echo > file` / heredoc → Write
-- `find` or recursive `ls` to locate files by name → Glob (plain `ls <dir>` is fine)
-- `grep` / `rg` to search file contents → Grep
-
-The dedicated tools cap their output, so they keep large raw dumps out of the conversation. That \
-is why they are worth reaching for whenever one fits.
-
-Output: stdout and stderr are combined and returned as a string, truncated if very long.
-
-Guidelines:
-- Each call runs in a fresh bash process in the working directory. Environment variables and `cd` \
-do NOT persist between calls — use absolute paths, or `cd <dir> && <command>` within one call.
-- Do not run interactive commands, or commands that never exit.
-- A long-running command needs a raised `timeout_ms`, not a retry. The default is \
-{default_timeout_ms}ms and the maximum is {max_timeout_ms}ms. Retrying a command that timed out \
-once will simply time out again.
-- Chain genuinely dependent steps with `&&`. Issue independent read-only commands as separate \
-parallel calls in one response rather than chaining them, so their output stays separate.
-- Quote paths containing spaces.
-- Avoid `..` to reach outside the working directory, and do not modify files outside it unless \
-explicitly asked.
-- Never run commands requiring superuser privileges unless explicitly asked.";
-
-const READ_DESCRIPTION: &str = "Read a text file from the workspace.
-
-Reading a file is also what clears it for writing: Edit and Write refuse a file that has not been \
-read in this session.
-
-- If you have a concrete path, call Read directly. Do not Glob or `ls` first to check that it \
-exists — a missing path returns an error you can handle.
-- When you need several files, emit multiple Read calls in one response rather than one per turn.
-- Returns `<line-number>\\t<content>` per line. Drop the number and tab when you take text for an \
-Edit `old_string`.
-- `limit` defaults to 2000 lines. Page a larger file with `offset` (1-based first line) and \
-`limit`.
-- Use Bash or an MCP tool for binary formats; this tool reads text.";
 
 const GREP_DESCRIPTION: &str = "Search file contents with a regular expression.
 
@@ -129,25 +80,20 @@ impl KimiProfile {
 
         register_core_tools(&mut registry, options, summarizer);
         registry.register(make_edit_file_tool());
+
+        // Read, Write, and Bash differ from fabro's built-ins in what their
+        // parameters mean, not just what they are called, so they are separate
+        // tools rather than renames. Registered after the core set so they
+        // replace it.
+        registry.register(kimi_tools::make_kimi_read_tool());
+        registry.register(kimi_tools::make_kimi_write_tool());
+        registry.register(kimi_tools::make_kimi_bash_tool(
+            options.default_command_timeout_ms,
+            options.max_command_timeout_ms,
+        ));
         registry.redescribe(NativeTool::EditFile, EDIT_FILE_DESCRIPTION);
-        registry.redescribe(NativeTool::WriteFile, WRITE_FILE_DESCRIPTION);
-        registry.redescribe(NativeTool::ReadFile, READ_DESCRIPTION);
         registry.redescribe(NativeTool::Grep, GREP_DESCRIPTION);
         registry.redescribe(NativeTool::Glob, GLOB_DESCRIPTION);
-        // The Bash description quotes the timeouts this profile actually
-        // enforces, so the two cannot drift.
-        registry.redescribe(
-            NativeTool::Shell,
-            BASH_DESCRIPTION
-                .replace(
-                    "{default_timeout_ms}",
-                    &options.default_command_timeout_ms.to_string(),
-                )
-                .replace(
-                    "{max_timeout_ms}",
-                    &options.max_command_timeout_ms.to_string(),
-                ),
-        );
 
         // Kimi Code drives todos with one replace-whole-list call. The
         // Anthropic task tools model the opposite interaction -- incremental
@@ -377,20 +323,22 @@ mod tests {
         for expected in ["→ Read", "→ Edit", "→ Write", "→ Glob", "→ Grep"] {
             assert!(bash.contains(expected), "Bash should map {expected}");
         }
-        // Timeouts are interpolated from the options this profile enforces, so
-        // the description cannot drift from behavior.
+        // Bash takes SECONDS, unlike fabro's millisecond built-in. Assert the
+        // seconds value is quoted and the raw millisecond value is not, which
+        // is what a unit bug would look like.
         let options = NativeToolOptions::for_profile(AgentProfileKind::Kimi);
+        let seconds = (options.default_command_timeout_ms / 1000).to_string();
         assert!(
-            bash.contains(&options.default_command_timeout_ms.to_string()),
-            "Bash should quote the real default timeout"
+            bash.contains(&seconds),
+            "Bash should quote {seconds}s: {bash}"
         );
         assert!(
-            !bash.contains("{default_timeout_ms}"),
-            "placeholder left unrendered"
+            !bash.contains(&options.default_command_timeout_ms.to_string()),
+            "Bash quotes milliseconds, so the unit conversion is wrong: {bash}"
         );
+        assert!(bash.contains("SECONDS"), "{bash}");
         // Fabro has no background shell; promising one would be a lie.
         assert!(!bash.contains("run_in_background"), "{bash}");
-        assert!(!bash.to_lowercase().contains("background task"), "{bash}");
 
         // Read explains that reading is what clears a file for writing.
         assert!(describe("Read").contains("refuse a file that has not been read"));

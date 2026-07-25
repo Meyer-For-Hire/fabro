@@ -78,7 +78,10 @@ pub(crate) fn required_str<'a>(args: &'a serde_json::Value, key: &str) -> Result
         .ok_or_else(|| format!("Missing required parameter: {key}"))
 }
 
-fn optional_usize_arg(args: &serde_json::Value, key: &str) -> Result<Option<usize>, String> {
+pub(crate) fn optional_usize_arg(
+    args: &serde_json::Value,
+    key: &str,
+) -> Result<Option<usize>, String> {
     args.get(key)
         .and_then(serde_json::Value::as_u64)
         .map(|value| {

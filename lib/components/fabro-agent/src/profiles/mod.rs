@@ -6,6 +6,7 @@ use fabro_model::{AgentProfileKind, Catalog, ProviderId};
 pub mod anthropic;
 pub mod gemini;
 pub mod kimi;
+pub mod kimi_tools;
 pub mod openai;
 
 pub use anthropic::AnthropicProfile;
