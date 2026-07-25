@@ -1543,12 +1543,7 @@ mod tests {
                 termination:       ::fabro_types::CommandTermination::Exited,
                 duration_ms:       12,
                 streams_separated: true,
-                exec_output_tail:  Some(::fabro_types::ExecOutputTail {
-                    stdout:           Some("out".to_string()),
-                    stderr:           Some("err".to_string()),
-                    stdout_truncated: false,
-                    stderr_truncated: false,
-                }),
+                exec_output_tail:  Some(exec_tail()),
             },
             session_id:        Some("ses_child".to_string()),
             parent_session_id: Some("ses_parent".to_string()),
@@ -1575,7 +1570,7 @@ mod tests {
         assert_eq!(properties["termination"], "exited");
         assert_eq!(properties["duration_ms"], 12);
         assert_eq!(properties["streams_separated"], true);
-        assert_eq!(properties["exec_output_tail"]["stdout"], "out");
+        assert_eq!(properties["exec_output_tail"]["stdout"], "last stdout line");
         assert_eq!(properties["visit"], 2);
     }
 

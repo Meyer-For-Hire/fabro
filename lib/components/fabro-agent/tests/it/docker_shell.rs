@@ -2,34 +2,22 @@
 //! Docker provider's streaming path, which uses a `bash -lc` supervisor and
 //! separate stdout/stderr channels.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use fabro_agent::event::SessionBoundEmitter;
 use fabro_agent::sandbox::Sandbox;
-use fabro_agent::tool_registry::{AgentEventEmitter, ToolContext};
+use fabro_agent::tool_registry::ToolContext;
 use fabro_agent::tools::make_shell_tool;
 use fabro_agent::types::AgentEvent;
-use fabro_agent::{DockerSandbox, DockerSandboxOptions};
+use fabro_agent::{DockerSandbox, DockerSandboxOptions, Emitter};
 use fabro_types::CommandTermination;
+use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
-
-#[derive(Default)]
-struct RecordingAgentEmitter {
-    events: Mutex<Vec<AgentEvent>>,
-}
-
-impl AgentEventEmitter for RecordingAgentEmitter {
-    fn emit(&self, event: AgentEvent) {
-        self.events
-            .lock()
-            .expect("events lock poisoned")
-            .push(event);
-    }
-}
 
 #[tokio::test]
 #[ignore = "requires real Docker container lifecycle; run explicitly when changing shell tool exec integration"]
 async fn shell_reports_real_docker_process_outcome() {
-    let Ok(sandbox) = DockerSandbox::new(
+    let sandbox = DockerSandbox::new(
         DockerSandboxOptions {
             image: "buildpack-deps:noble".to_string(),
             auto_pull: false,
@@ -40,16 +28,16 @@ async fn shell_reports_real_docker_process_outcome() {
         None,
         None,
         None,
-    ) else {
-        return;
-    };
-    // No Docker daemon or no local image: nothing to prove here.
-    if sandbox.initialize().await.is_err() {
-        return;
-    }
+    )
+    .expect("docker sandbox should construct");
+    sandbox
+        .initialize()
+        .await
+        .expect("docker sandbox should initialize");
 
     let sandbox = Arc::new(sandbox);
-    let emitter = Arc::new(RecordingAgentEmitter::default());
+    let emitter = Emitter::new();
+    let mut receiver = emitter.subscribe();
     let tool = make_shell_tool();
     let result = (tool.executor)(
         serde_json::json!({"command": "printf 'out'; printf 'err' >&2; exit 7"}),
@@ -57,10 +45,14 @@ async fn shell_reports_real_docker_process_outcome() {
             env:                 sandbox.clone() as Arc<dyn Sandbox>,
             cancel:              CancellationToken::new(),
             tool_env_provider:   None,
-            session_id:          None,
-            root_session_id:     None,
-            tool_call_id:        None,
-            agent_event_emitter: Some(emitter.clone()),
+            session_id:          Some("test-session".to_string()),
+            root_session_id:     Some("test-session".to_string()),
+            tool_call_id:        Some("call_1".to_string()),
+            agent_event_emitter: Some(Arc::new(SessionBoundEmitter {
+                emitter,
+                session_id: "test-session".to_string(),
+                tool_call_id: Some("call_1".to_string()),
+            })),
         },
     )
     .await;
@@ -75,9 +67,14 @@ async fn shell_reports_real_docker_process_outcome() {
     assert!(output.contains("stdout:\nout"), "got: {output}");
     assert!(output.contains("stderr:\nerr"), "got: {output}");
 
-    let events = emitter.events.lock().expect("events lock poisoned").clone();
-    assert_eq!(events.len(), 1, "expected one agent event, got {events:?}");
-    match &events[0] {
+    let event = receiver.try_recv().expect("one process event");
+    assert_eq!(event.session_id, "test-session");
+    assert_eq!(event.tool_call_id.as_deref(), Some("call_1"));
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(broadcast::error::TryRecvError::Empty)
+    ));
+    match event.event {
         AgentEvent::ToolProcessCompleted {
             exit_code,
             termination,
@@ -85,10 +82,10 @@ async fn shell_reports_real_docker_process_outcome() {
             exec_output_tail,
             ..
         } => {
-            assert_eq!(*exit_code, Some(7));
-            assert_eq!(*termination, CommandTermination::Exited);
+            assert_eq!(exit_code, Some(7));
+            assert_eq!(termination, CommandTermination::Exited);
             assert!(streams_separated);
-            let tail = exec_output_tail.as_ref().expect("output tail");
+            let tail = exec_output_tail.expect("output tail");
             assert_eq!(tail.stdout.as_deref(), Some("out"));
             assert_eq!(tail.stderr.as_deref(), Some("err"));
         }

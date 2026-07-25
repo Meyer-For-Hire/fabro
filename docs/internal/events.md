@@ -1190,6 +1190,10 @@ or launch failure) and when the tool ran without a session-bound emitter.
 | `duration_ms` | integer | Process duration |
 | `streams_separated` | boolean | `false` when the provider could not separate stdout from stderr; the combined output is then in `exec_output_tail.stdout` |
 | `exec_output_tail` | object | Bounded, redacted output tails; omitted when both streams were empty |
+| `exec_output_tail.stdout` | string | Bounded stdout tail, or combined-output tail when `streams_separated` is `false`; omitted when empty |
+| `exec_output_tail.stderr` | string | Bounded stderr tail; omitted when empty |
+| `exec_output_tail.stdout_truncated` | boolean | `true` when earlier stdout bytes were omitted; omitted when `false` |
+| `exec_output_tail.stderr_truncated` | boolean | `true` when earlier stderr bytes were omitted; omitted when `false` |
 | `visit` | integer | Stage visit |
 
 ### `agent.error`

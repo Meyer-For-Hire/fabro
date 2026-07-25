@@ -8,9 +8,10 @@ use fabro_model::ModelHandle;
 #[cfg(test)]
 use fabro_static::EnvVars;
 use futures::{StreamExt, stream};
+use tokio::task;
 
 use crate::config::NativeToolOptions;
-use crate::sandbox::{CommandOutputCallback, ExecStreamingResult, GrepOptions};
+use crate::sandbox::{ExecStreamingResult, GrepOptions};
 use crate::tool_registry::{RegisteredTool, ToolRegistry, ToolSource};
 use crate::types::AgentEvent;
 
@@ -262,7 +263,7 @@ pub fn make_shell_tool_with_options(options: &NativeToolOptions) -> RegisteredTo
                         None,
                         tool_env.as_ref(),
                         Some(ctx.cancel.clone()),
-                        discard_output_callback(),
+                        None,
                     )
                     .await
                     .map_err(|e| {
@@ -270,15 +271,37 @@ pub fn make_shell_tool_with_options(options: &NativeToolOptions) -> RegisteredTo
                     })?;
 
                 let text = render_shell_result(&streaming);
-                ctx.emit_agent_event(AgentEvent::ToolProcessCompleted {
-                    exit_code:         streaming.result.exit_code,
-                    termination:       streaming.result.termination,
-                    duration_ms:       streaming.result.duration_ms,
-                    streams_separated: streaming.streams_separated,
-                    exec_output_tail:  streaming.result.default_redacted_output_tail(),
-                });
+                let is_success = streaming.result.is_success();
+                if let Some(emitter) = ctx.agent_event_emitter {
+                    let exit_code = streaming.result.exit_code;
+                    let termination = streaming.result.termination;
+                    let duration_ms = streaming.result.duration_ms;
+                    let streams_separated = streaming.streams_separated;
+                    let result = streaming.result;
+                    let exec_output_tail = match task::spawn_blocking(move || {
+                        result.default_redacted_output_tail()
+                    })
+                    .await
+                    {
+                        Ok(exec_output_tail) => exec_output_tail,
+                        Err(err) => {
+                            tracing::warn!(
+                                error = ?err,
+                                "Failed to redact shell process output tail"
+                            );
+                            None
+                        }
+                    };
+                    emitter.emit(AgentEvent::ToolProcessCompleted {
+                        exit_code,
+                        termination,
+                        duration_ms,
+                        streams_separated,
+                        exec_output_tail,
+                    });
+                }
 
-                if streaming.result.is_success() {
+                if is_success {
                     Ok(text)
                 } else {
                     Err(text)
@@ -290,15 +313,8 @@ pub fn make_shell_tool_with_options(options: &NativeToolOptions) -> RegisteredTo
 }
 
 /// Prefix for shell failures that never produced an `ExecResult`, so the model
-/// can tell "the process never ran" apart from "the process ran and failed".
+/// can distinguish missing process diagnostics from a reported process failure.
 const SHELL_NO_PROCESS_RESULT: &str = "Shell command produced no process result";
-
-/// The agent shell tool consumes the streaming exec path for its stream
-/// provenance and partial-output capture, but does not forward live output
-/// deltas onto the agent protocol.
-fn discard_output_callback() -> CommandOutputCallback {
-    Arc::new(|_stream, _bytes| Box::pin(async { Ok(()) }))
-}
 
 /// Renders the model-facing shell result: termination, exit code, duration,
 /// and provider-honest output sections. Metadata stays at the head and
@@ -732,15 +748,18 @@ mod tests {
     use fabro_llm::provider::ProviderAdapter;
     use fabro_model::ProviderId;
     use fabro_types::CommandTermination;
+    use tokio::sync::broadcast;
     use tokio_util::sync::CancellationToken;
 
     use super::*;
     use crate::config::{NativeToolOptions, SessionOptions, ToolSecrets};
+    use crate::event::{Emitter, SessionBoundEmitter};
     use crate::local_sandbox::LocalSandbox;
     use crate::sandbox::*;
     use crate::test_support::MockSandbox;
-    use crate::tool_registry::{AgentEventEmitter, ToolContext};
+    use crate::tool_registry::ToolContext;
     use crate::truncation;
+    use crate::types::SessionEvent;
 
     #[test]
     fn core_tool_descriptions_include_actionable_guidance() {
@@ -1025,33 +1044,6 @@ mod tests {
         assert_eq!(written[0].1, "1 | keep this literal\ngoodbye");
     }
 
-    /// Records the typed agent events a tool emits through its bound emitter.
-    #[derive(Default)]
-    struct RecordingAgentEmitter {
-        events: std::sync::Mutex<Vec<AgentEvent>>,
-    }
-
-    impl RecordingAgentEmitter {
-        fn events(&self) -> Vec<AgentEvent> {
-            self.events.lock().expect("events lock poisoned").clone()
-        }
-
-        fn only_process_event(&self) -> AgentEvent {
-            let events = self.events();
-            assert_eq!(events.len(), 1, "expected one agent event, got {events:?}");
-            events.into_iter().next().expect("one event")
-        }
-    }
-
-    impl AgentEventEmitter for RecordingAgentEmitter {
-        fn emit(&self, event: AgentEvent) {
-            self.events
-                .lock()
-                .expect("events lock poisoned")
-                .push(event);
-        }
-    }
-
     fn shell_context(env: Arc<dyn Sandbox>) -> ToolContext {
         ToolContext {
             env,
@@ -1064,14 +1056,29 @@ mod tests {
         }
     }
 
-    fn shell_context_with_emitter(
-        env: Arc<dyn Sandbox>,
-        emitter: Arc<RecordingAgentEmitter>,
-    ) -> ToolContext {
+    fn shell_context_with_emitter(env: Arc<dyn Sandbox>, emitter: &Emitter) -> ToolContext {
         ToolContext {
-            agent_event_emitter: Some(emitter),
+            session_id: Some("test-session".to_string()),
+            root_session_id: Some("test-session".to_string()),
+            tool_call_id: Some("call_1".to_string()),
+            agent_event_emitter: Some(Arc::new(SessionBoundEmitter {
+                emitter:      emitter.clone(),
+                session_id:   "test-session".to_string(),
+                tool_call_id: Some("call_1".to_string()),
+            })),
             ..shell_context(env)
         }
+    }
+
+    fn only_process_event(receiver: &mut broadcast::Receiver<SessionEvent>) -> AgentEvent {
+        let event = receiver.try_recv().expect("one process event");
+        assert_eq!(event.session_id, "test-session");
+        assert_eq!(event.tool_call_id.as_deref(), Some("call_1"));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        event.event
     }
 
     fn mock_sandbox_with(result: ExecResult) -> Arc<MockSandbox> {
@@ -1223,11 +1230,12 @@ mod tests {
             exec_error: Some("sandbox transport is down".into()),
             ..Default::default()
         });
-        let emitter = Arc::new(RecordingAgentEmitter::default());
+        let emitter = Emitter::new();
+        let mut receiver = emitter.subscribe();
 
         let output = (tool.executor)(
             serde_json::json!({"command": "make test"}),
-            shell_context_with_emitter(env, emitter.clone()),
+            shell_context_with_emitter(env, &emitter),
         )
         .await
         .expect_err("a sandbox transport failure is a failed tool result");
@@ -1241,7 +1249,10 @@ mod tests {
             "got: {output}"
         );
         assert!(!output.contains("Exit code"), "got: {output}");
-        assert!(emitter.events().is_empty(), "got: {:?}", emitter.events());
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]
@@ -1254,15 +1265,16 @@ mod tests {
             termination: CommandTermination::Exited,
             duration_ms: 12,
         });
-        let emitter = Arc::new(RecordingAgentEmitter::default());
+        let emitter = Emitter::new();
+        let mut receiver = emitter.subscribe();
 
         let _ = (tool.executor)(
             serde_json::json!({"command": "printf out; printf err >&2; exit 7"}),
-            shell_context_with_emitter(env, emitter.clone()),
+            shell_context_with_emitter(env, &emitter),
         )
         .await;
 
-        match emitter.only_process_event() {
+        match only_process_event(&mut receiver) {
             AgentEvent::ToolProcessCompleted {
                 exit_code,
                 termination,
@@ -1298,11 +1310,12 @@ mod tests {
             streams_separated: false,
             ..Default::default()
         });
-        let emitter = Arc::new(RecordingAgentEmitter::default());
+        let emitter = Emitter::new();
+        let mut receiver = emitter.subscribe();
 
         let output = (tool.executor)(
             serde_json::json!({"command": "echo interleaved"}),
-            shell_context_with_emitter(env, emitter.clone()),
+            shell_context_with_emitter(env, &emitter),
         )
         .await
         .expect("exit 0 is a successful tool result");
@@ -1312,7 +1325,7 @@ mod tests {
             "got: {output}"
         );
         assert!(!output.contains("stderr:"), "got: {output}");
-        match emitter.only_process_event() {
+        match only_process_event(&mut receiver) {
             AgentEvent::ToolProcessCompleted {
                 streams_separated, ..
             } => assert!(!streams_separated),
@@ -1362,11 +1375,12 @@ mod tests {
         let env: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(
             std::env::current_dir().expect("current dir"),
         ));
-        let emitter = Arc::new(RecordingAgentEmitter::default());
+        let emitter = Emitter::new();
+        let mut receiver = emitter.subscribe();
 
         let output = (tool.executor)(
             serde_json::json!({"command": "printf 'out'; printf 'err' >&2; exit 7"}),
-            shell_context_with_emitter(env, emitter.clone()),
+            shell_context_with_emitter(env, &emitter),
         )
         .await
         .expect_err("exit 7 is a failed tool result");
@@ -1376,7 +1390,7 @@ mod tests {
         assert!(output.contains("stdout:\nout"), "got: {output}");
         assert!(output.contains("stderr:\nerr"), "got: {output}");
 
-        match emitter.only_process_event() {
+        match only_process_event(&mut receiver) {
             AgentEvent::ToolProcessCompleted {
                 exit_code,
                 termination,
@@ -1395,8 +1409,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn shell_public_schema_is_command_timeout_and_description() {
+    #[test]
+    fn shell_public_schema_is_command_timeout_and_description() {
         let tool = make_shell_tool();
         assert_eq!(
             tool.definition.parameters,

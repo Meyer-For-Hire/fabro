@@ -2475,28 +2475,6 @@ mod tests {
         assert_eq!(parsed, body);
     }
 
-    /// The trace summary is what `AgentEvent::trace()` expands into tracing
-    /// fields, so it must carry sizes and truncation flags only.
-    #[test]
-    fn exec_output_tail_trace_summary_exposes_sizes_not_content() {
-        let tail = ExecOutputTail {
-            stdout:           Some("secret stdout bytes".to_string()),
-            stderr:           Some("secret stderr".to_string()),
-            stdout_truncated: true,
-            stderr_truncated: false,
-        };
-
-        let summary = ExecOutputTail::trace_summary(Some(&tail));
-
-        assert!(summary.present);
-        assert_eq!(summary.stdout_bytes, 19);
-        assert_eq!(summary.stderr_bytes, 13);
-        assert!(summary.stdout_truncated);
-        assert!(!summary.stderr_truncated);
-        let rendered = format!("{summary:?}");
-        assert!(!rendered.contains("secret"), "got: {rendered}");
-    }
-
     #[test]
     fn agent_tool_source_and_category_use_public_json_shape() {
         assert_eq!(

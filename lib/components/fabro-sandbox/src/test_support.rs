@@ -9,7 +9,7 @@ use tokio::io::{DuplexStream, duplex};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
-use crate::sandbox::StdioProcessControl;
+use crate::sandbox::{self, StdioProcessControl};
 use crate::{
     DEFAULT_EXEC_OUTPUT_TAIL_BYTES, DirEntry, ExecResult, GrepOptions, Sandbox, SandboxEvent,
     SandboxEventCallback, StderrCollector, StdioProcess, StdioProcessHandle,
@@ -254,7 +254,7 @@ impl Sandbox for MockSandbox {
         working_dir: Option<&str>,
         env_vars: Option<&std::collections::HashMap<String, String>>,
         cancel_token: Option<CancellationToken>,
-        output_callback: crate::CommandOutputCallback,
+        output_callback: Option<crate::CommandOutputCallback>,
     ) -> crate::Result<crate::ExecStreamingResult> {
         let result = self
             .exec_command(
@@ -265,25 +265,7 @@ impl Sandbox for MockSandbox {
                 cancel_token,
             )
             .await?;
-        if !result.stdout.is_empty() {
-            output_callback(
-                fabro_types::CommandOutputStream::Stdout,
-                result.stdout.as_bytes().to_vec(),
-            )
-            .await?;
-        }
-        if !result.stderr.is_empty() {
-            output_callback(
-                fabro_types::CommandOutputStream::Stderr,
-                result.stderr.as_bytes().to_vec(),
-            )
-            .await?;
-        }
-        Ok(crate::ExecStreamingResult {
-            result,
-            streams_separated: self.streams_separated,
-            live_streaming: false,
-        })
+        sandbox::replay_exec_result(result, self.streams_separated, output_callback.as_ref()).await
     }
 
     async fn spawn_stdio_process(
