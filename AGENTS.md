@@ -123,7 +123,7 @@ Fabro is an AI-powered workflow orchestration platform. Workflows are defined as
 - **fabro-util** — Shared utilities (redaction, terminal formatting)
 
 ### TypeScript (`apps/` and `lib/packages/`)
-- **apps/fabro-web** — React 19 + React Router + Vite + Tailwind CSS frontend
+- **apps/fabro-web** — React 19 + React Router + Tailwind CSS frontend, bundled by a custom Bun script (`apps/fabro-web/scripts/build.ts`), not Vite
 - **lib/packages/fabro-api-client** — Auto-generated TypeScript Axios client from OpenAPI spec
 
 ### Key design patterns
