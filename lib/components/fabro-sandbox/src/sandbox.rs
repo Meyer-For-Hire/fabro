@@ -37,8 +37,8 @@ pub(crate) const BASH_ENV_VAR: &str = "BASH_ENV";
 
 /// Marker a successful [`BASH_PROBE_SCRIPT`] run prints on stdout.
 ///
-/// Providers validate the marker rather than trusting a zero exit: an image
-/// whose `/bin/bash` is a `sh` symlink still exits zero for many scripts.
+/// Providers validate the marker rather than trusting a zero exit: a non-Bash
+/// shell can exit zero for simple scripts without satisfying the contract.
 pub(crate) const BASH_PROBE_MARKER: &str = "fabro-bash-ready";
 
 /// Deterministic probe proving a sandbox's interpreter is non-login Bash.
@@ -46,8 +46,8 @@ pub(crate) const BASH_PROBE_MARKER: &str = "fabro-bash-ready";
 /// Run as the argument to `bash -c` during fresh initialization and on
 /// resume/start, before the sandbox is reported usable. It fails when the
 /// interpreter has an ambient `BASH_ENV` startup source, is not Bash, was
-/// started as a login shell, or is in POSIX mode — an image whose `bash` is
-/// really `sh` passes the `BASH_VERSION` check but changes behavior, so the
+/// started as a login shell, or is in POSIX mode. Bash invoked under the name
+/// `sh` still sets `BASH_VERSION` while enabling POSIX behavior, so the full
 /// interpreter contract is checked rather than assumed.
 pub(crate) const BASH_PROBE_SCRIPT: &str = r#"if [ -n "${BASH_ENV:-}" ]; then
   echo 'sandbox interpreter has BASH_ENV startup source configured' >&2
