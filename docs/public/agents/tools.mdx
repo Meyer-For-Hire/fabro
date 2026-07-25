@@ -132,7 +132,7 @@ Searches the web using the Brave Search API.
 | `query` | string | yes | Search query |
 | `max_results` | integer | no | Maximum results (default: 5, max: 20) |
 
-Requires `BRAVE_SEARCH_API_KEY` to be configured for the current runtime. Server-backed sessions read it from the server vault (`fabro secret set BRAVE_SEARCH_API_KEY <key>`); standalone local agent runs can pass it from the invoking shell. Returns numbered results with title, URL, and description.
+Requires `BRAVE_SEARCH_API_KEY` to be configured for the current runtime. Runs read it from the server vault (`fabro secret set BRAVE_SEARCH_API_KEY <key>`) — workers start from a cleared environment and this key is not inherited, so exporting it in the server's shell has no effect. The standalone agent CLI reads it from the invoking shell instead. Returns numbered results with title, URL, and description.
 
 ### web_fetch
 

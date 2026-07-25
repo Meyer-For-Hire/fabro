@@ -33,6 +33,8 @@ describe("StageChatView", () => {
             content: "Finished",
             inputTokens: 0,
             outputTokens: 0,
+            toolCallCount: null,
+            reasoning: null,
           },
           {
             kind: "tool",
@@ -72,6 +74,7 @@ describe("StageChatView", () => {
             inputTokens: 0,
             outputTokens: 0,
             toolCallCount: 1,
+            reasoning: null,
           },
           {
             kind: "tool",
@@ -89,6 +92,7 @@ describe("StageChatView", () => {
             inputTokens: 10,
             outputTokens: 20,
             toolCallCount: null,
+            reasoning: null,
           },
         ]}
         pendingTools={[]}

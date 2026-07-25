@@ -1,4 +1,10 @@
-import { useId, useMemo, useReducer, useState } from "react";
+import {
+  useId,
+  useMemo,
+  useReducer,
+  useState,
+  type ReactNode,
+} from "react";
 import { Link, useParams } from "react-router";
 import {
   ArrowDownTrayIcon,
@@ -88,22 +94,12 @@ import {
 } from "../lib/unknown";
 import type {
   EventEnvelope,
+  ReasoningOutput,
   StageHandler,
   StageModelUsage,
 } from "@qltysh/fabro-api-client";
 
 export const handle = { wide: true, fullHeight: true };
-
-/**
- * Readable reasoning a provider disclosed for one model response: `summary` is
- * the model's own recap, `trace` its verbatim reasoning. Providers send one,
- * the other, or both, and opaque material (signatures, redacted blocks) never
- * reaches the wire, so an absent field means nothing was disclosed.
- */
-export interface TurnReasoning {
-  summary: string | null;
-  trace: string | null;
-}
 
 type TurnType =
   | { kind: "system"; ts: string; content: string }
@@ -118,7 +114,7 @@ type TurnType =
       inputTokens: number;
       outputTokens: number;
       toolCallCount: number | null;
-      reasoning: TurnReasoning | null;
+      reasoning: ReasoningOutput | null;
     }
   | {
       kind: "tool";
@@ -294,15 +290,15 @@ interface PendingCommand {
   script: string;
 }
 
-function readTurnReasoning(props: UnknownRecord): TurnReasoning | null {
+function readTurnReasoning(props: UnknownRecord): ReasoningOutput | null {
   const reasoning = getObject(props, "reasoning");
   if (!reasoning) return null;
   // getString treats "" as absent, so a provider that sends an empty field
   // reads the same as one that sends nothing.
   const summary = getString(reasoning, "summary") ?? null;
   const trace = getString(reasoning, "trace") ?? null;
-  if (!summary && !trace) return null;
-  return { summary, trace };
+  if (summary) return trace ? { summary, trace } : { summary };
+  return trace ? { trace } : null;
 }
 
 export function buildStageActivity(
@@ -1177,39 +1173,60 @@ function ToolGroupRow({
   );
 }
 
-const REASONING_PREVIEW_CHARS = 280;
+const COLLAPSIBLE_PREVIEW_CHARS = 280;
 
 /**
- * Reasoning is raw model output, not authored Markdown, so it renders as
- * preformatted text: a trace's own line breaks are part of what it says, and
- * parsing it as Markdown would eat them along with any leading `#` or `-`.
+ * Shared disclosure for long stage text. By default it preserves raw text;
+ * callers may supply a full-content renderer for authored formats such as
+ * Markdown while retaining the same plain-text preview and accessible toggle.
  */
-function CollapsibleText({ text }: { text: string }) {
+function CollapsibleContent({
+  text,
+  className = "",
+  textClassName = "",
+  renderFull,
+}: {
+  text: string;
+  className?: string;
+  textClassName?: string;
+  renderFull?: (text: string) => ReactNode;
+}) {
   const [expanded, setExpanded] = useState(false);
   const contentId = useId();
-
-  if (text.length <= REASONING_PREVIEW_CHARS) {
-    return <p className="break-words whitespace-pre-wrap">{text}</p>;
-  }
+  const isLong = text.length > COLLAPSIBLE_PREVIEW_CHARS;
+  const preview = isLong
+    ? `${text.slice(0, COLLAPSIBLE_PREVIEW_CHARS).trimEnd()}…`
+    : text;
 
   return (
-    <div className="flex flex-col items-start gap-1.5">
-      <p id={contentId} className="break-words whitespace-pre-wrap">
-        {expanded
-          ? text
-          : `${text.slice(0, REASONING_PREVIEW_CHARS).trimEnd()}…`}
-      </p>
-      <button
-        type="button"
-        aria-controls={contentId}
-        aria-expanded={expanded}
-        onClick={() => setExpanded((current) => !current)}
-        className="text-xs text-teal-500 hover:underline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-teal-500"
-      >
-        {expanded
-          ? "Collapse"
-          : `Show all (${text.length.toLocaleString()} characters)`}
-      </button>
+    <div
+      className={`flex flex-col items-start gap-1.5 ${className}`.trim()}
+    >
+      {/*
+        `w-full` is load-bearing for ChatUserCard. Its `w-fit max-w-[85%]`
+        bubble is measured intrinsically before being clamped, so this wrapper
+        must fill the resolved width to keep prompt text inside the bubble.
+      */}
+      <div id={contentId} className="w-full">
+        {renderFull && (!isLong || expanded) ? (
+          renderFull(text)
+        ) : (
+          <p className={textClassName}>{expanded ? text : preview}</p>
+        )}
+      </div>
+      {isLong && (
+        <button
+          type="button"
+          aria-controls={contentId}
+          aria-expanded={expanded}
+          onClick={() => setExpanded((current) => !current)}
+          className="text-xs text-teal-500 hover:underline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-teal-500"
+        >
+          {expanded
+            ? "Collapse"
+            : `Show all (${text.length.toLocaleString()} characters)`}
+        </button>
+      )}
     </div>
   );
 }
@@ -1231,6 +1248,9 @@ export function EventDetails({
   })();
   const assistantContent =
     turn.kind === "assistant" ? nonBlankAssistantContent(turn) : null;
+  const reasoning = turn.kind === "assistant" ? turn.reasoning : null;
+  const reasoningSummary =
+    reasoning && "summary" in reasoning ? reasoning.summary : null;
 
   return (
     <div className="space-y-5">
@@ -1264,16 +1284,22 @@ export function EventDetails({
             ran: a trace can be thousands of characters, and leading with one
             would push the answer the user clicked on below the fold.
           */}
-          {turn.reasoning?.summary && (
+          {reasoningSummary && (
             <DetailField label="Reasoning">
-              <CollapsibleText text={turn.reasoning.summary} />
+              <CollapsibleContent
+                text={reasoningSummary}
+                textClassName="wrap-break-word whitespace-pre-wrap"
+              />
             </DetailField>
           )}
-          {turn.reasoning?.trace && (
+          {reasoning?.trace && (
             <DetailField
-              label={turn.reasoning.summary ? "Reasoning trace" : "Reasoning"}
+              label={reasoningSummary ? "Reasoning trace" : "Reasoning"}
             >
-              <CollapsibleText text={turn.reasoning.trace} />
+              <CollapsibleContent
+                text={reasoning.trace}
+                textClassName="wrap-break-word whitespace-pre-wrap"
+              />
             </DetailField>
           )}
           {turn.toolCallCount != null && turn.toolCallCount > 0 && (
@@ -1555,49 +1581,17 @@ function ToolGroupChildRow({
   );
 }
 
-const CHAT_PROMPT_PREVIEW_CHARS = 280;
-
 // User-side bubble. The stage prompt (and any steer / pair-user message over
 // the preview limit) collapses to a preview with an expand toggle; expanded
 // content renders as markdown.
 function ChatUserCard({ content }: { content: string }) {
-  const [expanded, setExpanded] = useState(false);
-  const contentId = useId();
-  const isLong = content.length > CHAT_PROMPT_PREVIEW_CHARS;
   return (
-    <div className="flex w-fit max-w-[85%] flex-col items-start gap-1.5 self-end rounded-2xl rounded-br-md bg-panel px-4 py-3">
-      {/*
-        `w-full` is load-bearing. `items-start` keeps the expand button hugging
-        its label, but it also leaves this wrapper intrinsically sized, and the
-        bubble's own `w-fit` width is only clamped to `max-w-[85%]` after that
-        intrinsic pass. The text then keeps the wider pre-clamp measurement and
-        spills past the bubble. Filling the resolved width sidesteps it.
-      */}
-      <div id={contentId} className="w-full">
-        {expanded ? (
-          <Markdown content={content} />
-        ) : (
-          <p className="text-sm break-words whitespace-pre-wrap text-fg-2">
-            {isLong
-              ? `${content.slice(0, CHAT_PROMPT_PREVIEW_CHARS).trimEnd()}…`
-              : content}
-          </p>
-        )}
-      </div>
-      {isLong && (
-        <button
-          type="button"
-          aria-controls={contentId}
-          aria-expanded={expanded}
-          onClick={() => setExpanded((current) => !current)}
-          className="text-xs text-teal-500 hover:underline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-teal-500"
-        >
-          {expanded
-            ? "Collapse"
-            : `Show all (${content.length.toLocaleString()} characters)`}
-        </button>
-      )}
-    </div>
+    <CollapsibleContent
+      text={content}
+      className="w-fit max-w-[85%] self-end rounded-2xl rounded-br-md bg-panel px-4 py-3"
+      textClassName="text-sm wrap-break-word whitespace-pre-wrap text-fg-2"
+      renderFull={(text) => <Markdown content={text} />}
+    />
   );
 }
 
@@ -1678,7 +1672,7 @@ export function StageChatView({
               </p>
             );
           case "assistant": {
-            const hasText = turn.content.trim().length > 0;
+            const assistantContent = nonBlankAssistantContent(turn);
             const metric = turnMetric(turn);
             const isFinal =
               turnIndex === lastAssistantTurnIndex && !stageActive;
@@ -1688,10 +1682,10 @@ export function StageChatView({
             // separate chips. It has nothing to show, and an empty node would
             // still take a slot in this gap-4 column, doubling the space
             // between the chips on either side of it.
-            if (!hasText && !showFooter) return null;
+            if (!assistantContent && !showFooter) return null;
             return (
               <div key={`turn-${turnIndex}`} className="flex flex-col gap-1.5">
-                {hasText && <Markdown content={turn.content} />}
+                {assistantContent && <Markdown content={assistantContent} />}
                 {showFooter && (
                   <div className="flex gap-3 font-mono text-[11px] text-fg-muted tabular-nums">
                     {metric && <span>{metric}</span>}
