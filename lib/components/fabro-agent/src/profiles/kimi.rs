@@ -37,6 +37,76 @@ files that have not been read, and the call will fail. Prefer Edit for any incre
 change: Write replaces the entire file, so using it to make a small edit discards \
 everything you did not restate.";
 
+const BASH_DESCRIPTION: &str = "Execute a bash command. Use this for shell semantics — pipes, \
+env, processes, git, package managers, build and test runners.
+
+Translate these to a dedicated tool instead:
+- `cat` / `head` / `tail` on a known path → Read
+- `sed` / `awk` for an in-place edit → Edit
+- `echo > file` / heredoc → Write
+- `find` or recursive `ls` to locate files by name → Glob (plain `ls <dir>` is fine)
+- `grep` / `rg` to search file contents → Grep
+
+The dedicated tools cap their output, so they keep large raw dumps out of the conversation. That \
+is why they are worth reaching for whenever one fits.
+
+Output: stdout and stderr are combined and returned as a string, truncated if very long.
+
+Guidelines:
+- Each call runs in a fresh bash process in the working directory. Environment variables and `cd` \
+do NOT persist between calls — use absolute paths, or `cd <dir> && <command>` within one call.
+- Do not run interactive commands, or commands that never exit.
+- A long-running command needs a raised `timeout_ms`, not a retry. The default is \
+{default_timeout_ms}ms and the maximum is {max_timeout_ms}ms. Retrying a command that timed out \
+once will simply time out again.
+- Chain genuinely dependent steps with `&&`. Issue independent read-only commands as separate \
+parallel calls in one response rather than chaining them, so their output stays separate.
+- Quote paths containing spaces.
+- Avoid `..` to reach outside the working directory, and do not modify files outside it unless \
+explicitly asked.
+- Never run commands requiring superuser privileges unless explicitly asked.";
+
+const READ_DESCRIPTION: &str = "Read a text file from the workspace.
+
+Reading a file is also what clears it for writing: Edit and Write refuse a file that has not been \
+read in this session.
+
+- If you have a concrete path, call Read directly. Do not Glob or `ls` first to check that it \
+exists — a missing path returns an error you can handle.
+- When you need several files, emit multiple Read calls in one response rather than one per turn.
+- Returns `<line-number>\\t<content>` per line. Drop the number and tab when you take text for an \
+Edit `old_string`.
+- `limit` defaults to 2000 lines. Page a larger file with `offset` (1-based first line) and \
+`limit`.
+- Use Bash or an MCP tool for binary formats; this tool reads text.";
+
+const GREP_DESCRIPTION: &str = "Search file contents with a regular expression.
+
+Use Grep when you are looking for unknown content or an unknown location. If you already know the \
+path, use Read instead. Prefer this over running `grep` or `rg` through Bash: it caps its output, \
+so it will not flood the conversation.
+
+- Backed by ripgrep when available and POSIX `grep` otherwise, so keep patterns portable across \
+both rather than relying on ripgrep-only syntax.
+- `path` chooses the search root, `glob_filter` limits which files are searched, \
+`case_insensitive` folds case, and `max_results` caps the output.";
+
+const GLOB_DESCRIPTION: &str = "Find files by name using a glob pattern, most recently modified \
+first.
+
+Use this instead of `find` or recursive `ls` through Bash. Prefer patterns with a literal anchor \
+— an extension or a subdirectory — over bare wildcards.
+
+Good patterns:
+- `*.rs` — an extension at any depth below the search root
+- `src/*.rs` — directly inside `src/`, not recursive
+- `src/**/*.rs` — recursive walk under a subdirectory
+- `{src,tests}/**/*.rs` — brace expansion works
+
+Avoid recursing into dependency or build output (`node_modules/**`, `target/**`): those produce \
+thousands of matches and waste context. Narrow to a specific subpath instead. Results are files, \
+so to locate a directory, glob for something inside it.";
+
 pub struct KimiProfile {
     base: BaseProfile,
 }
@@ -61,6 +131,23 @@ impl KimiProfile {
         registry.register(make_edit_file_tool());
         registry.redescribe(NativeTool::EditFile, EDIT_FILE_DESCRIPTION);
         registry.redescribe(NativeTool::WriteFile, WRITE_FILE_DESCRIPTION);
+        registry.redescribe(NativeTool::ReadFile, READ_DESCRIPTION);
+        registry.redescribe(NativeTool::Grep, GREP_DESCRIPTION);
+        registry.redescribe(NativeTool::Glob, GLOB_DESCRIPTION);
+        // The Bash description quotes the timeouts this profile actually
+        // enforces, so the two cannot drift.
+        registry.redescribe(
+            NativeTool::Shell,
+            BASH_DESCRIPTION
+                .replace(
+                    "{default_timeout_ms}",
+                    &options.default_command_timeout_ms.to_string(),
+                )
+                .replace(
+                    "{max_timeout_ms}",
+                    &options.max_command_timeout_ms.to_string(),
+                ),
+        );
 
         // Kimi Code drives todos with one replace-whole-list call. The
         // Anthropic task tools model the opposite interaction -- incremental
@@ -283,6 +370,34 @@ mod tests {
             );
         }
         assert!(describe("Edit").contains("never reconstruct it from memory"));
+
+        // Bash steers shell usage toward the dedicated tools, under the names
+        // this profile actually exposes.
+        let bash = describe("Bash");
+        for expected in ["→ Read", "→ Edit", "→ Write", "→ Glob", "→ Grep"] {
+            assert!(bash.contains(expected), "Bash should map {expected}");
+        }
+        // Timeouts are interpolated from the options this profile enforces, so
+        // the description cannot drift from behavior.
+        let options = NativeToolOptions::for_profile(AgentProfileKind::Kimi);
+        assert!(
+            bash.contains(&options.default_command_timeout_ms.to_string()),
+            "Bash should quote the real default timeout"
+        );
+        assert!(
+            !bash.contains("{default_timeout_ms}"),
+            "placeholder left unrendered"
+        );
+        // Fabro has no background shell; promising one would be a lie.
+        assert!(!bash.contains("run_in_background"), "{bash}");
+        assert!(!bash.to_lowercase().contains("background task"), "{bash}");
+
+        // Read explains that reading is what clears a file for writing.
+        assert!(describe("Read").contains("refuse a file that has not been read"));
+        // Grep must not promise ripgrep syntax: fabro falls back to POSIX grep.
+        let grep = describe("Grep");
+        assert!(grep.contains("POSIX"), "{grep}");
+        assert!(describe("Glob").contains("most recently modified"));
         // The shared description is untouched for other profiles.
         assert!(!describe("Read").contains("refuses writes"));
     }
