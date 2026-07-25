@@ -746,12 +746,13 @@ impl RunProjectionReducer for RunProjection {
 /// OpenAI plan lists are scoped per agent session (`openai_plan:<session_id>`),
 /// so a child/subagent session emits its own list events on the same stage.
 /// The root-agent projection excludes those child plans, while the underlying
-/// events remain in the run event log. Anthropic task lists are root-scoped
-/// (`anthropic_tasks:<root_session_id>`) and intentionally shared with
-/// subagents, so they always project.
+/// events remain in the run event log. Kimi todo lists
+/// (`kimi_todos:<session_id>`) are scoped the same way. Anthropic task lists
+/// are root-scoped (`anthropic_tasks:<root_session_id>`) and intentionally
+/// shared with subagents, so they always project.
 fn should_project_root_agent_todo_event(stored: &RunEvent, list_kind: TodoListKind) -> bool {
     match list_kind {
-        TodoListKind::OpenAiPlan => stored.parent_session_id.is_none(),
+        TodoListKind::OpenAiPlan | TodoListKind::KimiTodos => stored.parent_session_id.is_none(),
         TodoListKind::AnthropicTasks => true,
     }
 }

@@ -78,6 +78,8 @@ pub enum NativeTool {
     TaskGet,
     #[strum(to_string = "TaskList")]
     TaskList,
+    #[strum(to_string = "TodoList")]
+    TodoList,
     #[strum(to_string = "AskUserQuestion")]
     AskUserQuestion,
     #[strum(to_string = "request_user_input")]
@@ -157,6 +159,7 @@ impl NativeTool {
             | Self::TaskUpdate
             | Self::TaskGet
             | Self::TaskList
+            | Self::TodoList
             | Self::AskUserQuestion
             | Self::RequestUserInput => None,
         }

@@ -12,9 +12,7 @@ use crate::profiles::{self, BaseProfile, EmbeddedPrompt};
 use crate::sandbox::Sandbox;
 use crate::skills::Skill;
 use crate::todo_runtime::TodoRuntime;
-use crate::todo_tools::{
-    make_task_create_tool, make_task_get_tool, make_task_list_tool, make_task_update_tool,
-};
+use crate::todo_tools::make_todo_list_tool;
 use crate::tool_registry::{RegisteredTool, ToolRegistry};
 use crate::tools::{WebFetchSummarizer, make_edit_file_tool, register_core_tools};
 
@@ -106,14 +104,12 @@ impl KimiProfile {
         redescribe(&mut registry, NativeTool::EditFile, EDIT_FILE_DESCRIPTION);
         redescribe(&mut registry, NativeTool::WriteFile, WRITE_FILE_DESCRIPTION);
 
-        // Kimi Code exposes a single TodoList tool; fabro's four task tools
-        // cover the same ground over one runtime, so reuse them rather than
-        // introducing a fifth shape of todo state.
+        // Kimi Code drives todos with one replace-whole-list call. The
+        // Anthropic task tools model the opposite interaction -- incremental
+        // mutation against tracked ids -- so they are the wrong surface here
+        // even though both persist through the same runtime.
         let todo_runtime = Arc::new(TodoRuntime::new());
-        registry.register(make_task_create_tool(todo_runtime.clone()));
-        registry.register(make_task_update_tool(todo_runtime.clone()));
-        registry.register(make_task_get_tool(todo_runtime.clone()));
-        registry.register(make_task_list_tool(todo_runtime));
+        registry.register(make_todo_list_tool(todo_runtime));
 
         // Applied last so every built-in registered above is renamed.
         apply_vocabulary(&mut registry, ToolVocabulary::KimiCode);
@@ -283,7 +279,7 @@ mod tests {
             );
         }
         // No Kimi Code counterpart, so these keep fabro's names.
-        assert!(names.contains(&"TaskCreate".to_string()));
+        assert!(names.contains(&"TodoList".to_string()));
     }
 
     #[test]

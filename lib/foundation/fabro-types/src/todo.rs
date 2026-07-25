@@ -71,6 +71,12 @@ pub enum TodoListKind {
     #[serde(rename = "anthropic_tasks")]
     #[strum(to_string = "anthropic_tasks")]
     AnthropicTasks,
+    /// `TodoList` (Kimi Code). Like [`Self::OpenAiPlan`] it replaces the whole
+    /// list in one call and reconciles by item text, but it uses Kimi Code's
+    /// field names and exposes read and clear modes. Session-scoped.
+    #[serde(rename = "kimi_todos")]
+    #[strum(to_string = "kimi_todos")]
+    KimiTodos,
 }
 
 impl TodoListKind {

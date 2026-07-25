@@ -211,6 +211,183 @@ pub fn make_update_plan_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
     }
 }
 
+/// Compute the Kimi todo scope (`kimi_todos:<session_id>`).
+fn kimi_todo_scope(ctx: &ToolContext) -> Result<String, String> {
+    ctx.session_id
+        .as_ref()
+        .map(|sid| TodoListKind::KimiTodos.list_id(sid))
+        .ok_or_else(|| "TodoList requires an active session".to_string())
+}
+
+/// Kimi Code spells the terminal status `done`; internally it is
+/// [`TodoStatus::Completed`].
+fn parse_kimi_status(value: &str) -> Result<TodoStatus, String> {
+    match value {
+        "pending" => Ok(TodoStatus::Pending),
+        "in_progress" => Ok(TodoStatus::InProgress),
+        "done" => Ok(TodoStatus::Completed),
+        other => Err(format!(
+            "Invalid status `{other}` (expected pending|in_progress|done)"
+        )),
+    }
+}
+
+fn kimi_status_name(status: TodoStatus) -> &'static str {
+    match status {
+        TodoStatus::Pending => "pending",
+        TodoStatus::InProgress => "in_progress",
+        TodoStatus::Completed | TodoStatus::Deleted => "done",
+    }
+}
+
+fn render_kimi_todos(items: &[TodoProjection]) -> String {
+    if items.is_empty() {
+        return "The todo list is empty.".to_string();
+    }
+    let mut out = String::new();
+    for todo in items {
+        let _ = writeln!(out, "[{}] {}", kimi_status_name(todo.status), todo.subject);
+    }
+    out.truncate(out.trim_end().len());
+    out
+}
+
+/// Kimi Code-compatible `TodoList`.
+///
+/// A single tool serves reads and writes, matching the surface Kimi models are
+/// trained against: omit `todos` to read, pass `[]` to clear, pass a list to
+/// replace the whole thing. Items carry only `title` and `status`, and the
+/// terminal status is spelled `done`.
+///
+/// Reconciliation mirrors `update_plan` — items are identified by their text,
+/// so a re-submitted list preserves identity for unchanged entries — and the
+/// same [`TodoRuntime`] backs it, so projections and events are unchanged.
+pub fn make_todo_list_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
+    RegisteredTool {
+        definition: ToolDefinition {
+            name:        "TodoList".into(),
+            description: "Maintain a structured TODO list for the current task. Use it \
+                          proactively for multi-step work. Pass `todos` to replace the entire \
+                          list, omit `todos` to read the current list without changing it, and \
+                          pass an empty array to clear it. Keep exactly one item `in_progress` \
+                          while work is underway, and mark an item `done` as soon as it is \
+                          finished rather than batching completions at the end."
+                .into(),
+            parameters:  serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "todos": {
+                        "type": "array",
+                        "description": "The updated todo list. Omit to read the current list \
+            without making changes. Pass an empty array to clear the list.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "title": {
+                                    "type": "string",
+                                    "description": "Short, actionable title for the todo."
+                                },
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "done"],
+                                    "description": "Current status of the todo."
+                                }
+                            },
+                            "required": ["title", "status"]
+                        }
+                    }
+                }
+            }),
+        },
+        executor:   Arc::new(move |args, ctx| {
+            let runtime = runtime.clone();
+            Box::pin(async move {
+                let list_id = kimi_todo_scope(&ctx)?;
+
+                // Read mode: `todos` omitted entirely.
+                let Some(todos) = args.get("todos") else {
+                    let items = runtime
+                        .snapshot(&list_id)
+                        .map(|l| l.items)
+                        .unwrap_or_default();
+                    return Ok(render_kimi_todos(&items));
+                };
+                let todos = todos
+                    .as_array()
+                    .ok_or_else(|| "`todos` must be an array".to_string())?;
+
+                let mut incoming: Vec<(String, String, TodoStatus)> =
+                    Vec::with_capacity(todos.len());
+                let mut seen: HashSet<&str> = HashSet::with_capacity(todos.len());
+                for (index, entry) in todos.iter().enumerate() {
+                    let title = entry
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| format!("todos[{index}] is missing `title`"))?;
+                    let status = entry
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| format!("todos[{index}] is missing `status`"))?;
+                    let status = parse_kimi_status(status)?;
+                    if !seen.insert(title) {
+                        return Err(format!("Duplicate todo `{title}` — titles must be unique"));
+                    }
+                    incoming.push((openai_step_id(&list_id, title), title.to_string(), status));
+                }
+
+                let previous: HashMap<String, TodoProjection> = runtime
+                    .snapshot(&list_id)
+                    .map(|list| list.items.into_iter().map(|t| (t.id.clone(), t)).collect())
+                    .unwrap_or_default();
+                let incoming_ids: HashSet<&str> =
+                    incoming.iter().map(|(id, _, _)| id.as_str()).collect();
+
+                for id in previous.keys() {
+                    if !incoming_ids.contains(id.as_str()) {
+                        runtime.delete(&ctx, TodoListKind::KimiTodos, list_id.clone(), id.clone());
+                    }
+                }
+
+                for (index, (todo_id, title, status)) in incoming.iter().enumerate() {
+                    let order = u32::try_from(index).unwrap_or(u32::MAX);
+                    match previous.get(todo_id) {
+                        Some(prev)
+                            if prev.status == *status
+                                && prev.order == order
+                                && prev.subject == *title => {}
+                        Some(_) => {
+                            runtime.update(&ctx, TodoUpdatedProps {
+                                status: Some(*status),
+                                order: Some(order),
+                                subject: Some(title.clone()),
+                                ..TodoUpdatedProps::new(&list_id, TodoListKind::KimiTodos, todo_id)
+                            });
+                        }
+                        None => {
+                            let mut projection =
+                                TodoProjection::new(todo_id.clone(), order, title.clone());
+                            projection.status = *status;
+                            runtime.create(
+                                &ctx,
+                                TodoListKind::KimiTodos,
+                                list_id.clone(),
+                                projection,
+                            );
+                        }
+                    }
+                }
+
+                let items = runtime
+                    .snapshot(&list_id)
+                    .map(|l| l.items)
+                    .unwrap_or_default();
+                Ok(render_kimi_todos(&items))
+            })
+        }),
+        source:     ToolSource::Native,
+    }
+}
+
 /// Per-list monotonically-increasing task counter for Anthropic
 /// `TaskCreate`. Shared state lives inside the tool closure so two parallel
 /// `TaskCreate` calls inside one session can never receive the same ID.
@@ -498,6 +675,120 @@ pub fn make_task_list_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
 }
 
 #[cfg(test)]
+mod kimi_todo_tests {
+    use std::sync::Arc;
+
+    use serde_json::json;
+    use tokio_util::sync::CancellationToken;
+
+    use super::tests::SilentEmitter;
+    use super::*;
+    use crate::sandbox::Sandbox;
+    use crate::test_support::MockSandbox;
+
+    fn ctx() -> ToolContext {
+        let env: Arc<dyn Sandbox> = Arc::new(MockSandbox::default());
+        ToolContext {
+            env,
+            cancel: CancellationToken::new(),
+            tool_env_provider: None,
+            session_id: Some("ses_kimi".to_string()),
+            root_session_id: Some("ses_kimi".to_string()),
+            tool_call_id: None,
+            agent_event_emitter: Some(Arc::new(SilentEmitter)),
+        }
+    }
+
+    async fn call(tool: &RegisteredTool, args: serde_json::Value) -> Result<String, String> {
+        (tool.executor)(args, ctx()).await
+    }
+
+    #[tokio::test]
+    async fn replaces_the_whole_list_and_reads_it_back() {
+        let runtime = Arc::new(TodoRuntime::new());
+        let tool = make_todo_list_tool(runtime);
+
+        call(
+            &tool,
+            json!({"todos": [
+                {"title": "read the config", "status": "done"},
+                {"title": "patch the parser", "status": "in_progress"},
+                {"title": "add a test", "status": "pending"}
+            ]}),
+        )
+        .await
+        .unwrap();
+
+        // Read mode: `todos` omitted entirely.
+        let listed = call(&tool, json!({})).await.unwrap();
+        assert!(listed.contains("[done] read the config"), "{listed}");
+        assert!(
+            listed.contains("[in_progress] patch the parser"),
+            "{listed}"
+        );
+
+        // Re-submitting a shorter list drops the missing entries.
+        call(
+            &tool,
+            json!({"todos": [{"title": "add a test", "status": "done"}]}),
+        )
+        .await
+        .unwrap();
+        let listed = call(&tool, json!({})).await.unwrap();
+        assert!(listed.contains("[done] add a test"), "{listed}");
+        assert!(!listed.contains("patch the parser"), "{listed}");
+    }
+
+    #[tokio::test]
+    async fn empty_array_clears_the_list() {
+        let runtime = Arc::new(TodoRuntime::new());
+        let tool = make_todo_list_tool(runtime);
+        call(
+            &tool,
+            json!({"todos": [{"title": "x", "status": "pending"}]}),
+        )
+        .await
+        .unwrap();
+        call(&tool, json!({"todos": []})).await.unwrap();
+        assert_eq!(
+            call(&tool, json!({})).await.unwrap(),
+            "The todo list is empty."
+        );
+    }
+
+    /// Kimi Code spells the terminal status `done`; `completed` is the
+    /// Anthropic/Codex spelling and must not be silently accepted.
+    #[tokio::test]
+    async fn status_vocabulary_is_kimi_codes() {
+        let runtime = Arc::new(TodoRuntime::new());
+        let tool = make_todo_list_tool(runtime);
+        let err = call(
+            &tool,
+            json!({"todos": [{"title": "x", "status": "completed"}]}),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("expected pending|in_progress|done"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn duplicate_titles_are_rejected() {
+        let runtime = Arc::new(TodoRuntime::new());
+        let tool = make_todo_list_tool(runtime);
+        let err = call(
+            &tool,
+            json!({"todos": [
+                {"title": "same", "status": "pending"},
+                {"title": "same", "status": "done"}
+            ]}),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("must be unique"), "{err}");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
@@ -510,7 +801,7 @@ mod tests {
     use crate::types::AgentEvent;
 
     #[derive(Default)]
-    struct SilentEmitter;
+    pub(super) struct SilentEmitter;
     impl AgentEventEmitter for SilentEmitter {
         fn emit(&self, _event: AgentEvent) {}
     }

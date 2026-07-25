@@ -34,6 +34,16 @@ This workspace refuses writes to files you have not read. `Edit` and `Write` bot
 - After you edit a file, its contents have changed. Re-read before your next edit to the same file rather than assuming your own edit landed as written.
 - `Write` fully replaces a file. Use it only for new files or a deliberate complete rewrite; for every incremental change use `Edit`.
 
+# Tracking Multi-Step Work
+
+Use `TodoList` for work that spans several steps, and keep it current as you go.
+
+- Pass the whole list every time; it replaces what is there. Omit `todos` to read the list back without changing it, and pass an empty array to clear it.
+- Keep exactly one item `in_progress` while you are working.
+- Mark an item `done` the moment it is finished — do not batch completions until the end.
+- Do not re-send an unchanged list. Update it when something actually moved.
+- Skip it for single-step work where tracking adds nothing.
+
 # General Guidelines for Coding
 
 When building something from scratch, understand the requirements, plan the architecture, and write modular, maintainable code.

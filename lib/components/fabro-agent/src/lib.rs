@@ -72,7 +72,7 @@ pub use subagent::{SubAgentEventCallback, SubAgentResult, SubAgentStatus, SubAge
 pub use todo_runtime::TodoRuntime;
 pub use todo_tools::{
     make_task_create_tool, make_task_get_tool, make_task_list_tool, make_task_update_tool,
-    make_update_plan_tool,
+    make_todo_list_tool, make_update_plan_tool,
 };
 pub use tool_permissions::canonical_tool_name;
 pub use tool_registry::{AgentEventEmitter, ToolRegistry};
