@@ -96,7 +96,7 @@ Because `old_string` must match the file exactly, an edit built from a stale or 
 
 ### grep
 
-Searches file contents with a regex pattern, powered by ripgrep in the sandbox.
+Searches file contents with a regex pattern. The sandbox uses ripgrep when `rg` is on the path and falls back to POSIX `grep` otherwise, detected once and cached per sandbox. Keep patterns portable across both rather than relying on ripgrep-only syntax.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|

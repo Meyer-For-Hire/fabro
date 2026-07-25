@@ -536,11 +536,21 @@ mod tests {
                 );
             }
 
-            // The specific Kimi-only phrasing must not appear elsewhere.
-            assert!(
-                !anthropic_text.contains("never reconstruct it from memory"),
-                "Kimi read-before-edit drilling leaked into {tool} for other profiles"
-            );
+            // The Kimi-only phrasing must not appear elsewhere. Assert it is
+            // present in Kimi's own description too: a one-sided check against
+            // a literal silently goes vacuous the next time that wording is
+            // rewritten, which is exactly how it last stopped testing anything.
+            if tool == NativeTool::EditFile {
+                const KIMI_EDIT_MARKER: &str = "DO NOT call Edit from memory";
+                assert!(
+                    kimi_text.contains(KIMI_EDIT_MARKER),
+                    "Kimi's {tool} description should drill reading before an edit: {kimi_text}"
+                );
+                assert!(
+                    !anthropic_text.contains(KIMI_EDIT_MARKER),
+                    "Kimi read-before-edit drilling leaked into {tool} for other profiles"
+                );
+            }
         }
     }
 
