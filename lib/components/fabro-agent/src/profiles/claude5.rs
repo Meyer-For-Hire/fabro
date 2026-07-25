@@ -134,7 +134,7 @@ impl AgentProfile for Claude5Profile {
         skills: &[Skill],
     ) -> String {
         let template = EmbeddedPrompt::new("claude5.md.j2", CORE_PROMPT)
-            .with_vocabulary(ToolVocabulary::Claude5)
+            .with_vocabulary(self.base.registry.vocabulary())
             .with_bool(
                 "has_agent",
                 self.base

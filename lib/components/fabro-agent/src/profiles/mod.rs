@@ -786,38 +786,39 @@ mod tests {
     }
 
     #[test]
-    fn claude5_web_search_prompt_snapshot() {
-        insta::assert_snapshot!(system_prompt(&claude5_profile(true, false, false)));
-    }
-
-    #[test]
-    fn claude5_subagents_prompt_snapshot() {
-        insta::assert_snapshot!(system_prompt(&claude5_profile(false, true, false)));
-    }
-
-    #[test]
-    fn claude5_question_prompt_snapshot() {
-        insta::assert_snapshot!(system_prompt(&claude5_profile(false, false, true)));
-    }
-
-    #[test]
-    fn claude5_web_search_and_subagents_prompt_snapshot() {
-        insta::assert_snapshot!(system_prompt(&claude5_profile(true, true, false)));
-    }
-
-    #[test]
-    fn claude5_web_search_and_question_prompt_snapshot() {
-        insta::assert_snapshot!(system_prompt(&claude5_profile(true, false, true)));
-    }
-
-    #[test]
-    fn claude5_subagents_and_question_prompt_snapshot() {
-        insta::assert_snapshot!(system_prompt(&claude5_profile(false, true, true)));
-    }
-
-    #[test]
     fn claude5_all_conditionals_prompt_snapshot() {
         insta::assert_snapshot!(system_prompt(&claude5_profile(true, true, true)));
+    }
+
+    /// The two snapshots above pin the wording of every conditional section.
+    /// This covers the six intermediate combinations, which only need to show
+    /// that each section appears exactly when its tool is registered -- as
+    /// snapshots they were six near-identical copies of the same prose, and any
+    /// edit to the template invalidated all eight at once.
+    #[test]
+    fn claude5_prompt_sections_track_registered_tools() {
+        for web_search in [false, true] {
+            for subagents in [false, true] {
+                for question in [false, true] {
+                    let prompt = system_prompt(&claude5_profile(web_search, subagents, question));
+                    assert_eq!(
+                        prompt.contains("Use `WebSearch`"),
+                        web_search,
+                        "web_search={web_search} subagents={subagents} question={question}"
+                    );
+                    assert_eq!(
+                        prompt.contains("# Background agents"),
+                        subagents,
+                        "web_search={web_search} subagents={subagents} question={question}"
+                    );
+                    assert_eq!(
+                        prompt.contains("# Asking the user"),
+                        question,
+                        "web_search={web_search} subagents={subagents} question={question}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

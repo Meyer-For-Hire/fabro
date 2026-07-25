@@ -47,10 +47,7 @@ use crate::skills::{
     ExpandedInput, Skill, default_skill_dirs, discover_skills, expand_skill,
     make_use_skill_tool_for_vocabulary,
 };
-use crate::subagent::{
-    SubAgentCallbackEvent, SubAgentEventCallback, SubAgentSupervisor,
-    format_parent_notification_batch,
-};
+use crate::subagent::{SubAgentCallbackEvent, SubAgentEventCallback, SubAgentSupervisor};
 use crate::tool_execution::execute_tool_calls;
 use crate::tool_permissions::canonical_tool_name;
 use crate::tool_registry::ToolDefinitionWithSource;
@@ -369,6 +366,18 @@ impl ToolEnvProvider for StaticEnvProvider {
 struct BuiltRequest {
     request:        Request,
     context_window: StageContextWindowProjection,
+}
+
+/// Whether an input's `/name` tokens should be treated as skill references.
+///
+/// Only text the user actually typed can invoke a skill. Harness-synthesized
+/// input carries whatever a child agent wrote, where `/tmp` is a path rather
+/// than an invocation: expanding it would either fail the parent turn on an
+/// unknown name or splice a skill template in place of the envelope.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SkillExpansion {
+    Apply,
+    Skip,
 }
 
 pub struct Session {
@@ -1328,6 +1337,7 @@ impl Session {
         let mut result = self
             .run_single_input(
                 input,
+                SkillExpansion::Apply,
                 &agent_tool_runtime,
                 &mut timing,
                 &mut usage,
@@ -1343,15 +1353,13 @@ impl Session {
                     .expect("followup queue lock poisoned")
                     .pop_front();
                 let next_input = if let Some(followup) = followup {
-                    Some(followup)
+                    Some((followup, SkillExpansion::Apply))
                 } else if let Some(supervisor) = self.subagent_supervisor.clone() {
                     match supervisor
-                        .next_parent_notification_batch(&self.cancel_token)
+                        .next_parent_notification_turn(&self.cancel_token)
                         .await
                     {
-                        Ok(Some(notifications)) => {
-                            Some(format_parent_notification_batch(&notifications))
-                        }
+                        Ok(Some(turn)) => Some((turn, SkillExpansion::Skip)),
                         Ok(None) => None,
                         Err(Error::Interrupted(InterruptReason::Cancelled)) => {
                             result = Err(self.interrupted_error());
@@ -1365,10 +1373,13 @@ impl Session {
                 } else {
                     None
                 };
-                let Some(next_input) = next_input else { break };
+                let Some((next_input, skill_expansion)) = next_input else {
+                    break;
+                };
                 result = self
                     .run_single_input(
                         &next_input,
+                        skill_expansion,
                         &agent_tool_runtime,
                         &mut timing,
                         &mut usage,
@@ -1406,6 +1417,7 @@ impl Session {
     async fn run_single_input(
         &mut self,
         input: &str,
+        skill_expansion: SkillExpansion,
         agent_tool_runtime: &AgentToolRuntime,
         timing: &mut SessionInputTiming,
         usage_accumulator: &mut TokenCounts,
@@ -1420,7 +1432,7 @@ impl Session {
         self.transition(SessionState::Thinking);
 
         // Expand skill references in input
-        let expanded = if self.skills.is_empty() {
+        let expanded = if self.skills.is_empty() || skill_expansion == SkillExpansion::Skip {
             ExpandedInput {
                 text:       input.to_string(),
                 skill_name: None,
@@ -3129,6 +3141,57 @@ mod tests {
         assert!(notification.contains(&second_id));
         assert!(notification.contains("first result"));
         assert!(notification.contains("second result"));
+
+        supervisor.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn background_agent_output_is_not_parsed_for_skill_references() {
+        let supervisor = SubAgentSupervisor::new(3);
+        let child = make_session(vec![text_response("Cleaned up /tmp and exited")]).await;
+        let child_id = supervisor
+            .spawn_with_parent_notification(
+                child,
+                "clean up".to_string(),
+                "Clean scratch files".to_string(),
+                0,
+            )
+            .unwrap();
+        supervisor
+            .wait_with_cancel(&child_id, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        let provider = Arc::new(ScriptedStreamProvider::new(vec![
+            ScriptedStreamCall::Response(Box::new(text_response("Delegated"))),
+            ScriptedStreamCall::Response(Box::new(text_response("Acknowledged"))),
+        ]));
+        let mut parent =
+            make_session_with_provider_and_manager(provider, Some(supervisor.clone())).await;
+        parent.skills = vec![Skill {
+            name:        "commit".to_string(),
+            description: "Make a commit".to_string(),
+            template:    "Review changes and commit.".to_string(),
+        }];
+
+        // A child that mentions a bare path must not fail the parent turn on
+        // `Unknown skill: /tmp`, nor have its report replaced by a skill body.
+        let output = parent
+            .process_input_with_output("Delegate the cleanup")
+            .await
+            .unwrap();
+
+        assert_eq!(output.as_deref(), Some("Acknowledged"));
+        let turns = parent.history().turns();
+        let Message::User {
+            content: notification,
+            ..
+        } = &turns[2]
+        else {
+            panic!("third turn should deliver the background result");
+        };
+        assert!(notification.contains("Cleaned up /tmp and exited"));
+        assert!(!notification.contains("Review changes and commit."));
 
         supervisor.shutdown_all().await;
     }

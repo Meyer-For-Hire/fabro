@@ -297,7 +297,7 @@ pub(crate) fn make_task_output_tool(supervisor: SubAgentSupervisor) -> Registere
                         "description": "Whether to wait for completion."
                     },
                     "timeout": {
-                        "type": "number",
+                        "type": "integer",
                         "minimum": 0,
                         "maximum": 600_000,
                         "default": 30000,
@@ -402,13 +402,13 @@ pub(crate) fn make_send_message_tool(supervisor: SubAgentSupervisor) -> Register
     RegisteredTool {
         definition: definition(
             NativeTool::SendMessage,
-            "Send additional instructions to a running child agent by its Fabro agent ID.",
+            "Send additional instructions to a running background agent by its task ID.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
                     "to": {
                         "type": "string",
-                        "description": "The running Fabro agent ID."
+                        "description": "The background agent task ID."
                     },
                     "message": {
                         "type": "string",
