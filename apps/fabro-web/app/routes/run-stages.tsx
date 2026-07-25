@@ -80,7 +80,12 @@ import {
   ACTIVE_STAGE_STATES,
   mapRunStagesToSidebarStages,
 } from "../lib/stage-sidebar";
-import { getNumber, getString, type UnknownRecord } from "../lib/unknown";
+import {
+  getNumber,
+  getObject,
+  getString,
+  type UnknownRecord,
+} from "../lib/unknown";
 import type {
   EventEnvelope,
   StageHandler,
@@ -88,6 +93,17 @@ import type {
 } from "@qltysh/fabro-api-client";
 
 export const handle = { wide: true, fullHeight: true };
+
+/**
+ * Readable reasoning a provider disclosed for one model response: `summary` is
+ * the model's own recap, `trace` its verbatim reasoning. Providers send one,
+ * the other, or both, and opaque material (signatures, redacted blocks) never
+ * reaches the wire, so an absent field means nothing was disclosed.
+ */
+export interface TurnReasoning {
+  summary: string | null;
+  trace: string | null;
+}
 
 type TurnType =
   | { kind: "system"; ts: string; content: string }
@@ -102,6 +118,7 @@ type TurnType =
       inputTokens: number;
       outputTokens: number;
       toolCallCount: number | null;
+      reasoning: TurnReasoning | null;
     }
   | {
       kind: "tool";
@@ -277,6 +294,17 @@ interface PendingCommand {
   script: string;
 }
 
+function readTurnReasoning(props: UnknownRecord): TurnReasoning | null {
+  const reasoning = getObject(props, "reasoning");
+  if (!reasoning) return null;
+  // getString treats "" as absent, so a provider that sends an empty field
+  // reads the same as one that sends nothing.
+  const summary = getString(reasoning, "summary") ?? null;
+  const trace = getString(reasoning, "trace") ?? null;
+  if (!summary && !trace) return null;
+  return { summary, trace };
+}
+
 export function buildStageActivity(
   events: EventEnvelope[],
   stageId: string,
@@ -320,6 +348,7 @@ export function buildStageActivity(
           inputTokens: getNumber(billing, "input_tokens") ?? 0,
           outputTokens: getNumber(billing, "output_tokens") ?? 0,
           toolCallCount: getNumber(props, "tool_call_count") ?? null,
+          reasoning: readTurnReasoning(props),
         });
         break;
       }
@@ -333,6 +362,8 @@ export function buildStageActivity(
             inputTokens: getNumber(billing, "input_tokens") ?? 0,
             outputTokens: getNumber(billing, "output_tokens") ?? 0,
             toolCallCount: null,
+            // Only agent.message carries reasoning; prompt stages have none.
+            reasoning: null,
           });
         }
         break;
@@ -1146,7 +1177,44 @@ function ToolGroupRow({
   );
 }
 
-function EventDetails({
+const REASONING_PREVIEW_CHARS = 280;
+
+/**
+ * Reasoning is raw model output, not authored Markdown, so it renders as
+ * preformatted text: a trace's own line breaks are part of what it says, and
+ * parsing it as Markdown would eat them along with any leading `#` or `-`.
+ */
+function CollapsibleText({ text }: { text: string }) {
+  const [expanded, setExpanded] = useState(false);
+  const contentId = useId();
+
+  if (text.length <= REASONING_PREVIEW_CHARS) {
+    return <p className="break-words whitespace-pre-wrap">{text}</p>;
+  }
+
+  return (
+    <div className="flex flex-col items-start gap-1.5">
+      <p id={contentId} className="break-words whitespace-pre-wrap">
+        {expanded
+          ? text
+          : `${text.slice(0, REASONING_PREVIEW_CHARS).trimEnd()}…`}
+      </p>
+      <button
+        type="button"
+        aria-controls={contentId}
+        aria-expanded={expanded}
+        onClick={() => setExpanded((current) => !current)}
+        className="text-xs text-teal-500 hover:underline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-teal-500"
+      >
+        {expanded
+          ? "Collapse"
+          : `Show all (${text.length.toLocaleString()} characters)`}
+      </button>
+    </div>
+  );
+}
+
+export function EventDetails({
   turn,
   runStart,
   hideMeta = false,
@@ -1191,6 +1259,23 @@ function EventDetails({
               <span className="text-fg-muted">{turnSummary(turn)}</span>
             )}
           </DetailField>
+          {/*
+            Reasoning follows the message rather than preceding it, the way it
+            ran: a trace can be thousands of characters, and leading with one
+            would push the answer the user clicked on below the fold.
+          */}
+          {turn.reasoning?.summary && (
+            <DetailField label="Reasoning">
+              <CollapsibleText text={turn.reasoning.summary} />
+            </DetailField>
+          )}
+          {turn.reasoning?.trace && (
+            <DetailField
+              label={turn.reasoning.summary ? "Reasoning trace" : "Reasoning"}
+            >
+              <CollapsibleText text={turn.reasoning.trace} />
+            </DetailField>
+          )}
           {turn.toolCallCount != null && turn.toolCallCount > 0 && (
             <DetailField label="Tool calls" mono>
               {turn.toolCallCount}
