@@ -1,11 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
 
-import { EventDetails, type TurnReasoning } from "./run-stages";
+import type { ReasoningOutput } from "@qltysh/fabro-api-client";
+
+import { EventDetails } from "./run-stages";
 
 const RUN_START = "2026-04-09T12:00:00Z";
 
-function assistantMarkup(reasoning: TurnReasoning | null): string {
+function assistantMarkup(reasoning: ReasoningOutput | null): string {
   return renderToStaticMarkup(
     <EventDetails
       turn={{
@@ -31,7 +33,7 @@ describe("EventDetails reasoning", () => {
   });
 
   test("labels a trace-only response Reasoning, not Reasoning trace", () => {
-    const html = assistantMarkup({ summary: null, trace: "Considered A." });
+    const html = assistantMarkup({ trace: "Considered A." });
 
     expect(html).toContain("Reasoning");
     expect(html).not.toContain("Reasoning trace");
@@ -50,7 +52,7 @@ describe("EventDetails reasoning", () => {
   });
 
   test("renders short reasoning in full, with no disclosure control", () => {
-    const html = assistantMarkup({ summary: null, trace: "Considered A." });
+    const html = assistantMarkup({ trace: "Considered A." });
 
     expect(html).not.toContain("Show all");
     expect(html).not.toContain("aria-expanded");
@@ -58,7 +60,7 @@ describe("EventDetails reasoning", () => {
 
   test("connects a long trace's expand button to its controlled content", () => {
     const trace = "x".repeat(281);
-    const html = assistantMarkup({ summary: null, trace });
+    const html = assistantMarkup({ trace });
 
     const controls = html.match(/aria-controls="([^"]+)"/)?.[1];
     expect(controls).toBeDefined();

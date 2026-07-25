@@ -499,9 +499,15 @@ describe("eventsToActivity", () => {
     ).toEqual({ summary: "Checked the config", trace: "step one…" });
 
     // Anthropic thinking arrives as a trace with no summary.
-    expect(reasoningOf({ text: "Done.", reasoning: { trace: "step one…" } })).toEqual(
-      { summary: null, trace: "step one…" },
-    );
+    expect(
+      reasoningOf({ text: "Done.", reasoning: { trace: "step one…" } }),
+    ).toEqual({ trace: "step one…" });
+    expect(
+      reasoningOf({
+        text: "Done.",
+        reasoning: { summary: "Checked the config" },
+      }),
+    ).toEqual({ summary: "Checked the config" });
 
     expect(reasoningOf({ text: "Done." })).toBe(null);
     // A provider that sends the key but nothing usable reads as "none".
@@ -780,6 +786,7 @@ describe("groupConsecutiveTools", () => {
       inputTokens: 0,
       outputTokens: 0,
       toolCallCount: null,
+      reasoning: null,
     };
     const c = toolTurn({ ts: "2026-04-09T12:00:03Z", toolName: "shell" });
     const result = groupConsecutiveTools([
@@ -857,6 +864,8 @@ describe("buildChatItems", () => {
       content,
       inputTokens: 0,
       outputTokens: 0,
+      toolCallCount: null,
+      reasoning: null,
     };
   }
 
@@ -1074,6 +1083,7 @@ describe("buildThreadDnaItems", () => {
         inputTokens: 0,
         outputTokens: 0,
         toolCallCount: null,
+        reasoning: null,
       },
       selection: { kind: "single" as const, turnIndex },
     };
@@ -1295,6 +1305,7 @@ describe("tool-call-only agent responses", () => {
       inputTokens: 0,
       outputTokens: 0,
       toolCallCount: 3,
+      reasoning: null,
     };
     const withOneTool = { ...withTools, toolCallCount: 1 };
     const withoutCount = { ...withTools, toolCallCount: null };
