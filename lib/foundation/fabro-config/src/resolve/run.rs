@@ -490,11 +490,8 @@ fn resolve_mcp_command(
     interpreter: ScriptInterpreter,
 ) -> Vec<String> {
     if let Some(script) = script {
-        return vec![
-            interpreter.executable().to_string(),
-            "-c".to_string(),
-            script.as_source(),
-        ];
+        let executable: &'static str = interpreter.into();
+        return vec![executable.to_string(), "-c".to_string(), script.as_source()];
     }
     command
         .map(|command| command.iter().map(InterpString::as_source).collect())
@@ -506,22 +503,15 @@ fn resolve_mcp_command(
 /// The two transports run in different places, so they keep different
 /// contracts: a stdio script runs on the host outside the sandbox API, while a
 /// sandbox script is evaluated by the sandbox's Bash.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, strum::IntoStaticStr)]
 enum ScriptInterpreter {
     /// Host shell, unchanged for `type = "stdio"` servers.
+    #[strum(serialize = "sh")]
     HostShell,
     /// The sandbox's non-login Bash. Resolved through `PATH` rather than
     /// spelled `/bin/bash` so local sandboxes keep working on NixOS.
+    #[strum(serialize = "bash")]
     SandboxBash,
-}
-
-impl ScriptInterpreter {
-    fn executable(self) -> &'static str {
-        match self {
-            Self::HostShell => "sh",
-            Self::SandboxBash => "bash",
-        }
-    }
 }
 
 fn resolve_hook(hook: &HookEntry, index: usize, errors: &mut Vec<ResolveError>) -> HookDefinition {

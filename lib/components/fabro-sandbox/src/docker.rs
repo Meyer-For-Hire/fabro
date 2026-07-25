@@ -29,8 +29,8 @@ use crate::clone_source::{self, CloneDecision, EmptyWorkspaceReason};
 use crate::managed_labels::{self, MANAGED_LABEL, RUN_ID_LABEL};
 use crate::redact::redact_auth_url;
 use crate::sandbox::{
-    BASH_PROBE_SCRIPT, RefreshOutcome, StdioProcessControl, bash_probe_passed, optional_timeout,
-    resolve_path,
+    BASH_PROBE_SCRIPT, BASH_PROBE_TIMEOUT_MS, REMOTE_BASH, RefreshOutcome, StdioProcessControl,
+    optional_timeout, resolve_path, validate_bash_probe,
 };
 use crate::{
     CommandOutputCallback, DEFAULT_EXEC_OUTPUT_TAIL_BYTES, DirEntry, ExecResult,
@@ -39,12 +39,8 @@ use crate::{
     shell_quote,
 };
 
-/// Bash executable Docker sandboxes require.
-///
-/// Unlike the local sandbox there is no `PATH` resolution here: the remote
-/// filesystem is a Linux image Fabro documents a requirement for, and there is
-/// deliberately no `sh` fallback when it is missing.
-pub(crate) const DOCKER_BASH: &str = "/bin/bash";
+const DOCKER_BASH_REQUIREMENT: &str = "Docker sandboxes require /bin/bash for every command, with no `sh` fallback; use an \
+     image with bash and git, such as buildpack-deps:noble.";
 
 pub(crate) const WORKING_DIRECTORY: &str = "/workspace";
 pub(crate) const REPOS_ROOT: &str = "/repos";
@@ -420,7 +416,7 @@ impl DockerSandbox {
         let env: Option<Vec<String>> =
             env_vars.map(|vars| vars.iter().map(|(k, v)| format!("{k}={v}")).collect());
         let cmd = vec![
-            DOCKER_BASH.to_string(),
+            REMOTE_BASH.to_string(),
             "-c".to_string(),
             command.to_string(),
         ];
@@ -481,7 +477,7 @@ impl DockerSandbox {
         let (stop_file, pid_file) = docker_exec_control_paths();
         let controlled_command = docker_controlled_shell_command(command, &stop_file, &pid_file);
         let cmd = vec![
-            DOCKER_BASH.to_string(),
+            REMOTE_BASH.to_string(),
             "-c".to_string(),
             controlled_command,
         ];
@@ -607,27 +603,17 @@ impl DockerSandbox {
     /// resumed container cannot pass startup and then fail on its first
     /// command.
     async fn probe_bash(&self, working_dir: Option<&str>) -> crate::Result<()> {
-        let (stdout, stderr, exit_code) = self
-            .docker_exec(
-                vec![
-                    DOCKER_BASH.to_string(),
-                    "-c".to_string(),
-                    BASH_PROBE_SCRIPT.to_string(),
-                ],
-                working_dir,
+        let result = self
+            .docker_exec_shell(
+                BASH_PROBE_SCRIPT,
+                BASH_PROBE_TIMEOUT_MS,
+                Some(working_dir.unwrap_or("/")),
+                None,
                 None,
             )
-            .await?;
-
-        if bash_probe_passed(Some(exit_code), &stdout) {
-            return Ok(());
-        }
-
-        Err(crate::Error::message(format!(
-            "Docker container Bash check failed (exit {exit_code}). Docker sandboxes require \
-             {DOCKER_BASH} for every command, with no `sh` fallback; use an image with bash and \
-             git, such as buildpack-deps:noble. {stderr}"
-        )))
+            .await
+            .map_err(|err| crate::Error::context(DOCKER_BASH_REQUIREMENT, err))?;
+        validate_bash_probe(result, DOCKER_BASH_REQUIREMENT)
     }
 
     async fn verify_git_available(&self) -> crate::Result<()> {
@@ -910,7 +896,7 @@ wait \"$watcher\" 2>/dev/null || true; \
 rm -f \"$stop_file\" \"$pid_file\"; \
 exit \"$status\"\
 ",
-        bash = DOCKER_BASH,
+        bash = REMOTE_BASH,
         stop_file = shell_quote(stop_file),
         pid_file = shell_quote(pid_file),
         command = shell_quote(command),
@@ -930,7 +916,7 @@ fn docker_stdio_exec_options(
             attach_stdout: Some(true),
             attach_stderr: Some(true),
             tty: Some(false),
-            cmd: Some(vec![DOCKER_BASH.to_string(), "-c".to_string(), command]),
+            cmd: Some(vec![REMOTE_BASH.to_string(), "-c".to_string(), command]),
             working_dir: Some(working_dir),
             env,
             ..Default::default()
@@ -967,7 +953,7 @@ async fn create_and_start_exec(
 fn docker_stop_request_exec_options(stop_file: &str) -> CreateExecOptions<String> {
     CreateExecOptions {
         cmd: Some(vec![
-            DOCKER_BASH.to_string(),
+            REMOTE_BASH.to_string(),
             "-c".to_string(),
             format!("touch {}", shell_quote(stop_file)),
         ]),
@@ -1178,7 +1164,7 @@ fn container_config(config: &DockerSandboxOptions, run_id: Option<&RunId>) -> Co
     Config {
         image: Some(config.image.clone()),
         cmd: Some(vec![
-            DOCKER_BASH.to_string(),
+            REMOTE_BASH.to_string(),
             "-c".to_string(),
             format!(
                 "mkdir -p {} && sleep infinity",
@@ -1233,10 +1219,8 @@ fn docker_not_modified(error: &DockerError) -> bool {
     })
 }
 
-fn bash_remediation(error: &DockerError, image: &str) -> String {
-    format!(
-        "Failed to start Docker container from image '{image}': {error}. Docker sandboxes require {DOCKER_BASH} for every command, with no `sh` fallback; use an image with bash and git, such as buildpack-deps:noble."
-    )
+fn bash_remediation(image: &str) -> String {
+    format!("Failed to start Docker container from image '{image}'. {DOCKER_BASH_REQUIREMENT}")
 }
 
 fn build_single_file_tar(file_name: &str, bytes: &[u8]) -> crate::Result<Vec<u8>> {
@@ -1351,7 +1335,7 @@ impl Sandbox for DockerSandbox {
             .start_container(&id, None::<StartContainerOptions<String>>)
             .await
             .map_err(|e| {
-                let err = crate::Error::context(bash_remediation(&e, &self.config.image), e);
+                let err = crate::Error::context(bash_remediation(&self.config.image), e);
                 self.fail_init(init_start, err)
             })?;
 
@@ -2023,7 +2007,7 @@ mod tests {
     use tokio::process::Command;
 
     use super::*;
-    use crate::sandbox::BASH_PROBE_MARKER;
+    use crate::sandbox::{BASH_PROBE_MARKER, bash_probe_passed};
 
     #[test]
     fn per_run_container_idle_command_uses_non_login_bash() {

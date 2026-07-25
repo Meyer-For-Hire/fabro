@@ -20,6 +20,7 @@ use fabro_types::{
     AgentToolSummary, PermissionLevel, Principal, SessionMessage, SessionRecord,
     StageContextWindowProjection, SteeringMessage,
 };
+use fabro_util::shell;
 use futures::StreamExt;
 use tokio::sync::{Notify, broadcast};
 use tokio::time;
@@ -2079,17 +2080,14 @@ const fn is_auth_error(err: &LlmError) -> bool {
 /// `setsid` fully detaches the server so Daytona's exec doesn't block on it.
 /// The inner command is shell-quoted for the wrapper so a single quote or
 /// metacharacter in any argv element can't break out, and the wrapper itself is
-/// `bash -c` because the sandbox evaluates this string as non-login Bash.
+/// the current `$BASH` because the sandbox evaluates this string as non-login
+/// Bash and may resolve that executable outside `/bin` (for example on NixOS).
 fn sandbox_mcp_launch_script(command: &[String]) -> String {
-    let cmd_str = command
-        .iter()
-        .map(|arg| fabro_sandbox::shell_quote(arg))
-        .collect::<Vec<_>>()
-        .join(" ");
+    let cmd_str = shell::shell_join(command);
     let inner = format!("{cmd_str} > /tmp/mcp_server_stdout.log 2>/tmp/mcp_server_stderr.log");
     format!(
-        "setsid bash -c {quoted} </dev/null >/dev/null 2>&1 &\necho $!",
-        quoted = fabro_sandbox::shell_quote(&inner)
+        "setsid \"$BASH\" -c {quoted} </dev/null >/dev/null 2>&1 &\necho $!",
+        quoted = shell::shell_quote(&inner)
     )
 }
 
@@ -2137,7 +2135,7 @@ mod tests {
     #[test]
     fn sandbox_mcp_launch_wrapper_uses_bash() {
         // The sandbox evaluates this string as non-login Bash, so the detached
-        // wrapper must name bash rather than sh.
+        // wrapper reuses the executable selected by the provider.
         let script = sandbox_mcp_launch_script(&[
             "npx".to_string(),
             "@playwright/mcp@latest".to_string(),
@@ -2146,8 +2144,8 @@ mod tests {
         ]);
 
         assert!(
-            script.starts_with("setsid bash -c "),
-            "launch wrapper should detach through bash: {script}"
+            script.starts_with("setsid \"$BASH\" -c "),
+            "launch wrapper should detach through the provider-selected Bash: {script}"
         );
         assert!(
             script.ends_with(" </dev/null >/dev/null 2>&1 &\necho $!"),
@@ -2171,7 +2169,7 @@ mod tests {
         ]);
 
         let wrapper_argument = script
-            .strip_prefix("setsid bash -c ")
+            .strip_prefix("setsid \"$BASH\" -c ")
             .and_then(|rest| rest.strip_suffix(" </dev/null >/dev/null 2>&1 &\necho $!"))
             .expect("launch wrapper should have the canonical shape");
 

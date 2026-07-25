@@ -6,6 +6,16 @@ use bollard::Docker;
 use fabro_sandbox::{CommandOutputCallback, DockerSandbox, DockerSandboxOptions, Sandbox};
 use tokio::sync::Mutex;
 
+fn capture_bytes(chunks: Arc<Mutex<Vec<u8>>>) -> CommandOutputCallback {
+    Arc::new(move |_stream, bytes| {
+        let chunks = Arc::clone(&chunks);
+        Box::pin(async move {
+            chunks.lock().await.extend(bytes);
+            Ok(())
+        })
+    })
+}
+
 #[tokio::test]
 #[ignore = "requires real Docker container lifecycle; run explicitly when changing Docker exec integration"]
 async fn streaming_timeout_terminates_docker_exec_before_returning() {
@@ -36,14 +46,6 @@ async fn streaming_timeout_terminates_docker_exec_before_returning() {
         .expect("docker sandbox should initialize");
 
     let chunks = Arc::new(Mutex::new(Vec::new()));
-    let callback_chunks = Arc::clone(&chunks);
-    let callback: CommandOutputCallback = Arc::new(move |_stream, bytes| {
-        let callback_chunks = Arc::clone(&callback_chunks);
-        Box::pin(async move {
-            callback_chunks.lock().await.extend(bytes);
-            Ok(())
-        })
-    });
 
     let marker = "fabro_streaming_timeout_sentinel";
     let result = sandbox
@@ -53,7 +55,7 @@ async fn streaming_timeout_terminates_docker_exec_before_returning() {
             None,
             None,
             None,
-            callback,
+            capture_bytes(Arc::clone(&chunks)),
         )
         .await
         .expect("streaming command should return a timeout result");
@@ -193,16 +195,15 @@ async fn docker_runs_bash_only_syntax_through_both_command_paths() {
         .expect("non-streaming command should run");
 
     let chunks = Arc::new(Mutex::new(Vec::new()));
-    let callback_chunks = Arc::clone(&chunks);
-    let callback: CommandOutputCallback = Arc::new(move |_stream, bytes| {
-        let callback_chunks = Arc::clone(&callback_chunks);
-        Box::pin(async move {
-            callback_chunks.lock().await.extend(bytes);
-            Ok(())
-        })
-    });
     let streaming = sandbox
-        .exec_command_streaming(command, Some(10_000), None, None, None, callback)
+        .exec_command_streaming(
+            command,
+            Some(10_000),
+            None,
+            None,
+            None,
+            capture_bytes(Arc::clone(&chunks)),
+        )
         .await
         .expect("streaming command should run");
 

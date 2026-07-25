@@ -98,17 +98,7 @@ mod daytona_streaming_live {
                 "exec_command should report the Bash-only result",
             )?;
 
-            let chunks = Arc::new(Mutex::new(Vec::new()));
-            let streaming = sandbox
-                .exec_command_streaming(
-                    command,
-                    Some(30_000),
-                    None,
-                    None,
-                    None,
-                    capture_callback(Arc::clone(&chunks)),
-                )
-                .await?;
+            let (streaming, _) = run_captured(&sandbox, command, 30_000, None).await?;
             ensure_eq(
                 &streaming.result.exit_code,
                 &Some(0),

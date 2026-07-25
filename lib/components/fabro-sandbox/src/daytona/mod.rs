@@ -27,18 +27,13 @@ use tokio_util::sync::CancellationToken;
 use crate::clone_source::{self, CloneDecision, EmptyWorkspaceReason};
 use crate::redact::redact_auth_url;
 use crate::sandbox::{
-    BASH_PROBE_SCRIPT, RefreshOutcome, bash_probe_passed, optional_timeout, resolve_path,
+    BASH_PROBE_SCRIPT, BASH_PROBE_TIMEOUT_MS, REMOTE_BASH, RefreshOutcome, optional_timeout,
+    resolve_path, validate_bash_probe,
 };
 use crate::{
     CommandOutputCallback, DirEntry, ExecResult, ExecStreamingResult, GrepOptions, Sandbox,
     SandboxEvent, SandboxEventCallback, StdioProcess, glob_match, managed_labels, shell_quote,
 };
-
-/// Bash executable Daytona sandboxes require, on both sides of the transport.
-///
-/// Daytona snapshots are Linux images Fabro documents a requirement for, so
-/// the path is known rather than resolved, and there is no `sh` fallback.
-pub(crate) const DAYTONA_BASH: &str = "/bin/bash";
 
 /// Remediation shown when a Daytona sandbox has no usable Bash.
 const DAYTONA_BASH_REMEDIATION: &str = "Daytona sandboxes require /bin/bash for every command, with no `sh` fallback. Use the \
@@ -504,7 +499,8 @@ impl DaytonaSandbox {
     /// again after a reconnected sandbox starts, so a snapshot without Bash
     /// fails at the lifecycle boundary rather than on some later command.
     async fn probe_bash(sandbox: &daytona_sdk::Sandbox) -> crate::Result<()> {
-        let execution = async {
+        let start = Instant::now();
+        let execution = time::timeout(Duration::from_millis(BASH_PROBE_TIMEOUT_MS), async {
             let process_svc = sandbox
                 .process()
                 .await
@@ -514,14 +510,27 @@ impl DaytonaSandbox {
                     &wrap_bash_command(BASH_PROBE_SCRIPT),
                     daytona_sdk::ExecuteCommandOptions {
                         cwd: Some("/".to_string()),
+                        timeout: Some(Duration::from_millis(BASH_PROBE_TIMEOUT_MS)),
                         ..Default::default()
                     },
                 )
                 .await
                 .map_err(|e| crate::Error::context("Failed to run Daytona Bash check", e))?;
-            Ok((result.exit_code, result.result))
-        }
+            Ok(ExecResult {
+                stdout:      result.result,
+                stderr:      String::new(),
+                exit_code:   Some(result.exit_code),
+                termination: CommandTermination::Exited,
+                duration_ms: elapsed_ms(start),
+            })
+        })
         .await;
+        let execution = match execution {
+            Ok(result) => result,
+            Err(_) => Err(crate::Error::message(format!(
+                "Daytona Bash check timed out after {BASH_PROBE_TIMEOUT_MS}ms"
+            ))),
+        };
 
         daytona_bash_probe_outcome(execution)
     }
@@ -1720,7 +1729,7 @@ impl Sandbox for DaytonaSandbox {
         let mut session = DaytonaSession::create(sandbox).await?;
 
         let session_command =
-            wrap_bash_command(&build_bash_session_script(command, &cwd, env_vars));
+            wrap_bash_session_script(&build_bash_session_script(command, &cwd, env_vars));
         let session_exec = match session.execute(&session_command, true, true).await {
             Ok(result) => result,
             Err(err) => {
@@ -2291,8 +2300,7 @@ fn missing_log_suffix_offset(seen: &[u8], final_bytes: &[u8]) -> usize {
 /// Build the inner Bash script a session command evaluates.
 ///
 /// The result is Bash source, not something Daytona can exec directly — it is
-/// passed through [`wrap_bash_command`] before reaching the toolbox, exactly
-/// like the non-streaming path.
+/// passed through [`wrap_bash_session_script`] before reaching the toolbox.
 fn build_bash_session_script(
     command: &str,
     cwd: &str,
@@ -2322,14 +2330,10 @@ fn build_bash_session_script(
 ///
 /// A failure to run the probe at all, a nonzero exit, and a zero exit without
 /// the marker are all probe failures, and all carry the snapshot remediation.
-fn daytona_bash_probe_outcome(execution: crate::Result<(i32, String)>) -> crate::Result<()> {
+fn daytona_bash_probe_outcome(execution: crate::Result<ExecResult>) -> crate::Result<()> {
     match execution {
         Err(err) => Err(crate::Error::context(DAYTONA_BASH_REMEDIATION, err)),
-        Ok((exit_code, output)) if bash_probe_passed(Some(exit_code), &output) => Ok(()),
-        Ok((exit_code, output)) => Err(crate::Error::message(format!(
-            "Daytona sandbox Bash check failed (exit {exit_code}). {DAYTONA_BASH_REMEDIATION} {}",
-            output.trim()
-        ))),
+        Ok(result) => validate_bash_probe(result, DAYTONA_BASH_REMEDIATION),
     }
 }
 
@@ -2356,7 +2360,17 @@ fn wrap_bash_command(command: &str) -> String {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
     let encoded = STANDARD.encode(command);
-    format!("{DAYTONA_BASH} -c \"echo '{encoded}' | base64 -d | {DAYTONA_BASH}\"")
+    format!("{REMOTE_BASH} -c \"echo '{encoded}' | base64 -d | {REMOTE_BASH}\"")
+}
+
+/// Enter the canonical Bash interpreter from a Daytona streaming session.
+///
+/// Session commands already pass through the provider's shell parser, so an
+/// audited shell-quoted argument avoids the direct-exec path's base64 process
+/// and second Bash while keeping caller source inert until `/bin/bash -c`
+/// evaluates it.
+fn wrap_bash_session_script(script: &str) -> String {
+    format!("exec {REMOTE_BASH} -c {}", shell_quote(script))
 }
 
 #[cfg(test)]
@@ -2961,25 +2975,40 @@ mod tests {
     #[test]
     fn streaming_session_script_reaches_bash_through_the_canonical_wrapper() {
         let script = build_bash_session_script("[[ -d / ]] && echo ok", "/tmp", None);
+        let wrapped = wrap_bash_session_script(&script);
 
         assert_eq!(
-            decode_wrapped_command(&wrap_bash_command(&script)),
-            script,
-            "the streaming path must use the same wrapper as exec_command"
+            wrapped,
+            format!("exec /bin/bash -c {}", shell_quote(&script)),
+            "the streaming path must enter the canonical Bash exactly once"
         );
+        assert!(!wrapped.contains("base64"));
+    }
+
+    fn bash_probe_result(exit_code: i32, stdout: impl Into<String>) -> ExecResult {
+        ExecResult {
+            stdout:      stdout.into(),
+            stderr:      String::new(),
+            exit_code:   Some(exit_code),
+            termination: CommandTermination::Exited,
+            duration_ms: 1,
+        }
     }
 
     #[test]
     fn bash_probe_outcome_accepts_a_marked_zero_exit() {
-        assert!(daytona_bash_probe_outcome(Ok((0, format!("{BASH_PROBE_MARKER}\n")))).is_ok());
+        assert!(
+            daytona_bash_probe_outcome(Ok(bash_probe_result(0, format!("{BASH_PROBE_MARKER}\n"))))
+                .is_ok()
+        );
     }
 
     #[test]
     fn bash_probe_outcome_rejects_failures_with_snapshot_remediation() {
         let failures = [
             Err(crate::Error::message("connection reset")),
-            Ok((1, "bash: not found".to_string())),
-            Ok((0, "ready".to_string())),
+            Ok(bash_probe_result(1, "bash: not found")),
+            Ok(bash_probe_result(0, "ready")),
         ];
 
         for failure in failures {
@@ -2990,6 +3019,10 @@ mod tests {
             assert!(
                 err.contains("/bin/bash") && err.contains("snapshot"),
                 "probe failure should carry the Daytona snapshot remediation: {err}"
+            );
+            assert!(
+                !err.contains("bash: not found"),
+                "raw process output must not enter lifecycle errors: {err}"
             );
         }
     }

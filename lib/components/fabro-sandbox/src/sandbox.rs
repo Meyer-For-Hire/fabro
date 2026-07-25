@@ -21,6 +21,13 @@ const GIT: &str = "git -c maintenance.auto=0 -c gc.auto=0";
 
 pub const DEFAULT_EXEC_OUTPUT_TAIL_BYTES: usize = 8 * 1024;
 
+/// Maximum time a sandbox lifecycle check may spend proving Bash is usable.
+pub(crate) const BASH_PROBE_TIMEOUT_MS: u64 = 10_000;
+
+/// Bash path required by Linux-backed remote sandbox providers.
+#[cfg(any(feature = "docker", feature = "daytona"))]
+pub(crate) const REMOTE_BASH: &str = "/bin/bash";
+
 /// Marker a successful [`BASH_PROBE_SCRIPT`] run prints on stdout.
 ///
 /// Providers validate the marker rather than trusting a zero exit: an image
@@ -51,9 +58,29 @@ printf '%s\n' 'fabro-bash-ready'"#;
 
 /// Whether a [`BASH_PROBE_SCRIPT`] run succeeded.
 ///
-/// A zero exit without the marker is not a successful probe.
+/// A zero exit without exactly the marker is not a successful probe.
 pub(crate) fn bash_probe_passed(exit_code: Option<i32>, stdout: &str) -> bool {
-    exit_code == Some(0) && stdout.contains(BASH_PROBE_MARKER)
+    exit_code == Some(0) && stdout.trim() == BASH_PROBE_MARKER
+}
+
+/// Validate a completed Bash probe without flattening its raw output into an
+/// error message.
+///
+/// [`Error::Exec`](crate::Error::Exec) retains stdout/stderr for the existing
+/// redacted-tail diagnostics while its display form exposes only bounded,
+/// classified metadata safe for lifecycle events and tracing.
+pub(crate) fn validate_bash_probe(
+    result: ExecResult,
+    remediation: impl Into<String>,
+) -> crate::Result<()> {
+    if result.is_success() && bash_probe_passed(result.exit_code, &result.stdout) {
+        return Ok(());
+    }
+
+    Err(crate::Error::context(
+        remediation,
+        result.into_exec_error("Sandbox Bash probe"),
+    ))
 }
 
 /// Sleep for `timeout_ms` if `Some`, otherwise never resolves. Used by
@@ -1572,6 +1599,7 @@ mod tests {
             let output = Command::new(program)
                 .args(args)
                 .arg(BASH_PROBE_SCRIPT)
+                .env_remove("BASH_ENV")
                 .output()
                 .await
                 .expect("probe should run");
@@ -1584,7 +1612,7 @@ mod tests {
         let (code, stdout) = run("bash", &["-c"]).await;
         assert!(bash_probe_passed(code, &stdout), "non-login bash: {stdout}");
 
-        let (code, stdout) = run("bash", &["-lc"]).await;
+        let (code, stdout) = run("bash", &["--noprofile", "-lc"]).await;
         assert!(
             !bash_probe_passed(code, &stdout),
             "a login shell must fail the probe: {stdout}"
@@ -1597,6 +1625,44 @@ mod tests {
         assert!(
             !bash_probe_passed(code, &stdout),
             "sh must fail the probe: {stdout}"
+        );
+    }
+
+    #[test]
+    fn bash_probe_requires_the_exact_marker_output() {
+        assert!(bash_probe_passed(
+            Some(0),
+            &format!("  {BASH_PROBE_MARKER}\n")
+        ));
+        assert!(!bash_probe_passed(
+            Some(0),
+            &format!("prefix-{BASH_PROBE_MARKER}-suffix")
+        ));
+        assert!(!bash_probe_passed(
+            Some(0),
+            &format!("{BASH_PROBE_MARKER}\nunexpected output")
+        ));
+    }
+
+    #[test]
+    fn bash_probe_failure_keeps_raw_output_out_of_the_error_chain() {
+        let err = validate_bash_probe(
+            ExecResult {
+                stdout:      String::new(),
+                stderr:      "raw-probe-output".to_string(),
+                exit_code:   Some(1),
+                termination: CommandTermination::Exited,
+                duration_ms: 1,
+            },
+            "Install Bash",
+        )
+        .expect_err("failed probe should return remediation");
+
+        assert!(!err.display_with_causes().contains("raw-probe-output"));
+        assert_eq!(
+            err.default_redacted_output_tail()
+                .and_then(|tail| tail.stderr),
+            Some("raw-probe-output".to_string())
         );
     }
 

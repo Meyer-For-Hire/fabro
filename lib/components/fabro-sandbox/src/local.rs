@@ -12,7 +12,10 @@ use tokio::task::spawn_blocking;
 use tokio::{fs, time};
 use tokio_util::sync::CancellationToken;
 
-use crate::sandbox::{BASH_PROBE_SCRIPT, StdioProcessControl, bash_probe_passed, optional_timeout};
+use crate::sandbox::{
+    BASH_PROBE_SCRIPT, BASH_PROBE_TIMEOUT_MS, StdioProcessControl, optional_timeout,
+    validate_bash_probe,
+};
 use crate::{
     CommandOutputCallback, DEFAULT_EXEC_OUTPUT_TAIL_BYTES, DirEntry, ExecResult,
     ExecStreamingResult, GrepOptions, Sandbox, SandboxEvent, SandboxEventCallback, StderrCollector,
@@ -100,30 +103,20 @@ impl LocalSandbox {
     /// it.
     async fn probe_bash(&self) -> crate::Result<()> {
         let bash = self.bash()?;
-        let output = Command::new(&bash)
-            .arg("-c")
-            .arg(BASH_PROBE_SCRIPT)
-            .env_clear()
-            .envs(filtered_env_vars(None, ExplicitEnvPolicy::FilterSensitive))
-            .output()
+        let remediation = format!(
+            "{} is not usable as non-login Bash. {LOCAL_BASH_REMEDIATION}",
+            bash.display()
+        );
+        let result = self
+            .exec_command(BASH_PROBE_SCRIPT, BASH_PROBE_TIMEOUT_MS, None, None, None)
             .await
-            .map_err(|e| {
+            .map_err(|err| {
                 crate::Error::context(
-                    format!("{LOCAL_BASH_REMEDIATION} Failed to run {}", bash.display()),
-                    e,
+                    format!("Failed to run the local Bash check. {remediation}"),
+                    err,
                 )
             })?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if bash_probe_passed(output.status.code(), &stdout) {
-            return Ok(());
-        }
-
-        Err(crate::Error::message(format!(
-            "{LOCAL_BASH_REMEDIATION} {} is not usable as non-login Bash: {}",
-            bash.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        )))
+        validate_bash_probe(result, remediation)
     }
 
     pub fn set_event_callback(&mut self, cb: SandboxEventCallback) {
@@ -451,6 +444,7 @@ impl Sandbox for LocalSandbox {
             .current_dir(&effective_dir)
             .env_clear()
             .envs(filtered_env)
+            .kill_on_drop(true)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
@@ -528,6 +522,7 @@ impl Sandbox for LocalSandbox {
             .current_dir(&effective_dir)
             .env_clear()
             .envs(filtered_env)
+            .kill_on_drop(true)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
@@ -823,7 +818,23 @@ impl Sandbox for LocalSandbox {
     /// Bash it initialized with; there is deliberately no fallback interpreter
     /// when that happens.
     async fn start(&self) -> crate::Result<()> {
-        self.probe_bash().await
+        self.emit(SandboxEvent::StartStarted {
+            provider: "local".into(),
+        });
+        let start = Instant::now();
+        let result = self.probe_bash().await;
+        match &result {
+            Ok(()) => self.emit(SandboxEvent::StartCompleted {
+                provider:    "local".into(),
+                duration_ms: elapsed_ms(start),
+            }),
+            Err(err) => self.emit(SandboxEvent::StartFailed {
+                provider: "local".into(),
+                error:    err.to_string(),
+                causes:   err.causes(),
+            }),
+        }
+        result
     }
 
     async fn git_push_ref(&self, refspec: &str) -> crate::Result<()> {
@@ -1405,17 +1416,55 @@ mod tests {
 
     #[tokio::test]
     async fn start_repeats_the_bash_probe_on_resume() {
-        let dir = temp_dir();
+        use std::sync::Mutex;
 
-        LocalSandbox::new(dir.clone())
+        let dir = temp_dir();
+        let successful_events: Arc<Mutex<Vec<SandboxEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let successful_events_clone = Arc::clone(&successful_events);
+        let mut available = LocalSandbox::new(dir.clone());
+        available.set_event_callback(Arc::new(move |event| {
+            successful_events_clone.lock().unwrap().push(event);
+        }));
+
+        available
             .start()
             .await
             .expect("resume should succeed when Bash is present");
 
-        LocalSandbox::with_bash_executable(dir.clone(), BashExecutable::Unavailable)
+        let failed_events: Arc<Mutex<Vec<SandboxEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let failed_events_clone = Arc::clone(&failed_events);
+        let mut unavailable =
+            LocalSandbox::with_bash_executable(dir.clone(), BashExecutable::Unavailable);
+        unavailable.set_event_callback(Arc::new(move |event| {
+            failed_events_clone.lock().unwrap().push(event);
+        }));
+        unavailable
             .start()
             .await
             .expect_err("resume should fail when Bash disappeared between runs");
+
+        let successful_events = successful_events.lock().unwrap();
+        assert!(matches!(
+            &successful_events[..],
+            [
+                SandboxEvent::StartStarted { provider: started },
+                SandboxEvent::StartCompleted {
+                    provider: completed,
+                    ..
+                }
+            ] if started == "local" && completed == "local"
+        ));
+        let failed_events = failed_events.lock().unwrap();
+        assert!(matches!(
+            &failed_events[..],
+            [
+                SandboxEvent::StartStarted { provider: started },
+                SandboxEvent::StartFailed {
+                    provider: failed,
+                    ..
+                }
+            ] if started == "local" && failed == "local"
+        ));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
