@@ -30,8 +30,8 @@ use crate::native_tool::NativeTool;
 use crate::sandbox::{GrepOptions, format_lines_numbered};
 use crate::tool_registry::{RegisteredTool, ToolSource};
 use crate::tools::{
-    DEFAULT_READ_LINES, execute_grep, execute_shell_command, grep_result_path, make_edit_file_tool,
-    optional_usize_arg, required_str,
+    DEFAULT_READ_LINES, emit_shell_process_completed, execute_grep, execute_shell_command,
+    grep_result_path, make_edit_file_tool, optional_usize_arg, required_str,
 };
 
 const DEFAULT_GREP_RESULTS: usize = 250;
@@ -120,7 +120,8 @@ explicitly asked. Never run commands requiring superuser privileges unless expli
                     None => default_timeout_ms,
                 };
 
-                let result = execute_shell_command(&ctx, command, timeout_ms, cwd).await?;
+                let streaming = execute_shell_command(&ctx, command, timeout_ms, cwd).await?;
+                let result = &streaming.result;
 
                 let mut out = String::new();
                 if result.is_timed_out() {
@@ -141,7 +142,9 @@ explicitly asked. Never run commands requiring superuser privileges unless expli
                     }
                     let _ = write!(out, "Command failed with exit code: {code}");
                 }
-                Ok(out)
+                let is_success = result.is_success();
+                emit_shell_process_completed(&ctx, streaming).await;
+                if is_success { Ok(out) } else { Err(out) }
             })
         }),
         source:     ToolSource::Native,
@@ -699,7 +702,7 @@ mod tests {
             tool_ctx,
         )
         .await
-        .unwrap();
+        .expect_err("a timeout is a failed tool result");
 
         assert!(output.starts_with("Command timed out.\n"), "{output}");
         assert_eq!(*env.captured_timeout.lock().unwrap(), Some(7_000));
@@ -707,12 +710,9 @@ mod tests {
             Some("/repo".to_string())
         ]);
         assert_eq!(*env.captured_env_vars.lock().unwrap(), Some(tool_env));
-        assert!(
-            env.captured_command
-                .lock()
-                .unwrap()
-                .as_deref()
-                .is_some_and(|command| command.starts_with("exec 2>&1\n"))
+        assert_eq!(
+            env.captured_command.lock().unwrap().as_deref(),
+            Some("echo $TOKEN")
         );
     }
 }

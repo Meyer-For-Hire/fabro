@@ -558,6 +558,7 @@ mod tests {
     use async_trait::async_trait;
     use fabro_llm::types::{ToolCall, ToolDefinition};
     use fabro_model::AgentProfileKind;
+    use tokio::sync::broadcast;
 
     use super::*;
     use crate::config::{
@@ -570,11 +571,13 @@ mod tests {
         AgentToolRuntime, register_question_tools,
     };
     use crate::read_before_write_sandbox::ReadBeforeWriteSandbox;
-    use crate::test_support::MutableMockSandbox;
+    use crate::test_support::{MockSandbox, MutableMockSandbox};
     use crate::tool_registry::{RegisteredTool, ToolContext, ToolRegistry, ToolSource};
     use crate::tools::{
-        make_edit_file_tool, make_grep_tool, make_read_file_tool, make_write_file_tool,
+        make_edit_file_tool, make_grep_tool, make_read_file_tool, make_shell_tool,
+        make_write_file_tool,
     };
+    use crate::types::SessionEvent;
 
     struct NamedPolicy {
         decisions: HashMap<String, ToolAccess>,
@@ -1293,5 +1296,174 @@ mod tests {
         .await;
 
         assert!(!result.is_error);
+    }
+
+    fn shell_sandbox(result: fabro_sandbox::ExecResult) -> Arc<dyn Sandbox> {
+        Arc::new(MockSandbox {
+            exec_result: result,
+            ..Default::default()
+        })
+    }
+
+    fn exited(exit_code: i32) -> fabro_sandbox::ExecResult {
+        fabro_sandbox::ExecResult {
+            stdout:      "out".into(),
+            stderr:      "err".into(),
+            exit_code:   Some(exit_code),
+            termination: fabro_types::CommandTermination::Exited,
+            duration_ms: 12,
+        }
+    }
+
+    fn cancelled() -> fabro_sandbox::ExecResult {
+        fabro_sandbox::ExecResult {
+            stdout:      "out".into(),
+            stderr:      String::new(),
+            exit_code:   None,
+            termination: fabro_types::CommandTermination::Cancelled,
+            duration_ms: 12,
+        }
+    }
+
+    async fn run_shell_tool(
+        exec_result: fabro_sandbox::ExecResult,
+        hooks: Option<&Arc<dyn ToolHookCallback>>,
+        emitter: &Emitter,
+    ) -> ToolResult {
+        let mut registry = ToolRegistry::new();
+        registry.register(make_shell_tool());
+        let tc = make_tool_call(
+            "shell",
+            "call_1",
+            serde_json::json!({"command": "make test"}),
+        );
+
+        execute_and_emit_one_tool(
+            &tc,
+            &registry,
+            shell_sandbox(exec_result),
+            hooks,
+            CancellationToken::new(),
+            &SessionOptions::default(),
+            emitter,
+            "test-session",
+            "test-session",
+            None,
+        )
+        .await
+    }
+
+    fn drain(receiver: &mut broadcast::Receiver<SessionEvent>) -> Vec<SessionEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    #[tokio::test]
+    async fn shell_nonzero_exit_becomes_an_error_tool_result() {
+        let emitter = Emitter::new();
+        let result = run_shell_tool(exited(7), None, &emitter).await;
+
+        assert!(result.is_error);
+        assert!(
+            result.content.as_str().unwrap().contains("Exit code: 7"),
+            "got: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_exit_zero_remains_a_successful_tool_result() {
+        let emitter = Emitter::new();
+        let result = run_shell_tool(exited(0), None, &emitter).await;
+
+        assert!(!result.is_error);
+    }
+
+    #[tokio::test]
+    async fn shell_failure_emits_started_then_process_then_completed() {
+        let emitter = Emitter::new();
+        let mut receiver = emitter.subscribe();
+        run_shell_tool(exited(7), None, &emitter).await;
+
+        let events = drain(&mut receiver);
+        let names: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                AgentEvent::ToolCallStarted { .. } => Some("started"),
+                AgentEvent::ToolProcessCompleted { .. } => Some("process"),
+                AgentEvent::ToolCallCompleted { .. } => Some("completed"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["started", "process", "completed"]);
+
+        for event in &events {
+            assert_eq!(event.session_id, "test-session");
+        }
+        let process = events
+            .iter()
+            .find(|event| matches!(event.event, AgentEvent::ToolProcessCompleted { .. }))
+            .expect("process event");
+        assert_eq!(process.tool_call_id.as_deref(), Some("call_1"));
+        match &process.event {
+            AgentEvent::ToolProcessCompleted {
+                exit_code,
+                termination,
+                ..
+            } => {
+                assert_eq!(*exit_code, Some(7));
+                assert_eq!(*termination, fabro_types::CommandTermination::Exited);
+            }
+            other => panic!("expected a process event, got {other:?}"),
+        }
+
+        let completed = events
+            .iter()
+            .find_map(|event| match &event.event {
+                AgentEvent::ToolCallCompleted {
+                    tool_call_id,
+                    is_error,
+                    ..
+                } => Some((tool_call_id.clone(), *is_error)),
+                _ => None,
+            })
+            .expect("tool completed event");
+        assert_eq!(completed, ("call_1".to_string(), true));
+    }
+
+    #[tokio::test]
+    async fn shell_failure_runs_only_the_failure_hook() {
+        for exec_result in [exited(7), cancelled()] {
+            let mock = Arc::new(MockHookCallback::new(ToolHookDecision::Proceed));
+            let hooks: Arc<dyn ToolHookCallback> = mock.clone();
+            run_shell_tool(exec_result, Some(&hooks), &Emitter::new()).await;
+
+            assert_eq!(mock.post_failure_calls.lock().unwrap().len(), 1);
+            assert!(mock.post_calls.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_success_runs_only_the_success_hook() {
+        let mock = Arc::new(MockHookCallback::new(ToolHookDecision::Proceed));
+        let hooks: Arc<dyn ToolHookCallback> = mock.clone();
+        run_shell_tool(exited(0), Some(&hooks), &Emitter::new()).await;
+
+        assert_eq!(mock.post_calls.lock().unwrap().len(), 1);
+        assert!(mock.post_failure_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn truncation_preserves_tool_call_id_and_error_state() {
+        let result = ToolResult::error("call_1", "x".repeat(60_000));
+
+        let truncated = truncate_tool_result(&result, "shell", &SessionOptions::default());
+
+        assert_eq!(truncated.tool_call_id, "call_1");
+        assert!(truncated.is_error);
+        assert!(truncated.content.as_str().unwrap().len() < 60_000);
     }
 }

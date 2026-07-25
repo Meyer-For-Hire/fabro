@@ -53,7 +53,7 @@ async fn streaming_timeout_terminates_docker_exec_before_returning() {
             None,
             None,
             None,
-            callback,
+            Some(callback),
         )
         .await
         .expect("streaming command should return a timeout result");

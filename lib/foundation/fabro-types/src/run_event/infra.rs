@@ -401,3 +401,30 @@ pub struct CliEnsureFailedProps {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exec_output_tail: Option<ExecOutputTail>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ExecOutputTail;
+
+    /// The trace summary is expanded into tracing fields, so it must carry
+    /// sizes and truncation flags only.
+    #[test]
+    fn exec_output_tail_trace_summary_exposes_sizes_not_content() {
+        let tail = ExecOutputTail {
+            stdout:           Some("secret stdout bytes".to_string()),
+            stderr:           Some("secret stderr".to_string()),
+            stdout_truncated: true,
+            stderr_truncated: false,
+        };
+
+        let summary = ExecOutputTail::trace_summary(Some(&tail));
+
+        assert!(summary.present);
+        assert_eq!(summary.stdout_bytes, 19);
+        assert_eq!(summary.stderr_bytes, 13);
+        assert!(summary.stdout_truncated);
+        assert!(!summary.stderr_truncated);
+        let rendered = format!("{summary:?}");
+        assert!(!rendered.contains("secret"), "got: {rendered}");
+    }
+}
