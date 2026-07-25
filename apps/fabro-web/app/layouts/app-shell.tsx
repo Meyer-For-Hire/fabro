@@ -12,7 +12,6 @@ import {
   XMarkIcon,
 } from "@heroicons/react/24/outline";
 import { Link, Outlet, useLocation, useMatches } from "react-router";
-import { FabroToaster } from "../components/toast";
 import { ErrorState } from "../components/state";
 import { TooltipProvider } from "../components/ui";
 import { DemoModeProvider } from "../lib/demo-mode";
@@ -248,9 +247,6 @@ export default function AppShell() {
       )}
       <ShellMain fullHeight={fullHeight} maxWidth={maxWidth} />
     </div>
-    {typeof document !== "undefined" && (
-      <FabroToaster />
-    )}
     </TooltipProvider>
     </DemoModeProvider>
   );

@@ -1,5 +1,5 @@
 import TerminalView from "../components/terminal-view";
-import { FabroToaster, ToastProvider } from "../components/toast";
+import { ToastProvider } from "../components/toast";
 import { useDocumentTitle } from "../hooks/effects";
 
 export default function RunTerminal({ params }: { params: { id: string } }) {
@@ -10,7 +10,6 @@ export default function RunTerminal({ params }: { params: { id: string } }) {
       <div className="h-screen w-screen overflow-hidden">
         <TerminalView runId={params.id} chromeless />
       </div>
-      {typeof document !== "undefined" && <FabroToaster />}
     </ToastProvider>
   );
 }

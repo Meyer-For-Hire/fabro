@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { watch as fsWatch } from "node:fs";
 import {
   cp,
@@ -10,7 +11,13 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
-import { dirname, join, relative } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
+
+import {
+  BUILD_ID_FILE_NAME,
+  BUILD_ID_META_NAME,
+  buildIdDocument,
+} from "../app/lib/build-version-contract";
 
 declare const Bun: any;
 
@@ -34,59 +41,228 @@ const tailwindCliBin = join(
   JSON.parse(await readFile(tailwindCliPackageJsonPath, "utf8")).bin.tailwindcss,
 );
 
-function newBuildId(): string {
+// Names the `.dist-builds/` staging directory only. Time-ordered so builds sort
+// chronologically on disk, and unique so concurrent builds never collide. This
+// is deliberately NOT the id published to browsers: see `publishedBuildId`.
+function newBuildDirName(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+/**
+ * Lowercase-alphanumeric 8-char digest, matching the `[a-z0-9]{8}` shape the
+ * bundler uses for its own content hashes — and which the server's cache
+ * classifier (`is_content_hashed` in `static_files.rs`) keys on to decide
+ * between `immutable` and `no-cache`.
+ */
+function toShortId(hex: string): string {
+  return BigInt(`0x${hex.slice(0, 32)}`)
+    .toString(36)
+    .padStart(8, "0")
+    .slice(0, 8);
+}
+
+function contentHash8(content: string | Uint8Array): string {
+  return toShortId(createHash("sha256").update(content).digest("hex"));
+}
+
+// Inputs outside Bun's JavaScript module graph. Tailwind scans `app/` for class
+// names, `public/` is copied verbatim, and the remaining files control template
+// rendering, module resolution, dependency versions, or the build itself.
+const BUILD_INPUT_DIRS = ["app", "public"];
+const BUILD_INPUT_FILES = [
+  "index.template.html",
+  "package.json",
+  "scripts/build.ts",
+  "tsconfig.json",
+  "../../bun.lock",
+];
+const FILE_HASH_BATCH_SIZE = 32;
+
+/**
+ * The build id published to browsers, derived from the bundle's *source inputs*.
+ *
+ * The obvious implementation — hash the emitted asset filenames, which already
+ * embed content hashes — does not work, because **Bun's minified identifier
+ * naming is not deterministic**. Building this app twice from an unchanged tree
+ * produces byte-different output roughly one run in three: same length, ~100k
+ * differing bytes, all of it mangled names (`var Gr=C3((Pl5,qq)=>` in one run,
+ * `var yr=C3((Uc5,Oq)=>` in the next). Output hashes therefore change without
+ * any source change.
+ *
+ * That matters because the client shows a "new version" toast on mismatch. An id
+ * that flips at random would fire the toast on redeploys of identical code and
+ * train people to ignore it, which is worse than having no toast at all. Hashing
+ * the inputs makes the id change if and only if something we actually control
+ * changed.
+ *
+ * The tradeoff: when Bun emits a different permutation for the same source, the
+ * asset filenames change while the build id does not, so an open tab isn't told
+ * to reload. That is the correct call — the two builds are the same program —
+ * and `importChunk` covers the case where such a tab later needs a chunk whose
+ * name moved.
+ */
+async function publishedBuildId(bundlerInputs: Iterable<string>): Promise<string> {
+  const files = new Set<string>();
+  for (const dir of BUILD_INPUT_DIRS) {
+    for (const file of await collectFiles(join(rootPath, dir))) {
+      files.add(file);
+    }
+  }
+  for (const file of BUILD_INPUT_FILES) {
+    files.add(resolve(rootPath, file));
+  }
+  // Bun's metafile is the source of truth for resolved production modules. In
+  // particular, it captures workspace sources reached through tsconfig path
+  // aliases, which a hand-maintained app-local file list would miss.
+  for (const file of localBundlerInputPaths(bundlerInputs)) {
+    files.add(file);
+  }
+
+  const digest = createHash("sha256");
+  // The bundler itself is an input: a Bun upgrade can change output semantics.
+  digest.update(`bun:${Bun.version}\n`);
+  const inputs = [...files]
+    .map((file) => ({
+      file,
+      name: toUrlPath(relative(rootPath, file)),
+    }))
+    .sort((left, right) =>
+      left.name < right.name ? -1 : left.name > right.name ? 1 : 0
+    );
+
+  // Bound parallel reads so hashing stays off the rebuild critical path without
+  // exhausting low per-process file-descriptor limits on macOS.
+  for (let start = 0; start < inputs.length; start += FILE_HASH_BATCH_SIZE) {
+    const batch = inputs.slice(start, start + FILE_HASH_BATCH_SIZE);
+    const hashes = await Promise.all(
+      batch.map(async ({ file, name }) => ({
+        name,
+        hash: createHash("sha256").update(await readFile(file)).digest(),
+      })),
+    );
+    for (const { name, hash } of hashes) {
+      // Hash the repo-relative path, not the absolute one, so the id doesn't
+      // depend on where the repo is checked out.
+      digest.update(name);
+      digest.update("\0");
+      digest.update(hash);
+    }
+  }
+  return toShortId(digest.digest("hex"));
+}
+
+async function collectFiles(dir: string): Promise<string[]> {
+  const glob = new Bun.Glob("**/*");
+  const files: string[] = [];
+  for await (const file of glob.scan({ cwd: dir, dot: true, onlyFiles: true })) {
+    files.push(join(dir, file));
+  }
+  return files;
+}
+
+export function localBundlerInputPaths(inputs: Iterable<string>): string[] {
+  return [...inputs]
+    .map((input) => resolve(rootPath, input))
+    .filter((path) => !isInstalledDependency(path));
+}
+
+function isInstalledDependency(path: string): boolean {
+  return toUrlPath(relative(rootPath, path))
+    .split("/")
+    .includes("node_modules");
+}
+
+function toUrlPath(path: string): string {
+  return path.split(sep).join("/");
+}
+
+function assetHref(path: string): string {
+  return `/${toUrlPath(path)}`;
+}
+
 async function buildOnce() {
-  const buildId = newBuildId();
-  const buildDir = join(buildsRootDir, buildId);
+  const buildDirName = newBuildDirName();
+  const buildDir = join(buildsRootDir, buildDirName);
   const buildAssetsDir = join(buildDir, "assets");
   await mkdir(buildAssetsDir, { recursive: true });
 
-  const result = await Bun.build({
-    entrypoints: [join(rootPath, "app", "entry.tsx")],
-    outdir: buildAssetsDir,
-    naming: "[name]-[hash].[ext]",
-    minify: true,
-    splitting: true,
-    target: "browser",
-  });
-
-  if (!result.success) {
-    throw new Error(result.logs.map((log: any) => log.message).join("\n"));
-  }
-
-  const cssResult = await Bun.spawn([
-    process.execPath,
-    tailwindCliBin,
-    "-i",
-    "app/app.css",
-    "-o",
-    relative(rootPath, join(buildAssetsDir, "app.css")),
-    "--minify",
-  ], {
-    cwd: rootPath,
-    stdout: "inherit",
-    stderr: "inherit",
-  }).exited;
+  const [result, cssResult] = await Promise.all([
+    Bun.build({
+      entrypoints: [join(rootPath, "app", "entry.tsx")],
+      outdir: buildAssetsDir,
+      naming: "[name]-[hash].[ext]",
+      minify: true,
+      splitting: true,
+      target: "browser",
+      metafile: true,
+      root: rootPath,
+    }),
+    Bun.spawn([
+      process.execPath,
+      tailwindCliBin,
+      "-i",
+      "app/app.css",
+      "-o",
+      relative(rootPath, join(buildAssetsDir, "app.css")),
+      "--minify",
+    ], {
+      cwd: rootPath,
+      stdout: "inherit",
+      stderr: "inherit",
+    }).exited,
+  ]);
 
   if (cssResult !== 0) {
     throw new Error("Tailwind build failed");
   }
 
-  await cp(publicDir, buildDir, { recursive: true });
-  await copyPierreWorkerAssets(join(buildAssetsDir, "pierre-diffs-worker"));
-  await writeIndexHtml(
-    buildDir,
-    result.outputs.map((output: any) => ({
+  if (!result.success) {
+    throw new Error(result.logs.map((log: any) => log.message).join("\n"));
+  }
+
+  const [stylesheetPath, buildId] = await Promise.all([
+    hashStylesheet(buildAssetsDir),
+    publishedBuildId(Object.keys(result.metafile.inputs)),
+    cp(publicDir, buildDir, { recursive: true }),
+    copyPierreWorkerAssets(join(buildAssetsDir, "pierre-diffs-worker")),
+  ]);
+
+  const outputs: IndexHtmlOutput[] = [
+    { kind: "asset", path: stylesheetPath },
+    ...result.outputs.map((output: any) => ({
       kind: output.kind,
       path: relative(buildDir, output.path),
     })),
+  ];
+
+  await writeIndexHtml(buildDir, outputs, buildId);
+  // Served with `no-cache` + ETag (it doesn't match the server's content-hash
+  // pattern), so a polling client revalidates it as a cheap 304.
+  await writeFile(
+    join(buildDir, BUILD_ID_FILE_NAME),
+    `${JSON.stringify(buildIdDocument(buildId), null, 2)}\n`,
+    "utf8",
   );
 
   await publishBuild(buildDir);
-  await pruneOldBuilds(buildId);
+  await pruneOldBuilds(buildDirName);
+}
+
+/**
+ * Renames Tailwind's stable-named `app.css` to `app-<hash>.css`.
+ *
+ * A stable name forces `no-cache`, which lets a tab revalidate into the new
+ * stylesheet while still running the previous build's JavaScript. Tailwind
+ * purges unused classes per build, so classes the old JS still emits can vanish
+ * from the new CSS and elements silently render unstyled. Hashing pins the two
+ * together and lets the server cache the stylesheet immutably.
+ */
+async function hashStylesheet(buildAssetsDir: string): Promise<string> {
+  const source = join(buildAssetsDir, "app.css");
+  const css = await readFile(source);
+  const hashedName = `app-${contentHash8(css)}.css`;
+  await rename(source, join(buildAssetsDir, hashedName));
+  return join("assets", hashedName);
 }
 
 async function copyPierreWorkerAssets(targetDir: string) {
@@ -110,7 +286,11 @@ type IndexHtmlOutput = {
   path: string;
 };
 
-async function writeIndexHtml(buildDir: string, outputs: IndexHtmlOutput[]) {
+async function writeIndexHtml(
+  buildDir: string,
+  outputs: IndexHtmlOutput[],
+  buildId: string,
+) {
   const template = await readFile(templatePath, "utf8");
   // Only entry points get <script> tags. Bun's `splitting: true` emits
   // hundreds of chunks reachable from the entry through static and dynamic
@@ -120,20 +300,24 @@ async function writeIndexHtml(buildDir: string, outputs: IndexHtmlOutput[]) {
   // import() chunks load on demand.
   const scripts = outputs
     .filter((output) => output.kind === "entry-point" && output.path.endsWith(".js"))
-    .map((output) => `<script type="module" src="/${output.path.replaceAll("\\\\", "/")}"></script>`)
+    .map((output) => `<script type="module" src="${assetHref(output.path)}"></script>`)
     .join("\n    ");
-  const styles = [
-    "/assets/app.css",
-    ...outputs
-      .filter((output) => output.path.endsWith(".css"))
-      .map((output) => `/${output.path.replaceAll("\\\\", "/")}`),
-  ]
+  const styles = outputs
+    .filter((output) => output.path.endsWith(".css"))
+    .map((output) => assetHref(output.path))
     .filter((value, index, array) => array.indexOf(value) === index)
     .map((path) => `<link rel="stylesheet" href="${path}" />`)
     .join("\n    ");
 
+  // Records which build this document loaded. A tab reads it back at runtime
+  // and compares against /build-id.json; the meta tag is the honest answer
+  // because client-side routing never re-fetches index.html, so it stays
+  // pinned to the build the tab actually started with.
+  const buildMeta = `<meta name="${BUILD_ID_META_NAME}" content="${buildId}" />`;
+
   const html = template
     .replace("{{styles}}", styles)
+    .replace("{{buildMeta}}", buildMeta)
     .replace("{{scripts}}", scripts);
 
   await writeFile(join(buildDir, "index.html"), html, "utf8");
@@ -264,7 +448,9 @@ async function main() {
   });
 }
 
-main().catch((error) => {
-  console.error(error);
-  process.exit(1);
-});
+if (import.meta.main) {
+  main().catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });
+}

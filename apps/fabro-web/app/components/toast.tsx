@@ -9,10 +9,17 @@ import { Toaster as SonnerToaster, toast as sonnerToast, useSonner } from "sonne
 
 export type ToastTone = "info" | "error";
 
+export interface ToastAction {
+  label: string;
+  onClick: () => void;
+}
+
 export interface ToastInput {
   message: string;
   tone?: ToastTone;
+  /** Pass `Infinity` for a toast that stays until dismissed or acted on. */
   autoDismissMs?: number;
+  action?: ToastAction;
 }
 
 interface ToastContextValue {
@@ -27,6 +34,7 @@ function push(toast: ToastInput): string {
   const id = `toast-${nextToastId++}`;
   const options = {
     id,
+    ...(toast.action ? { action: toast.action } : {}),
     ...(toast.tone === "error"
       ? { duration: Infinity }
       : toast.autoDismissMs != null
@@ -55,9 +63,9 @@ const toastApi: ToastContextValue = {
 /**
  * No-op wrapper retained so existing test harnesses and the standalone terminal
  * route can keep their <ToastProvider> mount points. In a browser the real
- * <Toaster /> is mounted globally in AppShell; in non-DOM test environments we
- * render an aria-live fallback that subscribes to the Sonner store so test
- * assertions can read the toast text.
+ * <Toaster /> is mounted globally at the entry point; in non-DOM test
+ * environments we render an aria-live fallback that subscribes to the Sonner
+ * store so test assertions can read the toast text.
  */
 export function ToastProvider({ children }: { children: ReactNode }) {
   if (typeof document !== "undefined") {
