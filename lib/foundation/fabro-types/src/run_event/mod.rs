@@ -208,6 +208,8 @@ pub enum EventBody {
     AgentToolStarted(AgentToolStartedProps),
     #[serde(rename = "agent.tool.completed")]
     AgentToolCompleted(AgentToolCompletedProps),
+    #[serde(rename = "agent.tool.process.completed")]
+    AgentToolProcessCompleted(AgentToolProcessCompletedProps),
     #[serde(rename = "agent.error")]
     AgentError(AgentErrorProps),
     #[serde(rename = "agent.warning")]
@@ -487,6 +489,7 @@ impl EventBody {
             Self::AgentMessage(_) => "agent.message",
             Self::AgentToolStarted(_) => "agent.tool.started",
             Self::AgentToolCompleted(_) => "agent.tool.completed",
+            Self::AgentToolProcessCompleted(_) => "agent.tool.process.completed",
             Self::AgentError(_) => "agent.error",
             Self::AgentWarning(_) => "agent.warning",
             Self::AgentLoopDetected(_) => "agent.loop.detected",
@@ -656,6 +659,7 @@ fn is_known_event_name(event: &str) -> bool {
             | "agent.message"
             | "agent.tool.started"
             | "agent.tool.completed"
+            | "agent.tool.process.completed"
             | "agent.error"
             | "agent.warning"
             | "agent.loop.detected"
@@ -920,8 +924,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        AuthMethod, Edge, Graph, IdpIdentity, Node, PendingReason, RunBlobId, WorkflowSettings,
-        fixtures, test_support,
+        AuthMethod, CommandTermination, Edge, Graph, IdpIdentity, Node, PendingReason, RunBlobId,
+        WorkflowSettings, fixtures, test_support,
     };
 
     fn user_principal(login: &str) -> Principal {
@@ -2407,6 +2411,90 @@ mod tests {
 
         let parsed: EventBody = serde_json::from_value(value).unwrap();
         assert_eq!(parsed, body);
+    }
+
+    #[test]
+    fn agent_tool_process_completed_round_trips_as_a_known_typed_event() {
+        let value = json!({
+            "id": "evt_process",
+            "ts": "2026-04-08T16:21:11.106Z",
+            "run_id": fixtures::RUN_1,
+            "event": "agent.tool.process.completed",
+            "node_id": "code",
+            "session_id": "ses_child",
+            "tool_call_id": "call_1",
+            "properties": {
+                "exit_code": 7,
+                "termination": "exited",
+                "duration_ms": 12,
+                "streams_separated": true,
+                "exec_output_tail": {"stdout": "out", "stderr": "err"},
+                "visit": 1
+            }
+        });
+
+        let parsed = RunEvent::from_value(value.clone()).unwrap();
+        assert_eq!(parsed.event_name(), "agent.tool.process.completed");
+        assert_eq!(parsed.tool_call_id.as_deref(), Some("call_1"));
+        let EventBody::AgentToolProcessCompleted(props) = &parsed.body else {
+            panic!("expected a typed process event, got {:?}", parsed.body);
+        };
+        assert_eq!(props.exit_code, Some(7));
+        assert_eq!(props.termination, CommandTermination::Exited);
+        assert_eq!(props.duration_ms, 12);
+        assert!(props.streams_separated);
+        assert_eq!(
+            props.exec_output_tail.as_ref().unwrap().stdout.as_deref(),
+            Some("out")
+        );
+
+        assert_eq!(parsed.to_value().unwrap(), value);
+    }
+
+    #[test]
+    fn agent_tool_process_completed_omits_absent_exit_code_and_output_tail() {
+        let body = EventBody::AgentToolProcessCompleted(AgentToolProcessCompletedProps {
+            exit_code:         None,
+            termination:       CommandTermination::TimedOut,
+            duration_ms:       10_000,
+            streams_separated: false,
+            exec_output_tail:  None,
+            visit:             1,
+        });
+
+        let value = serde_json::to_value(&body).unwrap();
+
+        assert_eq!(value["event"], "agent.tool.process.completed");
+        assert_eq!(value["properties"]["termination"], "timed_out");
+        assert_eq!(value["properties"]["streams_separated"], false);
+        let properties = value["properties"].as_object().unwrap();
+        assert!(!properties.contains_key("exit_code"));
+        assert!(!properties.contains_key("exec_output_tail"));
+
+        let parsed: EventBody = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, body);
+    }
+
+    /// The trace summary is what `AgentEvent::trace()` expands into tracing
+    /// fields, so it must carry sizes and truncation flags only.
+    #[test]
+    fn exec_output_tail_trace_summary_exposes_sizes_not_content() {
+        let tail = ExecOutputTail {
+            stdout:           Some("secret stdout bytes".to_string()),
+            stderr:           Some("secret stderr".to_string()),
+            stdout_truncated: true,
+            stderr_truncated: false,
+        };
+
+        let summary = ExecOutputTail::trace_summary(Some(&tail));
+
+        assert!(summary.present);
+        assert_eq!(summary.stdout_bytes, 19);
+        assert_eq!(summary.stderr_bytes, 13);
+        assert!(summary.stdout_truncated);
+        assert!(!summary.stderr_truncated);
+        let rendered = format!("{summary:?}");
+        assert!(!rendered.contains("secret"), "got: {rendered}");
     }
 
     #[test]

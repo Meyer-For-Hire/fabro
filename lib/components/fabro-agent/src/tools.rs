@@ -10,8 +10,9 @@ use fabro_static::EnvVars;
 use futures::{StreamExt, stream};
 
 use crate::config::NativeToolOptions;
-use crate::sandbox::GrepOptions;
+use crate::sandbox::{CommandOutputCallback, ExecStreamingResult, GrepOptions};
 use crate::tool_registry::{RegisteredTool, ToolRegistry, ToolSource};
+use crate::types::AgentEvent;
 
 const MAX_WEB_FETCH_BYTES: usize = 100 * 1024;
 const MAX_READ_MANY_FILES_CONCURRENCY: usize = 8;
@@ -239,49 +240,90 @@ pub fn make_shell_tool_with_options(options: &NativeToolOptions) -> RegisteredTo
         executor:   Arc::new(move |args, ctx| {
             Box::pin(async move {
                 let command = required_str(&args, "command")?;
-                let command = format!("exec 2>&1\n{command}");
                 let timeout_ms = args
                     .get("timeout_ms")
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(default_timeout)
                     .min(max_timeout);
 
-                let tool_env = ctx.resolve_tool_env().await.map_err(|e| format!("{e:#}"))?;
+                let tool_env = ctx
+                    .resolve_tool_env()
+                    .await
+                    .map_err(|e| format!("{SHELL_NO_PROCESS_RESULT}: {e:#}"))?;
                 tracing::debug!(
                     env_var_count = tool_env.as_ref().map_or(0, std::collections::HashMap::len),
                     "Injecting sandbox env vars into tool execution"
                 );
-                let result = ctx
+                let streaming = ctx
                     .env
-                    .exec_command(
-                        &command,
-                        timeout_ms,
+                    .exec_command_streaming(
+                        command,
+                        Some(timeout_ms),
                         None,
                         tool_env.as_ref(),
-                        Some(ctx.cancel),
+                        Some(ctx.cancel.clone()),
+                        discard_output_callback(),
                     )
                     .await
-                    .map_err(|e| e.display_with_causes())?;
+                    .map_err(|e| {
+                        format!("{SHELL_NO_PROCESS_RESULT}: {}", e.display_with_causes())
+                    })?;
 
-                let mut output = String::new();
-                if result.is_timed_out() {
-                    output.push_str("Command timed out.\n");
-                } else if result.is_cancelled() {
-                    output.push_str("Command cancelled.\n");
+                let text = render_shell_result(&streaming);
+                ctx.emit_agent_event(AgentEvent::ToolProcessCompleted {
+                    exit_code:         streaming.result.exit_code,
+                    termination:       streaming.result.termination,
+                    duration_ms:       streaming.result.duration_ms,
+                    streams_separated: streaming.streams_separated,
+                    exec_output_tail:  streaming.result.default_redacted_output_tail(),
+                });
+
+                if streaming.result.is_success() {
+                    Ok(text)
+                } else {
+                    Err(text)
                 }
-                let _ = write!(
-                    output,
-                    "Exit code: {}\noutput:\n{}",
-                    result
-                        .exit_code
-                        .map_or_else(|| "none".to_string(), |code| code.to_string()),
-                    result.stdout
-                );
-                Ok(output)
             })
         }),
         source:     ToolSource::Native,
     }
+}
+
+/// Prefix for shell failures that never produced an `ExecResult`, so the model
+/// can tell "the process never ran" apart from "the process ran and failed".
+const SHELL_NO_PROCESS_RESULT: &str = "Shell command produced no process result";
+
+/// The agent shell tool consumes the streaming exec path for its stream
+/// provenance and partial-output capture, but does not forward live output
+/// deltas onto the agent protocol.
+fn discard_output_callback() -> CommandOutputCallback {
+    Arc::new(|_stream, _bytes| Box::pin(async { Ok(()) }))
+}
+
+/// Renders the model-facing shell result: termination, exit code, duration,
+/// and provider-honest output sections. Metadata stays at the head and
+/// `stderr` at the tail so head/tail truncation preserves both.
+fn render_shell_result(streaming: &ExecStreamingResult) -> String {
+    let result = &streaming.result;
+    let mut output = format!(
+        "Termination: {}\nExit code: {}\nDuration: {}ms\n",
+        result.termination.as_str(),
+        result
+            .exit_code
+            .map_or_else(|| "none".to_string(), |code| code.to_string()),
+        result.duration_ms,
+    );
+    if streaming.streams_separated {
+        if !result.stdout.is_empty() {
+            let _ = write!(output, "stdout:\n{}\n", result.stdout);
+        }
+        if !result.stderr.is_empty() {
+            let _ = write!(output, "stderr:\n{}\n", result.stderr);
+        }
+    } else if !result.stdout.is_empty() {
+        let _ = write!(output, "output (combined):\n{}\n", result.stdout);
+    }
+    output
 }
 
 #[must_use]
@@ -693,10 +735,12 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
-    use crate::config::{NativeToolOptions, ToolSecrets};
+    use crate::config::{NativeToolOptions, SessionOptions, ToolSecrets};
+    use crate::local_sandbox::LocalSandbox;
     use crate::sandbox::*;
     use crate::test_support::MockSandbox;
-    use crate::tool_registry::ToolContext;
+    use crate::tool_registry::{AgentEventEmitter, ToolContext};
+    use crate::truncation;
 
     #[test]
     fn core_tool_descriptions_include_actionable_guidance() {
@@ -981,20 +1025,35 @@ mod tests {
         assert_eq!(written[0].1, "1 | keep this literal\ngoodbye");
     }
 
-    #[tokio::test]
-    async fn shell_basic_command() {
-        let tool = make_shell_tool();
-        let env: Arc<dyn Sandbox> = Arc::new(MockSandbox {
-            exec_result: ExecResult {
-                stdout:      "hello".into(),
-                stderr:      String::new(),
-                exit_code:   Some(0),
-                termination: CommandTermination::Exited,
-                duration_ms: 10,
-            },
-            ..Default::default()
-        });
-        let result = (tool.executor)(serde_json::json!({"command": "echo hello"}), ToolContext {
+    /// Records the typed agent events a tool emits through its bound emitter.
+    #[derive(Default)]
+    struct RecordingAgentEmitter {
+        events: std::sync::Mutex<Vec<AgentEvent>>,
+    }
+
+    impl RecordingAgentEmitter {
+        fn events(&self) -> Vec<AgentEvent> {
+            self.events.lock().expect("events lock poisoned").clone()
+        }
+
+        fn only_process_event(&self) -> AgentEvent {
+            let events = self.events();
+            assert_eq!(events.len(), 1, "expected one agent event, got {events:?}");
+            events.into_iter().next().expect("one event")
+        }
+    }
+
+    impl AgentEventEmitter for RecordingAgentEmitter {
+        fn emit(&self, event: AgentEvent) {
+            self.events
+                .lock()
+                .expect("events lock poisoned")
+                .push(event);
+        }
+    }
+
+    fn shell_context(env: Arc<dyn Sandbox>) -> ToolContext {
+        ToolContext {
             env,
             cancel: CancellationToken::new(),
             tool_env_provider: None,
@@ -1002,11 +1061,72 @@ mod tests {
             root_session_id: None,
             tool_call_id: None,
             agent_event_emitter: None,
+        }
+    }
+
+    fn shell_context_with_emitter(
+        env: Arc<dyn Sandbox>,
+        emitter: Arc<RecordingAgentEmitter>,
+    ) -> ToolContext {
+        ToolContext {
+            agent_event_emitter: Some(emitter),
+            ..shell_context(env)
+        }
+    }
+
+    fn mock_sandbox_with(result: ExecResult) -> Arc<MockSandbox> {
+        Arc::new(MockSandbox {
+            exec_result: result,
+            ..Default::default()
         })
+    }
+
+    #[tokio::test]
+    async fn shell_success_returns_ok_with_metadata_and_separate_streams() {
+        let tool = make_shell_tool();
+        let env: Arc<dyn Sandbox> = mock_sandbox_with(ExecResult {
+            stdout:      "hello".into(),
+            stderr:      "a warning".into(),
+            exit_code:   Some(0),
+            termination: CommandTermination::Exited,
+            duration_ms: 10,
+        });
+        let output = (tool.executor)(
+            serde_json::json!({"command": "echo hello"}),
+            shell_context(env),
+        )
+        .await
+        .expect("exit 0 is a successful tool result");
+
+        assert_eq!(
+            output,
+            "Termination: exited\nExit code: 0\nDuration: 10ms\nstdout:\nhello\nstderr:\na \
+             warning\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_forwards_command_without_stream_redirection_wrapper() {
+        let tool = make_shell_tool();
+        let env = mock_sandbox_with(ExecResult {
+            stdout:      String::new(),
+            stderr:      String::new(),
+            exit_code:   Some(0),
+            termination: CommandTermination::Exited,
+            duration_ms: 1,
+        });
+        let _ = (tool.executor)(
+            serde_json::json!({"command": "make test"}),
+            shell_context(env.clone()),
+        )
         .await;
-        let output = result.unwrap();
-        assert!(output.contains("Exit code: 0"));
-        assert!(output.contains("hello"));
+
+        let captured = env
+            .captured_command
+            .lock()
+            .expect("captured_command lock poisoned")
+            .clone();
+        assert_eq!(captured.as_deref(), Some("make test"));
     }
 
     #[tokio::test]
@@ -1043,46 +1163,253 @@ mod tests {
             },
             ..Default::default()
         });
-        let result = (tool.executor)(serde_json::json!({"command": "false"}), ToolContext {
-            env,
-            cancel: CancellationToken::new(),
-            tool_env_provider: None,
-            session_id: None,
-            root_session_id: None,
-            tool_call_id: None,
-            agent_event_emitter: None,
-        })
-        .await;
-        let output = result.unwrap();
-        assert!(output.contains("Exit code: 1"));
-        assert!(output.contains("error"));
+        let output = (tool.executor)(serde_json::json!({"command": "false"}), shell_context(env))
+            .await
+            .expect_err("a nonzero exit is a failed tool result");
+        assert!(output.contains("Termination: exited"), "got: {output}");
+        assert!(output.contains("Exit code: 1"), "got: {output}");
+        assert!(output.contains("stdout:\nerror"), "got: {output}");
+        assert!(!output.contains("stderr:"), "got: {output}");
     }
 
     #[tokio::test]
-    async fn shell_timeout_output() {
+    async fn shell_timeout_returns_error_with_partial_output() {
+        let tool = make_shell_tool();
+        let env: Arc<dyn Sandbox> = mock_sandbox_with(ExecResult {
+            stdout:      "partial".into(),
+            stderr:      String::new(),
+            exit_code:   None,
+            termination: CommandTermination::TimedOut,
+            duration_ms: 10000,
+        });
+        let output = (tool.executor)(
+            serde_json::json!({"command": "sleep 100"}),
+            shell_context(env),
+        )
+        .await
+        .expect_err("a timeout is a failed tool result");
+
+        assert!(output.contains("Termination: timed_out"), "got: {output}");
+        assert!(output.contains("Exit code: none"), "got: {output}");
+        assert!(output.contains("stdout:\npartial"), "got: {output}");
+    }
+
+    #[tokio::test]
+    async fn shell_cancellation_returns_error_with_partial_output() {
+        let tool = make_shell_tool();
+        let env: Arc<dyn Sandbox> = mock_sandbox_with(ExecResult {
+            stdout:      "partial".into(),
+            stderr:      String::new(),
+            exit_code:   None,
+            termination: CommandTermination::Cancelled,
+            duration_ms: 42,
+        });
+        let output = (tool.executor)(
+            serde_json::json!({"command": "sleep 100"}),
+            shell_context(env),
+        )
+        .await
+        .expect_err("a cancellation is a failed tool result");
+
+        assert!(output.contains("Termination: cancelled"), "got: {output}");
+        assert!(output.contains("Exit code: none"), "got: {output}");
+        assert!(output.contains("stdout:\npartial"), "got: {output}");
+    }
+
+    #[tokio::test]
+    async fn shell_sandbox_failure_returns_error_without_a_process_outcome() {
+        let tool = make_shell_tool();
+        let env: Arc<dyn Sandbox> = Arc::new(MockSandbox {
+            exec_error: Some("sandbox transport is down".into()),
+            ..Default::default()
+        });
+        let emitter = Arc::new(RecordingAgentEmitter::default());
+
+        let output = (tool.executor)(
+            serde_json::json!({"command": "make test"}),
+            shell_context_with_emitter(env, emitter.clone()),
+        )
+        .await
+        .expect_err("a sandbox transport failure is a failed tool result");
+
+        assert!(
+            output.contains("Shell command produced no process result"),
+            "got: {output}"
+        );
+        assert!(
+            output.contains("sandbox transport is down"),
+            "got: {output}"
+        );
+        assert!(!output.contains("Exit code"), "got: {output}");
+        assert!(emitter.events().is_empty(), "got: {:?}", emitter.events());
+    }
+
+    #[tokio::test]
+    async fn shell_emits_process_event_with_typed_outcome_and_redacted_tails() {
+        let tool = make_shell_tool();
+        let env: Arc<dyn Sandbox> = mock_sandbox_with(ExecResult {
+            stdout:      "out".into(),
+            stderr:      "boom key=AKIAYRWQG5EJLPZLBYNP".into(),
+            exit_code:   Some(7),
+            termination: CommandTermination::Exited,
+            duration_ms: 12,
+        });
+        let emitter = Arc::new(RecordingAgentEmitter::default());
+
+        let _ = (tool.executor)(
+            serde_json::json!({"command": "printf out; printf err >&2; exit 7"}),
+            shell_context_with_emitter(env, emitter.clone()),
+        )
+        .await;
+
+        match emitter.only_process_event() {
+            AgentEvent::ToolProcessCompleted {
+                exit_code,
+                termination,
+                duration_ms,
+                streams_separated,
+                exec_output_tail,
+            } => {
+                assert_eq!(exit_code, Some(7));
+                assert_eq!(termination, CommandTermination::Exited);
+                assert_eq!(duration_ms, 12);
+                assert!(streams_separated);
+                let tail = exec_output_tail.expect("output tail");
+                assert_eq!(tail.stdout.as_deref(), Some("out"));
+                let stderr = tail.stderr.expect("stderr tail");
+                assert!(stderr.contains("boom"), "got: {stderr}");
+                assert!(!stderr.contains("AKIAYRWQG5EJLPZLBYNP"), "got: {stderr}");
+            }
+            other => panic!("expected a process event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_renders_combined_output_when_streams_are_not_separated() {
         let tool = make_shell_tool();
         let env: Arc<dyn Sandbox> = Arc::new(MockSandbox {
             exec_result: ExecResult {
-                stdout:      String::new(),
+                stdout:      "interleaved".into(),
                 stderr:      String::new(),
-                exit_code:   None,
-                termination: CommandTermination::TimedOut,
-                duration_ms: 10000,
+                exit_code:   Some(0),
+                termination: CommandTermination::Exited,
+                duration_ms: 5,
             },
+            streams_separated: false,
             ..Default::default()
         });
-        let result = (tool.executor)(serde_json::json!({"command": "sleep 100"}), ToolContext {
-            env,
-            cancel: CancellationToken::new(),
-            tool_env_provider: None,
-            session_id: None,
-            root_session_id: None,
-            tool_call_id: None,
-            agent_event_emitter: None,
-        })
-        .await;
-        let output = result.unwrap();
-        assert!(output.starts_with("Command timed out.\n"));
+        let emitter = Arc::new(RecordingAgentEmitter::default());
+
+        let output = (tool.executor)(
+            serde_json::json!({"command": "echo interleaved"}),
+            shell_context_with_emitter(env, emitter.clone()),
+        )
+        .await
+        .expect("exit 0 is a successful tool result");
+
+        assert!(
+            output.contains("output (combined):\ninterleaved"),
+            "got: {output}"
+        );
+        assert!(!output.contains("stderr:"), "got: {output}");
+        match emitter.only_process_event() {
+            AgentEvent::ToolProcessCompleted {
+                streams_separated, ..
+            } => assert!(!streams_separated),
+            other => panic!("expected a process event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_truncation_preserves_exit_metadata_and_stderr_tail() {
+        let tool = make_shell_tool();
+        let stdout = (0..400)
+            .map(|line| format!("{line}: {}", "x".repeat(100)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(stdout.len() > 30_000);
+        let env: Arc<dyn Sandbox> = mock_sandbox_with(ExecResult {
+            stdout,
+            stderr: "the build failed".into(),
+            exit_code: Some(2),
+            termination: CommandTermination::Exited,
+            duration_ms: 900,
+        });
+
+        let output = (tool.executor)(
+            serde_json::json!({"command": "make build"}),
+            shell_context(env),
+        )
+        .await
+        .expect_err("a nonzero exit is a failed tool result");
+        let truncated =
+            truncation::truncate_tool_output(&output, "shell", &SessionOptions::default());
+
+        assert!(truncated.len() < output.len());
+        assert!(truncated.starts_with("Termination: exited\nExit code: 2\n"));
+        assert!(
+            truncated.contains("stderr:\nthe build failed"),
+            "stderr tail did not survive truncation"
+        );
+    }
+
+    /// End-to-end against a real process: the local provider separates the
+    /// streams and reports the real exit code, and none of it is laundered
+    /// into a successful tool result.
+    #[tokio::test]
+    async fn shell_reports_real_local_process_outcome() {
+        let tool = make_shell_tool();
+        let env: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(
+            std::env::current_dir().expect("current dir"),
+        ));
+        let emitter = Arc::new(RecordingAgentEmitter::default());
+
+        let output = (tool.executor)(
+            serde_json::json!({"command": "printf 'out'; printf 'err' >&2; exit 7"}),
+            shell_context_with_emitter(env, emitter.clone()),
+        )
+        .await
+        .expect_err("exit 7 is a failed tool result");
+
+        assert!(output.contains("Termination: exited"), "got: {output}");
+        assert!(output.contains("Exit code: 7"), "got: {output}");
+        assert!(output.contains("stdout:\nout"), "got: {output}");
+        assert!(output.contains("stderr:\nerr"), "got: {output}");
+
+        match emitter.only_process_event() {
+            AgentEvent::ToolProcessCompleted {
+                exit_code,
+                termination,
+                streams_separated,
+                exec_output_tail,
+                ..
+            } => {
+                assert_eq!(exit_code, Some(7));
+                assert_eq!(termination, CommandTermination::Exited);
+                assert!(streams_separated);
+                let tail = exec_output_tail.expect("output tail");
+                assert_eq!(tail.stdout.as_deref(), Some("out"));
+                assert_eq!(tail.stderr.as_deref(), Some("err"));
+            }
+            other => panic!("expected a process event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_public_schema_is_command_timeout_and_description() {
+        let tool = make_shell_tool();
+        assert_eq!(
+            tool.definition.parameters,
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "The shell command to execute"},
+                    "timeout_ms": {"type": "integer", "description": "Timeout in milliseconds"},
+                    "description": {"type": "string", "description": "Description of what this command does"}
+                },
+                "required": ["command"]
+            })
+        );
     }
 
     #[tokio::test]

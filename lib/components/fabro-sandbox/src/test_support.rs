@@ -44,6 +44,12 @@ pub struct MockSandbox {
     pub event_callback:        Option<SandboxEventCallback>,
     pub stdio_process_error:   Option<String>,
     pub stdio_process:         Mutex<Option<MockStdioProcess>>,
+    /// Fails `exec_command` and `exec_command_streaming` before any process
+    /// runs, so callers see a transport error rather than an `ExecResult`.
+    pub exec_error:            Option<String>,
+    /// Reported by `exec_command_streaming`. Set to `false` to model a
+    /// provider that cannot separate stdout from stderr.
+    pub streams_separated:     bool,
 }
 
 impl MockSandbox {
@@ -116,6 +122,8 @@ impl Default for MockSandbox {
             event_callback:        None,
             stdio_process_error:   None,
             stdio_process:         Mutex::new(None),
+            exec_error:            None,
+            streams_separated:     true,
         }
     }
 }
@@ -233,7 +241,49 @@ impl Sandbox for MockSandbox {
             .captured_env_vars
             .lock()
             .expect("captured_env_vars lock poisoned") = env_vars.cloned();
-        Ok(self.exec_result.clone())
+        match &self.exec_error {
+            Some(error) => Err(crate::Error::message(error.clone())),
+            None => Ok(self.exec_result.clone()),
+        }
+    }
+
+    async fn exec_command_streaming(
+        &self,
+        command: &str,
+        timeout_ms: Option<u64>,
+        working_dir: Option<&str>,
+        env_vars: Option<&std::collections::HashMap<String, String>>,
+        cancel_token: Option<CancellationToken>,
+        output_callback: crate::CommandOutputCallback,
+    ) -> crate::Result<crate::ExecStreamingResult> {
+        let result = self
+            .exec_command(
+                command,
+                timeout_ms.unwrap_or(u64::MAX),
+                working_dir,
+                env_vars,
+                cancel_token,
+            )
+            .await?;
+        if !result.stdout.is_empty() {
+            output_callback(
+                fabro_types::CommandOutputStream::Stdout,
+                result.stdout.as_bytes().to_vec(),
+            )
+            .await?;
+        }
+        if !result.stderr.is_empty() {
+            output_callback(
+                fabro_types::CommandOutputStream::Stderr,
+                result.stderr.as_bytes().to_vec(),
+            )
+            .await?;
+        }
+        Ok(crate::ExecStreamingResult {
+            result,
+            streams_separated: self.streams_separated,
+            live_streaming: false,
+        })
     }
 
     async fn spawn_stdio_process(

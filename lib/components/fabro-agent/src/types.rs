@@ -4,7 +4,10 @@ use chrono::{DateTime, Utc};
 use fabro_llm::Error as LlmError;
 use fabro_llm::types::{ContentPart, ThinkingData, TokenCounts, ToolCall, ToolResult};
 use fabro_model::{CostSource, ModelRef};
-use fabro_types::{ReasoningOutput, SessionMessage, StageContextWindowProjection};
+use fabro_types::{
+    CommandTermination, ExecOutputTail, ReasoningOutput, SessionMessage,
+    StageContextWindowProjection,
+};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -280,6 +283,19 @@ pub enum AgentEvent {
         output:       serde_json::Value,
         is_error:     bool,
     },
+    /// Subordinate process outcome for a tool call that ran a command.
+    /// Emitted before the owning `ToolCallCompleted`, which stays the single
+    /// tool-protocol completion and the authoritative owner of `is_error`.
+    /// Session and tool-call identity come from the emitting envelope.
+    ToolProcessCompleted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code:         Option<i32>,
+        termination:       CommandTermination,
+        duration_ms:       u64,
+        streams_separated: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exec_output_tail:  Option<ExecOutputTail>,
+    },
     Error {
         error: Error,
     },
@@ -455,6 +471,28 @@ impl AgentEvent {
                     tool_call_id,
                     is_error,
                     "Tool call completed"
+                );
+            }
+            Self::ToolProcessCompleted {
+                exit_code,
+                termination,
+                duration_ms,
+                streams_separated,
+                exec_output_tail,
+            } => {
+                let tail = ExecOutputTail::trace_summary(exec_output_tail.as_ref());
+                debug!(
+                    session_id,
+                    exit_code = ?exit_code,
+                    termination = termination.as_str(),
+                    duration_ms,
+                    streams_separated,
+                    output_tail_present = tail.present,
+                    stdout_bytes = tail.stdout_bytes,
+                    stderr_bytes = tail.stderr_bytes,
+                    stdout_truncated = tail.stdout_truncated,
+                    stderr_truncated = tail.stderr_truncated,
+                    "Tool process completed"
                 );
             }
             Self::Error { error } => {

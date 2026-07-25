@@ -655,6 +655,22 @@ fn event_body_from_event(event: &Event) -> EventBody {
                 tool_result:  None,
                 turn_id:      None,
             }),
+            AgentEvent::ToolProcessCompleted {
+                exit_code,
+                termination,
+                duration_ms,
+                streams_separated,
+                exec_output_tail,
+            } => EventBody::AgentToolProcessCompleted(
+                fabro_types::AgentToolProcessCompletedProps {
+                    exit_code:         *exit_code,
+                    termination:       *termination,
+                    duration_ms:       *duration_ms,
+                    streams_separated: *streams_separated,
+                    exec_output_tail:  exec_output_tail.clone(),
+                    visit:             *visit,
+                },
+            ),
             AgentEvent::Error { error } => EventBody::AgentError(fabro_types::AgentErrorProps {
                 error: serde_json::to_value(error).expect("agent Error derives Serialize with no custom logic that can fail"),
                 visit: *visit,
@@ -1514,6 +1530,52 @@ mod tests {
         let properties = stored.properties().unwrap();
         assert_eq!(properties["tool_name"], "read_file");
         assert_eq!(properties["tool_call_id"], "call_1");
+        assert_eq!(properties["visit"], 2);
+    }
+
+    #[test]
+    fn run_event_agent_tool_process_completed_carries_stage_session_and_actor() {
+        let stored = to_run_event(&fixtures::RUN_4, &Event::Agent {
+            stage:             "code".to_string(),
+            visit:             2,
+            event:             AgentEvent::ToolProcessCompleted {
+                exit_code:         Some(7),
+                termination:       ::fabro_types::CommandTermination::Exited,
+                duration_ms:       12,
+                streams_separated: true,
+                exec_output_tail:  Some(::fabro_types::ExecOutputTail {
+                    stdout:           Some("out".to_string()),
+                    stderr:           Some("err".to_string()),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                }),
+            },
+            session_id:        Some("ses_child".to_string()),
+            parent_session_id: Some("ses_parent".to_string()),
+            tool_call_id:      Some("call_1".to_string()),
+        });
+
+        assert_eq!(stored.event_name(), "agent.tool.process.completed");
+        assert_eq!(stored.node_id.as_deref(), Some("code"));
+        assert_eq!(stored.stage_id, Some(StageId::new("code", 2)));
+        assert_eq!(stored.session_id.as_deref(), Some("ses_child"));
+        assert_eq!(stored.parent_session_id.as_deref(), Some("ses_parent"));
+        assert_eq!(stored.tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(
+            stored.actor,
+            Some(::fabro_types::Principal::Agent {
+                session_id:        Some("ses_child".to_string()),
+                parent_session_id: Some("ses_parent".to_string()),
+                model:             None,
+            })
+        );
+
+        let properties = stored.properties().unwrap();
+        assert_eq!(properties["exit_code"], 7);
+        assert_eq!(properties["termination"], "exited");
+        assert_eq!(properties["duration_ms"], 12);
+        assert_eq!(properties["streams_separated"], true);
+        assert_eq!(properties["exec_output_tail"]["stdout"], "out");
         assert_eq!(properties["visit"], 2);
     }
 
