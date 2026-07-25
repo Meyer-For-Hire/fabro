@@ -291,12 +291,14 @@ export function buildStageActivity(
 
   for (const e of events) {
     const eventName = e.event;
+    if (activityEventStageId(e) !== stageId) {
+      continue;
+    }
     if (eventName === "watchdog.timeout") {
       watchdogTimedOut = true;
       continue;
     }
     if (
-      activityEventStageId(e) !== stageId ||
       !eventName ||
       !STAGE_ACTIVITY_EVENT_SET.has(eventName)
     ) {
