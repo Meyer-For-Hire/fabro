@@ -1,7 +1,11 @@
 import useSWR from "swr";
 
-/** Where `scripts/build.ts` publishes the id of the build being served. */
-const BUILD_ID_URL = "/build-id.json";
+import {
+  BUILD_ID_META_NAME,
+  BUILD_ID_URL,
+  parseBuildId,
+  parseBuildIdDocument,
+} from "./build-version-contract";
 
 /**
  * How often a visible tab re-checks. SWR does not poll while the document is
@@ -9,8 +13,6 @@ const BUILD_ID_URL = "/build-id.json";
  * silent without any extra gating, and a hidden tab revalidates on focus.
  */
 const POLL_INTERVAL_MS = 60_000;
-
-export const BUILD_ID_META_NAME = "fabro-build-id";
 
 /**
  * The build this document loaded, from the meta tag `scripts/build.ts` writes
@@ -24,9 +26,8 @@ export function documentBuildId(): string | null {
   if (typeof document === "undefined") return null;
   const content = document
     .querySelector(`meta[name="${BUILD_ID_META_NAME}"]`)
-    ?.getAttribute("content")
-    ?.trim();
-  return content ? content : null;
+    ?.getAttribute("content");
+  return parseBuildId(content);
 }
 
 export async function fetchBuildId(url: string): Promise<string | null> {
@@ -34,9 +35,8 @@ export async function fetchBuildId(url: string): Promise<string | null> {
   // gets a 304 rather than a fresh body.
   const response = await fetch(url);
   if (!response.ok) return null;
-  const body: unknown = await response.json();
-  const buildId = (body as { buildId?: unknown } | null)?.buildId;
-  return typeof buildId === "string" && buildId ? buildId : null;
+  const body: unknown = await response.json().catch(() => null);
+  return parseBuildIdDocument(body);
 }
 
 /**

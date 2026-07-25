@@ -1,9 +1,29 @@
 import { test, expect } from "bun:test";
 import { existsSync } from "node:fs";
 import { lstat, readFile, readdir, readlink } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { basename, join, relative, sep } from "node:path";
+
+import {
+  BUILD_ID_FILE_NAME,
+  BUILD_ID_META_NAME,
+  parseBuildIdDocument,
+} from "../app/lib/build-version-contract";
+import { localBundlerInputPaths } from "./build";
 
 const root = Bun.fileURLToPath(new URL("..", import.meta.url));
+
+test("resolved build inputs retain workspace sources and omit installed packages", () => {
+  const inputs = localBundlerInputPaths([
+    "app/entry.tsx",
+    "../../lib/packages/fabro-api-client/src/index.ts",
+    "../../node_modules/example/index.js",
+  ]).map((path) => relative(root, path).split(sep).join("/"));
+
+  expect(inputs).toEqual([
+    "app/entry.tsx",
+    "../../lib/packages/fabro-api-client/src/index.ts",
+  ]);
+});
 
 async function runBuild() {
   const process = Bun.spawn(["bun", "run", "scripts/build.ts"], {
@@ -22,10 +42,15 @@ async function runBuild() {
   }
 }
 
-test("production build copies Pierre worker assets", async () => {
+test("production builds publish a stable asset set and prune the previous build", async () => {
   await runBuild();
 
-  const workerDist = join(root, "dist", "assets", "pierre-diffs-worker");
+  const distPath = join(root, "dist");
+  const firstTarget = await readlink(distPath);
+  expect((await lstat(distPath)).isSymbolicLink()).toBe(true);
+  expect(firstTarget.startsWith(".dist-builds/")).toBe(true);
+
+  const workerDist = join(distPath, "assets", "pierre-diffs-worker");
   expect(existsSync(join(workerDist, "worker-portable.js"))).toBe(true);
 
   const upstreamWorkerDir = join(
@@ -43,84 +68,43 @@ test("production build copies Pierre worker assets", async () => {
   for (const wasmFile of wasmFiles) {
     expect(existsSync(join(workerDist, wasmFile))).toBe(true);
   }
-}, 60000);
 
-test("dist is a symlink into .dist-builds and old builds are pruned", async () => {
-  await runBuild();
-  await runBuild();
-
-  const distPath = join(root, "dist");
-  const stat = await lstat(distPath);
-  expect(stat.isSymbolicLink()).toBe(true);
-
-  const target = await readlink(distPath);
-  expect(target.startsWith(".dist-builds/")).toBe(true);
-
-  const buildId = target.slice(".dist-builds/".length);
-  const buildsRoot = join(root, ".dist-builds");
-  const remaining = await readdir(buildsRoot);
-  expect(remaining).toEqual([buildId]);
-
-  expect(existsSync(join(distPath, "index.html"))).toBe(true);
-}, 60000);
-
-test("publishes a build id that index.html and build-id.json agree on", async () => {
-  await runBuild();
-
-  const distPath = join(root, "dist");
   const published = JSON.parse(
-    await readFile(join(distPath, "build-id.json"), "utf8"),
-  ) as { buildId: string };
-
-  expect(published.buildId).toMatch(/^[a-z0-9]{8}$/);
+    await readFile(join(distPath, BUILD_ID_FILE_NAME), "utf8"),
+  );
+  const firstBuildId = parseBuildIdDocument(published);
+  expect(firstBuildId).not.toBeNull();
 
   const html = await readFile(join(distPath, "index.html"), "utf8");
   expect(html).toContain(
-    `<meta name="fabro-build-id" content="${published.buildId}" />`,
+    `<meta name="${BUILD_ID_META_NAME}" content="${firstBuildId}" />`,
   );
-}, 60000);
 
-// The id is derived from source inputs rather than emitted filenames precisely
-// so this holds: Bun's minified identifier naming is not deterministic, so the
-// entry bundle's content hash changes between builds of an unchanged tree
-// roughly one run in three. An id that moved with it would fire the client's
-// "new version" toast on redeploys of identical code.
-test("build id is stable across rebuilds of an unchanged tree", async () => {
-  const distPath = join(root, "dist");
-  const readBuildId = async () =>
-    (
-      JSON.parse(await readFile(join(distPath, "build-id.json"), "utf8")) as {
-        buildId: string;
-      }
-    ).buildId;
-
-  await runBuild();
-  const first = await readBuildId();
-  await runBuild();
-  const second = await readBuildId();
-
-  expect(second).toBe(first);
-}, 120000);
-
-// A stable-named stylesheet is served `no-cache`, letting a tab revalidate into
-// new CSS while running old JS; Tailwind purges per build, so classes the old
-// bundle still emits can vanish. The hash must match the `[a-z0-9]{8}` shape
-// `is_content_hashed` in static_files.rs keys on.
-test("stylesheet is content-hashed and referenced from index.html", async () => {
-  await runBuild();
-
-  const distPath = join(root, "dist");
   const assets = await readdir(join(distPath, "assets"));
   const stylesheets = assets.filter((file) => /^app-.*\.css$/.test(file));
-
   expect(stylesheets).toHaveLength(1);
   expect(stylesheets[0]).toMatch(/^app-[a-z0-9]{8}\.css$/);
   expect(assets).not.toContain("app.css");
-
-  const html = await readFile(join(distPath, "index.html"), "utf8");
   expect(html).toContain(`href="/assets/${stylesheets[0]}"`);
   expect(html).not.toContain('href="/assets/app.css"');
-}, 60000);
+
+  // The id is derived from source inputs rather than emitted filenames. Bun's
+  // minified identifiers are nondeterministic, so output hashes can move even
+  // when the source graph is unchanged.
+  await runBuild();
+
+  const secondTarget = await readlink(distPath);
+  expect(secondTarget.startsWith(".dist-builds/")).toBe(true);
+  expect(secondTarget).not.toBe(firstTarget);
+  const secondBuildId = parseBuildIdDocument(
+    JSON.parse(await readFile(join(distPath, BUILD_ID_FILE_NAME), "utf8")),
+  );
+  expect(secondBuildId).toBe(firstBuildId);
+
+  const currentDirName = secondTarget.slice(".dist-builds/".length);
+  expect(await readdir(join(root, ".dist-builds"))).toEqual([currentDirName]);
+  expect(existsSync(join(distPath, "index.html"))).toBe(true);
+}, 120000);
 
 test("watch mode keeps running until interrupted", async () => {
   const process = Bun.spawn([

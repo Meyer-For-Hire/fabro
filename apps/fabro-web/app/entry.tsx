@@ -2,6 +2,8 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { createBrowserRouter, RouterProvider } from "react-router";
 import { SWRConfig } from "swr";
+import { FabroToaster } from "./components/toast";
+import { useBuildVersionGuard } from "./hooks/use-build-version-guard";
 import { installRoutes } from "./install-router";
 import { resolveFabroMode } from "./mode";
 import { routes } from "./router";
@@ -21,6 +23,17 @@ if (!rootElement) {
   throw new Error("Missing #root element");
 }
 
+function AppRuntime() {
+  useBuildVersionGuard();
+
+  return (
+    <>
+      <RouterProvider router={router} />
+      <FabroToaster />
+    </>
+  );
+}
+
 createRoot(rootElement).render(
   <StrictMode>
     <SWRConfig
@@ -30,7 +43,7 @@ createRoot(rootElement).render(
         shouldRetryOnError: false,
       }}
     >
-      <RouterProvider router={router} />
+      <AppRuntime />
     </SWRConfig>
   </StrictMode>,
 );

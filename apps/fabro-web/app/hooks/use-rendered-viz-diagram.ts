@@ -28,12 +28,13 @@ export function useRenderedVizDiagram<TIdentity>({
 
     async function render() {
       setError(null);
-      onRenderStart?.();
-      const { instance } = await importChunk(() => import("@viz-js/viz"));
-      const viz = await instance();
-      if (cancelled) return;
 
       try {
+        onRenderStart?.();
+        const { instance } = await importChunk(() => import("@viz-js/viz"));
+        const viz = await instance();
+        if (cancelled) return;
+
         const svg = viz.renderSVGElement(buildDot(identity));
         prepareSvg?.(svg);
 
@@ -42,7 +43,9 @@ export function useRenderedVizDiagram<TIdentity>({
           innerRef.current.replaceChildren(svg);
         }
       } catch (e) {
-        setError(e instanceof Error ? e.message : "Failed to render diagram");
+        if (!cancelled) {
+          setError(e instanceof Error ? e.message : "Failed to render diagram");
+        }
       }
     }
 

@@ -18,24 +18,31 @@ const NEW_VERSION_MESSAGE = "A new version of Fabro is available.";
  * offers a reload when that happens; it never reloads on its own.
  */
 export function useBuildVersionGuard(): void {
-  const { push } = useToast();
+  const { dismiss, push } = useToast();
   // Read once. It describes the document this tab loaded, which cannot change
   // without a full page load — and that remounts the hook anyway.
   const [loadedBuildId] = useState<string | null>(documentBuildId);
   const latestBuildId = useLatestBuildId();
-  const promptedForRef = useRef<string | null>(null);
+  const promptRef = useRef<{ buildId: string; toastId: string } | null>(null);
 
   const stale = isStaleBuild(loadedBuildId, latestBuildId);
 
   useEffect(() => {
-    if (!stale || !latestBuildId) return;
-    // One prompt per distinct build. Repeated polls of the same new build must
-    // not re-nag, but dismissing this one must not suppress a later, genuinely
-    // different build.
-    if (promptedForRef.current === latestBuildId) return;
-    promptedForRef.current = latestBuildId;
+    if (!latestBuildId) return;
+    if (!stale) {
+      // A rollback to the document's own build makes an existing prompt false.
+      if (promptRef.current) {
+        dismiss(promptRef.current.toastId);
+        promptRef.current = null;
+      }
+      return;
+    }
+    if (promptRef.current?.buildId === latestBuildId) return;
+    if (promptRef.current) {
+      dismiss(promptRef.current.toastId);
+    }
 
-    push({
+    const toastId = push({
       message: NEW_VERSION_MESSAGE,
       // Persistent by design: a prompt that vanishes after a few seconds is one
       // the user will miss, which is the whole failure this exists to fix.
@@ -45,5 +52,6 @@ export function useBuildVersionGuard(): void {
         onClick: () => window.location.reload(),
       },
     });
-  }, [latestBuildId, push, stale]);
+    promptRef.current = { buildId: latestBuildId, toastId };
+  }, [dismiss, latestBuildId, push, stale]);
 }

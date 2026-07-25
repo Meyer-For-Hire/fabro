@@ -89,6 +89,25 @@ export function useTerminalSession({
     const textEncoder = new TextEncoder();
     const disposables: Array<{ dispose: () => void }> = [];
 
+    function disposeResources() {
+      resizeObserver?.disconnect();
+      resizeObserver = null;
+      for (const disposable of disposables.splice(0)) disposable.dispose();
+
+      const socket = socketRef.current;
+      if (socket) {
+        if (socket.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify({ type: "close" }));
+        }
+        socket.close();
+        socketRef.current = null;
+      }
+
+      terminalRef.current?.dispose();
+      terminalRef.current = null;
+      fitRef.current = null;
+    }
+
     async function connect() {
       setStatus("connecting");
       setError(null);
@@ -109,12 +128,12 @@ export function useTerminalSession({
         theme: TERMINAL_THEME,
       });
       const fitAddon = new FitAddon();
+      terminalRef.current = terminal;
+      fitRef.current = fitAddon;
       terminal.loadAddon(fitAddon);
       terminal.open(terminalEl.current);
       fitAddon.fit();
       terminal.focus();
-      terminalRef.current = terminal;
-      fitRef.current = fitAddon;
 
       const socket = new WebSocket(buildTerminalWebSocketUrl(window.location, runId));
       socket.binaryType = "arraybuffer";
@@ -191,18 +210,21 @@ export function useTerminalSession({
       }
     }
 
-    void connect();
+    void connect().catch((error: unknown) => {
+      if (disposed) return;
+      disposeResources();
+      setStatus("error");
+      setError({
+        message: error instanceof Error
+          ? `Terminal initialization failed: ${error.message}`
+          : "Terminal initialization failed.",
+        recoverable: true,
+      });
+    });
 
     return () => {
       disposed = true;
-      resizeObserver?.disconnect();
-      for (const disposable of disposables) disposable.dispose();
-      socketRef.current?.send(JSON.stringify({ type: "close" }));
-      socketRef.current?.close();
-      socketRef.current = null;
-      terminalRef.current?.dispose();
-      terminalRef.current = null;
-      fitRef.current = null;
+      disposeResources();
     };
   }, [connectionKey, runId, setError, setStatus, terminalEl]);
 }

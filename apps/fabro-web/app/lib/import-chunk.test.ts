@@ -3,6 +3,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { importChunk } from "./import-chunk";
 
 interface WindowStub {
+  buildId: string | null;
   reloads: number;
   store: Map<string, string>;
   restore: () => void;
@@ -13,9 +14,16 @@ interface WindowStub {
  * `importChunk` touches. Follows the descriptor save/restore pattern used by
  * stage-insights-sidebar.test.tsx so other test files can install their own.
  */
-function installWindow({ throwOnStorage = false } = {}): WindowStub {
+function installWindow({
+  buildId = "aaaaaaaa",
+  throwOnStorage = false,
+}: {
+  buildId?: string | null;
+  throwOnStorage?: boolean;
+} = {}): WindowStub {
   const store = new Map<string, string>();
   const stub: WindowStub = {
+    buildId,
     reloads: 0,
     store,
     restore: () => undefined,
@@ -41,8 +49,21 @@ function installWindow({ throwOnStorage = false } = {}): WindowStub {
 
   const had = "window" in globalThis;
   const prev = (globalThis as { window?: unknown }).window;
+  const hadDocument = "document" in globalThis;
+  const previousDocument = (globalThis as { document?: unknown }).document;
   Object.defineProperty(globalThis, "window", {
     value:        windowStub,
+    writable:     true,
+    configurable: true,
+  });
+  Object.defineProperty(globalThis, "document", {
+    value: {
+      querySelector: () => stub.buildId == null
+        ? null
+        : {
+            getAttribute: () => stub.buildId,
+          },
+    },
     writable:     true,
     configurable: true,
   });
@@ -55,6 +76,15 @@ function installWindow({ throwOnStorage = false } = {}): WindowStub {
       });
     } else {
       delete (globalThis as { window?: unknown }).window;
+    }
+    if (hadDocument) {
+      Object.defineProperty(globalThis, "document", {
+        value:        previousDocument,
+        writable:     true,
+        configurable: true,
+      });
+    } else {
+      delete (globalThis as { document?: unknown }).document;
     }
   };
   return stub;
@@ -103,16 +133,24 @@ describe("importChunk", () => {
 
   // The marker is keyed by build id, so a tab that recovers from one deploy
   // still has a reload available for the next.
-  test("keys the once-only marker by build id", async () => {
+  test("allows one recovery reload for each loaded build id", async () => {
     installed = installWindow();
-    await expect(
-      importChunk(async () => {
-        throw new Error("boom");
-      }),
-    ).rejects.toThrow();
+    const load = async () => {
+      throw new Error("boom");
+    };
 
+    await expect(importChunk(load)).rejects.toThrow();
+    await expect(importChunk(load)).rejects.toThrow();
+    expect(installed.reloads).toBe(1);
+
+    installed.buildId = "bbbbbbbb";
+    await expect(importChunk(load)).rejects.toThrow();
+    await expect(importChunk(load)).rejects.toThrow();
+
+    expect(installed.reloads).toBe(2);
     expect([...installed.store.keys()]).toEqual([
-      "fabro:chunk-reload:unknown",
+      "fabro:chunk-reload:aaaaaaaa",
+      "fabro:chunk-reload:bbbbbbbb",
     ]);
   });
 
