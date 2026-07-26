@@ -12,7 +12,7 @@ use crate::{
     AgentToolSummary, BilledTokenCounts, Checkpoint, Conclusion, InterviewQuestionRecord,
     InvalidTransition, LlmOutputKind, ModelRef, PermissionLevel, PullRequestLink, RunApproval,
     RunControlAction, RunDiff, RunId, RunSandbox, RunSpec, RunStatus, RunTiming, StageCompletion,
-    StageHandler, StageId, StageState, StageTiming, StartRecord, TodoListProjection,
+    StageHandler, StageId, StageState, StageTiming, StartRecord, TodoListProjection, timing,
 };
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -433,6 +433,10 @@ fn is_zero_ms(value: &u64) -> bool {
 /// duplicated log must not let a repeated completion drain the batch early.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StageToolBatchProjection {
+    /// Root agent session that dispatched the batch. Later transitions are
+    /// gated on it so delayed events from a replaced session cannot mutate
+    /// the current session's batch.
+    pub session_id:    String,
     /// When the batch opened — the first `agent.tool.started` observed while
     /// no other calls were outstanding.
     pub started_at:    DateTime<Utc>,
@@ -603,10 +607,9 @@ impl StageProjection {
             state,
             StageState::Running | StageState::Retrying | StageState::Pending
         ) {
-            return self.started_at.map(|started| {
-                u64::try_from(now.signed_duration_since(started).num_milliseconds().max(0))
-                    .unwrap_or(0)
-            });
+            return self
+                .started_at
+                .map(|started| timing::elapsed_ms(started, now));
         }
         self.timing.map(|timing| timing.wall_time_ms)
     }
@@ -645,9 +648,6 @@ impl StageProjection {
         }
 
         let wall_time_ms = self.live_wall_time_ms(now).unwrap_or(0);
-        let elapsed = |since: DateTime<Utc>| {
-            u64::try_from(now.signed_duration_since(since).num_milliseconds().max(0)).unwrap_or(0)
-        };
 
         // `handler` is absent on projections built from events written before
         // stage execution identity. Treat those as agent stages, matching
@@ -660,11 +660,11 @@ impl StageProjection {
                 let open_inference = self
                     .inference
                     .as_ref()
-                    .map_or(0, |inference| elapsed(inference.started_at));
+                    .map_or(0, |inference| timing::elapsed_ms(inference.started_at, now));
                 let open_tool = self
                     .tool_batch
                     .as_ref()
-                    .map_or(0, |batch| elapsed(batch.started_at));
+                    .map_or(0, |batch| timing::elapsed_ms(batch.started_at, now));
                 (
                     self.live_inference_ms.saturating_add(open_inference),
                     self.live_tool_ms.saturating_add(open_tool),
@@ -693,9 +693,26 @@ impl StageProjection {
     }
 
     /// Record a dispatched tool call, opening a batch if none is outstanding.
-    pub fn open_tool_call(&mut self, tool_call_id: String, started_at: DateTime<Utc>) {
+    ///
+    /// If a replacement root session starts work before the old session's end
+    /// event arrives, freeze the old batch at this boundary before opening
+    /// the new one. This keeps the sessions separate without dropping time.
+    pub fn open_tool_call(
+        &mut self,
+        session_id: String,
+        tool_call_id: String,
+        started_at: DateTime<Utc>,
+    ) {
+        let replaces_open_batch = self
+            .tool_batch
+            .as_ref()
+            .is_some_and(|batch| batch.session_id != session_id);
+        if replaces_open_batch {
+            self.close_open_tool_batch(started_at);
+        }
         self.tool_batch
             .get_or_insert_with(|| StageToolBatchProjection {
+                session_id,
                 started_at,
                 open_call_ids: BTreeSet::new(),
             })
@@ -705,21 +722,52 @@ impl StageProjection {
 
     /// Retire a tool call. Folds the batch into the live accumulator once the
     /// last outstanding call reports, so concurrent calls count once.
-    pub fn close_tool_call(&mut self, tool_call_id: &str, now: DateTime<Utc>) {
+    pub fn close_tool_call(&mut self, session_id: &str, tool_call_id: &str, now: DateTime<Utc>) {
         let Some(batch) = self.tool_batch.as_mut() else {
             return;
         };
-        batch.open_call_ids.remove(tool_call_id);
-        if !batch.open_call_ids.is_empty() {
+        if batch.session_id != session_id
+            || !batch.open_call_ids.remove(tool_call_id)
+            || !batch.open_call_ids.is_empty()
+        {
             return;
         }
-        let elapsed = u64::try_from(
-            now.signed_duration_since(batch.started_at)
-                .num_milliseconds()
-                .max(0),
-        )
-        .unwrap_or(0);
-        self.live_tool_ms = self.live_tool_ms.saturating_add(elapsed);
+        self.close_open_tool_batch(now);
+    }
+
+    /// Close a tool batch only when it belongs to `session_id`.
+    pub fn close_tool_batch_for_session(&mut self, session_id: &str, now: DateTime<Utc>) {
+        let opened_here = self
+            .tool_batch
+            .as_ref()
+            .is_some_and(|batch| batch.session_id == session_id);
+        if opened_here {
+            self.close_open_tool_batch(now);
+        }
+    }
+
+    /// Fold any open tool batch into the live accumulator.
+    pub fn close_open_tool_batch(&mut self, now: DateTime<Utc>) {
+        let Some(batch) = self.tool_batch.take() else {
+            return;
+        };
+        self.live_tool_ms = self
+            .live_tool_ms
+            .saturating_add(timing::elapsed_ms(batch.started_at, now));
+    }
+
+    /// Install a worker-provided terminal timing and discard transient live
+    /// bookkeeping that is no longer authoritative.
+    pub fn set_authoritative_timing(&mut self, timing: StageTiming) {
+        self.timing = Some(timing);
+        self.clear_live_timing();
+    }
+
+    /// Discard transient timing accumulators and open brackets.
+    pub fn clear_live_timing(&mut self) {
+        self.live_inference_ms = 0;
+        self.live_tool_ms = 0;
+        self.inference = None;
         self.tool_batch = None;
     }
 
@@ -1138,19 +1186,14 @@ mod iter_stages_tests {
 #[cfg(test)]
 mod live_timing_tests {
     use std::collections::HashMap;
-    use std::num::NonZeroU32;
 
     use chrono::{DateTime, TimeZone, Utc};
 
     use super::{RunProjection, StageToolBatchProjection};
     use crate::{
         Graph, ModelRef, RunId, RunSpec, StageHandler, StageInferenceProjection, StageProjection,
-        StageState, StageTiming, StartRecord, WorkflowSettings, test_support,
+        StageState, StageTiming, StartRecord, WorkflowSettings, first_event_seq, test_support,
     };
-
-    fn seq(n: u32) -> NonZeroU32 {
-        NonZeroU32::new(n).unwrap()
-    }
 
     fn at(seconds: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(1_700_000_000 + seconds, 0).unwrap()
@@ -1180,7 +1223,7 @@ mod live_timing_tests {
 
     /// In-flight stage that started at `at(0)`.
     fn running(handler: StageHandler) -> StageProjection {
-        let mut stage = StageProjection::new(seq(1));
+        let mut stage = StageProjection::new(first_event_seq(1));
         stage.handler = Some(handler);
         stage.started_at = Some(at(0));
         stage.state = StageState::Running;
@@ -1225,6 +1268,7 @@ mod live_timing_tests {
         // Inference open for 20s, tools open for 10s, at t=120s.
         stage.inference = Some(open_bracket(at(100)));
         stage.tool_batch = Some(StageToolBatchProjection {
+            session_id:    "session-1".to_string(),
             started_at:    at(110),
             open_call_ids: ["call-1".to_string()].into_iter().collect(),
         });
@@ -1330,17 +1374,17 @@ mod live_timing_tests {
             base_sha:   None,
         });
 
-        let baseline = projection.stage_entry("baseline", 1, seq(1));
+        let baseline = projection.stage_entry("baseline", 1, first_event_seq(1));
         baseline.handler = Some(StageHandler::Command);
         baseline.state = StageState::Succeeded;
         baseline.timing = Some(StageTiming::new(42_666, 0, 42_663));
 
-        let assess = projection.stage_entry("assess", 1, seq(2));
+        let assess = projection.stage_entry("assess", 1, first_event_seq(2));
         assess.handler = Some(StageHandler::Agent);
         assess.state = StageState::Succeeded;
         assess.timing = Some(StageTiming::new(86_025, 78_230, 7_588));
 
-        let plan = projection.stage_entry("plan", 1, seq(3));
+        let plan = projection.stage_entry("plan", 1, first_event_seq(3));
         plan.handler = Some(StageHandler::Agent);
         plan.started_at = Some(at(146));
         plan.state = StageState::Running;
@@ -1367,7 +1411,8 @@ mod live_timing_tests {
         });
 
         for (index, node) in ["branch-a", "branch-b", "branch-c"].iter().enumerate() {
-            let stage = projection.stage_entry(node, 1, seq(u32::try_from(index).unwrap() + 1));
+            let stage =
+                projection.stage_entry(node, 1, first_event_seq(u32::try_from(index).unwrap() + 1));
             stage.handler = Some(StageHandler::Agent);
             stage.state = StageState::Succeeded;
             stage.timing = Some(StageTiming::new(60_000, 60_000, 0));

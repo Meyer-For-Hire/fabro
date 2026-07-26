@@ -73,6 +73,7 @@ import {
   type RunFileSelection,
   type RunGraphDirection,
 } from "./query-keys";
+import { isTerminalRunStatus } from "./run-actions";
 
 const immutableOptions: SWRConfiguration = {
   revalidateIfStale: false,
@@ -179,10 +180,19 @@ export function useRunsPage(opts: RunsPageOptions = {}, enabled = true) {
   );
 }
 
-export function useRun(id: string | undefined) {
+export function useRun(id: string | undefined, refreshInterval?: number) {
   return useSWR<Run | null>(
     id ? queryKeys.runs.detail(id) : null,
     () => apiNullableData(() => runsApi.retrieveRun(id!)),
+    refreshInterval
+      ? {
+          refreshInterval: (run) =>
+            run?.timestamps.started_at &&
+            !isTerminalRunStatus(run.lifecycle.status.kind)
+              ? refreshInterval
+              : 0,
+        }
+      : undefined,
   );
 }
 

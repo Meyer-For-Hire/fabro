@@ -19,11 +19,15 @@
  */
 export interface StageToolBatchProjection {
     /**
+     * Root agent session that dispatched the batch. Transitions are gated on it so delayed events from a replaced session cannot mutate the current batch.
+     */
+    'session_id': string;
+    /**
      * When the batch opened — the first dispatched call observed while no other calls were outstanding.
      */
     'started_at': string;
     /**
      * Calls dispatched but not yet completed, by tool call id.
      */
-    'open_call_ids': Array<string>;
+    'open_call_ids': Set<string>;
 }

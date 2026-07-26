@@ -69,6 +69,8 @@ import {
 
 export const handle = { hideHeader: true };
 
+const RUN_TIMING_REFRESH_INTERVAL_MS = 30_000;
+
 type LifecycleTrigger = () => Promise<LifecycleMutationResult | undefined>;
 
 export function meta({ data }: any) {
@@ -78,7 +80,7 @@ export function meta({ data }: any) {
 
 export default function RunDetail({ params }: { params: { id: string } }) {
   const demoMode = useDemoMode();
-  const runQuery = useRun(params.id);
+  const runQuery = useRun(params.id, RUN_TIMING_REFRESH_INTERVAL_MS);
   const runStateQuery = useRunState(params.id);
   const summary = runQuery.data;
   const run = summary ? buildRunDetailRun(summary) : null;
@@ -116,7 +118,7 @@ export default function RunDetail({ params }: { params: { id: string } }) {
     childrenCount,
   });
   const steerBarRef = useRef<SteerBarHandle | null>(null);
-  const now = useTickingNow(30_000);
+  const now = useTickingNow(RUN_TIMING_REFRESH_INTERVAL_MS);
   const { fullHeight, hideSteerBar } = childRouteLayoutFlags(matches);
 
   useRunEvents(params.id);

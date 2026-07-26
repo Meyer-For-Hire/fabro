@@ -118,6 +118,10 @@ const INFERENCE_EVENTS = new Set([
   "agent.error",
   "agent.session.ended",
 ]);
+const TOOL_TIMING_EVENTS = new Set([
+  "agent.tool.started",
+  "agent.tool.completed",
+]);
 // Todo / task mutation events refresh `getRunState` consumers (so per-stage
 // todo projections update live) and the run events list.
 const TODO_EVENTS = new Set([
@@ -184,6 +188,12 @@ export function queryKeysForRunEvent(
     if (AGENT_CONTROL_STATE_EVENTS.has(event)) {
       keys.unshift(queryKeys.runs.state(runId));
     }
+    if (event === "agent.round.interrupted") {
+      keys.unshift(
+        queryKeys.runs.detail(runId),
+        queryKeys.runs.billing(runId),
+      );
+    }
     if (stageId) {
       keys.push(queryKeys.runs.stageEvents(runId, stageId));
       keys.push(queryKeys.runs.stageContextWindow(runId, stageId));
@@ -192,12 +202,29 @@ export function queryKeysForRunEvent(
   }
 
   if (INFERENCE_EVENTS.has(event)) {
-    const keys: Key[] = [queryKeys.runs.state(runId)];
+    const keys: Key[] = [
+      queryKeys.runs.detail(runId),
+      queryKeys.runs.state(runId),
+      queryKeys.runs.billing(runId),
+    ];
     if (stageId) {
       keys.push(queryKeys.runs.stageEvents(runId, stageId));
       if (event === "agent.message") {
         keys.push(queryKeys.runs.stageContextWindow(runId, stageId));
       }
+    }
+    return keys;
+  }
+
+  if (TOOL_TIMING_EVENTS.has(event)) {
+    const keys: Key[] = [
+      queryKeys.runs.detail(runId),
+      queryKeys.runs.state(runId),
+      queryKeys.runs.billing(runId),
+    ];
+    if (stageId) {
+      keys.push(queryKeys.runs.stageEvents(runId, stageId));
+      keys.push(queryKeys.runs.stageContextWindow(runId, stageId));
     }
     return keys;
   }
