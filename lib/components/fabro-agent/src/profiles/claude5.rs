@@ -123,7 +123,7 @@ impl AgentProfile for Claude5Profile {
                 "has_agent",
                 self.base
                     .registry
-                    .get_native(NativeTool::ClaudeAgent)
+                    .get_native(NativeTool::BackgroundAgent)
                     .is_some(),
             )
             .with_bool(

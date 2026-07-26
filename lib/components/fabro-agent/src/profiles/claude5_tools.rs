@@ -187,7 +187,7 @@ pub(crate) fn make_agent_tool(
 ) -> RegisteredTool {
     RegisteredTool {
         definition: definition(
-            NativeTool::ClaudeAgent,
+            NativeTool::BackgroundAgent,
             "Launch a child agent for an independent task. Agents run in the background by \
              default and notify the parent when they finish. Set run_in_background to false to \
              wait for the result synchronously.",
@@ -281,7 +281,7 @@ fn finished_output(
 pub(crate) fn make_task_output_tool(supervisor: SubAgentSupervisor) -> RegisteredTool {
     RegisteredTool {
         definition: definition(
-            NativeTool::TaskOutput,
+            NativeTool::AgentOutput,
             "Get a background agent's current status or wait for its final output. Automatic \
              completion notifications make ordinary polling unnecessary.",
             serde_json::json!({
@@ -368,7 +368,7 @@ pub(crate) fn make_task_output_tool(supervisor: SubAgentSupervisor) -> Registere
 pub(crate) fn make_task_stop_tool(supervisor: SubAgentSupervisor) -> RegisteredTool {
     RegisteredTool {
         definition: definition(
-            NativeTool::TaskStop,
+            NativeTool::StopAgent,
             "Stop a running background agent by task ID.",
             serde_json::json!({
                 "type": "object",
@@ -401,7 +401,7 @@ pub(crate) fn make_task_stop_tool(supervisor: SubAgentSupervisor) -> RegisteredT
 pub(crate) fn make_send_message_tool(supervisor: SubAgentSupervisor) -> RegisteredTool {
     RegisteredTool {
         definition: definition(
-            NativeTool::SendMessage,
+            NativeTool::MessageAgent,
             "Send additional instructions to a running background agent by its task ID.",
             serde_json::json!({
                 "type": "object",
