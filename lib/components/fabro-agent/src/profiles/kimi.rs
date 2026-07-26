@@ -6,13 +6,13 @@ use super::EnvContext;
 use crate::agent_profile::AgentProfile;
 use crate::config::NativeToolOptions;
 use crate::native_tool::{NativeTool, ToolVocabulary};
-use crate::profiles::{self, BaseProfile, EmbeddedPrompt, kimi_tools};
+use crate::profiles::{self, BaseProfile, EmbeddedPrompt, ProfileDeps, kimi_tools};
 use crate::sandbox::Sandbox;
 use crate::skills::Skill;
 use crate::todo_runtime::TodoRuntime;
 use crate::todo_tools::make_todo_list_tool;
 use crate::tool_registry::ToolRegistry;
-use crate::tools::{WebFetchSummarizer, register_discovery_and_web_tools};
+use crate::tools::register_discovery_and_web_tools;
 
 const CORE_PROMPT: &str = include_str!("prompts/kimi.md.j2");
 
@@ -56,15 +56,12 @@ pub struct KimiProfile {
 impl KimiProfile {
     #[must_use]
     pub fn new(model: impl Into<String>) -> Self {
-        let options = NativeToolOptions::for_profile(AgentProfileKind::Kimi);
-        Self::with_native_tools(model, &options, None)
+        let deps = ProfileDeps::standalone(NativeToolOptions::for_profile(AgentProfileKind::Kimi));
+        Self::with_native_tools(model, &deps)
     }
 
-    pub(crate) fn with_native_tools(
-        model: impl Into<String>,
-        options: &NativeToolOptions,
-        summarizer: Option<WebFetchSummarizer>,
-    ) -> Self {
+    pub(crate) fn with_native_tools(model: impl Into<String>, deps: &ProfileDeps) -> Self {
+        let options = &deps.options;
         // The registry carries the vocabulary, so tools registered later
         // (subagent tools, skills) are renamed too.
         let mut registry = ToolRegistry::with_vocabulary(ToolVocabulary::KimiCode);
@@ -72,7 +69,7 @@ impl KimiProfile {
         // Glob and the web tools have the same contract in both vocabularies.
         // The remaining Kimi tools use adapters for their different schemas,
         // while reusing shared execution helpers where their behavior agrees.
-        register_discovery_and_web_tools(&mut registry, options, summarizer);
+        register_discovery_and_web_tools(&mut registry, options, deps.summarizer.clone());
         registry.register(kimi_tools::make_kimi_read_tool());
         registry.register(kimi_tools::make_kimi_write_tool());
         registry.register(kimi_tools::make_kimi_edit_tool(EDIT_FILE_DESCRIPTION));

@@ -46,6 +46,32 @@ pub struct AgentProfileBuilder {
     todo_runtime:        Arc<TodoRuntime>,
 }
 
+/// Everything a profile constructor needs from the builder.
+///
+/// Bundled rather than passed positionally so that adding a dependency does
+/// not mean editing every profile's signature -- and, more importantly, so a
+/// dependency cannot reach some profiles and silently miss others. The shared
+/// `todo_runtime` is exactly that case: task tools scope their list by
+/// `root_session_id`, so a root and its children address one logical list and
+/// must resolve it through one runtime.
+pub(crate) struct ProfileDeps {
+    pub options:      NativeToolOptions,
+    pub summarizer:   Option<WebFetchSummarizer>,
+    pub todo_runtime: Arc<TodoRuntime>,
+}
+
+impl ProfileDeps {
+    /// Standalone defaults, for `Profile::new` and tests. A profile built this
+    /// way owns its runtime because it has no children to share one with.
+    pub(crate) fn standalone(options: NativeToolOptions) -> Self {
+        Self {
+            options,
+            summarizer: None,
+            todo_runtime: Arc::new(TodoRuntime::new()),
+        }
+    }
+}
+
 impl AgentProfileBuilder {
     #[must_use]
     pub fn new(
@@ -84,44 +110,42 @@ impl AgentProfileBuilder {
     #[must_use]
     pub fn build(&self) -> Box<dyn AgentProfile> {
         let model = self.model.as_str();
-        let options = &self.native_tool_options;
-        let summarizer = if self.profile_kind == AgentProfileKind::Gpt56 {
-            None
-        } else {
-            self.summarizer.clone()
+        let deps = ProfileDeps {
+            options:      self.native_tool_options.clone(),
+            summarizer:   if self.profile_kind == AgentProfileKind::Gpt56 {
+                None
+            } else {
+                self.summarizer.clone()
+            },
+            todo_runtime: Arc::clone(&self.todo_runtime),
         };
         match self.profile_kind {
             AgentProfileKind::OpenAi => Box::new(
-                OpenAiProfile::with_native_tools(model, options, summarizer)
+                OpenAiProfile::with_native_tools(model, &deps)
                     .with_route(self.provider_id.clone(), Arc::clone(&self.catalog)),
             ),
             AgentProfileKind::Gemini => Box::new(
-                GeminiProfile::with_native_tools(model, options, summarizer)
+                GeminiProfile::with_native_tools(model, &deps)
                     .with_provider_id(self.provider_id.clone())
                     .with_catalog(Arc::clone(&self.catalog)),
             ),
             AgentProfileKind::Anthropic => Box::new(
-                AnthropicProfile::with_native_tools(model, options, summarizer)
+                AnthropicProfile::with_native_tools(model, &deps)
                     .with_provider_id(self.provider_id.clone())
                     .with_catalog(Arc::clone(&self.catalog)),
             ),
             AgentProfileKind::Claude5 => Box::new(
-                Claude5Profile::with_native_tools_and_todo_runtime(
-                    model,
-                    options,
-                    summarizer,
-                    Arc::clone(&self.todo_runtime),
-                )
-                .with_provider_id(self.provider_id.clone())
-                .with_catalog(Arc::clone(&self.catalog)),
+                Claude5Profile::with_native_tools(model, &deps)
+                    .with_provider_id(self.provider_id.clone())
+                    .with_catalog(Arc::clone(&self.catalog)),
             ),
             AgentProfileKind::Kimi => Box::new(
-                KimiProfile::with_native_tools(model, options, summarizer)
+                KimiProfile::with_native_tools(model, &deps)
                     .with_provider_id(self.provider_id.clone())
                     .with_catalog(Arc::clone(&self.catalog)),
             ),
             AgentProfileKind::Gpt56 => Box::new(
-                Gpt56Profile::with_native_tools(model, options)
+                Gpt56Profile::with_native_tools(model, &deps)
                     .with_route(self.provider_id.clone(), Arc::clone(&self.catalog)),
             ),
         }
@@ -422,7 +446,8 @@ mod tests {
 
     fn anthropic_profile(has_web_search: bool, has_subagents: bool) -> AnthropicProfile {
         let options = native_tool_options(AgentProfileKind::Anthropic, has_web_search);
-        let mut profile = AnthropicProfile::with_native_tools("claude-haiku-4-5", &options, None);
+        let deps = ProfileDeps::standalone(options);
+        let mut profile = AnthropicProfile::with_native_tools("claude-haiku-4-5", &deps);
         if has_subagents {
             register_test_subagent_tools(&mut profile);
         }
@@ -435,7 +460,8 @@ mod tests {
         has_question: bool,
     ) -> Claude5Profile {
         let options = native_tool_options(AgentProfileKind::Claude5, has_web_search);
-        let mut profile = Claude5Profile::with_native_tools("claude-sonnet-5", &options, None);
+        let deps = ProfileDeps::standalone(options);
+        let mut profile = Claude5Profile::with_native_tools("claude-sonnet-5", &deps);
         if has_subagents {
             register_test_subagent_tools(&mut profile);
         }
@@ -450,26 +476,30 @@ mod tests {
 
     fn gemini_profile(has_web_search: bool) -> GeminiProfile {
         let options = native_tool_options(AgentProfileKind::Gemini, has_web_search);
-        GeminiProfile::with_native_tools("gemini-3-flash-preview", &options, None)
+        let deps = ProfileDeps::standalone(options);
+        GeminiProfile::with_native_tools("gemini-3-flash-preview", &deps)
     }
 
     fn openai_apply_patch_profile(has_web_search: bool) -> OpenAiProfile {
         let options = native_tool_options(AgentProfileKind::OpenAi, has_web_search);
-        OpenAiProfile::with_native_tools("gpt-5.4-mini", &options, None)
+        let deps = ProfileDeps::standalone(options);
+        OpenAiProfile::with_native_tools("gpt-5.4-mini", &deps)
     }
 
     fn gpt56_profile(has_web_search: bool) -> Gpt56Profile {
         let options = native_tool_options(AgentProfileKind::Gpt56, has_web_search);
-        Gpt56Profile::with_native_tools("gpt-5.6-sol", &options)
+        let deps = ProfileDeps::standalone(options);
+        Gpt56Profile::with_native_tools("gpt-5.6-sol", &deps)
     }
 
     /// GPT-5.6 through an OpenAI-compatible gateway, where `apply_patch`
     /// cannot be carried and `edit_file` takes its place.
     fn gpt56_edit_file_profile(has_web_search: bool) -> Gpt56Profile {
         let options = native_tool_options(AgentProfileKind::Gpt56, has_web_search);
+        let deps = ProfileDeps::standalone(options);
         let overrides: LlmCatalogSettings =
             toml::from_str("[providers.openrouter]\nenabled = true\n").unwrap();
-        Gpt56Profile::with_native_tools("gpt-5.6-sol", &options).with_route(
+        Gpt56Profile::with_native_tools("gpt-5.6-sol", &deps).with_route(
             ProviderId::new("openrouter"),
             Arc::new(Catalog::from_builtin_with_overrides(&overrides).unwrap()),
         )
@@ -477,7 +507,8 @@ mod tests {
 
     fn openai_edit_file_profile(has_web_search: bool) -> OpenAiProfile {
         let options = native_tool_options(AgentProfileKind::OpenAi, has_web_search);
-        OpenAiProfile::with_native_tools("kimi-k2.5", &options, None).with_route(
+        let deps = ProfileDeps::standalone(options);
+        OpenAiProfile::with_native_tools("kimi-k2.5", &deps).with_route(
             ProviderId::new("kimi"),
             Arc::new(Catalog::from_builtin().unwrap()),
         )
@@ -681,37 +712,37 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn claude5_builder_shares_tasks_across_root_and_child_profiles() {
+    /// Task tools scope their list by `root_session_id`, so a root session and
+    /// every child it spawns address one logical list. `build()` runs once per
+    /// session, so the runtime behind that list has to come from the builder --
+    /// a per-profile runtime gives each session its own projection and its own
+    /// ID counter, and the two sessions then collide on `#1` in the merged
+    /// projection while neither can see the other's tasks.
+    async fn assert_builder_shares_tasks_across_root_and_child(
+        profile_kind: AgentProfileKind,
+        model: &str,
+    ) {
         let builder = AgentProfileBuilder::new(
-            AgentProfileKind::Claude5,
+            profile_kind,
             ProviderId::anthropic(),
-            "claude-sonnet-5",
+            model,
             Arc::new(Catalog::from_builtin().unwrap()),
         );
         let root = builder.build();
         let child = builder.build();
-        let root_create = Arc::clone(
-            &root
-                .tool_registry()
-                .get("TaskCreate")
-                .expect("root should expose TaskCreate")
-                .executor,
-        );
-        let child_create = Arc::clone(
-            &child
-                .tool_registry()
-                .get("TaskCreate")
-                .expect("child should expose TaskCreate")
-                .executor,
-        );
-        let child_list = Arc::clone(
-            &child
-                .tool_registry()
-                .get("TaskList")
-                .expect("child should expose TaskList")
-                .executor,
-        );
+        let executor = |profile: &dyn AgentProfile, name: &str| {
+            Arc::clone(
+                &profile
+                    .tool_registry()
+                    .get(name)
+                    .unwrap_or_else(|| panic!("{profile_kind} should expose {name}"))
+                    .executor,
+            )
+        };
+        let root_create = executor(root.as_ref(), "TaskCreate");
+        let child_create = executor(child.as_ref(), "TaskCreate");
+        let child_list = executor(child.as_ref(), "TaskList");
+
         let env: Arc<dyn Sandbox> = Arc::new(MockSandbox::default());
         let context = |session_id: &str| ToolContext {
             env:                 Arc::clone(&env),
@@ -741,6 +772,24 @@ mod tests {
 
         assert!(tasks.contains("#1 [pending] Parent task"), "{tasks}");
         assert!(tasks.contains("#2 [pending] Child task"), "{tasks}");
+    }
+
+    #[tokio::test]
+    async fn claude5_builder_shares_tasks_across_root_and_child_profiles() {
+        assert_builder_shares_tasks_across_root_and_child(
+            AgentProfileKind::Claude5,
+            "claude-sonnet-5",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn anthropic_builder_shares_tasks_across_root_and_child_profiles() {
+        assert_builder_shares_tasks_across_root_and_child(
+            AgentProfileKind::Anthropic,
+            "claude-haiku-4-5",
+        )
+        .await;
     }
 
     #[test]

@@ -6,13 +6,13 @@ use super::EnvContext;
 use crate::agent_profile::AgentProfile;
 use crate::apply_patch;
 use crate::config::NativeToolOptions;
-use crate::profiles::{self, BaseProfile, EmbeddedPrompt};
+use crate::profiles::{self, BaseProfile, EmbeddedPrompt, ProfileDeps};
 use crate::sandbox::Sandbox;
 use crate::skills::Skill;
 use crate::todo_runtime::TodoRuntime;
 use crate::todo_tools::make_update_plan_tool;
 use crate::tool_registry::ToolRegistry;
-use crate::tools::{self, WebFetchSummarizer, register_core_tools};
+use crate::tools::{self, register_core_tools};
 
 const CORE_PROMPT: &str = include_str!("prompts/openai.md.j2");
 
@@ -23,18 +23,15 @@ pub struct OpenAiProfile {
 impl OpenAiProfile {
     #[must_use]
     pub fn new(model: impl Into<String>) -> Self {
-        let options = NativeToolOptions::for_profile(AgentProfileKind::OpenAi);
-        Self::with_native_tools(model, &options, None)
+        let deps =
+            ProfileDeps::standalone(NativeToolOptions::for_profile(AgentProfileKind::OpenAi));
+        Self::with_native_tools(model, &deps)
     }
 
-    pub(crate) fn with_native_tools(
-        model: impl Into<String>,
-        options: &NativeToolOptions,
-        summarizer: Option<WebFetchSummarizer>,
-    ) -> Self {
+    pub(crate) fn with_native_tools(model: impl Into<String>, deps: &ProfileDeps) -> Self {
         let mut registry = ToolRegistry::new();
 
-        register_core_tools(&mut registry, options, summarizer);
+        register_core_tools(&mut registry, &deps.options, deps.summarizer.clone());
         registry.register(apply_patch::make_apply_patch_tool());
         // Codex-compatible `update_plan` is OpenAI-only.
         let todo_runtime = Arc::new(TodoRuntime::new());

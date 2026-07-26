@@ -8,16 +8,14 @@ use super::EnvContext;
 use crate::agent_profile::AgentProfile;
 use crate::config::NativeToolOptions;
 use crate::native_tool::{NativeTool, ToolVocabulary};
-use crate::profiles::{self, BaseProfile, EmbeddedPrompt, claude5_tools};
+use crate::profiles::{self, BaseProfile, EmbeddedPrompt, ProfileDeps, claude5_tools};
 use crate::sandbox::Sandbox;
 use crate::skills::Skill;
 use crate::subagent::{SessionFactory, SubAgentSupervisor};
-use crate::todo_runtime::TodoRuntime;
 use crate::todo_tools::{
     make_task_create_tool, make_task_get_tool, make_task_list_tool, make_task_update_tool,
 };
 use crate::tool_registry::ToolRegistry;
-use crate::tools::WebFetchSummarizer;
 
 const CORE_PROMPT: &str = include_str!("prompts/claude5.md.j2");
 
@@ -28,29 +26,15 @@ pub struct Claude5Profile {
 impl Claude5Profile {
     #[must_use]
     pub fn new(model: impl Into<String>) -> Self {
-        let options = NativeToolOptions::for_profile(AgentProfileKind::Claude5);
-        Self::with_native_tools(model, &options, None)
+        let deps =
+            ProfileDeps::standalone(NativeToolOptions::for_profile(AgentProfileKind::Claude5));
+        Self::with_native_tools(model, &deps)
     }
 
-    pub(crate) fn with_native_tools(
-        model: impl Into<String>,
-        options: &NativeToolOptions,
-        summarizer: Option<WebFetchSummarizer>,
-    ) -> Self {
-        Self::with_native_tools_and_todo_runtime(
-            model,
-            options,
-            summarizer,
-            Arc::new(TodoRuntime::new()),
-        )
-    }
-
-    pub(crate) fn with_native_tools_and_todo_runtime(
-        model: impl Into<String>,
-        options: &NativeToolOptions,
-        summarizer: Option<WebFetchSummarizer>,
-        todo_runtime: Arc<TodoRuntime>,
-    ) -> Self {
+    pub(crate) fn with_native_tools(model: impl Into<String>, deps: &ProfileDeps) -> Self {
+        let options = &deps.options;
+        let summarizer = deps.summarizer.clone();
+        let todo_runtime = Arc::clone(&deps.todo_runtime);
         let mut registry = ToolRegistry::with_vocabulary(ToolVocabulary::Claude5);
         registry.register(claude5_tools::make_read_tool());
         registry.register(claude5_tools::make_write_tool());
