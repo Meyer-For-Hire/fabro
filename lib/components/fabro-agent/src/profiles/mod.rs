@@ -199,6 +199,45 @@ impl FileEditToolKind {
     }
 }
 
+/// Implement the [`AgentProfile`](crate::agent_profile::AgentProfile)
+/// accessors that just delegate to an embedded [`BaseProfile`] named `base`.
+///
+/// Every profile that owns a `BaseProfile` writes the same six methods; what
+/// actually distinguishes them is `build_system_prompt` and, for some,
+/// `register_subagent_tools`. Types that implement the trait without a
+/// `BaseProfile` -- test doubles, and the server's ask-fabro profile -- write
+/// the accessors themselves, which is why this is a macro rather than a set of
+/// trait defaults: there is no sensible default for a profile that has no base.
+macro_rules! impl_base_profile_accessors {
+    () => {
+        fn profile_kind(&self) -> ::fabro_model::AgentProfileKind {
+            self.base.profile_kind
+        }
+
+        fn provider_id(&self) -> ::fabro_model::ProviderId {
+            self.base.provider_id.clone()
+        }
+
+        fn model(&self) -> &str {
+            &self.base.model
+        }
+
+        fn catalog(&self) -> Option<&::fabro_model::Catalog> {
+            self.base.catalog.as_deref()
+        }
+
+        fn tool_registry(&self) -> &$crate::tool_registry::ToolRegistry {
+            &self.base.registry
+        }
+
+        fn tool_registry_mut(&mut self) -> &mut $crate::tool_registry::ToolRegistry {
+            &mut self.base.registry
+        }
+    };
+}
+
+pub(crate) use impl_base_profile_accessors;
+
 /// Common fields shared by all provider profiles.
 ///
 /// Each concrete profile embeds this struct and delegates `profile_kind()`,

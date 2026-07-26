@@ -8,7 +8,9 @@ use super::EnvContext;
 use crate::agent_profile::AgentProfile;
 use crate::config::NativeToolOptions;
 use crate::native_tool::{NativeTool, ToolVocabulary};
-use crate::profiles::{self, BaseProfile, EmbeddedPrompt, ProfileDeps, claude5_tools};
+use crate::profiles::{
+    self, BaseProfile, EmbeddedPrompt, ProfileDeps, claude5_tools, impl_base_profile_accessors,
+};
 use crate::sandbox::Sandbox;
 use crate::skills::Skill;
 use crate::subagent::{SessionFactory, SubAgentSupervisor};
@@ -85,29 +87,7 @@ impl Claude5Profile {
 }
 
 impl AgentProfile for Claude5Profile {
-    fn profile_kind(&self) -> AgentProfileKind {
-        self.base.profile_kind
-    }
-
-    fn provider_id(&self) -> ProviderId {
-        self.base.provider_id.clone()
-    }
-
-    fn model(&self) -> &str {
-        &self.base.model
-    }
-
-    fn catalog(&self) -> Option<&Catalog> {
-        self.base.catalog.as_deref()
-    }
-
-    fn tool_registry(&self) -> &ToolRegistry {
-        &self.base.registry
-    }
-
-    fn tool_registry_mut(&mut self) -> &mut ToolRegistry {
-        &mut self.base.registry
-    }
+    impl_base_profile_accessors!();
 
     fn build_system_prompt(
         &self,
