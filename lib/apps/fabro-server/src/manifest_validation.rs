@@ -12,21 +12,34 @@ use crate::run_manifest;
 pub fn validate_manifest(
     manifest_run_defaults: &RunLayer,
     manifest: &types::RunManifest,
-    catalog: Arc<Catalog>,
 ) -> Result<types::ValidateResponse> {
     validate_manifest_with_environment_defaults(
         manifest_run_defaults,
         &fabro_environment::seeded_catalog_layer(),
         manifest,
-        catalog,
     )
+}
+
+pub fn validate_manifest_with_catalog(
+    manifest_run_defaults: &RunLayer,
+    manifest: &types::RunManifest,
+    catalog: &Arc<Catalog>,
+) -> Result<types::ValidateResponse> {
+    let prepared = run_manifest::prepare_manifest_with_environment_defaults(
+        manifest_run_defaults,
+        &fabro_environment::seeded_catalog_layer(),
+        &HashMap::new(),
+        manifest,
+    )?;
+    let validated =
+        run_manifest::validate_prepared_manifest(&prepared, catalog).map_err(anyhow::Error::new)?;
+    Ok(run_manifest::validate_response(&prepared, &validated))
 }
 
 pub fn validate_manifest_with_environment_defaults(
     manifest_run_defaults: &RunLayer,
     manifest_environment_defaults: &MergeMap<EnvironmentLayer>,
     manifest: &types::RunManifest,
-    catalog: Arc<Catalog>,
 ) -> Result<types::ValidateResponse> {
     let prepared = run_manifest::prepare_manifest_with_environment_defaults(
         manifest_run_defaults,
@@ -34,8 +47,8 @@ pub fn validate_manifest_with_environment_defaults(
         &HashMap::new(),
         manifest,
     )?;
-    let validated =
-        run_manifest::validate_prepared_manifest(&prepared, catalog).map_err(anyhow::Error::new)?;
+    let validated = run_manifest::validate_prepared_manifest_structural(&prepared)
+        .map_err(anyhow::Error::new)?;
     Ok(run_manifest::validate_response(&prepared, &validated))
 }
 

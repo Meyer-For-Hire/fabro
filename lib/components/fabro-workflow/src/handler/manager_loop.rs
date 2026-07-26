@@ -16,7 +16,7 @@ use crate::artifact_upload::ArtifactSink;
 use crate::condition::evaluate_condition;
 use crate::context::{Context, WorkflowContext, context_diff_public, keys};
 use crate::error::Error;
-use crate::operations::{ValidateInput, WorkflowInput, validate};
+use crate::operations::{ValidateInput, WorkflowInput, validate_with_catalog};
 use crate::outcome::{Outcome, OutcomeExt, StageOutcome};
 use crate::pipeline::types::Initialized;
 use crate::run_options::RunOptions;
@@ -65,17 +65,19 @@ fn parse_child_graph(node: &Node, services: &EngineServices) -> Result<ParsedChi
         .get("stack.child_dot_source")
         .and_then(|v| v.as_str())
     {
-        let mut validated = validate(ValidateInput {
-            workflow:          WorkflowInput::DotSource {
-                source:   dot.to_string(),
-                base_dir: None,
+        let mut validated = validate_with_catalog(
+            ValidateInput {
+                workflow:          WorkflowInput::DotSource {
+                    source:   dot.to_string(),
+                    base_dir: None,
+                },
+                settings:          WorkflowSettings::default(),
+                vars:              std::collections::HashMap::new(),
+                cwd:               cwd.clone(),
+                custom_transforms: Vec::new(),
             },
-            settings:          WorkflowSettings::default(),
-            vars:              std::collections::HashMap::new(),
-            cwd:               cwd.clone(),
-            custom_transforms: Vec::new(),
-            catalog:           Arc::clone(&services.run.catalog),
-        })?;
+            &services.run.catalog,
+        )?;
         validated.promote_template_undefined_variables_to_errors();
         validated.raise_on_errors()?;
         let (graph, _, _) = validated.into_parts();
@@ -113,14 +115,16 @@ fn parse_child_graph(node: &Node, services: &EngineServices) -> Result<ParsedChi
             WorkflowInput::Bundled(workflow) => Some(workflow.path.clone()),
             WorkflowInput::Path(_) | WorkflowInput::DotSource { .. } => None,
         };
-        let mut validated = validate(ValidateInput {
-            workflow,
-            settings: WorkflowSettings::default(),
-            vars: std::collections::HashMap::new(),
-            cwd,
-            custom_transforms: Vec::new(),
-            catalog: Arc::clone(&services.run.catalog),
-        })?;
+        let mut validated = validate_with_catalog(
+            ValidateInput {
+                workflow,
+                settings: WorkflowSettings::default(),
+                vars: std::collections::HashMap::new(),
+                cwd,
+                custom_transforms: Vec::new(),
+            },
+            &services.run.catalog,
+        )?;
         validated.promote_template_undefined_variables_to_errors();
         validated.raise_on_errors()?;
         let (graph, _, _) = validated.into_parts();

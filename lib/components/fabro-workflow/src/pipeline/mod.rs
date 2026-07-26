@@ -22,8 +22,8 @@ pub use pull_request::{
 };
 pub use transform::transform;
 pub use types::{
-    Concluded, Executed, FinalizeOptions, Finalized, InitOptions, Initialized, LlmSpec, Parsed,
-    Persisted, PullRequestOptions, ResumeState, SandboxEnvSpec, TEMPLATE_UNDEFINED_VARIABLE_RULE,
-    TransformOptions, Transformed, Validated,
+    Concluded, Executed, FinalizeOptions, Finalized, InitOptions, Initialized, LlmSpec,
+    ModelResolutionOptions, Parsed, Persisted, PullRequestOptions, ResumeState, SandboxEnvSpec,
+    TEMPLATE_UNDEFINED_VARIABLE_RULE, TransformOptions, Transformed, Validated,
 };
-pub use validate::validate;
+pub use validate::{validate, validate_with_catalog};

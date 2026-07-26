@@ -102,6 +102,52 @@ fn create_uses_explicit_server_target_and_prints_remote_run_id() {
 }
 
 #[test]
+fn create_defers_provider_validation_to_the_server() {
+    let context = test_context!();
+    let server = MockServer::start();
+    let run_id = unique_run_id();
+    let mock = server.mock(|when, then| {
+        when.method("POST")
+            .path("/api/v1/runs")
+            .body_includes(r#"provider=\"server-only\""#);
+        then.status(201)
+            .header("Content-Type", "application/json")
+            .body(run_status_response(run_id.as_str(), "submitted").to_string());
+    });
+    let workflow_path = context.temp_dir.join("server-model.fabro");
+    context.write_temp(
+        "server-model.fabro",
+        r#"digraph ServerModel {
+            graph [goal="Use a server-owned model"]
+            start [shape=Mdiamond]
+            work [prompt="Do work", model="private-model", provider="server-only"]
+            exit [shape=Msquare]
+            start -> work -> exit
+        }"#,
+    );
+
+    let output = context
+        .create_cmd()
+        .args([
+            "--server",
+            &format!("{}/api/v1", server.base_url()),
+            "--dry-run",
+            workflow_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("command should execute");
+
+    assert!(
+        output.status.success(),
+        "local validation should not reject a server-owned provider\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    mock.assert();
+    assert_eq!(output_stdout(&output).trim(), run_id.as_str());
+}
+
+#[test]
 fn create_uses_configured_server_target_without_server_flag() {
     let context = test_context!();
     let server = MockServer::start();

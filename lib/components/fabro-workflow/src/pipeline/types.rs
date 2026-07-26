@@ -359,18 +359,38 @@ pub struct Finalized {
 
 /// Options for the TRANSFORM phase.
 pub struct TransformOptions {
-    pub current_dir:        Option<PathBuf>,
-    pub file_resolver:      Option<Arc<dyn FileResolver>>,
-    pub template_context:   TemplateContext,
-    pub source_name:        Option<String>,
-    pub render_mode:        RenderMode,
-    pub custom_transforms:  Vec<Box<dyn Transform>>,
-    pub catalog:            Arc<fabro_model::Catalog>,
+    pub current_dir:       Option<PathBuf>,
+    pub file_resolver:     Option<Arc<dyn FileResolver>>,
+    pub template_context:  TemplateContext,
+    pub source_name:       Option<String>,
+    pub render_mode:       RenderMode,
+    pub custom_transforms: Vec<Box<dyn Transform>>,
+    /// Catalog-backed model resolution to perform. `None` preserves authored
+    /// model and provider selectors for catalog-free structural validation.
+    pub model_resolution:  Option<ModelResolutionOptions>,
+}
+
+/// Catalog-backed model resolution options for the TRANSFORM phase.
+pub struct ModelResolutionOptions {
+    pub catalog:            Arc<Catalog>,
     pub default_provider:   Option<ProviderId>,
     pub eligible_providers: HashSet<ProviderId>,
     /// Fall back to the full catalog when the eligible providers cannot
     /// supply a requested model, instead of erroring.
     pub catalog_fallback:   bool,
+}
+
+impl ModelResolutionOptions {
+    #[must_use]
+    pub fn new(catalog: Arc<Catalog>) -> Self {
+        let eligible_providers = catalog.all_provider_ids();
+        Self {
+            catalog,
+            default_provider: None,
+            eligible_providers,
+            catalog_fallback: false,
+        }
+    }
 }
 
 /// Options for the FINALIZE phase.

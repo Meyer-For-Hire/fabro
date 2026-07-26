@@ -35,7 +35,8 @@ use fabro_util::check_report::{CheckDetail, CheckReport, CheckResult, CheckSecti
 use fabro_validate::Severity;
 use fabro_workflow::Error as WorkflowError;
 use fabro_workflow::operations::{
-    CreateRunInput, ValidateInput, WorkflowInput, validate, validate_with_ready_providers,
+    CreateRunInput, ValidateInput, WorkflowInput, validate, validate_with_catalog,
+    validate_with_ready_providers,
 };
 use fabro_workflow::pipeline::Validated;
 use fabro_workflow::run_materialization::materialize_run_with_ready_providers;
@@ -187,34 +188,40 @@ pub(crate) fn prepare_manifest_with_environment_defaults(
 
 pub(crate) fn validate_prepared_manifest(
     prepared: &PreparedManifest,
-    catalog: Arc<Catalog>,
+    catalog: &Arc<Catalog>,
 ) -> Result<Validated, WorkflowError> {
     validate_prepared_manifest_with_vars(prepared, catalog, HashMap::new())
 }
 
+pub(crate) fn validate_prepared_manifest_structural(
+    prepared: &PreparedManifest,
+) -> Result<Validated, WorkflowError> {
+    validate(manifest_validate_input(prepared, HashMap::new()))
+}
+
 pub(crate) fn validate_prepared_manifest_with_vars(
     prepared: &PreparedManifest,
-    catalog: Arc<Catalog>,
+    catalog: &Arc<Catalog>,
     vars: HashMap<String, String>,
 ) -> Result<Validated, WorkflowError> {
-    validate(manifest_validate_input(prepared, catalog, vars))
+    validate_with_catalog(manifest_validate_input(prepared, vars), catalog)
 }
 
 pub(crate) fn validate_prepared_manifest_for_preflight(
     prepared: &PreparedManifest,
-    catalog: Arc<Catalog>,
+    catalog: &Arc<Catalog>,
     vars: HashMap<String, String>,
     ready_providers: &[ProviderId],
 ) -> Result<Validated, WorkflowError> {
     validate_with_ready_providers(
-        manifest_validate_input(prepared, catalog, vars),
+        manifest_validate_input(prepared, vars),
+        catalog,
         ready_providers,
     )
 }
 
 fn manifest_validate_input(
     prepared: &PreparedManifest,
-    catalog: Arc<Catalog>,
     vars: HashMap<String, String>,
 ) -> ValidateInput {
     ValidateInput {
@@ -223,7 +230,6 @@ fn manifest_validate_input(
         vars,
         cwd: prepared.cwd.clone(),
         custom_transforms: Vec::new(),
-        catalog,
     }
 }
 
@@ -1548,7 +1554,7 @@ digraph Demo {{
         .unwrap();
         let validated = validate_prepared_manifest_for_preflight(
             &prepared,
-            state.catalog(),
+            &state.catalog(),
             HashMap::new(),
             &ready_providers,
         )
@@ -1633,7 +1639,7 @@ enabled = {clone_enabled}
             &manifest,
         )
         .unwrap();
-        let validated = validate_prepared_manifest(&prepared, test_catalog()).unwrap();
+        let validated = validate_prepared_manifest(&prepared, &test_catalog()).unwrap();
         let resolved = materialize_run(
             prepared.settings.clone(),
             validated.graph(),
@@ -2193,7 +2199,7 @@ name = "Control Plane"
             &invalid_manifest(),
         )
         .unwrap();
-        let validated = validate_prepared_manifest(&prepared, test_catalog()).unwrap();
+        let validated = validate_prepared_manifest(&prepared, &test_catalog()).unwrap();
 
         assert!(validated.has_errors());
 
@@ -2238,7 +2244,7 @@ issues = "read"
             &manifest,
         )
         .unwrap();
-        let validated = validate_prepared_manifest(&prepared, test_catalog()).unwrap();
+        let validated = validate_prepared_manifest(&prepared, &test_catalog()).unwrap();
         assert!(!validated.has_errors());
 
         let (response, _ok) = resolve_and_run_preflight(state.as_ref(), &prepared, &validated)
@@ -2288,7 +2294,7 @@ id = "local"
             &manifest,
         )
         .unwrap();
-        let validated = validate_prepared_manifest(&prepared, test_catalog()).unwrap();
+        let validated = validate_prepared_manifest(&prepared, &test_catalog()).unwrap();
 
         assert!(!validated.has_errors());
 
@@ -2397,7 +2403,7 @@ id = "daytona"
             &manifest,
         )
         .unwrap();
-        let validated = validate_prepared_manifest(&prepared, test_catalog()).unwrap();
+        let validated = validate_prepared_manifest(&prepared, &test_catalog()).unwrap();
 
         let (response, _ok) = resolve_and_run_preflight(state.as_ref(), &prepared, &validated)
             .await
@@ -2465,7 +2471,7 @@ digraph Demo {
             &manifest,
         )
         .unwrap();
-        let validated = validate_prepared_manifest(&prepared, test_catalog()).unwrap();
+        let validated = validate_prepared_manifest(&prepared, &test_catalog()).unwrap();
 
         let (response, ok) = resolve_and_run_preflight(state.as_ref(), &prepared, &validated)
             .await
@@ -2579,7 +2585,7 @@ digraph Demo {
             &manifest,
         )
         .unwrap();
-        let Err(error) = validate_prepared_manifest(&prepared, test_catalog()) else {
+        let Err(error) = validate_prepared_manifest(&prepared, &test_catalog()) else {
             panic!("unknown provider should fail static validation");
         };
 
@@ -2646,7 +2652,7 @@ digraph Demo {
         assert!(ready_providers.is_empty());
         let validated = validate_prepared_manifest_for_preflight(
             &prepared,
-            state.catalog(),
+            &state.catalog(),
             HashMap::new(),
             &ready_providers,
         )

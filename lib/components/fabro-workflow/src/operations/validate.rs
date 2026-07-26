@@ -5,7 +5,9 @@ use std::sync::Arc;
 use fabro_model::{Catalog, ProviderId};
 use fabro_types::WorkflowSettings;
 
-use super::create::{preprocess_and_validate, template_context};
+use super::create::{
+    preprocess_and_validate, preprocess_and_validate_structural, template_context,
+};
 use super::source::{ResolveWorkflowInput, WorkflowInput, resolve_workflow};
 use crate::error::Error;
 use crate::operations::RenderMode;
@@ -20,20 +22,50 @@ pub struct ValidateInput {
     pub vars:              HashMap<String, String>,
     pub cwd:               PathBuf,
     pub custom_transforms: Vec<Box<dyn Transform>>,
-    pub catalog:           Arc<Catalog>,
 }
 
-/// Parse, transform, and validate a DOT source string.
+/// Parse, transform, and structurally validate a DOT source string without a
+/// model catalog.
 ///
 /// Returns `Validated` even when validation produced errors. Call
 /// `validated.raise_on_errors()` if the caller wants to fail fast.
 pub fn validate(input: ValidateInput) -> Result<Validated, Error> {
-    let eligible_providers = input
-        .catalog
-        .all_provider_ids()
-        .into_iter()
-        .collect::<Vec<_>>();
-    validate_with_eligible_providers(input, &eligible_providers, false)
+    let ValidateInput {
+        workflow,
+        settings,
+        vars,
+        cwd,
+        custom_transforms,
+    } = input;
+    let resolved = resolve_workflow(ResolveWorkflowInput {
+        workflow,
+        settings,
+        cwd,
+    })
+    .map_err(|err| Error::Parse(err.to_string()))?;
+
+    preprocess_and_validate_structural(
+        &resolved.raw_source,
+        resolved
+            .dot_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        resolved.current_dir,
+        resolved.file_resolver,
+        custom_transforms,
+        template_context(Some(&resolved.settings), vars),
+        resolved.goal_override.as_deref(),
+        RenderMode::Structural,
+    )
+}
+
+/// Parse, transform, and validate a DOT source string against `catalog`.
+pub fn validate_with_catalog(
+    input: ValidateInput,
+    catalog: &Arc<Catalog>,
+) -> Result<Validated, Error> {
+    let eligible_providers = catalog.all_provider_ids().into_iter().collect::<Vec<_>>();
+    validate_with_eligible_providers(input, catalog, &eligible_providers, false)
 }
 
 /// Parse, transform, and validate, resolving models against the ready
@@ -41,20 +73,29 @@ pub fn validate(input: ValidateInput) -> Result<Validated, Error> {
 /// provider-readiness selection failures.
 pub fn validate_with_ready_providers(
     input: ValidateInput,
+    catalog: &Arc<Catalog>,
     ready_providers: &[ProviderId],
 ) -> Result<Validated, Error> {
-    validate_with_eligible_providers(input, ready_providers, true)
+    validate_with_eligible_providers(input, catalog, ready_providers, true)
 }
 
 fn validate_with_eligible_providers(
     input: ValidateInput,
+    catalog: &Arc<Catalog>,
     eligible_providers: &[ProviderId],
     catalog_fallback: bool,
 ) -> Result<Validated, Error> {
+    let ValidateInput {
+        workflow,
+        settings,
+        vars,
+        cwd,
+        custom_transforms,
+    } = input;
     let resolved = resolve_workflow(ResolveWorkflowInput {
-        workflow: input.workflow,
-        settings: input.settings,
-        cwd:      input.cwd,
+        workflow,
+        settings,
+        cwd,
     })
     .map_err(|err| Error::Parse(err.to_string()))?;
 
@@ -66,8 +107,8 @@ fn validate_with_eligible_providers(
             .map(|path| path.display().to_string()),
         resolved.current_dir,
         resolved.file_resolver,
-        input.custom_transforms,
-        template_context(Some(&resolved.settings), input.vars),
+        custom_transforms,
+        template_context(Some(&resolved.settings), vars),
         resolved.goal_override.as_deref(),
         RenderMode::Structural,
         resolved
@@ -80,6 +121,6 @@ fn validate_with_eligible_providers(
             .map(fabro_model::ProviderId::new),
         eligible_providers,
         catalog_fallback,
-        &input.catalog,
+        catalog,
     )
 }

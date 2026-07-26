@@ -24,7 +24,9 @@ use crate::error::Error;
 use crate::event::{Event, append_event, to_run_event_at};
 use crate::file_resolver::FileResolver;
 use crate::pipeline::types::PersistOptions;
-use crate::pipeline::{self, Persisted, TransformOptions, Validated};
+use crate::pipeline::{
+    self, ModelResolutionOptions, Persisted, TransformOptions, Transformed, Validated,
+};
 use crate::records::RunSpec;
 use crate::run_lookup::default_scratch_base;
 use crate::run_materialization::materialize_run;
@@ -340,6 +342,69 @@ pub(super) fn preprocess_and_validate(
     catalog_fallback: bool,
     catalog: &Arc<Catalog>,
 ) -> Result<Validated, Error> {
+    let model_resolution = ModelResolutionOptions {
+        catalog: Arc::clone(catalog),
+        default_provider,
+        eligible_providers: eligible_providers.iter().cloned().collect(),
+        catalog_fallback,
+    };
+    let transformed = preprocess(
+        dot_source,
+        source_name,
+        current_dir,
+        file_resolver,
+        custom_transforms,
+        template_context,
+        goal_override,
+        render_mode,
+        Some(model_resolution),
+    )?;
+    Ok(pipeline::validate_with_catalog(
+        transformed,
+        catalog.as_ref(),
+        &[],
+    ))
+}
+
+pub(super) fn preprocess_and_validate_structural(
+    dot_source: &str,
+    source_name: Option<String>,
+    current_dir: Option<PathBuf>,
+    file_resolver: Option<Arc<dyn FileResolver>>,
+    custom_transforms: Vec<Box<dyn Transform>>,
+    template_context: TemplateContext,
+    goal_override: Option<&str>,
+    render_mode: RenderMode,
+) -> Result<Validated, Error> {
+    let transformed = preprocess(
+        dot_source,
+        source_name,
+        current_dir,
+        file_resolver,
+        custom_transforms,
+        template_context,
+        goal_override,
+        render_mode,
+        None,
+    )?;
+    Ok(pipeline::validate(transformed, &[]))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "pipeline stages have distinct source, rendering, and model-resolution inputs"
+)]
+fn preprocess(
+    dot_source: &str,
+    source_name: Option<String>,
+    current_dir: Option<PathBuf>,
+    file_resolver: Option<Arc<dyn FileResolver>>,
+    custom_transforms: Vec<Box<dyn Transform>>,
+    template_context: TemplateContext,
+    goal_override: Option<&str>,
+    render_mode: RenderMode,
+    model_resolution: Option<ModelResolutionOptions>,
+) -> Result<Transformed, Error> {
     let mut parsed = pipeline::parse(dot_source)?;
     apply_goal_override(&mut parsed.graph, goal_override);
 
@@ -350,12 +415,9 @@ pub(super) fn preprocess_and_validate(
         source_name,
         render_mode,
         custom_transforms,
-        catalog: Arc::clone(catalog),
-        default_provider,
-        eligible_providers: eligible_providers.iter().cloned().collect(),
-        catalog_fallback,
+        model_resolution,
     })?;
-    Ok(pipeline::validate(transformed, catalog.as_ref(), &[]))
+    Ok(transformed)
 }
 
 pub(super) fn template_context(
@@ -462,7 +524,7 @@ mod tests {
     use object_store::memory::InMemory;
 
     use super::*;
-    use crate::operations::{ValidateInput, validate};
+    use crate::operations::{ValidateInput, validate, validate_with_catalog};
     use crate::pipeline::types::{GOAL_SELF_REFERENCE_RULE, TEMPLATE_UNDEFINED_VARIABLE_RULE};
     use crate::workflow_bundle::BundledWorkflow;
     fn memory_store() -> Arc<Database> {
@@ -553,17 +615,19 @@ reasoning = false
     }
 
     fn validate_dot(dot_source: &str, settings: WorkflowSettings) -> Validated {
-        validate(ValidateInput {
-            workflow: WorkflowInput::DotSource {
-                source:   dot_source.to_string(),
-                base_dir: None,
+        validate_with_catalog(
+            ValidateInput {
+                workflow: WorkflowInput::DotSource {
+                    source:   dot_source.to_string(),
+                    base_dir: None,
+                },
+                settings,
+                vars: HashMap::new(),
+                cwd: PathBuf::from("."),
+                custom_transforms: Vec::new(),
             },
-            settings,
-            vars: HashMap::new(),
-            cwd: PathBuf::from("."),
-            custom_transforms: Vec::new(),
-            catalog: test_catalog(),
-        })
+            &test_catalog(),
+        )
         .unwrap()
     }
 
@@ -852,7 +916,6 @@ reasoning = false
             vars:              HashMap::new(),
             cwd:               PathBuf::from("."),
             custom_transforms: Vec::new(),
-            catalog:           test_catalog(),
         });
 
         assert!(result.is_err());
@@ -901,7 +964,6 @@ reasoning = false
             vars:              HashMap::new(),
             cwd:               dir.path().to_path_buf(),
             custom_transforms: Vec::new(),
-            catalog:           test_catalog(),
         })
         .unwrap();
         let file_missing = validate(ValidateInput {
@@ -920,7 +982,6 @@ reasoning = false
             vars:              HashMap::new(),
             cwd:               dir.path().to_path_buf(),
             custom_transforms: Vec::new(),
-            catalog:           test_catalog(),
         })
         .unwrap();
         assert_eq!(
@@ -944,7 +1005,6 @@ reasoning = false
             vars:              HashMap::new(),
             cwd:               dir.path().to_path_buf(),
             custom_transforms: Vec::new(),
-            catalog:           test_catalog(),
         })
         .unwrap();
         let file_goal = validate(ValidateInput {
@@ -963,7 +1023,6 @@ reasoning = false
             vars:              HashMap::new(),
             cwd:               dir.path().to_path_buf(),
             custom_transforms: Vec::new(),
-            catalog:           test_catalog(),
         })
         .unwrap();
         assert_eq!(
@@ -1055,7 +1114,6 @@ reasoning = false
             vars:              HashMap::new(),
             cwd:               PathBuf::from("."),
             custom_transforms: Vec::new(),
-            catalog:           test_catalog(),
         });
         assert!(result.is_err());
     }
@@ -1100,7 +1158,6 @@ reasoning = false
             vars:              HashMap::new(),
             cwd:               PathBuf::from("."),
             custom_transforms: vec![Box::new(TagTransform)],
-            catalog:           test_catalog(),
         })
         .unwrap();
         validated.raise_on_errors().unwrap();
@@ -1135,7 +1192,6 @@ reasoning = false
             vars:              HashMap::new(),
             cwd:               dir.path().to_path_buf(),
             custom_transforms: Vec::new(),
-            catalog:           test_catalog(),
         })
         .unwrap();
         validated.raise_on_errors().unwrap();
@@ -1177,7 +1233,6 @@ reasoning = false
             vars:              HashMap::new(),
             cwd:               dir.path().to_path_buf(),
             custom_transforms: Vec::new(),
-            catalog:           test_catalog(),
         })
         .unwrap();
 
@@ -1227,7 +1282,6 @@ reasoning = false
             vars:              HashMap::new(),
             cwd:               PathBuf::from("."),
             custom_transforms: Vec::new(),
-            catalog:           test_catalog(),
         })
         .unwrap();
 
@@ -1278,7 +1332,6 @@ reasoning = false
             vars:              HashMap::new(),
             cwd:               PathBuf::from("."),
             custom_transforms: Vec::new(),
-            catalog:           test_catalog(),
         })
         .unwrap();
 
