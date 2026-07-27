@@ -7,6 +7,7 @@ use fabro_template::{
     TemplateContext, TemplateError, TemplateRenderMode, TemplateSource, TemplateSourceOrigin,
     TemplateStore,
 };
+use fabro_types::settings::{InterpString, Namespace, ResolveCtx, ResolveError, ResolveErrorKind};
 use fabro_util::error::collect_chain;
 use fabro_validate::{Diagnostic, Severity};
 
@@ -234,6 +235,107 @@ fn template_diagnostic(error: &TemplateError, target: &TemplateRenderTarget) -> 
     }
 }
 
+/// Substitutes `{{ inputs.* }}` and `{{ vars.* }}` in a command node `script`.
+///
+/// Substitutes `{{ goal }}`, `{{ inputs.* }}`, and `{{ vars.* }}` in a command
+/// node `script`.
+///
+/// Scripts interpolate through [`InterpString`] tokens rather than the
+/// MiniJinja pass that renders prompts. Shell source is full of brace syntax
+/// that must survive untouched — `jq` filters, `awk` programs, Go templates,
+/// brace expansion — and `InterpString` claims only the bare `{{ goal }}` and
+/// `{{ <known-namespace>.NAME }}`, leaving everything else literal.
+///
+/// `env` and `secrets` are deliberately not wired, so a token in either
+/// namespace fails as [`ResolveErrorKind::Unavailable`]. A script reads the
+/// environment with `$NAME`, which needs no interpolation, and a resolved
+/// secret would be baked into the `CommandStarted` event that records the
+/// script verbatim.
+///
+/// Resolved values are substituted verbatim, not shell-quoted — matching
+/// `[[run.prepare.steps]].script`, where the shell snippet is the author's to
+/// quote. Callers wanting a value treated as a single argument must quote it
+/// in the script. This matters most for `{{ goal }}`, which is free-form prose.
+fn interpolate_script(
+    text: &str,
+    ctx: &TemplateContext,
+    render_mode: RenderMode,
+    target: &TemplateRenderTarget,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Result<String, Error> {
+    let mut resolve_ctx = ResolveCtx::new()
+        .with_inputs(|name| ctx.input(name))
+        .with_vars(|name| ctx.var(name));
+    // The graph goal is rendered before any node attribute, so by here it is
+    // the final text. Substituting it does not re-interpolate: whatever the
+    // goal contains lands in the script as literal characters.
+    if let Some(goal) = ctx.goal() {
+        resolve_ctx = resolve_ctx.with_goal(goal);
+    }
+    match InterpString::parse(text).resolve_with(&mut resolve_ctx) {
+        Ok(resolved) => Ok(resolved),
+        // An unbound input or variable is the same authoring gap the prompt
+        // pass reports, so it follows the same mode split: a hard error at
+        // run-create, a diagnostic during `fabro validate`.
+        Err(err) if err.kind == ResolveErrorKind::Missing => match render_mode {
+            RenderMode::Strict => Err(script_interpolation_error(target, &err)),
+            RenderMode::Structural => {
+                diagnostics.push(script_undefined_variable_diagnostic(&err, target));
+                // Leave the script in source form. Validation never executes
+                // it, and showing the unresolved token beats emptying it.
+                Ok(text.to_string())
+            }
+        },
+        // An unsupported namespace can never resolve here, however the inputs
+        // are bound, so it fails in both modes — the same treatment
+        // `render_attrs` gives an invalid static reference.
+        Err(err) => Err(script_interpolation_error(target, &err)),
+    }
+}
+
+fn script_interpolation_error(target: &TemplateRenderTarget, err: &ResolveError) -> Error {
+    Error::Validation(format!(
+        "script interpolation failed in {}: {err} ({})",
+        target.owner,
+        script_interpolation_fix(err)
+    ))
+}
+
+fn script_undefined_variable_diagnostic(
+    err: &ResolveError,
+    target: &TemplateRenderTarget,
+) -> Diagnostic {
+    Diagnostic {
+        rule: TEMPLATE_UNDEFINED_VARIABLE_RULE.to_owned(),
+        severity: Severity::Warning,
+        message: format!("{err} in {}", target.owner),
+        node_id: target.node_id.clone(),
+        edge: target.edge.clone(),
+        fix: Some(script_interpolation_fix(err)),
+        source_path: target.source_name.clone(),
+        ..Diagnostic::default()
+    }
+}
+
+fn script_interpolation_fix(err: &ResolveError) -> String {
+    let name = &err.name;
+    match err.namespace {
+        Namespace::Inputs => format!(
+            "bind `{name}` via `[run.inputs]` in workflow.toml, or pass `--input {name}=<value>`"
+        ),
+        Namespace::Vars => format!("set it with `fabro variable set {name} <value>`"),
+        Namespace::Env => format!(
+            "`script` does not interpolate environment variables; read it in the shell as \
+             `${name}` instead"
+        ),
+        Namespace::Secrets => format!(
+            "`script` does not interpolate secrets; expose `{name}` to the sandbox through \
+             `[environments.<slug>.env]` and read it in the shell as `${name}`"
+        ),
+        Namespace::Goal => "set a graph `goal` on the workflow".to_string(),
+    }
+}
+
 const DETEMPLATED_ATTRIBUTE_RULE: &str = "detemplated_attribute";
 
 /// Warning emitted when an attribute that is no longer a template still
@@ -244,7 +346,8 @@ fn detemplated_attribute_diagnostic(attr_name: &str, target: &TemplateRenderTarg
         severity: Severity::Warning,
         message: format!(
             "`{attr_name}` in {} is no longer a template; `{{{{ … }}}}` / `{{% … %}}` is treated \
-             as literal text. Only node `prompt` and graph `goal` support templating.",
+             as literal text. Only node `prompt` and graph `goal` support templating, and node \
+             `script` supports `{{{{ inputs.* }}}}` / `{{{{ vars.* }}}}` interpolation.",
             target.owner
         ),
         node_id: target.node_id.clone(),
@@ -382,9 +485,14 @@ impl TemplateTransform {
                     .with_source_name(source_name.cloned().unwrap_or_else(|| "workflow".into()))
                     .with_source_origin(source_text, text);
                 if matches!(scope, AttributeScope::Node) && attr_name == "prompt" {
-                    // `prompt` is the only templated node attribute.
+                    // `prompt` is the only node attribute rendered as a full
+                    // MiniJinja template.
                     *text =
                         render_template_for_target(text, ctx, render_mode, &target, diagnostics)?;
+                } else if matches!(scope, AttributeScope::Node) && attr_name == "script" {
+                    // `script` interpolates a narrow token set instead — see
+                    // `interpolate_script`.
+                    *text = interpolate_script(text, ctx, render_mode, &target, diagnostics)?;
                 } else if fabro_template::contains_template_syntax(text) {
                     // Every other attribute is no longer a template (`label`,
                     // `model`, `provider`, `speed`, `condition`, edge `label`,
@@ -553,6 +661,229 @@ mod tests {
         assert_eq!(
             detemplated, 3,
             "expected a migration warning per demoted label, got: {diagnostics:?}"
+        );
+    }
+
+    /// Build a one-node graph whose `test` node carries `script`.
+    fn script_graph(script: &str) -> Graph {
+        let mut graph = Graph::new("test");
+        graph
+            .attrs
+            .insert("goal".to_string(), AttrValue::String("Ship it".to_string()));
+        let mut node = Node::new("test");
+        node.attrs
+            .insert("script".to_string(), AttrValue::String(script.to_string()));
+        graph.nodes.insert("test".to_string(), node);
+        graph
+    }
+
+    fn script_transform(
+        inputs: &[(&str, toml::Value)],
+        vars: &[(&str, &str)],
+        render_mode: RenderMode,
+    ) -> TemplateTransform {
+        TemplateTransform {
+            context: TemplateContext::new()
+                .with_inputs(
+                    inputs
+                        .iter()
+                        .map(|(k, v)| ((*k).to_string(), v.clone()))
+                        .collect(),
+                )
+                .with_vars(
+                    vars.iter()
+                        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                        .collect(),
+                ),
+            source_name: None,
+            source_text: None,
+            render_mode,
+        }
+    }
+
+    fn script_of(graph: &Graph) -> &str {
+        graph.nodes["test"]
+            .attrs
+            .get("script")
+            .and_then(AttrValue::as_str)
+            .expect("script attribute should still be a string")
+    }
+
+    #[test]
+    fn script_interpolates_inputs_and_vars() {
+        let graph = script_graph("cargo test -p {{ inputs.crate }} --profile {{ vars.PROFILE }}");
+        let transform = script_transform(
+            &[("crate", toml::Value::String("fabro-workflow".into()))],
+            &[("PROFILE", "ci")],
+            RenderMode::Structural,
+        );
+
+        let (graph, diagnostics) = transform.apply_with_diagnostics(graph).unwrap();
+
+        assert_eq!(
+            script_of(&graph),
+            "cargo test -p fabro-workflow --profile ci"
+        );
+        assert!(diagnostics.is_empty(), "unexpected: {diagnostics:?}");
+    }
+
+    #[test]
+    fn script_substitutes_the_rendered_goal() {
+        let graph = script_graph("gh pr create --title \"{{ goal }}\"");
+        let transform = script_transform(&[], &[], RenderMode::Structural);
+
+        let (graph, diagnostics) = transform.apply_with_diagnostics(graph).unwrap();
+
+        assert_eq!(script_of(&graph), "gh pr create --title \"Ship it\"");
+        assert!(diagnostics.is_empty(), "unexpected: {diagnostics:?}");
+    }
+
+    /// The reason `script` uses `InterpString` rather than MiniJinja: shell
+    /// source is full of brace syntax that must reach the shell untouched.
+    #[test]
+    fn script_leaves_non_token_braces_literal() {
+        let script = "jq '{name: .name}' f.json | awk '{print $1}'; echo {{ .Values.image }}; \
+                      touch {a,b}.txt; {% raw %}";
+        let graph = script_graph(script);
+        let transform = script_transform(&[], &[], RenderMode::Structural);
+
+        let (graph, diagnostics) = transform.apply_with_diagnostics(graph).unwrap();
+
+        assert_eq!(script_of(&graph), script);
+        assert!(diagnostics.is_empty(), "unexpected: {diagnostics:?}");
+    }
+
+    #[test]
+    fn script_rejects_secrets_tokens_in_both_render_modes() {
+        for render_mode in [RenderMode::Structural, RenderMode::Strict] {
+            let graph = script_graph("curl -H \"Authorization: {{ secrets.API_KEY }}\" $URL");
+            let transform = script_transform(&[], &[], render_mode);
+
+            let err = transform
+                .apply_with_diagnostics(graph)
+                .expect_err("secrets must never interpolate into a script");
+
+            let message = err.to_string();
+            assert!(
+                message.contains("does not interpolate secrets"),
+                "unexpected message: {message}"
+            );
+            assert!(
+                message.contains("$API_KEY"),
+                "should point at the shell alternative: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn script_rejects_env_tokens_and_points_at_shell_expansion() {
+        let graph = script_graph("echo {{ env.HOME }}");
+        let transform = script_transform(&[], &[], RenderMode::Structural);
+
+        let err = transform
+            .apply_with_diagnostics(graph)
+            .expect_err("env is not interpolated in a script");
+
+        let message = err.to_string();
+        assert!(message.contains("$HOME"), "unexpected message: {message}");
+    }
+
+    #[test]
+    fn script_missing_input_warns_and_preserves_source_in_structural_mode() {
+        let script = "cargo test -p {{ inputs.crate }}";
+        let graph = script_graph(script);
+        let transform = script_transform(&[], &[], RenderMode::Structural);
+
+        let (graph, diagnostics) = transform.apply_with_diagnostics(graph).unwrap();
+
+        assert_eq!(script_of(&graph), script);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|d| d.rule == TEMPLATE_UNDEFINED_VARIABLE_RULE)
+            .expect("an unbound input should warn");
+        assert_eq!(diagnostic.severity, Severity::Warning);
+        assert_eq!(diagnostic.node_id.as_deref(), Some("test"));
+        assert!(
+            diagnostic
+                .fix
+                .as_deref()
+                .unwrap_or_default()
+                .contains("--input crate="),
+            "unexpected fix: {:?}",
+            diagnostic.fix
+        );
+    }
+
+    #[test]
+    fn script_missing_input_is_an_error_in_strict_mode() {
+        let graph = script_graph("cargo test -p {{ inputs.crate }}");
+        let transform = script_transform(&[], &[], RenderMode::Strict);
+
+        let err = transform
+            .apply_with_diagnostics(graph)
+            .expect_err("strict mode must reject an unbound input");
+
+        assert!(
+            err.to_string().contains("inputs.crate"),
+            "unexpected message: {err}"
+        );
+    }
+
+    /// A typed input must produce the same text in a script as in a prompt, so
+    /// authors do not have to reason about two stringification rules.
+    #[test]
+    fn script_and_prompt_stringify_typed_inputs_identically() {
+        let mut graph =
+            script_graph("retry --times {{ inputs.attempts }} --fast {{ inputs.fast }}");
+        graph.nodes.get_mut("test").unwrap().attrs.insert(
+            "prompt".to_string(),
+            AttrValue::String(
+                "retry --times {{ inputs.attempts }} --fast {{ inputs.fast }}".to_string(),
+            ),
+        );
+        let transform = script_transform(
+            &[
+                ("attempts", toml::Value::Integer(3)),
+                ("fast", toml::Value::Boolean(true)),
+            ],
+            &[],
+            RenderMode::Structural,
+        );
+
+        let (graph, _) = transform.apply_with_diagnostics(graph).unwrap();
+
+        assert_eq!(script_of(&graph), "retry --times 3 --fast true");
+        assert_eq!(
+            graph.nodes["test"]
+                .attrs
+                .get("prompt")
+                .and_then(AttrValue::as_str),
+            Some(script_of(&graph)),
+        );
+    }
+
+    /// `script` is node-scoped. A graph or edge attribute of the same name is
+    /// not a command node script and keeps the demoted-attribute behavior.
+    #[test]
+    fn script_interpolation_is_node_scoped() {
+        let mut graph = script_graph("echo ok");
+        graph.attrs.insert(
+            "script".to_string(),
+            AttrValue::String("echo {{ inputs.crate }}".to_string()),
+        );
+        let transform = script_transform(&[], &[], RenderMode::Structural);
+
+        let (graph, diagnostics) = transform.apply_with_diagnostics(graph).unwrap();
+
+        assert_eq!(
+            graph.attrs.get("script"),
+            Some(&AttrValue::String("echo {{ inputs.crate }}".to_string()))
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.rule == DETEMPLATED_ATTRIBUTE_RULE),
+            "graph-scope `script` should still warn: {diagnostics:?}"
         );
     }
 
