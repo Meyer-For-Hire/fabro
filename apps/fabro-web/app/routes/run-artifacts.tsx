@@ -1,14 +1,15 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import { useParams } from "react-router";
-import { ArrowDownTrayIcon, PaperClipIcon } from "@heroicons/react/24/outline";
-import type { RunArtifactEntry } from "@qltysh/fabro-api-client";
+import { ArrowDownTrayIcon, ChevronRightIcon, PaperClipIcon } from "@heroicons/react/24/outline";
 
 import { EmptyState, ErrorState, LoadingState } from "../components/state";
 import { StageSidebar } from "../components/stage-sidebar";
 import { stageArtifactDownloadUrl } from "../lib/api-client";
 import { formatBytes } from "../lib/format";
 import { useRunArtifacts, useRunStages } from "../lib/queries";
-import { formatStageLabel, mapRunStagesToSidebarStages } from "../lib/stage-sidebar";
+import { mapRunStagesToSidebarStages } from "../lib/stage-sidebar";
+import type { ArtifactFile, ArtifactVersion } from "./run-artifacts/group";
+import { groupArtifactsByFile } from "./run-artifacts/group";
 
 export const handle = { wide: true };
 
@@ -40,6 +41,9 @@ function RunArtifactsBody({
   artifactsQuery: ReturnType<typeof useRunArtifacts>;
   stages: ReturnType<typeof mapRunStagesToSidebarStages>;
 }) {
+  const entries = artifactsQuery.data?.data ?? [];
+  const files = useMemo(() => groupArtifactsByFile(entries, stages), [entries, stages]);
+
   if (artifactsQuery.error) {
     return (
       <ErrorState
@@ -52,8 +56,7 @@ function RunArtifactsBody({
   if (artifactsQuery.data === undefined) {
     return <LoadingState label="Loading artifacts…" />;
   }
-  const entries = artifactsQuery.data?.data ?? [];
-  if (entries.length === 0) {
+  if (files.length === 0) {
     return (
       <EmptyState
         icon={PaperClipIcon}
@@ -62,149 +65,151 @@ function RunArtifactsBody({
       />
     );
   }
-  return <ArtifactList runId={runId} entries={entries} stages={stages} />;
+  return <ArtifactList runId={runId} files={files} />;
 }
 
-interface StageGroup {
-  key: string;
-  stageId: string;
-  retry: number;
-  label: string;
-  entries: RunArtifactEntry[];
-  totalBytes: number;
-}
-
-function groupArtifacts(
-  entries: readonly RunArtifactEntry[],
-  stages: ReturnType<typeof mapRunStagesToSidebarStages>,
-): StageGroup[] {
-  const stageLabels = new Map<string, string>();
-  for (const stage of stages) {
-    stageLabels.set(stage.id, formatStageLabel(stage));
-  }
-
-  const groups = new Map<string, StageGroup>();
-  for (const entry of entries) {
-    const key = `${entry.stage_id}#${entry.retry}`;
-    const existing = groups.get(key);
-    if (existing) {
-      existing.entries.push(entry);
-      existing.totalBytes += entry.size;
-    } else {
-      groups.set(key, {
-        key,
-        stageId: entry.stage_id,
-        retry: entry.retry,
-        label: stageLabels.get(entry.stage_id) ?? entry.node_slug,
-        entries: [entry],
-        totalBytes: entry.size,
-      });
+function ArtifactList({ runId, files }: { runId: string; files: readonly ArtifactFile[] }) {
+  const { captures, latestBytes, storedBytes } = useMemo(() => {
+    let captures = 0;
+    let latestBytes = 0;
+    let storedBytes = 0;
+    for (const file of files) {
+      captures += file.versions.length;
+      latestBytes += file.latest.size;
+      for (const version of file.versions) storedBytes += version.size;
     }
-  }
+    return { captures, latestBytes, storedBytes };
+  }, [files]);
 
-  for (const group of groups.values()) {
-    group.entries.sort((a, b) => a.relative_path.localeCompare(b.relative_path));
-  }
-  const sortedGroups = Array.from(groups.values());
-  sortedGroups.sort((a, b) => {
-    const labelCmp = a.label.localeCompare(b.label);
-    return labelCmp !== 0 ? labelCmp : a.retry - b.retry;
-  });
-  return sortedGroups;
-}
-
-function ArtifactList({
-  runId,
-  entries,
-  stages,
-}: {
-  runId: string;
-  entries: readonly RunArtifactEntry[];
-  stages: ReturnType<typeof mapRunStagesToSidebarStages>;
-}) {
-  const groups = useMemo(() => groupArtifacts(entries, stages), [entries, stages]);
-  const totalBytes = useMemo(
-    () => entries.reduce((sum, entry) => sum + entry.size, 0),
-    [entries],
-  );
+  // Only mention versions once some file actually has more than one.
+  const versioned = captures > files.length;
 
   return (
     <div className="space-y-4">
-      <div className="flex items-baseline justify-between">
+      <div className="flex items-baseline justify-between gap-4">
         <h2 className="text-sm font-medium text-fg">
-          {entries.length} {entries.length === 1 ? "artifact" : "artifacts"}
+          {files.length} {files.length === 1 ? "file" : "files"}
+          {versioned && (
+            <span className="font-normal text-fg-muted"> · {captures} versions</span>
+          )}
         </h2>
         <span className="text-xs tabular-nums text-fg-muted">
-          {formatBytes(totalBytes)} total
+          {versioned
+            ? `${formatBytes(latestBytes)} latest · ${formatBytes(storedBytes)} stored`
+            : `${formatBytes(latestBytes)} total`}
         </span>
       </div>
 
-      {groups.map((group) => (
-        <StageGroupCard key={group.key} runId={runId} group={group} />
-      ))}
+      <section className="overflow-hidden rounded-md border border-line bg-panel-alt">
+        {files.map((file) => (
+          <ArtifactFileRow key={file.path} runId={runId} file={file} />
+        ))}
+      </section>
     </div>
   );
 }
 
-function StageGroupCard({ runId, group }: { runId: string; group: StageGroup }) {
+function ArtifactFileRow({ runId, file }: { runId: string; file: ArtifactFile }) {
+  const [expanded, setExpanded] = useState(false);
+  const earlier = file.versions.slice(1);
+
   return (
-    <section className="overflow-hidden rounded-md border border-line bg-panel-alt">
-      <header className="flex items-baseline justify-between border-b border-line px-4 py-2.5">
-        <div className="flex items-baseline gap-2">
-          <h3 className="text-sm font-medium text-fg">{group.label}</h3>
-          {group.retry > 0 && (
-            <span className="rounded bg-overlay px-1.5 py-0.5 text-[11px] font-medium text-fg-3">
-              retry {group.retry}
-            </span>
-          )}
-        </div>
-        <span className="text-xs tabular-nums text-fg-muted">
-          {group.entries.length} {group.entries.length === 1 ? "file" : "files"}
-          {" · "}
-          {formatBytes(group.totalBytes)}
+    <div className="border-t border-line first:border-t-0">
+      <div className="flex items-center gap-4 px-4 py-2.5">
+        {earlier.length > 0 ? (
+          <button
+            type="button"
+            aria-expanded={expanded}
+            onClick={() => setExpanded((prev) => !prev)}
+            className="shrink-0 rounded-md p-1 text-fg-3 transition-colors hover:bg-overlay hover:text-fg-2 focus-visible:outline-2 focus-visible:-outline-offset-1 focus-visible:outline-teal-500"
+          >
+            <span className="sr-only">Show earlier versions of {file.name}</span>
+            <ChevronRightIcon
+              className={`size-3.5 transition-transform ${expanded ? "rotate-90" : ""}`}
+              aria-hidden="true"
+            />
+          </button>
+        ) : (
+          <span className="size-5 shrink-0" aria-hidden="true" />
+        )}
+
+        <span className="flex min-w-0 flex-1 font-mono text-xs" title={file.path}>
+          <span className="shrink-0 text-fg-muted">{file.dir}</span>
+          <span className="truncate text-fg-2">{file.name}</span>
         </span>
-      </header>
-      <ul className="divide-y divide-line">
-        {group.entries.map((entry) => (
-          <ArtifactRow
-            key={`${group.key}#${entry.relative_path}`}
-            runId={runId}
-            entry={entry}
-          />
-        ))}
-      </ul>
-    </section>
+
+        {earlier.length > 0 && (
+          <span className="shrink-0 rounded-full bg-overlay-strong px-2 py-0.5 text-[11px] text-fg-3">
+            {file.versions.length} versions
+          </span>
+        )}
+
+        <span className="shrink-0 text-xs text-fg-3">{file.latest.stageLabel}</span>
+        <span className="shrink-0 text-xs tabular-nums text-fg-muted">
+          {formatBytes(file.latest.size)}
+        </span>
+        <DownloadLink runId={runId} path={file.path} version={file.latest} />
+      </div>
+
+      {expanded && earlier.length > 0 && (
+        <ul className="border-t border-line bg-black/15 py-1">
+          {earlier.map((version) => (
+            <li
+              key={`${version.stageId}#${version.retry}`}
+              className="flex items-center gap-4 py-1.5 pl-14 pr-4 hover:bg-overlay"
+            >
+              <span className="min-w-0 flex-1 truncate text-xs text-fg-3">
+                {version.stageLabel}
+                {version.retry > 1 && (
+                  <span className="ml-2 text-fg-muted">attempt {version.retry}</span>
+                )}
+              </span>
+              <span className="shrink-0 text-xs tabular-nums text-fg-muted">
+                {formatBytes(version.size)}
+              </span>
+              <SizeDelta delta={version.delta} />
+              <DownloadLink runId={runId} path={file.path} version={version} />
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
   );
 }
 
-function ArtifactRow({ runId, entry }: { runId: string; entry: RunArtifactEntry }) {
-  const href = stageArtifactDownloadUrl(
-    runId,
-    entry.stage_id,
-    entry.relative_path,
-    entry.retry,
-  );
-
+function SizeDelta({ delta }: { delta: number | null }) {
+  if (delta === null) {
+    return <span className="shrink-0 text-[11px] tabular-nums text-fg-muted">first</span>;
+  }
+  const tone = delta < 0 ? "text-amber" : "text-mint";
+  const sign = delta < 0 ? "−" : "+";
   return (
-    <li className="flex items-center gap-4 px-4 py-2">
-      <span
-        className="flex-1 truncate font-mono text-xs text-fg-2"
-        title={entry.relative_path}
-      >
-        {entry.relative_path}
-      </span>
-      <span className="shrink-0 tabular-nums text-xs text-fg-muted">
-        {formatBytes(entry.size)}
-      </span>
-      <a
-        href={href}
-        download={basename(entry.relative_path)}
-        className="inline-flex shrink-0 items-center gap-1 rounded-md px-2 py-1 text-xs text-fg-3 transition-colors hover:bg-overlay hover:text-fg focus-visible:outline-2 focus-visible:-outline-offset-1 focus-visible:outline-teal-500"
-      >
-        <ArrowDownTrayIcon className="size-3.5" aria-hidden="true" />
-        Download
-      </a>
-    </li>
+    <span className={`shrink-0 text-[11px] tabular-nums ${tone}`}>
+      {sign}
+      {formatBytes(Math.abs(delta))}
+    </span>
+  );
+}
+
+function DownloadLink({
+  runId,
+  path,
+  version,
+}: {
+  runId: string;
+  path: string;
+  version: ArtifactVersion;
+}) {
+  const href = stageArtifactDownloadUrl(runId, version.stageId, path, version.retry);
+  return (
+    <a
+      href={href}
+      download={basename(path)}
+      className="inline-flex shrink-0 items-center gap-1 rounded-md px-2 py-1 text-xs text-fg-3 transition-colors hover:bg-overlay hover:text-fg focus-visible:outline-2 focus-visible:-outline-offset-1 focus-visible:outline-teal-500"
+    >
+      <ArrowDownTrayIcon className="size-3.5" aria-hidden="true" />
+      Download
+    </a>
   );
 }
 
