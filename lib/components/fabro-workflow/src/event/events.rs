@@ -730,6 +730,8 @@ pub enum Event {
         repo:        String,
         base_branch: String,
         head_branch: String,
+        #[serde(default)]
+        head_sha:    String,
         title:       String,
         draft:       bool,
     },
@@ -769,6 +771,7 @@ impl Event {
         record: &PullRequestLink,
         base_branch: &str,
         head_branch: &str,
+        head_sha: &str,
         title: &str,
         draft: bool,
     ) -> Self {
@@ -779,6 +782,7 @@ impl Event {
             repo: record.repo.clone(),
             base_branch: base_branch.to_string(),
             head_branch: head_branch.to_string(),
+            head_sha: head_sha.to_string(),
             title: title.to_string(),
             draft,
         }

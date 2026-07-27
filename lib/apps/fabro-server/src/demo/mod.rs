@@ -1280,6 +1280,7 @@ mod runs {
     fn parse_failure_reason(reason: &str) -> Option<FailureReason> {
         match reason {
             "workflow_error" => Some(FailureReason::WorkflowError),
+            "publish_failed" => Some(FailureReason::PublishFailed),
             "cancelled" => Some(FailureReason::Cancelled),
             "approval_denied" => Some(FailureReason::ApprovalDenied),
             "terminated" => Some(FailureReason::Terminated),

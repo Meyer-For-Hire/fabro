@@ -587,7 +587,10 @@ async fn mint_installation_token_with_jwt(
     })
 }
 
-/// Request a scoped Installation Access Token with `contents: write`.
+/// Request a scoped Installation Access Token for git writes.
+///
+/// The `workflows` permission is required when a pushed commit creates or
+/// updates files under `.github/workflows/`.
 pub async fn create_installation_access_token(
     client: &impl HttpClient,
     jwt: &str,
@@ -601,7 +604,7 @@ pub async fn create_installation_access_token(
         owner,
         repo,
         base_url,
-        serde_json::json!({ "contents": "write" }),
+        serde_json::json!({ "contents": "write", "workflows": "write" }),
     )
     .await
 }
@@ -899,6 +902,55 @@ pub async fn branch_exists(
     branch_exists_with_client(&client, ctx, owner, repo, branch).await
 }
 
+/// Return the commit SHA at the head of a GitHub branch.
+///
+/// Returns `None` when the branch does not exist.
+pub async fn branch_head_sha(
+    ctx: &GitHubContext<'_>,
+    owner: &str,
+    repo: &str,
+    branch: &str,
+) -> anyhow::Result<Option<String>> {
+    #[derive(Deserialize)]
+    struct BranchResponse {
+        commit: BranchCommit,
+    }
+
+    #[derive(Deserialize)]
+    struct BranchCommit {
+        sha: String,
+    }
+
+    let client = ctx.http_client()?;
+    let token = ctx
+        .creds
+        .resolve_bearer_token(
+            &client,
+            owner,
+            repo,
+            ctx.base_url,
+            serde_json::json!({ "contents": "read" }),
+        )
+        .await?;
+
+    let url = format!("{}/repos/{owner}/{repo}/branches/{branch}", ctx.base_url);
+    let auth = format!("Bearer {token}");
+    let resp = HttpClient::request(&client, HttpMethod::Get, &url, &github_headers(&auth), None)
+        .await
+        .context("Failed to read remote branch head")?;
+
+    match resp.status {
+        200 => {
+            let branch: BranchResponse = resp
+                .json()
+                .context("Failed to parse remote branch response")?;
+            Ok(Some(branch.commit.sha))
+        }
+        404 => Ok(None),
+        status => bail!("Unexpected status {status} reading branch '{branch}'"),
+    }
+}
+
 async fn branch_exists_with_client(
     client: &impl HttpClient,
     ctx: &GitHubContext<'_>,
@@ -1032,10 +1084,32 @@ pub async fn update_app_webhook_config(
 
 /// Resolve git clone credentials for a GitHub repository.
 ///
-/// Returns `(username, password)` for authenticated cloning.
+/// Returns `(username, password)` for authenticated cloning and pushing.
 /// Always generates a token regardless of repo visibility, since the token
-/// is needed for pushing from the sandbox.
+/// is needed for pushing from the sandbox. The token includes `workflows:
+/// write` so a run can publish workflow-file changes.
 pub async fn resolve_clone_credentials(
+    ctx: &GitHubContext<'_>,
+    owner: &str,
+    repo: &str,
+) -> anyhow::Result<(Option<String>, Option<String>)> {
+    match ctx.creds {
+        GitHubCredentials::Pat(token) => {
+            Ok((Some("x-access-token".to_string()), Some(token.clone())))
+        }
+        GitHubCredentials::Installation(token) => Ok((
+            Some("x-access-token".to_string()),
+            Some(token.valid_token()?.to_string()),
+        )),
+        GitHubCredentials::App(_) => {
+            let client = ctx.http_client()?;
+            resolve_clone_credentials_with_client(&client, ctx, owner, repo).await
+        }
+    }
+}
+
+async fn resolve_clone_credentials_with_client(
+    client: &impl HttpClient,
     ctx: &GitHubContext<'_>,
     owner: &str,
     repo: &str,
@@ -1044,14 +1118,13 @@ pub async fn resolve_clone_credentials(
         GitHubCredentials::Pat(token) => token.clone(),
         GitHubCredentials::Installation(token) => token.valid_token()?.to_string(),
         GitHubCredentials::App(_) => {
-            let client = ctx.http_client()?;
             ctx.creds
                 .resolve_bearer_token(
-                    &client,
+                    client,
                     owner,
                     repo,
                     ctx.base_url,
-                    serde_json::json!({ "contents": "write" }),
+                    serde_json::json!({ "contents": "write", "workflows": "write" }),
                 )
                 .await?
         }
@@ -1775,7 +1848,9 @@ mod tests {
                 r#"{"token": "ghs_xxx", "expires_at": "2099-01-01T00:00:00Z"}"#,
             )
             .with_req_header("Authorization", "Bearer test-jwt")
-            .with_req_body(r#"{"permissions":{"contents":"write"},"repositories":["repo"]}"#);
+            .with_req_body(
+                r#"{"permissions":{"contents":"write","workflows":"write"},"repositories":["repo"]}"#,
+            );
 
         let token = create_installation_access_token(&mock, "test-jwt", "owner", "repo", "")
             .await
@@ -2292,6 +2367,43 @@ mod tests {
             (
                 Some("x-access-token".to_string()),
                 Some("ghu_test".to_string())
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_clone_credentials_requests_workflow_write_permission() {
+        let mock = MockHttpClient::new()
+            .on(
+                HttpMethod::Get,
+                "/repos/owner/repo/installation",
+                200,
+                r#"{"id": 123}"#,
+            )
+            .on(
+                HttpMethod::Post,
+                "/app/installations/123/access_tokens",
+                201,
+                r#"{"token": "ghs_xxx", "expires_at": "2099-01-01T00:00:00Z"}"#,
+            )
+            .with_req_body(
+                r#"{"permissions":{"contents":"write","workflows":"write"},"repositories":["repo"]}"#,
+            );
+        let credentials = GitHubCredentials::App(GitHubAppCredentials {
+            app_id:          "test".to_string(),
+            private_key_pem: test_rsa_key().to_string(),
+            slug:            None,
+        });
+        let context = GitHubContext::new(&credentials, "");
+        let resolved = resolve_clone_credentials_with_client(&mock, &context, "owner", "repo")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resolved,
+            (
+                Some("x-access-token".to_string()),
+                Some("ghs_xxx".to_string())
             )
         );
     }

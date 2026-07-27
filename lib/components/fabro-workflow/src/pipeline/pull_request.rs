@@ -13,9 +13,7 @@ use fabro_types::settings::run::MergeStrategy;
 use fabro_util::text::strip_goal_decoration;
 use tracing::{debug, info, warn};
 
-use super::types::{Concluded, Finalized, PullRequestOptions};
-use crate::event::{Event, RunNoticeCode, RunNoticeLevel};
-use crate::outcome::{StageOutcome, format_cost as outcome_format_cost};
+use crate::outcome::format_cost as outcome_format_cost;
 use crate::records::{Conclusion, RunSpec};
 use crate::runtime_store::RunStoreHandle;
 
@@ -327,22 +325,6 @@ fn assemble_pr_body(
     parts.join("\n")
 }
 
-async fn load_pull_request_diff(run_store: &RunStoreHandle) -> String {
-    run_store
-        .state()
-        .await
-        .inspect_err(|err| {
-            tracing::warn!(error = %err, "Failed to load final patch from store for PR");
-        })
-        .ok()
-        .and_then(|state| {
-            state
-                .conclusion
-                .and_then(|conclusion| conclusion.diff.patch)
-        })
-        .unwrap_or_default()
-}
-
 /// Build complete PR content by combining LLM-generated narrative with
 /// deterministic fallbacks and programmatic sections.
 pub async fn build_pr_content(
@@ -461,20 +443,23 @@ pub struct AutoMergeOptions {
 
 /// Inputs for [`maybe_open_pull_request`].
 pub struct OpenPullRequestRequest<'a> {
-    pub github:      github_app::GitHubContext<'a>,
-    pub origin_url:  &'a str,
-    pub base_branch: &'a str,
-    pub head_branch: &'a str,
-    pub goal:        &'a str,
-    pub diff:        &'a str,
-    pub model:       &'a str,
-    pub draft:       bool,
-    pub auto_merge:  Option<AutoMergeOptions>,
-    pub run_store:   &'a RunStoreHandle,
-    pub llm_source:  &'a dyn CredentialSource,
-    pub catalog:     Arc<Catalog>,
-    pub conclusion:  Option<&'a Conclusion>,
-    pub run_state:   Option<&'a RunProjection>,
+    pub github:            github_app::GitHubContext<'a>,
+    pub origin_url:        &'a str,
+    pub base_branch:       &'a str,
+    pub head_branch:       &'a str,
+    /// Commit that must be visible at the remote branch before the PR is
+    /// opened.
+    pub expected_head_sha: &'a str,
+    pub goal:              &'a str,
+    pub diff:              &'a str,
+    pub model:             &'a str,
+    pub draft:             bool,
+    pub auto_merge:        Option<AutoMergeOptions>,
+    pub run_store:         &'a RunStoreHandle,
+    pub llm_source:        &'a dyn CredentialSource,
+    pub catalog:           Arc<Catalog>,
+    pub conclusion:        Option<&'a Conclusion>,
+    pub run_state:         Option<&'a RunProjection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -483,6 +468,7 @@ pub struct CreatedPullRequest {
     pub title:       String,
     pub base_branch: String,
     pub head_branch: String,
+    pub head_sha:    String,
 }
 
 /// Optionally open a pull request after a successful workflow run.
@@ -515,6 +501,25 @@ pub async fn maybe_open_pull_request(
     .map_err(|err| format!("{err:#}"))?;
     let body = truncate_pr_body(&content.body);
     let title = content.title;
+
+    let remote_head = github_app::branch_head_sha(&req.github, &owner, &repo, req.head_branch)
+        .await
+        .map_err(|err| format!("failed to verify remote branch head: {err:#}"))?;
+    match remote_head {
+        Some(remote_head) if remote_head == req.expected_head_sha => {}
+        Some(remote_head) => {
+            return Err(format!(
+                "remote branch '{}' points to commit {remote_head}, expected final commit {}",
+                req.head_branch, req.expected_head_sha
+            ));
+        }
+        None => {
+            return Err(format!(
+                "remote branch '{}' does not exist; expected final commit {}",
+                req.head_branch, req.expected_head_sha
+            ));
+        }
+    }
 
     let created = github_app::create_pull_request(
         &req.github,
@@ -565,109 +570,8 @@ pub async fn maybe_open_pull_request(
         title,
         base_branch: req.base_branch.to_string(),
         head_branch: req.head_branch.to_string(),
+        head_sha: req.expected_head_sha.to_string(),
     }))
-}
-
-/// PULL_REQUEST phase: optionally create a pull request after finalize.
-///
-/// This stage is infallible: failures are emitted and logged, but the pipeline
-/// completes.
-pub async fn pull_request(concluded: Concluded, options: &PullRequestOptions) -> Finalized {
-    let Concluded {
-        outcome,
-        conclusion,
-        graph,
-        run_options,
-        services,
-    } = concluded;
-
-    let mut pr_url = None;
-    if let Some(pr_cfg) = &options.pr_config {
-        if run_options.dry_run_enabled() {
-            tracing::debug!("Skipping PR creation: run is in dry-run mode");
-        } else if let Err(ref e) = outcome {
-            tracing::debug!(error = %e, "Skipping PR creation: engine returned an error");
-        } else if let Ok(ref result) = outcome {
-            if matches!(
-                result.status,
-                StageOutcome::Succeeded | StageOutcome::PartiallySucceeded
-            ) {
-                let diff = load_pull_request_diff(&services.run_store).await;
-                if let (Some(base_branch), Some(run_branch), Some(creds), Some(origin)) = (
-                    &run_options.base_branch,
-                    run_options.run_branch(),
-                    &options.github_app,
-                    &options.origin_url,
-                ) {
-                    let auto_merge = if pr_cfg.auto_merge {
-                        Some(AutoMergeOptions {
-                            merge_strategy: pr_cfg.merge_strategy,
-                        })
-                    } else {
-                        None
-                    };
-
-                    match maybe_open_pull_request(OpenPullRequestRequest {
-                        github: github_app::GitHubContext::new(
-                            creds,
-                            &github_app::github_api_base_url(),
-                        ),
-                        origin_url: origin,
-                        base_branch,
-                        head_branch: run_branch,
-                        goal: graph.goal(),
-                        diff: &diff,
-                        model: &options.model,
-                        draft: pr_cfg.draft,
-                        auto_merge,
-                        run_store: &services.run_store,
-                        llm_source: services.llm_source.as_ref(),
-                        catalog: Arc::clone(&services.catalog),
-                        conclusion: Some(&conclusion),
-                        run_state: None,
-                    })
-                    .await
-                    {
-                        Ok(Some(created)) => {
-                            services.emitter.emit(&Event::pull_request_created(
-                                &created.link,
-                                &created.base_branch,
-                                &created.head_branch,
-                                &created.title,
-                                pr_cfg.draft,
-                            ));
-                            pr_url = Some(created.link.html_url());
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            services
-                                .emitter
-                                .emit(&Event::PullRequestFailed { error: e.clone() });
-                            services.emitter.notice(
-                                RunNoticeLevel::Warn,
-                                RunNoticeCode::PullRequestFailed,
-                                format!("PR creation failed: {e}"),
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Finalized {
-        run_id: run_options.run_id,
-        outcome,
-        conclusion,
-        pushed_branch: run_options
-            .settings
-            .run
-            .run_branch
-            .push
-            .then(|| run_options.run_branch().map(str::to_string))
-            .flatten(),
-        pr_url,
-    }
 }
 
 #[cfg(test)]
@@ -691,18 +595,14 @@ mod tests {
     };
     use fabro_vault::{SecretType, Vault};
     use futures::stream;
-    use httpmock::Method::POST;
+    use httpmock::Method::{GET, POST};
     use httpmock::MockServer;
     use object_store::memory::InMemory;
     use tokio::sync::RwLock as AsyncRwLock;
-    use tokio_util::sync::CancellationToken;
 
     use super::*;
     use crate::event::{Event, append_event};
-    use crate::outcome::Outcome;
     use crate::records::StageSummary;
-    use crate::run_options::{GitCheckpointOptions, RunOptions};
-    use crate::services::EngineServices;
 
     struct MockProvider {
         name:          String,
@@ -915,48 +815,6 @@ mod tests {
             total_retries:        0,
             diff:                 fabro_types::RunDiff::default(),
         }
-    }
-
-    #[tokio::test]
-    async fn pull_request_omits_pushed_branch_when_run_branch_push_disabled() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut settings = WorkflowSettings::default();
-        settings.run.run_branch.push = false;
-        let run_options = RunOptions {
-            settings,
-            run_dir: temp.path().to_path_buf(),
-            cancel_token: CancellationToken::new(),
-            run_id: fixtures::RUN_1,
-            labels: HashMap::new(),
-            workflow_slug: None,
-            github_app: None,
-            pre_run_git: None,
-            fork_source_ref: None,
-            base_branch: None,
-            display_base_sha: None,
-            git: Some(GitCheckpointOptions {
-                base_sha:    None,
-                run_branch:  Some("fabro/run/test".to_string()),
-                meta_branch: None,
-            }),
-        };
-        let concluded = Concluded {
-            outcome: Ok(Outcome::success()),
-            conclusion: make_test_conclusion(),
-            graph: Graph::new("test"),
-            run_options,
-            services: EngineServices::test_default().run,
-        };
-
-        let finalized = pull_request(concluded, &PullRequestOptions {
-            pr_config:  None,
-            github_app: None,
-            origin_url: None,
-            model:      "test-model".to_string(),
-        })
-        .await;
-
-        assert_eq!(finalized.pushed_branch, None);
     }
 
     // ── format_arc_details_section tests ────────────────────────────────
@@ -1555,20 +1413,21 @@ mod tests {
         });
         let base_url = github_app::github_api_base_url();
         let result = maybe_open_pull_request(OpenPullRequestRequest {
-            github:      github_app::GitHubContext::new(&creds, &base_url),
-            origin_url:  "https://github.com/owner/repo.git",
-            base_branch: "main",
-            head_branch: "fabro/run/123",
-            goal:        "Fix bug",
-            diff:        "",
-            model:       "claude-sonnet-4-20250514",
-            draft:       false,
-            auto_merge:  None,
-            run_store:   &run_store_handle,
-            llm_source:  llm_source.as_ref(),
-            catalog:     test_catalog(),
-            conclusion:  None,
-            run_state:   None,
+            github:            github_app::GitHubContext::new(&creds, &base_url),
+            origin_url:        "https://github.com/owner/repo.git",
+            base_branch:       "main",
+            head_branch:       "fabro/run/123",
+            expected_head_sha: "final-sha",
+            goal:              "Fix bug",
+            diff:              "",
+            model:             "claude-sonnet-4-20250514",
+            draft:             false,
+            auto_merge:        None,
+            run_store:         &run_store_handle,
+            llm_source:        llm_source.as_ref(),
+            catalog:           test_catalog(),
+            conclusion:        None,
+            run_state:         None,
         })
         .await;
         assert!(result.is_ok());
@@ -1576,79 +1435,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_pull_request_diff_uses_store_without_disk_patch() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = test_store();
-        let run_store = store.create_run(&fixtures::RUN_1).await.unwrap();
-        let run_spec = RunSpec {
-            run_id:           fixtures::RUN_1,
-            settings:         fabro_types::WorkflowSettings::default(),
-            graph:            Graph::new("test"),
-            graph_source:     None,
-            workflow_slug:    None,
-            automation:       None,
-            source_directory: Some(tmp.path().display().to_string()),
-            git:              None,
-            labels:           std::collections::HashMap::new(),
-            provenance:       test_support::test_run_provenance(),
-            manifest_blob:    None,
-            definition_blob:  None,
-            fork_source_ref:  None,
-        };
-        append_event(&run_store, &fixtures::RUN_1, &Event::RunCreated {
-            run_id:           fixtures::RUN_1,
-            title:            None,
-            settings:         serde_json::to_value(&run_spec.settings).unwrap(),
-            graph:            serde_json::to_value(&run_spec.graph).unwrap(),
-            workflow_source:  None,
-            workflow_config:  None,
-            labels:           run_spec.labels.clone().into_iter().collect(),
-            run_dir:          tmp.path().display().to_string(),
-            source_directory: run_spec.source_directory.clone(),
-            workflow_slug:    None,
-            automation:       None,
-            db_prefix:        None,
-            provenance:       run_spec.provenance.clone(),
-            manifest_blob:    None,
-            git:              None,
-            fork_source_ref:  None,
-            retried_from:     None,
-            parent_id:        None,
-            web_url:          None,
+    async fn stale_remote_branch_is_rejected_before_pull_request_creation() {
+        let payload = pr_content_json("Fix bug", "Narrative.");
+        let harness = setup_fallback_test_harness_with_branch_sha(&payload, "stale-sha").await;
+        let github_base_url = harness.github_server.url("");
+        let error = maybe_open_pull_request(OpenPullRequestRequest {
+            github:            fabro_github::GitHubContext::new(&harness.creds, &github_base_url),
+            origin_url:        "https://github.com/owner/repo.git",
+            base_branch:       "main",
+            head_branch:       "fabro/run/123",
+            expected_head_sha: "final-sha",
+            goal:              "Fix bug",
+            diff:              "diff --git a/src/lib.rs b/src/lib.rs\n+fn x() {}\n",
+            model:             "claude-sonnet-4-20250514",
+            draft:             false,
+            auto_merge:        None,
+            run_store:         &harness.run_store,
+            llm_source:        harness.llm_source.as_ref(),
+            catalog:           harness.catalog.clone(),
+            conclusion:        None,
+            run_state:         None,
         })
         .await
-        .unwrap();
-        append_event(&run_store, &fixtures::RUN_1, &Event::RunRunnable {
-            source: fabro_types::RunRunnableSource::StartRequested,
-            actor:  None,
-        })
-        .await
-        .unwrap();
-        append_event(&run_store, &fixtures::RUN_1, &Event::RunStarting)
-            .await
-            .unwrap();
-        append_event(&run_store, &fixtures::RUN_1, &Event::RunRunning)
-            .await
-            .unwrap();
-        append_event(&run_store, &fixtures::RUN_1, &Event::WorkflowRunCompleted {
-            timing:               fabro_types::RunTiming::wall_only(1),
-            artifact_count:       0,
-            status:               "succeeded".to_string(),
-            reason:               SuccessReason::Completed,
-            total_usd_micros:     None,
-            final_git_commit_sha: None,
-            final_patch:          Some(
-                "diff --git a/src/lib.rs b/src/lib.rs\n+fn from_store() {}\n".to_string(),
-            ),
-            diff_summary:         None,
-            billing:              None,
-        })
-        .await
-        .unwrap();
+        .expect_err("stale remote branch must prevent PR creation");
 
-        let diff = load_pull_request_diff(&run_store.clone().into()).await;
-
-        assert!(diff.contains("from_store"));
+        assert!(error.contains("stale-sha"));
+        assert!(error.contains("final-sha"));
+        httpmock::Mock::new(harness.openai_mock_id, &harness.openai_server)
+            .assert_async()
+            .await;
+        httpmock::Mock::new(harness.branch_mock_id, &harness.github_server)
+            .assert_async()
+            .await;
+        httpmock::Mock::new(harness.github_mock_id, &harness.github_server)
+            .assert_calls_async(0)
+            .await;
     }
 
     // ── Structured-output PR content tests ──────────────────────────────
@@ -1807,6 +1628,7 @@ mod tests {
         openai_server:  MockServer,
         github_server:  MockServer,
         openai_mock_id: usize,
+        branch_mock_id: usize,
         github_mock_id: usize,
         llm_source:     Arc<dyn CredentialSource>,
         catalog:        Arc<Catalog>,
@@ -1817,6 +1639,9 @@ mod tests {
     impl FallbackHarness {
         async fn assert_mocks_called_once(&self) {
             httpmock::Mock::new(self.openai_mock_id, &self.openai_server)
+                .assert_async()
+                .await;
+            httpmock::Mock::new(self.branch_mock_id, &self.github_server)
                 .assert_async()
                 .await;
             httpmock::Mock::new(self.github_mock_id, &self.github_server)
@@ -1830,6 +1655,13 @@ mod tests {
     /// credential source, and a run store seeded with a non-empty
     /// `final_patch`.
     async fn setup_fallback_test_harness(openai_payload_text: &str) -> FallbackHarness {
+        setup_fallback_test_harness_with_branch_sha(openai_payload_text, "final-sha").await
+    }
+
+    async fn setup_fallback_test_harness_with_branch_sha(
+        openai_payload_text: &str,
+        branch_sha: &str,
+    ) -> FallbackHarness {
         let openai_server = MockServer::start_async().await;
         let openai_mock = openai_server
             .mock_async(|when, then| {
@@ -1843,6 +1675,19 @@ mod tests {
             .await;
 
         let github_server = MockServer::start_async().await;
+        let branch_sha = branch_sha.to_string();
+        let branch_mock = github_server
+            .mock_async(move |when, then| {
+                when.method(GET)
+                    .path("/repos/owner/repo/branches/fabro/run/123")
+                    .header("authorization", "Bearer test-token");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(serde_json::json!({
+                        "commit": { "sha": branch_sha }
+                    }));
+            })
+            .await;
         let github_mock = github_server
             .mock_async(|when, then| {
                 when.method(POST)
@@ -1878,8 +1723,7 @@ mod tests {
 
         let store = test_store();
         let run_store = store.create_run(&fixtures::RUN_1).await.unwrap();
-        // Seed a non-empty `final_patch` so `load_pull_request_diff` returns
-        // diff content and the early-return for empty diffs does not fire.
+        // Seed a completed run so the PR body can include run details.
         let run_spec = RunSpec {
             run_id:           fixtures::RUN_1,
             settings:         fabro_types::WorkflowSettings::default(),
@@ -1947,6 +1791,7 @@ mod tests {
         .unwrap();
 
         let openai_mock_id = openai_mock.id;
+        let branch_mock_id = branch_mock.id;
         let github_mock_id = github_mock.id;
 
         FallbackHarness {
@@ -1954,6 +1799,7 @@ mod tests {
             openai_server,
             github_server,
             openai_mock_id,
+            branch_mock_id,
             github_mock_id,
             llm_source,
             catalog,
@@ -1978,6 +1824,7 @@ mod tests {
             origin_url: "https://github.com/owner/repo.git",
             base_branch: "main",
             head_branch: "fabro/run/123",
+            expected_head_sha: "final-sha",
             goal: "Fix telemetry leak\n\ndetails...",
             diff: "diff --git a/src/lib.rs b/src/lib.rs\n+fn x() {}\n",
             model: "gpt-5.4",
@@ -2015,6 +1862,7 @@ mod tests {
             origin_url: "https://github.com/owner/repo.git",
             base_branch: "main",
             head_branch: "fabro/run/123",
+            expected_head_sha: "final-sha",
             goal: &goal,
             diff: "diff --git a/src/lib.rs b/src/lib.rs\n+fn x() {}\n",
             model: "gpt-5.4",

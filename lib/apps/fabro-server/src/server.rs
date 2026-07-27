@@ -4183,6 +4183,14 @@ async fn execute_run_in_process(state: Arc<AppState>, run_id: RunId) {
                             reason: FailureReason::Cancelled,
                         };
                     }
+                    Err(e @ WorkflowError::Publish { .. }) => {
+                        let detail = e.display_with_causes();
+                        error!(run_id = %run_id, error = %detail, "Run publish failed");
+                        managed_run.status = RunStatus::Failed {
+                            reason: FailureReason::PublishFailed,
+                        };
+                        managed_run.error = Some(detail);
+                    }
                     Err(e) => {
                         error!(run_id = %run_id, error = %e, "Run failed");
                         managed_run.status = RunStatus::Failed {
@@ -4196,6 +4204,14 @@ async fn execute_run_in_process(state: Arc<AppState>, run_id: RunId) {
                     managed_run.status = RunStatus::Failed {
                         reason: FailureReason::Cancelled,
                     };
+                }
+                Err(e @ WorkflowError::Publish { .. }) => {
+                    let detail = e.display_with_causes();
+                    error!(run_id = %run_id, error = %detail, "Run publish failed");
+                    managed_run.status = RunStatus::Failed {
+                        reason: FailureReason::PublishFailed,
+                    };
+                    managed_run.error = Some(detail);
                 }
                 Err(e) => {
                     error!(run_id = %run_id, error = %e, "Run failed");

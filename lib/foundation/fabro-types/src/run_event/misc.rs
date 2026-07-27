@@ -247,6 +247,8 @@ pub struct PullRequestCreatedProps {
     pub repo:        String,
     pub base_branch: String,
     pub head_branch: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_sha:    Option<String>,
     pub title:       String,
     pub draft:       bool,
 }

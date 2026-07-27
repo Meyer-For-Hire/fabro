@@ -337,17 +337,59 @@ pub struct Executed {
     pub model:         String,
 }
 
-/// Output of the FINALIZE phase.
+/// Output of the CONCLUDE phase.
 #[non_exhaustive]
 pub struct Concluded {
-    pub outcome:     Result<Outcome, Error>,
-    pub conclusion:  Conclusion,
-    pub graph:       Graph,
-    pub run_options: RunOptions,
-    pub services:    Arc<RunServices>,
+    pub outcome:        Result<Outcome, Error>,
+    pub conclusion:     Conclusion,
+    pub artifact_count: usize,
+    pub graph:          Graph,
+    pub run_options:    RunOptions,
+    pub services:       Arc<RunServices>,
 }
 
-/// Output of the PULL_REQUEST phase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublishOutcome {
+    NotRequested,
+    NoChanges {
+        pushed_branch: String,
+    },
+    Published {
+        pushed_branch: String,
+        pr_url:        Option<String>,
+    },
+}
+
+impl PublishOutcome {
+    pub fn pushed_branch(&self) -> Option<&str> {
+        match self {
+            Self::NotRequested => None,
+            Self::NoChanges { pushed_branch } | Self::Published { pushed_branch, .. } => {
+                Some(pushed_branch)
+            }
+        }
+    }
+
+    pub fn pr_url(&self) -> Option<&str> {
+        match self {
+            Self::Published { pr_url, .. } => pr_url.as_deref(),
+            Self::NotRequested | Self::NoChanges { .. } => None,
+        }
+    }
+}
+
+/// Output of the PUBLISH phase.
+#[non_exhaustive]
+pub struct Published {
+    pub execution_outcome: Result<Outcome, Error>,
+    pub publish_outcome:   Result<PublishOutcome, Error>,
+    pub conclusion:        Conclusion,
+    pub artifact_count:    usize,
+    pub run_options:       RunOptions,
+    pub services:          Arc<RunServices>,
+}
+
+/// Output of the FINALIZE phase.
 #[non_exhaustive]
 pub struct Finalized {
     pub run_id:        RunId,
@@ -383,8 +425,8 @@ pub struct FinalizeOptions {
     pub last_git_sha:     Option<String>,
 }
 
-/// Options for the PULL_REQUEST phase.
-pub struct PullRequestOptions {
+/// Options for the PUBLISH phase.
+pub struct PublishOptions {
     pub pr_config:  Option<PullRequestSettings>,
     pub github_app: Option<fabro_github::GitHubCredentials>,
     pub origin_url: Option<String>,

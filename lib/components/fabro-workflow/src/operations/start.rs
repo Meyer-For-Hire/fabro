@@ -37,8 +37,8 @@ use crate::event::{
 use crate::handler::HandlerRegistry;
 use crate::outcome::{Outcome, StageOutcome};
 use crate::pipeline::{
-    self, FinalizeOptions, Finalized, InitOptions, LlmSpec, Persisted, PullRequestOptions,
-    ResumeState, SandboxEnvSpec, build_conclusion_from_store, classify_engine_result,
+    self, FinalizeOptions, Finalized, InitOptions, LlmSpec, Persisted, PublishOptions, ResumeState,
+    SandboxEnvSpec, build_conclusion_from_store, classify_engine_result,
 };
 #[cfg(test)]
 use crate::records::Checkpoint;
@@ -794,7 +794,7 @@ fn runtime_setup_commands(
 }
 
 impl RunSession {
-    /// Shared engine: initialize, execute, finalize, pull_request.
+    /// Shared engine: initialize, execute, conclude, publish, finalize.
     async fn run(
         self,
         persisted: Persisted,
@@ -921,14 +921,14 @@ impl RunSession {
                 .expect("last_git_sha mutex should not be poisoned: no code panics while holding this lock")
                 .clone(),
         };
-        let pr_opts = PullRequestOptions {
+        let publish_opts = PublishOptions {
             pr_config:  self.pr_config,
             github_app: self.pr_github_app,
             origin_url: self.pr_origin_url,
             model:      self.pr_model,
         };
 
-        let concluded = match Box::pin(pipeline::finalize(executed, &finalize_opts)).await {
+        let concluded = match Box::pin(pipeline::conclude(executed, &finalize_opts)).await {
             Ok(concluded) => concluded,
             Err(err) => {
                 self.steering_hub.drain_pending_at_run_end();
@@ -936,7 +936,15 @@ impl RunSession {
                 return Err(err);
             }
         };
-        let finalized = Box::pin(pipeline::pull_request(concluded, &pr_opts)).await;
+        let published = Box::pin(pipeline::publish(concluded, &publish_opts)).await;
+        let finalized = match Box::pin(pipeline::finalize(published, &finalize_opts)).await {
+            Ok(finalized) => finalized,
+            Err(err) => {
+                self.steering_hub.drain_pending_at_run_end();
+                store_progress_logger.flush().await;
+                return Err(err);
+            }
+        };
         // Emit `agent.steer.dropped { reason: run_ended }` for any
         // unconsumed pending steers on the success path, then flush. The
         // scopeguard above re-runs as a no-op (drain is idempotent on an

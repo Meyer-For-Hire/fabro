@@ -285,6 +285,15 @@ pub enum Error {
         source:           Option<SharedError>,
     },
 
+    #[error("Publish error: {message}")]
+    Publish {
+        message:          String,
+        failure_class:    FailureCategory,
+        exec_output_tail: Option<ExecOutputTail>,
+        #[source]
+        source:           Option<SharedError>,
+    },
+
     #[error("Handler error: {message}")]
     Handler {
         message:          String,
@@ -420,10 +429,49 @@ impl Error {
         Self::engine_with_source(message, source)
     }
 
+    /// Build an error for the required publish stage.
+    pub fn publish(message: impl Into<String>) -> Self {
+        let message = message.into();
+        let failure_class = classify_failure_reason(&message);
+        Self::Publish {
+            message,
+            failure_class,
+            exec_output_tail: None,
+            source: None,
+        }
+    }
+
+    pub fn publish_with_source(
+        message: impl Into<String>,
+        source: impl Into<anyhow::Error>,
+    ) -> Self {
+        Self::publish_with_source_and_exec_output_tail(message, source, None)
+    }
+
+    pub fn publish_with_source_and_exec_output_tail(
+        message: impl Into<String>,
+        source: impl Into<anyhow::Error>,
+        exec_output_tail: Option<ExecOutputTail>,
+    ) -> Self {
+        let message = message.into();
+        let source = SharedError::new(source.into());
+        let causes = collect_chain(&source);
+        let rendered = render_with_causes(&message, &causes);
+        let failure_class = classify_failure_reason(&rendered);
+        Self::Publish {
+            message,
+            failure_class,
+            exec_output_tail,
+            source: Some(source),
+        }
+    }
+
     #[must_use]
     pub fn causes(&self) -> Vec<String> {
         match self {
-            Self::Engine { source, .. } | Self::Handler { source, .. } => source
+            Self::Engine { source, .. }
+            | Self::Publish { source, .. }
+            | Self::Handler { source, .. } => source
                 .as_ref()
                 .map_or_else(Vec::new, |source| collect_chain(source)),
             Self::Template { source, .. } => collect_chain(source),
@@ -439,15 +487,17 @@ impl Error {
 
     /// Whether this error category is retryable (transient) or terminal.
     ///
-    /// Retryable: Handler (transient handler failures), Engine (could be
-    /// transient),            Io (network/disk issues are often transient),
-    /// Llm (delegates to SdkError). Terminal:  Parse, Validation,
-    /// OutputSchemaValidation, Stylesheet (configuration errors), Checkpoint
-    /// (storage integrity), Cancelled (explicit cancellation).
+    /// Retryable: Handler and Engine, I/O, LLM errors when the SDK marks them
+    /// retryable, and Publish errors classified as transient infrastructure
+    /// failures. Terminal: Parse, Validation, OutputSchemaValidation,
+    /// Stylesheet, Checkpoint, and Cancelled.
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Handler { .. } | Self::Engine { .. } | Self::Io(_) => true,
+            Self::Publish { failure_class, .. } => {
+                matches!(failure_class, FailureCategory::TransientInfra)
+            }
             Self::Llm(sdk_err) => sdk_err.retryable(),
             Self::Parse(_)
             | Self::Validation(_)
@@ -483,9 +533,9 @@ impl Error {
             | Self::Unsupported(_)
             | Self::OutputSchemaValidation(_) => FailureCategory::Deterministic,
             Self::Precondition(_) | Self::RunNotFound(_) => FailureCategory::Structural,
-            Self::Handler { failure_class, .. } | Self::Engine { failure_class, .. } => {
-                *failure_class
-            }
+            Self::Handler { failure_class, .. }
+            | Self::Engine { failure_class, .. }
+            | Self::Publish { failure_class, .. } => *failure_class,
         }
     }
 
@@ -502,11 +552,16 @@ impl Error {
     #[must_use]
     pub fn to_failure_detail(&self) -> FailureDetail {
         let message = match self {
-            Self::Engine { message, .. } | Self::Handler { message, .. } => message.clone(),
+            Self::Engine { message, .. }
+            | Self::Publish { message, .. }
+            | Self::Handler { message, .. } => message.clone(),
             _ => self.to_string(),
         };
         let explicit_exec_output_tail = match self {
             Self::Engine {
+                exec_output_tail, ..
+            }
+            | Self::Publish {
                 exec_output_tail, ..
             }
             | Self::Handler {
@@ -1974,6 +2029,7 @@ mod tests {
                 }],
             },
             Error::engine("engine err"),
+            Error::publish("publish err"),
             Error::handler("handler err"),
             Error::Llm(SdkError::Network {
                 message: "refused".into(),
@@ -2003,6 +2059,12 @@ mod tests {
             Error::engine("no outgoing edge").to_string(),
             "Engine error: no outgoing edge"
         );
+    }
+
+    #[test]
+    fn publish_error_is_only_retryable_for_transient_failures() {
+        assert!(Error::publish("connection timed out").is_retryable());
+        assert!(!Error::publish("permission denied").is_retryable());
     }
 
     #[test]

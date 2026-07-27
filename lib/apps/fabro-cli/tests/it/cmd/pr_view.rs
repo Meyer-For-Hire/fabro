@@ -85,6 +85,7 @@ fn pr_view_reads_pull_request_from_store_without_pull_request_json() {
                 repo:        "fabro".to_string(),
                 base_branch: "main".to_string(),
                 head_branch: "fabro/run/demo".to_string(),
+                head_sha:    Some("final-sha".to_string()),
                 title:       "Map the constellations".to_string(),
                 draft:       false,
             }),
