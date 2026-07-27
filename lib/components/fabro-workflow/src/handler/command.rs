@@ -31,12 +31,7 @@ impl Handler for CommandHandler {
         _run_dir: &Path,
         _services: &EngineServices,
     ) -> Result<Outcome, Error> {
-        let script = node
-            .attrs
-            .get("script")
-            .or_else(|| node.attrs.get("tool_command"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let script = node.script().unwrap_or("");
 
         let mut outcome = Outcome::simulated(&node.id);
         outcome.notes = Some(format!("[Simulated] Command skipped: {script}"));
@@ -54,12 +49,7 @@ impl Handler for CommandHandler {
         run_dir: &Path,
         services: &EngineServices,
     ) -> Result<Outcome, Error> {
-        let script = node
-            .attrs
-            .get("script")
-            .or_else(|| node.attrs.get("tool_command"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let script = node.script().unwrap_or("");
 
         if script.is_empty() {
             return Ok(Outcome::fail_classify("No script specified"));
@@ -1264,7 +1254,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_command_attribute_fallback() {
+    async fn tool_command_attribute_is_not_read() {
         let handler = CommandHandler;
         let mut node = Node::new("script_node");
         node.attrs.insert(
@@ -1280,13 +1270,10 @@ mod tests {
             .execute(&node, &context, &graph, run_dir.path(), &services)
             .await
             .unwrap();
-        assert_eq!(outcome.status, StageOutcome::Succeeded);
-        let command_output = outcome.context_updates.get(keys::COMMAND_OUTPUT).unwrap();
-        assert!(
-            command_text(&services, command_output)
-                .await
-                .contains("legacy")
-        );
+        assert_eq!(outcome.status, StageOutcome::Failed {
+            retry_requested: false,
+        });
+        assert!(outcome.failure_reason().unwrap().contains("No script"));
     }
 
     #[tokio::test]

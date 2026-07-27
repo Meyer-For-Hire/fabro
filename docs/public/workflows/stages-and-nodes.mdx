@@ -35,7 +35,7 @@ exit [shape=Msquare, label="Exit"]
 
 ### Agent
 
-**Shape:** `box` (default)
+**Shape:** `box` (default — a node with no shape and no `script` is an agent node)
 
 Runs an LLM with access to tools — bash, file editing, sub-agents — in an agentic loop. The agent works autonomously, calling tools as needed, until it decides the task is complete.
 
@@ -94,17 +94,19 @@ Prompt nodes accept the same attributes as agent nodes (`prompt`, `reasoning_eff
 
 ### Command
 
-**Shape:** `parallelogram`
+**Shape:** `parallelogram` (optional — inferred from `script`)
 
 Runs a shell script inside the configured sandbox and captures its output. The output is available to downstream nodes as context. This ensures command nodes execute in the same environment as agent nodes.
 
 ```dot
-test [label="Run Tests", shape=parallelogram, script="cargo test 2>&1 || true"]
+test [label="Run Tests", script="cargo test 2>&1 || true"]
 ```
+
+`script` is what makes a node a command node, so the shape can be left off. Writing `shape=parallelogram` explicitly is still valid and does the same thing.
 
 | Attribute | Description |
 |---|---|
-| `script` | The shell command to execute |
+| `script` | The shell command to execute (required) |
 | `language` | `"shell"` (default) or `"python"` |
 
 ### Human

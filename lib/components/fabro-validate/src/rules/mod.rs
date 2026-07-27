@@ -1,5 +1,6 @@
 mod all_conditional_edges;
 mod backend_valid;
+mod command_requires_script;
 mod condition_syntax;
 mod direction_valid;
 mod edge_target_exists;
@@ -21,6 +22,7 @@ mod reachability;
 mod reserved_keyword_node_id;
 mod retry_target_exists;
 mod script_absolute_cd;
+mod script_prompt_conflict;
 mod selection_valid;
 mod start_no_incoming;
 mod start_node;
@@ -59,6 +61,8 @@ pub fn built_in_rules() -> Vec<Box<dyn LintRule>> {
         all_conditional_edges::rule(),
         orphan_custom_outcome::rule(),
         script_absolute_cd::rule(),
+        script_prompt_conflict::rule(),
+        command_requires_script::rule(),
         import_error::rule(),
         join_policy_removed::rule(),
         unresolved_file_ref::rule(),

@@ -161,7 +161,7 @@ Each node's `shape` attribute determines its execution behavior. See [Nodes & St
 | `Msquare` | exit | Workflow terminal (exactly one required) |
 | `box` (default) | agent | Multi-turn LLM with tool access |
 | `tab` | prompt | Single LLM call, no tools |
-| `parallelogram` | command | Execute a shell script |
+| `parallelogram` (inferred from `script`) | command | Execute a shell script |
 | `hexagon` | human | Human-in-the-loop decision gate |
 | `diamond` | conditional | Route based on conditions |
 | `component` | parallel | Fan-out to concurrent branches |
@@ -172,6 +172,19 @@ Each node's `shape` attribute determines its execution behavior. See [Nodes & St
 The `type` attribute can also be set explicitly to override the shape-based mapping.
 
 Start nodes can also be identified by ID (`start` or `Start`). Exit nodes can be identified by ID (`exit`, `Exit`, `end`, or `End`).
+
+### Omitting the shape
+
+The two most common node types don't need a `shape`. A node that sets `script` is a command node; every other shapeless node is an agent node:
+
+```dot
+plan  [prompt="Plan the work"]      // agent
+build [script="cargo build"]        // command
+```
+
+An explicit `shape` always wins, so `box` with a `script` is still an agent node — and the `script` is then read by nothing. Setting both `script` and `prompt` on one node is an error: no handler reads both.
+
+Other node types still need their shape, because their attributes don't identify them uniquely. In particular, agent and prompt nodes take the same attributes, so a prompt node needs `shape=tab`.
 
 ## Node attributes
 
@@ -244,7 +257,7 @@ audit [
 
 | Attribute | Type | Description |
 |---|---|---|
-| `script` | String | Shell command to execute |
+| `script` | String | Shell command to execute (required). Its presence also makes `shape=parallelogram` optional. |
 | `language` | String | `"shell"` (default) or `"python"` |
 | `output_schema` | String | Optional structured output validation. Accepts `routing`, `@path/to/schema.json`, or an inline JSON Schema object string. See [Structured output validation](#structured-output-validation). |
 

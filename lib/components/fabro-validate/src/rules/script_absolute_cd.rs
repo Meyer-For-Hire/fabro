@@ -40,12 +40,7 @@ impl LintRule for Rule {
             if node.handler_type() != Some("command") {
                 continue;
             }
-            let script = node
-                .attrs
-                .get("script")
-                .or_else(|| node.attrs.get("tool_command"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let script = node.script().unwrap_or("");
             if contains_cd_absolute(script) {
                 diagnostics.push(Diagnostic {
                     rule: self.name().to_string(),
@@ -114,7 +109,22 @@ mod tests {
     }
 
     #[test]
-    fn script_absolute_cd_warns_on_legacy_tool_command() {
+    fn script_absolute_cd_warns_on_shapeless_script_node() {
+        let mut g = minimal_graph();
+        let mut node = Node::new("run");
+        node.attrs.insert(
+            "script".to_string(),
+            AttrValue::String("cd /home/user && make".to_string()),
+        );
+        g.nodes.insert("run".to_string(), node);
+        let rule = Rule;
+        let d = rule.apply(&g);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].severity, Severity::Warning);
+    }
+
+    #[test]
+    fn script_absolute_cd_ignores_legacy_tool_command() {
         let mut g = minimal_graph();
         let mut node = Node::new("run");
         node.attrs.insert(
@@ -127,9 +137,7 @@ mod tests {
         );
         g.nodes.insert("run".to_string(), node);
         let rule = Rule;
-        let d = rule.apply(&g);
-        assert_eq!(d.len(), 1);
-        assert_eq!(d[0].severity, Severity::Warning);
+        assert!(rule.apply(&g).is_empty());
     }
 
     #[test]

@@ -153,9 +153,21 @@ impl Node {
         self.str_attr("label").unwrap_or(&self.id)
     }
 
+    /// The node's Graphviz shape, which selects its handler.
+    ///
+    /// An explicit `shape` attribute always wins. Otherwise the shape is
+    /// inferred from the attributes the node carries: `script` is read by the
+    /// command handler and by nothing else, so a shapeless node that sets it
+    /// is a command node. Everything else falls back to `box` (agent).
     #[must_use]
     pub fn shape(&self) -> &str {
-        self.str_attr("shape").unwrap_or("box")
+        if let Some(shape) = self.str_attr("shape") {
+            return shape;
+        }
+        if self.script().is_some() {
+            return "parallelogram";
+        }
+        "box"
     }
 
     #[must_use]
@@ -166,6 +178,12 @@ impl Node {
     #[must_use]
     pub fn prompt(&self) -> Option<&str> {
         self.str_attr("prompt")
+    }
+
+    /// The shell or Python source a command node runs.
+    #[must_use]
+    pub fn script(&self) -> Option<&str> {
+        self.str_attr("script")
     }
 
     #[must_use]
@@ -604,6 +622,53 @@ mod tests {
         assert_eq!(node.retry_policy(), None);
         assert_eq!(node.max_visits(), None);
         assert!(node.project_memory());
+    }
+
+    fn node_with(id: &str, attrs: &[(&str, &str)]) -> Node {
+        let mut node = Node::new(id);
+        for (key, value) in attrs {
+            node.attrs
+                .insert((*key).to_string(), AttrValue::String((*value).to_string()));
+        }
+        node
+    }
+
+    #[test]
+    fn shapeless_script_node_infers_command() {
+        let node = node_with("build", &[("script", "cargo build")]);
+        assert_eq!(node.shape(), "parallelogram");
+        assert_eq!(node.handler_type(), Some("command"));
+    }
+
+    #[test]
+    fn shapeless_node_without_script_stays_agent() {
+        let node = node_with("plan", &[("prompt", "Plan the work")]);
+        assert_eq!(node.shape(), "box");
+        assert_eq!(node.handler_type(), Some("agent"));
+    }
+
+    #[test]
+    fn explicit_shape_wins_over_script_inference() {
+        let node = node_with("odd", &[("shape", "box"), ("script", "cargo build")]);
+        assert_eq!(node.shape(), "box");
+        assert_eq!(node.handler_type(), Some("agent"));
+    }
+
+    #[test]
+    fn explicit_type_wins_over_script_inference() {
+        let node = node_with("odd", &[("type", "agent"), ("script", "cargo build")]);
+        assert_eq!(node.shape(), "parallelogram");
+        assert_eq!(node.handler_type(), Some("agent"));
+    }
+
+    #[test]
+    fn empty_script_still_infers_command() {
+        // The command-requires-script lint reports this; inference only asks
+        // whether the attribute is present so the diagnostic lands on a
+        // command node rather than a silently-agent one.
+        let node = node_with("build", &[("script", "")]);
+        assert_eq!(node.shape(), "parallelogram");
+        assert_eq!(node.handler_type(), Some("command"));
     }
 
     #[test]
