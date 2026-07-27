@@ -1,9 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
 
-import type { ReasoningOutput } from "@qltysh/fabro-api-client";
+import type {
+  BilledTokenCounts,
+  ReasoningOutput,
+  StageModelUsage,
+} from "@qltysh/fabro-api-client";
 
-import { EventDetails } from "./run-stages";
+import { EventDetails, ModelUsagePopover } from "./run-stages";
 
 const RUN_START = "2026-04-09T12:00:00Z";
 
@@ -70,5 +74,84 @@ describe("EventDetails reasoning", () => {
     // Collapsed, so the preview is truncated rather than the whole trace.
     expect(html).not.toContain(trace);
     expect(html).toContain(`${"x".repeat(280)}…`);
+  });
+});
+
+const PROVIDER_USED: StageModelUsage = {
+  mode: "agent",
+  provider: "moonshot",
+  model: "kimi-k3",
+  reasoning_effort: "max",
+};
+
+function billing(partial: Partial<BilledTokenCounts>): BilledTokenCounts {
+  return {
+    input_tokens: 0,
+    output_tokens: 0,
+    total_tokens: 0,
+    reasoning_tokens: 0,
+    cache_read_tokens: 0,
+    cache_write_tokens: 0,
+    ...partial,
+  };
+}
+
+function popoverMarkup(counts: BilledTokenCounts | null): string {
+  return renderToStaticMarkup(
+    <ModelUsagePopover providerUsed={PROVIDER_USED} billing={counts} />,
+  );
+}
+
+describe("ModelUsagePopover billing", () => {
+  test("shows the visit's token buckets and cost next to the model", () => {
+    const html = popoverMarkup(
+      billing({
+        input_tokens: 28_640,
+        output_tokens: 7_550,
+        reasoning_tokens: 1_200,
+        cache_read_tokens: 4_800,
+        cache_write_tokens: 1_500,
+        total_tokens: 43_690,
+        total_usd_micros: 720_000,
+      }),
+    );
+
+    expect(html).toContain("kimi-k3");
+    expect(html).toContain("Cache read");
+    expect(html).toContain("4.8k");
+    expect(html).toContain("Cache creation");
+    expect(html).toContain("1.5k");
+    expect(html).toContain("Uncached");
+    expect(html).toContain("28.6k");
+    // Output folds in reasoning tokens, matching the Billing tab.
+    expect(html).toContain("Output");
+    expect(html).toContain("8.8k");
+    expect(html).toContain("Cost");
+    expect(html).toContain("$0.72");
+  });
+
+  test("omits the token section for a stage that called no model", () => {
+    const html = popoverMarkup(billing({}));
+
+    expect(html).toContain("kimi-k3");
+    expect(html).not.toContain("Tokens");
+    expect(html).not.toContain("Cost");
+  });
+
+  test("still shows tokens when nothing priced the stage", () => {
+    const html = popoverMarkup(
+      billing({ input_tokens: 1_000, output_tokens: 500, total_tokens: 1_500 }),
+    );
+
+    expect(html).toContain("Uncached");
+    expect(html).toContain("1.0k");
+    expect(html).not.toContain("Cost");
+  });
+
+  test("renders the model rows alone when the stage list carried no billing", () => {
+    const html = popoverMarkup(null);
+
+    expect(html).toContain("kimi-k3");
+    expect(html).not.toContain("Tokens");
   });
 });
