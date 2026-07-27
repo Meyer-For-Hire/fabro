@@ -19,10 +19,10 @@ export function SizeChip({
   totalUsdMicros?: number | null;
 }) {
   const tone = SIZE_TONE[size];
-  const billed = totalUsdMicros != null ? ` · ${formatUsdMicros(totalUsdMicros)} billed` : "";
+  const amount = totalUsdMicros != null ? ` · ${formatUsdMicros(totalUsdMicros)}` : "";
   const tooltip = tone.note != null
-    ? `Size ${size} (${tone.note})${billed}`
-    : `Size ${size}${billed}`;
+    ? `Size ${size} (${tone.note})${amount}`
+    : `Size ${size}${amount}`;
   return (
     <Tooltip label={tooltip}>
       <span className={`rounded px-1.5 py-0.5 font-mono text-xs font-bold tabular-nums ${tone.className}`}>
