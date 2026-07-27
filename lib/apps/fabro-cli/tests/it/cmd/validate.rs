@@ -82,6 +82,7 @@ fn branching() {
     Workflow: Branch (6 nodes, 6 edges)
     Graph: [FIXTURES]/branching.fabro
     warning [node: implement]: Node 'implement' has goal_gate=true but no retry_target or fallback_retry_target (goal_gate_has_retry)
+      fix: Add retry_target or fallback_retry_target attribute
     Validation: OK
     ");
 }
@@ -163,7 +164,9 @@ fn bare_fabro_with_unbound_inputs_validates_structurally_with_warning() {
     Workflow: TemplatedUnbound (3 nodes, 2 edges)
     Graph: [FIXTURES]/templated_unbound.fabro
     warning: [FIXTURES]/templated_unbound.fabro:2:26: undefined template variable `inputs.app_dir` in graph attribute `goal` (template_undefined_variable)
+      fix: bind `inputs.app_dir` via `[run.inputs]` in workflow.toml, or pass `--input inputs.app_dir=<value>`
     warning: [FIXTURES]/templated_unbound.fabro:7:44: undefined template variable `inputs.app_dir` in node `work` attribute `prompt` [node: work] (template_undefined_variable)
+      fix: bind `inputs.app_dir` via `[run.inputs]` in workflow.toml, or pass `--input inputs.app_dir=<value>`
     Validation: OK
     ");
 }
@@ -186,6 +189,7 @@ fn bare_fabro_with_unbound_inputs_in_imported_prompt_validates_structurally_with
     Workflow: TemplatedUnboundImported (3 nodes, 2 edges)
     Graph: [FIXTURES]/templated_unbound_imported/workflow.fabro
     warning: [FIXTURES]/templated_unbound_imported/work.md:1:12: undefined template variable `inputs.app_dir` in node `work` attribute `prompt` [node: work] (template_undefined_variable)
+      fix: bind `inputs.app_dir` via `[run.inputs]` in workflow.toml, or pass `--input inputs.app_dir=<value>`
     Validation: OK
     ");
 }
@@ -207,6 +211,7 @@ fn bare_fabro_with_unbound_inputs_in_template_partial_validates_structurally_wit
     Workflow: TemplatedUnboundPartial (3 nodes, 2 edges)
     Graph: [FIXTURES]/templated_unbound_partial/workflow.fabro
     warning: [FIXTURES]/templated_unbound_partial/test-include.partial.md:1:4: undefined template variable `inputs.hello` in node `test_imported_include` attribute `prompt` [node: test_imported_include] (template_undefined_variable)
+      fix: bind `inputs.hello` via `[run.inputs]` in workflow.toml, or pass `--input inputs.hello=<value>`
     Validation: OK
     ");
 }
@@ -293,7 +298,9 @@ fn edge_only_node() {
     Workflow: EdgeOnlyNode (3 nodes, 2 edges)
     Graph: [FIXTURES]/edge_only_node.fabro
     error [node: misspelled_node]: Node 'misspelled_node' is referenced by edge 'start -> misspelled_node' but has no node declaration (edge_target_exists)
+      fix: Declare node 'misspelled_node' or correct the edge endpoint
     warning [node: misspelled_node]: LLM node 'misspelled_node' has no prompt or label attribute (prompt_on_llm_nodes)
+      fix: Add a prompt or label attribute
       × Validation failed
     ");
 }
@@ -311,7 +318,9 @@ fn invalid() {
     Workflow: Invalid (2 nodes, 1 edges)
     Graph: [FIXTURES]/invalid.fabro
     error: Pipeline must have exactly one start node (shape=Mdiamond or id start/Start) (start_node)
+      fix: Add a node with shape=Mdiamond or id 'start'
     error [node: exit]: Exit node 'exit' has 1 outgoing edge(s) but must have none (exit_no_outgoing)
+      fix: Remove outgoing edges from the exit node
       × Validation failed
     ");
 }
