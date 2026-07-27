@@ -119,20 +119,26 @@ pub fn shape_to_handler_type(shape: &str) -> Option<&'static str> {
 /// A node in the workflow graph.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Node {
-    pub id:      String,
-    pub attrs:   HashMap<String, AttrValue>,
+    pub id:       String,
+    pub attrs:    HashMap<String, AttrValue>,
     /// CSS-like classes for model stylesheet targeting (from `class` attr and
     /// subgraph derivation).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub classes: Vec<String>,
+    pub classes:  Vec<String>,
+    /// True when the node was synthesized from an edge endpoint instead of a
+    /// node declaration. Validation rejects these because an edge-only node in
+    /// an executable workflow is almost always a typo.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub implicit: bool,
 }
 
 impl Node {
     pub fn new(id: impl Into<String>) -> Self {
         Self {
-            id:      id.into(),
-            attrs:   HashMap::new(),
-            classes: Vec::new(),
+            id:       id.into(),
+            attrs:    HashMap::new(),
+            classes:  Vec::new(),
+            implicit: false,
         }
     }
 

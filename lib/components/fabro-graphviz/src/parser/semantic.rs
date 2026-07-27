@@ -57,6 +57,14 @@ fn derive_class_from_label(label: &str) -> String {
         .collect()
 }
 
+/// How a statement named a node. A node stays implicit only while every
+/// mention of it is an edge endpoint, so declaration order does not matter.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mention {
+    Declaration,
+    EdgeEndpoint,
+}
+
 struct SemanticState {
     graph:         Graph,
     node_defaults: HashMap<String, AttrValue>,
@@ -72,13 +80,25 @@ impl SemanticState {
         }
     }
 
-    fn ensure_node(&mut self, id: &str) {
+    /// Insert the node if this is the first statement to mention it, and record
+    /// whether the workflow ever declares it.
+    fn ensure_node(&mut self, id: &str, mention: Mention) {
         if !self.graph.nodes.contains_key(id) {
             let mut node = Node::new(id);
             for (k, v) in &self.node_defaults {
                 node.attrs.insert(k.clone(), v.clone());
             }
+            node.implicit = mention == Mention::EdgeEndpoint;
             self.graph.nodes.insert(id.to_string(), node);
+            return;
+        }
+        if mention == Mention::Declaration {
+            let node = self
+                .graph
+                .nodes
+                .get_mut(id)
+                .expect("contains_key returned true, so get_mut cannot return None");
+            node.implicit = false;
         }
     }
 
@@ -90,7 +110,7 @@ impl SemanticState {
     }
 
     fn process_node(&mut self, node_stmt: &NodeStmt, subgraph_class: Option<&str>) {
-        self.ensure_node(&node_stmt.id);
+        self.ensure_node(&node_stmt.id, Mention::Declaration);
         let node = self
             .graph
             .nodes
@@ -127,7 +147,7 @@ impl SemanticState {
 
     fn process_edge(&mut self, edge_stmt: &EdgeStmt, subgraph_class: Option<&str>) {
         for id in &edge_stmt.nodes {
-            self.ensure_node(id);
+            self.ensure_node(id, Mention::EdgeEndpoint);
             if let Some(cls) = subgraph_class {
                 let node =
                     self.graph.nodes.get_mut(id).expect(
@@ -527,5 +547,72 @@ mod tests {
         let graph = ast_to_graph(&dot).unwrap();
         assert!(graph.nodes.contains_key("a"));
         assert!(graph.nodes.contains_key("b"));
+        assert!(graph.nodes["a"].implicit);
+        assert!(graph.nodes["b"].implicit);
+    }
+
+    #[test]
+    fn ast_to_graph_marks_declared_nodes_explicit() {
+        let dot = DotGraph {
+            name:       "Declared".into(),
+            statements: vec![
+                Statement::Node(NodeStmt {
+                    id:    "a".into(),
+                    attrs: None,
+                }),
+                Statement::Edge(EdgeStmt {
+                    nodes: vec!["a".into(), "b".into()],
+                    attrs: None,
+                }),
+            ],
+        };
+
+        let graph = ast_to_graph(&dot).unwrap();
+        assert!(!graph.nodes["a"].implicit);
+        assert!(graph.nodes["b"].implicit);
+    }
+
+    #[test]
+    fn ast_to_graph_declaration_after_edge_still_counts() {
+        let dot = DotGraph {
+            name:       "DeclaredLater".into(),
+            statements: vec![
+                Statement::Edge(EdgeStmt {
+                    nodes: vec!["a".into(), "b".into()],
+                    attrs: None,
+                }),
+                Statement::Node(NodeStmt {
+                    id:    "b".into(),
+                    attrs: Some(vec![("prompt".into(), AstValue::Str("Do it".into()))]),
+                }),
+            ],
+        };
+
+        let graph = ast_to_graph(&dot).unwrap();
+        assert!(!graph.nodes["b"].implicit);
+    }
+
+    #[test]
+    fn ast_to_graph_subgraph_declaration_counts() {
+        let dot = DotGraph {
+            name:       "SubgraphDeclared".into(),
+            statements: vec![
+                Statement::Edge(EdgeStmt {
+                    nodes: vec!["start".into(), "plan".into()],
+                    attrs: None,
+                }),
+                Statement::Subgraph(SubgraphStmt {
+                    name:       Some("cluster_loop".into()),
+                    statements: vec![Statement::Node(NodeStmt {
+                        id:    "plan".into(),
+                        attrs: None,
+                    })],
+                }),
+            ],
+        };
+
+        let graph = ast_to_graph(&dot).unwrap();
+        assert!(!graph.nodes["plan"].implicit);
+        assert!(graph.nodes["start"].implicit);
     }
 }

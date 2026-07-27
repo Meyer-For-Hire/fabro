@@ -113,7 +113,7 @@ plan [label="Plan", prompt="Create an implementation plan."]
 
 **Node identifiers** must start with a letter or underscore, followed by letters, digits, or underscores (e.g. `run_tests`, `gate_1`, `_private`).
 
-Nodes referenced in edges are auto-created if not explicitly declared.
+Every node used by an edge needs its own declaration. Validation fails when an edge names a node the workflow never declares, because that is nearly always a typo or a rename that missed an edge. The declaration can come before or after the edges that use it, and it can live in a subgraph.
 
 ### Edge declarations
 

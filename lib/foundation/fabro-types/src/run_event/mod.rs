@@ -995,9 +995,10 @@ mod tests {
         let graph = Graph {
             name:  "test".to_string(),
             nodes: HashMap::from([("start".to_string(), Node {
-                id:      "start".to_string(),
-                attrs:   HashMap::new(),
-                classes: Vec::new(),
+                id:       "start".to_string(),
+                attrs:    HashMap::new(),
+                classes:  Vec::new(),
+                implicit: false,
             })]),
             edges: vec![Edge {
                 from:  "start".to_string(),

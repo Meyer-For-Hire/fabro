@@ -346,6 +346,7 @@ impl ImportTransform {
 
             let prefixed_id = format!("{placeholder_id}.{node_id}");
             let mut merged_node = Node::new(&prefixed_id);
+            merged_node.implicit = node.implicit;
             merged_node.attrs.clone_from(&placeholder.default_attrs);
             merged_node.attrs.extend(node.attrs);
             Self::remap_retry_target(&mut merged_node.attrs, placeholder_id);
@@ -949,6 +950,54 @@ mod tests {
                 .iter()
                 .any(|class_name| class_name == "validate")
         );
+    }
+
+    #[test]
+    fn imported_node_declarations_survive_splicing() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(&dir.path().join("validate.fabro"), basic_import_source());
+
+        let graph = apply_import(
+            r#"digraph Deploy {
+                start [shape=Mdiamond]
+                validate [import="./validate.fabro"]
+                exit [shape=Msquare]
+                start -> validate -> exit
+            }"#,
+            dir.path(),
+            None,
+        );
+
+        assert!(!graph.nodes["validate.lint"].implicit);
+        assert!(!graph.nodes["validate.test"].implicit);
+    }
+
+    #[test]
+    fn edge_only_node_in_imported_fragment_stays_undeclared() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(
+            &dir.path().join("validate.fabro"),
+            r#"digraph validate {
+                start [shape=Mdiamond]
+                lint [prompt="Run clippy"]
+                exit [shape=Msquare]
+                start -> lint -> typo -> exit
+            }"#,
+        );
+
+        let graph = apply_import(
+            r#"digraph Deploy {
+                start [shape=Mdiamond]
+                validate [import="./validate.fabro"]
+                exit [shape=Msquare]
+                start -> validate -> exit
+            }"#,
+            dir.path(),
+            None,
+        );
+
+        assert!(graph.nodes["validate.typo"].implicit);
+        assert!(!graph.nodes["validate.lint"].implicit);
     }
 
     #[test]
