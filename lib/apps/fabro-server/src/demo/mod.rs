@@ -1143,6 +1143,8 @@ mod runs {
             started_at: None,
             graph_visit: None,
             resumed_from_stage_id: None,
+            parallel_group_id: None,
+            parallel_branch_index: None,
         }
     }
 

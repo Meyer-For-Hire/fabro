@@ -25,6 +25,10 @@ export interface Stage {
   graphVisit: number | null;
   /** StageId of the prior execution superseded by this resumed replay, if any. */
   resumedFromStageId: string | null;
+  /** Exact StageId of the parent parallel execution, if this is a branch. */
+  parallelGroupId: string | null;
+  /** Zero-based outgoing-edge index within the parent parallel execution. */
+  parallelBranchIndex: number | null;
   startedAt: string | null;
   providerUsed: StageModelUsage | null;
 }
@@ -96,6 +100,8 @@ export function mapRunStagesToSidebarStages(
       visit: stage.visit,
       graphVisit: stage.graph_visit ?? null,
       resumedFromStageId: stage.resumed_from_stage_id ?? null,
+      parallelGroupId: stage.parallel_group_id ?? null,
+      parallelBranchIndex: stage.parallel_branch_index ?? null,
       status: stage.status,
       duration: stage.wall_time_ms != null
         ? formatDurationMs(stage.wall_time_ms)

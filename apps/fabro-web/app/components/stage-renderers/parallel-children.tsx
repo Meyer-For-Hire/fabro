@@ -10,10 +10,12 @@ import { formatDurationMs } from "../../lib/format";
 import { StageMetaBar } from "./meta-bar";
 import { parseParallelOverview } from "./helpers";
 
-/** Branch row view state: completed outcomes plus a synthesized in-flight row. */
+/** Branch row view state sourced from a live branch stage or completed result. */
 interface BranchRow {
+  branchIndex: number;
   id: string;
   status: StageState;
+  stageHref: string | null;
 }
 
 function StatItem({
@@ -38,25 +40,23 @@ function StatItem({
 }
 
 function ChildRow({
-  result,
-  stageHref,
+  row,
 }: {
-  result: BranchRow;
-  stageHref: string | null;
+  row: BranchRow;
 }) {
-  const tone = stageStatusTone(result.status);
+  const tone = stageStatusTone(row.status);
 
   const inner = (
     <>
       <span
         className={`inline-flex w-24 shrink-0 justify-center rounded-full px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider ${tone}`}
       >
-        {stageStatusLabel(result.status)}
+        {stageStatusLabel(row.status)}
       </span>
       <span className="min-w-0 flex-1 truncate font-mono text-sm text-fg-3">
-        {result.id}
+        {row.id}
       </span>
-      {stageHref && (
+      {row.stageHref && (
         <ArrowTopRightOnSquareIcon
           className="size-3.5 shrink-0 text-fg-muted transition-colors group-hover:text-fg-2"
           aria-hidden="true"
@@ -67,9 +67,9 @@ function ChildRow({
 
   return (
     <li className="flex items-center gap-3 px-4 py-2.5">
-      {stageHref ? (
+      {row.stageHref ? (
         <Link
-          to={stageHref}
+          to={row.stageHref}
           className="group flex flex-1 items-center gap-3 rounded -m-1 p-1 transition-colors hover:bg-overlay focus-visible:bg-overlay focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-teal-500"
         >
           {inner}
@@ -94,24 +94,63 @@ export function ParallelChildren({
 }) {
   const overview = useMemo(() => parseParallelOverview(events), [events]);
 
-  // Map node_id -> latest stage_id so we can deep-link branches.
-  const latestStageByNode = useMemo(() => {
-    const latest = new Map<string, Stage>();
-    for (const s of allStages) {
-      const prev = latest.get(s.nodeId);
-      if (!prev || s.visit > prev.visit) latest.set(s.nodeId, s);
+  const stagesByBranchIndex = useMemo(() => {
+    const byIndex = new Map<number, Stage>();
+    for (const candidate of allStages) {
+      if (
+        candidate.parallelGroupId === stage.id
+        && candidate.parallelBranchIndex != null
+      ) {
+        byIndex.set(candidate.parallelBranchIndex, candidate);
+      }
     }
-    return new Map(Array.from(latest.entries()).map(([nodeId, s]) => [nodeId, s.id]));
-  }, [allStages]);
+    return byIndex;
+  }, [allStages, stage.id]);
 
-  const items: BranchRow[] = overview.results.length > 0
-    ? overview.results
-    : overview.branchCount && overview.branchCount > 0
-      ? Array.from({ length: overview.branchCount }, (_, i) => ({
-          id: `branch ${i + 1}`,
-          status: StageState.RUNNING,
-        }))
-      : [];
+  const branchCount = overview.branchCount ?? stagesByBranchIndex.size;
+  const slots = Array.from({ length: branchCount }, (_, index) => ({
+    index,
+    stage: stagesByBranchIndex.get(index) ?? null,
+    result: overview.results[index] ?? null,
+  }));
+  const rows = slots.map<BranchRow>(({ index, stage: branchStage, result }) => {
+    if (branchStage) {
+      return {
+        branchIndex: index,
+        id: branchStage.name,
+        status: branchStage.status,
+        stageHref: `/runs/${runId}/stages/${branchStage.id}`,
+      };
+    }
+    if (result) {
+      return {
+        branchIndex: index,
+        id: result.id,
+        status: result.status,
+        stageHref: null,
+      };
+    }
+    return {
+      branchIndex: index,
+      id: `branch ${index + 1}`,
+      status: StageState.PENDING,
+      stageHref: null,
+    };
+  });
+
+  const liveBranchStages = Array.from(stagesByBranchIndex.values());
+  const liveSuccessCount = liveBranchStages
+    .filter((branchStage) => branchStage.status === StageState.SUCCEEDED)
+    .length;
+  const liveFailureCount = liveBranchStages
+    .filter((branchStage) => branchStage.status === StageState.FAILED)
+    .length;
+  const successCount = overview.isComplete
+    ? overview.successCount ?? 0
+    : liveSuccessCount;
+  const failureCount = overview.isComplete
+    ? overview.failureCount ?? 0
+    : liveFailureCount;
 
   return (
     <div className="space-y-6 pl-3 pr-4 sm:pr-6 lg:pr-8">
@@ -121,13 +160,13 @@ export function ParallelChildren({
         <StatItem label="Branches" value={overview.branchCount ?? "—"} />
         <StatItem
           label="Succeeded"
-          value={overview.successCount ?? (overview.isComplete ? 0 : "—")}
+          value={successCount}
           tone="success"
         />
         <StatItem
           label="Failed"
-          value={overview.failureCount ?? (overview.isComplete ? 0 : "—")}
-          tone={overview.failureCount && overview.failureCount > 0 ? "danger" : "default"}
+          value={failureCount}
+          tone={failureCount > 0 ? "danger" : "default"}
         />
         <StatItem
           label="Duration"
@@ -139,21 +178,13 @@ export function ParallelChildren({
         <h3 className="mb-2 text-xs font-medium uppercase tracking-wider text-fg-muted">
           Branches
         </h3>
-        {items.length === 0 ? (
+        {rows.length === 0 ? (
           <p className="text-sm text-fg-muted">No branches recorded yet.</p>
         ) : (
           <ul className="divide-y divide-line rounded-lg bg-panel outline-1 -outline-offset-1 outline-line">
-            {items.map((result, i) => {
-              const stageId = latestStageByNode.get(result.id);
-              const href = stageId ? `/runs/${runId}/stages/${stageId}` : null;
-              return (
-                <ChildRow
-                  key={`${result.id}-${i}`}
-                  result={result}
-                  stageHref={href}
-                />
-              );
-            })}
+            {rows.map((row) => (
+              <ChildRow key={row.branchIndex} row={row} />
+            ))}
           </ul>
         )}
       </section>

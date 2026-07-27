@@ -26,11 +26,11 @@ use fabro_types::{
     ActivatedSkill, AgentControlState, AgentMcpToolSummary, AgentSkillActivationSource,
     AgentSkillSummary, AgentToolCategory, AgentToolSource, AgentToolSummary,
     AgentToolsAvailableProps, LlmOutputKind, McpServerProjection, McpServerStatus,
-    ParallelBranchResult, PermissionLevel, SkillsProjection, StageContextWindow,
+    ParallelBranchId, ParallelBranchResult, PermissionLevel, SkillsProjection, StageContextWindow,
     StageContextWindowBreakdownItem, StageContextWindowCategory, StageContextWindowCountMethod,
     StageContextWindowProjection, StageContextWindowStaleness, StageContextWindowUnavailableReason,
-    StageContextWindowWarning, StageInferenceProjection, StageProjection, SubAgentProjection,
-    SubAgentStatus, TodoListKind, TodoListProjection,
+    StageContextWindowWarning, StageId, StageInferenceProjection, StageProjection,
+    SubAgentProjection, SubAgentStatus, TodoListKind, TodoListProjection,
 };
 use serde_json::json;
 
@@ -188,6 +188,7 @@ fn stage_projection_round_trips_representative_json() {
                 "context_updates": {}
             }
         ],
+        "parallel_branch_id": "review_fork@3:1",
         "output": "ok",
         "termination": "exited",
         "started_at": "2026-04-29T12:34:00Z",
@@ -316,6 +317,10 @@ fn stage_projection_round_trips_representative_json() {
     });
 
     let state: StageProjection = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(
+        state.parallel_branch_id,
+        Some(ParallelBranchId::new(StageId::new("review_fork", 3), 1))
+    );
     assert_eq!(serde_json::to_value(state).unwrap(), value);
 }
 

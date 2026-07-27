@@ -13,6 +13,8 @@ function makeStage(nodeId: string, visit: number, status: StageState): Stage {
     visit,
     graphVisit: null,
     resumedFromStageId: null,
+    parallelGroupId: null,
+    parallelBranchIndex: null,
     status,
     duration: "--",
     startedAt: null,
@@ -180,6 +182,28 @@ describe("mapRunStagesToSidebarStages", () => {
     const result = mapRunStagesToSidebarStages(stages);
     expect(result[0].graphVisit).toBeNull();
     expect(result[0].resumedFromStageId).toBeNull();
+  });
+
+  test("maps parallel branch identity without parsing it in the client", () => {
+    const stages: PaginatedRunStageList = {
+      data: [
+        {
+          id: "review_opus@2",
+          name: "review_opus",
+          handler: "agent",
+          status: "running",
+          node_id: "review_opus",
+          visit: 2,
+          parallel_group_id: "review_fork@1",
+          parallel_branch_index: 3,
+        },
+      ],
+      meta: { has_more: false },
+    };
+
+    const result = mapRunStagesToSidebarStages(stages);
+    expect(result[0].parallelGroupId).toBe("review_fork@1");
+    expect(result[0].parallelBranchIndex).toBe(3);
   });
 
   test("preserves the authoritative handler for renderer dispatch", () => {

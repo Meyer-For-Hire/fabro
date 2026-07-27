@@ -32,6 +32,11 @@ fn run_stage_from_projection(
                 .and_then(|node| node.handler_type()),
         )
     });
+    let (parallel_group_id, parallel_branch_index) = stage
+        .parallel_branch_id
+        .as_ref()
+        .map(|branch_id| (branch_id.group().clone(), branch_id.index()))
+        .unzip();
     RunStage {
         id: stage_id.clone(),
         name: stage_id.node_id().to_owned(),
@@ -45,6 +50,8 @@ fn run_stage_from_projection(
         started_at: stage.started_at,
         graph_visit: stage.graph_visit.and_then(std::num::NonZeroU32::new),
         resumed_from_stage_id: stage.resumed_from_stage_id.clone(),
+        parallel_group_id,
+        parallel_branch_index,
     }
 }
 

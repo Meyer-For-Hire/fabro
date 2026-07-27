@@ -609,6 +609,9 @@ impl RunProjectionReducer for RunProjection {
                     stage
                         .resumed_from_stage_id
                         .clone_from(&props.resumed_from_stage_id);
+                    stage
+                        .parallel_branch_id
+                        .clone_from(&stored.parallel_branch_id);
                 }
                 stage.state = StageState::Running;
             }
@@ -1548,9 +1551,9 @@ mod tests {
         AgentBackend, AgentControlState, AutomationRef, BilledModelUsage, BilledTokenCounts,
         BlockedReason, Checkpoint, CheckpointRecord, CommandTermination, EventBody,
         FailureCategory, FailureDetail, FailureReason, Graph, McpServerStatus, Outcome,
-        PendingReason, PermissionLevel, PullRequestLink, QuestionType, ReasoningEffort,
-        RunApprovalState, RunBlobId, RunControlAction, RunDiff, RunEvent, RunSize, RunSpec,
-        RunStatus, Speed, StageContextWindowBreakdownItem, StageContextWindowCategory,
+        ParallelBranchId, PendingReason, PermissionLevel, PullRequestLink, QuestionType,
+        ReasoningEffort, RunApprovalState, RunBlobId, RunControlAction, RunDiff, RunEvent, RunSize,
+        RunSpec, RunStatus, Speed, StageContextWindowBreakdownItem, StageContextWindowCategory,
         StageContextWindowCountMethod, StageContextWindowProjection, StageContextWindowStaleness,
         StageContextWindowWarning, StageModelUsage, StageOutcome, StageState, SubAgentStatus,
         SuccessReason, WorkflowSettings, first_event_seq, fixtures, test_support,
@@ -2275,6 +2278,56 @@ mod tests {
         let stage = state.stage(&stage_id).unwrap();
         assert_eq!(stage.first_event_seq, first_event_seq(3));
         assert_eq!(stage.prompt.as_deref(), Some("prompt"));
+    }
+
+    #[test]
+    fn parallel_branch_started_projects_identity_without_churning_it() {
+        let mut state = initialized_projection();
+        let group_id = StageId::new("review_fork", 1);
+        let branch_stage_id = StageId::new("review_glm", 1);
+        let branch_id = ParallelBranchId::new(group_id.clone(), 0);
+        let mut started = test_stage_event(
+            3,
+            EventBody::ParallelBranchStarted(ParallelBranchStartedProps {
+                index:                 0,
+                graph_visit:           Some(1),
+                resumed_from_stage_id: None,
+            }),
+            branch_stage_id.clone(),
+        );
+        started.event.parallel_group_id = Some(group_id.clone());
+        started.event.parallel_branch_id = Some(branch_id.clone());
+
+        state.apply_event(&started).unwrap();
+
+        assert_eq!(
+            state
+                .stage(&branch_stage_id)
+                .unwrap()
+                .parallel_branch_id
+                .as_ref(),
+            Some(&branch_id)
+        );
+
+        let replacement_branch_id = ParallelBranchId::new(group_id.clone(), 1);
+        let mut reobserved = test_stage_event(
+            4,
+            EventBody::ParallelBranchStarted(ParallelBranchStartedProps {
+                index:                 1,
+                graph_visit:           Some(2),
+                resumed_from_stage_id: Some(StageId::new("review_glm", 2)),
+            }),
+            branch_stage_id.clone(),
+        );
+        reobserved.event.parallel_group_id = Some(group_id);
+        reobserved.event.parallel_branch_id = Some(replacement_branch_id);
+
+        state.apply_event(&reobserved).unwrap();
+
+        let stage = state.stage(&branch_stage_id).unwrap();
+        assert_eq!(stage.parallel_branch_id.as_ref(), Some(&branch_id));
+        assert_eq!(stage.graph_visit, Some(1));
+        assert!(stage.resumed_from_stage_id.is_none());
     }
 
     #[test]

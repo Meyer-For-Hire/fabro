@@ -10,9 +10,10 @@ use crate::run_event::{AgentSessionActivatedProps, StagePromptProps};
 use crate::{
     AgentBackend, AgentMcpToolSummary, AgentSkillActivationSource, AgentSkillSummary,
     AgentToolSummary, BilledTokenCounts, Checkpoint, Conclusion, InterviewQuestionRecord,
-    InvalidTransition, LlmOutputKind, ModelRef, PermissionLevel, PullRequestLink, RunApproval,
-    RunControlAction, RunDiff, RunId, RunSandbox, RunSpec, RunStatus, RunTiming, StageCompletion,
-    StageHandler, StageId, StageState, StageTiming, StartRecord, TodoListProjection,
+    InvalidTransition, LlmOutputKind, ModelRef, ParallelBranchId, PermissionLevel, PullRequestLink,
+    RunApproval, RunControlAction, RunDiff, RunId, RunSandbox, RunSpec, RunStatus, RunTiming,
+    StageCompletion, StageHandler, StageId, StageState, StageTiming, StartRecord,
+    TodoListProjection,
 };
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -328,6 +329,8 @@ pub struct StageProjection {
     pub script_invocation:     Option<serde_json::Value>,
     pub script_timing:         Option<serde_json::Value>,
     pub parallel_results:      Option<Vec<crate::ParallelBranchResult>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_branch_id:    Option<ParallelBranchId>,
     pub output:                Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_bytes:          Option<u64>,
@@ -522,6 +525,7 @@ impl StageProjection {
             script_invocation: None,
             script_timing: None,
             parallel_results: None,
+            parallel_branch_id: None,
             output: None,
             output_bytes: None,
             live_streaming: None,

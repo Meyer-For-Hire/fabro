@@ -10652,6 +10652,11 @@ components:
           items:
             $ref: "#/components/schemas/ParallelBranchResult"
           description: Ordered per-branch results produced by a parallel stage.
+        parallel_branch_id:
+          type: ["string", "null"]
+          description: >
+            Durable identity of this branch within a parallel execution,
+            formatted as "{parallel_group_id}:{index}".
         output:
           type: ["string", "null"]
         output_bytes:
@@ -12658,6 +12663,23 @@ components:
             StageId of the prior post-checkpoint execution superseded by this
             replay after the run was resumed.
           example: verify@1
+        parallel_group_id:
+          oneOf:
+            - $ref: "#/components/schemas/StageId"
+            - type: "null"
+          description: >-
+            Exact StageId of the parent parallel execution. Clients can compare
+            this directly with a parallel stage's `id`. Null for stages that
+            are not parallel branches.
+          example: review_fork@1
+        parallel_branch_index:
+          type: ["integer", "null"]
+          format: uint32
+          minimum: 0
+          description: >-
+            Zero-based outgoing-edge index within the parent parallel
+            execution. Null for stages that are not parallel branches.
+          example: 1
         provider_used:
           oneOf:
             - $ref: "#/components/schemas/StageModelUsage"
