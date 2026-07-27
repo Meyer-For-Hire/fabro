@@ -116,7 +116,11 @@ export function RunTableRow({
       )}
       {show("size") && (
         <td className="whitespace-nowrap px-3 py-2.5 text-center">
-          {run.size != null && <SizeChip size={run.size} />}
+          {run.size != null && (
+            <span className="relative z-10 inline-flex">
+              <SizeChip size={run.size} totalUsdMicros={run.totalUsdMicros} />
+            </span>
+          )}
         </td>
       )}
       {show("changes") && (
