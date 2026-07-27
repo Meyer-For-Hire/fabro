@@ -5,6 +5,7 @@ use fabro_llm::client::Client;
 use fabro_llm::generate::{self, GenerateParams};
 use fabro_llm::types::TimeoutOptions;
 use fabro_model::ProviderId;
+use fabro_template::{TemplateContext, TemplateError};
 use fabro_types::{Graph, MAX_RUN_TITLE_CHARS, RunId};
 use serde::Serialize;
 use toml::Value as TomlValue;
@@ -12,11 +13,8 @@ use toml::Value as TomlValue;
 const TRUNCATED_MARKER: &str = "...[truncated]";
 const MAX_PROMPT_SECTION_CHARS: usize = 4_000;
 
-const TITLE_PROMPT_TEMPLATE: &str = include_str!("prompts/run_title.md");
-const MAX_CHARS_PLACEHOLDER: &str = "{max_chars}";
-const IDENTITY_PLACEHOLDER: &str = "{workflow_identity}";
-const INPUTS_PLACEHOLDER: &str = "{run_inputs}";
-const WORKFLOW_PLACEHOLDER: &str = "{workflow_summary}";
+const TITLE_PROMPT_NAME: &str = "run_title.md.j2";
+const TITLE_PROMPT_TEMPLATE: &str = include_str!("prompts/run_title.md.j2");
 
 pub(crate) struct TitlePromptInput<'a> {
     pub(crate) run_id:          &'a RunId,
@@ -35,7 +33,15 @@ pub(crate) struct GenerateTitleInput<'a> {
 
 pub(crate) async fn generate_title_or_current(input: GenerateTitleInput<'_>) -> String {
     let current_title = input.prompt.current_title.to_string();
-    let prompt = build_title_prompt(&input.prompt);
+    let prompt = match build_title_prompt(&input.prompt) {
+        Ok(prompt) => prompt,
+        Err(err) => {
+            // A checked-in template that will not render is a bug, not a
+            // transient failure, so this is louder than a generation miss.
+            tracing::warn!(error = %err, "Run title prompt template failed to render");
+            return current_title;
+        }
+    };
     let params = GenerateParams::new(input.model_id, input.client)
         .provider(input.provider_id.to_string())
         .prompt(prompt)
@@ -62,7 +68,7 @@ pub(crate) async fn generate_title_or_current(input: GenerateTitleInput<'_>) -> 
         .unwrap_or(current_title)
 }
 
-fn build_title_prompt(input: &TitlePromptInput<'_>) -> String {
+fn build_title_prompt(input: &TitlePromptInput<'_>) -> Result<String, TemplateError> {
     let workflow_identity = serde_json::json!({
         "run_id": input.run_id.to_string(),
         "current_deterministic_title": input.current_title,
@@ -74,20 +80,26 @@ fn build_title_prompt(input: &TitlePromptInput<'_>) -> String {
     let inputs = pretty_json(input.run_inputs);
     let workflow = pretty_json(input.workflow);
 
-    TITLE_PROMPT_TEMPLATE
-        .replace(MAX_CHARS_PLACEHOLDER, &MAX_RUN_TITLE_CHARS.to_string())
-        .replace(
-            IDENTITY_PLACEHOLDER,
-            &truncate_section(&identity, MAX_PROMPT_SECTION_CHARS),
-        )
-        .replace(
-            INPUTS_PLACEHOLDER,
-            &truncate_section(&inputs, MAX_PROMPT_SECTION_CHARS),
-        )
-        .replace(
-            WORKFLOW_PLACEHOLDER,
-            &truncate_section(&workflow, MAX_PROMPT_SECTION_CHARS),
-        )
+    let template_inputs = HashMap::from([
+        (
+            "max_chars".to_string(),
+            TomlValue::String(MAX_RUN_TITLE_CHARS.to_string()),
+        ),
+        (
+            "workflow_identity".to_string(),
+            TomlValue::String(truncate_section(&identity, MAX_PROMPT_SECTION_CHARS)),
+        ),
+        (
+            "run_inputs".to_string(),
+            TomlValue::String(truncate_section(&inputs, MAX_PROMPT_SECTION_CHARS)),
+        ),
+        (
+            "workflow_summary".to_string(),
+            TomlValue::String(truncate_section(&workflow, MAX_PROMPT_SECTION_CHARS)),
+        ),
+    ]);
+    let ctx = TemplateContext::new().with_inputs(template_inputs);
+    fabro_template::render_named(TITLE_PROMPT_NAME, TITLE_PROMPT_TEMPLATE, &ctx)
 }
 
 fn normalize_generated_title(title: &str) -> Option<String> {
@@ -196,21 +208,11 @@ mod tests {
         .unwrap()
     }
 
+    /// Strict rendering already fails on a variable the template asks for and
+    /// the caller does not supply. This covers the other direction: a variable
+    /// dropped from the template renders fine but silently starves the model.
     #[test]
-    fn prompt_template_placeholders_are_present_once_and_substituted_away() {
-        for placeholder in [
-            MAX_CHARS_PLACEHOLDER,
-            IDENTITY_PLACEHOLDER,
-            INPUTS_PLACEHOLDER,
-            WORKFLOW_PLACEHOLDER,
-        ] {
-            assert_eq!(
-                TITLE_PROMPT_TEMPLATE.matches(placeholder).count(),
-                1,
-                "run_title.md must contain {placeholder} exactly once"
-            );
-        }
-
+    fn prompt_template_renders_every_variable_the_caller_supplies() {
         let run_id = RunId::new();
         let graph = title_test_graph();
         let summary = workflow_summary(&graph);
@@ -220,12 +222,13 @@ mod tests {
             workflow_target: Some("workflow.fabro"),
             run_inputs:      &HashMap::new(),
             workflow:        &summary,
-        });
+        })
+        .unwrap();
 
-        assert!(!prompt.contains(IDENTITY_PLACEHOLDER));
-        assert!(!prompt.contains(INPUTS_PLACEHOLDER));
-        assert!(!prompt.contains(WORKFLOW_PLACEHOLDER));
         assert!(prompt.contains(&format!("no more than {MAX_RUN_TITLE_CHARS} characters")));
+        assert!(prompt.contains(&run_id.to_string()));
+        assert!(prompt.contains("\"stage_count\": 4"));
+        assert!(!prompt.contains("{{"));
     }
 
     #[test]
@@ -250,7 +253,8 @@ mod tests {
             workflow_target: Some("workflows/deploy.fabro"),
             run_inputs:      &inputs,
             workflow:        &summary,
-        });
+        })
+        .unwrap();
 
         assert!(prompt.contains("Deploy API token SECRET_123 to production"));
         assert!(prompt.contains("\"api_key\": \"SECRET_123\""));
@@ -276,7 +280,8 @@ mod tests {
             workflow_target: Some("workflow.fabro"),
             run_inputs:      &inputs,
             workflow:        &summary,
-        });
+        })
+        .unwrap();
 
         // Section truncation: per-section budget × 3 + small boilerplate.
         assert!(prompt.chars().count() < MAX_PROMPT_SECTION_CHARS * 3 + 1_000);

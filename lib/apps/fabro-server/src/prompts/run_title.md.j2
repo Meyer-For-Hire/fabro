@@ -27,19 +27,19 @@ Examples:
   -> "Fix flaky checkout test on release-9.2"
 
 Return only structured JSON with one field: {"title":"..."}.
-The title must be a single line, not blank, and no more than {max_chars} characters.
+The title must be a single line, not blank, and no more than {{ inputs.max_chars }} characters.
 
 Workflow identity:
 ```json
-{workflow_identity}
+{{ inputs.workflow_identity }}
 ```
 
 Run inputs (raw values, not redacted):
 ```json
-{run_inputs}
+{{ inputs.run_inputs }}
 ```
 
 Workflow summary:
 ```json
-{workflow_summary}
+{{ inputs.workflow_summary }}
 ```
