@@ -1316,15 +1316,17 @@ impl Catalog {
     }
 
     /// Small default model for a provider — the small/cheap utility model used
-    /// for metadata enrichment. Falls back to the provider's normal default
-    /// when no explicit small default is configured.
+    /// for metadata enrichment. `None` when the provider marks no small
+    /// default. Deliberately does not substitute the provider's normal
+    /// default, which is typically a large reasoning model: callers asking for
+    /// a small model give it a small token budget and a short timeout, and a
+    /// flagship model silently exceeds both.
     #[must_use]
     pub fn small_default_for_provider(&self, p: &ProviderId) -> Option<&Model> {
         let provider_id = self.provider(p).map_or(p, |provider| &provider.id);
         self.models
             .iter()
             .find(|m| &m.provider == provider_id && m.small_default)
-            .or_else(|| self.default_for_provider(provider_id))
     }
 
     /// Default model for the best-available provider (based on API keys),
@@ -1368,22 +1370,25 @@ impl Catalog {
             .unwrap_or_else(|| self.default_model())
     }
 
-    /// Small default model for the best-available built-in provider IDs,
-    /// falling back to the global catalog default.
+    /// Small default model for the best-available built-in provider IDs.
+    ///
+    /// Configured providers that mark no small default are skipped in favour
+    /// of a lower-priority provider that has one. Only when none of them does
+    /// is the ordinary default used.
     #[must_use]
     pub fn small_default_for_configured_ids(&self, configured: &[ProviderId]) -> &Model {
         if configured.is_empty() {
             return self.default_model();
         }
-        let configured = configured
+        let resolved = configured
             .iter()
             .filter_map(|id| self.provider(id).map(|provider| provider.id.clone()))
             .collect::<HashSet<_>>();
         self.providers
             .iter()
-            .filter(|provider| configured.contains(&provider.id))
+            .filter(|provider| resolved.contains(&provider.id))
             .find_map(|provider| self.small_default_for_provider(&provider.id))
-            .unwrap_or_else(|| self.default_model())
+            .unwrap_or_else(|| self.default_for_configured_ids(configured))
     }
 
     /// Probe model for a provider — the cheapest model suitable for
@@ -5064,7 +5069,7 @@ reasoning = false
     }
 
     #[test]
-    fn small_default_for_provider_falls_back_to_provider_default_when_no_small_default_marked() {
+    fn small_default_for_provider_returns_none_when_no_small_default_marked() {
         let layer = minimal_settings(
             r#"
 [providers.test]
@@ -5102,12 +5107,10 @@ reasoning = false
         );
         let catalog = Catalog::from_settings(&layer).unwrap();
 
-        assert_eq!(
+        assert!(
             catalog
                 .small_default_for_provider(&ProviderId::new("test"))
-                .unwrap()
-                .id,
-            "default_model"
+                .is_none()
         );
     }
 
@@ -5258,6 +5261,66 @@ reasoning = false
     }
 
     #[test]
+    fn small_default_for_configured_ids_skips_provider_without_a_small_model() {
+        let layer = minimal_settings(
+            r#"
+[providers.low]
+display_name = "Low"
+adapter = "openai"
+agent_profile = "openai"
+priority = 10
+
+[providers.high]
+display_name = "High"
+adapter = "openai"
+agent_profile = "openai"
+priority = 20
+
+[models.low_small]
+provider = "low"
+display_name = "Low Small"
+family = "test"
+small_default = true
+
+[models.low_small.limits]
+context_window = 1000
+
+[models.low_small.features]
+tools = false
+vision = false
+reasoning = false
+
+[models.high_default]
+provider = "high"
+display_name = "High Default"
+family = "test"
+default = true
+
+[models.high_default.limits]
+context_window = 1000
+
+[models.high_default.features]
+tools = false
+vision = false
+reasoning = false
+"#,
+        );
+        let catalog = Catalog::from_settings(&layer).unwrap();
+
+        // `high` outranks `low` but marks no small default, so selection moves
+        // on rather than substituting `high_default`.
+        assert_eq!(
+            catalog
+                .small_default_for_configured_ids(&[
+                    ProviderId::new("low"),
+                    ProviderId::new("high")
+                ])
+                .id,
+            "low_small"
+        );
+    }
+
+    #[test]
     fn small_default_for_configured_ids_falls_back_to_provider_default() {
         let layer = minimal_settings(
             r#"
@@ -5365,10 +5428,7 @@ small_default = false
         .expect("sparse built-in model override should build");
 
         let openai = ProviderId::openai();
-        assert_eq!(
-            catalog.small_default_for_provider(&openai).unwrap().id,
-            catalog.default_for_provider(&openai).unwrap().id
-        );
+        assert!(catalog.small_default_for_provider(&openai).is_none());
     }
 
     #[test]
