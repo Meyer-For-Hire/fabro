@@ -12,6 +12,12 @@ use toml::Value as TomlValue;
 const TRUNCATED_MARKER: &str = "...[truncated]";
 const MAX_PROMPT_SECTION_CHARS: usize = 4_000;
 
+const TITLE_PROMPT_TEMPLATE: &str = include_str!("prompts/run_title.md");
+const MAX_CHARS_PLACEHOLDER: &str = "{max_chars}";
+const IDENTITY_PLACEHOLDER: &str = "{workflow_identity}";
+const INPUTS_PLACEHOLDER: &str = "{run_inputs}";
+const WORKFLOW_PLACEHOLDER: &str = "{workflow_summary}";
+
 pub(crate) struct TitlePromptInput<'a> {
     pub(crate) run_id:          &'a RunId,
     pub(crate) current_title:   &'a str,
@@ -68,33 +74,20 @@ fn build_title_prompt(input: &TitlePromptInput<'_>) -> String {
     let inputs = pretty_json(input.run_inputs);
     let workflow = pretty_json(input.workflow);
 
-    format!(
-        r#"Generate a concise, human-readable title for this Fabro workflow run.
-
-Base the title on the workflow identity, workflow goal, and run input values.
-Preserve meaningful proper nouns, ticket IDs, repositories, branches, environments, and explicit user goals.
-Return only structured JSON with one field: {{"title":"..."}}.
-The title must be a single line, not blank, and no more than {MAX_RUN_TITLE_CHARS} characters.
-
-Workflow identity:
-```json
-{}
-```
-
-Run inputs (raw values, not redacted):
-```json
-{}
-```
-
-Workflow summary:
-```json
-{}
-```
-"#,
-        truncate_section(&identity, MAX_PROMPT_SECTION_CHARS),
-        truncate_section(&inputs, MAX_PROMPT_SECTION_CHARS),
-        truncate_section(&workflow, MAX_PROMPT_SECTION_CHARS),
-    )
+    TITLE_PROMPT_TEMPLATE
+        .replace(MAX_CHARS_PLACEHOLDER, &MAX_RUN_TITLE_CHARS.to_string())
+        .replace(
+            IDENTITY_PLACEHOLDER,
+            &truncate_section(&identity, MAX_PROMPT_SECTION_CHARS),
+        )
+        .replace(
+            INPUTS_PLACEHOLDER,
+            &truncate_section(&inputs, MAX_PROMPT_SECTION_CHARS),
+        )
+        .replace(
+            WORKFLOW_PLACEHOLDER,
+            &truncate_section(&workflow, MAX_PROMPT_SECTION_CHARS),
+        )
 }
 
 fn normalize_generated_title(title: &str) -> Option<String> {
@@ -201,6 +194,38 @@ mod tests {
             }"#,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn prompt_template_placeholders_are_present_once_and_substituted_away() {
+        for placeholder in [
+            MAX_CHARS_PLACEHOLDER,
+            IDENTITY_PLACEHOLDER,
+            INPUTS_PLACEHOLDER,
+            WORKFLOW_PLACEHOLDER,
+        ] {
+            assert_eq!(
+                TITLE_PROMPT_TEMPLATE.matches(placeholder).count(),
+                1,
+                "run_title.md must contain {placeholder} exactly once"
+            );
+        }
+
+        let run_id = RunId::new();
+        let graph = title_test_graph();
+        let summary = workflow_summary(&graph);
+        let prompt = build_title_prompt(&TitlePromptInput {
+            run_id:          &run_id,
+            current_title:   "Current",
+            workflow_target: Some("workflow.fabro"),
+            run_inputs:      &HashMap::new(),
+            workflow:        &summary,
+        });
+
+        assert!(!prompt.contains(IDENTITY_PLACEHOLDER));
+        assert!(!prompt.contains(INPUTS_PLACEHOLDER));
+        assert!(!prompt.contains(WORKFLOW_PLACEHOLDER));
+        assert!(prompt.contains(&format!("no more than {MAX_RUN_TITLE_CHARS} characters")));
     }
 
     #[test]
