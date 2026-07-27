@@ -263,11 +263,11 @@ inline array or a managed `blob://` or `file://` JSON artifact, then clones the
 target once per item. Nested `for_each` is not supported.
 
 Each clone receives the target's normal prompt followed by the item as pretty
-JSON inside a fresh random fence and a fixed notice that the content is data,
-not instructions. There is no item interpolation syntax. The fence prevents an
-item from closing its own data block, but it does not restrict an agent's tools;
-workflow authors must give the target only the tool access appropriate for
-untrusted item data.
+JSON inside a fresh `<untrusted-{16 lowercase hex}>` fence with a matching
+closing tag, plus a fixed notice that the content is data, not instructions.
+There is no item interpolation syntax. The fence prevents an item from closing
+its own data block, but it does not restrict an agent's tools; workflow authors
+must give the target only the tool access appropriate for untrusted item data.
 
 Dynamic results retain input order. Each result uses the template target ID and
 adds a zero-based `index` plus `item_label`, derived from the item's `name`,

@@ -132,8 +132,9 @@ reviewer -> aggregate
 The `routing` output schema merges `context_updates.candidates` into the flat
 `candidates` context key. `review_batch` accepts that inline array or its
 automatically offloaded managed artifact reference. It clones `reviewer` for
-each item, appends the item as pretty JSON inside a fresh matching fence, and
-keeps `parallel.results` in candidate order.
+each item, appends the item as pretty JSON inside a fresh
+`<untrusted-{16 lowercase hex}>` fence with a matching closing tag, and keeps
+`parallel.results` in candidate order.
 
 Each result has `id="reviewer"`, a zero-based `index`, and an `item_label`
 chosen from the item's `name`, then `label`, then index. An empty candidate
