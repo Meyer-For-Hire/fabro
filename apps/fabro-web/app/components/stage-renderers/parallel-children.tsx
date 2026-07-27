@@ -13,6 +13,8 @@ import { parseParallelOverview } from "./helpers";
 /** Branch row view state: completed outcomes plus a synthesized in-flight row. */
 interface BranchRow {
   id: string;
+  index: number | null;
+  itemLabel: string | null;
   status: StageState;
 }
 
@@ -53,8 +55,15 @@ function ChildRow({
       >
         {stageStatusLabel(result.status)}
       </span>
-      <span className="min-w-0 flex-1 truncate font-mono text-sm text-fg-3">
-        {result.id}
+      <span className="min-w-0 flex flex-1 items-baseline gap-2">
+        <span className="truncate font-mono text-sm text-fg-3">
+          {result.itemLabel ?? result.id}
+        </span>
+        {result.itemLabel && (
+          <span className="shrink-0 font-mono text-[11px] text-fg-muted">
+            {result.id}
+          </span>
+        )}
       </span>
       {stageHref && (
         <ArrowTopRightOnSquareIcon
@@ -104,11 +113,21 @@ export function ParallelChildren({
     return new Map(Array.from(latest.entries()).map(([nodeId, s]) => [nodeId, s.id]));
   }, [allStages]);
 
+  const resultCountByNode = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const result of overview.results) {
+      counts.set(result.id, (counts.get(result.id) ?? 0) + 1);
+    }
+    return counts;
+  }, [overview.results]);
+
   const items: BranchRow[] = overview.results.length > 0
     ? overview.results
     : overview.branchCount && overview.branchCount > 0
       ? Array.from({ length: overview.branchCount }, (_, i) => ({
           id: `branch ${i + 1}`,
+          index: i,
+          itemLabel: null,
           status: StageState.RUNNING,
         }))
       : [];
@@ -144,11 +163,16 @@ export function ParallelChildren({
         ) : (
           <ul className="divide-y divide-line rounded-lg bg-panel outline-1 -outline-offset-1 outline-line">
             {items.map((result, i) => {
-              const stageId = latestStageByNode.get(result.id);
+              // A node id alone cannot identify one dynamic item when several
+              // results share the template target. Avoid linking every row to
+              // whichever execution happened to finish last.
+              const stageId = resultCountByNode.get(result.id) === 1
+                ? latestStageByNode.get(result.id)
+                : null;
               const href = stageId ? `/runs/${runId}/stages/${stageId}` : null;
               return (
                 <ChildRow
-                  key={`${result.id}-${i}`}
+                  key={`${result.id}-${result.index ?? i}`}
                   result={result}
                   stageHref={href}
                 />

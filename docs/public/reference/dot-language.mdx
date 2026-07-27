@@ -253,8 +253,26 @@ audit [
 | Attribute | Type | Description |
 |---|---|---|
 | `max_parallel` | Integer | Maximum concurrent branches (default: 4). The node always waits for every branch. |
+| `for_each` | String | Flat runtime context key containing a JSON array. Runs the node's single agent or prompt target once per item. `context.items` first checks that exact key, then falls back to `items`. |
 
 For the first node in each branch, `fidelity` resolves from the fork-to-branch edge, then the branch node; without either, the fork preamble is inherited unchanged. Branch-specific preambles are rendered before fan-out from the fork's context snapshot. Concurrent branches cannot share sessions, so explicit branch `full` becomes `summary:high`, and branch-level `thread_id` is inert.
+
+When `for_each` is set, the parallel node must have exactly one outgoing edge,
+and its target must be an agent or prompt node. Fabro resolves the source as an
+inline array or a managed `blob://` or `file://` JSON artifact, then clones the
+target once per item. Nested `for_each` is not supported.
+
+Each clone receives the target's normal prompt followed by the item as pretty
+JSON inside a fresh random fence and a fixed notice that the content is data,
+not instructions. There is no item interpolation syntax. The fence prevents an
+item from closing its own data block, but it does not restrict an agent's tools;
+workflow authors must give the target only the tool access appropriate for
+untrusted item data.
+
+Dynamic results retain input order. Each result uses the template target ID and
+adds a zero-based `index` plus `item_label`, derived from the item's `name`,
+then `label`, then its index. An empty array succeeds and proceeds directly to
+the target's fan-in node without executing the unparameterized target.
 
 ### Wait nodes
 

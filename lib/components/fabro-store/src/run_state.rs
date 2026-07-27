@@ -2293,6 +2293,7 @@ mod tests {
                 "2026-04-07T12:00:00Z",
                 EventBody::ParallelBranchStarted(ParallelBranchStartedProps {
                     index:                 0,
+                    item_label:            None,
                     graph_visit:           None,
                     resumed_from_stage_id: None,
                 }),
@@ -2308,6 +2309,7 @@ mod tests {
                 4,
                 EventBody::ParallelBranchCompleted(ParallelBranchCompletedProps {
                     index:       0,
+                    item_label:  None,
                     duration_ms: 1234,
                     status:      StageOutcome::Succeeded,
                 }),
@@ -2334,6 +2336,7 @@ mod tests {
                 3,
                 EventBody::ParallelBranchStarted(ParallelBranchStartedProps {
                     index:                 0,
+                    item_label:            None,
                     graph_visit:           None,
                     resumed_from_stage_id: None,
                 }),
@@ -2345,6 +2348,7 @@ mod tests {
                 4,
                 EventBody::ParallelBranchCompleted(ParallelBranchCompletedProps {
                     index:       0,
+                    item_label:  None,
                     duration_ms: 500,
                     status:      StageOutcome::Failed {
                         retry_requested: false,

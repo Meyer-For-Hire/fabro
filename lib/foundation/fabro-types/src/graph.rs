@@ -169,6 +169,11 @@ impl Node {
     }
 
     #[must_use]
+    pub fn for_each(&self) -> Option<&str> {
+        self.str_attr("for_each")
+    }
+
+    #[must_use]
     pub fn output_schema(&self) -> Option<&str> {
         self.str_attr("output_schema")
     }
@@ -586,6 +591,7 @@ mod tests {
         assert_eq!(node.shape(), "box");
         assert_eq!(node.node_type(), None);
         assert_eq!(node.prompt(), None);
+        assert_eq!(node.for_each(), None);
         assert_eq!(node.output_schema(), None);
         assert_eq!(node.output_retries(), 2);
         assert_eq!(node.max_retries(), None);
@@ -637,6 +643,17 @@ mod tests {
         );
 
         assert_eq!(node.output_schema(), Some("routing"));
+    }
+
+    #[test]
+    fn node_for_each_returns_context_source() {
+        let mut node = Node::new("fanout");
+        node.attrs.insert(
+            "for_each".to_string(),
+            AttrValue::String("context.candidates".to_string()),
+        );
+
+        assert_eq!(node.for_each(), Some("context.candidates"));
     }
 
     #[test]

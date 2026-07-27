@@ -22,6 +22,8 @@ pub struct ParallelStartedProps {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ParallelBranchStartedProps {
     pub index:                 usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_label:            Option<String>,
     /// Graph visit of the branch target for this dispatch. The envelope
     /// `stage_id` ordinal counts executions, so a resumed fan-out's branches
     /// keep visit metadata even though their ordinals advanced.
@@ -35,6 +37,8 @@ pub struct ParallelBranchStartedProps {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ParallelBranchCompletedProps {
     pub index:       usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_label:  Option<String>,
     pub duration_ms: u64,
     pub status:      StageOutcome,
 }

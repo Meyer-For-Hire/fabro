@@ -660,10 +660,11 @@ mod tests {
             parallel_branch_id:    ParallelBranchId::new(StageId::new("fork1", 1), 0),
             branch:                "security".into(),
             index:                 0,
+            item_label:            Some("auth".into()),
         });
         let stage = &ui.stage.active_stages["fork1"];
         assert_eq!(stage.tool_calls.len(), 1);
-        assert_eq!(stage.tool_calls[0].tool_call_id, "security");
+        assert_eq!(stage.tool_calls[0].tool_call_id, "auth (security #0)");
         assert!(matches!(
             stage.tool_calls[0].status,
             ToolCallStatus::Running
@@ -674,6 +675,7 @@ mod tests {
             parallel_branch_id: ParallelBranchId::new(StageId::new("fork1", 1), 0),
             branch:             "security".into(),
             index:              0,
+            item_label:         Some("auth".into()),
             duration_ms:        2000,
             status:             fabro_workflow::outcome::StageOutcome::Succeeded,
         });
@@ -701,6 +703,7 @@ mod tests {
             parallel_branch_id:    ParallelBranchId::new(StageId::new("fork1", 1), 0),
             branch:                "security".into(),
             index:                 0,
+            item_label:            None,
         });
 
         let stage = &ui.stage.active_stages["fork1"];
@@ -1477,12 +1480,14 @@ mod tests {
             parallel_branch_id:    ParallelBranchId::new(StageId::new("fork1", 1), 0),
             branch:                "security".into(),
             index:                 0,
+            item_label:            None,
         });
         emit(&mut ui, Event::ParallelBranchCompleted {
             parallel_group_id:  StageId::new("fork1", 1),
             parallel_branch_id: ParallelBranchId::new(StageId::new("fork1", 1), 0),
             branch:             "security".into(),
             index:              0,
+            item_label:         None,
             duration_ms:        500,
             status:             fabro_workflow::outcome::StageOutcome::Succeeded,
         });

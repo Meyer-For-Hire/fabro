@@ -330,11 +330,15 @@ pub(super) fn from_run_event(stored: &RunEvent) -> Option<ProgressEvent> {
             delay_ms:     props.delay_ms,
         }),
         EventBody::ParallelStarted(_) => Some(ProgressEvent::ParallelStarted),
-        EventBody::ParallelBranchStarted(_) => {
-            Some(ProgressEvent::ParallelBranchStarted { branch: node_id })
-        }
+        EventBody::ParallelBranchStarted(props) => Some(ProgressEvent::ParallelBranchStarted {
+            branch: parallel_branch_display(&node_id, props.index, props.item_label.as_deref()),
+        }),
         EventBody::ParallelBranchCompleted(props) => Some(ProgressEvent::ParallelBranchCompleted {
-            branch:      node_id,
+            branch:      parallel_branch_display(
+                &node_id,
+                props.index,
+                props.item_label.as_deref(),
+            ),
             duration_ms: props.duration_ms,
             status:      props.status,
         }),
@@ -462,6 +466,13 @@ pub(super) fn from_run_event(stored: &RunEvent) -> Option<ProgressEvent> {
         }),
         _ => None,
     }
+}
+
+fn parallel_branch_display(node_id: &str, index: usize, item_label: Option<&str>) -> String {
+    item_label.map_or_else(
+        || node_id.to_string(),
+        |label| format!("{label} ({node_id} #{index})"),
+    )
 }
 
 pub(super) fn from_json_line(line: &str) -> Option<ProgressEvent> {

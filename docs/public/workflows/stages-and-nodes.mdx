@@ -168,6 +168,28 @@ fork -> quality
 | Attribute | Description |
 |---|---|
 | `max_parallel` | Maximum concurrent branches (default: 4) |
+| `for_each` | Flat context key containing a runtime JSON array. Requires one outgoing agent or prompt template target. |
+
+To run one template node for a runtime array, add `for_each`:
+
+```dot
+review_batch [shape=component, for_each="context.candidates", max_parallel=8]
+reviewer [prompt="Review this candidate for security issues."]
+aggregate [shape=tripleoctagon, prompt="Synthesize every candidate review."]
+
+review_batch -> reviewer -> aggregate
+```
+
+Fabro accepts an inline array or a managed JSON artifact reference. It runs
+`reviewer` once per item, appends the item to the prompt as fenced data, and
+keeps the results in input order. The source lookup is flat:
+`context.candidates` checks that exact key and then `candidates`; it does not
+traverse nested objects.
+
+The template target must be an agent or prompt node, and nested `for_each` is
+rejected. An empty source array succeeds with `parallel.results=[]` and skips
+straight to `aggregate`. Missing, invalid, or non-array sources fail the
+parallel stage before any branches start.
 
 Because the checkout is shared, file changes from one branch are immediately visible to the others. Concurrent writes can race or overwrite each other. Fabro does not isolate branch files, lock paths, detect conflicts, or warn about overlapping writes. Design branches to be read-only or assign each branch disjoint files and directories when deterministic workspace changes matter.
 

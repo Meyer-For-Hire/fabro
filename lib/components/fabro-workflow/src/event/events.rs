@@ -321,6 +321,8 @@ pub enum Event {
         branch:                String,
         index:                 usize,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_label:            Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         graph_visit:           Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         resumed_from_stage_id: Option<StageId>,
@@ -330,6 +332,8 @@ pub enum Event {
         parallel_branch_id: ParallelBranchId,
         branch:             String,
         index:              usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_label:         Option<String>,
         duration_ms:        u64,
         status:             StageOutcome,
     },

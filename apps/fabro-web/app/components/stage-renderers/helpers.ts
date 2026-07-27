@@ -147,6 +147,8 @@ export function parseHumanInterviewPairs(events: EventEnvelope[]): HumanIntervie
 /** Identity and outcome of one branch, parsed from `parallel.completed`. */
 export interface ParallelBranchSummary {
   id: string;
+  index: number | null;
+  itemLabel: string | null;
   status: StageOutcome;
 }
 
@@ -187,9 +189,11 @@ export function parseParallelOverview(events: EventEnvelope[]): ParallelOverview
           const record = entry && typeof entry === "object" ? (entry as UnknownRecord) : null;
           if (!record) return null;
           const id = getString(record, "id");
+          const index = getNumber(record, "index") ?? null;
+          const itemLabel = getString(record, "item_label") ?? null;
           const status = asStageOutcome(getString(record, "status"));
           if (!id || !status) return null;
-          return { id, status } satisfies ParallelBranchSummary;
+          return { id, index, itemLabel, status } satisfies ParallelBranchSummary;
         })
         .filter((r): r is ParallelBranchSummary => r != null);
       if (branchCount == null) branchCount = results.length;
