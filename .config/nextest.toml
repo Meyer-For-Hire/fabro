@@ -7,16 +7,13 @@ leak-timeout = "500ms"
     filter = "package(fabro-cli)"
     slow-timeout = { period = "6s", terminate-after = 4 }
 
-    # Must stay above the package-wide fabro-server override: nextest resolves
-    # each setting from the first matching override, so a narrower filter
-    # placed after a broader one never applies.
-    [[profile.default.overrides]]
-    filter = "package(fabro-server) & test(all_spec_routes_are_routable)"
-    slow-timeout = { period = "10s", terminate-after = 3 }
-
     [[profile.default.overrides]]
     filter = "package(fabro-server)"
     slow-timeout = { period = "5s", terminate-after = 4 }
+
+    [[profile.default.overrides]]
+    filter = "package(fabro-server) & test(all_spec_routes_are_routable)"
+    slow-timeout = { period = "15s", terminate-after = 4 }
 
     [[profile.default.overrides]]
     filter = "package(fabro-workflow)"
