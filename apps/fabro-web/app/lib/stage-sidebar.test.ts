@@ -4,22 +4,10 @@ import type { PaginatedRunStageList, StageHandler, StageState } from "@qltysh/fa
 import type { Stage } from "../components/stage-sidebar";
 import { aggregateGraphNodeStatus, formatStageLabel, mapRunStagesToSidebarStages } from "./stage-sidebar";
 import { makeBilledTokenCounts } from "./test-fixtures";
+import { makeStage as baseMakeStage } from "./test-utils";
 
 function makeStage(nodeId: string, visit: number, status: StageState): Stage {
-  return {
-    id: `${nodeId}@${visit}`,
-    name: nodeId,
-    handler: "agent",
-    nodeId,
-    visit,
-    graphVisit: null,
-    resumedFromStageId: null,
-    status,
-    duration: "--",
-    startedAt: null,
-    providerUsed: null,
-    billing: makeBilledTokenCounts(),
-  };
+  return baseMakeStage({ id: `${nodeId}@${visit}`, name: nodeId, nodeId, visit, status });
 }
 
 describe("mapRunStagesToSidebarStages", () => {
@@ -203,6 +191,28 @@ describe("mapRunStagesToSidebarStages", () => {
     const result = mapRunStagesToSidebarStages(stages);
     expect(result[0].graphVisit).toBeNull();
     expect(result[0].resumedFromStageId).toBeNull();
+  });
+
+  test("maps parallel branch identity without parsing it in the client", () => {
+    const stages: PaginatedRunStageList = {
+      data: [
+        {
+          id: "review_opus@2",
+          name: "review_opus",
+          handler: "agent",
+          status: "running",
+          node_id: "review_opus",
+          visit: 2,
+          parallel_group_id: "review_fork@1",
+          parallel_branch_index: 3,
+        },
+      ],
+      meta: { has_more: false },
+    };
+
+    const result = mapRunStagesToSidebarStages(stages);
+    expect(result[0].parallelGroupId).toBe("review_fork@1");
+    expect(result[0].parallelBranchIndex).toBe(3);
   });
 
   test("preserves the authoritative handler for renderer dispatch", () => {

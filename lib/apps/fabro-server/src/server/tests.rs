@@ -26,8 +26,8 @@ use fabro_types::settings::ServerAuthMethod;
 use fabro_types::settings::run::EnvironmentProvider;
 use fabro_types::{
     AgentBackend, AttrValue, AuthMethod, CommandTermination, FailureCategory, FailureDetail, Graph,
-    InterviewQuestionRecord, Node, Outcome, QuestionType, RunBlobId, RunId, RunSpec,
-    SandboxProviderKind, StageContextWindowBreakdownItem, StageContextWindowCategory,
+    InterviewQuestionRecord, Node, Outcome, ParallelBranchId, QuestionType, RunBlobId, RunId,
+    RunSpec, SandboxProviderKind, StageContextWindowBreakdownItem, StageContextWindowCategory,
     StageContextWindowCountMethod, StageContextWindowProjection, StageContextWindowStaleness,
     StageContextWindowWarning, StageModelUsage, StageTiming, SuccessReason, SystemActorKind,
     WorkflowSettings, fixtures, test_support,
@@ -4907,7 +4907,16 @@ async fn append_scoped_stage_event(
         parallel_group_id: None,
         parallel_branch_id: None,
     };
-    let stored = fabro_workflow::event::to_run_event_at(&run_id, event, Utc::now(), Some(&scope));
+    append_event_with_scope(state, run_id, event, &scope).await;
+}
+
+async fn append_event_with_scope(
+    state: &Arc<AppState>,
+    run_id: RunId,
+    event: &workflow_event::Event,
+    scope: &fabro_workflow::event::StageScope,
+) {
+    let stored = fabro_workflow::event::to_run_event_at(&run_id, event, Utc::now(), Some(scope));
     let payload = fabro_workflow::event::build_redacted_event_payload(&stored, &run_id).unwrap();
     let run_store = state.stores.runs.open_run(&run_id).await.unwrap();
     run_store.append_event(&payload).await.unwrap();
@@ -5561,6 +5570,77 @@ async fn list_run_stages_exposes_execution_identity_for_resumed_stage() {
     assert_eq!(second["visit"], 2);
     assert_eq!(second["graph_visit"], 1);
     assert_eq!(second["resumed_from_stage_id"], "work@1");
+}
+
+#[tokio::test]
+async fn list_run_stages_exposes_parallel_branch_identity() {
+    let state = test_app_state_with_isolated_storage();
+    let app = crate::test_support::build_test_router(Arc::clone(&state));
+    let run_id = RunId::new();
+
+    create_durable_run_with_events(&state, run_id, &[
+        workflow_event::Event::RunSubmitted {
+            definition_blob: None,
+        },
+        workflow_event::Event::RunStarting,
+        workflow_event::Event::RunRunning,
+    ])
+    .await;
+    append_scoped_stage_event(
+        &state,
+        run_id,
+        "ordinary",
+        1,
+        &workflow_event::Event::StageStarted {
+            graph_visit:           Some(1),
+            resumed_from_stage_id: None,
+            node_id:               "ordinary".to_string(),
+            name:                  "Ordinary".to_string(),
+            index:                 0,
+            handler_type:          "agent".to_string(),
+            attempt:               1,
+            max_attempts:          1,
+        },
+    )
+    .await;
+
+    let parallel_group_id = StageId::new("review_fork", 2);
+    let parallel_branch_id = ParallelBranchId::new(parallel_group_id.clone(), 4);
+    let branch_event = workflow_event::Event::ParallelBranchStarted {
+        parallel_group_id:     parallel_group_id.clone(),
+        parallel_branch_id:    parallel_branch_id.clone(),
+        branch:                "review_glm".to_string(),
+        index:                 4,
+        graph_visit:           Some(3),
+        resumed_from_stage_id: None,
+    };
+    let branch_scope = workflow_event::StageScope::for_parallel_branch(
+        "review_glm",
+        3,
+        parallel_group_id,
+        parallel_branch_id,
+    );
+    append_event_with_scope(&state, run_id, &branch_event, &branch_scope).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(api(&format!("/runs/{run_id}/stages")))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = response_json!(response, StatusCode::OK).await;
+
+    let branch = stage_entry(&body, "review_glm@3");
+    assert_eq!(branch["parallel_group_id"], "review_fork@2");
+    assert_eq!(branch["parallel_branch_index"], 4);
+
+    let ordinary = stage_entry(&body, "ordinary@1");
+    assert!(ordinary.get("parallel_group_id").is_none());
+    assert!(ordinary.get("parallel_branch_index").is_none());
 }
 
 #[tokio::test]

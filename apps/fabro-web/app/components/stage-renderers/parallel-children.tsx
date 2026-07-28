@@ -5,15 +5,17 @@ import { StageState } from "@qltysh/fabro-api-client";
 import type { EventEnvelope } from "@qltysh/fabro-api-client";
 
 import type { Stage } from "../stage-sidebar";
-import { stageStatusLabel, stageStatusTone } from "../../lib/stage-sidebar";
+import { formatStageLabel, stageStatusLabel, stageStatusTone } from "../../lib/stage-sidebar";
 import { formatDurationMs } from "../../lib/format";
 import { StageMetaBar } from "./meta-bar";
 import { parseParallelOverview } from "./helpers";
 
-/** Branch row view state: completed outcomes plus a synthesized in-flight row. */
+/** Branch row view state sourced from a live branch stage or completed result. */
 interface BranchRow {
-  id: string;
+  label: string;
   status: StageState;
+  /** Null when no stage backs this branch yet, which also means it is unlinkable. */
+  stageId: string | null;
 }
 
 function StatItem({
@@ -32,31 +34,33 @@ function StatItem({
       <span className="text-[10px] font-medium uppercase tracking-[0.16em] text-fg-muted">
         {label}
       </span>
-      <span className={`font-mono text-xl tabular-nums ${toneClass}`}>{value}</span>
+      <span data-stat={label} className={`font-mono text-xl tabular-nums ${toneClass}`}>
+        {value}
+      </span>
     </div>
   );
 }
 
 function ChildRow({
-  result,
-  stageHref,
+  row,
+  runId,
 }: {
-  result: BranchRow;
-  stageHref: string | null;
+  row: BranchRow;
+  runId: string;
 }) {
-  const tone = stageStatusTone(result.status);
+  const tone = stageStatusTone(row.status);
 
   const inner = (
     <>
       <span
         className={`inline-flex w-24 shrink-0 justify-center rounded-full px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider ${tone}`}
       >
-        {stageStatusLabel(result.status)}
+        {stageStatusLabel(row.status)}
       </span>
       <span className="min-w-0 flex-1 truncate font-mono text-sm text-fg-3">
-        {result.id}
+        {row.label}
       </span>
-      {stageHref && (
+      {row.stageId && (
         <ArrowTopRightOnSquareIcon
           className="size-3.5 shrink-0 text-fg-muted transition-colors group-hover:text-fg-2"
           aria-hidden="true"
@@ -67,9 +71,9 @@ function ChildRow({
 
   return (
     <li className="flex items-center gap-3 px-4 py-2.5">
-      {stageHref ? (
+      {row.stageId ? (
         <Link
-          to={stageHref}
+          to={`/runs/${runId}/stages/${row.stageId}`}
           className="group flex flex-1 items-center gap-3 rounded -m-1 p-1 transition-colors hover:bg-overlay focus-visible:bg-overlay focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-teal-500"
         >
           {inner}
@@ -94,40 +98,68 @@ export function ParallelChildren({
 }) {
   const overview = useMemo(() => parseParallelOverview(events), [events]);
 
-  // Map node_id -> latest stage_id so we can deep-link branches.
-  const latestStageByNode = useMemo(() => {
-    const latest = new Map<string, Stage>();
-    for (const s of allStages) {
-      const prev = latest.get(s.nodeId);
-      if (!prev || s.visit > prev.visit) latest.set(s.nodeId, s);
+  const stagesByBranchIndex = useMemo(() => {
+    const byIndex = new Map<number, Stage>();
+    for (const candidate of allStages) {
+      if (
+        candidate.parallelGroupId === stage.id
+        && candidate.parallelBranchIndex != null
+      ) {
+        byIndex.set(candidate.parallelBranchIndex, candidate);
+      }
     }
-    return new Map(Array.from(latest.entries()).map(([nodeId, s]) => [nodeId, s.id]));
-  }, [allStages]);
+    return byIndex;
+  }, [allStages, stage.id]);
 
-  const items: BranchRow[] = overview.results.length > 0
-    ? overview.results
-    : overview.branchCount && overview.branchCount > 0
-      ? Array.from({ length: overview.branchCount }, (_, i) => ({
-          id: `branch ${i + 1}`,
-          status: StageState.RUNNING,
-        }))
-      : [];
+  // Branch indexes are sparse: a branch queued behind `max_parallel` has no
+  // stage identity yet, and one cancelled while queued never gets one. Size the
+  // list from the highest index seen so a late-starting branch is never hidden.
+  const branchCount = Math.max(
+    overview.branchCount ?? 0,
+    overview.results.length,
+    ...Array.from(stagesByBranchIndex.keys(), (index) => index + 1),
+  );
+  const rows = Array.from({ length: branchCount }, (_, index): BranchRow => {
+    // A live branch stage is the freshest source; fall back to the completed
+    // event's result for runs whose branches predate parallel identity.
+    const branchStage = stagesByBranchIndex.get(index);
+    if (branchStage) {
+      return {
+        label: formatStageLabel(branchStage),
+        status: branchStage.status,
+        stageId: branchStage.id,
+      };
+    }
+    const result = overview.results[index];
+    if (result) {
+      return { label: result.id, status: result.status, stageId: null };
+    }
+    return { label: `Branch ${index + 1}`, status: StageState.PENDING, stageId: null };
+  });
+
+  // Count what is on screen, so the tiles can never contradict the rows.
+  let successCount = 0;
+  let failureCount = 0;
+  for (const row of rows) {
+    if (row.status === StageState.SUCCEEDED) successCount += 1;
+    else if (row.status === StageState.FAILED) failureCount += 1;
+  }
 
   return (
     <div className="space-y-6 pl-3 pr-4 sm:pr-6 lg:pr-8">
       <StageMetaBar stage={stage} />
 
       <section className="grid grid-cols-2 gap-x-6 gap-y-4 rounded-lg bg-panel p-5 outline-1 -outline-offset-1 outline-line sm:grid-cols-4">
-        <StatItem label="Branches" value={overview.branchCount ?? "—"} />
+        <StatItem label="Branches" value={branchCount || "—"} />
         <StatItem
           label="Succeeded"
-          value={overview.successCount ?? (overview.isComplete ? 0 : "—")}
+          value={successCount}
           tone="success"
         />
         <StatItem
           label="Failed"
-          value={overview.failureCount ?? (overview.isComplete ? 0 : "—")}
-          tone={overview.failureCount && overview.failureCount > 0 ? "danger" : "default"}
+          value={failureCount}
+          tone={failureCount > 0 ? "danger" : "default"}
         />
         <StatItem
           label="Duration"
@@ -139,21 +171,13 @@ export function ParallelChildren({
         <h3 className="mb-2 text-xs font-medium uppercase tracking-wider text-fg-muted">
           Branches
         </h3>
-        {items.length === 0 ? (
+        {rows.length === 0 ? (
           <p className="text-sm text-fg-muted">No branches recorded yet.</p>
         ) : (
           <ul className="divide-y divide-line rounded-lg bg-panel outline-1 -outline-offset-1 outline-line">
-            {items.map((result, i) => {
-              const stageId = latestStageByNode.get(result.id);
-              const href = stageId ? `/runs/${runId}/stages/${stageId}` : null;
-              return (
-                <ChildRow
-                  key={`${result.id}-${i}`}
-                  result={result}
-                  stageHref={href}
-                />
-              );
-            })}
+            {rows.map((row, index) => (
+              <ChildRow key={index} row={row} runId={runId} />
+            ))}
           </ul>
         )}
       </section>

@@ -88,6 +88,17 @@ export const STAGE_ACTIVITY_EVENT_TYPES = [
 ] as const;
 export type StageActivityEventType = (typeof STAGE_ACTIVITY_EVENT_TYPES)[number];
 const STAGE_ACTIVITY_EVENTS = new Set<string>(STAGE_ACTIVITY_EVENT_TYPES);
+// Parallel branches bypass the engine's `stage.started` / `stage.completed`
+// lifecycle (the parallel handler dispatches each branch directly), so
+// `STAGE_EVENTS` never fires for them. Without this set the stages list never
+// refetches while a fork runs and branch rows stay frozen at their first
+// observed state.
+const PARALLEL_EVENTS = new Set([
+  "parallel.started",
+  "parallel.branch.started",
+  "parallel.branch.completed",
+  "parallel.completed",
+]);
 const INTERVIEW_EVENTS = new Set([
   "interview.started",
   "interview.completed",
@@ -199,6 +210,19 @@ export function queryKeysForRunEvent(
     if (stageId) {
       keys.push(queryKeys.runs.stageEvents(runId, stageId));
       keys.push(queryKeys.runs.stageContextWindow(runId, stageId));
+    }
+    return keys;
+  }
+
+  if (PARALLEL_EVENTS.has(event)) {
+    const keys: Key[] = [
+      queryKeys.runs.stages(runId),
+      queryKeys.runs.events(runId, 1000),
+      queryKeys.runs.graph(runId, "LR"),
+      queryKeys.runs.graph(runId, "TB"),
+    ];
+    if (stageId) {
+      keys.push(queryKeys.runs.stageEvents(runId, stageId));
     }
     return keys;
   }
