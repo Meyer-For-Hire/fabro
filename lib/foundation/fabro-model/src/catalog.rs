@@ -747,6 +747,12 @@ impl Catalog {
                         &model.provider,
                     )?;
                 }
+                register_model_identifier(
+                    identifiers,
+                    resolved_settings.api_id.clone(),
+                    model.id.clone(),
+                    &model.provider,
+                )?;
 
                 if model.default {
                     defaults_by_provider
@@ -793,14 +799,14 @@ impl Catalog {
                 .then_with(|| left.id.cmp(&right.id))
         });
         warn_multiple_probe_models(&models_with_settings);
+        let (offering_index, provider_selector_index, canonical_candidates, alias_candidates) =
+            build_model_indexes(&models_with_settings);
         let mut model_settings_by_offering = HashMap::new();
         let mut models = Vec::new();
         for (model, settings) in models_with_settings {
             model_settings_by_offering.insert((model.provider.clone(), model.id.clone()), settings);
             models.push(model);
         }
-        let (offering_index, provider_selector_index, canonical_candidates, alias_candidates) =
-            build_model_indexes(&models);
 
         Ok(Self {
             models,
@@ -879,16 +885,20 @@ impl Catalog {
             .and_then(|idx| self.models.get(*idx))
     }
 
-    /// Look up a selector on exactly one provider, without considering
-    /// provider availability. Historical built-in API identifiers normalize
-    /// to their canonical model slug before lookup.
+    /// Look up a canonical ID, alias, or API ID on exactly one provider,
+    /// without considering provider availability. Exact provider-scoped
+    /// identifiers win before historical built-in API identifiers normalize
+    /// to their canonical model slug.
     #[must_use]
     pub fn get_on_provider(&self, provider: &ProviderId, selector: &str) -> Option<&Model> {
         let provider = self.provider(provider)?;
-        let selector = normalize_legacy_builtin_selector(selector);
-        self.provider_selector_index
-            .get(&(provider.id.clone(), selector.into_owned()))
-            .and_then(|idx| self.models.get(*idx))
+        let lookup = |selector: &str| {
+            self.provider_selector_index
+                .get(&(provider.id.clone(), selector.to_string()))
+        };
+        let index =
+            lookup(selector).or_else(|| lookup(&normalize_legacy_builtin_selector(selector)))?;
+        self.models.get(*index)
     }
 
     /// Look up a canonical offering by its composite identity.
@@ -900,7 +910,7 @@ impl Catalog {
             .and_then(|idx| self.models.get(*idx))
     }
 
-    /// Resolve a selector on exactly one provider.
+    /// Resolve a canonical ID, alias, or API ID on exactly one provider.
     pub fn resolve_on_provider(
         &self,
         provider: &ProviderId,
@@ -926,8 +936,9 @@ impl Catalog {
     /// Historical built-in API identifiers normalize to their canonical model
     /// slug before selection.
     ///
-    /// An explicit provider is a pin. Unqualified selection checks canonical
-    /// IDs before aliases and uses the catalog's provider priority ordering.
+    /// An explicit provider is a pin and also permits that provider's API IDs.
+    /// Unqualified selection checks canonical IDs before aliases and uses the
+    /// catalog's provider priority ordering.
     pub fn select<'a>(
         &'a self,
         selector: &str,
@@ -1487,12 +1498,12 @@ type ModelIndexes = (
     HashMap<String, Vec<usize>>,
 );
 
-fn build_model_indexes(models: &[Model]) -> ModelIndexes {
+fn build_model_indexes(models: &[(Model, CatalogModelSettings)]) -> ModelIndexes {
     let mut offering_index = HashMap::new();
     let mut provider_selector_index = HashMap::new();
     let mut canonical_candidates = HashMap::<ModelId, Vec<usize>>::new();
     let mut alias_candidates = HashMap::<String, Vec<usize>>::new();
-    for (idx, model) in models.iter().enumerate() {
+    for (idx, (model, settings)) in models.iter().enumerate() {
         offering_index.insert((model.provider.clone(), model.id.clone()), idx);
         provider_selector_index
             .insert((model.provider.clone(), model.id.as_str().to_string()), idx);
@@ -1504,6 +1515,7 @@ fn build_model_indexes(models: &[Model]) -> ModelIndexes {
             provider_selector_index.insert((model.provider.clone(), alias.clone()), idx);
             alias_candidates.entry(alias.clone()).or_default().push(idx);
         }
+        provider_selector_index.insert((model.provider.clone(), settings.api_id.clone()), idx);
     }
     (
         offering_index,
@@ -2861,7 +2873,7 @@ enabled = true
             catalog
                 .default_for_provider(&bedrock)
                 .map(|model| model.id.as_str()),
-            Some("claude-sonnet-4-6")
+            Some("claude-sonnet-5")
         );
         // Fable 5 ships with sampling params pinned off (the Converse
         // encoder drops temperature/top_p for it).
@@ -2869,18 +2881,27 @@ enabled = true
             .get_on_provider(&bedrock, "claude-fable-5")
             .expect("fable row should be present");
         assert!(!fable.features.sampling_params);
-        assert!(
-            catalog
-                .settings_for(fable)
-                .expect("fable settings should be present")
-                .reasoning_by_default
-        );
+        let fable_settings = catalog
+            .settings_for(fable)
+            .expect("fable settings should be present");
+        assert!(fable_settings.reasoning_by_default);
+        assert_eq!(fable_settings.agent_profile, AgentProfileKind::Claude5);
         assert_eq!(
             catalog
                 .model_settings_on_provider(&bedrock, "claude-fable-5")
                 .unwrap()
                 .billing_policy,
             BillingPolicy::Anthropic
+        );
+        let sonnet = catalog
+            .get_on_provider(&bedrock, "claude-sonnet-5")
+            .expect("Sonnet 5 row should be present");
+        assert_eq!(sonnet.limits.context_window, 1_000_000);
+        assert_eq!(sonnet.limits.max_output, Some(128_000));
+        assert!(!sonnet.features.sampling_params);
+        assert_eq!(
+            catalog.settings_for(sonnet).unwrap().agent_profile,
+            AgentProfileKind::Claude5
         );
     }
 
@@ -3028,7 +3049,7 @@ enabled = true
         // open-weights rows inherit it.
         assert_eq!(
             catalog
-                .model_settings_on_provider(&openrouter, "claude-sonnet-4-6")
+                .model_settings_on_provider(&openrouter, "claude-sonnet-5")
                 .unwrap()
                 .billing_policy,
             BillingPolicy::Anthropic
@@ -3044,7 +3065,7 @@ enabled = true
             catalog
                 .default_for_provider(&openrouter)
                 .map(|model| model.id.as_str()),
-            Some("claude-sonnet-4-6")
+            Some("claude-sonnet-5")
         );
     }
 
@@ -3137,6 +3158,19 @@ enabled = true
                 true,
                 BillingPolicy::Anthropic,
             ),
+            (
+                "claude-sonnet-5",
+                "anthropic/claude-sonnet-5",
+                "claude-5",
+                1_000_000,
+                2.0,
+                10.0,
+                0.2,
+                ReasoningEffortFeature::Levels,
+                false,
+                true,
+                BillingPolicy::Anthropic,
+            ),
         ];
 
         for (
@@ -3188,13 +3222,21 @@ enabled = true
                 ReasoningEffort::VARIANTS,
                 "{id}"
             );
+            if family == "claude-5" {
+                assert_eq!(settings.agent_profile, AgentProfileKind::Claude5, "{id}");
+            }
         }
 
-        for alias in ["opus", "claude-opus"] {
+        for (alias, expected) in [
+            ("opus", "claude-opus-5"),
+            ("claude-opus", "claude-opus-5"),
+            ("sonnet", "claude-sonnet-5"),
+            ("claude-sonnet", "claude-sonnet-5"),
+        ] {
             let model = catalog
                 .resolve_on_provider(&ProviderId::new("openrouter"), alias)
                 .unwrap_or_else(|error| panic!("{alias} should resolve on OpenRouter: {error}"));
-            assert_eq!(model.id, "claude-opus-5", "{alias}");
+            assert_eq!(model.id, expected, "{alias}");
         }
     }
 
@@ -3503,6 +3545,174 @@ enabled = true
             ReasoningEffort::High,
             ReasoningEffort::Max,
         ]);
+    }
+
+    #[test]
+    fn builtin_modal_provider_is_opt_in() {
+        let modal = ProviderId::new("modal");
+        let builtin = Catalog::builtin();
+
+        assert!(builtin.provider(&modal).is_none());
+        assert!(builtin.list(Some(&modal)).is_empty());
+
+        let catalog = Catalog::from_builtin_with_overrides(&minimal_settings(
+            r"
+[providers.modal]
+enabled = true
+",
+        ))
+        .expect("enabled Modal override should build from the built-in provider settings");
+
+        let provider = catalog
+            .provider(&modal)
+            .expect("enabled Modal provider should be present");
+        assert_eq!(provider.adapter, AdapterKind::OpenAiCompatible);
+        assert_eq!(provider.codec, CodecKind::OpenAiCompatible);
+        assert_eq!(provider.agent_profile, AgentProfileKind::Kimi);
+        assert_eq!(provider.billing_policy, BillingPolicy::OpenAi);
+        assert_eq!(provider.priority, 30);
+        assert!(provider.auth.is_none());
+        assert_eq!(
+            provider.extra_headers,
+            HashMap::from([
+                (
+                    "Modal-Key".to_string(),
+                    "{{ secrets.MODAL_TOKEN_ID }}".to_string(),
+                ),
+                (
+                    "Modal-Secret".to_string(),
+                    "{{ secrets.MODAL_TOKEN_SECRET }}".to_string(),
+                ),
+            ])
+        );
+
+        // Modal assigns the endpoint URL per deployment, so the built-in entry
+        // ships without one and the operator supplies it through settings.
+        assert!(provider.base_url.is_none());
+        let catalog = Catalog::from_builtin_with_overrides(&minimal_settings(
+            r#"
+[providers.modal]
+enabled = true
+base_url = "https://example--kimi-k3.modal.run/v1"
+"#,
+        ))
+        .expect("Modal base URL override should build");
+        assert_eq!(
+            catalog
+                .provider(&modal)
+                .and_then(|provider| provider.base_url.as_deref()),
+            Some("https://example--kimi-k3.modal.run/v1")
+        );
+    }
+
+    #[test]
+    fn builtin_modal_includes_kimi_k3_when_enabled() {
+        let modal = ProviderId::new("modal");
+        let catalog = Catalog::from_builtin_with_overrides(&minimal_settings(
+            r"
+[providers.modal]
+enabled = true
+",
+        ))
+        .expect("enabled Modal override should build from the built-in provider settings");
+
+        assert_eq!(catalog.list(Some(&modal)).len(), 1);
+        let model = catalog
+            .get_on_provider(&modal, "kimi-k3")
+            .expect("Modal Kimi K3 should be present");
+        insta::assert_debug_snapshot!(model, @r#"
+        Model {
+            id: "kimi-k3",
+            provider: modal,
+            family: "kimi-k3",
+            display_name: "Kimi K3 (via Modal)",
+            limits: ModelLimits {
+                context_window: 1048576,
+                max_output: Some(
+                    131072,
+                ),
+            },
+            training: None,
+            knowledge_cutoff: None,
+            features: ModelFeatures {
+                tools: true,
+                vision: true,
+                reasoning: true,
+                reasoning_effort: AlwaysAdaptive,
+                prompt_cache: true,
+                cache_control_breakpoints: false,
+                sampling_params: false,
+            },
+            controls: ModelControls {
+                reasoning_effort: [
+                    Low,
+                    High,
+                    Max,
+                ],
+            },
+            costs: ModelCosts {
+                input_cost_per_mtok: Some(
+                    3.0,
+                ),
+                output_cost_per_mtok: Some(
+                    15.0,
+                ),
+                cache_input_cost_per_mtok: Some(
+                    0.3,
+                ),
+            },
+            estimated_output_tps: Some(
+                460.0,
+            ),
+            aliases: [],
+            default: true,
+            small_default: false,
+            configured: false,
+        }
+        "#);
+
+        let settings = catalog
+            .model_settings_on_provider(&modal, "kimi-k3")
+            .expect("Modal Kimi K3 settings should be present");
+        assert_eq!(settings.api_id, "moonshotai/Kimi-K3");
+        assert_eq!(settings.agent_profile, AgentProfileKind::Kimi);
+        assert_eq!(settings.billing_policy, BillingPolicy::OpenAi);
+        assert_eq!(settings.controls.reasoning_effort, vec![
+            ReasoningEffort::Low,
+            ReasoningEffort::High,
+            ReasoningEffort::Max,
+        ]);
+    }
+
+    #[test]
+    fn builtin_kimi_k3_selection_prefers_direct_kimi_then_modal_over_openrouter() {
+        let kimi = ProviderId::new("kimi");
+        let modal = ProviderId::new("modal");
+        let openrouter = ProviderId::new("openrouter");
+        let catalog = Catalog::from_builtin_with_overrides(&minimal_settings(
+            r"
+[providers.modal]
+enabled = true
+
+[providers.openrouter]
+enabled = true
+",
+        ))
+        .expect("enabled Modal and OpenRouter overrides should build");
+
+        let selected = catalog
+            .select(
+                "kimi-k3",
+                None,
+                &HashSet::from([kimi.clone(), modal.clone(), openrouter.clone()]),
+            )
+            .expect("direct Kimi should win portable Kimi K3 selection");
+        assert_eq!(selected.provider, kimi);
+
+        let selected = catalog
+            .select("kimi-k3", None, &HashSet::from([modal.clone(), openrouter]))
+            .expect("Modal should win gateway-only Kimi K3 selection");
+        assert_eq!(selected.provider, modal);
     }
 
     #[test]
@@ -3883,7 +4093,7 @@ enabled = true
         let m = Catalog::builtin()
             .default_for_provider(&ProviderId::anthropic())
             .unwrap();
-        assert_eq!(m.id, "claude-sonnet-4-6");
+        assert_eq!(m.id, "claude-sonnet-5");
         assert!(m.default);
 
         let m = Catalog::builtin()
@@ -4256,9 +4466,15 @@ codec = "anthropic_messages"
     }
 
     #[test]
-    fn catalog_from_settings_rejects_duplicate_model_aliases() {
-        let layer = minimal_settings(
-            r#"
+    /// Canonical IDs, aliases, and API IDs share one identifier namespace per
+    /// provider, so a collision in any of them is rejected the same way.
+    fn catalog_from_settings_rejects_duplicate_provider_model_selectors() {
+        for (declaration, expected) in [
+            (r#"aliases = ["shared"]"#, "shared"),
+            (r#"api_id = "vendor/shared""#, "vendor/shared"),
+        ] {
+            let layer = minimal_settings(&format!(
+                r#"
 [providers.test]
 display_name = "Test"
 adapter = "openai"
@@ -4268,7 +4484,7 @@ enabled = true
 [providers.test.models.one]
 display_name = "One"
 family = "test"
-aliases = ["shared"]
+{declaration}
 
 [providers.test.models.one.limits]
 context_window = 1000
@@ -4281,7 +4497,7 @@ reasoning = false
 [providers.test.models.two]
 display_name = "Two"
 family = "test"
-aliases = ["shared"]
+{declaration}
 
 [providers.test.models.two.limits]
 context_window = 1000
@@ -4290,22 +4506,75 @@ context_window = 1000
 tools = false
 vision = false
 reasoning = false
-"#,
-        );
+"#
+            ));
 
-        let err = Catalog::from_settings(&layer).unwrap_err();
+            let err = Catalog::from_settings(&layer).unwrap_err();
+
+            assert!(
+                matches!(
+                    &err,
+                    CatalogBuildError::DuplicateProviderModelSelector {
+                        provider,
+                        selector,
+                        first,
+                        second,
+                    } if provider == &ProviderId::new("test")
+                        && selector == expected
+                        && first == "one"
+                        && second == "two"
+                ),
+                "{declaration}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_scoped_lookup_accepts_canonical_alias_and_api_id_selectors() {
+        let catalog = Catalog::from_settings(&minimal_settings(
+            r#"
+[providers.test]
+display_name = "Test"
+adapter = "openai"
+agent_profile = "openai"
+aliases = ["test-alias"]
+
+[providers.test.models.one]
+api_id = "vendor/models/one:latest"
+display_name = "One"
+family = "test"
+aliases = ["one-alias"]
+default = true
+
+[providers.test.models.one.limits]
+context_window = 1000
+
+[providers.test.models.one.features]
+tools = false
+vision = false
+reasoning = false
+"#,
+        ))
+        .expect("provider-scoped selector fixture should build");
+
+        for selector in ["one", "one-alias", "vendor/models/one:latest"] {
+            let model = catalog
+                .resolve_on_provider(&ProviderId::new("test-alias"), selector)
+                .unwrap_or_else(|error| {
+                    panic!("selector '{selector}' should resolve on provider alias: {error}")
+                });
+            assert_eq!(model.provider, ProviderId::new("test"), "{selector}");
+            assert_eq!(model.id, "one", "{selector}");
+        }
 
         assert!(matches!(
-            err,
-            CatalogBuildError::DuplicateProviderModelSelector {
-                provider,
-                selector,
-                first,
-                second,
-            } if provider == ProviderId::new("test")
-                && selector == "shared"
-                && first == "one"
-                && second == "two"
+            catalog.select(
+                "vendor/models/one:latest",
+                None,
+                &HashSet::from([ProviderId::new("test")]),
+            ),
+            Err(ModelSelectionError::UnknownSelector { selector })
+                if selector == "vendor/models/one:latest"
         ));
     }
 

@@ -67,6 +67,12 @@ impl AsRef<str> for AdapterKind {
 #[strum(serialize_all = "snake_case")]
 pub enum AgentProfileKind {
     Anthropic,
+    /// Claude 5 models trained against Anthropic's current coding-agent
+    /// harness. This remains model-scoped so older Claude models keep the
+    /// established Anthropic profile.
+    #[serde(rename = "claude-5")]
+    #[strum(to_string = "claude-5")]
+    Claude5,
     #[serde(rename = "openai")]
     #[strum(to_string = "openai")]
     OpenAi,

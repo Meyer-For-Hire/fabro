@@ -15,12 +15,12 @@ use fabro_sandbox::from_environment::{
 };
 use fabro_sandbox::{DockerSandboxOptions, SandboxSpec};
 use fabro_static::EnvVars;
+use fabro_types::settings::ResolvedModelRef;
 use fabro_types::settings::run::{
     ApprovalMode, McpServerSettings as ResolvedMcpServerSettings, PullRequestSettings,
     ResolvedMcpEntry, RunMode, RunModelSettings as ResolvedRunModelSettings,
     RunNamespace as ResolvedRunSettings, RunPrepareSettings as ResolvedRunPrepareSettings,
 };
-use fabro_types::settings::{ModelRegistry, ResolvedModelRef};
 use fabro_types::{ManifestPath, RunId, RunRunnableSource, SandboxProviderKind};
 use fabro_vault::Vault;
 use tokio::runtime::Handle;
@@ -635,12 +635,11 @@ fn resolve_fallback_chain(
     if settings.fallbacks.is_empty() {
         return Ok(Vec::new());
     }
-    let registry = CatalogModelRegistry { catalog };
     let primary = catalog.get_on_provider(provider, model);
     let mut chain = Vec::new();
 
     for model_ref in &settings.fallbacks {
-        match model_ref.resolve(&registry)? {
+        match model_ref.resolve(catalog)? {
             ResolvedModelRef::Provider(provider_name) => {
                 let provider_id = canonical_provider_id(catalog, &provider_name);
                 if !eligible.contains(&provider_id) {
@@ -660,14 +659,14 @@ fn resolve_fallback_chain(
             }
             ResolvedModelRef::Model {
                 provider: fallback_provider,
-                model,
+                selector,
             } => {
                 if let Some(provider) = fallback_provider {
                     let provider = canonical_provider_id(catalog, &provider);
                     if !eligible.contains(&provider) {
                         return Err(ModelSelectionError::ProviderUnavailable { provider }.into());
                     }
-                    match catalog.resolve_on_provider(&provider, &model) {
+                    match catalog.resolve_on_provider(&provider, &selector) {
                         Ok(info) => chain.push(FallbackTarget {
                             provider: info.provider.to_string(),
                             model:    info.id.to_string(),
@@ -675,13 +674,13 @@ fn resolve_fallback_chain(
                         Err(ModelSelectionError::UnknownSelectorOnProvider { .. }) => {
                             chain.push(FallbackTarget {
                                 provider: provider.to_string(),
-                                model,
+                                model:    selector,
                             });
                         }
                         Err(error) => return Err(error.into()),
                     }
                 } else {
-                    match catalog.select(&model, None, eligible) {
+                    match catalog.select(&selector, None, eligible) {
                         Ok(info) => chain.push(FallbackTarget {
                             provider: info.provider.to_string(),
                             model:    info.id.to_string(),
@@ -689,7 +688,7 @@ fn resolve_fallback_chain(
                         Err(ModelSelectionError::UnknownSelector { .. }) => {
                             chain.push(FallbackTarget {
                                 provider: provider.to_string(),
-                                model,
+                                model:    selector,
                             });
                         }
                         Err(error) => return Err(error.into()),
@@ -706,20 +705,6 @@ fn canonical_provider_id(catalog: &Catalog, provider_name: &str) -> ProviderId {
     catalog
         .provider(&provider_id)
         .map_or(provider_id, |provider| provider.id.clone())
-}
-
-struct CatalogModelRegistry<'a> {
-    catalog: &'a Catalog,
-}
-
-impl ModelRegistry for CatalogModelRegistry<'_> {
-    fn is_provider(&self, token: &str) -> bool {
-        self.catalog.provider(&ProviderId::from(token)).is_some()
-    }
-
-    fn is_model(&self, token: &str) -> bool {
-        self.catalog.is_model_selector(token)
-    }
 }
 
 /// Build the launch-time MCP config from resolved settings. Secret tokens in
@@ -1325,7 +1310,7 @@ reasoning = false
     fn resolve_fallback_chain_resolves_explicit_model_fallbacks() {
         let catalog = test_catalog();
         let settings = ResolvedRunModelSettings {
-            fallbacks: vec!["openai/gpt-5.4-mini".parse::<ModelRef>().unwrap()],
+            fallbacks: vec!["openai:gpt-5.4-mini".parse::<ModelRef>().unwrap()],
             ..ResolvedRunModelSettings::default()
         };
 
@@ -1371,7 +1356,7 @@ reasoning = false
     fn resolve_fallback_chain_resolves_provider_qualified_shared_alias() {
         let catalog = portable_model_catalog();
         let settings = ResolvedRunModelSettings {
-            fallbacks: vec!["openrouter/gpt-56-sol".parse::<ModelRef>().unwrap()],
+            fallbacks: vec!["openrouter:gpt-56-sol".parse::<ModelRef>().unwrap()],
             ..ResolvedRunModelSettings::default()
         };
 
@@ -1387,6 +1372,85 @@ reasoning = false
         assert_eq!(chain, vec![FallbackTarget {
             provider: "openrouter".to_string(),
             model:    "gpt-5.6-sol".to_string(),
+        }]);
+    }
+
+    /// A qualified fallback resolves to the same offering whether the selector
+    /// is the canonical model ID or the provider's API ID. The trailing bare
+    /// alias still goes through ready-provider priority selection.
+    #[test]
+    fn resolve_fallback_chain_resolves_qualified_model_id_and_api_id_alike() {
+        let overrides: fabro_model::catalog::LlmCatalogSettings = toml::from_str(
+            r"
+[providers.openrouter]
+enabled = true
+",
+        )
+        .unwrap();
+        let catalog = Catalog::from_builtin_with_overrides(&overrides).unwrap();
+
+        for selector in ["openrouter:kimi-k3", "openrouter:moonshotai/kimi-k3"] {
+            let settings = ResolvedRunModelSettings {
+                fallbacks: vec![
+                    selector.parse::<ModelRef>().unwrap(),
+                    "gpt-terra".parse::<ModelRef>().unwrap(),
+                ],
+                ..ResolvedRunModelSettings::default()
+            };
+
+            let chain = resolve_fallback_chain(
+                &catalog,
+                &ProviderId::new("kimi"),
+                "kimi-k3",
+                &settings,
+                &HashSet::from([
+                    ProviderId::new("kimi"),
+                    ProviderId::new("openrouter"),
+                    ProviderId::openai(),
+                ]),
+            )
+            .unwrap();
+
+            assert_eq!(
+                chain,
+                vec![
+                    FallbackTarget {
+                        provider: "openrouter".to_string(),
+                        model:    "kimi-k3".to_string(),
+                    },
+                    FallbackTarget {
+                        provider: "openai".to_string(),
+                        model:    "gpt-5.6-terra".to_string(),
+                    },
+                ],
+                "{selector}"
+            );
+        }
+    }
+
+    /// A colon in a model ID does not make it provider-qualified, so an
+    /// unknown colon-bearing selector still passes through to a provider
+    /// instead of failing the run with an unknown-provider error.
+    #[test]
+    fn resolve_fallback_chain_passes_through_colon_bearing_model_ids() {
+        let catalog = portable_model_catalog();
+        let settings = ResolvedRunModelSettings {
+            fallbacks: vec!["future-model:latest".parse::<ModelRef>().unwrap()],
+            ..ResolvedRunModelSettings::default()
+        };
+
+        let chain = resolve_fallback_chain(
+            &catalog,
+            &ProviderId::openai(),
+            "gpt-5.6-sol",
+            &settings,
+            &HashSet::from([ProviderId::openai(), ProviderId::new("openrouter")]),
+        )
+        .unwrap();
+
+        assert_eq!(chain, vec![FallbackTarget {
+            provider: ProviderId::openai().to_string(),
+            model:    "future-model:latest".to_string(),
         }]);
     }
 

@@ -627,6 +627,9 @@ impl RunProjectionReducer for RunProjection {
                     stage
                         .resumed_from_stage_id
                         .clone_from(&props.resumed_from_stage_id);
+                    stage
+                        .parallel_branch_id
+                        .clone_from(&stored.parallel_branch_id);
                 }
                 stage.state = StageState::Running;
             }
@@ -1620,9 +1623,9 @@ mod tests {
         AgentBackend, AgentControlState, AttrValue, AutomationRef, BilledModelUsage,
         BilledTokenCounts, BlockedReason, Checkpoint, CheckpointRecord, CommandTermination,
         EventBody, FailureCategory, FailureDetail, FailureReason, Graph, McpServerStatus, Node,
-        Outcome, PendingReason, PermissionLevel, PullRequestLink, QuestionType, ReasoningEffort,
-        RunApprovalState, RunBlobId, RunControlAction, RunDiff, RunEvent, RunSize, RunSpec,
-        RunStatus, Speed, StageContextWindowBreakdownItem, StageContextWindowCategory,
+        Outcome, ParallelBranchId, PendingReason, PermissionLevel, PullRequestLink, QuestionType,
+        ReasoningEffort, RunApprovalState, RunBlobId, RunControlAction, RunDiff, RunEvent, RunSize,
+        RunSpec, RunStatus, Speed, StageContextWindowBreakdownItem, StageContextWindowCategory,
         StageContextWindowCountMethod, StageContextWindowProjection, StageContextWindowStaleness,
         StageContextWindowWarning, StageHandler, StageModelUsage, StageOutcome, StageState,
         StageTiming, SubAgentStatus, SuccessReason, WorkflowSettings, first_event_seq, fixtures,
@@ -2153,6 +2156,18 @@ mod tests {
     fn test_stage_event(seq: u32, body: EventBody, stage_id: StageId) -> EventEnvelope {
         let mut event = test_event(seq, body, Some(stage_id.node_id()));
         event.event.stage_id = Some(stage_id);
+        event
+    }
+
+    fn test_branch_event(
+        seq: u32,
+        body: EventBody,
+        stage_id: StageId,
+        branch_id: ParallelBranchId,
+    ) -> EventEnvelope {
+        let mut event = test_stage_event(seq, body, stage_id);
+        event.event.parallel_group_id = Some(branch_id.group().clone());
+        event.event.parallel_branch_id = Some(branch_id);
         event
     }
 
@@ -2845,6 +2860,53 @@ mod tests {
         let stage = state.stage(&stage_id).unwrap();
         assert_eq!(stage.first_event_seq, first_event_seq(3));
         assert_eq!(stage.prompt.as_deref(), Some("prompt"));
+    }
+
+    #[test]
+    fn parallel_branch_started_projects_identity_without_churning_it() {
+        let mut state = initialized_projection();
+        let group_id = StageId::new("review_fork", 1);
+        let branch_stage_id = StageId::new("review_glm", 1);
+        let branch_id = ParallelBranchId::new(group_id.clone(), 0);
+        let started = test_branch_event(
+            3,
+            EventBody::ParallelBranchStarted(ParallelBranchStartedProps {
+                index:                 0,
+                graph_visit:           Some(1),
+                resumed_from_stage_id: None,
+            }),
+            branch_stage_id.clone(),
+            branch_id.clone(),
+        );
+
+        state.apply_event(&started).unwrap();
+
+        assert_eq!(
+            state
+                .stage(&branch_stage_id)
+                .unwrap()
+                .parallel_branch_id
+                .as_ref(),
+            Some(&branch_id)
+        );
+
+        let reobserved = test_branch_event(
+            4,
+            EventBody::ParallelBranchStarted(ParallelBranchStartedProps {
+                index:                 1,
+                graph_visit:           Some(2),
+                resumed_from_stage_id: Some(StageId::new("review_glm", 2)),
+            }),
+            branch_stage_id.clone(),
+            ParallelBranchId::new(group_id, 1),
+        );
+
+        state.apply_event(&reobserved).unwrap();
+
+        let stage = state.stage(&branch_stage_id).unwrap();
+        assert_eq!(stage.parallel_branch_id.as_ref(), Some(&branch_id));
+        assert_eq!(stage.graph_visit, Some(1));
+        assert!(stage.resumed_from_stage_id.is_none());
     }
 
     #[test]

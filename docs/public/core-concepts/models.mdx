@@ -180,6 +180,23 @@ Fabro ships an [OpenRouter](/integrations/openrouter) provider definition with a
 enabled = true
 ```
 
+### Modal
+
+Fabro ships a [Modal](/integrations/modal) provider definition for Kimi K3, disabled by default. Modal assigns the endpoint URL and authenticates requests with a two-part proxy token:
+
+```toml title="settings.toml"
+[llm.providers.modal]
+enabled = true
+base_url = "https://your-endpoint.modal.run/v1"
+```
+
+Store both token values in the Fabro server vault:
+
+```bash
+fabro secret set MODAL_TOKEN_ID wk-...
+fabro secret set MODAL_TOKEN_SECRET ws-...
+```
+
 ### Amazon Bedrock
 
 Fabro ships an [Amazon Bedrock](/integrations/bedrock) provider definition with a curated multi-vendor catalog over Bedrock's Converse API, disabled by default. Enable it and authenticate with a Bedrock API key or AWS SigV4 credentials:
@@ -277,7 +294,7 @@ Then launch with:
 fabro run run.toml
 ```
 
-The `fallbacks` array is optional. Each entry may be a bare provider token (like `"gemini"`), a bare model alias (like `"gpt-5.4"`), or a qualified `"provider/model"` reference. Fabro tries them in order when the primary provider is unavailable. In this field, qualified references keep their established provider-pin meaning: `"openai/gpt-5.6-sol"` selects the direct OpenAI offering.
+The `fallbacks` array is optional. Each entry may be a bare provider token (like `"gemini"`), a bare model ID or alias (like `"gpt-terra"`), or a qualified `"provider:selector"` reference. A qualified selector may be the provider's canonical model ID, alias, or API ID, including API IDs with slashes such as `"openrouter:moonshotai/kimi-k3"`. Fabro tries entries in order when the primary provider is unavailable, and qualified references remain provider pins. Legacy `provider/model` references remain accepted for compatibility.
 
 <Note>
 The precedence order is: node-level stylesheet > run config TOML > CLI flags > server defaults. More specific settings always win.

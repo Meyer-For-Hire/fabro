@@ -1058,7 +1058,7 @@ reasoning = false
 
         assert_eq!(
             validated.graph().nodes["work"].attrs.get("model"),
-            Some(&AttrValue::String("claude-sonnet-4-6".into()))
+            Some(&AttrValue::String("claude-sonnet-5".into()))
         );
     }
 
@@ -1460,7 +1460,7 @@ reasoning = false
                 .model
                 .name
                 .as_deref(),
-            Some("claude-sonnet-4-6")
+            Some("claude-sonnet-5")
         );
         assert_eq!(
             created

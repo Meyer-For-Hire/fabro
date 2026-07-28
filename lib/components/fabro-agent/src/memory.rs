@@ -31,7 +31,9 @@ pub async fn discover_memory(
     let directories = build_directory_walk(git_root, working_dir);
 
     let candidate_filenames: Vec<&str> = match profile_kind {
-        AgentProfileKind::Anthropic => vec!["AGENTS.md", "CLAUDE.md"],
+        AgentProfileKind::Anthropic | AgentProfileKind::Claude5 => {
+            vec!["AGENTS.md", "CLAUDE.md"]
+        }
         AgentProfileKind::OpenAi | AgentProfileKind::Gpt56 => {
             vec!["AGENTS.md", ".codex/instructions.md"]
         }
@@ -206,6 +208,23 @@ mod tests {
         assert_eq!(anthropic_docs.len(), 2);
         assert_eq!(anthropic_docs[0].content, "agents");
         assert_eq!(anthropic_docs[1].content, "claude");
+
+        let env: Arc<dyn Sandbox> = Arc::new(MockSandbox {
+            files: files.clone(),
+            ..Default::default()
+        });
+        let claude5_docs = discover_memory(
+            env.as_ref(),
+            "/repo",
+            "/repo",
+            AgentProfileKind::Claude5,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(claude5_docs.len(), 2);
+        assert_eq!(claude5_docs[0].content, "agents");
+        assert_eq!(claude5_docs[1].content, "claude");
 
         let env: Arc<dyn Sandbox> = Arc::new(MockSandbox {
             files: files.clone(),

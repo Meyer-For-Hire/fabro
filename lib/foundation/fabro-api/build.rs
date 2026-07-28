@@ -345,6 +345,7 @@ fn main() {
         ("Conclusion", "fabro_types::Conclusion", &[]),
         ("StageOutcome", "fabro_types::StageOutcome", &[]),
         ("StageId", "fabro_types::StageId", &[]),
+        ("ParallelBranchId", "fabro_types::ParallelBranchId", &[]),
         ("StageHandler", "fabro_types::StageHandler", &[]),
         ("StageState", "fabro_types::StageState", &[]),
         ("AgentControlState", "fabro_types::AgentControlState", &[]),

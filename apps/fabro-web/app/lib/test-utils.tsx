@@ -2,6 +2,9 @@ import { createElement, type ReactNode } from "react";
 import type { EventEnvelope } from "@qltysh/fabro-api-client";
 import TestRenderer, { act } from "react-test-renderer";
 
+import type { Stage } from "./stage-sidebar";
+import { makeBilledTokenCounts } from "./test-fixtures";
+
 const IS_REACT_ACT_ENV = "IS_REACT_ACT_ENVIRONMENT" as const;
 
 /**
@@ -53,6 +56,38 @@ export function makeEventEnvelope(
     event: "stage.prompt",
     ...partial,
   } as EventEnvelope;
+}
+
+/** Flatten a rendered subtree to its visible text. */
+export function textContent(node: TestRenderer.ReactTestInstance): string {
+  return node.children
+    .map((child) => (typeof child === "string" ? child : textContent(child)))
+    .join("");
+}
+
+/**
+ * Build a sidebar `Stage` fixture; override any field via `overrides`. Kept
+ * here so widening `Stage` updates every fixture at once — test files are
+ * excluded from typecheck, so a per-file copy silently goes stale instead.
+ */
+export function makeStage(overrides: Partial<Stage> = {}): Stage {
+  return {
+    id: "implement@1",
+    name: "implement",
+    handler: "agent",
+    nodeId: "implement",
+    visit: 1,
+    graphVisit: null,
+    resumedFromStageId: null,
+    parallelGroupId: null,
+    parallelBranchIndex: null,
+    status: "running",
+    duration: "--",
+    startedAt: null,
+    providerUsed: null,
+    billing: makeBilledTokenCounts(),
+    ...overrides,
+  };
 }
 
 export function renderHook<T>(

@@ -60,6 +60,14 @@ export interface RunStage {
      * Canonical stage execution identifier in `node_id@visit` form.
      */
     'resumed_from_stage_id'?: string | null;
+    /**
+     * Exact StageId of the parent parallel execution. Clients can compare this directly with the `id` of a parallel stage. Omitted for stages that are not parallel branches.
+     */
+    'parallel_group_id'?: string;
+    /**
+     * Zero-based outgoing-edge index within the parent parallel execution. Omitted for stages that are not parallel branches.
+     */
+    'parallel_branch_index'?: number;
     'provider_used'?: StageModelUsage | null;
     /**
      * Wall-clock time the latest attempt of this stage started, if known.

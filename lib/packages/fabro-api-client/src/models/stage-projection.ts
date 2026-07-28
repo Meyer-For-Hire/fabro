@@ -90,6 +90,10 @@ export interface StageProjection {
      * Ordered per-branch results produced by a parallel stage.
      */
     'parallel_results'?: Array<ParallelBranchResult> | null;
+    /**
+     * Durable identity of one branch within a parallel execution, in `{parallel_group_id}:{index}` form.
+     */
+    'parallel_branch_id'?: string | null;
     'output'?: string | null;
     'output_bytes'?: number | null;
     'live_streaming'?: boolean | null;

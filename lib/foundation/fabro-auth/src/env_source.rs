@@ -171,4 +171,41 @@ x-account = "{{ env.ACME_ACCOUNT }}"
                 )
         }));
     }
+
+    #[tokio::test]
+    async fn modal_env_vars_do_not_replace_vault_secrets() {
+        let settings: LlmCatalogSettings = toml::from_str(
+            r#"
+[providers.modal]
+enabled = true
+base_url = "https://example--kimi-k3.modal.run/v1"
+"#,
+        )
+        .unwrap();
+        let catalog = Catalog::from_builtin_with_overrides(&settings).unwrap();
+        let source = test_source(&[
+            ("MODAL_TOKEN_ID", "wk-test"),
+            ("MODAL_TOKEN_SECRET", "ws-test"),
+        ]);
+        let modal = ProviderId::new("modal");
+
+        assert!(!source.configured_providers(&catalog).await.contains(&modal));
+
+        let resolved = source.resolve(&catalog).await.unwrap();
+
+        assert!(
+            resolved
+                .credentials
+                .iter()
+                .all(|credential| credential.provider != modal)
+        );
+        assert!(resolved.auth_issues.iter().any(|(provider, issue)| {
+            provider == &modal
+                && matches!(
+                    issue,
+                    crate::ResolveError::Interpolation { source, .. }
+                        if source.namespace == Namespace::Secrets
+                )
+        }));
+    }
 }
