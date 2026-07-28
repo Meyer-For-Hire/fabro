@@ -76,7 +76,7 @@ enum WorkerTitlePhase {
 pub(crate) async fn execute(
     run_id: RunId,
     server: String,
-    storage_dir: Option<PathBuf>,
+    storage_dir: PathBuf,
     run_dir: PathBuf,
     mode: RunWorkerMode,
     worker_token: &str,
@@ -137,7 +137,7 @@ pub(crate) async fn execute(
     if let Some(control_manager) = &mut control_manager {
         control_manager.wait_for_first_connection().await?;
     }
-    let vault = load_worker_vault(storage_dir.as_deref(), &run_dir).await?;
+    let vault = load_worker_vault(&storage_dir).await?;
     let github_app = {
         let vault_guard = vault.read().await;
         maybe_build_github_credentials(&run_spec.settings, &vault_guard)?
@@ -272,22 +272,9 @@ impl fabro_tool::RunManifestBuilder for WorkerRunManifestBuilder {
 
 /// Load the worker's secret vault from the run's storage root.
 ///
-/// A worker always runs against a server-created run, which lives under
-/// `<storage>/scratch/<run>`, so the storage root is always resolvable. Failing
-/// here is better than continuing without a vault: credentials would silently
-/// fall back to whatever the worker process happens to have in its environment.
-async fn load_worker_vault(
-    storage_dir: Option<&Path>,
-    run_dir: &Path,
-) -> Result<Arc<AsyncRwLock<Vault>>> {
-    let storage_dir = storage_dir.with_context(|| {
-        format!(
-            "run worker for {} was spawned without --storage-dir; it needs the storage root to \
-             load its secret vault",
-            run_dir.display()
-        )
-    })?;
-
+/// A worker always receives the server storage root so it can load the same
+/// secret vault as the server.
+async fn load_worker_vault(storage_dir: &Path) -> Result<Arc<AsyncRwLock<Vault>>> {
     let storage = Storage::new(storage_dir);
     let vault = SecretStore::open_snapshot(storage.sqlite_path(), storage.secrets_path())
         .await
@@ -1750,9 +1737,7 @@ mod tests {
             .set("ANTHROPIC_API_KEY", "vault-key", SecretType::Token, None)
             .unwrap();
 
-        let loaded = load_worker_vault(Some(temp.path()), temp.path())
-            .await
-            .unwrap();
+        let loaded = load_worker_vault(temp.path()).await.unwrap();
         let guard = loaded.read().await;
         let credential = guard.get("ANTHROPIC_API_KEY").unwrap();
 

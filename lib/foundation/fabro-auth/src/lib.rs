@@ -1,6 +1,7 @@
 mod context;
 mod credential;
 mod credential_source;
+mod env_source;
 mod extra_headers_source;
 mod refresh;
 mod resolve;
@@ -16,6 +17,7 @@ pub mod strategies;
 pub use context::{AuthContextRequest, AuthContextResponse};
 pub use credential::{ApiKeyHeader, OAuthConfig, OAuthCredential, OAuthTokens};
 pub use credential_source::{CredentialSource, ResolvedCredentials};
+pub use env_source::EnvCredentialSource;
 pub use extra_headers_source::ExtraHeadersCredentialSource;
 pub use refresh::refresh_oauth_credential;
 pub use resolve::{

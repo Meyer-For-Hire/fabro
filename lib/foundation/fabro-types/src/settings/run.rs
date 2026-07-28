@@ -269,9 +269,9 @@ where
 /// value. Both interpolation passes route through this one traversal so they
 /// cannot drift as `PreparedStepRun` or `PreparedStep` grow fields: the
 /// `{{ vars.* }}` pass ([`RunNamespace::substitute_variables`]) passes a
-/// `substitute_string` visitor, the `{{ env.* }}` pass
-/// ([`RunPrepareSettings::resolve_step_env`]) passes a `resolve_env_string`
-/// visitor. Mirrors [`visit_mcp_transport_strings`].
+/// `substitute_string` visitor, and the late secret pass
+/// ([`RunPrepareSettings::resolve_step_secrets`]) passes a
+/// `resolve_secret_string` visitor. Mirrors [`visit_mcp_transport_strings`].
 fn visit_prepared_step_strings<F>(
     step: &mut PreparedStep,
     visitor: &mut F,
@@ -735,36 +735,32 @@ impl Default for RunPrepareSettings {
 }
 
 impl RunPrepareSettings {
-    /// Resolve `{{ env.* }}` and `{{ secrets.* }}` tokens in every prepare
-    /// step's runnable part and per-step `env` values against the supplied
-    /// lookups, returning a copy with the tokens replaced and every other field
-    /// preserved. A `script` step's snippet resolves in place; a `command`
-    /// step's argv resolves per element (each element is shell-quoted later, in
-    /// [`PreparedStep::to_shell_command`], so quoting applies to the resolved
-    /// value rather than the source token).
+    /// Resolve `{{ secrets.* }}` tokens in every prepare step's runnable part
+    /// and per-step `env` values against the supplied lookup. Unsupported
+    /// tokens fail instead of reaching the process. A `script` step's snippet
+    /// resolves in place; a `command` step's argv resolves per element (each
+    /// element is shell-quoted later, in [`PreparedStep::to_shell_command`], so
+    /// quoting applies to the resolved value rather than the source token).
     ///
     /// This is the late, use-time half of prepare-step interpolation, the
     /// counterpart to the server-side `{{ vars.* }}` substitution in
     /// [`RunNamespace::substitute_variables`]: `{{ vars.* }}` are substituted
-    /// earlier, server-side, while `{{ env.* }}` and `{{ secrets.* }}` resolve
-    /// here — in whichever process actually runs the steps (the run worker for
-    /// `fabro run`).
+    /// earlier, server-side, while `{{ secrets.* }}` resolves in whichever
+    /// process actually runs the steps (the run worker for `fabro run`).
     /// Carrying the source form out of the config resolve layer keeps
-    /// `fabro validate` portable (it never requires env to be set).
+    /// `fabro validate` portable.
     ///
-    /// A referenced env var or secret that is unset is a hard error — no
-    /// fallback to the unresolved source. Reserved `inputs` tokens have no
-    /// lookup here and surface as a loud
-    /// [`ResolveErrorKind::Unavailable`] error rather than
-    /// passing through as literal text.
-    pub fn resolve_step_env(
+    /// A missing or non-token secret is a hard error. Unsupported `env` and
+    /// template-only `inputs` tokens surface as
+    /// [`ResolveErrorKind::Unavailable`] errors.
+    pub fn resolve_step_secrets(
         &self,
         mut secrets_lookup: impl FnMut(&str) -> Option<String>,
     ) -> Result<Self, ResolveError> {
         let mut resolved = self.clone();
         for step in &mut resolved.steps {
             visit_prepared_step_strings(step, &mut |value| {
-                resolve_env_string(value, &mut secrets_lookup)
+                resolve_secret_string(value, &mut secrets_lookup)
             })?;
         }
         Ok(resolved)
@@ -774,9 +770,9 @@ impl RunPrepareSettings {
 /// A single resolved prepare step: the thing to run plus the per-step
 /// environment variables it should see. The runnable part keeps the
 /// script-vs-argv distinction (see [`PreparedStepRun`]), and every string is
-/// carried in source form out of the config resolve layer; their `{{ env.* }}`
-/// tokens resolve at the run boundary via
-/// [`RunPrepareSettings::resolve_step_env`].
+/// carried in source form out of the config resolve layer. Secret tokens
+/// resolve at the run boundary via
+/// [`RunPrepareSettings::resolve_step_secrets`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PreparedStep {
     #[serde(flatten)]
@@ -793,10 +789,10 @@ pub struct PreparedStep {
 ///   for the shell to interpret.
 /// - [`Command`](PreparedStepRun::Command) is an argv: a vector of element
 ///   source strings, neither pre-joined nor shell-quoted at config time. Its
-///   `{{ env.* }}` tokens resolve per element at the run boundary, and only
-///   then is each *resolved* element shell-quoted and joined. Resolving before
-///   quoting is what stops an interpolated env value from breaking out of its
-///   argument and injecting shell syntax.
+///   `{{ secrets.* }}` tokens resolve per element at the run boundary, and only
+///   then is each resolved element shell-quoted and joined. Resolving before
+///   quoting stops an interpolated secret from breaking out of its argument and
+///   injecting shell syntax.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PreparedStepRun {
@@ -811,8 +807,8 @@ impl PreparedStep {
     /// For a script, the snippet is returned verbatim. For an argv `command`,
     /// each element is shell-quoted and joined with spaces so an argument that
     /// contains spaces or shell metacharacters survives as a single token. This
-    /// must run *after* [`RunPrepareSettings::resolve_step_env`] so the quoting
-    /// applies to the resolved values, not the `{{ env.* }}` source.
+    /// must run *after* [`RunPrepareSettings::resolve_step_secrets`] so the
+    /// quoting applies to the resolved values, not the secret token source.
     pub fn to_shell_command(&self) -> String {
         match &self.run {
             PreparedStepRun::Script { script } => script.clone(),
@@ -1568,30 +1564,27 @@ impl McpServerSettings {
         StdDuration::from_secs(self.tool_timeout_secs)
     }
 
-    /// Resolve `{{ env.* }}` and `{{ secrets.* }}` tokens in this server's
-    /// transport strings (`command`/`args`/`url`/`env`/`headers`) against the
-    /// supplied lookups, returning a copy with the tokens replaced and every
-    /// other field preserved.
+    /// Resolve `{{ secrets.* }}` tokens in this server's transport strings
+    /// (`command`/`args`/`url`/`env`/`headers`) against the supplied lookup.
+    /// Unsupported tokens fail instead of reaching the transport.
     ///
     /// This is the late, use-time half of MCP interpolation, the counterpart
     /// to [`substitute_mcp_transport`]: `{{ vars.* }}` are substituted
-    /// earlier, server-side, while `{{ env.* }}` and `{{ secrets.* }}` resolve
-    /// here — in whichever process actually launches the server (the run worker
-    /// for `fabro run`, the CLI process for `fabro exec`). Carrying the source
-    /// form out of the config resolve layer keeps `fabro validate` portable (it
-    /// never requires env to be set).
+    /// earlier, server-side, while `{{ secrets.* }}` resolves in whichever
+    /// process actually launches the server (the run worker for `fabro run`,
+    /// the CLI process for `fabro exec`). Carrying the source form out of the
+    /// config resolve layer keeps `fabro validate` portable.
     ///
-    /// A referenced env var or secret that is unset is a hard error — no
-    /// fallback to the unresolved source. Reserved `inputs` tokens have no
-    /// lookup here and surface as a loud [`ResolveErrorKind::Unavailable`]
-    /// error rather than passing through as literal text.
-    pub fn resolve_transport_env(
+    /// A missing or non-token secret is a hard error. Unsupported `env` and
+    /// template-only `inputs` tokens surface as
+    /// [`ResolveErrorKind::Unavailable`] errors.
+    pub fn resolve_transport_secrets(
         &self,
         mut secrets_lookup: impl FnMut(&str) -> Option<String>,
     ) -> Result<Self, ResolveError> {
         let mut resolved = self.clone();
         visit_mcp_transport_strings(&mut resolved.transport, &mut |value| {
-            resolve_env_string(value, &mut secrets_lookup)
+            resolve_secret_string(value, &mut secrets_lookup)
         })?;
         Ok(resolved)
     }
@@ -1599,7 +1592,7 @@ impl McpServerSettings {
 
 /// Resolve `{{ secrets.* }}` tokens in one run-boundary
 /// string. A literal value (no tokens) round-trips unchanged.
-fn resolve_env_string(
+fn resolve_secret_string(
     value: &mut String,
     secrets_lookup: &mut impl FnMut(&str) -> Option<String>,
 ) -> Result<(), ResolveError> {
@@ -1612,7 +1605,7 @@ fn resolve_env_string(
 }
 
 #[cfg(test)]
-mod resolve_transport_env_tests {
+mod resolve_transport_secrets_tests {
     use std::collections::HashMap;
 
     use super::super::interp::ResolveErrorKind;
@@ -1631,7 +1624,9 @@ mod resolve_transport_env_tests {
             ..McpServerSettings::default()
         };
 
-        let resolved = settings.resolve_transport_env(secret_lookup(&[])).unwrap();
+        let resolved = settings
+            .resolve_transport_secrets(secret_lookup(&[]))
+            .unwrap();
 
         let McpTransport::Stdio { command, env } = resolved.transport else {
             panic!("expected stdio transport");
@@ -1641,7 +1636,7 @@ mod resolve_transport_env_tests {
     }
 
     #[test]
-    fn missing_env_is_hard_error() {
+    fn missing_secret_is_hard_error() {
         let settings = McpServerSettings {
             name: "gemini".to_string(),
             transport: McpTransport::Stdio {
@@ -1655,7 +1650,7 @@ mod resolve_transport_env_tests {
         };
 
         let err = settings
-            .resolve_transport_env(secret_lookup(&[]))
+            .resolve_transport_secrets(secret_lookup(&[]))
             .unwrap_err();
 
         assert_eq!(err.namespace, Namespace::Secrets);
@@ -1682,7 +1677,7 @@ mod resolve_transport_env_tests {
         };
 
         let resolved = settings
-            .resolve_transport_env(secret_lookup(&[
+            .resolve_transport_secrets(secret_lookup(&[
                 ("SERVER_BIN", "/srv/mcp"),
                 ("API_TOKEN", "vault-token"),
             ]))
@@ -1718,7 +1713,7 @@ mod resolve_transport_env_tests {
         };
 
         let resolved = settings
-            .resolve_transport_env(secret_lookup(&[
+            .resolve_transport_secrets(secret_lookup(&[
                 ("MCP_HOST", "mcp.example"),
                 ("MCP_TOKEN", "vault-token"),
             ]))
@@ -1749,7 +1744,7 @@ mod resolve_transport_env_tests {
         };
 
         let err = settings
-            .resolve_transport_env(secret_lookup(&[]))
+            .resolve_transport_secrets(secret_lookup(&[]))
             .unwrap_err();
 
         assert_eq!(err.namespace, Namespace::Secrets);
@@ -1759,7 +1754,7 @@ mod resolve_transport_env_tests {
 }
 
 #[cfg(test)]
-mod resolve_step_env_tests {
+mod resolve_step_secrets_tests {
     use std::collections::HashMap;
 
     use super::super::interp::ResolveErrorKind;
@@ -1823,7 +1818,7 @@ mod resolve_step_env_tests {
             timeout_ms: 1_000,
         };
 
-        let resolved = settings.resolve_step_env(secret_lookup(&[])).unwrap();
+        let resolved = settings.resolve_step_secrets(secret_lookup(&[])).unwrap();
 
         assert_eq!(resolved.steps[0].to_shell_command(), "echo hello");
         assert_eq!(
@@ -1845,7 +1840,7 @@ mod resolve_step_env_tests {
         };
 
         let resolved = settings
-            .resolve_step_env(secret_lookup(&[("REGION", "us-east-1")]))
+            .resolve_step_secrets(secret_lookup(&[("REGION", "us-east-1")]))
             .unwrap();
 
         assert_eq!(
@@ -1868,7 +1863,7 @@ mod resolve_step_env_tests {
         };
 
         let resolved = settings
-            .resolve_step_env(secret_lookup(&[
+            .resolve_step_secrets(secret_lookup(&[
                 ("REGION", "us-east-1"),
                 ("DEPLOY_TOKEN", "secret-token"),
             ]))
@@ -1894,7 +1889,7 @@ mod resolve_step_env_tests {
         };
 
         let resolved = settings
-            .resolve_step_env(secret_lookup(&[("MESSAGE", "hello world")]))
+            .resolve_step_secrets(secret_lookup(&[("MESSAGE", "hello world")]))
             .unwrap();
 
         let shell = resolved.steps[0].to_shell_command();
@@ -1904,7 +1899,7 @@ mod resolve_step_env_tests {
 
     #[test]
     fn command_arg_resolving_to_shell_metacharacters_is_not_injected() {
-        // Regression test for the command-injection defect: an `{{ env.* }}`
+        // Regression test for the command-injection defect: an interpolated
         // value containing a single quote and `;` must be resolved THEN quoted
         // so it stays a single argument and cannot break out to inject extra
         // shell commands. Quoting the source token *before* resolving (the old
@@ -1919,7 +1914,7 @@ mod resolve_step_env_tests {
         };
 
         let resolved = settings
-            .resolve_step_env(|name| (name == "USER_INPUT").then(|| malicious.to_string()))
+            .resolve_step_secrets(|name| (name == "USER_INPUT").then(|| malicious.to_string()))
             .unwrap();
 
         let shell = resolved.steps[0].to_shell_command();
@@ -1949,7 +1944,9 @@ mod resolve_step_env_tests {
             timeout_ms: 1_000,
         };
 
-        let err = settings.resolve_step_env(secret_lookup(&[])).unwrap_err();
+        let err = settings
+            .resolve_step_secrets(secret_lookup(&[]))
+            .unwrap_err();
 
         assert_eq!(err.namespace, Namespace::Secrets);
         assert_eq!(err.name, "REGION");
@@ -1969,7 +1966,9 @@ mod resolve_step_env_tests {
             timeout_ms: 1_000,
         };
 
-        let err = settings.resolve_step_env(secret_lookup(&[])).unwrap_err();
+        let err = settings
+            .resolve_step_secrets(secret_lookup(&[]))
+            .unwrap_err();
 
         assert_eq!(err.namespace, Namespace::Secrets);
         assert_eq!(err.name, "DEPLOY_TOKEN");
@@ -1993,7 +1992,7 @@ mod resolve_step_env_tests {
         };
 
         let resolved = settings
-            .resolve_step_env(secret_lookup(&[
+            .resolve_step_secrets(secret_lookup(&[
                 ("REGION", "us-east-1"),
                 ("DEPLOY_TOKEN", "vault-token"),
                 ("MESSAGE", "hello world"),
@@ -2021,7 +2020,9 @@ mod resolve_step_env_tests {
             timeout_ms: 1_000,
         };
 
-        let err = settings.resolve_step_env(secret_lookup(&[])).unwrap_err();
+        let err = settings
+            .resolve_step_secrets(secret_lookup(&[]))
+            .unwrap_err();
 
         assert_eq!(err.namespace, Namespace::Secrets);
         assert_eq!(err.name, "API_KEY");

@@ -7,32 +7,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use fabro_model::{Catalog, ProviderId};
 use fabro_vault::Vault;
 use tokio::sync::RwLock as AsyncRwLock;
 
-use crate::credential_source::{CredentialSource, ResolvedCredentials};
+use crate::credential_source::CredentialSource;
 use crate::vault_source::VaultCredentialSource;
-
-/// A credential source that resolves nothing, for tests that need a source but
-/// never make a provider request.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct StubCredentialSource;
-
-#[async_trait]
-impl CredentialSource for StubCredentialSource {
-    async fn resolve(&self, _catalog: &Catalog) -> anyhow::Result<ResolvedCredentials> {
-        Ok(ResolvedCredentials {
-            credentials: Vec::new(),
-            auth_issues: Vec::new(),
-        })
-    }
-
-    async fn configured_providers(&self, _catalog: &Catalog) -> Vec<ProviderId> {
-        Vec::new()
-    }
-}
 
 /// A detached in-memory vault holding no secrets.
 #[must_use]

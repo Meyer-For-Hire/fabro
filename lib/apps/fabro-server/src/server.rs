@@ -4078,17 +4078,31 @@ async fn execute_run_in_process(state: Arc<AppState>, run_id: RunId) {
             return;
         }
     };
-    let github_permissions = persisted
+    let github_permissions = match persisted
         .run_spec()
         .settings
         .run
         .integrations
         .github
         .resolve_permissions()
-        .unwrap_or_else(|err| {
-            tracing::warn!(error = %err, "github permission interpolation failed");
-            std::collections::HashMap::new()
-        });
+    {
+        Ok(permissions) => permissions,
+        Err(err) => {
+            tracing::error!(
+                run_id = %run_id,
+                error = %err,
+                "GitHub permission interpolation failed"
+            );
+            fail_run_before_execution(
+                &state,
+                run_id,
+                FailureReason::WorkflowError,
+                format!("Failed to resolve GitHub permissions: {err}"),
+            )
+            .await;
+            return;
+        }
+    };
     let vault = match state.stores.vault.snapshot().await {
         Ok(vault) => vault,
         Err(err) => {

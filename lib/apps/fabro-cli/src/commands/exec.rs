@@ -333,17 +333,14 @@ pub(crate) async fn execute(mut args: ExecArgs, ctx: &CommandContext) -> AnyResu
             .transpose()?
             .unwrap_or_default(),
     };
-    // Resolve `{{ env.* }}` in MCP transport config at the exec boundary,
-    // against the CLI process env — the mirror of the `fabro run` worker
-    // boundary in `fabro_workflow::operations::start::runtime_mcp_server`.
-    // Both consumers read the same source-form settings; missing env is a hard
-    // error. `fabro exec` has no server vault, so secrets/inputs tokens surface
-    // loudly rather than leaking.
+    // Fully validate MCP transport config at the exec boundary. `fabro exec`
+    // has no server vault, so secret and unsupported tokens fail instead of
+    // reaching the transport.
     let mcp_servers = mcp_servers
         .into_iter()
         .map(|settings| {
             settings
-                .resolve_transport_env(|_| None)
+                .resolve_transport_secrets(|_| None)
                 .with_context(|| format!("failed to resolve MCP server {:?}", settings.name))
         })
         .collect::<AnyResult<Vec<_>>>()?;

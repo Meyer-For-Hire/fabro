@@ -6913,7 +6913,7 @@ mod real_llm {
     use std::sync::Arc;
 
     use async_trait::async_trait;
-    use fabro_auth::test_support as auth_test_support;
+    use fabro_auth::EnvCredentialSource;
     use fabro_graphviz::graph::Node;
     use fabro_llm::client::Client;
     use fabro_llm::providers::OpenAiAdapter;
@@ -7007,7 +7007,7 @@ mod real_llm {
         }
 
         fabro_test::require_env("ANTHROPIC_API_KEY")?;
-        let source = auth_test_support::StubCredentialSource;
+        let source = EnvCredentialSource::new();
         Some(Arc::new(
             Client::from_source(&source, super::default_catalog())
                 .await

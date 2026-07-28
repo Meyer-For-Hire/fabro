@@ -393,17 +393,17 @@ fn runner_rejects_bogus_worker_token_against_github_only_server() {
         cmd.env("FABRO_HOME", &worker_home);
         cmd.env("FABRO_AUTH_FILE", &auth_file);
         cmd.env("FABRO_WORKER_TOKEN", bogus_token);
-        cmd.args([
-            "__run-worker",
-            "--server",
-            &target,
-            "--run-dir",
-            run_dir.to_str().unwrap(),
-            "--run-id",
-            &run_id,
-            "--mode",
-            "start",
-        ]);
+        cmd.arg("__run-worker")
+            .arg("--server")
+            .arg(&target)
+            .arg("--storage-dir")
+            .arg(&server.storage_dir)
+            .arg("--run-dir")
+            .arg(&run_dir)
+            .arg("--run-id")
+            .arg(&run_id)
+            .arg("--mode")
+            .arg("start");
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());

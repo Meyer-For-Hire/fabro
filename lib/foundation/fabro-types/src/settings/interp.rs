@@ -2,26 +2,26 @@
 //!
 //! An [`InterpString`] field may contain narrow `{{ <namespace>.NAME }}`
 //! tokens — no template logic. Which [`Namespace`]s resolve is
-//! scope-determined by the caller through [`ResolveCtx`]: run-scope settings
-//! provide `vars` and `secrets`, a command node `script` provides `inputs`,
-//! `vars`, and `goal`. A token whose namespace has no lookup in the resolution
-//! context fails loudly rather than passing through as literal text.
+//! scope-determined by the caller through [`ResolveCtx`]. Run-scope settings
+//! provide `vars` during run creation and `secrets` at consumption time. A
+//! token whose namespace has no lookup in the resolution context fails loudly
+//! rather than passing through as literal text.
 //!
-//! Two namespaces parse but never resolve. `inputs` and `goal` are bound only
-//! where a run's values are in scope, which is the workflow graph rather than
-//! general config. `env` resolves nowhere at all: the process environment is
-//! not a configuration source, and `{{ vars.NAME }}` (non-sensitive, stored on
-//! the server) or `{{ secrets.NAME }}` (vault-backed) replaces it. Keeping
-//! them parseable is what lets an out-of-scope token fail with a message that
-//! names the alternative instead of reaching a consumer as literal text.
+//! Two namespaces parse but have no [`ResolveCtx`] lookup. `inputs` is handled
+//! by the workflow template layer, not general config interpolation. `env`
+//! resolves nowhere: the process environment is not a configuration source.
+//! Use `{{ vars.NAME }}` for non-sensitive server-owned values or
+//! `{{ secrets.NAME }}` for vault-backed values. Keeping both namespaces
+//! parseable lets an out-of-scope token fail with a useful message instead of
+//! reaching a consumer as literal text.
 //!
-//! Resolution timing is split: `vars` and `inputs` substitute early
-//! (server-side, at run creation) via [`InterpString::substitute_with`], while
-//! `secrets` resolves late, at consumption time in the process that owns the
-//! value, via [`InterpString::resolve_with`]. Resolved secret values are plain
-//! strings; sensitivity is not tracked. Redaction of run output is
-//! content-based (entropy analysis plus credential patterns), applied where
-//! output is serialized.
+//! Resolution timing is split: `vars` substitute early (server-side, at run
+//! creation) via [`InterpString::substitute_with`], while `secrets` resolve
+//! late, at consumption time in the process that owns the value, via
+//! [`InterpString::resolve_with`]. Resolved secret values are plain strings;
+//! sensitivity is not tracked. Redaction of run output is content-based
+//! (entropy analysis plus credential patterns), applied where output is
+//! serialized.
 
 use std::borrow::Cow;
 use std::fmt;
@@ -308,9 +308,10 @@ impl InterpString {
     /// for the namespaces it does not — their resolution happens later,
     /// possibly in a different process.
     ///
-    /// This is the early, server-side pass (`vars`/`inputs`); late-bound
-    /// namespaces (`env`/`secrets`) survive in token form for their
-    /// consumption-time [`InterpString::resolve_with`].
+    /// This is the early, server-side `vars` pass. `secrets` survive in token
+    /// form for consumption-time [`InterpString::resolve_with`]. Unsupported
+    /// `env` tokens and template-only `inputs` tokens also remain so the next
+    /// full-resolution boundary can reject or route them explicitly.
     pub fn substitute_with(&self, ctx: &mut ResolveCtx<'_>) -> Result<Self, ResolveError> {
         let mut segments = Vec::new();
         for seg in &self.segments {

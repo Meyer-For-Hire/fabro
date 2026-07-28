@@ -556,7 +556,7 @@ fn git_checkpoint_options_from_start(
 
 #[expect(
     clippy::disallowed_methods,
-    reason = "Run startup interpolation owns a process-env lookup facade for {{ env.* }} values."
+    reason = "Run startup reads process env only for explicit provider credential refs and test mode."
 )]
 fn process_env_var(name: &str) -> Option<String> {
     std::env::var(name).ok()
@@ -722,24 +722,22 @@ impl ModelRegistry for CatalogModelRegistry<'_> {
     }
 }
 
-/// Build the launch-time MCP config from resolved settings, resolving any
-/// `{{ env.* }}` and `{{ secrets.* }}` tokens in the transport
-/// (`command`/`url`/`env`/`headers`) against the worker process environment and
-/// vault — the run boundary where the MCP is actually launched.
+/// Build the launch-time MCP config from resolved settings. Secret tokens in
+/// the transport (`command`/`url`/`env`/`headers`) resolve from the vault at
+/// the run boundary. Unsupported tokens fail.
 ///
 /// The resolution itself lives on the type
-/// ([`McpServerSettings::resolve_transport_env`]) so `fabro run` (here) and
+/// ([`McpServerSettings::resolve_transport_secrets`]) so `fabro run` (here) and
 /// `fabro exec` share one resolver; this wrapper just adds the server name to
 /// the error. MCP transport strings are carried in source form out of the
-/// config resolve layer so `fabro validate` stays portable (it never requires
-/// env to be set), and a referenced env var or secret that is unset is a hard
-/// error — no fallback to the unresolved source.
+/// config resolve layer so `fabro validate` stays portable. A missing or
+/// non-token secret is a hard error.
 fn runtime_mcp_server(
     settings: &ResolvedMcpServerSettings,
     secrets_lookup: impl FnMut(&str) -> Option<String>,
 ) -> Result<McpServerSettings, Error> {
     settings
-        .resolve_transport_env(secrets_lookup)
+        .resolve_transport_secrets(secrets_lookup)
         .map_err(|err| {
             Error::engine_with_source(
                 format!("failed to resolve MCP server {:?}", settings.name),
@@ -748,24 +746,22 @@ fn runtime_mcp_server(
         })
 }
 
-/// Build the launch-time setup (prepare) commands from resolved settings,
-/// resolving any `{{ env.* }}` and `{{ secrets.* }}` tokens in each step's
-/// command and per-step env against the worker process environment and vault —
-/// the run boundary where the steps actually run.
+/// Build the launch-time setup (prepare) commands from resolved settings.
+/// Secret tokens in each step's command and per-step env resolve from the vault
+/// at the run boundary. Unsupported tokens fail.
 ///
 /// The resolution itself lives on the type
-/// ([`ResolvedRunPrepareSettings::resolve_step_env`]) so prepare-step env
+/// ([`ResolvedRunPrepareSettings::resolve_step_secrets`]) so prepare-step
 /// resolution shares one resolver with the rest of the run-boundary
 /// interpolation. Prepare-step commands and env are carried in source form out
-/// of the config resolve layer so `fabro validate` stays portable (it never
-/// requires env to be set), and a referenced env var or secret that is unset is
-/// a hard error — no fallback to the unresolved source.
+/// of the config resolve layer so `fabro validate` stays portable. A missing or
+/// non-token secret is a hard error.
 fn runtime_setup_commands(
     prepare: &ResolvedRunPrepareSettings,
     secrets_lookup: impl FnMut(&str) -> Option<String>,
 ) -> Result<Vec<SetupCommand>, Error> {
     let resolved = prepare
-        .resolve_step_env(secrets_lookup)
+        .resolve_step_secrets(secrets_lookup)
         .map_err(|err| Error::engine_with_source("failed to resolve prepare step", err))?;
     Ok(resolved
         .steps

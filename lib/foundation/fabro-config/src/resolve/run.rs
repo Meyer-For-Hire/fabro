@@ -156,8 +156,9 @@ fn resolve_git(git: Option<&RunGitLayer>) -> RunGitSettings {
 #[expect(
     clippy::disallowed_methods,
     reason = "intentional source preservation: prepare step commands and per-step env are carried \
-              in source form so `fabro validate` stays portable; their {{ env.* }} tokens resolve \
-              at the run boundary in fabro_types::settings::run::RunPrepareSettings::resolve_step_env"
+              in source form so `fabro validate` stays portable; secret tokens resolve and \
+              unsupported tokens fail at the run boundary in \
+              fabro_types::settings::run::RunPrepareSettings::resolve_step_secrets"
 )]
 fn resolve_prepare(
     prepare: Option<&RunPrepareLayer>,
@@ -168,18 +169,16 @@ fn resolve_prepare(
     let mut steps = Vec::new();
     for (index, step) in prepare.steps.iter().enumerate() {
         let run = match (&step.script, &step.command) {
-            // A `script` is a raw shell snippet: carry it verbatim so the shell
-            // interprets it. Its `{{ env.* }}` tokens resolve at the run
-            // boundary.
+            // A `script` is a raw shell snippet. Carry it verbatim so the shell
+            // interprets it after late secret resolution.
             (Some(script), None) => PreparedStepRun::Script {
                 script: script.as_source(),
             },
             // A `command` is an argv: carry it as a vector of element source
-            // strings — neither pre-joined nor shell-quoted here. Each element's
-            // `{{ env.* }}` token resolves at the run boundary, and only the
-            // resolved value is shell-quoted (resolve-then-quote), so an
-            // interpolated value can never break out of its argument and inject
-            // shell syntax.
+            // strings — neither pre-joined nor shell-quoted here. Secret tokens
+            // resolve at the run boundary, and only the resolved value is
+            // shell-quoted (resolve-then-quote), so an interpolated value can
+            // never break out of its argument and inject shell syntax.
             (None, Some(argv)) => PreparedStepRun::Command {
                 command: argv.iter().map(InterpString::as_source).collect(),
             },
@@ -386,8 +385,9 @@ pub(crate) fn resolve_enabled_mcps(
 #[expect(
     clippy::disallowed_methods,
     reason = "intentional source preservation: MCP transport strings are carried in source form \
-              so `fabro validate` stays portable; their {{ env.* }} tokens resolve at the run \
-              boundary in fabro_workflow::operations::start::runtime_mcp_server"
+              so `fabro validate` stays portable; secret tokens resolve and unsupported tokens \
+              fail at the run boundary in \
+              fabro_workflow::operations::start::runtime_mcp_server"
 )]
 pub(crate) fn resolve_mcp_entry(name: &str, entry: &McpEntryLayer) -> McpServerSettings {
     let transport = match entry {
@@ -482,8 +482,9 @@ pub(crate) fn resolve_mcp_entry(name: &str, entry: &McpEntryLayer) -> McpServerS
 #[expect(
     clippy::disallowed_methods,
     reason = "intentional source preservation: MCP transport strings are carried in source form \
-              so `fabro validate` stays portable; their {{ env.* }} tokens resolve at the run \
-              boundary in fabro_workflow::operations::start::runtime_mcp_server"
+              so `fabro validate` stays portable; secret tokens resolve and unsupported tokens \
+              fail at the run boundary in \
+              fabro_workflow::operations::start::runtime_mcp_server"
 )]
 fn resolve_mcp_command(
     script: Option<&InterpString>,
@@ -705,8 +706,8 @@ mod resolve_prepare_tests {
         assert_eq!(steps[0].run, PreparedStepRun::Script {
             script: "setup".to_string(),
         });
-        // The per-step env survives resolution in source form (its {{ env.* }}
-        // token resolves later, at the run boundary).
+        // The per-step env survives config resolution in source form. The
+        // unsupported token fails later at the run boundary.
         assert_eq!(
             steps[0].env.get("TOKEN").map(String::as_str),
             Some("{{ env.DEPLOY_TOKEN }}")
@@ -731,9 +732,9 @@ mod resolve_prepare_tests {
         let steps = resolve(&layer);
 
         // Argv elements are carried as separate source strings, NOT joined and
-        // NOT shell-quoted here. Quoting happens at the run boundary, after
-        // `{{ env.* }}` resolution, so the resolved value (not the source
-        // token) is what gets quoted.
+        // NOT shell-quoted here. Quoting happens after late interpolation at
+        // the run boundary, so a resolved value (not the source token) is what
+        // gets quoted.
         assert_eq!(steps[0].run, PreparedStepRun::Command {
             command: vec![
                 "echo".to_string(),

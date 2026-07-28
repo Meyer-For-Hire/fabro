@@ -13,7 +13,7 @@ use fabro_agent::{
     AgentEvent, AgentProfile, AgentProfileBuilder, LocalSandbox, OpenAiProfile, Session,
     SessionOptions, SubAgentSupervisor, ToolSecrets, WebFetchSummarizer,
 };
-use fabro_auth::test_support;
+use fabro_auth::EnvCredentialSource;
 use fabro_llm::client::Client;
 use fabro_llm::provider::ProviderAdapter;
 use fabro_llm::providers::{OpenAiAdapter, OpenAiCompatibleAdapter};
@@ -132,7 +132,7 @@ async fn make_client(provider: &Provider, twin: Option<&OpenAiTwinOptions>) -> C
         return make_twin_client(twin.expect("openai twin config should be provided"));
     }
 
-    let source = test_support::StubCredentialSource;
+    let source = EnvCredentialSource::new();
     let catalog = Arc::new(Catalog::from_builtin().expect("default catalog should build"));
     Client::from_source(&source, catalog)
         .await

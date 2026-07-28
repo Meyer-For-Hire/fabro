@@ -74,9 +74,9 @@ fn resolve_interp(value: &InterpString) -> Result<String, ResolveError> {
 
 #[expect(
     clippy::disallowed_methods,
-    reason = "hook HTTP logs use the unresolved token source, not the resolved URL, so env-sourced \
-              URL material is not logged; redacted_url_for_log masks literal credentials in \
-              parseable source URLs and replaces unparseable sources with a placeholder"
+    reason = "hook HTTP logs use the unresolved token source, not the resolved URL; \
+              redacted_url_for_log masks literal credentials in parseable source URLs and \
+              replaces unparseable sources with a placeholder"
 )]
 fn safe_url_source_for_log(url: &InterpString) -> String {
     redacted_url_for_log(&url.as_source())
@@ -288,7 +288,7 @@ impl HookExecutorImpl {
         let (prompt, model) = match Self::resolve_prompt_and_model(prompt, model) {
             Ok(resolved) => resolved,
             Err(error) => {
-                tracing::error!(error = %error, "prompt hook env resolution failed, not firing");
+                tracing::error!(error = %error, "prompt hook interpolation failed, not firing");
                 return HookDecision::Block {
                     reason: Some(error.to_string()),
                 };
@@ -353,7 +353,7 @@ impl HookExecutorImpl {
         let (prompt, model) = match Self::resolve_prompt_and_model(prompt, model) {
             Ok(resolved) => resolved,
             Err(error) => {
-                tracing::error!(error = %error, "agent hook env resolution failed, not firing");
+                tracing::error!(error = %error, "agent hook interpolation failed, not firing");
                 return HookDecision::Block {
                     reason: Some(error.to_string()),
                 };
@@ -495,7 +495,7 @@ impl HookExecutorImpl {
                 tracing::error!(
                     url_source = %safe_url_source_for_log(url),
                     error = %error,
-                    "HTTP hook URL env resolution failed, not firing"
+                    "HTTP hook URL interpolation failed, not firing"
                 );
                 return HookDecision::Block {
                     reason: Some(error.to_string()),
@@ -528,7 +528,7 @@ impl HookExecutorImpl {
                             url_source = %safe_url_source_for_log(url),
                             header = %key,
                             error = %error,
-                            "HTTP hook header env resolution failed, not firing"
+                            "HTTP hook header interpolation failed, not firing"
                         );
                         return HookDecision::Block {
                             reason: Some(error.to_string()),
@@ -1336,7 +1336,6 @@ mod tests {
             &client,
             &interp(&server.url("/hook")),
             Some(&headers),
-            // Allowlisted but unset: still blocks on the Missing lookup.
             &TlsMode::Off,
             &make_context(),
             std::time::Duration::from_secs(5),

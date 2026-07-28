@@ -295,7 +295,7 @@ When `provider = "local"`, Fabro runs directly in the resolved working
 directory. If you want local isolation, create or enter a separate clone or Git
 worktree yourself.
 
-Environment variable values can combine literal text with server variables, worker environment variables, and token secrets:
+Environment variable values can combine literal text with server variables and token secrets:
 
 ```toml title="run.toml"
 [environments.ci.env]
@@ -354,7 +354,7 @@ Each enabled Slack route posts once for each matching lifecycle event. Messages 
 
 `run.failed` is emitted only when the run terminally fails. A failed stage that routes onward to a normal completion path produces `run.completed`, not `run.failed`.
 
-If a Slack route's channel is missing, empty, or references an unresolved environment variable, Fabro logs a warning and skips that route. Delivery failures are logged and never fail or alter the run.
+If a Slack route's channel is missing, empty, or contains an unsupported interpolation token, Fabro logs a warning and skips that route. Delivery failures are logged and never fail or alter the run.
 
 ### `[run.checkpoint]`
 

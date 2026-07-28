@@ -13961,7 +13961,7 @@ components:
           $ref: "#/components/schemas/RunNamespace"
 
     InterpString:
-      description: Resolved config string that may contain env interpolation tokens.
+      description: Config string that can contain typed interpolation tokens.
       type: string
 
     StringMap:
