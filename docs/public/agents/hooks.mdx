@@ -30,7 +30,7 @@ type = "http"
 url = "https://hooks.example.com/done"
 
 [hooks.headers]
-Authorization = "Bearer {{ vars.WEBHOOK_TOKEN }}"
+X-Deployment-Environment = "{{ vars.DEPLOY_ENV }}"
 ```
 
 | Field | Description |
@@ -39,7 +39,7 @@ Authorization = "Bearer {{ vars.WEBHOOK_TOKEN }}"
 | `headers` | Optional HTTP headers. Values support `{{ vars.NAME }}` interpolation. A token that is still unresolved when the hook fires blocks it (fail-closed), so a header is never sent half-rendered. |
 | `tls` | TLS mode: `"verify"` (default), `"no_verify"`, or `"off"`. |
 
-`{{ vars.NAME }}` is substituted when the run is created. `{{ env.NAME }}` and `{{ secrets.NAME }}` are not available in hooks.
+`{{ vars.NAME }}` is substituted when the run is created. Use variables only for non-sensitive metadata. Do not store tokens, API keys, or other credentials in variables or literal hook configuration. `{{ env.NAME }}` and `{{ secrets.NAME }}` are not available in hooks.
 
 ### Prompt
 
