@@ -49,7 +49,8 @@ pub use loop_detection::detect_loop;
 pub use memory::{MemoryDocument, discover_memory};
 pub use native_tool::{NativeTool, ToolVocabulary};
 pub use profiles::{
-    AgentProfileBuilder, AnthropicProfile, EnvContext, GeminiProfile, KimiProfile, OpenAiProfile,
+    AgentProfileBuilder, AnthropicProfile, Claude5Profile, EnvContext, GeminiProfile, KimiProfile,
+    OpenAiProfile,
 };
 pub use question_tools::{
     ANTHROPIC_ASK_USER_QUESTION_TOOL, AgentQuestion, AgentQuestionAnswer,

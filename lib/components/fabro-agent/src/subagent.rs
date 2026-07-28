@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use fabro_llm::types::ToolDefinition;
+use fabro_util::error as util_error;
 use futures::future;
 use tokio::sync::{oneshot, watch};
 use tokio::task::{AbortHandle, JoinHandle};
@@ -32,6 +33,51 @@ pub struct SubAgentResult {
     pub turns_used: usize,
 }
 
+/// A terminal background-agent result waiting to be delivered to its parent at
+/// a safe turn boundary.
+#[derive(Debug, Clone)]
+pub(crate) struct SubAgentParentNotification {
+    pub agent_id:    String,
+    pub description: String,
+    pub result:      Result<SubAgentResult, Error>,
+}
+
+fn format_parent_notification_batch(notifications: &[SubAgentParentNotification]) -> String {
+    notifications
+        .iter()
+        .map(|notification| {
+            let (status, result) = match &notification.result {
+                Ok(result) if result.success => ("completed", result.output.clone()),
+                Ok(result) => ("failed", result.output.clone()),
+                Err(error) => ("failed", util_error::collect_chain(error).join(": ")),
+            };
+            format!(
+                "<task-notification>\n  <task-id>{}</task-id>\n  <status>{status}</status>\n  \
+                 <description>{}</description>\n  <result>{}</result>\n</task-notification>",
+                escape_notification_xml(&notification.agent_id),
+                escape_notification_xml(&notification.description),
+                escape_notification_xml(&result),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn escape_notification_xml(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+}
+
 #[derive(Debug, Clone)]
 pub enum SubAgentStatus {
     Running,
@@ -43,16 +89,27 @@ pub enum SubAgentStatus {
 const SUBAGENT_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 struct SubAgent {
-    status:             watch::Sender<SubAgentStatus>,
-    cleanup_done:       watch::Sender<bool>,
-    cleanup_started:    bool,
-    monitor_task:       Option<JoinHandle<()>>,
-    event_forwarder:    Option<JoinHandle<()>>,
-    cleanup_task:       Option<JoinHandle<()>>,
-    child_abort_handle: AbortHandle,
-    followup_queue:     Arc<Mutex<VecDeque<String>>>,
-    cancel_token:       CancellationToken,
-    depth:              usize,
+    status:              watch::Sender<SubAgentStatus>,
+    cleanup_done:        watch::Sender<bool>,
+    cleanup_started:     bool,
+    monitor_task:        Option<JoinHandle<()>>,
+    event_forwarder:     Option<JoinHandle<()>>,
+    cleanup_task:        Option<JoinHandle<()>>,
+    child_abort_handle:  AbortHandle,
+    followup_queue:      Arc<Mutex<VecDeque<String>>>,
+    cancel_token:        CancellationToken,
+    depth:               usize,
+    /// Task description, set when the parent should receive this child's
+    /// terminal result automatically. Cleared once the result is delivered,
+    /// the parent retrieves it explicitly, or the agent is shut down.
+    ///
+    /// Keeping this beside the status it is delivered with means a
+    /// notification cannot be registered before -- or suppressed after -- the
+    /// state it describes: there is only one lock and one ordering.
+    parent_notification: Option<String>,
+    /// Spawn order, so a batch is delivered oldest-first rather than in
+    /// whatever order the map happens to iterate.
+    spawn_seq:           u64,
 }
 
 impl Drop for SubAgent {
@@ -73,7 +130,8 @@ impl Drop for SubAgent {
 
 #[derive(Default)]
 struct SupervisorState {
-    agents: HashMap<String, SubAgent>,
+    agents:         HashMap<String, SubAgent>,
+    next_spawn_seq: u64,
 }
 
 struct ShutdownWork {
@@ -115,10 +173,20 @@ impl Drop for CleanupDoneGuard {
     }
 }
 
+/// Wake anything parked in
+/// [`SubAgentSupervisor::next_parent_notification_batch`] so it can re-evaluate
+/// which children are deliverable.
+fn signal_notifications(changed: &watch::Sender<u64>) {
+    changed.send_modify(|generation| {
+        *generation = generation.wrapping_add(1);
+    });
+}
+
 fn spawn_result_monitor(
     child_task: JoinHandle<Result<SubAgentResult, Error>>,
     status: watch::Sender<SubAgentStatus>,
     event_callback: Arc<RwLock<Option<SubAgentEventCallback>>>,
+    notifications_changed: Arc<watch::Sender<u64>>,
     agent_id: String,
     depth: usize,
 ) -> JoinHandle<()> {
@@ -140,18 +208,20 @@ fn spawn_result_monitor(
         if !committed {
             return;
         }
+        // The status this agent will be delivered with is now committed.
+        signal_notifications(&notifications_changed);
 
-        let event = match task_result {
+        let event = match &task_result {
             Ok(result) => AgentEvent::SubAgentCompleted {
-                agent_id,
+                agent_id: agent_id.clone(),
                 depth,
                 success: result.success,
                 turns_used: result.turns_used,
             },
             Err(error) => AgentEvent::SubAgentFailed {
-                agent_id,
+                agent_id: agent_id.clone(),
                 depth,
-                error,
+                error: error.clone(),
             },
         };
         let callback = event_callback
@@ -171,9 +241,10 @@ fn spawn_result_monitor(
 /// happen after the guard has been released.
 #[derive(Clone)]
 pub struct SubAgentSupervisor {
-    state:          Arc<Mutex<SupervisorState>>,
-    max_depth:      usize,
-    event_callback: Arc<RwLock<Option<SubAgentEventCallback>>>,
+    state:                 Arc<Mutex<SupervisorState>>,
+    max_depth:             usize,
+    event_callback:        Arc<RwLock<Option<SubAgentEventCallback>>>,
+    notifications_changed: Arc<watch::Sender<u64>>,
 }
 
 impl SubAgentSupervisor {
@@ -183,6 +254,7 @@ impl SubAgentSupervisor {
             state: Arc::new(Mutex::new(SupervisorState::default())),
             max_depth,
             event_callback: Arc::new(RwLock::new(None)),
+            notifications_changed: Arc::new(watch::channel(0).0),
         }
     }
 
@@ -206,9 +278,31 @@ impl SubAgentSupervisor {
 
     pub fn spawn(
         &self,
+        session: Session,
+        task_prompt: String,
+        depth: usize,
+    ) -> Result<String, Error> {
+        self.spawn_inner(session, task_prompt, depth, None)
+    }
+
+    /// Spawn a child whose terminal result should automatically be delivered
+    /// to the parent session.
+    pub(crate) fn spawn_with_parent_notification(
+        &self,
+        session: Session,
+        task_prompt: String,
+        description: String,
+        depth: usize,
+    ) -> Result<String, Error> {
+        self.spawn_inner(session, task_prompt, depth, Some(description))
+    }
+
+    fn spawn_inner(
+        &self,
         mut session: Session,
         task_prompt: String,
         depth: usize,
+        parent_notification_description: Option<String>,
     ) -> Result<String, Error> {
         if depth >= self.max_depth {
             return Err(Error::InvalidState(format!(
@@ -295,12 +389,15 @@ impl SubAgentSupervisor {
             child_task,
             status.clone(),
             Arc::clone(&self.event_callback),
+            Arc::clone(&self.notifications_changed),
             agent_id.clone(),
             child_depth,
         );
 
         {
             let mut state = self.state.lock().expect("subagent state lock poisoned");
+            let spawn_seq = state.next_spawn_seq;
+            state.next_spawn_seq = state.next_spawn_seq.saturating_add(1);
             state.agents.insert(agent_id.clone(), SubAgent {
                 status,
                 cleanup_done,
@@ -312,8 +409,11 @@ impl SubAgentSupervisor {
                 followup_queue,
                 cancel_token,
                 depth: child_depth,
+                parent_notification: parent_notification_description,
+                spawn_seq,
             });
         }
+        signal_notifications(&self.notifications_changed);
 
         self.emit_event(AgentEvent::SubAgentSpawned {
             agent_id: agent_id.clone(),
@@ -397,6 +497,108 @@ impl SubAgentSupervisor {
         }
     }
 
+    /// Stop automatic delivery for an agent whose result the parent retrieved
+    /// explicitly.
+    pub(crate) fn suppress_parent_notification(&self, agent_id: &str) {
+        let cleared = {
+            let mut state = self.state.lock().expect("subagent state lock poisoned");
+            state
+                .agents
+                .get_mut(agent_id)
+                .and_then(|agent| agent.parent_notification.take())
+                .is_some()
+        };
+        if cleared {
+            signal_notifications(&self.notifications_changed);
+        }
+    }
+
+    /// Wait until all currently-ready background results can be delivered in
+    /// one parent turn, rendered as the text of that turn. Returns `None` once
+    /// no notifiable agents remain.
+    ///
+    /// The envelope format is the supervisor's concern, so callers receive a
+    /// finished turn rather than the notifications behind it.
+    pub(crate) async fn next_parent_notification_turn(
+        &self,
+        cancel: &CancellationToken,
+    ) -> Result<Option<String>, Error> {
+        Ok(self
+            .next_parent_notification_batch(cancel)
+            .await?
+            .map(|notifications| format_parent_notification_batch(&notifications)))
+    }
+
+    /// The notifications behind [`Self::next_parent_notification_turn`], for
+    /// tests that assert on delivery semantics rather than on the rendering.
+    pub(crate) async fn next_parent_notification_batch(
+        &self,
+        cancel: &CancellationToken,
+    ) -> Result<Option<Vec<SubAgentParentNotification>>, Error> {
+        let mut changed = self.notifications_changed.subscribe();
+        loop {
+            {
+                let mut state = self.state.lock().expect("subagent state lock poisoned");
+                let mut ready = Vec::new();
+                let mut awaiting_result = false;
+                for (agent_id, agent) in &state.agents {
+                    let Some(description) = agent.parent_notification.as_ref() else {
+                        continue;
+                    };
+                    let finished = match &*agent.status.borrow() {
+                        SubAgentStatus::Finished(result) => Some(result.clone()),
+                        SubAgentStatus::Running => {
+                            awaiting_result = true;
+                            None
+                        }
+                        // Being torn down, so no result is coming. Ignoring
+                        // these is what keeps a shutdown that races delivery
+                        // from parking the parent forever.
+                        SubAgentStatus::Closing | SubAgentStatus::Closed => None,
+                    };
+                    if let Some(result) = finished {
+                        ready.push((agent.spawn_seq, SubAgentParentNotification {
+                            agent_id: agent_id.clone(),
+                            description: description.clone(),
+                            result,
+                        }));
+                    }
+                }
+
+                if !ready.is_empty() {
+                    ready.sort_by_key(|(spawn_seq, _)| *spawn_seq);
+                    let batch: Vec<_> = ready
+                        .into_iter()
+                        .map(|(_, notification)| notification)
+                        .collect();
+                    for notification in &batch {
+                        if let Some(agent) = state.agents.get_mut(&notification.agent_id) {
+                            agent.parent_notification = None;
+                        }
+                    }
+                    return Ok(Some(batch));
+                }
+                if !awaiting_result {
+                    return Ok(None);
+                }
+            }
+
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    return Err(Error::Interrupted(InterruptReason::Cancelled));
+                }
+                observed = changed.changed() => {
+                    observed.map_err(|_| {
+                        Error::InvalidState(
+                            "Background-agent notification observer closed unexpectedly".to_string(),
+                        )
+                    })?;
+                }
+            }
+        }
+    }
+
     #[cfg(test)]
     async fn wait(&self, agent_id: &str) -> Result<SubAgentResult, Error> {
         self.wait_with_cancel(agent_id, &CancellationToken::new())
@@ -443,6 +645,11 @@ impl SubAgentSupervisor {
                 SubAgentStatus::Closed => return Ok(ShutdownDisposition::Done),
             }
         };
+
+        // Shutdown is committed, so this child's result will never reach the
+        // parent. The early returns above leave the notification intact, so a
+        // rejected shutdown cannot discard a result the parent is owed.
+        agent.parent_notification = None;
 
         if agent.cleanup_started {
             return Ok(ShutdownDisposition::Follow(agent.cleanup_done.subscribe()));
@@ -549,7 +756,9 @@ impl SubAgentSupervisor {
     }
 
     async fn ensure_closed(&self, agent_id: &str) -> Result<(), Error> {
-        let cleanup_done = match self.begin_shutdown(agent_id, false)? {
+        let disposition = self.begin_shutdown(agent_id, false)?;
+        signal_notifications(&self.notifications_changed);
+        let cleanup_done = match disposition {
             ShutdownDisposition::Lead(work) => self.spawn_shutdown(work),
             ShutdownDisposition::Follow(cleanup_done) => cleanup_done,
             ShutdownDisposition::Done => return Ok(()),
@@ -560,7 +769,9 @@ impl SubAgentSupervisor {
 
     /// Strict user-facing close: only a currently running child may be closed.
     pub async fn close_agent(&self, agent_id: &str) -> Result<(), Error> {
-        let cleanup_done = match self.begin_shutdown(agent_id, true)? {
+        let disposition = self.begin_shutdown(agent_id, true)?;
+        signal_notifications(&self.notifications_changed);
+        let cleanup_done = match disposition {
             ShutdownDisposition::Lead(work) => self.spawn_shutdown(work),
             ShutdownDisposition::Follow(_) | ShutdownDisposition::Done => {
                 return Err(Error::InvalidState(format!(
@@ -628,6 +839,7 @@ impl SubAgentSupervisor {
             child_task,
             status.clone(),
             Arc::clone(&self.event_callback),
+            Arc::clone(&self.notifications_changed),
             agent_id.clone(),
             depth,
         );
@@ -643,6 +855,8 @@ impl SubAgentSupervisor {
                 event_forwarder,
                 cleanup_task: None,
                 child_abort_handle,
+                parent_notification: None,
+                spawn_seq: 0,
                 followup_queue: Arc::new(Mutex::new(VecDeque::new())),
                 cancel_token,
                 depth,
@@ -840,6 +1054,192 @@ mod tests {
         let manager = SubAgentSupervisor::new(3);
         assert_eq!(manager.max_depth, 3);
         assert!(manager.is_empty());
+    }
+
+    #[test]
+    fn parent_notification_envelope_escapes_xml() {
+        let envelope = format_parent_notification_batch(&[SubAgentParentNotification {
+            agent_id:    "agent<&".to_string(),
+            description: "Review <core> & tests".to_string(),
+            result:      Ok(SubAgentResult {
+                output:     "done <safely> & \"verified\"".to_string(),
+                success:    true,
+                turns_used: 2,
+            }),
+        }]);
+
+        assert!(envelope.contains("<status>completed</status>"));
+        assert!(envelope.contains("<task-id>agent&lt;&amp;</task-id>"));
+        assert!(envelope.contains("<description>Review &lt;core&gt; &amp; tests</description>"));
+        assert!(
+            envelope.contains("<result>done &lt;safely&gt; &amp; &quot;verified&quot;</result>")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_finished_agent_is_delivered_to_the_parent_exactly_once() {
+        let supervisor = SubAgentSupervisor::new(3);
+        let child = make_session(vec![text_response("child result")]).await;
+        let agent_id = supervisor
+            .spawn_with_parent_notification(
+                child,
+                "task".to_string(),
+                "Inspect the module".to_string(),
+                0,
+            )
+            .unwrap();
+        supervisor
+            .wait_with_cancel(&agent_id, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        let batch = supervisor
+            .next_parent_notification_batch(&CancellationToken::new())
+            .await
+            .unwrap()
+            .expect("the finished child must be delivered");
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].agent_id, agent_id);
+        assert_eq!(batch[0].description, "Inspect the module");
+
+        // The status stays `Finished`, so re-delivery is prevented by clearing
+        // the registration rather than by consuming the result.
+        assert!(
+            supervisor
+                .next_parent_notification_batch(&CancellationToken::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        supervisor.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn batches_are_delivered_in_spawn_order() {
+        let supervisor = SubAgentSupervisor::new(3);
+        let mut ids = Vec::new();
+        for index in 0..3 {
+            let child = make_session(vec![text_response("done")]).await;
+            ids.push(
+                supervisor
+                    .spawn_with_parent_notification(
+                        child,
+                        format!("task {index}"),
+                        format!("Task {index}"),
+                        0,
+                    )
+                    .unwrap(),
+            );
+        }
+        for id in &ids {
+            supervisor
+                .wait_with_cancel(id, &CancellationToken::new())
+                .await
+                .unwrap();
+        }
+
+        let batch = supervisor
+            .next_parent_notification_batch(&CancellationToken::new())
+            .await
+            .unwrap()
+            .expect("all three children must be delivered together");
+        let delivered: Vec<_> = batch.iter().map(|n| n.agent_id.clone()).collect();
+        assert_eq!(delivered, ids);
+
+        supervisor.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn suppressing_before_completion_stops_delivery() {
+        let supervisor = SubAgentSupervisor::new(3);
+        let child = make_session(vec![text_response("child result")]).await;
+        let agent_id = supervisor
+            .spawn_with_parent_notification(
+                child,
+                "task".to_string(),
+                "Inspect the module".to_string(),
+                0,
+            )
+            .unwrap();
+
+        supervisor.suppress_parent_notification(&agent_id);
+        supervisor
+            .wait_with_cancel(&agent_id, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert!(
+            supervisor
+                .next_parent_notification_batch(&CancellationToken::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        supervisor.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn closing_a_running_agent_stops_delivery_without_parking_the_parent() {
+        let supervisor = SubAgentSupervisor::new(3);
+        let child = make_session(vec![text_response("child result")]).await;
+        let agent_id = supervisor
+            .spawn_with_parent_notification(
+                child,
+                "task".to_string(),
+                "Inspect the module".to_string(),
+                0,
+            )
+            .unwrap();
+
+        supervisor.close_agent(&agent_id).await.unwrap();
+
+        // Must resolve rather than wait for a result that will never arrive.
+        assert!(
+            supervisor
+                .next_parent_notification_batch(&CancellationToken::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        supervisor.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn rejected_stop_of_a_finished_agent_keeps_its_notification() {
+        let supervisor = SubAgentSupervisor::new(3);
+        let child = make_session(vec![text_response("child result")]).await;
+        let agent_id = supervisor
+            .spawn_with_parent_notification(
+                child,
+                "task".to_string(),
+                "Inspect the module".to_string(),
+                0,
+            )
+            .unwrap();
+
+        // Finish the child so its result is queued for automatic delivery.
+        supervisor
+            .wait_with_cancel(&agent_id, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        // Stopping a finished agent is rejected...
+        let error = supervisor.close_agent(&agent_id).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidState(_)), "{error:?}");
+
+        // ...so it must not have discarded the result the parent is owed.
+        let batch = supervisor
+            .next_parent_notification_batch(&CancellationToken::new())
+            .await
+            .unwrap()
+            .expect("a rejected stop must leave the pending result deliverable");
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].agent_id, agent_id);
+
+        supervisor.shutdown_all().await;
     }
 
     #[tokio::test]

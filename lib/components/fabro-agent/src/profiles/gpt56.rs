@@ -24,7 +24,9 @@ use super::EnvContext;
 use crate::agent_profile::AgentProfile;
 use crate::config::NativeToolOptions;
 use crate::native_tool::{NativeTool, ToolVocabulary};
-use crate::profiles::{self, BaseProfile, EmbeddedPrompt, FileEditToolKind};
+use crate::profiles::{
+    self, BaseProfile, EmbeddedPrompt, FileEditToolKind, ProfileDeps, impl_base_profile_accessors,
+};
 use crate::sandbox::Sandbox;
 use crate::skills::Skill;
 use crate::todo_runtime::TodoRuntime;
@@ -45,11 +47,13 @@ pub struct Gpt56Profile {
 impl Gpt56Profile {
     #[must_use]
     pub fn new(model: impl Into<String>) -> Self {
-        let options = NativeToolOptions::for_profile(AgentProfileKind::Gpt56);
-        Self::with_native_tools(model, &options)
+        let deps = ProfileDeps::standalone(NativeToolOptions::for_profile(AgentProfileKind::Gpt56));
+        Self::with_native_tools(model, &deps)
     }
 
-    pub(crate) fn with_native_tools(model: impl Into<String>, options: &NativeToolOptions) -> Self {
+    /// `deps.summarizer` is ignored: this profile exposes no `web_fetch`.
+    pub(crate) fn with_native_tools(model: impl Into<String>, deps: &ProfileDeps) -> Self {
+        let options = &deps.options;
         // The registry carries the vocabulary, so tools registered later --
         // subagent tools, skills -- are named consistently too.
         let mut registry = ToolRegistry::with_vocabulary(ToolVocabulary::Codex);
@@ -177,29 +181,7 @@ fn make_shell_command_tool(options: &NativeToolOptions) -> RegisteredTool {
 }
 
 impl AgentProfile for Gpt56Profile {
-    fn profile_kind(&self) -> AgentProfileKind {
-        self.base.profile_kind
-    }
-
-    fn provider_id(&self) -> ProviderId {
-        self.base.provider_id.clone()
-    }
-
-    fn model(&self) -> &str {
-        &self.base.model
-    }
-
-    fn catalog(&self) -> Option<&Catalog> {
-        self.base.catalog.as_deref()
-    }
-
-    fn tool_registry(&self) -> &ToolRegistry {
-        &self.base.registry
-    }
-
-    fn tool_registry_mut(&mut self) -> &mut ToolRegistry {
-        &mut self.base.registry
-    }
+    impl_base_profile_accessors!();
 
     fn build_system_prompt(
         &self,
@@ -386,7 +368,8 @@ mod tests {
 
         let mut options = NativeToolOptions::for_profile(AgentProfileKind::Gpt56);
         options.secrets.brave_search_api_key = Some("configured-key".to_string());
-        let searching = Gpt56Profile::with_native_tools("gpt-5.6-sol", &options);
+        let deps = ProfileDeps::standalone(options);
+        let searching = Gpt56Profile::with_native_tools("gpt-5.6-sol", &deps);
         assert!(searching.tool_registry().get("web_search").is_some());
         assert!(prompt(&searching).contains("web_search"));
     }

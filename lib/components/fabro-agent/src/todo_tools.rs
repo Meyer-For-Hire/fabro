@@ -10,8 +10,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use fabro_llm::types::ToolDefinition;
 use fabro_types::{TodoListKind, TodoProjection, TodoStatus, TodoUpdatedProps};
@@ -395,28 +394,6 @@ pub fn make_todo_list_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
     }
 }
 
-/// Per-list monotonically-increasing task counter for Anthropic
-/// `TaskCreate`. Shared state lives inside the tool closure so two parallel
-/// `TaskCreate` calls inside one session can never receive the same ID.
-#[derive(Debug, Default)]
-struct AnthropicTaskCounters {
-    counters: Mutex<BTreeMap<String, Arc<AtomicU64>>>,
-}
-
-impl AnthropicTaskCounters {
-    fn next(&self, list_id: &str) -> u64 {
-        let counter = {
-            let mut guard = self.counters.lock().expect("task counter lock poisoned");
-            Arc::clone(
-                guard
-                    .entry(list_id.to_string())
-                    .or_insert_with(|| Arc::new(AtomicU64::new(0))),
-            )
-        };
-        counter.fetch_add(1, Ordering::Relaxed) + 1
-    }
-}
-
 fn optional_string(args: &Value, key: &str) -> Option<String> {
     args.get(key)
         .and_then(Value::as_str)
@@ -471,7 +448,6 @@ fn format_task_details(todo: &TodoProjection) -> String {
 
 #[must_use]
 pub fn make_task_create_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
-    let counters = Arc::new(AnthropicTaskCounters::default());
     RegisteredTool {
         definition: ToolDefinition {
             name:        "TaskCreate".into(),
@@ -489,7 +465,6 @@ pub fn make_task_create_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
         },
         executor:   Arc::new(move |args, ctx| {
             let runtime = runtime.clone();
-            let counters = counters.clone();
             Box::pin(async move {
                 let list_id = anthropic_task_scope(&ctx)?;
                 let subject = args
@@ -502,7 +477,7 @@ pub fn make_task_create_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
                     .and_then(Value::as_str)
                     .ok_or_else(|| "Missing required parameter: description".to_string())?
                     .to_string();
-                let task_id = counters.next(&list_id);
+                let task_id = runtime.next_task_id(&list_id);
                 let id_string = task_id.to_string();
                 let order = u32::try_from(task_id.saturating_sub(1)).unwrap_or(u32::MAX);
 

@@ -39,6 +39,7 @@ display_name = "Claude Fable 5 (via OpenRouter)"
 family = "claude-5"
 billing_policy = "anthropic"
 aliases = ["fable", "claude-fable"]
+agent_profile = "claude-5"
 
 [providers.openrouter.models."claude-fable-5".limits]
 context_window = 1000000
@@ -66,6 +67,7 @@ billing_policy = "anthropic"
 training = "2026-05-01"
 knowledge_cutoff = "May 2026"
 aliases = ["opus", "claude-opus"]
+agent_profile = "claude-5"
 
 [providers.openrouter.models."claude-opus-5".limits]
 context_window = 1000000
@@ -84,6 +86,37 @@ sampling_params = false
 input_cost_per_mtok = 5.0
 output_cost_per_mtok = 25.0
 cache_input_cost_per_mtok = 0.5
+
+[providers.openrouter.models."claude-sonnet-5"]
+api_id = "anthropic/claude-sonnet-5"
+display_name = "Claude Sonnet 5 (via OpenRouter)"
+family = "claude-5"
+billing_policy = "anthropic"
+training = "2026-01-01"
+knowledge_cutoff = "Jan 2026"
+default = true
+aliases = ["sonnet", "claude-sonnet"]
+agent_profile = "claude-5"
+
+[providers.openrouter.models."claude-sonnet-5".limits]
+context_window = 1000000
+max_output = 128000
+
+[providers.openrouter.models."claude-sonnet-5".features]
+tools = true
+vision = true
+reasoning = true
+reasoning_effort = "levels"
+prompt_cache = true
+cache_control_breakpoints = true
+sampling_params = false
+
+# Current introductory rate. OpenRouter's authoritative in-band usage.cost
+# supersedes this estimate on completed responses.
+[providers.openrouter.models."claude-sonnet-5".costs]
+input_cost_per_mtok = 2.0
+output_cost_per_mtok = 10.0
+cache_input_cost_per_mtok = 0.2
 
 [providers.openrouter.models."claude-opus-4-8"]
 api_id = "anthropic/claude-opus-4.8"
@@ -138,8 +171,6 @@ api_id = "anthropic/claude-sonnet-4.6"
 display_name = "Claude Sonnet 4.6 (via OpenRouter)"
 family = "claude-4"
 billing_policy = "anthropic"
-default = true
-aliases = ["sonnet", "claude-sonnet"]
 
 [providers.openrouter.models."claude-sonnet-4-6".limits]
 context_window = 1000000

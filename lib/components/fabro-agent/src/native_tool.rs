@@ -9,8 +9,8 @@
 //!
 //! A [`NativeTool`] is an identity, not a name. The same tool is expressed
 //! under different names depending on the [`ToolVocabulary`] a profile speaks:
-//! fabro's own names by default, Kimi Code's names for the Kimi profile, and
-//! Codex's names for the GPT-5.6 profile.
+//! fabro's own names by default, Anthropic's names for Claude 5, Kimi Code's
+//! names for the Kimi profile, and Codex's names for the GPT-5.6 profile.
 //! Permissions, categories, and telemetry resolve any name back to the
 //! identity, so behavior never depends on which vocabulary is in play.
 //!
@@ -26,6 +26,8 @@ pub enum ToolVocabulary {
     /// Fabro's own names, and the canonical identity used internally.
     #[default]
     Fabro,
+    /// The names Anthropic's Claude 5 coding harness exposes.
+    Claude5,
     /// The names Kimi Code exposes, for models trained against that harness.
     KimiCode,
     /// The names Codex exposes, for the GPT-5.6 models trained against it.
@@ -57,7 +59,11 @@ pub enum NativeTool {
     Shell,
     #[strum(to_string = "web_search", serialize = "WebSearch")]
     WebSearch,
-    #[strum(to_string = "web_fetch", serialize = "FetchURL")]
+    #[strum(
+        to_string = "web_fetch",
+        serialize = "FetchURL",
+        serialize = "WebFetch"
+    )]
     WebFetch,
     #[strum(to_string = "spawn_agent")]
     SpawnAgent,
@@ -67,6 +73,21 @@ pub enum NativeTool {
     Wait,
     #[strum(to_string = "close_agent")]
     CloseAgent,
+    // Claude 5 drives one background agent through four tools, where fabro's
+    // own vocabulary uses `spawn_agent`/`wait`/`close_agent`/`send_input`.
+    // They are separate identities rather than aliases of those because the
+    // capabilities differ: `Agent` runs in the background or inline depending
+    // on `run_in_background`, and `TaskOutput` both polls and waits. Mapping
+    // them onto the fabro four would promise semantics those tools do not
+    // have -- the same reason Kimi Code's `Agent` is deliberately unmapped.
+    #[strum(to_string = "background_agent", serialize = "Agent")]
+    BackgroundAgent,
+    #[strum(to_string = "agent_output", serialize = "TaskOutput")]
+    AgentOutput,
+    #[strum(to_string = "stop_agent", serialize = "TaskStop")]
+    StopAgent,
+    #[strum(to_string = "message_agent", serialize = "SendMessage")]
+    MessageAgent,
     #[strum(to_string = "use_skill", serialize = "Skill")]
     UseSkill,
     #[strum(to_string = "update_plan")]
@@ -116,6 +137,25 @@ impl NativeTool {
     pub fn name(self, vocabulary: ToolVocabulary) -> &'static str {
         match vocabulary {
             ToolVocabulary::Fabro => self.canonical_name(),
+            ToolVocabulary::Claude5 => match self {
+                Self::ReadFile => "Read",
+                Self::WriteFile => "Write",
+                Self::EditFile => "Edit",
+                Self::Shell => "Bash",
+                // Named for completeness: this arm describes the vocabulary,
+                // not the profile's registry, and the Claude 5 profile
+                // deliberately registers neither.
+                Self::Grep => "Grep",
+                Self::Glob => "Glob",
+                Self::WebSearch => "WebSearch",
+                Self::WebFetch => "WebFetch",
+                Self::UseSkill => "Skill",
+                Self::BackgroundAgent => "Agent",
+                Self::AgentOutput => "TaskOutput",
+                Self::StopAgent => "TaskStop",
+                Self::MessageAgent => "SendMessage",
+                other => other.canonical_name(),
+            },
             ToolVocabulary::KimiCode => match self {
                 Self::ReadFile => "Read",
                 Self::WriteFile => "Write",
@@ -177,9 +217,14 @@ impl NativeTool {
             }
             Self::WriteFile | Self::EditFile | Self::ApplyPatch => Some(AgentToolCategory::Write),
             Self::Shell => Some(AgentToolCategory::Shell),
-            Self::SpawnAgent | Self::SendInput | Self::Wait | Self::CloseAgent => {
-                Some(AgentToolCategory::Subagent)
-            }
+            Self::SpawnAgent
+            | Self::SendInput
+            | Self::Wait
+            | Self::CloseAgent
+            | Self::BackgroundAgent
+            | Self::AgentOutput
+            | Self::StopAgent
+            | Self::MessageAgent => Some(AgentToolCategory::Subagent),
             // Uncategorized today. Giving these a category would change the CLI
             // permission gate, which is a behavior change rather than a
             // classification cleanup, so they keep their existing answer.
@@ -259,6 +304,50 @@ mod tests {
             NativeTool::SpawnAgent.name(ToolVocabulary::KimiCode),
             "spawn_agent"
         );
+    }
+
+    #[test]
+    fn claude5_vocabulary_uses_anthropic_harness_names() {
+        assert_eq!(NativeTool::ReadFile.name(ToolVocabulary::Claude5), "Read");
+        assert_eq!(NativeTool::Shell.name(ToolVocabulary::Claude5), "Bash");
+        assert_eq!(
+            NativeTool::WebFetch.name(ToolVocabulary::Claude5),
+            "WebFetch"
+        );
+        assert_eq!(
+            NativeTool::BackgroundAgent.name(ToolVocabulary::Claude5),
+            "Agent"
+        );
+        assert_eq!(
+            NativeTool::AgentOutput.name(ToolVocabulary::Claude5),
+            "TaskOutput"
+        );
+        assert_eq!(
+            NativeTool::StopAgent.name(ToolVocabulary::Claude5),
+            "TaskStop"
+        );
+        assert_eq!(
+            NativeTool::MessageAgent.name(ToolVocabulary::Claude5),
+            "SendMessage"
+        );
+    }
+
+    /// The harness name is how a tool is expressed, not what it is: the
+    /// identity keeps a fabro name, and the harness name resolves back to it.
+    #[test]
+    fn claude5_subagent_tools_keep_fabro_canonical_names() {
+        for (tool, canonical, claude5) in [
+            (NativeTool::BackgroundAgent, "background_agent", "Agent"),
+            (NativeTool::AgentOutput, "agent_output", "TaskOutput"),
+            (NativeTool::StopAgent, "stop_agent", "TaskStop"),
+            (NativeTool::MessageAgent, "message_agent", "SendMessage"),
+        ] {
+            assert_eq!(tool.canonical_name(), canonical);
+            assert_eq!(tool.name(ToolVocabulary::Fabro), canonical);
+            assert_eq!(tool.name(ToolVocabulary::Claude5), claude5);
+            assert_eq!(NativeTool::from_any_name(canonical), Some(tool));
+            assert_eq!(NativeTool::from_any_name(claude5), Some(tool));
+        }
     }
 
     #[test]

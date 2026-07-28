@@ -6781,7 +6781,7 @@ async fn test_model_explicit_provider_alias_returns_canonical_model_id_when_unav
 
     let response = app.oneshot(req).await.unwrap();
     let body = response_json!(response, StatusCode::OK).await;
-    assert_eq!(body["model_id"], "claude-sonnet-4-6");
+    assert_eq!(body["model_id"], "claude-sonnet-5");
     assert_eq!(body["provider"], "anthropic");
     assert_eq!(body["status"], "skip");
 }

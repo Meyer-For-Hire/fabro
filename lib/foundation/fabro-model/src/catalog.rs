@@ -2873,7 +2873,7 @@ enabled = true
             catalog
                 .default_for_provider(&bedrock)
                 .map(|model| model.id.as_str()),
-            Some("claude-sonnet-4-6")
+            Some("claude-sonnet-5")
         );
         // Fable 5 ships with sampling params pinned off (the Converse
         // encoder drops temperature/top_p for it).
@@ -2881,18 +2881,27 @@ enabled = true
             .get_on_provider(&bedrock, "claude-fable-5")
             .expect("fable row should be present");
         assert!(!fable.features.sampling_params);
-        assert!(
-            catalog
-                .settings_for(fable)
-                .expect("fable settings should be present")
-                .reasoning_by_default
-        );
+        let fable_settings = catalog
+            .settings_for(fable)
+            .expect("fable settings should be present");
+        assert!(fable_settings.reasoning_by_default);
+        assert_eq!(fable_settings.agent_profile, AgentProfileKind::Claude5);
         assert_eq!(
             catalog
                 .model_settings_on_provider(&bedrock, "claude-fable-5")
                 .unwrap()
                 .billing_policy,
             BillingPolicy::Anthropic
+        );
+        let sonnet = catalog
+            .get_on_provider(&bedrock, "claude-sonnet-5")
+            .expect("Sonnet 5 row should be present");
+        assert_eq!(sonnet.limits.context_window, 1_000_000);
+        assert_eq!(sonnet.limits.max_output, Some(128_000));
+        assert!(!sonnet.features.sampling_params);
+        assert_eq!(
+            catalog.settings_for(sonnet).unwrap().agent_profile,
+            AgentProfileKind::Claude5
         );
     }
 
@@ -3040,7 +3049,7 @@ enabled = true
         // open-weights rows inherit it.
         assert_eq!(
             catalog
-                .model_settings_on_provider(&openrouter, "claude-sonnet-4-6")
+                .model_settings_on_provider(&openrouter, "claude-sonnet-5")
                 .unwrap()
                 .billing_policy,
             BillingPolicy::Anthropic
@@ -3056,7 +3065,7 @@ enabled = true
             catalog
                 .default_for_provider(&openrouter)
                 .map(|model| model.id.as_str()),
-            Some("claude-sonnet-4-6")
+            Some("claude-sonnet-5")
         );
     }
 
@@ -3149,6 +3158,19 @@ enabled = true
                 true,
                 BillingPolicy::Anthropic,
             ),
+            (
+                "claude-sonnet-5",
+                "anthropic/claude-sonnet-5",
+                "claude-5",
+                1_000_000,
+                2.0,
+                10.0,
+                0.2,
+                ReasoningEffortFeature::Levels,
+                false,
+                true,
+                BillingPolicy::Anthropic,
+            ),
         ];
 
         for (
@@ -3200,13 +3222,21 @@ enabled = true
                 ReasoningEffort::VARIANTS,
                 "{id}"
             );
+            if family == "claude-5" {
+                assert_eq!(settings.agent_profile, AgentProfileKind::Claude5, "{id}");
+            }
         }
 
-        for alias in ["opus", "claude-opus"] {
+        for (alias, expected) in [
+            ("opus", "claude-opus-5"),
+            ("claude-opus", "claude-opus-5"),
+            ("sonnet", "claude-sonnet-5"),
+            ("claude-sonnet", "claude-sonnet-5"),
+        ] {
             let model = catalog
                 .resolve_on_provider(&ProviderId::new("openrouter"), alias)
                 .unwrap_or_else(|error| panic!("{alias} should resolve on OpenRouter: {error}"));
-            assert_eq!(model.id, "claude-opus-5", "{alias}");
+            assert_eq!(model.id, expected, "{alias}");
         }
     }
 
@@ -4063,7 +4093,7 @@ enabled = true
         let m = Catalog::builtin()
             .default_for_provider(&ProviderId::anthropic())
             .unwrap();
-        assert_eq!(m.id, "claude-sonnet-4-6");
+        assert_eq!(m.id, "claude-sonnet-5");
         assert!(m.default);
 
         let m = Catalog::builtin()

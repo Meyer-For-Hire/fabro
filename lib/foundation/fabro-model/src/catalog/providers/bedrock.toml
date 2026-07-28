@@ -41,16 +41,15 @@ credentials = [
 # ---------- Anthropic Claude ----------
 #
 # Claude bills Anthropic-style cache reads/writes, so these rows override
-# the provider's billing default. Claude Fable 5 appears at the end of this
-# file because its Bedrock deployment pins sampling parameters and requires an
-# extra data-sharing opt-in.
+# the provider's billing default. Claude 5 models appear at the end of this
+# file because their Bedrock deployments pin sampling parameters and require
+# extra endpoint-specific handling.
 
 [providers.bedrock.models."claude-sonnet-4-6"]
 api_id = "us.anthropic.claude-sonnet-4-6"
 display_name = "Claude Sonnet 4.6 (Bedrock)"
 family = "claude-4"
 billing_policy = "anthropic"
-default = true
 
 [providers.bedrock.models."claude-sonnet-4-6".limits]
 context_window = 1000000
@@ -360,6 +359,7 @@ api_id = "us.anthropic.claude-fable-5"
 display_name = "Claude Fable 5 (Bedrock)"
 family = "claude-5"
 billing_policy = "anthropic"
+agent_profile = "claude-5"
 
 [providers.bedrock.models."claude-fable-5".limits]
 context_window = 1000000
@@ -377,3 +377,33 @@ sampling_params = false
 input_cost_per_mtok = 10.0
 output_cost_per_mtok = 50.0
 cache_input_cost_per_mtok = 1.0
+
+# Claude Sonnet 5 uses adaptive thinking by default and rejects non-default
+# sampling parameters. Effort-level mapping through
+# additionalModelRequestFields is a named follow-up, as for Fable 5.
+
+[providers.bedrock.models."claude-sonnet-5"]
+api_id = "us.anthropic.claude-sonnet-5"
+display_name = "Claude Sonnet 5 (Bedrock)"
+family = "claude-5"
+billing_policy = "anthropic"
+default = true
+agent_profile = "claude-5"
+
+[providers.bedrock.models."claude-sonnet-5".limits]
+context_window = 1000000
+max_output = 128000
+
+[providers.bedrock.models."claude-sonnet-5".features]
+tools = true
+vision = true
+reasoning = true
+reasoning_by_default = true
+prompt_cache = true
+sampling_params = false
+
+# Introductory pricing through August 31, 2026.
+[providers.bedrock.models."claude-sonnet-5".costs]
+input_cost_per_mtok = 2.0
+output_cost_per_mtok = 10.0
+cache_input_cost_per_mtok = 0.2
