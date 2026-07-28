@@ -226,6 +226,16 @@ pub(crate) fn apply_validated_output(
 
 /// Find all balanced `{...}` JSON object substrings in the text.
 fn find_json_objects(text: &str) -> Vec<&str> {
+    find_json_objects_with_nested(text, true)
+}
+
+/// Find balanced `{...}` JSON object substrings in the text, skipping objects
+/// nested within a previous match.
+fn find_outermost_json_objects(text: &str) -> Vec<&str> {
+    find_json_objects_with_nested(text, false)
+}
+
+fn find_json_objects_with_nested(text: &str, include_nested: bool) -> Vec<&str> {
     let mut results = Vec::new();
     let bytes = text.as_bytes();
     let mut i = 0;
@@ -251,6 +261,9 @@ fn find_json_objects(text: &str) -> Vec<&str> {
                         depth -= 1;
                         if depth == 0 {
                             results.push(&text[start..=j]);
+                            if !include_nested {
+                                i = j;
+                            }
                             break;
                         }
                     }
@@ -334,7 +347,7 @@ fn validate_custom_response_text(
     validator: &Validator,
     text: &str,
 ) -> Result<ValidatedStructuredOutput, StructuredOutputError> {
-    let candidates = find_json_objects(text);
+    let candidates = find_outermost_json_objects(text);
     let Some(candidate) = candidates.last() else {
         return Err(StructuredOutputError::new(
             StructuredOutputErrorKind::NoJsonObject,
@@ -556,6 +569,58 @@ mod tests {
             validate_response_text(&schema, r#"ignore {"other":1} final {"passed":true}"#).unwrap();
 
         assert_eq!(validated.value, serde_json::json!({"passed": true}));
+    }
+
+    #[test]
+    fn validates_custom_schema_against_outermost_object() {
+        let schema = schema(serde_json::json!({
+            "type": "object",
+            "required": ["issue"],
+            "properties": {
+                "issue": {
+                    "type": "object",
+                    "required": ["number"],
+                    "properties": {
+                        "number": { "type": "integer" }
+                    }
+                }
+            }
+        }));
+
+        let validated = validate_response_text(&schema, r#"{"issue":{"number":19}}"#).unwrap();
+
+        assert_eq!(
+            validated.value,
+            serde_json::json!({"issue": {"number": 19}})
+        );
+    }
+
+    #[test]
+    fn validates_last_outermost_object_when_response_has_trailing_prose() {
+        let schema = schema(serde_json::json!({
+            "type": "object",
+            "required": ["issue"],
+            "properties": {
+                "issue": {
+                    "type": "object",
+                    "required": ["number"],
+                    "properties": {
+                        "number": { "type": "integer" }
+                    }
+                }
+            }
+        }));
+
+        let validated = validate_response_text(
+            &schema,
+            r#"ignore {"issue":{"number":1}} final {"issue":{"number":19}} trailing"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            validated.value,
+            serde_json::json!({"issue": {"number": 19}})
+        );
     }
 
     #[test]
