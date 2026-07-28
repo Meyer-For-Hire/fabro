@@ -9,6 +9,7 @@ import { StagePopover } from "./stage-popover";
 import { deriveStageSummary } from "./stage-popover-summary";
 import type { Stage } from "../lib/stage-sidebar";
 import { generatedAxios } from "../lib/api-client";
+import { makeStage as baseMakeStage } from "../lib/test-utils";
 
 function makeEvent(overrides: Partial<EventEnvelope>): EventEnvelope {
   return {
@@ -22,20 +23,13 @@ function makeEvent(overrides: Partial<EventEnvelope>): EventEnvelope {
 }
 
 function makeStage(overrides: Partial<Stage> = {}): Stage {
-  return {
-    id:                 "implement@1",
-    name:               "implement",
-    handler:            "agent",
-    nodeId:             "implement",
-    visit:              1,
-    graphVisit:         null,
-    resumedFromStageId: null,
-    status:             "succeeded",
-    duration:           "1m 30s",
-    startedAt:          "2026-05-24T11:58:30Z",
-    providerUsed:       { mode: "policy", model: "claude-opus-4-7", reasoning_effort: "high" },
+  return baseMakeStage({
+    status:       "succeeded",
+    duration:     "1m 30s",
+    startedAt:    "2026-05-24T11:58:30Z",
+    providerUsed: { mode: "policy", model: "claude-opus-4-7", reasoning_effort: "high" },
     ...overrides,
-  };
+  });
 }
 
 describe("deriveStageSummary", () => {

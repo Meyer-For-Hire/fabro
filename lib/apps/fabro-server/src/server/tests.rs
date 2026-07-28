@@ -4905,7 +4905,16 @@ async fn append_scoped_stage_event(
         parallel_group_id: None,
         parallel_branch_id: None,
     };
-    let stored = fabro_workflow::event::to_run_event_at(&run_id, event, Utc::now(), Some(&scope));
+    append_event_with_scope(state, run_id, event, &scope).await;
+}
+
+async fn append_event_with_scope(
+    state: &Arc<AppState>,
+    run_id: RunId,
+    event: &workflow_event::Event,
+    scope: &fabro_workflow::event::StageScope,
+) {
+    let stored = fabro_workflow::event::to_run_event_at(&run_id, event, Utc::now(), Some(scope));
     let payload = fabro_workflow::event::build_redacted_event_payload(&stored, &run_id).unwrap();
     let run_store = state.stores.runs.open_run(&run_id).await.unwrap();
     run_store.append_event(&payload).await.unwrap();
@@ -5551,11 +5560,7 @@ async fn list_run_stages_exposes_parallel_branch_identity() {
         parallel_group_id,
         parallel_branch_id,
     );
-    let stored =
-        workflow_event::to_run_event_at(&run_id, &branch_event, Utc::now(), Some(&branch_scope));
-    let payload = workflow_event::build_redacted_event_payload(&stored, &run_id).unwrap();
-    let run_store = state.stores.runs.open_run(&run_id).await.unwrap();
-    run_store.append_event(&payload).await.unwrap();
+    append_event_with_scope(&state, run_id, &branch_event, &branch_scope).await;
 
     let response = app
         .oneshot(

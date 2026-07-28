@@ -37,7 +37,7 @@ export interface RunEvent {
      */
     'parallel_group_id'?: string | null;
     /**
-     * Durable identity of one branch within a parallel execution, formatted as \"{parallel_group_id}:{index}\".
+     * Durable identity of one branch within a parallel execution, in `{parallel_group_id}:{index}` form.
      */
     'parallel_branch_id'?: string | null;
     'session_id'?: string | null;

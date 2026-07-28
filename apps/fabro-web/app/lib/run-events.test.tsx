@@ -92,6 +92,36 @@ describe("queryKeysForRunEvent", () => {
     ]);
   });
 
+  test("parallel branch lifecycle invalidates the stages list backing live branch rows", () => {
+    // Branches bypass stage.started/stage.completed, so these events are the
+    // only signal that a branch row's status changed.
+    expect(queryKeysForRunEvent("run-1", "parallel.branch.started", "review_glm@1")).toEqual([
+      queryKeys.runs.stages("run-1"),
+      queryKeys.runs.events("run-1", 1000),
+      queryKeys.runs.graph("run-1", "LR"),
+      queryKeys.runs.graph("run-1", "TB"),
+      queryKeys.runs.stageEvents("run-1", "review_glm@1"),
+    ]);
+    expect(queryKeysForRunEvent("run-1", "parallel.branch.completed", "review_glm@1")).toEqual([
+      queryKeys.runs.stages("run-1"),
+      queryKeys.runs.events("run-1", 1000),
+      queryKeys.runs.graph("run-1", "LR"),
+      queryKeys.runs.graph("run-1", "TB"),
+      queryKeys.runs.stageEvents("run-1", "review_glm@1"),
+    ]);
+  });
+
+  test("fork lifecycle invalidates run-scoped resources without a stage id", () => {
+    for (const event of ["parallel.started", "parallel.completed"]) {
+      expect(queryKeysForRunEvent("run-1", event)).toEqual([
+        queryKeys.runs.stages("run-1"),
+        queryKeys.runs.events("run-1", 1000),
+        queryKeys.runs.graph("run-1", "LR"),
+        queryKeys.runs.graph("run-1", "TB"),
+      ]);
+    }
+  });
+
   test("cancel requests invalidate the durable run summary", () => {
     expect(queryKeysForRunEvent("run-1", "run.cancel.requested")).toEqual([
       queryKeys.runs.detail("run-1"),

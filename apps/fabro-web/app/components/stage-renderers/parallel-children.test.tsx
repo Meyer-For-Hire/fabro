@@ -4,7 +4,12 @@ import type { EventEnvelope } from "@qltysh/fabro-api-client";
 import TestRenderer, { act } from "react-test-renderer";
 import { MemoryRouter } from "react-router";
 
-import { makeEventEnvelope, setupReactTestEnv } from "../../lib/test-utils";
+import {
+  makeEventEnvelope,
+  makeStage as baseMakeStage,
+  setupReactTestEnv,
+  textContent,
+} from "../../lib/test-utils";
 import type { Stage } from "../stage-sidebar";
 import { ParallelChildren } from "./parallel-children";
 
@@ -15,22 +20,14 @@ beforeEach(() => {
 afterEach(() => teardown());
 
 function makeStage(overrides: Partial<Stage> = {}): Stage {
-  return {
+  return baseMakeStage({
     id: "stage@1",
     name: "stage",
-    handler: "agent",
-    status: StageState.RUNNING,
-    duration: "--",
     nodeId: "stage",
-    visit: 1,
     graphVisit: 1,
-    resumedFromStageId: null,
-    parallelGroupId: null,
-    parallelBranchIndex: null,
     startedAt: "2026-04-09T12:00:00Z",
-    providerUsed: null,
     ...overrides,
-  };
+  });
 }
 
 const parallelStage = makeStage({
@@ -113,12 +110,6 @@ function renderParallel(
   return renderer;
 }
 
-function textContent(node: TestRenderer.ReactTestInstance): string {
-  return node.children
-    .map((child) => typeof child === "string" ? child : textContent(child))
-    .join("");
-}
-
 function branchRowText(renderer: TestRenderer.ReactTestRenderer): string[] {
   return renderer.root.findAllByType("li").map(textContent);
 }
@@ -128,11 +119,7 @@ function hrefs(renderer: TestRenderer.ReactTestRenderer): string[] {
 }
 
 function statValue(renderer: TestRenderer.ReactTestRenderer, label: string): string {
-  const stat = renderer.root
-    .findAllByProps({ className: "flex flex-col gap-0.5" })
-    .find((item) => textContent(item).startsWith(label));
-  if (!stat) throw new Error(`stat ${label} not found`);
-  return textContent(stat.findAllByType("span")[1]);
+  return textContent(renderer.root.findByProps({ "data-stat": label }));
 }
 
 describe("ParallelChildren", () => {
@@ -169,6 +156,17 @@ describe("ParallelChildren", () => {
     );
 
     expect(hrefs(renderer)).toEqual(["/runs/run-1/stages/review_glm@1"]);
+  });
+
+  test("labels a re-entered branch with its visit, matching the sidebar", () => {
+    const renderer = renderParallel(
+      [startedEvent(1)],
+      [branchStage("review_glm", 0, StageState.RUNNING, "fork@2", 2)],
+      makeStage({ id: "fork@2", name: "fork", handler: "parallel", visit: 2 }),
+    );
+
+    expect(branchRowText(renderer)).toEqual(["Runningreview_glm@2"]);
+    expect(hrefs(renderer)).toEqual(["/runs/run-1/stages/review_glm@2"]);
   });
 
   test("keeps duplicate branch targets in index order and only links recorded stages", () => {

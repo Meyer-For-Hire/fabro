@@ -88,7 +88,7 @@ export interface StageProjection {
      */
     'parallel_results'?: Array<ParallelBranchResult> | null;
     /**
-     * Durable identity of this branch within a parallel execution, formatted as \"{parallel_group_id}:{index}\".
+     * Durable identity of one branch within a parallel execution, in `{parallel_group_id}:{index}` form.
      */
     'parallel_branch_id'?: string | null;
     'output'?: string | null;

@@ -5,7 +5,7 @@ import { StageState } from "@qltysh/fabro-api-client";
 import type { EventEnvelope } from "@qltysh/fabro-api-client";
 
 import type { Stage } from "../stage-sidebar";
-import { stageStatusLabel, stageStatusTone } from "../../lib/stage-sidebar";
+import { formatStageLabel, stageStatusLabel, stageStatusTone } from "../../lib/stage-sidebar";
 import { formatDurationMs } from "../../lib/format";
 import { StageMetaBar } from "./meta-bar";
 import { parseParallelOverview } from "./helpers";
@@ -34,7 +34,9 @@ function StatItem({
       <span className="text-[10px] font-medium uppercase tracking-[0.16em] text-fg-muted">
         {label}
       </span>
-      <span className={`font-mono text-xl tabular-nums ${toneClass}`}>{value}</span>
+      <span data-stat={label} className={`font-mono text-xl tabular-nums ${toneClass}`}>
+        {value}
+      </span>
     </div>
   );
 }
@@ -108,20 +110,19 @@ export function ParallelChildren({
   }, [allStages, stage.id]);
 
   const branchCount = overview.branchCount ?? stagesByBranchIndex.size;
-  const slots = Array.from({ length: branchCount }, (_, index) => ({
-    index,
-    stage: stagesByBranchIndex.get(index) ?? null,
-    result: overview.results[index] ?? null,
-  }));
-  const rows = slots.map<BranchRow>(({ index, stage: branchStage, result }) => {
+  const rows = Array.from({ length: branchCount }, (_, index): BranchRow => {
+    // A live branch stage is the freshest source; fall back to the completed
+    // event's result for runs whose branches predate parallel identity.
+    const branchStage = stagesByBranchIndex.get(index);
     if (branchStage) {
       return {
         branchIndex: index,
-        id: branchStage.name,
+        id: formatStageLabel(branchStage),
         status: branchStage.status,
         stageHref: `/runs/${runId}/stages/${branchStage.id}`,
       };
     }
+    const result = overview.results[index];
     if (result) {
       return {
         branchIndex: index,
@@ -138,13 +139,12 @@ export function ParallelChildren({
     };
   });
 
-  const liveBranchStages = Array.from(stagesByBranchIndex.values());
-  const liveSuccessCount = liveBranchStages
-    .filter((branchStage) => branchStage.status === StageState.SUCCEEDED)
-    .length;
-  const liveFailureCount = liveBranchStages
-    .filter((branchStage) => branchStage.status === StageState.FAILED)
-    .length;
+  let liveSuccessCount = 0;
+  let liveFailureCount = 0;
+  for (const branchStage of stagesByBranchIndex.values()) {
+    if (branchStage.status === StageState.SUCCEEDED) liveSuccessCount += 1;
+    else if (branchStage.status === StageState.FAILED) liveFailureCount += 1;
+  }
   const successCount = overview.isComplete
     ? overview.successCount ?? 0
     : liveSuccessCount;

@@ -3,23 +3,10 @@ import type { PaginatedRunStageList, StageHandler, StageState } from "@qltysh/fa
 
 import type { Stage } from "../components/stage-sidebar";
 import { aggregateGraphNodeStatus, formatStageLabel, mapRunStagesToSidebarStages } from "./stage-sidebar";
+import { makeStage as baseMakeStage } from "./test-utils";
 
 function makeStage(nodeId: string, visit: number, status: StageState): Stage {
-  return {
-    id: `${nodeId}@${visit}`,
-    name: nodeId,
-    handler: "agent",
-    nodeId,
-    visit,
-    graphVisit: null,
-    resumedFromStageId: null,
-    parallelGroupId: null,
-    parallelBranchIndex: null,
-    status,
-    duration: "--",
-    startedAt: null,
-    providerUsed: null,
-  };
+  return baseMakeStage({ id: `${nodeId}@${visit}`, name: nodeId, nodeId, visit, status });
 }
 
 describe("mapRunStagesToSidebarStages", () => {

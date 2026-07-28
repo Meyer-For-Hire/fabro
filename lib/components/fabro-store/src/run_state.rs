@@ -1589,6 +1589,18 @@ mod tests {
         event
     }
 
+    fn test_branch_event(
+        seq: u32,
+        body: EventBody,
+        stage_id: StageId,
+        branch_id: ParallelBranchId,
+    ) -> EventEnvelope {
+        let mut event = test_stage_event(seq, body, stage_id);
+        event.event.parallel_group_id = Some(branch_id.group().clone());
+        event.event.parallel_branch_id = Some(branch_id);
+        event
+    }
+
     fn test_stage_event_at(
         seq: u32,
         ts: &str,
@@ -2286,7 +2298,7 @@ mod tests {
         let group_id = StageId::new("review_fork", 1);
         let branch_stage_id = StageId::new("review_glm", 1);
         let branch_id = ParallelBranchId::new(group_id.clone(), 0);
-        let mut started = test_stage_event(
+        let started = test_branch_event(
             3,
             EventBody::ParallelBranchStarted(ParallelBranchStartedProps {
                 index:                 0,
@@ -2294,9 +2306,8 @@ mod tests {
                 resumed_from_stage_id: None,
             }),
             branch_stage_id.clone(),
+            branch_id.clone(),
         );
-        started.event.parallel_group_id = Some(group_id.clone());
-        started.event.parallel_branch_id = Some(branch_id.clone());
 
         state.apply_event(&started).unwrap();
 
@@ -2309,8 +2320,7 @@ mod tests {
             Some(&branch_id)
         );
 
-        let replacement_branch_id = ParallelBranchId::new(group_id.clone(), 1);
-        let mut reobserved = test_stage_event(
+        let reobserved = test_branch_event(
             4,
             EventBody::ParallelBranchStarted(ParallelBranchStartedProps {
                 index:                 1,
@@ -2318,9 +2328,8 @@ mod tests {
                 resumed_from_stage_id: Some(StageId::new("review_glm", 2)),
             }),
             branch_stage_id.clone(),
+            ParallelBranchId::new(group_id, 1),
         );
-        reobserved.event.parallel_group_id = Some(group_id);
-        reobserved.event.parallel_branch_id = Some(replacement_branch_id);
 
         state.apply_event(&reobserved).unwrap();
 
