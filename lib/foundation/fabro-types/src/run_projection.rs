@@ -545,10 +545,11 @@ impl StageProjection {
     /// A provider-reported cost always wins. Otherwise the catalog prices the
     /// recorded tokens for the stage's model. The stored counts pass through
     /// untouched when there is no catalog, no model, or no price for that
-    /// model, which leaves `total_usd_micros` as `None` rather than zero.
+    /// model. Empty usage also passes through untouched. These cases leave
+    /// `total_usd_micros` as `None` rather than zero.
     #[must_use]
     pub fn billed_usage(&self, catalog: Option<&Catalog>) -> Cow<'_, BilledTokenCounts> {
-        if self.usage.total_usd_micros.is_some() {
+        if self.usage.total_usd_micros.is_some() || self.usage.is_zero() {
             return Cow::Borrowed(&self.usage);
         }
         let (Some(catalog), Some(model)) = (catalog, self.model.as_ref()) else {
@@ -1044,6 +1045,19 @@ mod iter_stages_tests {
     fn billed_usage_leaves_a_modelless_stage_uncosted() {
         let mut stage = priced_stage(None);
         stage.model = None;
+
+        assert_eq!(
+            stage
+                .billed_usage(Some(Catalog::builtin()))
+                .total_usd_micros,
+            None
+        );
+    }
+
+    #[test]
+    fn billed_usage_leaves_zero_tokens_uncosted() {
+        let mut stage = priced_stage(None);
+        stage.usage = BilledTokenCounts::default();
 
         assert_eq!(
             stage

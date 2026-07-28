@@ -69,6 +69,7 @@ import {
   formatTokenCount,
   formatUsdMicros,
 } from "../lib/format";
+import { billingTokenBuckets, hasBillingUsage } from "../lib/billing";
 import { plural } from "../lib/plural";
 import {
   useRun,
@@ -870,27 +871,10 @@ export function formatStageModelUsageLabel(
 
 const POPOVER_NUMBER = "block text-right font-mono tabular-nums";
 
-/**
- * The disjoint token buckets behind a stage's usage, labelled and ordered to
- * match the Billing tab's breakdown so the two views read the same. `Uncached`
- * is input that missed the cache; `Output` folds in reasoning tokens.
- */
-function stageTokenBuckets(billing: BilledTokenCounts) {
-  return [
-    { label: "Cache read", value: billing.cache_read_tokens },
-    { label: "Cache creation", value: billing.cache_write_tokens },
-    { label: "Uncached", value: billing.input_tokens },
-    {
-      label: "Output",
-      value: billing.output_tokens + billing.reasoning_tokens,
-    },
-  ];
-}
-
 /** Tokens and cost for this stage visit alone. */
 function StageBillingRows({ billing }: { billing: BilledTokenCounts }) {
-  const buckets = stageTokenBuckets(billing);
-  if (buckets.every((bucket) => bucket.value === 0)) return null;
+  if (!hasBillingUsage(billing)) return null;
+  const buckets = billingTokenBuckets(billing);
   const cost = formatUsdMicros(billing.total_usd_micros);
   return (
     <div className="mt-3">
@@ -920,7 +904,7 @@ export function ModelUsagePopover({
   billing,
 }: {
   providerUsed: StageModelUsage;
-  billing: BilledTokenCounts | null;
+  billing: BilledTokenCounts;
 }) {
   return (
     <>
@@ -943,7 +927,7 @@ export function ModelUsagePopover({
           <PopoverRow label="Speed">{providerUsed.speed}</PopoverRow>
         )}
       </PopoverRows>
-      {billing && <StageBillingRows billing={billing} />}
+      <StageBillingRows billing={billing} />
     </>
   );
 }
@@ -1977,7 +1961,7 @@ function EventsToolbar({
   filteredCount: number;
   totalCount: number;
   providerUsed: StageModelUsage | null;
-  billing: BilledTokenCounts | null;
+  billing: BilledTokenCounts;
   events: EventEnvelope[];
   runId: string;
   stageId: string;

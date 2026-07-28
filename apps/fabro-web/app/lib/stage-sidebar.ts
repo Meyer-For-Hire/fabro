@@ -32,7 +32,7 @@ export interface Stage {
    * Tokens and cost for this visit alone, priced the same way the Billing tab
    * prices its per-node rows. All-zero counts mean the stage called no model.
    */
-  billing: BilledTokenCounts | null;
+  billing: BilledTokenCounts;
 }
 
 export const ACTIVE_STAGE_STATES: ReadonlySet<StageState> = new Set([
@@ -108,7 +108,7 @@ export function mapRunStagesToSidebarStages(
         : "--",
       startedAt: stage.started_at ?? null,
       providerUsed: stage.provider_used ?? null,
-      billing: stage.billing ?? null,
+      billing: stage.billing,
     });
   }
   return stages;
