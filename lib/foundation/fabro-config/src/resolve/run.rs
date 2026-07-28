@@ -595,7 +595,6 @@ fn resolve_hook_type(hook: &HookEntry) -> Option<HookType> {
         return Some(HookType::Http {
             url: url.clone(),
             headers,
-            allowed_env_vars: hook.allowed_env_vars.clone(),
             tls,
         });
     }

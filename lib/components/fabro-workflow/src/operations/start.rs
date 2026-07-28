@@ -393,9 +393,7 @@ impl RunSession {
             .mcps
             .iter()
             .map(|(key, entry)| match entry {
-                ResolvedMcpEntry::Resolved(server) => {
-                    runtime_mcp_server(server, process_env_var, secret_lookup)
-                }
+                ResolvedMcpEntry::Resolved(server) => runtime_mcp_server(server, secret_lookup),
                 // References must be resolved to concrete servers before the run
                 // spec is persisted (server-side run-preparation pass). Reaching
                 // worker startup with an unresolved reference is an invariant
@@ -449,7 +447,7 @@ impl RunSession {
 
         let toml_env = resolved
             .environment
-            .resolve_env(process_env_var, secret_lookup)
+            .resolve_env(secret_lookup)
             .map_err(|err| Error::engine_with_source("failed to resolve run environment", err))?;
         let github_permissions: Option<HashMap<String, String>> =
             (!services.github_permissions.is_empty()).then(|| services.github_permissions.clone());
@@ -467,8 +465,7 @@ impl RunSession {
         };
 
         let pr_config = resolved.pull_request.clone();
-        let setup_commands =
-            runtime_setup_commands(&resolved.prepare, process_env_var, secret_lookup)?;
+        let setup_commands = runtime_setup_commands(&resolved.prepare, secret_lookup)?;
         drop(vault_guard);
 
         Ok(Self {
@@ -739,11 +736,10 @@ impl ModelRegistry for CatalogModelRegistry<'_> {
 /// error — no fallback to the unresolved source.
 fn runtime_mcp_server(
     settings: &ResolvedMcpServerSettings,
-    env_lookup: impl FnMut(&str) -> Option<String>,
     secrets_lookup: impl FnMut(&str) -> Option<String>,
 ) -> Result<McpServerSettings, Error> {
     settings
-        .resolve_transport_env(env_lookup, secrets_lookup)
+        .resolve_transport_env(secrets_lookup)
         .map_err(|err| {
             Error::engine_with_source(
                 format!("failed to resolve MCP server {:?}", settings.name),
@@ -766,11 +762,10 @@ fn runtime_mcp_server(
 /// a hard error — no fallback to the unresolved source.
 fn runtime_setup_commands(
     prepare: &ResolvedRunPrepareSettings,
-    env_lookup: impl FnMut(&str) -> Option<String>,
     secrets_lookup: impl FnMut(&str) -> Option<String>,
 ) -> Result<Vec<SetupCommand>, Error> {
     let resolved = prepare
-        .resolve_step_env(env_lookup, secrets_lookup)
+        .resolve_step_env(secrets_lookup)
         .map_err(|err| Error::engine_with_source("failed to resolve prepare step", err))?;
     Ok(resolved
         .steps
@@ -1576,7 +1571,7 @@ reasoning = false
             ..ResolvedMcpServerSettings::default()
         };
 
-        let err = runtime_mcp_server(&settings, |_| None, |_| None).unwrap_err();
+        let err = runtime_mcp_server(&settings, |_| None).unwrap_err();
 
         assert_eq!(
             err.to_string(),
@@ -1598,8 +1593,7 @@ reasoning = false
             )]),
         ));
 
-        let commands =
-            runtime_setup_commands(&prepare, |_| None, vault_secret_lookup(&vault)).unwrap();
+        let commands = runtime_setup_commands(&prepare, vault_secret_lookup(&vault)).unwrap();
 
         assert_eq!(commands.len(), 1);
         assert_eq!(
@@ -1617,8 +1611,7 @@ reasoning = false
             HashMap::new(),
         ));
 
-        let commands =
-            runtime_setup_commands(&prepare, |_| None, vault_secret_lookup(&vault)).unwrap();
+        let commands = runtime_setup_commands(&prepare, vault_secret_lookup(&vault)).unwrap();
         let tokens =
             shlex::split(&commands[0].command).expect("resolved command should remain valid shell");
 
@@ -1646,8 +1639,7 @@ reasoning = false
             ..ResolvedMcpServerSettings::default()
         };
 
-        let resolved =
-            runtime_mcp_server(&settings, |_| None, vault_secret_lookup(&vault)).unwrap();
+        let resolved = runtime_mcp_server(&settings, vault_secret_lookup(&vault)).unwrap();
 
         let ResolvedMcpTransport::Stdio { env, .. } = resolved.transport else {
             panic!("expected stdio transport");
@@ -1666,8 +1658,7 @@ reasoning = false
             HashMap::new(),
         ));
 
-        let Err(err) = runtime_setup_commands(&prepare, |_| None, vault_secret_lookup(&vault))
-        else {
+        let Err(err) = runtime_setup_commands(&prepare, vault_secret_lookup(&vault)) else {
             panic!("missing secret should fail setup command resolution");
         };
 
@@ -1691,8 +1682,7 @@ reasoning = false
             )]),
         ));
 
-        let Err(err) = runtime_setup_commands(&prepare, |_| None, vault_secret_lookup(&vault))
-        else {
+        let Err(err) = runtime_setup_commands(&prepare, vault_secret_lookup(&vault)) else {
             panic!("OAuth secret should fail setup command resolution");
         };
 
@@ -1714,8 +1704,7 @@ reasoning = false
             )]),
         ));
 
-        let Err(err) = runtime_setup_commands(&prepare, |_| None, vault_secret_lookup(&vault))
-        else {
+        let Err(err) = runtime_setup_commands(&prepare, vault_secret_lookup(&vault)) else {
             panic!("file secret should fail setup command resolution");
         };
 

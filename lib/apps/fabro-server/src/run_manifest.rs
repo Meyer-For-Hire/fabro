@@ -44,7 +44,6 @@ use futures_util::stream::{self, StreamExt};
 use tokio::process::Command;
 use tokio::time;
 
-use crate::interp::process_env_var;
 use crate::server::AppState;
 use crate::server_secrets::LlmClientResult;
 
@@ -1214,7 +1213,8 @@ async fn run_github_token_check(
     let github_permissions = resolved_run
         .integrations
         .github
-        .resolve_permissions(process_env_var);
+        .resolve_permissions()
+        .unwrap_or_default();
 
     let perm_details = github_permissions
         .iter()

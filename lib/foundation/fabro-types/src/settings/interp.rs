@@ -1,21 +1,25 @@
 //! Interpolation for config strings.
 //!
 //! An [`InterpString`] field may contain narrow `{{ <namespace>.NAME }}`
-//! tokens — no template logic. Three [`Namespace`]s resolve here: `env`,
-//! `vars`, and `secrets`. `inputs` is **template-only**: it is a
-//! recognized namespace so an `{{ inputs.* }}` token fails loudly with a clear
-//! message instead of passing through as literal text, but it never resolves
-//! in an `InterpString` field — it belongs in prompts and goals. Which of the
-//! resolvable namespaces actually apply is scope-determined by the caller
-//! through [`ResolveCtx`]: server-scope settings provide `env` (and eventually
-//! `secrets`), run-scope settings additionally provide `vars`. A token whose
-//! namespace is not available in the resolution context fails loudly.
+//! tokens — no template logic. Which [`Namespace`]s resolve is
+//! scope-determined by the caller through [`ResolveCtx`]: run-scope settings
+//! provide `vars` and `secrets`, a command node `script` provides `inputs`,
+//! `vars`, and `goal`. A token whose namespace has no lookup in the resolution
+//! context fails loudly rather than passing through as literal text.
 //!
-//! Resolution timing is split: `vars` substitutes early (server-side, at run
-//! creation) via [`InterpString::substitute_with`], while `env`/`secrets`
-//! resolve late, at consumption time in the process that owns
-//! the value, via [`InterpString::resolve_with`]. Resolved secret values are
-//! plain strings; sensitivity is not tracked. Redaction of run output is
+//! Two namespaces parse but never resolve. `inputs` and `goal` are bound only
+//! where a run's values are in scope, which is the workflow graph rather than
+//! general config. `env` resolves nowhere at all: the process environment is
+//! not a configuration source, and `{{ vars.NAME }}` (non-sensitive, stored on
+//! the server) or `{{ secrets.NAME }}` (vault-backed) replaces it. Keeping
+//! them parseable is what lets an out-of-scope token fail with a message that
+//! names the alternative instead of reaching a consumer as literal text.
+//!
+//! Resolution timing is split: `vars` and `inputs` substitute early
+//! (server-side, at run creation) via [`InterpString::substitute_with`], while
+//! `secrets` resolves late, at consumption time in the process that owns the
+//! value, via [`InterpString::resolve_with`]. Resolved secret values are plain
+//! strings; sensitivity is not tracked. Redaction of run output is
 //! content-based (entropy analysis plus credential patterns), applied where
 //! output is serialized.
 
@@ -49,7 +53,8 @@ enum Segment {
 )]
 #[strum(serialize_all = "lowercase")]
 pub enum Namespace {
-    /// `{{ env.NAME }}` — process environment, resolved at consumption time.
+    /// `{{ env.NAME }}` — the process environment. Parses so the token fails
+    /// loudly, but resolves nowhere: use `vars` or `secrets` instead.
     Env,
     /// `{{ vars.NAME }}` — non-sensitive run variables, substituted early.
     Vars,
@@ -115,7 +120,6 @@ impl Namespace {
 /// [`InterpString::substitute_with`].
 #[derive(Default)]
 pub struct ResolveCtx<'a> {
-    env:     Option<LookupFn<'a>>,
     vars:    Option<LookupFn<'a>>,
     secrets: Option<LookupFn<'a>>,
 }
@@ -126,12 +130,6 @@ impl<'a> ResolveCtx<'a> {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
-    }
-
-    #[must_use]
-    pub fn with_env(mut self, lookup: impl FnMut(&str) -> Option<String> + 'a) -> Self {
-        self.env = Some(Box::new(lookup));
-        self
     }
 
     #[must_use]
@@ -148,14 +146,15 @@ impl<'a> ResolveCtx<'a> {
 
     fn lookup_for(&mut self, namespace: Namespace) -> Option<&mut LookupFn<'a>> {
         match namespace {
-            Namespace::Env => self.env.as_mut(),
             Namespace::Vars => self.vars.as_mut(),
             Namespace::Secrets => self.secrets.as_mut(),
-            // `inputs` is template-only: an `InterpString` resolve context
-            // never provides it, so an `{{ inputs.* }}` token is always
-            // unavailable here. `substitute_with` still preserves the token so a
-            // goal (an `InterpString` that feeds a template) can forward it.
-            Namespace::Inputs => None,
+            // Neither is ever wired. `env` has no lookup because the process
+            // environment is not a configuration source; `inputs` is
+            // template-only. Both variants exist so the token fails with a
+            // message naming where the value belongs, and `substitute_with`
+            // still preserves them so a goal (an `InterpString` that feeds a
+            // template) can forward `{{ inputs.* }}` to the template layer.
+            Namespace::Env | Namespace::Inputs => None,
         }
     }
 }
@@ -334,35 +333,6 @@ impl InterpString {
         Ok(Self { segments })
     }
 
-    /// Resolve in an env-only context, e.g. server-scope settings.
-    ///
-    /// `lookup` should return the current value for a given env var name (or
-    /// `None` if unset). Tokens in any other namespace fail with
-    /// [`ResolveErrorKind::Unavailable`].
-    pub fn resolve<F>(&self, lookup: F) -> Result<String, ResolveError>
-    where
-        F: FnMut(&str) -> Option<String>,
-    {
-        self.resolve_with(&mut ResolveCtx::new().with_env(lookup))
-    }
-
-    /// Resolve in an env-only context, falling back to the raw template
-    /// source when resolution fails so a missing env var surfaces as a
-    /// recognizable diagnostic instead of a silently dropped value.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "intentional raw-source fallback so a missing env var surfaces as a \
-                  recognizable diagnostic; slated for hard-error semantics in the \
-                  interpolation cleanup"
-    )]
-    #[must_use]
-    pub fn resolve_or_source<F>(&self, lookup: F) -> String
-    where
-        F: FnMut(&str) -> Option<String>,
-    {
-        self.resolve(lookup).unwrap_or_else(|_| self.as_source())
-    }
-
     /// Substitute only `{{ vars.* }}` tokens while preserving all other
     /// namespaces for their consumption-time resolution.
     pub fn substitute_variables<F>(&self, lookup: F) -> Result<Self, ResolveError>
@@ -471,6 +441,16 @@ impl fmt::Display for ResolveError {
                      config fields",
                     self.name
                 ),
+                // `env` resolves nowhere. Name the replacement rather than
+                // reporting a generic out-of-scope error.
+                Namespace::Env => write!(
+                    f,
+                    "{{{{ env.{} }}}} is not supported: the process environment is not a \
+                     configuration source. Use {{{{ vars.{} }}}} for a non-sensitive value \
+                     (`fabro variable set`) or {{{{ secrets.{} }}}} for a credential \
+                     (`fabro secret set`)",
+                    self.name, self.name, self.name
+                ),
                 _ => write!(
                     f,
                     "{noun} {:?} referenced by {{{{ {namespace}.{} }}}} is not supported in \
@@ -567,56 +547,67 @@ mod tests {
         assert_eq!(s.names(Namespace::Env), vec!["USER", "HOST", "PORT"]);
     }
 
+    fn resolve_vars(s: &InterpString, pairs: &[(&str, &str)]) -> Result<String, ResolveError> {
+        s.resolve_with(&mut ResolveCtx::new().with_vars(lookup_from(pairs)))
+    }
+
     #[test]
     fn resolve_literal_string() {
         let s = InterpString::parse("static");
-        let resolved = s.resolve(lookup_from(&[])).unwrap();
-        assert_eq!(resolved, "static");
+        assert_eq!(resolve_vars(&s, &[]).unwrap(), "static");
     }
 
     #[test]
     fn resolve_whole_value() {
-        let s = InterpString::parse("{{ env.API_KEY }}");
-        let resolved = s
-            .resolve(lookup_from(&[("API_KEY", "secret-123")]))
-            .unwrap();
-        assert_eq!(resolved, "secret-123");
+        let s = InterpString::parse("{{ vars.API_KEY }}");
+        assert_eq!(
+            resolve_vars(&s, &[("API_KEY", "secret-123")]).unwrap(),
+            "secret-123"
+        );
     }
 
     #[test]
     fn resolve_substring() {
-        let s = InterpString::parse("Bearer {{ env.TOKEN }}");
-        let resolved = s.resolve(lookup_from(&[("TOKEN", "abc")])).unwrap();
-        assert_eq!(resolved, "Bearer abc");
+        let s = InterpString::parse("Bearer {{ vars.TOKEN }}");
+        assert_eq!(resolve_vars(&s, &[("TOKEN", "abc")]).unwrap(), "Bearer abc");
     }
 
     #[test]
     fn resolve_multiple_tokens() {
-        let s = InterpString::parse("{{ env.USER }}@{{ env.HOST }}");
-        let resolved = s
-            .resolve(lookup_from(&[("USER", "root"), ("HOST", "example.com")]))
-            .unwrap();
-        assert_eq!(resolved, "root@example.com");
+        let s = InterpString::parse("{{ vars.USER }}@{{ vars.HOST }}");
+        assert_eq!(
+            resolve_vars(&s, &[("USER", "root"), ("HOST", "example.com")]).unwrap(),
+            "root@example.com"
+        );
     }
 
     #[test]
-    fn resolve_missing_env_fails_with_name() {
-        let s = InterpString::parse("{{ env.MISSING }}");
-        let err = s.resolve(lookup_from(&[])).unwrap_err();
+    fn resolve_missing_var_fails_with_name() {
+        let s = InterpString::parse("{{ vars.MISSING }}");
+        let err = resolve_vars(&s, &[]).unwrap_err();
         assert_eq!(err.name, "MISSING");
-        assert_eq!(err.namespace, Namespace::Env);
+        assert_eq!(err.namespace, Namespace::Vars);
         assert_eq!(err.kind, ResolveErrorKind::Missing);
-        assert_eq!(
-            err.to_string(),
-            "environment variable \"MISSING\" referenced by {{ env.MISSING }} is not set"
-        );
+    }
+
+    /// `env` still parses so the token fails loudly, but it resolves nowhere
+    /// and the message names its replacements.
+    #[test]
+    fn env_token_parses_but_never_resolves() {
+        let s = InterpString::parse("{{ env.API_KEY }}");
+        let err = resolve_vars(&s, &[("API_KEY", "ignored")]).unwrap_err();
+
+        assert_eq!(err.namespace, Namespace::Env);
+        assert_eq!(err.kind, ResolveErrorKind::Unavailable);
+        let message = err.to_string();
+        assert!(message.contains("vars.API_KEY"), "{message}");
+        assert!(message.contains("secrets.API_KEY"), "{message}");
     }
 
     #[test]
     fn unterminated_token_treated_as_literal() {
         let s = InterpString::parse("{{ env.OPEN");
-        let resolved = s.resolve(lookup_from(&[])).unwrap();
-        assert_eq!(resolved, "{{ env.OPEN");
+        assert_eq!(resolve_vars(&s, &[]).unwrap(), "{{ env.OPEN");
     }
 
     #[test]
@@ -631,8 +622,7 @@ mod tests {
         ] {
             let s = InterpString::parse(raw);
             assert!(s.is_literal(), "{raw} should stay literal");
-            let resolved = s.resolve(lookup_from(&[])).unwrap();
-            assert_eq!(resolved, raw);
+            assert_eq!(resolve_vars(&s, &[]).unwrap(), raw);
         }
     }
 
@@ -672,14 +662,14 @@ mod tests {
     }
 
     #[test]
-    fn resolve_with_substitutes_env_and_var_tokens() {
-        let s = InterpString::parse("https://{{ env.REGION }}.{{ vars.DOMAIN }}");
+    fn resolve_with_substitutes_secret_and_var_tokens() {
+        let s = InterpString::parse("https://{{ vars.REGION }}.{{ secrets.DOMAIN }}");
 
         let resolved = s
             .resolve_with(
                 &mut ResolveCtx::new()
-                    .with_env(lookup_from(&[("REGION", "us-east-1")]))
-                    .with_vars(lookup_from(&[("DOMAIN", "example.com")])),
+                    .with_vars(lookup_from(&[("REGION", "us-east-1")]))
+                    .with_secrets(lookup_from(&[("DOMAIN", "example.com")])),
             )
             .unwrap();
 
@@ -691,11 +681,7 @@ mod tests {
         let s = InterpString::parse("{{ vars.MISSING }}");
 
         let err = s
-            .resolve_with(
-                &mut ResolveCtx::new()
-                    .with_env(lookup_from(&[]))
-                    .with_vars(lookup_from(&[])),
-            )
+            .resolve_with(&mut ResolveCtx::new().with_vars(lookup_from(&[])))
             .unwrap_err();
 
         assert_eq!(err.name, "MISSING");
@@ -708,10 +694,10 @@ mod tests {
     }
 
     #[test]
-    fn env_only_resolution_rejects_vars_reference() {
+    fn empty_context_rejects_vars_reference() {
         let s = InterpString::parse("{{ vars.RUNTIME_TOKEN }}");
 
-        let err = s.resolve(lookup_from(&[])).unwrap_err();
+        let err = s.resolve_with(&mut ResolveCtx::new()).unwrap_err();
 
         assert_eq!(err.name, "RUNTIME_TOKEN");
         assert_eq!(err.namespace, Namespace::Vars);
@@ -724,10 +710,10 @@ mod tests {
     }
 
     #[test]
-    fn env_only_resolution_rejects_secrets_reference() {
+    fn empty_context_rejects_secrets_reference() {
         let s = InterpString::parse("{{ secrets.API_KEY }}");
 
-        let err = s.resolve(lookup_from(&[])).unwrap_err();
+        let err = s.resolve_with(&mut ResolveCtx::new()).unwrap_err();
 
         assert_eq!(err.namespace, Namespace::Secrets);
         assert_eq!(err.kind, ResolveErrorKind::Unavailable);
@@ -739,13 +725,13 @@ mod tests {
     }
 
     #[test]
-    fn resolve_with_substitutes_secrets_and_env() {
-        let s = InterpString::parse("Bearer {{ secrets.API_KEY }} via {{ env.PROXY }}");
+    fn resolve_with_substitutes_secrets_and_vars() {
+        let s = InterpString::parse("Bearer {{ secrets.API_KEY }} via {{ vars.PROXY }}");
 
         let resolved = s
             .resolve_with(
                 &mut ResolveCtx::new()
-                    .with_env(lookup_from(&[("PROXY", "proxy.internal")]))
+                    .with_vars(lookup_from(&[("PROXY", "proxy.internal")]))
                     .with_secrets(lookup_from(&[("API_KEY", "vault-value")])),
             )
             .unwrap();

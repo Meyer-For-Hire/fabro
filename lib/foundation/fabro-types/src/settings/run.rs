@@ -422,13 +422,12 @@ mod run_namespace_variable_substitution_tests {
                 event:      HookEvent::RunComplete,
                 command:    None,
                 hook_type:  Some(HookType::Http {
-                    url:              InterpString::parse("https://hooks.example/{{ vars.ENV }}"),
-                    headers:          Some(HashMap::from([(
+                    url:     InterpString::parse("https://hooks.example/{{ vars.ENV }}"),
+                    headers: Some(HashMap::from([(
                         "X-Env".to_string(),
                         InterpString::parse("{{ vars.ENV }}"),
                     )])),
-                    allowed_env_vars: Vec::new(),
-                    tls:              super::TlsMode::Verify,
+                    tls:     super::TlsMode::Verify,
                 }),
                 matcher:    None,
                 blocking:   None,
@@ -617,26 +616,22 @@ impl RunIntegrationsGithubSettings {
         !self.permissions.is_empty()
     }
 
-    /// Resolve every `permissions` value's `{{ env.* }}` tokens via
-    /// `lookup`, falling back to the raw template source when resolution
-    /// fails so callers see a recognizable diagnostic instead of a
-    /// silently dropped key. The `lookup` seam keeps tests free of
-    /// process-env coupling; production callers pass a thin wrapper over
-    /// `std::env::var`.
-    pub fn resolve_permissions<F>(&self, mut lookup: F) -> HashMap<String, String>
-    where
-        F: FnMut(&str) -> Option<String>,
-    {
+    /// Resolve every `permissions` value. `{{ vars.* }}` is substituted
+    /// server-side at run creation, so values are literal by this point; a
+    /// still-unresolved token fails closed rather than reaching the GitHub API
+    /// as literal text.
+    pub fn resolve_permissions(&self) -> Result<HashMap<String, String>, ResolveError> {
+        let mut ctx = ResolveCtx::new();
         self.permissions
             .iter()
-            .map(|(name, value)| (name.clone(), value.resolve_or_source(&mut lookup)))
+            .map(|(name, value)| Ok((name.clone(), value.resolve_with(&mut ctx)?)))
             .collect()
     }
 }
 
 #[cfg(test)]
 mod run_integrations_github_tests {
-    use super::{HashMap, InterpString, RunIntegrationsGithubSettings};
+    use super::{InterpString, Namespace, RunIntegrationsGithubSettings};
 
     fn settings(permissions: &[(&str, &str)]) -> RunIntegrationsGithubSettings {
         RunIntegrationsGithubSettings {
@@ -654,30 +649,26 @@ mod run_integrations_github_tests {
     }
 
     #[test]
-    fn resolve_permissions_substitutes_env_tokens_via_lookup() {
-        let s = settings(&[("issues", "{{ env.GH_PERM_LEVEL }}"), ("contents", "read")]);
-        let resolved = s.resolve_permissions(|name| match name {
-            "GH_PERM_LEVEL" => Some("write".to_string()),
-            _ => None,
-        });
+    fn resolve_permissions_passes_through_literal_values() {
+        let s = settings(&[("issues", "write"), ("contents", "read")]);
+        let resolved = s.resolve_permissions().unwrap();
         assert_eq!(resolved.get("issues"), Some(&"write".to_string()));
         assert_eq!(resolved.get("contents"), Some(&"read".to_string()));
     }
 
+    /// `{{ vars.* }}` is substituted at run creation, so a token still present
+    /// here can never resolve and must fail rather than reach the GitHub API
+    /// as literal text.
     #[test]
-    fn resolve_permissions_falls_back_to_source_when_lookup_fails() {
-        let s = settings(&[("issues", "{{ env.GH_PERM_MISSING }}")]);
-        let resolved = s.resolve_permissions(|_| None);
-        assert_eq!(
-            resolved.get("issues"),
-            Some(&"{{ env.GH_PERM_MISSING }}".to_string())
-        );
+    fn resolve_permissions_fails_on_an_unresolved_token() {
+        let s = settings(&[("issues", "{{ env.GH_PERM_LEVEL }}")]);
+        let err = s.resolve_permissions().unwrap_err();
+        assert_eq!(err.namespace, Namespace::Env);
     }
 
     #[test]
     fn resolve_permissions_is_empty_for_empty_settings() {
-        let s: HashMap<String, String> = settings(&[]).resolve_permissions(|_| None);
-        assert!(s.is_empty());
+        assert!(settings(&[]).resolve_permissions().unwrap().is_empty());
     }
 }
 
@@ -764,17 +755,16 @@ impl RunPrepareSettings {
     /// A referenced env var or secret that is unset is a hard error — no
     /// fallback to the unresolved source. Reserved `inputs` tokens have no
     /// lookup here and surface as a loud
-    /// [`super::interp::ResolveErrorKind::Unavailable`] error rather than
+    /// [`ResolveErrorKind::Unavailable`] error rather than
     /// passing through as literal text.
     pub fn resolve_step_env(
         &self,
-        mut env_lookup: impl FnMut(&str) -> Option<String>,
         mut secrets_lookup: impl FnMut(&str) -> Option<String>,
     ) -> Result<Self, ResolveError> {
         let mut resolved = self.clone();
         for step in &mut resolved.steps {
             visit_prepared_step_strings(step, &mut |value| {
-                resolve_env_string(value, &mut env_lookup, &mut secrets_lookup)
+                resolve_env_string(value, &mut secrets_lookup)
             })?;
         }
         Ok(resolved)
@@ -1094,35 +1084,17 @@ impl RunEnvironmentSettings {
         }
     }
 
-    /// Resolve every environment value's `{{ env.* }}` and `{{ secrets.* }}`
-    /// tokens via the supplied lookups. Missing env vars retain the historical
-    /// fallback to the original source string for env-only values; values that
-    /// reference secrets fail closed instead of preserving a secret token.
+    /// Resolve every environment value's `{{ secrets.* }}` tokens via
+    /// `secrets_lookup`. `{{ vars.* }}` is already substituted server-side at
+    /// run creation, so anything still unresolved here fails closed.
     pub fn resolve_env(
         &self,
-        mut env_lookup: impl FnMut(&str) -> Option<String>,
         mut secrets_lookup: impl FnMut(&str) -> Option<String>,
     ) -> Result<HashMap<String, String>, ResolveError> {
-        let mut ctx = ResolveCtx::new()
-            .with_env(&mut env_lookup)
-            .with_secrets(&mut secrets_lookup);
+        let mut ctx = ResolveCtx::new().with_secrets(&mut secrets_lookup);
         let mut resolved = HashMap::with_capacity(self.env.len());
         for (name, value) in &self.env {
-            let references_secrets = value.references(Namespace::Secrets);
-            let resolved_value = match value.resolve_with(&mut ctx) {
-                Ok(resolved) => resolved,
-                Err(err) if err.namespace == Namespace::Env && !references_secrets => {
-                    #[expect(
-                        clippy::disallowed_methods,
-                        reason = "intentional raw-source fallback preserves existing \
-                                  environment variable behavior for env-only run environment values"
-                    )]
-                    let source = value.as_source();
-                    source
-                }
-                Err(err) => return Err(err),
-            };
-            resolved.insert(name.clone(), resolved_value);
+            resolved.insert(name.clone(), value.resolve_with(&mut ctx)?);
         }
         Ok(resolved)
     }
@@ -1151,6 +1123,7 @@ fn pair_lookup(
 #[cfg(test)]
 mod run_environment_settings_tests {
     use super::{HashMap, InterpString, RunEnvironmentSettings, pair_lookup as lookup};
+    use crate::settings::ResolveErrorKind;
 
     fn settings(env: &[(&str, &str)]) -> RunEnvironmentSettings {
         RunEnvironmentSettings {
@@ -1163,25 +1136,12 @@ mod run_environment_settings_tests {
     }
 
     #[test]
-    fn resolve_env_substitutes_env_tokens_via_lookup() {
-        let s = settings(&[("NODE_ENV", "{{ env.NODE_ENV }}"), ("STATIC", "value")]);
-        let resolved = s
-            .resolve_env(lookup(&[("NODE_ENV", "test")]), lookup(&[]))
-            .unwrap();
+    fn resolve_env_passes_through_literal_values() {
+        let s = settings(&[("NODE_ENV", "production"), ("STATIC", "value")]);
+        let resolved = s.resolve_env(lookup(&[])).unwrap();
 
-        assert_eq!(resolved.get("NODE_ENV"), Some(&"test".to_string()));
+        assert_eq!(resolved.get("NODE_ENV"), Some(&"production".to_string()));
         assert_eq!(resolved.get("STATIC"), Some(&"value".to_string()));
-    }
-
-    #[test]
-    fn resolve_env_falls_back_to_source_when_lookup_fails() {
-        let s = settings(&[("NODE_ENV", "{{ env.MISSING_NODE_ENV }}")]);
-        let resolved = s.resolve_env(lookup(&[]), lookup(&[])).unwrap();
-
-        assert_eq!(
-            resolved.get("NODE_ENV"),
-            Some(&"{{ env.MISSING_NODE_ENV }}".to_string())
-        );
     }
 
     #[test]
@@ -1189,7 +1149,7 @@ mod run_environment_settings_tests {
         let s = settings(&[("API_TOKEN", "Bearer {{ secrets.API_TOKEN }}")]);
 
         let resolved = s
-            .resolve_env(lookup(&[]), lookup(&[("API_TOKEN", "vault-token")]))
+            .resolve_env(lookup(&[("API_TOKEN", "vault-token")]))
             .unwrap();
 
         assert_eq!(
@@ -1202,31 +1162,28 @@ mod run_environment_settings_tests {
     fn resolve_env_returns_secret_error_without_source_fallback() {
         let s = settings(&[("API_TOKEN", "{{ secrets.MISSING_TOKEN }}")]);
 
-        let err = s.resolve_env(lookup(&[]), lookup(&[])).unwrap_err();
+        let err = s.resolve_env(lookup(&[])).unwrap_err();
 
         assert_eq!(err.namespace, super::Namespace::Secrets);
         assert_eq!(err.name, "MISSING_TOKEN");
     }
 
+    /// `{{ env.* }}` no longer resolves anywhere. It fails closed rather than
+    /// falling back to source form, which previously let an unresolved token
+    /// reach the sandbox as literal text.
     #[test]
-    fn resolve_env_does_not_source_fallback_mixed_values_that_reference_secrets() {
-        let s = settings(&[(
-            "API_TOKEN",
-            "{{ env.MISSING_PREFIX }} {{ secrets.API_TOKEN }}",
-        )]);
+    fn resolve_env_fails_closed_on_an_env_token() {
+        let s = settings(&[("NODE_ENV", "{{ env.NODE_ENV }}")]);
 
-        let err = s
-            .resolve_env(lookup(&[]), lookup(&[("API_TOKEN", "vault-token")]))
-            .unwrap_err();
+        let err = s.resolve_env(lookup(&[])).unwrap_err();
 
         assert_eq!(err.namespace, super::Namespace::Env);
-        assert_eq!(err.name, "MISSING_PREFIX");
+        assert_eq!(err.kind, ResolveErrorKind::Unavailable);
     }
 
     #[test]
     fn resolve_env_is_empty_for_empty_settings() {
-        let s: HashMap<String, String> =
-            settings(&[]).resolve_env(lookup(&[]), lookup(&[])).unwrap();
+        let s: HashMap<String, String> = settings(&[]).resolve_env(lookup(&[])).unwrap();
         assert!(s.is_empty());
     }
 }
@@ -1630,30 +1587,26 @@ impl McpServerSettings {
     /// error rather than passing through as literal text.
     pub fn resolve_transport_env(
         &self,
-        mut env_lookup: impl FnMut(&str) -> Option<String>,
         mut secrets_lookup: impl FnMut(&str) -> Option<String>,
     ) -> Result<Self, ResolveError> {
         let mut resolved = self.clone();
         visit_mcp_transport_strings(&mut resolved.transport, &mut |value| {
-            resolve_env_string(value, &mut env_lookup, &mut secrets_lookup)
+            resolve_env_string(value, &mut secrets_lookup)
         })?;
         Ok(resolved)
     }
 }
 
-/// Resolve `{{ env.* }}` and `{{ secrets.* }}` tokens in one run-boundary
+/// Resolve `{{ secrets.* }}` tokens in one run-boundary
 /// string. A literal value (no tokens) round-trips unchanged.
 fn resolve_env_string(
     value: &mut String,
-    env_lookup: &mut impl FnMut(&str) -> Option<String>,
     secrets_lookup: &mut impl FnMut(&str) -> Option<String>,
 ) -> Result<(), ResolveError> {
     if !value.contains("{{") {
         return Ok(());
     }
-    let mut ctx = ResolveCtx::new()
-        .with_env(&mut *env_lookup)
-        .with_secrets(&mut *secrets_lookup);
+    let mut ctx = ResolveCtx::new().with_secrets(&mut *secrets_lookup);
     *value = InterpString::parse(value).resolve_with(&mut ctx)?;
     Ok(())
 }
@@ -1664,8 +1617,7 @@ mod resolve_transport_env_tests {
 
     use super::super::interp::ResolveErrorKind;
     use super::{
-        McpHttpProtocol, McpServerSettings, McpTransport, Namespace, pair_lookup as env_lookup,
-        pair_lookup as secret_lookup,
+        McpHttpProtocol, McpServerSettings, McpTransport, Namespace, pair_lookup as secret_lookup,
     };
 
     #[test]
@@ -1679,84 +1631,13 @@ mod resolve_transport_env_tests {
             ..McpServerSettings::default()
         };
 
-        let resolved = settings
-            .resolve_transport_env(env_lookup(&[]), secret_lookup(&[]))
-            .unwrap();
+        let resolved = settings.resolve_transport_env(secret_lookup(&[])).unwrap();
 
         let McpTransport::Stdio { command, env } = resolved.transport else {
             panic!("expected stdio transport");
         };
         assert_eq!(command, vec!["python".to_string(), "server.py".to_string()]);
         assert_eq!(env.get("TOKEN").map(String::as_str), Some("literal-value"));
-    }
-
-    #[test]
-    fn stdio_command_and_env_resolve() {
-        let settings = McpServerSettings {
-            name: "gemini".to_string(),
-            transport: McpTransport::Stdio {
-                command: vec!["python".to_string(), "{{ env.SERVER_PATH }}".to_string()],
-                env:     HashMap::from([(
-                    "GEMINI_API_KEY".to_string(),
-                    "{{ env.GEMINI_API_KEY }}".to_string(),
-                )]),
-            },
-            ..McpServerSettings::default()
-        };
-
-        let resolved = settings
-            .resolve_transport_env(
-                env_lookup(&[
-                    ("SERVER_PATH", "/srv/mcp.py"),
-                    ("GEMINI_API_KEY", "real-key"),
-                ]),
-                secret_lookup(&[]),
-            )
-            .unwrap();
-
-        let McpTransport::Stdio { command, env } = resolved.transport else {
-            panic!("expected stdio transport");
-        };
-        assert_eq!(command, vec![
-            "python".to_string(),
-            "/srv/mcp.py".to_string()
-        ]);
-        assert_eq!(
-            env.get("GEMINI_API_KEY").map(String::as_str),
-            Some("real-key")
-        );
-    }
-
-    #[test]
-    fn http_url_and_headers_resolve() {
-        let settings = McpServerSettings {
-            name: "remote".to_string(),
-            transport: McpTransport::Http {
-                protocol: McpHttpProtocol::default(),
-                url:      "https://{{ env.MCP_HOST }}/mcp".to_string(),
-                headers:  HashMap::from([(
-                    "Authorization".to_string(),
-                    "Bearer {{ env.MCP_TOKEN }}".to_string(),
-                )]),
-            },
-            ..McpServerSettings::default()
-        };
-
-        let resolved = settings
-            .resolve_transport_env(
-                env_lookup(&[("MCP_HOST", "mcp.example"), ("MCP_TOKEN", "abc123")]),
-                secret_lookup(&[]),
-            )
-            .unwrap();
-
-        let McpTransport::Http { url, headers, .. } = resolved.transport else {
-            panic!("expected http transport");
-        };
-        assert_eq!(url, "https://mcp.example/mcp");
-        assert_eq!(
-            headers.get("Authorization").map(String::as_str),
-            Some("Bearer abc123")
-        );
     }
 
     #[test]
@@ -1767,17 +1648,17 @@ mod resolve_transport_env_tests {
                 command: vec!["python".to_string()],
                 env:     HashMap::from([(
                     "GEMINI_API_KEY".to_string(),
-                    "{{ env.GEMINI_API_KEY }}".to_string(),
+                    "{{ secrets.GEMINI_API_KEY }}".to_string(),
                 )]),
             },
             ..McpServerSettings::default()
         };
 
         let err = settings
-            .resolve_transport_env(env_lookup(&[]), secret_lookup(&[]))
+            .resolve_transport_env(secret_lookup(&[]))
             .unwrap_err();
 
-        assert_eq!(err.namespace, Namespace::Env);
+        assert_eq!(err.namespace, Namespace::Secrets);
         assert_eq!(err.name, "GEMINI_API_KEY");
         assert_eq!(err.kind, ResolveErrorKind::Missing);
     }
@@ -1801,10 +1682,10 @@ mod resolve_transport_env_tests {
         };
 
         let resolved = settings
-            .resolve_transport_env(
-                env_lookup(&[]),
-                secret_lookup(&[("SERVER_BIN", "/srv/mcp"), ("API_TOKEN", "vault-token")]),
-            )
+            .resolve_transport_env(secret_lookup(&[
+                ("SERVER_BIN", "/srv/mcp"),
+                ("API_TOKEN", "vault-token"),
+            ]))
             .unwrap();
 
         let McpTransport::Stdio { command, env } = resolved.transport else {
@@ -1837,10 +1718,10 @@ mod resolve_transport_env_tests {
         };
 
         let resolved = settings
-            .resolve_transport_env(
-                env_lookup(&[]),
-                secret_lookup(&[("MCP_HOST", "mcp.example"), ("MCP_TOKEN", "vault-token")]),
-            )
+            .resolve_transport_env(secret_lookup(&[
+                ("MCP_HOST", "mcp.example"),
+                ("MCP_TOKEN", "vault-token"),
+            ]))
             .unwrap();
 
         let McpTransport::Http { url, headers, .. } = resolved.transport else {
@@ -1868,7 +1749,7 @@ mod resolve_transport_env_tests {
         };
 
         let err = settings
-            .resolve_transport_env(env_lookup(&[]), secret_lookup(&[]))
+            .resolve_transport_env(secret_lookup(&[]))
             .unwrap_err();
 
         assert_eq!(err.namespace, Namespace::Secrets);
@@ -1883,8 +1764,7 @@ mod resolve_step_env_tests {
 
     use super::super::interp::ResolveErrorKind;
     use super::{
-        Namespace, PreparedStep, PreparedStepRun, RunPrepareSettings, pair_lookup as env_lookup,
-        pair_lookup as secret_lookup,
+        Namespace, PreparedStep, PreparedStepRun, RunPrepareSettings, pair_lookup as secret_lookup,
     };
 
     fn script_step(script: &str, env: HashMap<String, String>) -> PreparedStep {
@@ -1943,9 +1823,7 @@ mod resolve_step_env_tests {
             timeout_ms: 1_000,
         };
 
-        let resolved = settings
-            .resolve_step_env(env_lookup(&[]), secret_lookup(&[]))
-            .unwrap();
+        let resolved = settings.resolve_step_env(secret_lookup(&[])).unwrap();
 
         assert_eq!(resolved.steps[0].to_shell_command(), "echo hello");
         assert_eq!(
@@ -1956,19 +1834,18 @@ mod resolve_step_env_tests {
 
     #[test]
     fn script_resolves_verbatim() {
-        // A script is a raw shell snippet: its `{{ env.* }}` token resolves but
-        // the result is NOT shell-quoted — the shell interprets the snippet as
-        // written.
+        // A script is a raw shell snippet: its token resolves but the result is
+        // NOT shell-quoted — the shell interprets the snippet as written.
         let settings = RunPrepareSettings {
             steps:      vec![script_step(
-                "deploy {{ env.REGION }} && echo done",
+                "deploy {{ secrets.REGION }} && echo done",
                 HashMap::new(),
             )],
             timeout_ms: 1_000,
         };
 
         let resolved = settings
-            .resolve_step_env(env_lookup(&[("REGION", "us-east-1")]), secret_lookup(&[]))
+            .resolve_step_env(secret_lookup(&[("REGION", "us-east-1")]))
             .unwrap();
 
         assert_eq!(
@@ -1978,20 +1855,23 @@ mod resolve_step_env_tests {
     }
 
     #[test]
-    fn command_and_env_resolve() {
+    fn command_and_env_resolve_secret_tokens() {
         let settings = RunPrepareSettings {
             steps:      vec![command_step(
-                &["deploy", "{{ env.REGION }}"],
-                HashMap::from([("TOKEN".to_string(), "{{ env.DEPLOY_TOKEN }}".to_string())]),
+                &["deploy", "{{ secrets.REGION }}"],
+                HashMap::from([(
+                    "TOKEN".to_string(),
+                    "{{ secrets.DEPLOY_TOKEN }}".to_string(),
+                )]),
             )],
             timeout_ms: 1_000,
         };
 
         let resolved = settings
-            .resolve_step_env(
-                env_lookup(&[("REGION", "us-east-1"), ("DEPLOY_TOKEN", "secret-token")]),
-                secret_lookup(&[]),
-            )
+            .resolve_step_env(secret_lookup(&[
+                ("REGION", "us-east-1"),
+                ("DEPLOY_TOKEN", "secret-token"),
+            ]))
             .unwrap();
 
         assert_eq!(resolved.steps[0].to_shell_command(), "deploy us-east-1");
@@ -2006,15 +1886,15 @@ mod resolve_step_env_tests {
         // A resolved argv element that contains a space must survive as a
         // single shell word, not re-split into two.
         let settings = RunPrepareSettings {
-            steps:      vec![command_step(&["echo", "{{ env.MESSAGE }}"], HashMap::new())],
+            steps:      vec![command_step(
+                &["echo", "{{ secrets.MESSAGE }}"],
+                HashMap::new(),
+            )],
             timeout_ms: 1_000,
         };
 
         let resolved = settings
-            .resolve_step_env(
-                env_lookup(&[("MESSAGE", "hello world")]),
-                secret_lookup(&[]),
-            )
+            .resolve_step_env(secret_lookup(&[("MESSAGE", "hello world")]))
             .unwrap();
 
         let shell = resolved.steps[0].to_shell_command();
@@ -2032,17 +1912,14 @@ mod resolve_step_env_tests {
         let malicious = "x'; touch PWNED; echo '";
         let settings = RunPrepareSettings {
             steps:      vec![command_step(
-                &["echo", "{{ env.USER_INPUT }}"],
+                &["echo", "{{ secrets.USER_INPUT }}"],
                 HashMap::new(),
             )],
             timeout_ms: 1_000,
         };
 
         let resolved = settings
-            .resolve_step_env(
-                |name| (name == "USER_INPUT").then(|| malicious.to_string()),
-                secret_lookup(&[]),
-            )
+            .resolve_step_env(|name| (name == "USER_INPUT").then(|| malicious.to_string()))
             .unwrap();
 
         let shell = resolved.steps[0].to_shell_command();
@@ -2063,39 +1940,38 @@ mod resolve_step_env_tests {
     }
 
     #[test]
-    fn missing_env_in_command_is_hard_error() {
+    fn missing_secret_in_command_is_hard_error() {
         let settings = RunPrepareSettings {
             steps:      vec![command_step(
-                &["deploy", "{{ env.REGION }}"],
+                &["deploy", "{{ secrets.REGION }}"],
                 HashMap::new(),
             )],
             timeout_ms: 1_000,
         };
 
-        let err = settings
-            .resolve_step_env(env_lookup(&[]), secret_lookup(&[]))
-            .unwrap_err();
+        let err = settings.resolve_step_env(secret_lookup(&[])).unwrap_err();
 
-        assert_eq!(err.namespace, Namespace::Env);
+        assert_eq!(err.namespace, Namespace::Secrets);
         assert_eq!(err.name, "REGION");
         assert_eq!(err.kind, ResolveErrorKind::Missing);
     }
 
     #[test]
-    fn missing_env_in_step_env_value_is_hard_error() {
+    fn missing_secret_in_step_env_value_is_hard_error() {
         let settings = RunPrepareSettings {
             steps:      vec![script_step(
                 "echo hi",
-                HashMap::from([("TOKEN".to_string(), "{{ env.DEPLOY_TOKEN }}".to_string())]),
+                HashMap::from([(
+                    "TOKEN".to_string(),
+                    "{{ secrets.DEPLOY_TOKEN }}".to_string(),
+                )]),
             )],
             timeout_ms: 1_000,
         };
 
-        let err = settings
-            .resolve_step_env(env_lookup(&[]), secret_lookup(&[]))
-            .unwrap_err();
+        let err = settings.resolve_step_env(secret_lookup(&[])).unwrap_err();
 
-        assert_eq!(err.namespace, Namespace::Env);
+        assert_eq!(err.namespace, Namespace::Secrets);
         assert_eq!(err.name, "DEPLOY_TOKEN");
         assert_eq!(err.kind, ResolveErrorKind::Missing);
     }
@@ -2117,14 +1993,11 @@ mod resolve_step_env_tests {
         };
 
         let resolved = settings
-            .resolve_step_env(
-                env_lookup(&[]),
-                secret_lookup(&[
-                    ("REGION", "us-east-1"),
-                    ("DEPLOY_TOKEN", "vault-token"),
-                    ("MESSAGE", "hello world"),
-                ]),
-            )
+            .resolve_step_env(secret_lookup(&[
+                ("REGION", "us-east-1"),
+                ("DEPLOY_TOKEN", "vault-token"),
+                ("MESSAGE", "hello world"),
+            ]))
             .unwrap();
 
         assert_eq!(
@@ -2148,9 +2021,7 @@ mod resolve_step_env_tests {
             timeout_ms: 1_000,
         };
 
-        let err = settings
-            .resolve_step_env(env_lookup(&[]), secret_lookup(&[]))
-            .unwrap_err();
+        let err = settings.resolve_step_env(secret_lookup(&[])).unwrap_err();
 
         assert_eq!(err.namespace, Namespace::Secrets);
         assert_eq!(err.name, "API_KEY");
@@ -2232,12 +2103,10 @@ pub enum HookType {
         command: InterpString,
     },
     Http {
-        url:              InterpString,
-        headers:          Option<HashMap<String, InterpString>>,
+        url:     InterpString,
+        headers: Option<HashMap<String, InterpString>>,
         #[serde(default)]
-        allowed_env_vars: Vec<String>,
-        #[serde(default)]
-        tls:              TlsMode,
+        tls:     TlsMode,
     },
     Prompt {
         prompt: InterpString,

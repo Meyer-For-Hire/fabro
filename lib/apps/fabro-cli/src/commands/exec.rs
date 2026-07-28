@@ -282,14 +282,6 @@ impl ProviderAdapter for AuthenticatedFabroServerAdapter {
     }
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "exec-boundary MCP transport InterpString resolution facade for {{ env.* }} values."
-)]
-fn process_env_var(name: &str) -> Option<String> {
-    std::env::var(name).ok()
-}
-
 fn run_mcp_servers_for_exec(
     mcps: &HashMap<String, ResolvedMcpEntry>,
 ) -> AnyResult<Vec<McpServerSettings>> {
@@ -351,7 +343,7 @@ pub(crate) async fn execute(mut args: ExecArgs, ctx: &CommandContext) -> AnyResu
         .into_iter()
         .map(|settings| {
             settings
-                .resolve_transport_env(process_env_var, |_| None)
+                .resolve_transport_env(|_| None)
                 .with_context(|| format!("failed to resolve MCP server {:?}", settings.name))
         })
         .collect::<AnyResult<Vec<_>>>()?;

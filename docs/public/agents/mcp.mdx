@@ -149,12 +149,11 @@ Inline transport fields can interpolate values at the run boundary:
 | Syntax | Resolution time |
 |---|---|
 | `{{ vars.NAME }}` | When the server creates the run, using that run's variable snapshot |
-| `{{ env.NAME }}` | When the worker launches the MCP transport |
 | `{{ secrets.NAME }}` | When the worker launches the MCP transport, using a token secret from the server vault |
 
 Interpolation applies to stdio and sandbox commands and env values, plus HTTP URLs and headers. Variable tokens are replaced in the created run configuration. Worker-time environment and secret expressions remain in persisted configuration, while resolved secret values do not. A missing environment variable, missing secret, or non-token secret fails MCP startup instead of passing an unresolved token to the transport.
 
-Standalone `fabro exec` can resolve `{{ env.* }}` from its process environment, but it has no server vault. A `{{ secrets.* }}` reference therefore fails with an explicit error in standalone execution.
+Standalone `fabro exec` has no server vault, so a `{{ secrets.* }}` reference fails with an explicit error in standalone execution.
 
 ## Transports
 

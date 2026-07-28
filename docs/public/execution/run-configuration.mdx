@@ -79,7 +79,7 @@ memory = "8GB"
 disk = "20GB"
 
 [environments.cloud.env]
-API_KEY = "{{ env.MY_API_KEY }}"
+API_KEY = "{{ secrets.MY_API_KEY }}"
 NODE_ENV = "production"
 
 [run.integrations.github.permissions]
@@ -192,13 +192,13 @@ env = { NPM_TOKEN = "{{ secrets.NPM_TOKEN }}" }
 
 | Field | Description |
 |---|---|
-| `script` | Bash source, evaluated by the sandbox's non-login Bash (`bash -c`). Supports `{{ vars.* }}`, `{{ env.* }}`, and `{{ secrets.* }}` interpolation. |
+| `script` | Bash source, evaluated by the sandbox's non-login Bash (`bash -c`). Supports `{{ vars.* }}` and `{{ secrets.* }}` interpolation. |
 | `command` | Argv-style command, mutually exclusive with `script`. Each resolved element is shell-quoted as one argument. |
 | `env` | Additional environment variables for this step. Values support the same interpolation as `script` and `command`. |
 
 Each step must exit with status 0. If any step fails, the run aborts before the workflow starts. Prepare steps replace across layers — the higher-precedence layer wins wholesale.
 
-Fabro substitutes `{{ vars.* }}` when the server creates the run, then resolves `{{ env.* }}` from the worker process and `{{ secrets.* }}` from token entries in the server vault immediately before the worker executes the steps. Worker-time environment and secret expressions remain in the persisted run definition; resolved secret values are not persisted. A missing environment variable, missing secret, or non-token secret aborts startup with the affected step and token named in the error.
+Fabro substitutes `{{ vars.* }}` when the server creates the run, then resolves `{{ secrets.* }}` from token entries in the server vault immediately before the worker executes the steps. Secret expressions remain in the persisted run definition; resolved secret values are not persisted. A missing or non-token secret aborts startup with the affected step and token named in the error.
 
 ### `[run.clone]`
 
@@ -301,7 +301,7 @@ Environment variable values can combine literal text with server variables, work
 [environments.ci.env]
 API_KEY = "{{ secrets.SERVICE_API_KEY }}"
 NODE_ENV = "production"
-SERVICE_URL = "https://api.{{ env.REGION }}.example.com"
+SERVICE_URL = "https://api.{{ vars.REGION }}.example.com"
 RELEASE_CHANNEL = "{{ vars.RELEASE_CHANNEL }}"
 ```
 
@@ -309,11 +309,10 @@ RELEASE_CHANNEL = "{{ vars.RELEASE_CHANNEL }}"
 |---|---|
 | `"literal"` | Static value passed as-is |
 | `"{{ vars.NAME }}"` | Server-managed variable substituted when the run is created |
-| `"{{ env.VARNAME }}"` | Worker process environment value resolved when the run starts |
 | `"{{ secrets.NAME }}"` | Token secret resolved from the server vault when the run starts |
-| `"prefix-{{ env.X }}-suffix"` | Substring interpolation; multiple supported tokens per string are allowed |
+| `"prefix-{{ vars.X }}-suffix"` | Substring interpolation; multiple supported tokens per string are allowed |
 
-Missing or non-token secret references fail closed before sandbox startup. For backward compatibility, an environment value that references only a missing `{{ env.* }}` value is passed through in source form; use preflight or prepare-step interpolation when an absent worker variable must be a hard error.
+Missing or non-token secret references fail closed before sandbox startup. `{{ env.* }}` is not supported: the process environment is not a configuration source. Use `{{ vars.NAME }}` for a non-sensitive value or `{{ secrets.NAME }}` for a credential.
 
 ### `[run.integrations.github.permissions]`
 
@@ -349,7 +348,7 @@ channel = "#deploys"
 | `enabled` | Enables this route. Defaults to `false`. |
 | `provider` | Notification provider. Use `"slack"` for Slack lifecycle notifications. Other provider names may be parsed but are not delivered by the server yet. |
 | `events` | Raw Fabro event names that trigger this route, such as `run.started`, `run.completed`, and `run.failed`. |
-| `[run.notifications.<name>.slack].channel` | Required for Slack lifecycle notifications. Literal channel names and `{{ env.VAR }}` interpolation are supported. |
+| `[run.notifications.<name>.slack].channel` | Required for Slack lifecycle notifications. Literal channel names and `{{ vars.NAME }}` interpolation are supported. |
 
 Each enabled Slack route posts once for each matching lifecycle event. Messages include the run ID, an Open in Fabro link when available, workflow label, terminal result, duration, and pull request details when those are already present in the run event stream.
 
@@ -489,7 +488,7 @@ id = "sentry"
 | `startup_timeout` | Max duration for server startup + MCP handshake (e.g. `"10s"`, `"1m"`). | `"10s"` |
 | `tool_timeout` | Max duration for a single tool call. | `"60s"` |
 
-Inline transport commands, URLs, env values, and headers support `{{ vars.* }}`, `{{ env.* }}`, and `{{ secrets.* }}` interpolation. As with prepare steps, server variables resolve at run creation and worker env/token secrets resolve at launch; missing values fail closed. See [MCP runtime interpolation](/agents/mcp#runtime-interpolation) for the standalone `fabro exec` difference.
+Inline transport commands, URLs, env values, and headers support `{{ vars.* }}` and `{{ secrets.* }}` interpolation. As with prepare steps, server variables resolve at run creation and token secrets resolve at launch; missing values fail closed. See [MCP runtime interpolation](/agents/mcp#runtime-interpolation) for the standalone `fabro exec` difference.
 
 The `sandbox` transport runs the MCP server inside the workflow's sandbox. This is useful for tools that need access to the sandbox environment, such as browser automation with Playwright. See [MCP](/agents/mcp#sandbox) for details.
 

@@ -167,7 +167,8 @@ pub(crate) async fn execute(
             .run
             .integrations
             .github
-            .resolve_permissions(process_env_var),
+            .resolve_permissions()
+            .context("failed to resolve github permissions")?,
         vault,
         catalog,
         on_node: None,
@@ -1151,14 +1152,6 @@ fn maybe_build_github_credentials(
     }
 
     Ok(None)
-}
-
-#[expect(
-    clippy::disallowed_methods,
-    reason = "CLI worker InterpString resolution facade for {{ env.* }} values."
-)]
-fn process_env_var(name: &str) -> Option<String> {
-    std::env::var(name).ok()
 }
 
 /// Hard-gate for the CLI worker path: a run-level token is requested, or

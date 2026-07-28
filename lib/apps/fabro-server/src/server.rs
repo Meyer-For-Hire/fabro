@@ -152,7 +152,6 @@ use crate::git_checkout::GitRepoCache;
 use crate::github_webhooks::{
     WEBHOOK_ROUTE, WEBHOOK_SECRET_ENV, parse_event_metadata, verify_signature,
 };
-use crate::interp::process_env_var;
 use crate::jwt_auth::{self, AuthMode};
 use crate::principal_middleware::{
     AuthContextSlot, RequestAuth, RequestAuthContext, RequireRunBlob, RequireRunManagementTarget,
@@ -873,13 +872,8 @@ impl SlackService {
 
         let blocks = &blocks;
         let posts = routes.into_iter().filter_map(|(route_name, route)| {
-            let channel = resolve_slack_lifecycle_route_channel(
-                state,
-                event.run_id,
-                route_name,
-                route,
-                event_name,
-            )?;
+            let channel =
+                resolve_slack_lifecycle_route_channel(event.run_id, route_name, route, event_name)?;
             Some(async move {
                 if let Err(err) = self.client.post_message(&channel, blocks, None).await {
                     warn!(
@@ -1059,7 +1053,6 @@ fn slack_lifecycle_pull_request_from_link(link: &PullRequestLink) -> SlackLifecy
 }
 
 fn resolve_slack_lifecycle_route_channel(
-    state: &AppState,
     run_id: RunId,
     route_name: &str,
     route: &NotificationRouteSettings,
@@ -1079,7 +1072,10 @@ fn resolve_slack_lifecycle_route_channel(
         return None;
     };
 
-    let resolved = match channel.resolve(|name| (state.env_lookup)(name)) {
+    // `{{ vars.* }}` is substituted at run creation, so the channel is literal
+    // here; anything still unresolved skips the route rather than sending to a
+    // half-rendered channel name.
+    let resolved = match channel.resolve_with(&mut fabro_types::settings::ResolveCtx::new()) {
         Ok(resolved) => resolved,
         Err(err) => {
             warn!(
@@ -4088,7 +4084,11 @@ async fn execute_run_in_process(state: Arc<AppState>, run_id: RunId) {
         .run
         .integrations
         .github
-        .resolve_permissions(process_env_var);
+        .resolve_permissions()
+        .unwrap_or_else(|err| {
+            tracing::warn!(error = %err, "github permission interpolation failed");
+            std::collections::HashMap::new()
+        });
     let vault = match state.stores.vault.snapshot().await {
         Ok(vault) => vault,
         Err(err) => {
