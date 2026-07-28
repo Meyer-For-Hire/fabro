@@ -4253,9 +4253,15 @@ codec = "anthropic_messages"
     }
 
     #[test]
-    fn catalog_from_settings_rejects_duplicate_model_aliases() {
-        let layer = minimal_settings(
-            r#"
+    /// Canonical IDs, aliases, and API IDs share one identifier namespace per
+    /// provider, so a collision in any of them is rejected the same way.
+    fn catalog_from_settings_rejects_duplicate_provider_model_selectors() {
+        for (declaration, expected) in [
+            (r#"aliases = ["shared"]"#, "shared"),
+            (r#"api_id = "vendor/shared""#, "vendor/shared"),
+        ] {
+            let layer = minimal_settings(&format!(
+                r#"
 [providers.test]
 display_name = "Test"
 adapter = "openai"
@@ -4265,7 +4271,7 @@ enabled = true
 [providers.test.models.one]
 display_name = "One"
 family = "test"
-aliases = ["shared"]
+{declaration}
 
 [providers.test.models.one.limits]
 context_window = 1000
@@ -4278,7 +4284,7 @@ reasoning = false
 [providers.test.models.two]
 display_name = "Two"
 family = "test"
-aliases = ["shared"]
+{declaration}
 
 [providers.test.models.two.limits]
 context_window = 1000
@@ -4287,23 +4293,27 @@ context_window = 1000
 tools = false
 vision = false
 reasoning = false
-"#,
-        );
+"#
+            ));
 
-        let err = Catalog::from_settings(&layer).unwrap_err();
+            let err = Catalog::from_settings(&layer).unwrap_err();
 
-        assert!(matches!(
-            err,
-            CatalogBuildError::DuplicateProviderModelSelector {
-                provider,
-                selector,
-                first,
-                second,
-            } if provider == ProviderId::new("test")
-                && selector == "shared"
-                && first == "one"
-                && second == "two"
-        ));
+            assert!(
+                matches!(
+                    &err,
+                    CatalogBuildError::DuplicateProviderModelSelector {
+                        provider,
+                        selector,
+                        first,
+                        second,
+                    } if provider == &ProviderId::new("test")
+                        && selector == expected
+                        && first == "one"
+                        && second == "two"
+                ),
+                "{declaration}: {err:?}"
+            );
+        }
     }
 
     #[test]
@@ -4352,60 +4362,6 @@ reasoning = false
             ),
             Err(ModelSelectionError::UnknownSelector { selector })
                 if selector == "vendor/models/one:latest"
-        ));
-    }
-
-    #[test]
-    fn catalog_from_settings_rejects_duplicate_provider_api_ids() {
-        let layer = minimal_settings(
-            r#"
-[providers.test]
-display_name = "Test"
-adapter = "openai"
-agent_profile = "openai"
-
-[providers.test.models.one]
-api_id = "vendor/shared"
-display_name = "One"
-family = "test"
-default = true
-
-[providers.test.models.one.limits]
-context_window = 1000
-
-[providers.test.models.one.features]
-tools = false
-vision = false
-reasoning = false
-
-[providers.test.models.two]
-api_id = "vendor/shared"
-display_name = "Two"
-family = "test"
-
-[providers.test.models.two.limits]
-context_window = 1000
-
-[providers.test.models.two.features]
-tools = false
-vision = false
-reasoning = false
-"#,
-        );
-
-        let err = Catalog::from_settings(&layer).unwrap_err();
-
-        assert!(matches!(
-            err,
-            CatalogBuildError::DuplicateProviderModelSelector {
-                provider,
-                selector,
-                first,
-                second,
-            } if provider == ProviderId::new("test")
-                && selector == "vendor/shared"
-                && first == "one"
-                && second == "two"
         ));
     }
 
