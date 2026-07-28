@@ -13,6 +13,12 @@
 //! The parser produces [`ModelRef`]; ambiguity resolution against a known
 //! registry of providers and models happens at consumption time via
 //! [`ModelRef::resolve`].
+//!
+//! That split matters for the `:` form. Model IDs legitimately contain colons —
+//! ollama `name:tag` values, Bedrock inference-profile ARNs — so no separator
+//! is safe to split on by shape alone. Parsing leaves colon-bearing tokens bare
+//! and [`ModelRef::qualify`] promotes only the ones whose prefix names a
+//! provider.
 
 use std::fmt;
 use std::str::FromStr;
@@ -72,22 +78,25 @@ impl FromStr for ModelRef {
             return Err(ParseModelRefError::Empty);
         }
 
-        // A `:` splits provider from selector. The selector keeps any further
-        // `:` or `/`, so provider API IDs survive intact. Without a `:`, a
-        // single `/` is the legacy qualified form.
-        let (provider, selector) = match trimmed.split_once(':') {
-            Some(qualified) => qualified,
-            None => match trimmed.split_once('/') {
-                Some((_, selector)) if selector.contains('/') => {
-                    return Err(ParseModelRefError::TooManySlashes {
-                        input: input.to_owned(),
-                    });
-                }
-                Some(legacy) => legacy,
-                None => return Ok(Self::Bare(trimmed.to_owned())),
-            },
-        };
+        // A `:` may separate provider from selector, but model IDs legitimately
+        // contain colons — ollama `name:tag` values, Bedrock ARNs. Only a
+        // registry can tell the two apart, so colon-bearing tokens stay bare
+        // here and [`ModelRef::qualify`] promotes the ones that name a
+        // provider.
+        if trimmed.contains(':') {
+            return Ok(Self::Bare(trimmed.to_owned()));
+        }
 
+        // Legacy `provider/model`. A selector with a further `/` needs the
+        // `provider:selector` form.
+        let Some((provider, selector)) = trimmed.split_once('/') else {
+            return Ok(Self::Bare(trimmed.to_owned()));
+        };
+        if selector.contains('/') {
+            return Err(ParseModelRefError::TooManySlashes {
+                input: input.to_owned(),
+            });
+        }
         if provider.is_empty() || selector.is_empty() {
             return Err(ParseModelRefError::EmptySide {
                 input: input.to_owned(),
@@ -153,9 +162,37 @@ pub trait ModelRegistry {
 }
 
 impl ModelRef {
+    /// Promote a bare `provider:selector` token to [`ModelRef::Qualified`] when
+    /// the prefix names a known provider.
+    ///
+    /// Parsing alone cannot do this. A model ID may itself contain a colon —
+    /// ollama `name:tag` values, Bedrock inference-profile ARNs — and those
+    /// must stay whole. Anything else is returned unchanged.
+    #[must_use]
+    pub fn qualify(self, registry: &dyn ModelRegistry) -> Self {
+        let Self::Bare(token) = self else {
+            return self;
+        };
+        match token.split_once(':') {
+            Some((provider, selector))
+                if !provider.is_empty()
+                    && !selector.is_empty()
+                    && registry.is_provider(provider) =>
+            {
+                Self::Qualified {
+                    provider: provider.to_owned(),
+                    selector: selector.to_owned(),
+                }
+            }
+            _ => Self::Bare(token),
+        }
+    }
+
     /// Resolve this reference against a registry.
     ///
     /// - [`ModelRef::Qualified`] always resolves to a model.
+    /// - A bare `provider:selector` token is qualified first — see
+    ///   [`ModelRef::qualify`].
     /// - [`ModelRef::Bare`] resolves to a provider if the token is only a
     ///   provider, to a model if the token is only a model, and returns
     ///   [`AmbiguousModelRef`] if the token matches both a provider and a model
@@ -164,29 +201,40 @@ impl ModelRef {
         &self,
         registry: &dyn ModelRegistry,
     ) -> Result<ResolvedModelRef, AmbiguousModelRef> {
-        match self {
+        match self.clone().qualify(registry) {
             Self::Qualified { provider, selector } => Ok(ResolvedModelRef::Model {
-                provider: Some(provider.clone()),
-                selector: selector.clone(),
+                provider: Some(provider),
+                selector,
             }),
             Self::Bare(token) => {
-                let is_provider = registry.is_provider(token);
-                let is_model = registry.is_model(token);
+                let is_provider = registry.is_provider(&token);
+                let is_model = registry.is_model(&token);
                 match (is_provider, is_model) {
-                    (true, false) => Ok(ResolvedModelRef::Provider(token.clone())),
+                    (true, false) => Ok(ResolvedModelRef::Provider(token)),
                     (true, true) => Err(AmbiguousModelRef {
                         input:     token.clone(),
                         providers: vec![token.clone()],
-                        models:    vec![token.clone()],
+                        models:    vec![token],
                     }),
                     // Known and unknown bare models leave provider selection to the runtime.
                     (false, _) => Ok(ResolvedModelRef::Model {
                         provider: None,
-                        selector: token.clone(),
+                        selector: token,
                     }),
                 }
             }
         }
+    }
+}
+
+impl ModelRegistry for fabro_model::Catalog {
+    fn is_provider(&self, token: &str) -> bool {
+        self.provider(&fabro_model::ProviderId::from(token))
+            .is_some()
+    }
+
+    fn is_model(&self, token: &str) -> bool {
+        self.is_model_selector(token)
     }
 }
 
@@ -248,15 +296,21 @@ mod tests {
         );
     }
 
+    /// Parsing cannot tell a provider prefix from a model ID that contains a
+    /// colon, so it defers to [`ModelRef::qualify`].
     #[test]
-    fn parses_colon_qualified() {
-        assert_eq!(
-            "gemini:gemini-flash".parse::<ModelRef>().unwrap(),
-            ModelRef::Qualified {
-                provider: "gemini".into(),
-                selector: "gemini-flash".into(),
-            }
-        );
+    fn parses_colon_tokens_as_bare() {
+        for input in [
+            "gemini:gemini-flash",
+            "openrouter:moonshotai/kimi-k3",
+            "bedrock:us.anthropic.claude-haiku-4-5-20251001-v1:0",
+        ] {
+            assert_eq!(
+                input.parse::<ModelRef>().unwrap(),
+                ModelRef::Bare(input.into()),
+                "{input}"
+            );
+        }
     }
 
     #[test]
@@ -271,23 +325,55 @@ mod tests {
     }
 
     #[test]
-    fn colon_qualified_selector_may_contain_slashes_and_colons() {
-        assert_eq!(
-            "openrouter:moonshotai/kimi-k3".parse::<ModelRef>().unwrap(),
-            ModelRef::Qualified {
-                provider: "openrouter".into(),
-                selector: "moonshotai/kimi-k3".into(),
-            }
-        );
-        assert_eq!(
-            "bedrock:us.anthropic.claude-haiku-4-5-20251001-v1:0"
-                .parse::<ModelRef>()
-                .unwrap(),
-            ModelRef::Qualified {
-                provider: "bedrock".into(),
-                selector: "us.anthropic.claude-haiku-4-5-20251001-v1:0".into(),
-            }
-        );
+    fn qualify_promotes_a_known_provider_prefix() {
+        let reg = TestRegistry {
+            providers: &["openrouter", "bedrock"],
+            models:    &[],
+        };
+        for (input, selector) in [
+            ("openrouter:kimi-k3", "kimi-k3"),
+            ("openrouter:moonshotai/kimi-k3", "moonshotai/kimi-k3"),
+            (
+                "bedrock:us.anthropic.claude-haiku-4-5-20251001-v1:0",
+                "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+            ),
+        ] {
+            let qualified = input.parse::<ModelRef>().unwrap().qualify(&reg);
+            let provider = input.split_once(':').unwrap().0;
+            assert_eq!(
+                qualified,
+                ModelRef::Qualified {
+                    provider: provider.into(),
+                    selector: selector.into(),
+                },
+                "{input}"
+            );
+        }
+    }
+
+    /// The regression this guards: a model ID that merely contains a colon —
+    /// an ollama `name:tag`, a Bedrock ARN — must not be read as qualified.
+    #[test]
+    fn qualify_leaves_colon_bearing_model_ids_bare() {
+        let reg = TestRegistry {
+            providers: &["ollama", "bedrock"],
+            models:    &[],
+        };
+        for input in [
+            "llama3:8b",
+            "qwen3.5:latest",
+            "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+            "arn:aws:bedrock:us-east-1:1234:inference-profile/us.anthropic.claude-fable-5",
+            ":foo",
+            "foo:",
+        ] {
+            let parsed = input.parse::<ModelRef>().unwrap();
+            assert_eq!(
+                parsed.clone().qualify(&reg),
+                parsed,
+                "{input} should stay bare"
+            );
+        }
     }
 
     #[test]
@@ -308,14 +394,6 @@ mod tests {
         ));
         assert!(matches!(
             "foo/".parse::<ModelRef>().unwrap_err(),
-            ParseModelRefError::EmptySide { .. }
-        ));
-        assert!(matches!(
-            ":foo".parse::<ModelRef>().unwrap_err(),
-            ParseModelRefError::EmptySide { .. }
-        ));
-        assert!(matches!(
-            "foo:".parse::<ModelRef>().unwrap_err(),
             ParseModelRefError::EmptySide { .. }
         ));
     }
@@ -407,14 +485,21 @@ mod tests {
             m: ModelRef,
         }
 
+        // Colon tokens stay bare until a registry qualifies them, and survive
+        // the round trip verbatim either way.
         let input = r#"{"m":"openrouter:moonshotai/kimi-k3"}"#;
         let parsed: Wrap = serde_json::from_str(input).unwrap();
-        assert!(matches!(
+        assert_eq!(
             parsed.m,
-            ModelRef::Qualified { ref provider, ref selector }
-                if provider == "openrouter" && selector == "moonshotai/kimi-k3"
-        ));
+            ModelRef::Bare("openrouter:moonshotai/kimi-k3".into())
+        );
         let rendered = serde_json::to_string(&parsed).unwrap();
         assert_eq!(rendered, input);
+
+        let legacy: Wrap = serde_json::from_str(r#"{"m":"gemini/gemini-flash"}"#).unwrap();
+        assert_eq!(
+            serde_json::to_string(&legacy).unwrap(),
+            r#"{"m":"gemini:gemini-flash"}"#
+        );
     }
 }

@@ -857,7 +857,8 @@ fn canonical_session_model(
     }
     let model_ref = requested
         .parse::<SettingsModelRef>()
-        .map_err(|err| ApiError::bad_request(err.to_string()))?;
+        .map_err(|err| ApiError::bad_request(err.to_string()))?
+        .qualify(catalog);
     let (qualified_provider, selector) = match model_ref {
         SettingsModelRef::Qualified { provider, selector } => {
             let requested_provider = ProviderId::new(provider);
@@ -1626,6 +1627,31 @@ reasoning = false
         assert_eq!(
             canonical_session_model(&catalog, &both, Some("future-model"), None).unwrap(),
             (openai, "future-model".to_string())
+        );
+    }
+
+    /// A colon in a model ID does not make it provider-qualified. Ollama
+    /// `name:tag` values and Bedrock ARNs must still reach the provider.
+    #[test]
+    fn canonical_session_model_passes_through_colon_bearing_model_ids() {
+        let catalog = portable_session_catalog();
+        let openai = ProviderId::openai();
+        let openrouter = ProviderId::new("openrouter");
+        let both = std::collections::HashSet::from([openai.clone(), openrouter.clone()]);
+
+        assert_eq!(
+            canonical_session_model(
+                &catalog,
+                &both,
+                Some("future-model:latest"),
+                Some(&openrouter),
+            )
+            .unwrap(),
+            (openrouter, "future-model:latest".to_string())
+        );
+        assert_eq!(
+            canonical_session_model(&catalog, &both, Some("future-model:latest"), None).unwrap(),
+            (openai, "future-model:latest".to_string())
         );
     }
 

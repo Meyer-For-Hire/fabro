@@ -7943,7 +7943,9 @@ components:
           description: |
             Catalog model ID or alias, optionally qualified as
             `provider:selector`. A provider-qualified selector may be a
-            canonical model ID, alias, or provider API ID. Legacy
+            canonical model ID, alias, or provider API ID. A value counts as
+            qualified only when the text before the first `:` names a known
+            provider, so model IDs containing a colon stay whole. Legacy
             `provider/model` references remain accepted. The server stores the
             canonical model ID.
         provider:
@@ -14126,7 +14128,10 @@ components:
         A fallback model reference. Bare values name a provider, canonical
         model ID, or alias. Provider-qualified values use
         `provider:selector`; the selector may be a canonical model ID, alias,
-        or provider API ID and may contain `/` or additional colons. Legacy
+        or provider API ID and may contain `/` or additional colons. A value
+        is treated as qualified only when the text before the first `:` names
+        a known provider, so model IDs that contain a colon — ollama
+        `name:tag` values, Bedrock inference-profile IDs — stay whole. Legacy
         `provider/model` references remain accepted.
       example: openrouter:moonshotai/kimi-k3
 
