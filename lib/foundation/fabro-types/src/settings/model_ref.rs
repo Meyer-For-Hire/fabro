@@ -16,9 +16,10 @@
 //!
 //! That split matters for the `:` form. Model IDs legitimately contain colons —
 //! ollama `name:tag` values, Bedrock inference-profile ARNs — so no separator
-//! is safe to split on by shape alone. Parsing leaves colon-bearing tokens bare
-//! and [`ModelRef::qualify`] promotes only the ones whose prefix names a
-//! provider.
+//! is safe to split on by shape alone. Whichever separator appears first
+//! decides the form: a `/` before any `:` is the legacy pin, and its selector
+//! may contain colons. Otherwise the token stays bare and
+//! [`ModelRef::qualify`] promotes it only when the prefix names a provider.
 
 use std::fmt;
 use std::str::FromStr;
@@ -78,20 +79,20 @@ impl FromStr for ModelRef {
             return Err(ParseModelRefError::Empty);
         }
 
-        // A `:` may separate provider from selector, but model IDs legitimately
-        // contain colons — ollama `name:tag` values, Bedrock ARNs. Only a
-        // registry can tell the two apart, so colon-bearing tokens stay bare
-        // here and [`ModelRef::qualify`] promotes the ones that name a
-        // provider.
-        if trimmed.contains(':') {
-            return Ok(Self::Bare(trimmed.to_owned()));
-        }
-
-        // Legacy `provider/model`. A selector with a further `/` needs the
-        // `provider:selector` form.
-        let Some((provider, selector)) = trimmed.split_once('/') else {
-            return Ok(Self::Bare(trimmed.to_owned()));
+        // Whichever separator comes first decides the form.
+        let (provider, selector) = match (trimmed.find('/'), trimmed.find(':')) {
+            // A `/` before any `:` is the legacy `provider/model` form. Its
+            // selector may itself contain colons, as Bedrock API IDs do.
+            (Some(slash), colon) if colon.is_none_or(|colon| slash < colon) => {
+                (&trimmed[..slash], &trimmed[slash + 1..])
+            }
+            // Otherwise a `:` may separate provider from selector — but model
+            // IDs legitimately contain colons (ollama `name:tag` values,
+            // Bedrock ARNs) and only a registry can tell those apart, so leave
+            // the token bare for [`ModelRef::qualify`] to promote.
+            _ => return Ok(Self::Bare(trimmed.to_owned())),
         };
+
         if selector.contains('/') {
             return Err(ParseModelRefError::TooManySlashes {
                 input: input.to_owned(),
@@ -320,6 +321,46 @@ mod tests {
             ModelRef::Qualified {
                 provider: "gemini".into(),
                 selector: "gemini-flash".into(),
+            }
+        );
+    }
+
+    /// A `/` before any `:` keeps the legacy pin, so Bedrock-style API IDs
+    /// stay on the selector side instead of splitting at the wrong colon.
+    #[test]
+    fn legacy_slash_selector_may_contain_colons() {
+        for (input, provider, selector) in [
+            (
+                "bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0",
+                "bedrock",
+                "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+            ),
+            ("openai/gpt-5.6-sol:0", "openai", "gpt-5.6-sol:0"),
+        ] {
+            assert_eq!(
+                input.parse::<ModelRef>().unwrap(),
+                ModelRef::Qualified {
+                    provider: provider.into(),
+                    selector: selector.into(),
+                },
+                "{input}"
+            );
+        }
+    }
+
+    /// A `:` before any `/` wins, so a provider-qualified selector keeps its
+    /// slashes.
+    #[test]
+    fn first_separator_decides_the_form() {
+        assert_eq!(
+            "openrouter:moonshotai/kimi-k3".parse::<ModelRef>().unwrap(),
+            ModelRef::Bare("openrouter:moonshotai/kimi-k3".into())
+        );
+        assert_eq!(
+            "bedrock/us.anthropic:0".parse::<ModelRef>().unwrap(),
+            ModelRef::Qualified {
+                provider: "bedrock".into(),
+                selector: "us.anthropic:0".into(),
             }
         );
     }
