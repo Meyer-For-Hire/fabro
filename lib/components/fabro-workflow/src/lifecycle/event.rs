@@ -496,7 +496,7 @@ impl RunLifecycle<WorkflowGraph> for EventLifecycle {
             }
             for push in &result.push_results {
                 self.emitter.emit(&Event::GitPush {
-                    branch:           push.refspec.clone(),
+                    branch:           push.branch.clone(),
                     success:          push.success,
                     exec_output_tail: push.exec_output_tail.clone(),
                 });

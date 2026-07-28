@@ -15,12 +15,12 @@
 
 
 /**
- * Timing breakdown for one stage visit. Fields are all milliseconds. `wall_time_ms` is elapsed clock time; `inference_time_ms` is Fabro- observed LLM request/stream elapsed time; `tool_time_ms` is tool or command execution elapsed time; `active_time_ms` equals `inference_time_ms + tool_time_ms`.
+ * Timing breakdown for one stage visit. Fields are all milliseconds. `wall_time_ms` is elapsed clock time; `inference_time_ms` is Fabro- observed LLM request/stream elapsed time; `tool_time_ms` is tool or command execution elapsed time; `active_time_ms` equals `inference_time_ms + tool_time_ms`.  For a terminal stage these come from the worker\'s own stopwatch and are authoritative. For a stage still in flight they are a live estimate reconstructed from the event log, and `active_time_ms` is clamped to `wall_time_ms`. The estimate is replaced by the authoritative breakdown when the stage reaches a terminal event.
  */
 export interface StageTiming {
     'wall_time_ms': number;
-    'inference_time_ms'?: number;
-    'tool_time_ms'?: number;
+    'inference_time_ms': number;
+    'tool_time_ms': number;
     /**
      * Equals `inference_time_ms + tool_time_ms`.
      */

@@ -276,6 +276,13 @@ pub async fn execute(init: Initialized) -> Executed {
         Err(fabro_core::Error::Blocked { message }) => {
             (Err(Error::engine(message)), initial_context)
         }
+        Err(error @ fabro_core::Error::Context { .. }) => (
+            Err(Error::engine_with_source(
+                "Pipeline lifecycle operation failed",
+                error,
+            )),
+            initial_context,
+        ),
         Err(e) => (Err(Error::engine(e.to_string())), initial_context),
     };
 

@@ -28,7 +28,7 @@ use crate::pipeline::{self, Persisted, TransformOptions, Validated};
 use crate::records::RunSpec;
 use crate::run_lookup::default_scratch_base;
 use crate::run_materialization::materialize_run;
-use crate::transforms::{RenderMode, Transform};
+use crate::transforms::{ModelResolutionTransform, RenderMode};
 use crate::workflow_bundle::{RunDefinition, WorkflowBundle};
 
 #[derive(Clone, Debug)]
@@ -293,28 +293,21 @@ fn create_from_source(
     file_resolver: Option<Arc<dyn FileResolver>>,
     goal_override: Option<&str>,
 ) -> Result<Persisted, Error> {
-    let template_context = template_context(Some(&options.settings), vars);
-    let mut validated = preprocess_and_validate(
-        dot_source,
-        options.source_name.clone(),
+    let mut validated = preprocess_and_validate(dot_source, goal_override, &TransformOptions {
         current_dir,
         file_resolver,
-        Vec::new(),
-        template_context,
-        goal_override,
-        RenderMode::Structural,
-        options
-            .settings
-            .run
-            .model
-            .provider
-            .as_deref()
-            .filter(|provider| !provider.is_empty())
-            .map(ProviderId::new),
-        &options.configured_providers,
-        false,
-        &options.catalog,
-    )?;
+        template_context: template_context(Some(&options.settings), vars),
+        source_name: options.source_name.clone(),
+        render_mode: RenderMode::Structural,
+        custom_transforms: Vec::new(),
+        model_resolution: Some(
+            ModelResolutionTransform::for_eligible(
+                Arc::clone(&options.catalog),
+                options.configured_providers.iter().cloned().collect(),
+            )
+            .with_default_provider(configured_default_provider(&options.settings)),
+        ),
+    })?;
 
     validated.promote_template_undefined_variables_to_errors();
     if validated.has_errors() {
@@ -326,36 +319,37 @@ fn create_from_source(
     persist_validated(validated, options)
 }
 
+/// Parse, transform, and validate `dot_source`.
+///
+/// `options.model_resolution` drives both halves of catalog awareness: it
+/// selects concrete models during TRANSFORM and enables the catalog-backed
+/// lint rules during VALIDATE. `None` leaves authored model and provider
+/// selectors untouched for offline structural validation.
 pub(super) fn preprocess_and_validate(
     dot_source: &str,
-    source_name: Option<String>,
-    current_dir: Option<PathBuf>,
-    file_resolver: Option<Arc<dyn FileResolver>>,
-    custom_transforms: Vec<Box<dyn Transform>>,
-    template_context: TemplateContext,
     goal_override: Option<&str>,
-    render_mode: RenderMode,
-    default_provider: Option<ProviderId>,
-    eligible_providers: &[ProviderId],
-    catalog_fallback: bool,
-    catalog: &Arc<Catalog>,
+    options: &TransformOptions,
 ) -> Result<Validated, Error> {
     let mut parsed = pipeline::parse(dot_source)?;
     apply_goal_override(&mut parsed.graph, goal_override);
 
-    let transformed = pipeline::transform(parsed, &TransformOptions {
-        current_dir,
-        file_resolver,
-        template_context,
-        source_name,
-        render_mode,
-        custom_transforms,
-        catalog: Arc::clone(catalog),
-        default_provider,
-        eligible_providers: eligible_providers.iter().cloned().collect(),
-        catalog_fallback,
-    })?;
-    Ok(pipeline::validate(transformed, catalog.as_ref(), &[]))
+    let transformed = pipeline::transform(parsed, options)?;
+    let catalog = options
+        .model_resolution
+        .as_ref()
+        .map(ModelResolutionTransform::catalog);
+    Ok(pipeline::validate(transformed, catalog, &[]))
+}
+
+/// The workflow-level default provider, treating an empty setting as unset.
+pub(super) fn configured_default_provider(settings: &WorkflowSettings) -> Option<ProviderId> {
+    settings
+        .run
+        .model
+        .provider
+        .as_deref()
+        .filter(|provider| !provider.is_empty())
+        .map(ProviderId::new)
 }
 
 pub(super) fn template_context(
@@ -462,8 +456,9 @@ mod tests {
     use object_store::memory::InMemory;
 
     use super::*;
-    use crate::operations::{ValidateInput, validate};
+    use crate::operations::{ValidateInput, validate, validate_with_catalog};
     use crate::pipeline::types::{GOAL_SELF_REFERENCE_RULE, TEMPLATE_UNDEFINED_VARIABLE_RULE};
+    use crate::transforms::Transform;
     use crate::workflow_bundle::BundledWorkflow;
     fn memory_store() -> Arc<Database> {
         Arc::new(Database::new(
@@ -553,17 +548,19 @@ reasoning = false
     }
 
     fn validate_dot(dot_source: &str, settings: WorkflowSettings) -> Validated {
-        validate(ValidateInput {
-            workflow: WorkflowInput::DotSource {
-                source:   dot_source.to_string(),
-                base_dir: None,
+        validate_with_catalog(
+            ValidateInput {
+                workflow: WorkflowInput::DotSource {
+                    source:   dot_source.to_string(),
+                    base_dir: None,
+                },
+                settings,
+                vars: HashMap::new(),
+                cwd: PathBuf::from("."),
+                custom_transforms: Vec::new(),
             },
-            settings,
-            vars: HashMap::new(),
-            cwd: PathBuf::from("."),
-            custom_transforms: Vec::new(),
-            catalog: test_catalog(),
-        })
+            test_catalog(),
+        )
         .unwrap()
     }
 
@@ -573,19 +570,33 @@ reasoning = false
     fn validate_dot_with_vars(dot_source: &str, vars: HashMap<String, String>) -> Validated {
         preprocess_and_validate(
             dot_source,
-            Some("workflow.fabro".to_string()),
-            Some(PathBuf::from(".")),
             None,
-            Vec::new(),
-            template_context(Some(&WorkflowSettings::default()), vars),
-            None,
-            RenderMode::Structural,
-            None,
-            &test_provider_ids(),
-            false,
-            &test_catalog(),
+            &test_transform_options(
+                PathBuf::from("."),
+                None,
+                RenderMode::Structural,
+                template_context(Some(&WorkflowSettings::default()), vars),
+            ),
         )
         .unwrap()
+    }
+
+    /// Catalog-backed TRANSFORM options for the built-in test catalog.
+    fn test_transform_options(
+        current_dir: PathBuf,
+        file_resolver: Option<Arc<dyn FileResolver>>,
+        render_mode: RenderMode,
+        template_context: TemplateContext,
+    ) -> TransformOptions {
+        TransformOptions {
+            current_dir: Some(current_dir),
+            file_resolver,
+            template_context,
+            source_name: Some("workflow.fabro".to_string()),
+            render_mode,
+            custom_transforms: Vec::new(),
+            model_resolution: Some(ModelResolutionTransform::new(test_catalog())),
+        }
     }
 
     const MINIMAL_DOT: &str = r#"digraph Test {
@@ -796,17 +807,13 @@ reasoning = false
 
         let result = preprocess_and_validate(
             dot,
-            Some("workflow.fabro".to_string()),
-            Some(PathBuf::from(".")),
             None,
-            Vec::new(),
-            template_context(Some(&WorkflowSettings::default()), HashMap::new()),
-            None,
-            RenderMode::Strict,
-            None,
-            &test_provider_ids(),
-            false,
-            &test_catalog(),
+            &test_transform_options(
+                PathBuf::from("."),
+                None,
+                RenderMode::Strict,
+                template_context(Some(&WorkflowSettings::default()), HashMap::new()),
+            ),
         );
         let Err(err) = result else {
             panic!("expected strict mode to hard-fail on unbound inline prompt");
@@ -833,19 +840,15 @@ reasoning = false
 
         let result = preprocess_and_validate(
             dot,
-            Some("workflow.fabro".to_string()),
-            Some(dir.path().to_path_buf()),
-            Some(Arc::new(crate::file_resolver::FilesystemFileResolver::new(
-                None,
-            ))),
-            Vec::new(),
-            template_context(Some(&WorkflowSettings::default()), HashMap::new()),
             None,
-            RenderMode::Strict,
-            None,
-            &test_provider_ids(),
-            false,
-            &test_catalog(),
+            &test_transform_options(
+                dir.path().to_path_buf(),
+                Some(Arc::new(crate::file_resolver::FilesystemFileResolver::new(
+                    None,
+                ))),
+                RenderMode::Strict,
+                template_context(Some(&WorkflowSettings::default()), HashMap::new()),
+            ),
         );
         let Err(err) = result else {
             panic!("expected strict mode to hard-fail on unbound imported prompt");
@@ -904,7 +907,6 @@ reasoning = false
             vars:              HashMap::new(),
             cwd:               PathBuf::from("."),
             custom_transforms: Vec::new(),
-            catalog:           test_catalog(),
         });
 
         assert!(result.is_err());
@@ -953,7 +955,6 @@ reasoning = false
             vars:              HashMap::new(),
             cwd:               dir.path().to_path_buf(),
             custom_transforms: Vec::new(),
-            catalog:           test_catalog(),
         })
         .unwrap();
         let file_missing = validate(ValidateInput {
@@ -972,7 +973,6 @@ reasoning = false
             vars:              HashMap::new(),
             cwd:               dir.path().to_path_buf(),
             custom_transforms: Vec::new(),
-            catalog:           test_catalog(),
         })
         .unwrap();
         assert_eq!(
@@ -996,7 +996,6 @@ reasoning = false
             vars:              HashMap::new(),
             cwd:               dir.path().to_path_buf(),
             custom_transforms: Vec::new(),
-            catalog:           test_catalog(),
         })
         .unwrap();
         let file_goal = validate(ValidateInput {
@@ -1015,7 +1014,6 @@ reasoning = false
             vars:              HashMap::new(),
             cwd:               dir.path().to_path_buf(),
             custom_transforms: Vec::new(),
-            catalog:           test_catalog(),
         })
         .unwrap();
         assert_eq!(
@@ -1107,7 +1105,6 @@ reasoning = false
             vars:              HashMap::new(),
             cwd:               PathBuf::from("."),
             custom_transforms: Vec::new(),
-            catalog:           test_catalog(),
         });
         assert!(result.is_err());
     }
@@ -1152,7 +1149,6 @@ reasoning = false
             vars:              HashMap::new(),
             cwd:               PathBuf::from("."),
             custom_transforms: vec![Box::new(TagTransform)],
-            catalog:           test_catalog(),
         })
         .unwrap();
         validated.raise_on_errors().unwrap();
@@ -1187,7 +1183,6 @@ reasoning = false
             vars:              HashMap::new(),
             cwd:               dir.path().to_path_buf(),
             custom_transforms: Vec::new(),
-            catalog:           test_catalog(),
         })
         .unwrap();
         validated.raise_on_errors().unwrap();
@@ -1229,7 +1224,6 @@ reasoning = false
             vars:              HashMap::new(),
             cwd:               dir.path().to_path_buf(),
             custom_transforms: Vec::new(),
-            catalog:           test_catalog(),
         })
         .unwrap();
 
@@ -1279,7 +1273,6 @@ reasoning = false
             vars:              HashMap::new(),
             cwd:               PathBuf::from("."),
             custom_transforms: Vec::new(),
-            catalog:           test_catalog(),
         })
         .unwrap();
 
@@ -1330,7 +1323,6 @@ reasoning = false
             vars:              HashMap::new(),
             cwd:               PathBuf::from("."),
             custom_transforms: Vec::new(),
-            catalog:           test_catalog(),
         })
         .unwrap();
 

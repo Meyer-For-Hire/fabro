@@ -1,9 +1,9 @@
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::num::NonZeroU32;
 
 use chrono::{DateTime, Utc};
-use fabro_model::{ReasoningEffort, Speed};
+use fabro_model::{Catalog, ReasoningEffort, Speed};
 use strum::{Display, EnumString, IntoStaticStr};
 
 use crate::run_event::{AgentSessionActivatedProps, StagePromptProps};
@@ -12,7 +12,7 @@ use crate::{
     AgentToolSummary, BilledTokenCounts, Checkpoint, Conclusion, InterviewQuestionRecord,
     InvalidTransition, LlmOutputKind, ModelRef, PermissionLevel, PullRequestLink, RunApproval,
     RunControlAction, RunDiff, RunId, RunSandbox, RunSpec, RunStatus, RunTiming, StageCompletion,
-    StageHandler, StageId, StageState, StageTiming, StartRecord, TodoListProjection,
+    StageHandler, StageId, StageState, StageTiming, StartRecord, TodoListProjection, timing,
 };
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -354,10 +354,31 @@ pub struct StageProjection {
     /// immutable projections under their own `StageId`s.
     ///
     /// `None` for stages still in flight (`started_at` is set but no terminal
-    /// event has been observed yet). For live wall-time ticking, the UI uses
-    /// `started_at`; once terminal this carries the finalized breakdown.
+    /// event has been observed yet). For a live breakdown while in flight, use
+    /// [`StageProjection::live_timing`]; once terminal this carries the
+    /// finalized, authoritative breakdown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timing:                Option<StageTiming>,
+    /// Inference time accumulated from closed brackets during this attempt.
+    ///
+    /// Live estimate only: the authoritative value arrives with the terminal
+    /// event and lands in `timing`. Excludes the currently-open bracket, which
+    /// [`StageProjection::live_timing`] adds from `inference.started_at`.
+    #[serde(default, skip_serializing_if = "is_zero_ms")]
+    pub live_inference_ms:     u64,
+    /// Tool time accumulated from closed tool batches during this attempt.
+    ///
+    /// A batch spans the first `agent.tool.started` with no outstanding calls
+    /// through the `agent.tool.completed` that drains the last one, so tools
+    /// running concurrently within a turn are counted once. This matches how
+    /// the in-process stopwatch brackets `execute_tool_calls`; summing
+    /// per-call durations would over-count parallel tool use.
+    #[serde(default, skip_serializing_if = "is_zero_ms")]
+    pub live_tool_ms:          u64,
+    /// Open tool batch for this stage: when the current batch started, and the
+    /// `tool_call_id`s that have not yet reported completion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_batch:            Option<StageToolBatchProjection>,
     #[serde(default)]
     pub usage:                 BilledTokenCounts,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -390,9 +411,43 @@ pub struct StageProjection {
     /// the authority on whether a run is actually stuck.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inference:             Option<StageInferenceProjection>,
+    /// Start of an external ACP agent process, if one is running.
+    ///
+    /// ACP agents do not emit Fabro's internal LLM brackets, so their process
+    /// lifetime is the best available live inference estimate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_started_at:        Option<DateTime<Utc>>,
     #[serde(default)]
     pub agent_control:         AgentControlState,
     pub state:                 StageState,
+}
+
+/// Serde guard so zero-valued live accumulators stay off the wire.
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if predicates receive fields by reference"
+)]
+fn is_zero_ms(value: &u64) -> bool {
+    *value == 0
+}
+
+/// One open tool batch: tool calls dispatched together that have not all
+/// reported completion.
+///
+/// `open_call_ids` is a set rather than a count because `agent.tool.completed`
+/// identifies its call by id, and a projection replaying a truncated or
+/// duplicated log must not let a repeated completion drain the batch early.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StageToolBatchProjection {
+    /// Root agent session that dispatched the batch. Later transitions are
+    /// gated on it so delayed events from a replaced session cannot mutate
+    /// the current session's batch.
+    pub session_id:    String,
+    /// When the batch opened — the first `agent.tool.started` observed while
+    /// no other calls were outstanding.
+    pub started_at:    DateTime<Utc>,
+    /// Calls dispatched but not yet completed, by `tool_call_id`.
+    pub open_call_ids: BTreeSet<String>,
 }
 
 /// One open inference bracket: a dispatched LLM request that has not yet
@@ -506,6 +561,9 @@ impl StageProjection {
             response: None,
             completion: None,
             timing: None,
+            live_inference_ms: 0,
+            live_tool_ms: 0,
+            tool_batch: None,
             usage: BilledTokenCounts::default(),
             model: None,
             root_agent_todos: None,
@@ -516,6 +574,7 @@ impl StageProjection {
             mcp_servers: Vec::new(),
             context_window: None,
             inference: None,
+            acp_started_at: None,
             agent_control: AgentControlState::default(),
             provider_used: None,
             diff: None,
@@ -540,6 +599,29 @@ impl StageProjection {
         self.state
     }
 
+    /// This stage's token counts with a cost attached.
+    ///
+    /// A provider-reported cost always wins. Otherwise the catalog prices the
+    /// recorded tokens for the stage's model. The stored counts pass through
+    /// untouched when there is no catalog, no model, or no price for that
+    /// model. Empty usage also passes through untouched. These cases leave
+    /// `total_usd_micros` as `None` rather than zero.
+    #[must_use]
+    pub fn billed_usage(&self, catalog: Option<&Catalog>) -> Cow<'_, BilledTokenCounts> {
+        if self.usage.total_usd_micros.is_some() || self.usage.is_zero() {
+            return Cow::Borrowed(&self.usage);
+        }
+        let (Some(catalog), Some(model)) = (catalog, self.model.as_ref()) else {
+            return Cow::Borrowed(&self.usage);
+        };
+        let Some(total_usd_micros) = catalog.price_tokens(model, &self.usage.token_counts()) else {
+            return Cow::Borrowed(&self.usage);
+        };
+        let mut usage = self.usage.clone();
+        usage.total_usd_micros = Some(total_usd_micros);
+        Cow::Owned(usage)
+    }
+
     /// Live wall-clock time in milliseconds.
     ///
     /// While the stage is non-terminal (`Pending`, `Running`, or `Retrying`),
@@ -555,12 +637,195 @@ impl StageProjection {
             state,
             StageState::Running | StageState::Retrying | StageState::Pending
         ) {
-            return self.started_at.map(|started| {
-                u64::try_from(now.signed_duration_since(started).num_milliseconds().max(0))
-                    .unwrap_or(0)
-            });
+            return self
+                .started_at
+                .map(|started| timing::elapsed_ms(started, now));
         }
         self.timing.map(|timing| timing.wall_time_ms)
+    }
+
+    /// Live timing breakdown in milliseconds — the active-time twin of
+    /// [`Self::live_wall_time_ms`].
+    ///
+    /// Once terminal, returns the stored `timing` unchanged: the finalized
+    /// breakdown comes from the worker's own stopwatch and is authoritative.
+    ///
+    /// While in flight, returns an estimate reconstructed from the event log:
+    /// accumulated closed brackets plus whatever bracket is open right now.
+    /// The estimate is per-handler, because only agent stages emit brackets at
+    /// all:
+    ///
+    /// - `Agent` — accumulated inference and tool brackets, plus the open
+    ///   inference bracket and open tool batch.
+    /// - `Prompt` — one inference call spanning the stage, so elapsed time
+    ///   since `started_at` counts as inference. Matches the finalized
+    ///   `active_only(inference, 0)`.
+    /// - `Command` — the command *is* the work, so elapsed time counts as tool.
+    ///   Matches the finalized `active_only(0, duration_ms)`.
+    /// - Everything else — zero. Waiting on a human, a timer, a condition, or
+    ///   child branches is wall time, not active time.
+    ///
+    /// Active is clamped to wall. A worker killed mid-turn leaves its bracket
+    /// open forever (see [`StageInferenceProjection`]), and without the clamp
+    /// that bracket would tick up without bound. The clamp does not need to
+    /// know the worker died: a stage cannot have been active longer than it
+    /// has existed. `watchdog.timeout` remains the authority on whether a run
+    /// is actually stuck.
+    #[must_use]
+    pub fn live_timing(&self, now: DateTime<Utc>) -> StageTiming {
+        if let Some(timing) = self.timing {
+            return timing;
+        }
+
+        let wall_time_ms = self.live_wall_time_ms(now).unwrap_or(0);
+
+        // `handler` is absent on projections built from events written before
+        // stage execution identity. Treat those as agent stages, matching
+        // `StageHandler::from_handler_type`: the accumulators below are only
+        // ever populated by agent events, so a legacy non-agent stage still
+        // reads zero rather than being credited work it never did.
+        let handler = self.handler.unwrap_or(StageHandler::Agent);
+        let (inference_time_ms, tool_time_ms) = match handler {
+            StageHandler::Agent => {
+                let open_inference = self
+                    .inference
+                    .as_ref()
+                    .map(|inference| inference.started_at)
+                    .or(self.acp_started_at)
+                    .map_or(0, |started_at| timing::elapsed_ms(started_at, now));
+                let open_tool = self
+                    .tool_batch
+                    .as_ref()
+                    .map_or(0, |batch| timing::elapsed_ms(batch.started_at, now));
+                (
+                    self.live_inference_ms.saturating_add(open_inference),
+                    self.live_tool_ms.saturating_add(open_tool),
+                )
+            }
+            StageHandler::Prompt => (wall_time_ms, 0),
+            StageHandler::Command => (0, wall_time_ms),
+            // Waiting on a human, a timer, a condition, or child branches is
+            // wall time, not active time.
+            StageHandler::Human
+            | StageHandler::Wait
+            | StageHandler::Conditional
+            | StageHandler::Parallel
+            | StageHandler::ParallelFanIn
+            | StageHandler::StackManagerLoop
+            | StageHandler::Start
+            | StageHandler::Exit => (0, 0),
+        };
+
+        StageTiming::new(wall_time_ms, inference_time_ms, tool_time_ms).clamped_to_wall()
+    }
+
+    /// Fold a closed inference bracket into the live accumulator.
+    pub fn accumulate_inference_ms(&mut self, elapsed_ms: u64) {
+        self.live_inference_ms = self.live_inference_ms.saturating_add(elapsed_ms);
+    }
+
+    /// Record the start of an external ACP agent process.
+    pub fn open_acp_inference(&mut self, started_at: DateTime<Utc>) {
+        self.close_open_acp_inference(started_at);
+        self.acp_started_at = Some(started_at);
+    }
+
+    /// Close an ACP process with its measured duration.
+    ///
+    /// The duration covers the complete process. Use the larger value so a
+    /// replayed terminal event or a projection restored mid-process cannot
+    /// double-count it.
+    pub fn close_acp_inference(&mut self, duration_ms: u64) {
+        self.acp_started_at = None;
+        self.live_inference_ms = self.live_inference_ms.max(duration_ms);
+    }
+
+    /// Fold an open ACP process into the live accumulator at a run boundary.
+    pub fn close_open_acp_inference(&mut self, now: DateTime<Utc>) {
+        let Some(started_at) = self.acp_started_at.take() else {
+            return;
+        };
+        self.accumulate_inference_ms(timing::elapsed_ms(started_at, now));
+    }
+
+    /// Record a dispatched tool call, opening a batch if none is outstanding.
+    ///
+    /// If a replacement root session starts work before the old session's end
+    /// event arrives, freeze the old batch at this boundary before opening
+    /// the new one. This keeps the sessions separate without dropping time.
+    pub fn open_tool_call(
+        &mut self,
+        session_id: String,
+        tool_call_id: String,
+        started_at: DateTime<Utc>,
+    ) {
+        let replaces_open_batch = self
+            .tool_batch
+            .as_ref()
+            .is_some_and(|batch| batch.session_id != session_id);
+        if replaces_open_batch {
+            self.close_open_tool_batch(started_at);
+        }
+        self.tool_batch
+            .get_or_insert_with(|| StageToolBatchProjection {
+                session_id,
+                started_at,
+                open_call_ids: BTreeSet::new(),
+            })
+            .open_call_ids
+            .insert(tool_call_id);
+    }
+
+    /// Retire a tool call. Folds the batch into the live accumulator once the
+    /// last outstanding call reports, so concurrent calls count once.
+    pub fn close_tool_call(&mut self, session_id: &str, tool_call_id: &str, now: DateTime<Utc>) {
+        let Some(batch) = self.tool_batch.as_mut() else {
+            return;
+        };
+        if batch.session_id != session_id
+            || !batch.open_call_ids.remove(tool_call_id)
+            || !batch.open_call_ids.is_empty()
+        {
+            return;
+        }
+        self.close_open_tool_batch(now);
+    }
+
+    /// Close a tool batch only when it belongs to `session_id`.
+    pub fn close_tool_batch_for_session(&mut self, session_id: &str, now: DateTime<Utc>) {
+        let opened_here = self
+            .tool_batch
+            .as_ref()
+            .is_some_and(|batch| batch.session_id == session_id);
+        if opened_here {
+            self.close_open_tool_batch(now);
+        }
+    }
+
+    /// Fold any open tool batch into the live accumulator.
+    pub fn close_open_tool_batch(&mut self, now: DateTime<Utc>) {
+        let Some(batch) = self.tool_batch.take() else {
+            return;
+        };
+        self.live_tool_ms = self
+            .live_tool_ms
+            .saturating_add(timing::elapsed_ms(batch.started_at, now));
+    }
+
+    /// Install a worker-provided terminal timing and discard transient live
+    /// bookkeeping that is no longer authoritative.
+    pub fn set_authoritative_timing(&mut self, timing: StageTiming) {
+        self.timing = Some(timing);
+        self.clear_live_timing();
+    }
+
+    /// Discard transient timing accumulators and open brackets.
+    pub fn clear_live_timing(&mut self) {
+        self.live_inference_ms = 0;
+        self.live_tool_ms = 0;
+        self.inference = None;
+        self.acp_started_at = None;
+        self.tool_batch = None;
     }
 
     /// Begin a new automatic attempt within this stage execution: clear every
@@ -709,18 +974,21 @@ impl RunProjection {
     /// terminal conclusion yet.
     ///
     /// Run-level wall time ticks from `run.started` to `now`. Active time sums
-    /// inference and tool timing from stages that have already emitted a
-    /// terminal stage event. Stage projections do not currently track live
-    /// inference/tool time while a stage is still running, so active time steps
-    /// forward when each stage completes while wall time advances continuously.
+    /// [`StageProjection::live_timing`] across every stage, so an in-flight
+    /// stage contributes its live estimate rather than nothing — both halves
+    /// advance continuously. Terminal stages contribute their finalized,
+    /// authoritative breakdown.
+    ///
+    /// Active is not clamped to run wall time here: concurrent branches can
+    /// legitimately sum past it. The clamp applies per stage.
     #[must_use]
     pub fn live_run_timing(&self, now: DateTime<Utc>) -> Option<RunTiming> {
         let start = self.start.as_ref()?;
-        let wall_time_ms = RunTiming::wall_time_ms_since(start.start_time, now);
+        let wall_time_ms = timing::elapsed_ms(start.start_time, now);
         let active = self
             .stages
             .values()
-            .filter_map(|stage| stage.timing)
+            .map(|stage| stage.live_timing(now))
             .fold(RunTiming::default(), |acc, timing| {
                 acc.saturating_add(&RunTiming::from(timing))
             });
@@ -844,11 +1112,13 @@ mod iter_stages_tests {
     use std::num::NonZeroU32;
 
     use chrono::Utc;
+    use fabro_model::{Catalog, ModelRef, ProviderId};
     use serde_json::json;
 
     use super::RunProjection;
     use crate::{
-        AgentControlState, Graph, RunId, RunSpec, StageProjection, WorkflowSettings, test_support,
+        AgentControlState, BilledTokenCounts, Graph, RunId, RunSpec, StageProjection,
+        WorkflowSettings, test_support,
     };
 
     fn seq(n: u32) -> NonZeroU32 {
@@ -969,5 +1239,362 @@ mod iter_stages_tests {
                 .collect();
             assert_eq!(order, vec!["build@1", "verify@1", "verify@2"]);
         }
+    }
+
+    fn priced_stage(total_usd_micros: Option<i64>) -> StageProjection {
+        let mut stage = StageProjection::new(seq(1));
+        stage.usage = BilledTokenCounts {
+            input_tokens: 500_000,
+            output_tokens: 125_000,
+            total_tokens: 625_000,
+            total_usd_micros,
+            ..BilledTokenCounts::default()
+        };
+        stage.model = Some(ModelRef {
+            provider: ProviderId::openai(),
+            model_id: "gpt-5.4".into(),
+            speed:    None,
+        });
+        stage
+    }
+
+    #[test]
+    fn billed_usage_prices_uncosted_tokens_from_the_catalog() {
+        let stage = priced_stage(None);
+
+        assert_eq!(stage.billed_usage(None).total_usd_micros, None);
+        let priced = stage.billed_usage(Some(Catalog::builtin()));
+        assert!(
+            priced.total_usd_micros.is_some_and(|cost| cost > 0),
+            "expected a catalog price, got {:?}",
+            priced.total_usd_micros
+        );
+        // Pricing only fills in the cost; the token buckets pass through.
+        assert_eq!(priced.input_tokens, 500_000);
+        assert_eq!(priced.output_tokens, 125_000);
+    }
+
+    #[test]
+    fn billed_usage_keeps_a_provider_reported_cost_over_the_catalog_estimate() {
+        let stage = priced_stage(Some(42));
+
+        assert_eq!(
+            stage
+                .billed_usage(Some(Catalog::builtin()))
+                .total_usd_micros,
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn billed_usage_leaves_a_modelless_stage_uncosted() {
+        let mut stage = priced_stage(None);
+        stage.model = None;
+
+        assert_eq!(
+            stage
+                .billed_usage(Some(Catalog::builtin()))
+                .total_usd_micros,
+            None
+        );
+    }
+
+    #[test]
+    fn billed_usage_leaves_zero_tokens_uncosted() {
+        let mut stage = priced_stage(None);
+        stage.usage = BilledTokenCounts::default();
+
+        assert_eq!(
+            stage
+                .billed_usage(Some(Catalog::builtin()))
+                .total_usd_micros,
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod live_timing_tests {
+    use std::collections::HashMap;
+
+    use chrono::{DateTime, TimeZone, Utc};
+
+    use super::{RunProjection, StageToolBatchProjection};
+    use crate::{
+        Graph, ModelRef, RunId, RunSpec, StageHandler, StageInferenceProjection, StageProjection,
+        StageState, StageTiming, StartRecord, WorkflowSettings, first_event_seq, test_support,
+    };
+
+    fn at(seconds: i64) -> DateTime<Utc> {
+        Utc.timestamp_opt(1_700_000_000 + seconds, 0).unwrap()
+    }
+
+    fn projection() -> RunProjection {
+        RunProjection::new(
+            "Test run".to_string(),
+            RunSpec {
+                run_id:           RunId::new(),
+                settings:         WorkflowSettings::default(),
+                graph:            Graph::new("test"),
+                graph_source:     None,
+                workflow_slug:    None,
+                automation:       None,
+                source_directory: None,
+                labels:           HashMap::default(),
+                provenance:       test_support::test_run_provenance(),
+                manifest_blob:    None,
+                definition_blob:  None,
+                git:              None,
+                fork_source_ref:  None,
+            },
+            at(0),
+        )
+    }
+
+    /// In-flight stage that started at `at(0)`.
+    fn running(handler: StageHandler) -> StageProjection {
+        let mut stage = StageProjection::new(first_event_seq(1));
+        stage.handler = Some(handler);
+        stage.started_at = Some(at(0));
+        stage.state = StageState::Running;
+        stage
+    }
+
+    fn open_bracket(started_at: DateTime<Utc>) -> StageInferenceProjection {
+        StageInferenceProjection {
+            session_id: "session-1".to_string(),
+            started_at,
+            requested_model: ModelRef {
+                provider: "anthropic".parse().unwrap(),
+                model_id: "claude-sonnet-5".into(),
+                speed:    None,
+            },
+            first_output_at: None,
+            first_output_kind: None,
+            retries: 0,
+        }
+    }
+
+    #[test]
+    fn terminal_stage_returns_stored_timing_unchanged() {
+        let mut stage = running(StageHandler::Agent);
+        stage.state = StageState::Succeeded;
+        stage.timing = Some(StageTiming::new(90_000, 78_000, 7_000));
+        // Live accumulators are stale leftovers; the finalized value wins.
+        stage.live_inference_ms = 5;
+        stage.live_tool_ms = 5;
+
+        assert_eq!(
+            stage.live_timing(at(600)),
+            StageTiming::new(90_000, 78_000, 7_000)
+        );
+    }
+
+    #[test]
+    fn agent_stage_sums_accumulators_and_open_brackets() {
+        let mut stage = running(StageHandler::Agent);
+        stage.live_inference_ms = 30_000;
+        stage.live_tool_ms = 5_000;
+        // Inference open for 20s, tools open for 10s, at t=120s.
+        stage.inference = Some(open_bracket(at(100)));
+        stage.tool_batch = Some(StageToolBatchProjection {
+            session_id:    "session-1".to_string(),
+            started_at:    at(110),
+            open_call_ids: ["call-1".to_string()].into_iter().collect(),
+        });
+
+        assert_eq!(
+            stage.live_timing(at(120)),
+            StageTiming::new(120_000, 50_000, 15_000)
+        );
+    }
+
+    #[test]
+    fn agent_stage_without_brackets_reports_only_accumulators() {
+        let mut stage = running(StageHandler::Agent);
+        stage.live_inference_ms = 30_000;
+        stage.live_tool_ms = 5_000;
+
+        assert_eq!(
+            stage.live_timing(at(120)),
+            StageTiming::new(120_000, 30_000, 5_000)
+        );
+    }
+
+    #[test]
+    fn acp_process_counts_as_live_inference_and_uses_measured_duration() {
+        let mut stage = running(StageHandler::Agent);
+        stage.open_acp_inference(at(30));
+
+        assert_eq!(
+            stage.live_timing(at(45)),
+            StageTiming::new(45_000, 15_000, 0)
+        );
+
+        stage.close_acp_inference(14_500);
+        assert_eq!(
+            stage.live_timing(at(45)),
+            StageTiming::new(45_000, 14_500, 0)
+        );
+    }
+
+    #[test]
+    fn prompt_stage_counts_elapsed_as_inference() {
+        let stage = running(StageHandler::Prompt);
+
+        assert_eq!(
+            stage.live_timing(at(45)),
+            StageTiming::new(45_000, 45_000, 0)
+        );
+    }
+
+    #[test]
+    fn command_stage_counts_elapsed_as_tool() {
+        let stage = running(StageHandler::Command);
+
+        assert_eq!(
+            stage.live_timing(at(45)),
+            StageTiming::new(45_000, 0, 45_000)
+        );
+    }
+
+    #[test]
+    fn waiting_handlers_report_wall_time_with_zero_active() {
+        for handler in [
+            StageHandler::Human,
+            StageHandler::Wait,
+            StageHandler::Conditional,
+            StageHandler::Parallel,
+            StageHandler::ParallelFanIn,
+            StageHandler::StackManagerLoop,
+            StageHandler::Start,
+            StageHandler::Exit,
+        ] {
+            let stage = running(handler);
+            let timing = stage.live_timing(at(600));
+
+            assert_eq!(
+                timing,
+                StageTiming::new(600_000, 0, 0),
+                "{handler} should report wall time only"
+            );
+        }
+    }
+
+    #[test]
+    fn open_bracket_from_a_killed_worker_is_clamped_to_wall() {
+        let mut stage = running(StageHandler::Agent);
+        // Bracket opened before the stage even started — the pathological
+        // shape a killed worker leaves behind. Without the clamp this would
+        // report 700s of inference against 600s of wall.
+        stage.inference = Some(open_bracket(at(-100)));
+
+        let timing = stage.live_timing(at(600));
+
+        assert_eq!(timing.wall_time_ms, 600_000);
+        assert_eq!(timing.active_time_ms, 600_000);
+    }
+
+    #[test]
+    fn clamping_preserves_the_inference_tool_split() {
+        let mut stage = running(StageHandler::Agent);
+        // 3:1 inference:tool, totalling 200s of active against 100s of wall.
+        stage.live_inference_ms = 150_000;
+        stage.live_tool_ms = 50_000;
+
+        let timing = stage.live_timing(at(100));
+
+        assert_eq!(timing.wall_time_ms, 100_000);
+        assert_eq!(timing.active_time_ms, 100_000);
+        assert_eq!(timing.inference_time_ms, 75_000);
+        assert_eq!(timing.tool_time_ms, 25_000);
+    }
+
+    #[test]
+    fn live_run_timing_counts_in_flight_stages_not_just_terminal_ones() {
+        // The shape that motivated this change: two finished stages and one
+        // long-running agent stage that had been active nearly the whole run.
+        let mut projection = projection();
+        projection.start = Some(StartRecord {
+            start_time: at(0),
+            run_branch: None,
+            base_sha:   None,
+        });
+
+        let baseline = projection.stage_entry("baseline", 1, first_event_seq(1));
+        baseline.handler = Some(StageHandler::Command);
+        baseline.state = StageState::Succeeded;
+        baseline.timing = Some(StageTiming::new(42_666, 0, 42_663));
+
+        let assess = projection.stage_entry("assess", 1, first_event_seq(2));
+        assess.handler = Some(StageHandler::Agent);
+        assess.state = StageState::Succeeded;
+        assess.timing = Some(StageTiming::new(86_025, 78_230, 7_588));
+
+        let plan = projection.stage_entry("plan", 1, first_event_seq(3));
+        plan.handler = Some(StageHandler::Agent);
+        plan.started_at = Some(at(146));
+        plan.state = StageState::Running;
+        plan.live_inference_ms = 700_000;
+        plan.live_tool_ms = 150_000;
+
+        let timing = projection.live_run_timing(at(1_013)).unwrap();
+
+        assert_eq!(timing.wall_time_ms, 1_013_000);
+        assert_eq!(timing.inference_time_ms, 778_230);
+        assert_eq!(timing.tool_time_ms, 200_251);
+        // Before this change the in-flight stage contributed nothing and the
+        // run reported 128,481 ms of active time against 1,013,000 ms of wall.
+        assert_eq!(timing.active_time_ms, 978_481);
+    }
+
+    #[test]
+    fn live_run_timing_may_exceed_run_wall_when_branches_overlap() {
+        let mut projection = projection();
+        projection.start = Some(StartRecord {
+            start_time: at(0),
+            run_branch: None,
+            base_sha:   None,
+        });
+
+        for (index, node) in ["branch-a", "branch-b", "branch-c"].iter().enumerate() {
+            let stage =
+                projection.stage_entry(node, 1, first_event_seq(u32::try_from(index).unwrap() + 1));
+            stage.handler = Some(StageHandler::Agent);
+            stage.state = StageState::Succeeded;
+            stage.timing = Some(StageTiming::new(60_000, 60_000, 0));
+        }
+
+        let timing = projection.live_run_timing(at(60)).unwrap();
+
+        assert_eq!(timing.wall_time_ms, 60_000);
+        assert_eq!(
+            timing.active_time_ms, 180_000,
+            "concurrent branches legitimately sum past run wall time"
+        );
+    }
+
+    #[test]
+    fn a_legacy_stage_without_a_recorded_handler_uses_its_accumulators() {
+        let mut stage = StageProjection::new(first_event_seq(1));
+        stage.handler = None;
+        stage.started_at = Some(at(0));
+        stage.state = StageState::Running;
+        stage.live_inference_ms = 30_000;
+
+        assert_eq!(
+            stage.live_timing(at(120)),
+            StageTiming::new(120_000, 30_000, 0)
+        );
+    }
+
+    #[test]
+    fn a_legacy_stage_with_no_accumulators_reports_no_active_time() {
+        let mut stage = StageProjection::new(first_event_seq(1));
+        stage.handler = None;
+        stage.started_at = Some(at(0));
+        stage.state = StageState::Running;
+
+        assert_eq!(stage.live_timing(at(120)), StageTiming::new(120_000, 0, 0));
     }
 }

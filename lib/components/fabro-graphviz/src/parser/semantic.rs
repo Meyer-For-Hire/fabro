@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use crate::error::Error;
@@ -57,29 +57,44 @@ fn derive_class_from_label(label: &str) -> String {
         .collect()
 }
 
+fn collect_declared_node_ids(statements: &[Statement], node_ids: &mut HashSet<String>) {
+    for statement in statements {
+        match statement {
+            Statement::Node(node) => {
+                node_ids.insert(node.id.clone());
+            }
+            Statement::Subgraph(subgraph) => {
+                collect_declared_node_ids(&subgraph.statements, node_ids);
+            }
+            _ => {}
+        }
+    }
+}
+
 struct SemanticState {
-    graph:         Graph,
-    node_defaults: HashMap<String, AttrValue>,
-    edge_defaults: HashMap<String, AttrValue>,
+    graph:             Graph,
+    declared_node_ids: HashSet<String>,
+    node_defaults:     HashMap<String, AttrValue>,
+    edge_defaults:     HashMap<String, AttrValue>,
 }
 
 impl SemanticState {
-    fn new(name: String) -> Self {
+    fn new(name: String, declared_node_ids: HashSet<String>) -> Self {
         Self {
-            graph:         Graph::new(name),
+            graph: Graph::new(name),
+            declared_node_ids,
             node_defaults: HashMap::new(),
             edge_defaults: HashMap::new(),
         }
     }
 
-    fn ensure_node(&mut self, id: &str) {
-        if !self.graph.nodes.contains_key(id) {
+    fn ensure_node(&mut self, id: &str) -> &mut Node {
+        let node_defaults = &self.node_defaults;
+        self.graph.nodes.entry(id.to_string()).or_insert_with(|| {
             let mut node = Node::new(id);
-            for (k, v) in &self.node_defaults {
-                node.attrs.insert(k.clone(), v.clone());
-            }
-            self.graph.nodes.insert(id.to_string(), node);
-        }
+            node.attrs.clone_from(node_defaults);
+            node
+        })
     }
 
     fn add_class_to_node(node: &mut Node, cls: &str) {
@@ -90,12 +105,7 @@ impl SemanticState {
     }
 
     fn process_node(&mut self, node_stmt: &NodeStmt, subgraph_class: Option<&str>) {
-        self.ensure_node(&node_stmt.id);
-        let node = self
-            .graph
-            .nodes
-            .get_mut(&node_stmt.id)
-            .expect("node was just inserted by ensure_node, so get_mut cannot return None");
+        let node = self.ensure_node(&node_stmt.id);
         if let Some(attrs) = &node_stmt.attrs {
             for (k, v) in attrs {
                 node.attrs.insert(k.clone(), convert_value(v));
@@ -111,11 +121,6 @@ impl SemanticState {
             .and_then(AttrValue::as_str)
             .map(String::from);
         if let Some(class_str) = class_str {
-            let node = self
-                .graph
-                .nodes
-                .get_mut(&node_stmt.id)
-                .expect("node was just inserted by ensure_node, so get_mut cannot return None");
             for cls in class_str.split(',') {
                 let cls = cls.trim().to_string();
                 if !cls.is_empty() && !node.classes.contains(&cls) {
@@ -127,12 +132,11 @@ impl SemanticState {
 
     fn process_edge(&mut self, edge_stmt: &EdgeStmt, subgraph_class: Option<&str>) {
         for id in &edge_stmt.nodes {
-            self.ensure_node(id);
+            if !self.declared_node_ids.contains(id) {
+                continue;
+            }
+            let node = self.ensure_node(id);
             if let Some(cls) = subgraph_class {
-                let node =
-                    self.graph.nodes.get_mut(id).expect(
-                        "node was just inserted by ensure_node, so get_mut cannot return None",
-                    );
                 Self::add_class_to_node(node, cls);
             }
         }
@@ -251,7 +255,9 @@ impl SemanticState {
 ///
 /// Returns an error if the AST cannot be converted to a valid graph.
 pub fn ast_to_graph(dot: &DotGraph) -> Result<Graph, Error> {
-    let mut state = SemanticState::new(dot.name.clone());
+    let mut declared_node_ids = HashSet::new();
+    collect_declared_node_ids(&dot.statements, &mut declared_node_ids);
+    let mut state = SemanticState::new(dot.name.clone(), declared_node_ids);
     let empty = HashMap::new();
     state.process_statements(&dot.statements, None, &empty, &empty);
     Ok(state.graph)
@@ -515,7 +521,7 @@ mod tests {
     }
 
     #[test]
-    fn ast_to_graph_implicit_nodes_from_edges() {
+    fn ast_to_graph_keeps_undeclared_edge_endpoints_out_of_nodes() {
         let dot = DotGraph {
             name:       "Implicit".into(),
             statements: vec![Statement::Edge(EdgeStmt {
@@ -525,7 +531,82 @@ mod tests {
         };
 
         let graph = ast_to_graph(&dot).unwrap();
+        assert!(graph.nodes.is_empty());
+        assert_eq!(graph.edges, vec![Edge::new("a", "b")]);
+    }
+
+    #[test]
+    fn ast_to_graph_includes_only_declared_edge_endpoints() {
+        let dot = DotGraph {
+            name:       "Declared".into(),
+            statements: vec![
+                Statement::Node(NodeStmt {
+                    id:    "a".into(),
+                    attrs: None,
+                }),
+                Statement::Edge(EdgeStmt {
+                    nodes: vec!["a".into(), "b".into()],
+                    attrs: None,
+                }),
+            ],
+        };
+
+        let graph = ast_to_graph(&dot).unwrap();
         assert!(graph.nodes.contains_key("a"));
+        assert!(!graph.nodes.contains_key("b"));
+    }
+
+    #[test]
+    fn ast_to_graph_declaration_after_edge_still_counts() {
+        let dot = DotGraph {
+            name:       "DeclaredLater".into(),
+            statements: vec![
+                Statement::NodeDefaults(vec![("model".into(), AstValue::Str("first".into()))]),
+                Statement::Edge(EdgeStmt {
+                    nodes: vec!["a".into(), "b".into()],
+                    attrs: None,
+                }),
+                Statement::NodeDefaults(vec![("model".into(), AstValue::Str("second".into()))]),
+                Statement::Node(NodeStmt {
+                    id:    "b".into(),
+                    attrs: Some(vec![("prompt".into(), AstValue::Str("Do it".into()))]),
+                }),
+            ],
+        };
+
+        let graph = ast_to_graph(&dot).unwrap();
         assert!(graph.nodes.contains_key("b"));
+        assert!(!graph.nodes.contains_key("a"));
+        assert_eq!(
+            graph.nodes["b"]
+                .attrs
+                .get("model")
+                .and_then(AttrValue::as_str),
+            Some("first")
+        );
+    }
+
+    #[test]
+    fn ast_to_graph_subgraph_declaration_counts() {
+        let dot = DotGraph {
+            name:       "SubgraphDeclared".into(),
+            statements: vec![
+                Statement::Edge(EdgeStmt {
+                    nodes: vec!["start".into(), "plan".into()],
+                    attrs: None,
+                }),
+                Statement::Subgraph(SubgraphStmt {
+                    name:       Some("cluster_loop".into()),
+                    statements: vec![Statement::Node(NodeStmt {
+                        id:    "plan".into(),
+                        attrs: None,
+                    })],
+                }),
+            ],
+        };
+
+        let graph = ast_to_graph(&dot).unwrap();
+        assert!(graph.nodes.contains_key("plan"));
+        assert!(!graph.nodes.contains_key("start"));
     }
 }

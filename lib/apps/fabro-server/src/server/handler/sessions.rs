@@ -730,6 +730,10 @@ async fn build_agent_session(
     let sandbox = reconnect_for_run(sandbox_instance, daytona_api_key, Some(run_id))
         .await
         .map_err(AskFabroBuildError::SandboxUnavailable)?;
+    sandbox
+        .activate()
+        .await
+        .map_err(|err| AskFabroBuildError::SandboxUnavailable(anyhow::Error::new(err)))?;
     let sandbox: Arc<dyn fabro_agent::Sandbox> = Arc::from(sandbox);
     // No optional web-tool dependencies: `AskFabroToolAccessPolicy` denies
     // `web_search` and `web_fetch`, and both `tools()` and the prompt are

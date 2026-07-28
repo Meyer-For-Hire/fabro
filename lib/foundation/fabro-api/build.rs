@@ -361,6 +361,11 @@ fn main() {
             "fabro_types::StageInferenceProjection",
             &[],
         ),
+        (
+            "StageToolBatchProjection",
+            "fabro_types::StageToolBatchProjection",
+            &[],
+        ),
         ("LlmOutputKind", "fabro_types::LlmOutputKind", &[]),
         ("PermissionLevel", "fabro_types::PermissionLevel", &[]),
         (
@@ -463,6 +468,8 @@ fn main() {
             &[],
         ),
         ("InterviewOption", "fabro_types::InterviewOption", &[]),
+        ("ReviewTarget", "fabro_types::ReviewTarget", &[]),
+        ("ReviewTargetKind", "fabro_types::ReviewTargetKind", &[]),
         (
             "InterviewQuestionRecord",
             "fabro_types::InterviewQuestionRecord",
