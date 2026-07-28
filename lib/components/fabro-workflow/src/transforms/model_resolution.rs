@@ -52,6 +52,13 @@ impl ModelResolutionTransform {
         self
     }
 
+    /// The catalog this transform resolves against, so callers can run the
+    /// matching catalog-backed lint rules.
+    #[must_use]
+    pub fn catalog(&self) -> &Catalog {
+        &self.catalog
+    }
+
     fn resolve_model(
         &self,
         model: &str,

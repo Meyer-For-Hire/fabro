@@ -5,6 +5,7 @@ import { MemoryRouter } from "react-router";
 import { makeStage } from "../lib/test-utils";
 import { StageSidebar, type Stage } from "./stage-sidebar";
 
+
 function renderSidebar(stages: Stage[]): string {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   let renderer!: TestRenderer.ReactTestRenderer;

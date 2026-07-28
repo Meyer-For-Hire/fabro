@@ -30,8 +30,10 @@ pub fn build_router(state: SharedState) -> Router {
             post(installations::create_access_token),
         )
         // Branch endpoints
+        // Wildcard: branch names contain slashes (`fabro/run/<id>`), and
+        // GitHub routes the branch as the remainder of the path.
         .route(
-            "/repos/{owner}/{repo}/branches/{branch}",
+            "/repos/{owner}/{repo}/branches/{*branch}",
             get(branches::get_branch),
         )
         // Pull request endpoints

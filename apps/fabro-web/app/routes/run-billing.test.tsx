@@ -2,10 +2,11 @@ import { afterEach, describe, expect, mock, test } from "bun:test";
 import TestRenderer from "react-test-renderer";
 
 import type {
-  BilledTokenCounts,
   RunBilling,
   StageTiming,
 } from "@qltysh/fabro-api-client";
+
+import { makeBilledTokenCounts } from "../lib/test-fixtures";
 
 function stageTiming(wall_time_ms = 0, inference_time_ms = 0, tool_time_ms = 0): StageTiming {
   return {
@@ -24,25 +25,12 @@ mock.module("../lib/queries", () => ({
 
 const { default: RunBillingRoute } = await import("./run-billing");
 
-function zeroBilling(overrides: Partial<BilledTokenCounts> = {}): BilledTokenCounts {
-  return {
-    cache_read_tokens: 0,
-    cache_write_tokens: 0,
-    input_tokens: 0,
-    output_tokens: 0,
-    reasoning_tokens: 0,
-    total_tokens: 0,
-    total_usd_micros: null,
-    ...overrides,
-  };
-}
-
 function billing(overrides: Partial<RunBilling> = {}): RunBilling {
   return {
     stages: [],
     totals: {
       timing: stageTiming(),
-      ...zeroBilling(),
+      ...makeBilledTokenCounts(),
     },
     by_model: [],
     ...overrides,
@@ -86,21 +74,21 @@ describe("RunBilling", () => {
           {
             stage: { id: "start", name: "start" },
             model: null,
-            billing: zeroBilling(),
+            billing: makeBilledTokenCounts(),
             timing: stageTiming(),
             state: "succeeded",
           },
           {
             stage: { id: "command", name: "command" },
             model: null,
-            billing: zeroBilling(),
+            billing: makeBilledTokenCounts(),
             timing: stageTiming(61000),
             state: "succeeded",
           },
         ],
         totals: {
           timing: stageTiming(61000),
-          ...zeroBilling(),
+          ...makeBilledTokenCounts(),
         },
       }),
     );
@@ -121,7 +109,7 @@ describe("RunBilling", () => {
           {
             stage: { id: "start", name: "start" },
             model: null,
-            billing: zeroBilling(),
+            billing: makeBilledTokenCounts(),
             timing: stageTiming(),
             state: "succeeded",
           },
@@ -131,7 +119,7 @@ describe("RunBilling", () => {
               provider: "anthropic",
               model_id: "claude-sonnet-4-5",
             },
-            billing: zeroBilling({
+            billing: makeBilledTokenCounts({
               input_tokens: 1200,
               output_tokens: 300,
               total_tokens: 1500,
@@ -143,7 +131,7 @@ describe("RunBilling", () => {
         ],
         totals: {
           timing: stageTiming(42000),
-          ...zeroBilling({
+          ...makeBilledTokenCounts({
             input_tokens: 1200,
             output_tokens: 300,
             total_tokens: 1500,
@@ -157,7 +145,7 @@ describe("RunBilling", () => {
               model_id: "claude-sonnet-4-5",
             },
             stages: 1,
-            billing: zeroBilling({
+            billing: makeBilledTokenCounts({
               input_tokens: 1200,
               output_tokens: 300,
               total_tokens: 1500,
@@ -204,7 +192,7 @@ describe("RunBilling", () => {
                 model_id: "claude-opus-4-6",
                 speed: "fast",
               },
-              billing: zeroBilling({
+              billing: makeBilledTokenCounts({
                 input_tokens: 1200,
                 output_tokens: 300,
                 total_tokens: 1500,
@@ -217,7 +205,7 @@ describe("RunBilling", () => {
           ],
           totals: {
             timing: stageTiming(),
-            ...zeroBilling({
+            ...makeBilledTokenCounts({
               input_tokens: 1200,
               output_tokens: 300,
               total_tokens: 1500,
@@ -232,7 +220,7 @@ describe("RunBilling", () => {
                 speed: "fast",
               },
               stages: 1,
-              billing: zeroBilling({
+              billing: makeBilledTokenCounts({
                 input_tokens: 1200,
                 output_tokens: 300,
                 total_tokens: 1500,

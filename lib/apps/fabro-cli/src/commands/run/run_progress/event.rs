@@ -614,6 +614,7 @@ mod tests {
             repo:        "widgets".into(),
             base_branch: "main".into(),
             head_branch: "fabro/run/42".into(),
+            head_sha:    Some("final-sha".to_string()),
             title:       "Ship the server-side PR".into(),
             draft:       true,
         };

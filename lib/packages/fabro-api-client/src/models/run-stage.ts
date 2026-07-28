@@ -15,6 +15,9 @@
 
 // May contain unused imports in some cases
 // @ts-ignore
+import type { BilledTokenCounts } from './billed-token-counts';
+// May contain unused imports in some cases
+// @ts-ignore
 import type { StageHandler } from './stage-handler';
 // May contain unused imports in some cases
 // @ts-ignore
@@ -70,4 +73,8 @@ export interface RunStage {
      * Wall-clock time the latest attempt of this stage started, if known.
      */
     'started_at'?: string | null;
+    /**
+     * Token counts for this stage execution alone. `total_usd_micros` is the provider-reported cost when there is one, otherwise the server catalog\'s price for these tokens — the same pricing the `/runs/{id}/billing` rows use. All-zero counts mean the stage made no model calls. Unlike the billing rows, which sum every visit of a node, this covers only this visit.
+     */
+    'billing': BilledTokenCounts;
 }

@@ -438,6 +438,7 @@ fn api_question_to_question(question: &types::ApiQuestion) -> Question {
     converted
         .context_display
         .clone_from(&question.context_display);
+    converted.review_target.clone_from(&question.review_target);
     converted
 }
 
@@ -450,6 +451,9 @@ async fn ask_attach_question(question: Question, styles: &'static Styles) -> Ans
     if let Some(ref context_text) = question.context_display {
         let rendered = styles.render_markdown(context_text);
         eprint!("{rendered}");
+    }
+    if let Some(line) = fabro_interview::review_target_line(&question) {
+        eprintln!("{line}");
     }
     eprintln!("{} {}", styles.bold_cyan.apply_to("?"), question.text);
 

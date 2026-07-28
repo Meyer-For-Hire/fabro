@@ -926,8 +926,6 @@ impl<'de> Deserialize<'de> for RunEvent {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use serde_json::json;
 
     use super::*;
@@ -992,20 +990,9 @@ mod tests {
     #[test]
     fn run_event_deserializes_adjacent_layout() {
         let settings = WorkflowSettings::default();
-        let graph = Graph {
-            name:  "test".to_string(),
-            nodes: HashMap::from([("start".to_string(), Node {
-                id:      "start".to_string(),
-                attrs:   HashMap::new(),
-                classes: Vec::new(),
-            })]),
-            edges: vec![Edge {
-                from:  "start".to_string(),
-                to:    "done".to_string(),
-                attrs: HashMap::new(),
-            }],
-            attrs: HashMap::new(),
-        };
+        let mut graph = Graph::new("test");
+        graph.nodes.insert("start".to_string(), Node::new("start"));
+        graph.edges.push(Edge::new("start", "done"));
 
         let line = json!({
             "id": "evt_2",

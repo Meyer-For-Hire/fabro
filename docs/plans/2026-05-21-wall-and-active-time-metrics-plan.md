@@ -155,9 +155,16 @@ git diff --check
 
 - Inference time is Fabro-observed LLM request/stream elapsed time, not
   provider-reported model-only compute time.
-- LLM retry backoff, queueing outside a request/stream, human waits, steering
-  waits, and scheduler gaps are wall time but not active time.
-- Active timing is finalized-event based in v1; live active-time ticking can be
-  added later if it becomes necessary.
+- Queueing outside a request/stream, human waits, steering waits, and scheduler
+  gaps are wall time but not active time. Retry delay inside an open LLM request
+  bracket follows the executor stopwatch and counts as inference time.
+- ~~Active timing is finalized-event based in v1; live active-time ticking can
+  be added later if it becomes necessary.~~ **Superseded 2026-07-25.** It became
+  necessary: a run parked in one long agent stage reported ~12% of its wall time
+  as active, because in-flight stages contributed nothing. Stage projections now
+  accumulate inference and tool brackets from the event log and expose
+  `StageProjection::live_timing(now)`, the active-time twin of
+  `live_wall_time_ms`. Finalized values remain authoritative and still replace
+  the live estimate at terminal events. Implemented in PR #647.
 - No compatibility layer is required for existing API clients or stored run
   event data.

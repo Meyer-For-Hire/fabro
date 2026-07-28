@@ -3,6 +3,7 @@ import type { EventEnvelope } from "@qltysh/fabro-api-client";
 import TestRenderer, { act } from "react-test-renderer";
 
 import { makeEventEnvelope, setupReactTestEnv } from "../../lib/test-utils";
+import { makeBilledTokenCounts } from "../../lib/test-fixtures";
 import type { Stage } from "../stage-sidebar";
 import { FanInResults } from "./fan-in-results";
 
@@ -22,6 +23,7 @@ const fanInStage: Stage = {
   visit: 1,
   startedAt: "2026-04-09T12:00:00Z",
   providerUsed: null,
+  billing: makeBilledTokenCounts(),
 };
 
 function event(seq: number, partial: Partial<EventEnvelope>): EventEnvelope {

@@ -3,6 +3,7 @@ import type { EventEnvelope } from "@qltysh/fabro-api-client";
 import TestRenderer, { act } from "react-test-renderer";
 
 import type { Stage } from "./stage-sidebar";
+import { makeBilledTokenCounts } from "./test-fixtures";
 
 const IS_REACT_ACT_ENV = "IS_REACT_ACT_ENVIRONMENT" as const;
 
@@ -84,6 +85,7 @@ export function makeStage(overrides: Partial<Stage> = {}): Stage {
     duration: "--",
     startedAt: null,
     providerUsed: null,
+    billing: makeBilledTokenCounts(),
     ...overrides,
   };
 }

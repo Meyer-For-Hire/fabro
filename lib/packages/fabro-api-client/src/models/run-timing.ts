@@ -15,12 +15,12 @@
 
 
 /**
- * Timing rollup for an entire run. Active fields sum work across stage visits, so `active_time_ms` can exceed `wall_time_ms` when parallel branches run concurrently.
+ * Timing rollup for an entire run. Active fields sum work across stage visits, so `active_time_ms` can exceed `wall_time_ms` when parallel branches run concurrently.  For a running run, stages still in flight contribute a live estimate rather than nothing, so wall and active both advance continuously. Unlike `StageTiming`, active is not clamped to wall here — concurrent branches can legitimately sum past run wall time.
  */
 export interface RunTiming {
     'wall_time_ms': number;
-    'inference_time_ms'?: number;
-    'tool_time_ms'?: number;
+    'inference_time_ms': number;
+    'tool_time_ms': number;
     /**
      * Equals `inference_time_ms + tool_time_ms`.
      */

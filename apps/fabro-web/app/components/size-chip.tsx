@@ -1,3 +1,4 @@
+import { memo } from "react";
 import type { RunSize } from "@qltysh/fabro-api-client";
 
 import { formatUsdMicros } from "../lib/format";
@@ -11,7 +12,7 @@ const SIZE_TONE: Record<RunSize, { className: string; note: string | null }> = {
   XL: { className: "bg-coral/15 text-coral",     note: "unhealthy" },
 };
 
-export function SizeChip({
+export const SizeChip = memo(function SizeChip({
   size,
   totalUsdMicros,
 }: {
@@ -19,10 +20,10 @@ export function SizeChip({
   totalUsdMicros?: number | null;
 }) {
   const tone = SIZE_TONE[size];
-  const billed = totalUsdMicros != null ? ` · ${formatUsdMicros(totalUsdMicros)} billed` : "";
+  const amount = totalUsdMicros != null ? ` · ${formatUsdMicros(totalUsdMicros)}` : "";
   const tooltip = tone.note != null
-    ? `Size ${size} (${tone.note})${billed}`
-    : `Size ${size}${billed}`;
+    ? `Size ${size} (${tone.note})${amount}`
+    : `Size ${size}${amount}`;
   return (
     <Tooltip label={tooltip}>
       <span className={`rounded px-1.5 py-0.5 font-mono text-xs font-bold tabular-nums ${tone.className}`}>
@@ -30,4 +31,4 @@ export function SizeChip({
       </span>
     </Tooltip>
   );
-}
+});

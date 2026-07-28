@@ -1,0 +1,10 @@
+digraph EdgeOnlyNode {
+    graph [goal="Reference a node that was never declared"]
+
+    /* `misspelled_node` is only ever named by an edge, never declared. */
+    start [shape=Mdiamond, label="Start"]
+    exit [shape=Msquare, label="Exit"]
+
+    start -> misspelled_node
+    misspelled_node -> exit
+}

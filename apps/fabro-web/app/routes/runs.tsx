@@ -26,6 +26,7 @@ import { ciConfig, columnForRun, columnStatusDisplay, columnStatuses, deriveCiSt
 import type { CiStatus, CheckRun, CheckStatus, RunItem } from "../data/runs";
 import { EmptyState } from "../components/state";
 import { PullRequestChip } from "../components/pull-request-chip";
+import { SizeChip } from "../components/size-chip";
 import {
   summarizeBatchLifecycleAction,
 } from "../components/runs-list/batch-lifecycle";
@@ -345,7 +346,7 @@ function PrCard({
 
 // All inline footer metadata on PrCard belongs in this one row. Adding a new
 // piece as a sibling `<div>` below the card body recreates a recurring bug
-// where stats stack onto separate lines instead of sitting next to elapsed/actions.
+// where stats stack onto separate lines instead of sitting next to size/actions.
 function PrCardFooter({ pr, actions }: { pr: RunItem; actions?: string[] }) {
   const hasActions = actions != null && actions.length > 0;
   const hasStats =
@@ -354,7 +355,7 @@ function PrCardFooter({ pr, actions }: { pr: RunItem; actions?: string[] }) {
     (pr.additions != null && pr.additions !== 0) ||
     (pr.deletions != null && pr.deletions !== 0);
 
-  if (!hasStats && !hasActions && pr.elapsed == null) return null;
+  if (!hasStats && !hasActions && pr.size == null) return null;
 
   return (
     <div className="mt-3 flex items-center gap-3 font-mono text-xs">
@@ -416,9 +417,9 @@ function PrCardFooter({ pr, actions }: { pr: RunItem; actions?: string[] }) {
           ))}
         </div>
       )}
-      {pr.elapsed != null && (
-        <span className={`text-fg-muted ${hasActions ? "" : "ml-auto"}`}>
-          {pr.elapsed}
+      {pr.size != null && (
+        <span className={hasActions ? "inline-flex" : "ml-auto inline-flex"}>
+          <SizeChip size={pr.size} totalUsdMicros={pr.totalUsdMicros} />
         </span>
       )}
     </div>

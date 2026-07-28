@@ -290,6 +290,7 @@ pub enum SuccessReason {
 #[strum(serialize_all = "snake_case")]
 pub enum FailureReason {
     WorkflowError,
+    PublishFailed,
     Cancelled,
     ApprovalDenied,
     Terminated,

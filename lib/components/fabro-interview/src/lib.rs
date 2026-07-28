@@ -10,7 +10,7 @@ mod replay;
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use fabro_types::{InterviewOption, Principal, QuestionType, SystemActorKind};
+use fabro_types::{InterviewOption, Principal, QuestionType, ReviewTarget, SystemActorKind};
 use serde::{Deserialize, Serialize};
 use tokio::time;
 
@@ -29,6 +29,8 @@ pub struct Question {
     pub metadata:        HashMap<String, serde_json::Value>,
     #[serde(default)]
     pub context_display: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_target:   Option<ReviewTarget>,
 }
 
 impl Question {
@@ -44,6 +46,7 @@ impl Question {
             stage: String::new(),
             metadata: HashMap::new(),
             context_display: None,
+            review_target: None,
         }
     }
 }
@@ -219,7 +222,7 @@ pub trait Interviewer: Send + Sync {
 // Re-export all implementors at the crate root
 pub use auto_approve::AutoApproveInterviewer;
 pub use callback::CallbackInterviewer;
-pub use console::ConsoleInterviewer;
+pub use console::{ConsoleInterviewer, review_target_line};
 pub use control::{ControlInterviewer, SubmitError};
 pub use control_protocol::{
     WORKER_CONTROL_INVALID_CURSOR_REASON, WORKER_CONTROL_PONG_TIMEOUT_REASON,
@@ -260,6 +263,7 @@ mod tests {
         assert!(q.timeout_seconds.is_none());
         assert!(q.stage.is_empty());
         assert!(q.metadata.is_empty());
+        assert!(q.review_target.is_none());
     }
 
     #[test]

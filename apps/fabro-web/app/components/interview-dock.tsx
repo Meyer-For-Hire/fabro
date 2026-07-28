@@ -1,14 +1,8 @@
+import { useCallback, useState } from "react";
 import {
-  useCallback,
-  useState,
-  type FormEvent,
-  type KeyboardEvent,
-} from "react";
-import {
-  ArrowPathIcon,
   ArrowRightIcon,
-  ArrowUturnLeftIcon,
   CheckIcon,
+  ChevronRightIcon,
 } from "@heroicons/react/20/solid";
 import { QuestionType } from "@qltysh/fabro-api-client";
 import type {
@@ -22,16 +16,31 @@ import {
 } from "../lib/mutations";
 import { ApiError } from "../lib/api-client";
 import { displayLabel } from "./interview-label";
-import { ErrorMessage } from "./ui";
+import {
+  ReviewTargetQuestion,
+  safeReviewTarget,
+} from "./review-target-question";
+import {
+  DockComposer,
+  RunDockShell,
+  DOCK_CHOICE_BUTTON,
+  DOCK_CHOICE_BUTTON_SELECTED,
+  DOCK_HEADER_BUTTON,
+} from "./run-dock";
+import { Spinner } from "./state";
+import {
+  ErrorMessage,
+  PRIMARY_BUTTON_CLASS,
+} from "./ui";
 
-const PRIMARY_BUTTON =
-  "inline-flex items-center justify-center gap-1.5 rounded-lg bg-teal-500 px-3.5 py-2 text-sm font-medium text-on-primary transition-colors hover:bg-teal-300 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:bg-teal-500";
+/**
+ * Options stack into a list once a label is long enough that a row of pills
+ * would wrap mid-sentence.
+ */
+const STACK_LABEL_LENGTH = 40;
 
-const CHOICE_BUTTON =
-  "inline-flex items-center justify-center gap-1.5 rounded-lg bg-overlay px-3.5 py-2 text-sm font-medium text-fg-2 outline-1 -outline-offset-1 outline-line-strong transition-colors hover:bg-overlay-strong hover:text-fg focus-visible:outline-2 focus-visible:-outline-offset-1 focus-visible:outline-teal-500 disabled:cursor-not-allowed disabled:opacity-60";
-
-const CHOICE_BUTTON_SELECTED =
-  "inline-flex items-center justify-center gap-1.5 rounded-lg bg-teal-500/15 px-3.5 py-2 text-sm font-medium text-fg outline-1 -outline-offset-1 outline-teal-500/60 transition-colors hover:bg-teal-500/20 focus-visible:outline-2 focus-visible:-outline-offset-1 focus-visible:outline-teal-500";
+/** Shared by the plain question text and the review target rendering. */
+const QUESTION_TEXT = "max-w-[78ch] text-base/6 font-medium text-pretty text-fg";
 
 type SubmitInterviewAnswer = SubmitInterviewAnswerArg["answer"];
 
@@ -51,6 +60,8 @@ export function InterviewDock({ runId, questions }: InterviewDockProps) {
   const moreCount = questions.length - 1;
 
   return (
+    // Keyed by question id, so a new question always arrives expanded with an
+    // empty composer. A collapsed panel can never silently block a run.
     <InterviewQuestionDock
       key={question.id}
       runId={runId}
@@ -76,110 +87,113 @@ function InterviewQuestionDock({
 }) {
   const submitMutation = useSubmitInterviewAnswer(runId);
   const [error, setError] = useState<string | null>(null);
+  const [collapsed, setCollapsed] = useState(false);
   const submitting = submitMutation.isMutating;
+  const reviewTarget = safeReviewTarget(question.review_target);
 
   const submit = useCallback(
     async (answer: SubmitInterviewAnswer) => {
       setError(null);
       try {
         await submitMutation.trigger({ questionId: question.id, answer });
+        return true;
       } catch (caught) {
         setError(interviewSubmitErrorMessage(caught));
+        return false;
       }
     },
     [question.id, submitMutation],
   );
 
   return (
-    <section aria-label="Interview question">
-      <DockHeader
-        stage={question.stage}
-        moreCount={moreCount}
-        onCycle={onCycle}
-      />
-      <div className="space-y-5 px-5 py-4 sm:px-6">
-        <div>
-          <p className="text-pretty text-base/6 font-medium text-fg">
-            {question.text}
-          </p>
-          <p className="mt-1 text-xs/5 text-fg-muted">
-            {questionTypeLabel(question.question_type)}
-          </p>
-        </div>
-
-        {question.context_display && (
-          <ContextPanel text={question.context_display} />
-        )}
-
-        <QuestionBody
-          question={question}
-          submitting={submitting}
-          onSubmit={submit}
-        />
-
-        {error && <ErrorMessage message={error} />}
-      </div>
-    </section>
+    <RunDockShell
+      label="Interview question"
+      tone="waiting"
+      status="Awaiting input"
+      stage={question.stage}
+      peek={question.text}
+      collapsed={collapsed}
+      onCollapsedChange={setCollapsed}
+      headerActions={
+        moreCount > 0 && (
+          <button
+            type="button"
+            onClick={onCycle}
+            className={DOCK_HEADER_BUTTON}
+          >
+            <span className="tabular-nums">{moreCount}</span> more pending
+            <ArrowRightIcon className="size-3" aria-hidden="true" />
+          </button>
+        )
+      }
+      body={
+        <>
+          {reviewTarget ? (
+            <ReviewTargetQuestion
+              target={reviewTarget}
+              className={QUESTION_TEXT}
+            />
+          ) : (
+            <p className={QUESTION_TEXT}>{question.text}</p>
+          )}
+          {question.context_display && (
+            <ContextPanel text={question.context_display} />
+          )}
+        </>
+      }
+      actions={
+        <>
+          <QuestionBody
+            question={question}
+            submitting={submitting}
+            onSubmit={submit}
+          />
+          {error && <ErrorMessage message={error} />}
+        </>
+      }
+    />
   );
 }
 
-function DockHeader({
-  stage,
-  moreCount,
-  onCycle,
-}: {
-  stage: string;
-  moreCount: number;
-  onCycle: () => void;
-}) {
-  return (
-    <div className="flex items-center justify-between gap-3 border-b border-line px-5 py-2.5">
-      <div className="flex min-w-0 items-center gap-2 text-sm">
-        <PulseDot />
-        <span className="font-medium text-fg-2">Awaiting input</span>
-        {stage && (
-          <>
-            <span className="text-fg-muted" aria-hidden="true">
-              ·
-            </span>
-            <span className="truncate font-mono text-xs text-fg-3">{stage}</span>
-          </>
-        )}
-      </div>
-      {moreCount > 0 && (
-        <button
-          type="button"
-          onClick={onCycle}
-          className="inline-flex shrink-0 items-center gap-1 rounded-md bg-overlay px-2 py-1 text-xs font-medium text-fg-2 outline-1 -outline-offset-1 outline-line-strong hover:bg-overlay-strong hover:text-fg focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500"
-        >
-          <span className="tabular-nums">{moreCount}</span> more pending
-          <ArrowRightIcon className="size-3" aria-hidden="true" />
-        </button>
-      )}
-    </div>
-  );
-}
-
-function PulseDot() {
-  return (
-    <span className="relative flex size-2 items-center justify-center" aria-hidden="true">
-      <span className="absolute inline-flex size-full animate-ping rounded-full bg-amber/60" />
-      <span className="relative inline-flex size-2 rounded-full bg-amber" />
-    </span>
-  );
-}
-
+/**
+ * Context arrives collapsed. It repeats material the operator has usually
+ * already read in the stage stream above, so it earns a line rather than a
+ * standing panel.
+ */
 function ContextPanel({ text }: { text: string }) {
   return (
-    <div className="rounded-lg bg-panel-alt p-4 outline-1 -outline-offset-1 outline-line">
-      <p className="mb-1.5 font-mono text-[0.6875rem] tracking-wide text-fg-muted uppercase">
+    <details className="group rounded-lg bg-panel-alt outline-1 -outline-offset-1 outline-line">
+      <summary className="flex cursor-pointer list-none items-center gap-1.5 rounded-lg px-3 py-1.5 font-mono text-[0.6875rem] tracking-wide text-fg-muted uppercase transition-colors hover:text-fg-3 focus-visible:outline-2 focus-visible:-outline-offset-1 focus-visible:outline-teal-500 [&::-webkit-details-marker]:hidden">
+        <ChevronRightIcon
+          className="size-3 shrink-0 transition-transform group-open:rotate-90"
+          aria-hidden="true"
+        />
         Context from preceding stage
-      </p>
-      <div className="max-h-40 overflow-y-auto text-sm/6 text-fg-2">
+        <span className="ml-auto truncate pl-3 font-sans text-xs tracking-normal normal-case group-open:hidden">
+          {contextPreview(text)}
+        </span>
+      </summary>
+      <div className="px-3 pb-2.5 text-sm/6 text-fg-2">
         <pre className="font-sans whitespace-pre-wrap">{text}</pre>
       </div>
-    </div>
+    </details>
   );
+}
+
+/** First line of the context, for the collapsed summary. */
+export function contextPreview(text: string): string {
+  let lineStart = 0;
+  while (lineStart < text.length) {
+    const newline = text.indexOf("\n", lineStart);
+    const lineEnd = newline === -1 ? text.length : newline;
+    const line = text.slice(lineStart, lineEnd).trim();
+    if (line) {
+      return line.length > 60 ? `${line.slice(0, 60).trimEnd()}…` : line;
+    }
+    if (newline === -1) break;
+    lineStart = newline + 1;
+  }
+  return "";
 }
 
 function QuestionBody({
@@ -189,7 +203,7 @@ function QuestionBody({
 }: {
   question: ApiQuestion;
   submitting: boolean;
-  onSubmit: (answer: SubmitInterviewAnswer) => Promise<void>;
+  onSubmit: (answer: SubmitInterviewAnswer) => Promise<boolean>;
 }) {
   switch (question.question_type) {
     case QuestionType.YES_NO:
@@ -215,11 +229,10 @@ function QuestionBody({
       );
     case QuestionType.FREEFORM:
       return (
-        <FreeformBody
+        <FreeformAnswer
           submitting={submitting}
           onSubmit={onSubmit}
           placeholder="Write your response…"
-          submitLabel="Send"
         />
       );
     default:
@@ -232,7 +245,7 @@ function YesNoBody({
   onSubmit,
 }: {
   submitting: boolean;
-  onSubmit: (answer: SubmitInterviewAnswer) => Promise<void>;
+  onSubmit: (answer: SubmitInterviewAnswer) => Promise<boolean>;
 }) {
   return (
     <div className="flex flex-wrap items-center gap-2">
@@ -242,7 +255,7 @@ function YesNoBody({
         aria-label="Answer no"
         disabled={submitting}
         onClick={() => void onSubmit({ kind: "no" })}
-        className={CHOICE_BUTTON}
+        className={DOCK_CHOICE_BUTTON}
       >
         No
       </button>
@@ -251,9 +264,13 @@ function YesNoBody({
         aria-label="Answer yes"
         disabled={submitting}
         onClick={() => void onSubmit({ kind: "yes" })}
-        className={PRIMARY_BUTTON}
+        className={PRIMARY_BUTTON_CLASS}
       >
-        {submitting ? <Spinner /> : <CheckIcon className="size-4" aria-hidden="true" />}
+        {submitting ? (
+          <Spinner className="size-4" />
+        ) : (
+          <CheckIcon className="size-4" aria-hidden="true" />
+        )}
         Yes
       </button>
     </div>
@@ -265,7 +282,7 @@ function ConfirmationBody({
   onSubmit,
 }: {
   submitting: boolean;
-  onSubmit: (answer: SubmitInterviewAnswer) => Promise<void>;
+  onSubmit: (answer: SubmitInterviewAnswer) => Promise<boolean>;
 }) {
   return (
     <div className="flex flex-wrap items-center gap-2">
@@ -273,13 +290,33 @@ function ConfirmationBody({
         type="button"
         disabled={submitting}
         onClick={() => void onSubmit({ kind: "yes" })}
-        className={PRIMARY_BUTTON}
+        className={PRIMARY_BUTTON_CLASS}
       >
-        {submitting ? <Spinner /> : <CheckIcon className="size-4" aria-hidden="true" />}
+        {submitting ? (
+          <Spinner className="size-4" />
+        ) : (
+          <CheckIcon className="size-4" aria-hidden="true" />
+        )}
         Confirm
       </button>
     </div>
   );
+}
+
+/**
+ * Long labels wrap badly as pills, so they become a stacked list instead.
+ */
+export function shouldStackOptions(options: InterviewOption[]): boolean {
+  return options.some(
+    (option) =>
+      option.label.length > STACK_LABEL_LENGTH || Boolean(option.description),
+  );
+}
+
+function optionListClass(stacked: boolean): string {
+  return stacked
+    ? "flex flex-col items-stretch gap-2"
+    : "flex flex-wrap items-center gap-2";
 }
 
 function ChoiceBody({
@@ -291,19 +328,23 @@ function ChoiceBody({
   options: InterviewOption[];
   allowFreeform: boolean;
   submitting: boolean;
-  onSubmit: (answer: SubmitInterviewAnswer) => Promise<void>;
+  onSubmit: (answer: SubmitInterviewAnswer) => Promise<boolean>;
 }) {
+  const stacked = shouldStackOptions(options);
+
   return (
-    <div className="space-y-4">
+    <div className="space-y-2.5">
       {options.length > 0 && (
-        <div className="flex flex-wrap items-center gap-2">
+        <div className={optionListClass(stacked)}>
           {options.map((option) => (
             <button
               key={option.key}
               type="button"
               disabled={submitting}
               onClick={() => void onSubmit({ kind: "selected", option_key: option.key })}
-              className={CHOICE_BUTTON}
+              className={
+                stacked ? `${DOCK_CHOICE_BUTTON} justify-start` : DOCK_CHOICE_BUTTON
+              }
             >
               <OptionLabel option={option} />
             </button>
@@ -311,7 +352,7 @@ function ChoiceBody({
         </div>
       )}
       {allowFreeform && (
-        <FreeformBody
+        <FreeformAnswer
           submitting={submitting}
           onSubmit={onSubmit}
           placeholder={
@@ -319,8 +360,6 @@ function ChoiceBody({
               ? "Or write a custom response…"
               : "Write your response…"
           }
-          submitLabel="Send"
-          divider={options.length > 0}
         />
       )}
     </div>
@@ -334,7 +373,7 @@ function MultiSelectBody({
 }: {
   options: InterviewOption[];
   submitting: boolean;
-  onSubmit: (answer: SubmitInterviewAnswer) => Promise<void>;
+  onSubmit: (answer: SubmitInterviewAnswer) => Promise<boolean>;
 }) {
   const [selected, setSelected] = useState<Set<string>>(new Set());
 
@@ -352,11 +391,14 @@ function MultiSelectBody({
     if (selected.has(option.key)) selectedKeys.push(option.key);
   }
 
+  const stacked = shouldStackOptions(options);
+
   return (
-    <div className="space-y-3">
-      <div className="flex flex-wrap items-center gap-2">
+    <div className="space-y-2.5">
+      <div className={optionListClass(stacked)}>
         {options.map((option) => {
           const isSelected = selected.has(option.key);
+          const base = isSelected ? DOCK_CHOICE_BUTTON_SELECTED : DOCK_CHOICE_BUTTON;
           return (
             <button
               key={option.key}
@@ -364,7 +406,7 @@ function MultiSelectBody({
               disabled={submitting}
               aria-pressed={isSelected}
               onClick={() => toggle(option.key)}
-              className={isSelected ? CHOICE_BUTTON_SELECTED : CHOICE_BUTTON}
+              className={stacked ? `${base} justify-start` : base}
             >
               {isSelected && <CheckIcon className="size-3.5" aria-hidden="true" />}
               <OptionLabel option={option} />
@@ -380,9 +422,13 @@ function MultiSelectBody({
           type="button"
           disabled={submitting || selectedKeys.length === 0}
           onClick={() => void onSubmit({ kind: "multi_selected", option_keys: selectedKeys })}
-          className={PRIMARY_BUTTON}
+          className={PRIMARY_BUTTON_CLASS}
         >
-          {submitting ? <Spinner /> : <CheckIcon className="size-4" aria-hidden="true" />}
+          {submitting ? (
+            <Spinner className="size-4" />
+          ) : (
+            <CheckIcon className="size-4" aria-hidden="true" />
+          )}
           Submit selection
         </button>
       </div>
@@ -390,82 +436,23 @@ function MultiSelectBody({
   );
 }
 
-function FreeformBody({
+function FreeformAnswer({
   submitting,
   onSubmit,
   placeholder,
-  submitLabel,
-  divider = false,
 }: {
   submitting: boolean;
-  onSubmit: (answer: SubmitInterviewAnswer) => Promise<void>;
+  onSubmit: (answer: SubmitInterviewAnswer) => Promise<boolean>;
   placeholder: string;
-  submitLabel: string;
-  divider?: boolean;
 }) {
-  const [value, setValue] = useState("");
-
-  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const trimmed = value.trim();
-    if (!trimmed || submitting) return;
-    await onSubmit({ kind: "text", text: trimmed });
-    setValue("");
-  }
-
-  function handleKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
-    if (event.key === "Enter" && !event.shiftKey) {
-      event.preventDefault();
-      const form = event.currentTarget.form;
-      if (form) form.requestSubmit();
-    }
-  }
-
-  const disabled = submitting || value.trim().length === 0;
-
   return (
-    <form onSubmit={handleSubmit} className="space-y-2">
-      {divider && (
-        <div className="flex items-center gap-3" aria-hidden="true">
-          <span className="h-px flex-1 bg-line" />
-          <span className="text-xs text-fg-muted">or</span>
-          <span className="h-px flex-1 bg-line" />
-        </div>
-      )}
-      <div className="flex items-end gap-2">
-        <label className="sr-only" htmlFor="interview-freeform-answer">
-          Your response
-        </label>
-        <textarea
-          id="interview-freeform-answer"
-          name="answer"
-          aria-label="Interview answer"
-          rows={1}
-          value={value}
-          onChange={(event) => setValue(event.target.value)}
-          onKeyDown={handleKeyDown}
-          placeholder={placeholder}
-          disabled={submitting}
-          className="block w-full resize-none rounded-lg bg-panel-alt px-3.5 py-2.5 text-base/6 text-fg outline-1 -outline-offset-1 outline-line-strong placeholder:text-fg-muted focus:outline-2 focus:-outline-offset-1 focus:outline-teal-500 disabled:opacity-60 sm:text-sm/5"
-        />
-        <button type="submit" disabled={disabled} className={PRIMARY_BUTTON}>
-          {submitting ? (
-            <Spinner />
-          ) : (
-            <ArrowUturnLeftIcon
-              className="size-3.5 -scale-x-100"
-              aria-hidden="true"
-            />
-          )}
-          {submitLabel}
-        </button>
-      </div>
-      <p className="text-xs text-fg-muted">
-        Press <kbd className="rounded bg-overlay px-1 font-mono text-[0.6875rem]">Enter</kbd> to
-        send · <kbd className="rounded bg-overlay px-1 font-mono text-[0.6875rem]">Shift</kbd>+
-        <kbd className="rounded bg-overlay px-1 font-mono text-[0.6875rem]">Enter</kbd> for a new line
-      </p>
-    </form>
+    <DockComposer
+      onSubmit={(text) => onSubmit({ kind: "text", text })}
+      placeholder={placeholder}
+      submitLabel="Send"
+      submitting={submitting}
+      ariaLabel="Interview answer"
+    />
   );
 }
 
@@ -480,27 +467,6 @@ function OptionLabel({ option }: { option: InterviewOption }) {
       )}
     </span>
   );
-}
-
-function Spinner() {
-  return <ArrowPathIcon className="size-4 animate-spin" aria-hidden="true" />;
-}
-
-function questionTypeLabel(type: QuestionType): string {
-  switch (type) {
-    case QuestionType.YES_NO:
-      return "Yes or no";
-    case QuestionType.CONFIRMATION:
-      return "Confirmation required";
-    case QuestionType.MULTIPLE_CHOICE:
-      return "Pick one";
-    case QuestionType.MULTI_SELECT:
-      return "Pick one or more";
-    case QuestionType.FREEFORM:
-      return "Freeform response";
-    default:
-      return "";
-  }
 }
 
 function interviewSubmitErrorMessage(error: unknown): string {
