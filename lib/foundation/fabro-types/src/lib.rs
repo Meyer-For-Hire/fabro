@@ -75,7 +75,9 @@ pub use graph::{
     AttrValue, Edge, Graph, KNOWN_HANDLER_TYPES, Node, is_known_handler_type, is_llm_handler_type,
     shape_to_handler_type,
 };
-pub use interview::{InterviewQuestionRecord, QuestionType};
+pub use interview::{
+    InterviewQuestionRecord, QuestionType, ReviewTarget, ReviewTargetError, ReviewTargetKind,
+};
 pub use llm_backend::AgentBackend;
 pub use manifest_path::{ManifestPath, ManifestPathParseError};
 pub use mcp_store::{
@@ -125,7 +127,7 @@ pub use run_projection::{
     StageContextWindowBreakdownItem, StageContextWindowCategory, StageContextWindowCountMethod,
     StageContextWindowProjection, StageContextWindowStaleness, StageContextWindowUnavailableReason,
     StageContextWindowWarning, StageInferenceProjection, StageModelUsage, StageProjection,
-    SubAgentProjection, SubAgentStatus, first_event_seq,
+    StageToolBatchProjection, SubAgentProjection, SubAgentStatus, first_event_seq,
 };
 pub use run_sandbox::{
     RunSandbox, RunSandboxFailure, RunSandboxInstance, RunSandboxKind, RunSandboxPlan,

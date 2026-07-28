@@ -22,6 +22,7 @@ const HANDLER_SPECIFIC_ATTRS: &[(&str, &[&str])] = &[
     ("output_retries", &["agent", "prompt"]),
     ("output_schema", &["agent", "prompt", "command"]),
     ("prompt", &["agent", "prompt", "parallel.fan_in"]),
+    ("review_target", &["human"]),
 ];
 
 struct Rule;
@@ -197,7 +198,26 @@ mod tests {
             "prompt".to_string(),
             node_with_attr("prompt", "tab", "output_retries", "2"),
         );
+        g.nodes.insert(
+            "human".to_string(),
+            node_with_attr("human", "hexagon", "review_target", "true"),
+        );
         assert!(Rule.apply(&g).is_empty());
+    }
+
+    #[test]
+    fn warns_on_review_target_on_non_human_node() {
+        let mut g = minimal_graph();
+        g.nodes.insert(
+            "work".to_string(),
+            node_with_attr("work", "box", "review_target", "true"),
+        );
+
+        let diagnostics = Rule.apply(&g);
+
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].message.contains("'review_target'"));
+        assert!(diagnostics[0].message.contains("human"));
     }
 
     #[test]

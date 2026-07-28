@@ -423,6 +423,7 @@ fn event_body_from_event(event: &Event) -> EventBody {
             allow_freeform,
             timeout_seconds,
             context_display,
+            review_target,
         } => EventBody::InterviewStarted(fabro_types::InterviewStartedProps {
             question_id:     question_id.clone(),
             question:        question.clone(),
@@ -432,6 +433,7 @@ fn event_body_from_event(event: &Event) -> EventBody {
             allow_freeform:  *allow_freeform,
             timeout_seconds: *timeout_seconds,
             context_display: context_display.clone(),
+            review_target:   review_target.clone(),
         }),
         Event::InterviewCompleted {
             actor: _,

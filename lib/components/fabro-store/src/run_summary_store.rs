@@ -3,7 +3,7 @@ use std::fmt::Write as _;
 use std::sync::LazyLock;
 
 use chrono::{DateTime, Utc};
-use fabro_types::{BilledTokenCounts, Run, RunId, RunSize, RunStatusKind, RunTiming};
+use fabro_types::{BilledTokenCounts, Run, RunId, RunSize, RunStatusKind, RunTiming, timing};
 use sqlx::sqlite::{SqliteConnection, SqliteRow};
 use sqlx::{QueryBuilder, Row as _, Sqlite, SqlitePool};
 use strum::VariantArray as _;
@@ -545,7 +545,7 @@ fn overlay_live_wall_time(run: &mut Run, now: DateTime<Utc>) {
     let Some(started_at) = run.timestamps.started_at else {
         return;
     };
-    let wall_time_ms = RunTiming::wall_time_ms_since(started_at, now);
+    let wall_time_ms = timing::elapsed_ms(started_at, now);
     run.timing = Some(
         run.timing
             .unwrap_or_else(|| RunTiming::wall_only(wall_time_ms))

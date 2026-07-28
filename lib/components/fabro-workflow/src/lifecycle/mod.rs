@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use async_trait::async_trait;
-use fabro_core::error::Result as CoreResult;
+use fabro_core::error::{Error as CoreError, Result as CoreResult};
 use fabro_core::graph::NodeSpec;
 use fabro_core::lifecycle::{
     AttemptContext, AttemptResultContext, EdgeContext, EdgeDecision, NodeDecision, RunLifecycle,
@@ -60,6 +60,7 @@ pub(crate) struct WorkflowLifecycle {
     circuit_breaker:       Arc<CircuitBreakerLifecycle>,
     git:                   GitLifecycle,
     artifact:              ArtifactLifecycle,
+    sandbox:               Arc<dyn Sandbox>,
     on_node:               crate::OnNodeCallback,
     emitter:               Arc<Emitter>,
     run_control:           Option<Arc<RunControlState>>,
@@ -190,6 +191,7 @@ impl WorkflowLifecycle {
             circuit_breaker,
             git,
             artifact,
+            sandbox: Arc::clone(sandbox),
             on_node,
             emitter: Arc::clone(emitter),
             run_control,
@@ -280,6 +282,13 @@ impl RunLifecycle<WorkflowGraph> for WorkflowLifecycle {
         if let Some(run_control) = &self.run_control {
             run_control.wait_if_paused(self.emitter.as_ref()).await;
         }
+        // A provider may auto-stop while the run is paused between nodes.
+        self.sandbox.activate().await.map_err(|err| {
+            CoreError::context(
+                format!("failed to activate sandbox before node {}", node.id()),
+                err,
+            )
+        })?;
         if let Some(on_node) = &self.on_node {
             on_node(node.id());
         }
@@ -330,6 +339,17 @@ impl RunLifecycle<WorkflowGraph> for WorkflowLifecycle {
         if let Some(run_control) = &self.run_control {
             run_control.wait_if_paused(self.emitter.as_ref()).await;
         }
+        // Human, wait, and paused stages can return after a long period with
+        // no sandbox traffic. Reactivate before artifact and checkpoint work.
+        self.sandbox.activate().await.map_err(|err| {
+            CoreError::context(
+                format!(
+                    "failed to activate sandbox after node attempt {}",
+                    ctx.node.id()
+                ),
+                err,
+            )
+        })?;
         self.artifact.after_attempt(ctx, state).await?;
         self.event.after_attempt(ctx, state).await?;
         Ok(())

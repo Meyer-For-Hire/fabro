@@ -5,11 +5,15 @@ use super::types::{Transformed, Validated};
 
 /// VALIDATE phase: run lint rules against the transformed graph.
 ///
+/// Catalog-backed rules (model and provider availability) run only when
+/// `catalog` is `Some`. Offline callers pass `None` so a workflow naming a
+/// server-owned model is left for the server to judge.
+///
 /// **Infallible.** Always returns `Validated` with diagnostics. Caller decides
 /// whether to fail via `validated.raise_on_errors()`.
 pub fn validate(
     transformed: Transformed,
-    catalog: &Catalog,
+    catalog: Option<&Catalog>,
     extra_rules: &[&dyn LintRule],
 ) -> Validated {
     let Transformed {
@@ -17,44 +21,33 @@ pub fn validate(
         source,
         mut diagnostics,
     } = transformed;
-    diagnostics.extend(fabro_validate::validate_with_catalog(
-        &graph,
-        catalog,
-        extra_rules,
-    ));
+    diagnostics.extend(match catalog {
+        Some(catalog) => fabro_validate::validate_with_catalog(&graph, catalog, extra_rules),
+        None => fabro_validate::validate(&graph, extra_rules),
+    });
     Validated::new(graph, source, diagnostics)
 }
 
 #[cfg(test)]
 mod tests {
-    use fabro_model::Catalog;
-
     use super::*;
     use crate::pipeline::parse::parse;
     use crate::pipeline::transform;
     use crate::pipeline::types::TransformOptions;
 
-    fn test_catalog() -> std::sync::Arc<Catalog> {
-        std::sync::Arc::new(Catalog::from_builtin().unwrap())
-    }
-
     fn run_pipeline(dot: &str) -> Validated {
-        let catalog = test_catalog();
         let parsed = parse(dot).unwrap();
         let transformed = transform::transform(parsed, &TransformOptions {
-            current_dir:        None,
-            file_resolver:      None,
-            template_context:   fabro_template::TemplateContext::new(),
-            source_name:        None,
-            render_mode:        crate::operations::RenderMode::Strict,
-            custom_transforms:  vec![],
-            catalog:            std::sync::Arc::clone(&catalog),
-            default_provider:   None,
-            eligible_providers: catalog.all_provider_ids(),
-            catalog_fallback:   false,
+            current_dir:       None,
+            file_resolver:     None,
+            template_context:  fabro_template::TemplateContext::new(),
+            source_name:       None,
+            render_mode:       crate::operations::RenderMode::Strict,
+            custom_transforms: vec![],
+            model_resolution:  None,
         })
         .unwrap();
-        validate(transformed, catalog.as_ref(), &[])
+        validate(transformed, None, &[])
     }
 
     #[test]

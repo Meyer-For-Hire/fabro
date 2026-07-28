@@ -257,7 +257,7 @@ impl TestAppStateBuilder {
     pub fn try_build(mut self) -> anyhow::Result<Arc<AppState>> {
         let (store, artifact_store) = self.store_bundle.unwrap_or_else(test_store_bundle);
         let vault_path = self.vault_path.unwrap_or_else(test_secret_store_path);
-        redirect_default_storage_root(&mut self.server_settings, &vault_path);
+        self.server_settings = redirect_default_storage_root(self.server_settings, &vault_path);
         if !self.vault_entries.is_empty() {
             let mut vault = Vault::load(vault_path.clone()).expect("test vault should load");
             for (name, value) in &self.vault_entries {
@@ -683,14 +683,16 @@ pub fn test_secret_store_path() -> PathBuf {
 /// machine-dependent, and letting run-creating tests write there.
 ///
 /// Only settings still carrying the production default are redirected; a test
-/// that chose its own root keeps it.
-fn redirect_default_storage_root(settings: &mut ServerSettings, vault_path: &Path) {
+/// that chose its own root keeps it. The redirect goes through
+/// [`ServerSettings::with_storage_override`] so the derived local object-store
+/// roots move with it instead of pointing back at the real storage tree.
+fn redirect_default_storage_root(settings: ServerSettings, vault_path: &Path) -> ServerSettings {
     if Path::new(&settings.server.storage.root) != default_storage_dir() {
-        return;
+        return settings;
     }
     let root = vault_path.with_file_name("storage");
     std::fs::create_dir_all(&root).expect("test storage root should be creatable");
-    settings.server.storage.root = root.display().to_string();
+    settings.with_storage_override(&root)
 }
 
 #[must_use]

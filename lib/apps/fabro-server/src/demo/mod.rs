@@ -1134,6 +1134,7 @@ mod runs {
             id: stage_id.clone(),
             name: name.to_owned(),
             handler,
+            billing: BilledTokenCounts::default(),
             status,
             wall_time_ms,
             node_id: stage_id.node_id().to_owned(),
@@ -1752,6 +1753,7 @@ mod runs {
                 allow_freeform:  false,
                 timeout_seconds: None,
                 context_display: None,
+                review_target:   None,
             },
             ApiQuestion {
                 id:              "q-002".into(),
@@ -1775,6 +1777,7 @@ mod runs {
                 allow_freeform:  true,
                 timeout_seconds: None,
                 context_display: None,
+                review_target:   None,
             },
         ]
     }

@@ -19,6 +19,9 @@ import type { InterviewOption } from './interview-option';
 // May contain unused imports in some cases
 // @ts-ignore
 import type { QuestionType } from './question-type';
+// May contain unused imports in some cases
+// @ts-ignore
+import type { ReviewTarget } from './review-target';
 
 /**
  * Storage shape of an interview question recorded in the event log.
@@ -32,4 +35,5 @@ export interface InterviewQuestionRecord {
     'allow_freeform': boolean;
     'timeout_seconds'?: number | null;
     'context_display'?: string | null;
+    'review_target'?: ReviewTarget | null;
 }
