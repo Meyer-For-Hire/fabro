@@ -69,37 +69,22 @@ fn simple_does_not_connect_to_configured_server() {
     );
 }
 
+/// Offline validation has no model catalog, so a model or provider the server
+/// owns must pass rather than be reported as unknown.
 #[test]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "sync CLI test writes one workflow fixture before spawning the subprocess"
-)]
 fn server_owned_provider_is_not_rejected_by_offline_validation() {
-    let cli = LightweightCli::new();
-    let workflow = cli.home().join("server-model.fabro");
-    std::fs::write(
-        &workflow,
-        r#"digraph ServerModel {
-            graph [goal="Use a server-owned model"]
-            start [shape=Mdiamond]
-            work [prompt="Do work", model="private-model", provider="server-only"]
-            exit [shape=Msquare]
-            start -> work -> exit
-        }"#,
-    )
-    .expect("workflow fixture should be written");
-    let mut cmd = cli.command();
-    cmd.env("FABRO_SERVER", "http://127.0.0.1:9")
-        .arg("validate")
-        .arg(&workflow);
-
-    let output = cmd.output().expect("validate should execute");
-    assert!(
-        output.status.success(),
-        "offline validation should leave provider availability to the server\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
+    let context = test_context!();
+    let mut cmd = context.validate();
+    cmd.arg(fixture("server-model.fabro"));
+    fabro_snapshot!(context.filters(), cmd, @"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+    ----- stderr -----
+    Workflow: ServerModel (3 nodes, 2 edges)
+    Graph: [FIXTURES]/server-model.fabro
+    Validation: OK
+    ");
 }
 
 #[test]

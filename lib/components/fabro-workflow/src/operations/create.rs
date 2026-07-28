@@ -24,13 +24,11 @@ use crate::error::Error;
 use crate::event::{Event, append_event, to_run_event_at};
 use crate::file_resolver::FileResolver;
 use crate::pipeline::types::PersistOptions;
-use crate::pipeline::{
-    self, ModelResolutionOptions, Persisted, TransformOptions, Transformed, Validated,
-};
+use crate::pipeline::{self, ModelResolutionOptions, Persisted, TransformOptions, Validated};
 use crate::records::RunSpec;
 use crate::run_lookup::default_scratch_base;
 use crate::run_materialization::materialize_run;
-use crate::transforms::{RenderMode, Transform};
+use crate::transforms::RenderMode;
 use crate::workflow_bundle::{RunDefinition, WorkflowBundle};
 
 #[derive(Clone, Debug)]
@@ -295,28 +293,20 @@ fn create_from_source(
     file_resolver: Option<Arc<dyn FileResolver>>,
     goal_override: Option<&str>,
 ) -> Result<Persisted, Error> {
-    let template_context = template_context(Some(&options.settings), vars);
-    let mut validated = preprocess_and_validate(
-        dot_source,
-        options.source_name.clone(),
+    let mut validated = preprocess_and_validate(dot_source, goal_override, &TransformOptions {
         current_dir,
         file_resolver,
-        Vec::new(),
-        template_context,
-        goal_override,
-        RenderMode::Structural,
-        options
-            .settings
-            .run
-            .model
-            .provider
-            .as_deref()
-            .filter(|provider| !provider.is_empty())
-            .map(ProviderId::new),
-        &options.configured_providers,
-        false,
-        &options.catalog,
-    )?;
+        template_context: template_context(Some(&options.settings), vars),
+        source_name: options.source_name.clone(),
+        render_mode: RenderMode::Structural,
+        custom_transforms: Vec::new(),
+        model_resolution: Some(ModelResolutionOptions {
+            catalog:            Arc::clone(&options.catalog),
+            default_provider:   configured_default_provider(&options.settings),
+            eligible_providers: options.configured_providers.iter().cloned().collect(),
+            catalog_fallback:   false,
+        }),
+    })?;
 
     validated.promote_template_undefined_variables_to_errors();
     if validated.has_errors() {
@@ -328,96 +318,37 @@ fn create_from_source(
     persist_validated(validated, options)
 }
 
+/// Parse, transform, and validate `dot_source`.
+///
+/// `options.model_resolution` drives both halves of catalog awareness: it
+/// selects concrete models during TRANSFORM and enables the catalog-backed
+/// lint rules during VALIDATE. `None` leaves authored model and provider
+/// selectors untouched for offline structural validation.
 pub(super) fn preprocess_and_validate(
     dot_source: &str,
-    source_name: Option<String>,
-    current_dir: Option<PathBuf>,
-    file_resolver: Option<Arc<dyn FileResolver>>,
-    custom_transforms: Vec<Box<dyn Transform>>,
-    template_context: TemplateContext,
     goal_override: Option<&str>,
-    render_mode: RenderMode,
-    default_provider: Option<ProviderId>,
-    eligible_providers: &[ProviderId],
-    catalog_fallback: bool,
-    catalog: &Arc<Catalog>,
+    options: &TransformOptions,
 ) -> Result<Validated, Error> {
-    let model_resolution = ModelResolutionOptions {
-        catalog: Arc::clone(catalog),
-        default_provider,
-        eligible_providers: eligible_providers.iter().cloned().collect(),
-        catalog_fallback,
-    };
-    let transformed = preprocess(
-        dot_source,
-        source_name,
-        current_dir,
-        file_resolver,
-        custom_transforms,
-        template_context,
-        goal_override,
-        render_mode,
-        Some(model_resolution),
-    )?;
-    Ok(pipeline::validate_with_catalog(
-        transformed,
-        catalog.as_ref(),
-        &[],
-    ))
-}
-
-pub(super) fn preprocess_and_validate_structural(
-    dot_source: &str,
-    source_name: Option<String>,
-    current_dir: Option<PathBuf>,
-    file_resolver: Option<Arc<dyn FileResolver>>,
-    custom_transforms: Vec<Box<dyn Transform>>,
-    template_context: TemplateContext,
-    goal_override: Option<&str>,
-    render_mode: RenderMode,
-) -> Result<Validated, Error> {
-    let transformed = preprocess(
-        dot_source,
-        source_name,
-        current_dir,
-        file_resolver,
-        custom_transforms,
-        template_context,
-        goal_override,
-        render_mode,
-        None,
-    )?;
-    Ok(pipeline::validate(transformed, &[]))
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "pipeline stages have distinct source, rendering, and model-resolution inputs"
-)]
-fn preprocess(
-    dot_source: &str,
-    source_name: Option<String>,
-    current_dir: Option<PathBuf>,
-    file_resolver: Option<Arc<dyn FileResolver>>,
-    custom_transforms: Vec<Box<dyn Transform>>,
-    template_context: TemplateContext,
-    goal_override: Option<&str>,
-    render_mode: RenderMode,
-    model_resolution: Option<ModelResolutionOptions>,
-) -> Result<Transformed, Error> {
     let mut parsed = pipeline::parse(dot_source)?;
     apply_goal_override(&mut parsed.graph, goal_override);
 
-    let transformed = pipeline::transform(parsed, &TransformOptions {
-        current_dir,
-        file_resolver,
-        template_context,
-        source_name,
-        render_mode,
-        custom_transforms,
-        model_resolution,
-    })?;
-    Ok(transformed)
+    let transformed = pipeline::transform(parsed, options)?;
+    let catalog = options
+        .model_resolution
+        .as_ref()
+        .map(|resolution| resolution.catalog.as_ref());
+    Ok(pipeline::validate(transformed, catalog, &[]))
+}
+
+/// The workflow-level default provider, treating an empty setting as unset.
+pub(super) fn configured_default_provider(settings: &WorkflowSettings) -> Option<ProviderId> {
+    settings
+        .run
+        .model
+        .provider
+        .as_deref()
+        .filter(|provider| !provider.is_empty())
+        .map(ProviderId::new)
 }
 
 pub(super) fn template_context(
@@ -526,6 +457,7 @@ mod tests {
     use super::*;
     use crate::operations::{ValidateInput, validate, validate_with_catalog};
     use crate::pipeline::types::{GOAL_SELF_REFERENCE_RULE, TEMPLATE_UNDEFINED_VARIABLE_RULE};
+    use crate::transforms::Transform;
     use crate::workflow_bundle::BundledWorkflow;
     fn memory_store() -> Arc<Database> {
         Arc::new(Database::new(
@@ -637,19 +569,38 @@ reasoning = false
     fn validate_dot_with_vars(dot_source: &str, vars: HashMap<String, String>) -> Validated {
         preprocess_and_validate(
             dot_source,
-            Some("workflow.fabro".to_string()),
-            Some(PathBuf::from(".")),
             None,
-            Vec::new(),
-            template_context(Some(&WorkflowSettings::default()), vars),
-            None,
-            RenderMode::Structural,
-            None,
-            &test_provider_ids(),
-            false,
-            &test_catalog(),
+            &test_transform_options(
+                PathBuf::from("."),
+                None,
+                RenderMode::Structural,
+                template_context(Some(&WorkflowSettings::default()), vars),
+            ),
         )
         .unwrap()
+    }
+
+    /// Catalog-backed TRANSFORM options for the built-in test catalog.
+    fn test_transform_options(
+        current_dir: PathBuf,
+        file_resolver: Option<Arc<dyn FileResolver>>,
+        render_mode: RenderMode,
+        template_context: TemplateContext,
+    ) -> TransformOptions {
+        TransformOptions {
+            current_dir: Some(current_dir),
+            file_resolver,
+            template_context,
+            source_name: Some("workflow.fabro".to_string()),
+            render_mode,
+            custom_transforms: Vec::new(),
+            model_resolution: Some(ModelResolutionOptions {
+                catalog:            test_catalog(),
+                default_provider:   None,
+                eligible_providers: test_provider_ids().into_iter().collect(),
+                catalog_fallback:   false,
+            }),
+        }
     }
 
     const MINIMAL_DOT: &str = r#"digraph Test {
@@ -808,17 +759,13 @@ reasoning = false
 
         let result = preprocess_and_validate(
             dot,
-            Some("workflow.fabro".to_string()),
-            Some(PathBuf::from(".")),
             None,
-            Vec::new(),
-            template_context(Some(&WorkflowSettings::default()), HashMap::new()),
-            None,
-            RenderMode::Strict,
-            None,
-            &test_provider_ids(),
-            false,
-            &test_catalog(),
+            &test_transform_options(
+                PathBuf::from("."),
+                None,
+                RenderMode::Strict,
+                template_context(Some(&WorkflowSettings::default()), HashMap::new()),
+            ),
         );
         let Err(err) = result else {
             panic!("expected strict mode to hard-fail on unbound inline prompt");
@@ -845,19 +792,15 @@ reasoning = false
 
         let result = preprocess_and_validate(
             dot,
-            Some("workflow.fabro".to_string()),
-            Some(dir.path().to_path_buf()),
-            Some(Arc::new(crate::file_resolver::FilesystemFileResolver::new(
-                None,
-            ))),
-            Vec::new(),
-            template_context(Some(&WorkflowSettings::default()), HashMap::new()),
             None,
-            RenderMode::Strict,
-            None,
-            &test_provider_ids(),
-            false,
-            &test_catalog(),
+            &test_transform_options(
+                dir.path().to_path_buf(),
+                Some(Arc::new(crate::file_resolver::FilesystemFileResolver::new(
+                    None,
+                ))),
+                RenderMode::Strict,
+                template_context(Some(&WorkflowSettings::default()), HashMap::new()),
+            ),
         );
         let Err(err) = result else {
             panic!("expected strict mode to hard-fail on unbound imported prompt");

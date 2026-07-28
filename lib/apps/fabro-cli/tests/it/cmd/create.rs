@@ -114,25 +114,13 @@ fn create_defers_provider_validation_to_the_server() {
             .header("Content-Type", "application/json")
             .body(run_status_response(run_id.as_str(), "submitted").to_string());
     });
-    let workflow_path = context.temp_dir.join("server-model.fabro");
-    context.write_temp(
-        "server-model.fabro",
-        r#"digraph ServerModel {
-            graph [goal="Use a server-owned model"]
-            start [shape=Mdiamond]
-            work [prompt="Do work", model="private-model", provider="server-only"]
-            exit [shape=Msquare]
-            start -> work -> exit
-        }"#,
-    );
-
     let output = context
         .create_cmd()
         .args([
             "--server",
             &format!("{}/api/v1", server.base_url()),
             "--dry-run",
-            workflow_path.to_str().unwrap(),
+            fixture("server-model.fabro").to_str().unwrap(),
         ])
         .output()
         .expect("command should execute");

@@ -1,28 +1,19 @@
+use fabro_model::Catalog;
 use fabro_validate::LintRule;
 
 use super::types::{Transformed, Validated};
 
-/// VALIDATE phase: run catalog-free lint rules against the transformed graph.
+/// VALIDATE phase: run lint rules against the transformed graph.
+///
+/// Catalog-backed rules (model and provider availability) run only when
+/// `catalog` is `Some`. Offline callers pass `None` so a workflow naming a
+/// server-owned model is left for the server to judge.
 ///
 /// **Infallible.** Always returns `Validated` with diagnostics. Caller decides
 /// whether to fail via `validated.raise_on_errors()`.
-pub fn validate(transformed: Transformed, extra_rules: &[&dyn LintRule]) -> Validated {
-    let Transformed {
-        graph,
-        source,
-        mut diagnostics,
-    } = transformed;
-    diagnostics.extend(fabro_validate::validate(&graph, extra_rules));
-    Validated::new(graph, source, diagnostics)
-}
-
-/// VALIDATE phase: run catalog-free and catalog-backed lint rules.
-///
-/// **Infallible.** Always returns `Validated` with diagnostics. Caller decides
-/// whether to fail via `validated.raise_on_errors()`.
-pub fn validate_with_catalog(
+pub fn validate(
     transformed: Transformed,
-    catalog: &fabro_model::Catalog,
+    catalog: Option<&Catalog>,
     extra_rules: &[&dyn LintRule],
 ) -> Validated {
     let Transformed {
@@ -30,11 +21,10 @@ pub fn validate_with_catalog(
         source,
         mut diagnostics,
     } = transformed;
-    diagnostics.extend(fabro_validate::validate_with_catalog(
-        &graph,
-        catalog,
-        extra_rules,
-    ));
+    diagnostics.extend(match catalog {
+        Some(catalog) => fabro_validate::validate_with_catalog(&graph, catalog, extra_rules),
+        None => fabro_validate::validate(&graph, extra_rules),
+    });
     Validated::new(graph, source, diagnostics)
 }
 
@@ -57,7 +47,7 @@ mod tests {
             model_resolution:  None,
         })
         .unwrap();
-        validate(transformed, &[])
+        validate(transformed, None, &[])
     }
 
     #[test]

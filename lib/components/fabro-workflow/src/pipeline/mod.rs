@@ -26,4 +26,4 @@ pub use types::{
     ModelResolutionOptions, Parsed, Persisted, PullRequestOptions, ResumeState, SandboxEnvSpec,
     TEMPLATE_UNDEFINED_VARIABLE_RULE, TransformOptions, Transformed, Validated,
 };
-pub use validate::{validate, validate_with_catalog};
+pub use validate::validate;
