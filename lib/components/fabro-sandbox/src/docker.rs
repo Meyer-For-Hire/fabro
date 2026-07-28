@@ -3,7 +3,7 @@ use std::fmt::Write as _;
 use std::io::Cursor;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bollard::Docker;
@@ -17,7 +17,7 @@ use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
 use bollard::image::CreateImageOptions;
 use bollard::models::{ContainerInspectResponse, HostConfig};
 use fabro_github::GitHubCredentials;
-use fabro_types::{CommandOutputStream, CommandTermination, RunId};
+use fabro_types::{CommandOutputStream, CommandTermination, RunId, SandboxProviderKind};
 use fabro_util::time::elapsed_ms;
 use futures::StreamExt;
 use tokio::io::{AsyncWriteExt, duplex};
@@ -37,7 +37,7 @@ use crate::{
     CommandOutputCallback, DEFAULT_EXEC_OUTPUT_TAIL_BYTES, DirEntry, ExecResult,
     ExecStreamingResult, GrepOptions, Sandbox, SandboxEvent, SandboxEventCallback, SandboxFile,
     StderrCollector, StdioProcess, StdioProcessHandle, StdioProcessTermination, WalkOptions,
-    format_lines_numbered, shell_quote,
+    clone_retry, format_lines_numbered, shell_quote,
 };
 
 const DOCKER_BASH_REQUIREMENT: &str = "Docker sandboxes require /bin/bash for every command, with no `sh` fallback; use an \
@@ -46,6 +46,7 @@ const DOCKER_BASH_REQUIREMENT: &str = "Docker sandboxes require /bin/bash for ev
 pub(crate) const WORKING_DIRECTORY: &str = "/workspace";
 pub(crate) const REPOS_ROOT: &str = "/repos";
 const GIT_CLONE_DEPTH: usize = 10;
+const GIT_CLONE_TIMEOUT: Duration = Duration::from_mins(5);
 #[cfg(test)]
 const EXEC_STOP_POLL_SLEEP_SECONDS: &str = "0.005";
 #[cfg(not(test))]
@@ -54,6 +55,11 @@ const EXEC_STOP_POLL_SLEEP_SECONDS: &str = "0.1";
 const EXEC_TERM_GRACE_SECONDS: &str = "0.02";
 #[cfg(not(test))]
 const EXEC_TERM_GRACE_SECONDS: &str = "0.2";
+
+struct DockerCloneFailure {
+    error:        crate::Error,
+    retry_reason: Option<clone_retry::CloneRetryReason>,
+}
 
 fn env_entry_name(entry: &str) -> &str {
     entry.split_once('=').map_or(entry, |(name, _)| name)
@@ -681,6 +687,32 @@ impl DockerSandbox {
         Ok(())
     }
 
+    /// Preserve a failed `git clone` result while masking the auth URL.
+    fn clone_failure_error(
+        &self,
+        result: ExecResult,
+        auth_url: Option<&fabro_redact::DisplaySafeUrl>,
+    ) -> crate::Error {
+        let error = result
+            .into_exec_error_with_redactor("git clone", |output| redact_auth_url(output, auth_url));
+        let message = if self.github_app.is_none() {
+            "Git clone failed. If this is a private repository, configure a GitHub App with \
+             `fabro install` and install it for your organization."
+        } else {
+            "Failed to clone repository into Docker sandbox"
+        };
+        crate::Error::context(message, error)
+    }
+
+    fn report_clone_failure(&self, origin_url: &str, err: crate::Error) -> crate::Error {
+        self.emit(SandboxEvent::GitCloneFailed {
+            url:    origin_url.to_string(),
+            error:  err.to_string(),
+            causes: err.causes(),
+        });
+        err
+    }
+
     async fn clone_github_repo(
         &self,
         origin_url: String,
@@ -688,12 +720,10 @@ impl DockerSandbox {
     ) -> crate::Result<()> {
         self.verify_git_available().await?;
         let layout = clone_source::github_repo_layout(&origin_url, WORKING_DIRECTORY, REPOS_ROOT)?;
-
-        self.emit(SandboxEvent::GitCloneStarted {
-            url:    origin_url.clone(),
-            branch: branch.clone(),
-        });
-        let clone_start = Instant::now();
+        let token_was_freshly_minted = self
+            .github_app
+            .as_ref()
+            .is_some_and(GitHubCredentials::mints_installation_token);
 
         let auth_url = match &self.github_app {
             Some(creds) => Some(
@@ -714,26 +744,101 @@ impl DockerSandbox {
             .as_ref()
             .map_or(origin_url.as_str(), |url| url.as_raw_url().as_str());
 
-        let command = git_clone_and_link_command(clone_url, branch.as_deref(), &layout);
+        self.emit(SandboxEvent::GitCloneStarted {
+            url:    origin_url.clone(),
+            branch: branch.clone(),
+        });
+        let clone_start = Instant::now();
 
-        let result = self
-            .docker_exec_shell(&command, 300_000, Some("/"), None, None)
-            .await?;
-        if !result.is_success() {
-            let stderr = redact_auth_url(&result.stderr, auth_url.as_ref());
-            let err = crate::Error::message(if self.github_app.is_none() {
-                format!(
-                    "Git clone failed: {stderr}. If this is a private repository, configure a GitHub App with `fabro install` and install it for your organization."
-                )
-            } else {
-                format!("Failed to clone repo into Docker sandbox: {stderr}")
-            });
-            self.emit(SandboxEvent::GitCloneFailed {
-                url:    origin_url,
-                error:  err.to_string(),
-                causes: err.causes(),
-            });
-            return Err(err);
+        let prepare_command = format!(
+            "mkdir -p {} {}",
+            shell_quote(WORKING_DIRECTORY),
+            shell_quote(&layout.repos_owner_path),
+        );
+        match self
+            .docker_exec_shell(&prepare_command, 10_000, Some("/"), None, None)
+            .await
+        {
+            Ok(result) if result.is_success() => {}
+            Ok(result) => {
+                let err = result.into_exec_error("prepare Docker repository checkout");
+                return Err(self.report_clone_failure(&origin_url, err));
+            }
+            Err(err) => {
+                return Err(self.report_clone_failure(&origin_url, err));
+            }
+        }
+
+        let command = git_clone_command(clone_url, branch.as_deref(), &layout.primary_repo_path);
+        let clone_deadline = time::Instant::now() + GIT_CLONE_TIMEOUT;
+        let clone_result = clone_retry::retry_clone(
+            SandboxProviderKind::Docker,
+            Some(clone_deadline),
+            |_attempt| {
+                let command = command.as_str();
+                let auth_url = auth_url.as_ref();
+                async move {
+                    let remaining = clone_deadline.saturating_duration_since(time::Instant::now());
+                    let timeout_ms = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX);
+                    if timeout_ms == 0 {
+                        return Err(DockerCloneFailure {
+                            error:        crate::Error::message(
+                                "Docker git clone deadline expired before retry",
+                            ),
+                            retry_reason: None,
+                        });
+                    }
+                    let result = self
+                        .docker_exec_shell_streaming(
+                            command,
+                            Some(timeout_ms),
+                            Some("/"),
+                            None,
+                            None,
+                            None,
+                        )
+                        .await
+                        .map_err(|error| DockerCloneFailure {
+                            error:        crate::Error::context(
+                                "Docker git clone transport failed",
+                                error,
+                            ),
+                            retry_reason: None,
+                        })?
+                        .result;
+                    if result.is_success() {
+                        return Ok(());
+                    }
+                    let retry_reason =
+                        classify_docker_clone_result(&result, token_was_freshly_minted);
+                    Err(DockerCloneFailure {
+                        error: self.clone_failure_error(result, auth_url),
+                        retry_reason,
+                    })
+                }
+            },
+            |failure: &DockerCloneFailure| failure.retry_reason,
+        )
+        .await;
+
+        if let Err(failure) = clone_result {
+            let err = failure.error;
+            return Err(self.report_clone_failure(&origin_url, err));
+        }
+
+        let symlink_command = clone_source::repo_symlink_command(&layout);
+        match self
+            .docker_exec_shell(&symlink_command, 10_000, Some("/"), None, None)
+            .await
+        {
+            Ok(result) if result.is_success() => {}
+            Ok(result) => {
+                let err = result.into_exec_error("create Docker workspace repo symlink");
+                return Err(self.report_clone_failure(&origin_url, err));
+            }
+            Err(err) => {
+                return Err(self.report_clone_failure(&origin_url, err));
+            }
         }
 
         let _ = self.repo_cloned.set(true);
@@ -1252,19 +1357,17 @@ fn git_clone_command(clone_url: &str, branch: Option<&str>, checkout_path: &str)
     command
 }
 
-fn git_clone_and_link_command(
-    clone_url: &str,
-    branch: Option<&str>,
-    layout: &clone_source::GitHubRepoLayout,
-) -> String {
-    format!(
-        "mkdir -p {} {} && {} && ln -s {} {}",
-        shell_quote(WORKING_DIRECTORY),
-        shell_quote(&layout.repos_owner_path),
-        git_clone_command(clone_url, branch, &layout.primary_repo_path),
-        shell_quote(&layout.primary_repo_path),
-        shell_quote(&layout.primary_repo_link),
-    )
+fn classify_docker_clone_result(
+    result: &ExecResult,
+    token_was_freshly_minted: bool,
+) -> Option<clone_retry::CloneRetryReason> {
+    let stderr = clone_retry::classify_message(&result.stderr, token_was_freshly_minted);
+    match stderr {
+        clone_retry::CloneMessageClass::Unknown => {
+            clone_retry::classify_message(&result.stdout, token_was_freshly_minted).retry_reason()
+        }
+        class => class.retry_reason(),
+    }
 }
 
 fn host_config(config: &DockerSandboxOptions) -> HostConfig {
@@ -2079,7 +2182,7 @@ impl Sandbox for DockerSandbox {
         // Only a GitHub App installation token can be re-minted; a static PAT or
         // a pre-minted Installation token is fixed, so re-embedding it changes
         // nothing. Short-circuit to Skipped before the resolve + set-url exec.
-        if !matches!(creds, GitHubCredentials::App(_)) {
+        if !creds.mints_installation_token() {
             return Ok(RefreshOutcome::Skipped);
         }
 
@@ -2307,20 +2410,16 @@ mod tests {
     }
 
     #[test]
-    fn clone_and_link_command_creates_workspace_symlink_to_repos_checkout() {
-        let layout = clone_source::github_repo_layout(
-            "https://github.com/fabro-sh/fabro",
-            "/workspace",
-            "/repos",
-        )
-        .unwrap();
-        let command =
-            git_clone_and_link_command("https://github.com/fabro-sh/fabro", Some("main"), &layout);
+    fn clone_result_uses_stderr_before_stdout() {
+        let result = ExecResult {
+            stdout:      "Could not resolve host: github.com".to_string(),
+            stderr:      "fatal: destination path 'fabro' already exists".to_string(),
+            exit_code:   Some(128),
+            termination: CommandTermination::Exited,
+            duration_ms: 1,
+        };
 
-        assert_eq!(
-            command,
-            "mkdir -p /workspace /repos/fabro-sh && git -c maintenance.auto=0 -c gc.auto=0 clone --branch main --single-branch --depth 10 --no-tags -- https://github.com/fabro-sh/fabro /repos/fabro-sh/fabro && ln -s /repos/fabro-sh/fabro /workspace/fabro"
-        );
+        assert_eq!(classify_docker_clone_result(&result, true), None);
     }
 
     #[test]
