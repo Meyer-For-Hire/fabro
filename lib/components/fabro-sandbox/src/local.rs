@@ -835,6 +835,10 @@ impl Sandbox for LocalSandbox {
         result
     }
 
+    async fn activate(&self) -> crate::Result<()> {
+        Ok(())
+    }
+
     async fn git_push_ref(&self, refspec: &str) -> crate::Result<()> {
         let has_origin = match self
             .exec_command("git remote get-url origin", 10_000, None, None, None)

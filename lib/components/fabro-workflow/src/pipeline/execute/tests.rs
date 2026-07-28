@@ -16,6 +16,7 @@ use fabro_graphviz::graph::{AttrValue, Edge, Graph, Node};
 use fabro_hooks::HookSettings;
 use fabro_interview::AutoApproveInterviewer;
 use fabro_sandbox::SandboxSpec;
+use fabro_sandbox::test_support::MockSandbox;
 use fabro_store::Database;
 use fabro_types::settings::run::RunModelControls;
 use fabro_types::{
@@ -647,6 +648,31 @@ impl HandlerTrait for SlowHandler {
     }
 }
 
+struct StopsSandboxHandler {
+    sandbox:                   Arc<MockSandbox>,
+    observed_activation_count: Arc<AtomicU32>,
+}
+
+#[async_trait]
+impl HandlerTrait for StopsSandboxHandler {
+    async fn execute(
+        &self,
+        _node: &Node,
+        _context: &Context,
+        _graph: &Graph,
+        _run_dir: &Path,
+        _services: &crate::handler::EngineServices,
+    ) -> std::result::Result<Outcome, Error> {
+        self.observed_activation_count
+            .store(self.sandbox.activate_count(), Ordering::Relaxed);
+        self.sandbox
+            .stop()
+            .await
+            .map_err(|err| Error::handler_with_source("failed to stop test sandbox", err))?;
+        Ok(Outcome::success())
+    }
+}
+
 struct PanickingHandler;
 
 #[async_trait]
@@ -800,6 +826,38 @@ async fn execute_runs_simple_workflow() {
     .await
     .unwrap();
     assert_eq!(outcome.status, StageOutcome::Succeeded);
+}
+
+#[tokio::test]
+async fn execute_reactivates_sandbox_after_a_stage_can_leave_it_stopped() {
+    let dir = tempfile::tempdir().unwrap();
+    let sandbox = Arc::new(MockSandbox::linux());
+    let observed_activation_count = Arc::new(AtomicU32::new(0));
+    let mut registry = make_registry();
+    registry.register(
+        "start",
+        Box::new(StopsSandboxHandler {
+            sandbox:                   Arc::clone(&sandbox),
+            observed_activation_count: Arc::clone(&observed_activation_count),
+        }),
+    );
+    let sandbox_for_run: Arc<dyn Sandbox> = sandbox.clone();
+
+    let outcome = run_graph(
+        registry,
+        test_emitter_arc("test-run"),
+        sandbox_for_run,
+        &simple_graph(),
+        &test_run_options(dir.path(), "test-run"),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(outcome.status, StageOutcome::Succeeded);
+    assert_eq!(observed_activation_count.load(Ordering::Relaxed), 1);
+    assert_eq!(sandbox.stop_count(), 1);
+    assert_eq!(sandbox.activate_count(), 2);
+    assert_eq!(sandbox.start_count(), 2);
 }
 
 #[tokio::test]

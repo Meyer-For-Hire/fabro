@@ -1461,6 +1461,35 @@ impl Sandbox for DockerSandbox {
         Ok(())
     }
 
+    async fn activate(&self) -> crate::Result<()> {
+        let container_id = self.container_id()?.to_string();
+        let inspect = self
+            .docker
+            .inspect_container(&container_id, None::<InspectContainerOptions>)
+            .await
+            .map_err(|e| {
+                if docker_not_found(&e) {
+                    crate::Error::message(format!("Docker container '{container_id}' is gone"))
+                } else {
+                    crate::Error::message(format!(
+                        "Failed to inspect Docker container '{container_id}': {e}"
+                    ))
+                }
+            })?;
+        let labels = inspect
+            .config
+            .and_then(|config| config.labels)
+            .unwrap_or_default();
+        verify_managed_labels(&container_id, &labels, self.run_id.as_ref())?;
+        let active = inspect
+            .state
+            .is_some_and(|state| state.running == Some(true) && state.paused != Some(true));
+        if active {
+            return Ok(());
+        }
+        self.start().await
+    }
+
     async fn stop(&self) -> crate::Result<()> {
         self.emit(SandboxEvent::StopStarted {
             provider: "docker".into(),

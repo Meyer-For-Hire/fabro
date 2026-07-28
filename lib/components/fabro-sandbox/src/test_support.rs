@@ -38,6 +38,7 @@ pub struct MockSandbox {
     pub captured_working_dirs: Mutex<Vec<Option<String>>>,
     /// Captures the `env_vars` argument from `exec_command` calls.
     pub captured_env_vars:     Mutex<Option<HashMap<String, String>>>,
+    pub activate_calls:        Mutex<u32>,
     pub start_calls:           Mutex<u32>,
     pub stop_calls:            Mutex<u32>,
     pub delete_calls:          Mutex<u32>,
@@ -68,6 +69,13 @@ impl MockSandbox {
 
     pub fn start_count(&self) -> u32 {
         *self.start_calls.lock().expect("start_calls lock poisoned")
+    }
+
+    pub fn activate_count(&self) -> u32 {
+        *self
+            .activate_calls
+            .lock()
+            .expect("activate_calls lock poisoned")
     }
 
     pub fn stop_count(&self) -> u32 {
@@ -132,6 +140,7 @@ impl Default for MockSandbox {
             captured_commands:     Mutex::new(Vec::new()),
             captured_working_dirs: Mutex::new(Vec::new()),
             captured_env_vars:     Mutex::new(None),
+            activate_calls:        Mutex::new(0),
             start_calls:           Mutex::new(0),
             stop_calls:            Mutex::new(0),
             delete_calls:          Mutex::new(0),
@@ -442,6 +451,14 @@ impl Sandbox for MockSandbox {
             url:         None,
         });
         Ok(())
+    }
+
+    async fn activate(&self) -> crate::Result<()> {
+        *self
+            .activate_calls
+            .lock()
+            .expect("activate_calls lock poisoned") += 1;
+        self.start().await
     }
 
     async fn start(&self) -> crate::Result<()> {
