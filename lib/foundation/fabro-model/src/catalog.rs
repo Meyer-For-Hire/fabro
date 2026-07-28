@@ -3491,6 +3491,196 @@ enabled = true
     }
 
     #[test]
+    fn builtin_modal_provider_is_opt_in() {
+        let modal = ProviderId::new("modal");
+        let builtin = Catalog::builtin();
+
+        assert!(builtin.provider(&modal).is_none());
+        assert!(builtin.list(Some(&modal)).is_empty());
+
+        let catalog = Catalog::from_builtin_with_overrides(&minimal_settings(
+            r"
+[providers.modal]
+enabled = true
+",
+        ))
+        .expect("enabled Modal override should build from the built-in provider settings");
+
+        let provider = catalog
+            .provider(&modal)
+            .expect("enabled Modal provider should be present");
+        assert_eq!(provider.adapter, AdapterKind::OpenAiCompatible);
+        assert_eq!(provider.codec, CodecKind::OpenAiCompatible);
+        assert_eq!(provider.agent_profile, AgentProfileKind::Kimi);
+        assert_eq!(provider.billing_policy, BillingPolicy::OpenAi);
+        assert_eq!(provider.priority, 30);
+        assert!(provider.auth.is_none());
+        assert!(provider.base_url.is_none());
+        assert_eq!(
+            provider.api_key_url.as_deref(),
+            Some("https://modal.com/docs/guide/endpoints#proxy-tokens")
+        );
+        assert_eq!(
+            provider.extra_headers,
+            HashMap::from([
+                (
+                    "Modal-Key".to_string(),
+                    "{{ secrets.MODAL_TOKEN_ID }}".to_string(),
+                ),
+                (
+                    "Modal-Secret".to_string(),
+                    "{{ secrets.MODAL_TOKEN_SECRET }}".to_string(),
+                ),
+            ])
+        );
+        assert_eq!(
+            catalog
+                .default_for_provider(&modal)
+                .map(|model| model.id.as_str()),
+            Some("kimi-k3")
+        );
+        assert_eq!(
+            catalog
+                .probe_for_provider(&modal)
+                .map(|model| model.id.as_str()),
+            Some("kimi-k3")
+        );
+
+        let catalog = Catalog::from_builtin_with_overrides(&minimal_settings(
+            r#"
+[providers.modal]
+enabled = true
+base_url = "https://example--kimi-k3.modal.run/v1"
+"#,
+        ))
+        .expect("Modal base URL override should build");
+        assert_eq!(
+            catalog
+                .provider(&modal)
+                .and_then(|provider| provider.base_url.as_deref()),
+            Some("https://example--kimi-k3.modal.run/v1")
+        );
+    }
+
+    #[test]
+    fn builtin_modal_includes_kimi_k3_when_enabled() {
+        let modal = ProviderId::new("modal");
+        let catalog = Catalog::from_builtin_with_overrides(&minimal_settings(
+            r"
+[providers.modal]
+enabled = true
+",
+        ))
+        .expect("enabled Modal override should build from the built-in provider settings");
+
+        assert_eq!(catalog.list(Some(&modal)).len(), 1);
+        let model = catalog
+            .get_on_provider(&modal, "kimi-k3")
+            .expect("Modal Kimi K3 should be present");
+        insta::assert_debug_snapshot!(model, @r#"
+        Model {
+            id: "kimi-k3",
+            provider: modal,
+            family: "kimi-k3",
+            display_name: "Kimi K3 (via Modal)",
+            limits: ModelLimits {
+                context_window: 1048576,
+                max_output: Some(
+                    131072,
+                ),
+            },
+            training: None,
+            knowledge_cutoff: None,
+            features: ModelFeatures {
+                tools: true,
+                vision: true,
+                reasoning: true,
+                reasoning_effort: AlwaysAdaptive,
+                prompt_cache: true,
+                cache_control_breakpoints: false,
+                sampling_params: false,
+            },
+            controls: ModelControls {
+                reasoning_effort: [
+                    Low,
+                    High,
+                    Max,
+                ],
+            },
+            costs: ModelCosts {
+                input_cost_per_mtok: Some(
+                    3.0,
+                ),
+                output_cost_per_mtok: Some(
+                    15.0,
+                ),
+                cache_input_cost_per_mtok: Some(
+                    0.3,
+                ),
+            },
+            estimated_output_tps: Some(
+                460.0,
+            ),
+            aliases: [],
+            default: true,
+            small_default: false,
+            configured: false,
+        }
+        "#);
+
+        let settings = catalog
+            .model_settings_on_provider(&modal, "kimi-k3")
+            .expect("Modal Kimi K3 settings should be present");
+        assert_eq!(settings.api_id, "moonshotai/Kimi-K3");
+        assert_eq!(settings.agent_profile, AgentProfileKind::Kimi);
+        assert_eq!(settings.billing_policy, BillingPolicy::OpenAi);
+        assert_eq!(settings.controls.reasoning_effort, vec![
+            ReasoningEffort::Low,
+            ReasoningEffort::High,
+            ReasoningEffort::Max,
+        ]);
+    }
+
+    #[test]
+    fn builtin_kimi_k3_slug_is_portable_across_direct_and_gateway_providers() {
+        let kimi = ProviderId::new("kimi");
+        let modal = ProviderId::new("modal");
+        let openrouter = ProviderId::new("openrouter");
+        let catalog = Catalog::from_builtin_with_overrides(&minimal_settings(
+            r"
+[providers.modal]
+enabled = true
+
+[providers.openrouter]
+enabled = true
+",
+        ))
+        .expect("enabled Modal and OpenRouter overrides should build");
+
+        for provider in [&kimi, &modal, &openrouter] {
+            let model = catalog
+                .get_on_provider(provider, "kimi-k3")
+                .unwrap_or_else(|| panic!("Kimi K3 should resolve on provider '{provider}'"));
+            assert_eq!(model.id, "kimi-k3", "{provider}");
+            assert_eq!(&model.provider, provider, "{provider}");
+        }
+
+        let selected = catalog
+            .select(
+                "kimi-k3",
+                None,
+                &HashSet::from([kimi.clone(), modal.clone(), openrouter.clone()]),
+            )
+            .expect("direct Kimi should win portable Kimi K3 selection");
+        assert_eq!(selected.provider, kimi);
+
+        let selected = catalog
+            .select("kimi-k3", None, &HashSet::from([modal.clone(), openrouter]))
+            .expect("Modal should win gateway-only Kimi K3 selection");
+        assert_eq!(selected.provider, modal);
+    }
+
+    #[test]
     fn builtin_openrouter_includes_poolside_laguna_when_enabled() {
         let catalog = Catalog::from_builtin_with_overrides(&minimal_settings(
             r"

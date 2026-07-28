@@ -195,6 +195,20 @@ reasoning_effort = "levels"
         ))
     }
 
+    fn modal_env_catalog() -> Catalog {
+        catalog_with(
+            r#"
+[providers.modal]
+enabled = true
+base_url = "https://example--kimi-k3.modal.run/v1"
+
+[providers.modal.extra_headers]
+"Modal-Key" = "{{ env.MODAL_TOKEN_ID }}"
+"Modal-Secret" = "{{ env.MODAL_TOKEN_SECRET }}"
+"#,
+        )
+    }
+
     #[tokio::test]
     async fn configured_providers_reads_injected_env() {
         let source = test_source(&[("ANTHROPIC_API_KEY", "anthropic-key")]);
@@ -328,6 +342,38 @@ x-portkey-provider = "@bedrock-prod"
         assert_eq!(
             credential.extra_headers.get("x-portkey-provider"),
             Some(&"@bedrock-prod".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn env_source_resolves_modal_proxy_headers_when_explicitly_configured() {
+        let catalog = modal_env_catalog();
+        let source = test_source(&[
+            ("MODAL_TOKEN_ID", "wk-test"),
+            ("MODAL_TOKEN_SECRET", "ws-test"),
+        ]);
+        let modal = ProviderId::new("modal");
+
+        assert!(source.configured_providers(&catalog).await.contains(&modal));
+
+        let resolved = source.resolve(&catalog).await.unwrap();
+        let credential = resolved
+            .credentials
+            .iter()
+            .find(|credential| credential.provider == modal)
+            .expect("Modal should resolve from the explicit environment header settings");
+
+        assert!(credential.auth_header.is_none());
+        assert_eq!(
+            credential.extra_headers,
+            HashMap::from([
+                ("Modal-Key".to_string(), "wk-test".to_string()),
+                ("Modal-Secret".to_string(), "ws-test".to_string()),
+            ])
+        );
+        assert_eq!(
+            credential.base_url.as_deref(),
+            Some("https://example--kimi-k3.modal.run/v1")
         );
     }
 

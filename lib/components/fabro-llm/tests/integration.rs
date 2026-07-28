@@ -3,6 +3,7 @@
     reason = "Live provider integration tests read required API keys from process env."
 )]
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use fabro_auth::ApiCredential;
@@ -637,6 +638,64 @@ async fn openrouter_kimi_k3_deep_tool_round_trip() {
         outcome.status,
         ModelTestStatus::Ok,
         "OpenRouter Kimi K3 deep test failed: {:?}",
+        outcome.error_message
+    );
+}
+
+#[fabro_macros::e2e_test(
+    live("MODAL_KIMI_K3_BASE_URL"),
+    live("MODAL_TOKEN_ID"),
+    live("MODAL_TOKEN_SECRET")
+)]
+async fn modal_kimi_k3_deep_tool_round_trip() {
+    let Some(base_url) = fabro_test::require_env("MODAL_KIMI_K3_BASE_URL") else {
+        return;
+    };
+    let Some(token_id) = fabro_test::require_env("MODAL_TOKEN_ID") else {
+        return;
+    };
+    let Some(token_secret) = fabro_test::require_env("MODAL_TOKEN_SECRET") else {
+        return;
+    };
+    let provider = ProviderId::new("modal");
+    let mut settings = LlmCatalogSettings::default();
+    settings
+        .providers
+        .insert(provider.to_string(), ProviderCatalogSettings {
+            enabled: Some(true),
+            base_url: Some(base_url),
+            ..ProviderCatalogSettings::default()
+        });
+    let catalog = Arc::new(
+        Catalog::from_builtin_with_overrides(&settings)
+            .expect("enabled Modal catalog should build"),
+    );
+    let credential = ApiCredential {
+        provider:      provider.clone(),
+        auth_header:   None,
+        extra_headers: HashMap::from([
+            ("Modal-Key".to_string(), token_id),
+            ("Modal-Secret".to_string(), token_secret),
+        ]),
+        base_url:      None,
+        codex_mode:    false,
+        org_id:        None,
+        project_id:    None,
+    };
+    let client = Arc::new(
+        Client::from_credentials(vec![credential], Arc::clone(&catalog))
+            .await
+            .expect("Modal client should build from the catalog"),
+    );
+    let model = catalog
+        .get_on_provider(&provider, "kimi-k3")
+        .expect("Modal Kimi K3 should be present");
+
+    let outcome = run_model_test(model, ModelTestMode::Deep, client).await;
+    assert_eq!(
+        outcome.status,
+        ModelTestStatus::Ok,
+        "Modal Kimi K3 deep test failed: {:?}",
         outcome.error_message
     );
 }

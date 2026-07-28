@@ -609,6 +609,16 @@ reasoning_effort = "levels"
         ))
     }
 
+    fn modal_catalog() -> Catalog {
+        catalog_with(
+            r#"
+[providers.modal]
+enabled = true
+base_url = "https://example--kimi-k3.modal.run/v1"
+"#,
+        )
+    }
+
     #[tokio::test]
     async fn resolve_openai_api_request_prefers_env_when_listed_first() {
         let dir = tempfile::tempdir().unwrap();
@@ -933,6 +943,83 @@ reasoning = false
             api.extra_headers.get("x-team-secret"),
             Some(&"s3cr3t".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn modal_resolves_both_vault_proxy_headers_without_authorization() {
+        let catalog = modal_catalog();
+        let dir = tempfile::tempdir().unwrap();
+        let mut vault = Vault::load(dir.path().join("secrets.json")).unwrap();
+        vault_set_token(&mut vault, "MODAL_TOKEN_ID", "wk-test").unwrap();
+        vault_set_token(&mut vault, "MODAL_TOKEN_SECRET", "ws-test").unwrap();
+        let resolver = test_resolver(vault, Arc::new(|_| None));
+        let modal = ProviderId::new("modal");
+
+        {
+            let vault = resolver.vault.read().await;
+            assert!(
+                resolver
+                    .configured_providers(&vault, &catalog)
+                    .contains(&modal)
+            );
+        }
+
+        let resolved = resolver
+            .resolve(modal.clone(), CredentialUsage::ApiRequest, &catalog)
+            .await
+            .unwrap();
+        let ResolvedCredential::Api(api) = resolved;
+
+        assert_eq!(api.provider, modal);
+        assert!(api.auth_header.is_none());
+        assert_eq!(
+            api.extra_headers,
+            HashMap::from([
+                ("Modal-Key".to_string(), "wk-test".to_string()),
+                ("Modal-Secret".to_string(), "ws-test".to_string()),
+            ])
+        );
+        assert_eq!(
+            api.base_url.as_deref(),
+            Some("https://example--kimi-k3.modal.run/v1")
+        );
+    }
+
+    #[tokio::test]
+    async fn modal_requires_both_vault_proxy_tokens() {
+        for (present_name, present_value, missing_name) in [
+            ("MODAL_TOKEN_ID", "wk-present", "MODAL_TOKEN_SECRET"),
+            ("MODAL_TOKEN_SECRET", "ws-present", "MODAL_TOKEN_ID"),
+        ] {
+            let catalog = modal_catalog();
+            let dir = tempfile::tempdir().unwrap();
+            let mut vault = Vault::load(dir.path().join("secrets.json")).unwrap();
+            vault_set_token(&mut vault, present_name, present_value).unwrap();
+            let resolver = test_resolver(vault, Arc::new(|_| None));
+            let modal = ProviderId::new("modal");
+
+            {
+                let vault = resolver.vault.read().await;
+                assert!(
+                    !resolver
+                        .configured_providers(&vault, &catalog)
+                        .contains(&modal)
+                );
+            }
+
+            let err = resolver
+                .resolve(modal.clone(), CredentialUsage::ApiRequest, &catalog)
+                .await
+                .unwrap_err();
+
+            assert!(matches!(
+                err,
+                ResolveError::Interpolation { ref provider, .. } if provider == &modal
+            ));
+            let message = err.to_string();
+            assert!(message.contains(missing_name));
+            assert!(!message.contains(present_value));
+        }
     }
 
     #[tokio::test]

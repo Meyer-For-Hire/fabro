@@ -1170,6 +1170,72 @@ output_cost_per_mtok = 20.0
     }
 
     #[tokio::test]
+    async fn modal_routes_kimi_k3_with_proxy_headers_and_no_bearer_auth() {
+        let upstream = httpmock::MockServer::start_async().await;
+        let completion = upstream
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/v1/chat/completions")
+                    .header("Modal-Key", "wk-test")
+                    .header("Modal-Secret", "ws-test")
+                    .header_missing("Authorization")
+                    .json_body_includes(r#"{"model":"moonshotai/Kimi-K3"}"#);
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(serde_json::json!({
+                        "id": "chatcmpl-modal",
+                        "model": "moonshotai/Kimi-K3",
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "OK"},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {
+                            "prompt_tokens": 1,
+                            "completion_tokens": 1,
+                            "total_tokens": 2
+                        }
+                    }));
+            })
+            .await;
+        let catalog = catalog_with(&format!(
+            r#"
+[providers.modal]
+enabled = true
+base_url = "{}/v1"
+"#,
+            upstream.base_url()
+        ));
+        let modal = ProviderId::new("modal");
+        let client = Client::from_credentials(
+            vec![ApiCredential {
+                provider:      modal.clone(),
+                auth_header:   None,
+                extra_headers: HashMap::from([
+                    ("Modal-Key".to_string(), "wk-test".to_string()),
+                    ("Modal-Secret".to_string(), "ws-test".to_string()),
+                ]),
+                base_url:      None,
+                codex_mode:    false,
+                org_id:        None,
+                project_id:    None,
+            }],
+            catalog,
+        )
+        .await
+        .unwrap();
+        let mut request = test_request();
+        request.model = "kimi-k3".to_string();
+        request.provider = Some(modal.to_string());
+
+        let response = client.complete(&request).await.unwrap();
+
+        assert_eq!(response.text(), "OK");
+        assert_eq!(response.model, "kimi-k3");
+        assert_eq!(response.provider, "modal");
+        completion.assert_async().await;
+    }
+
+    #[tokio::test]
     async fn complete_stamps_estimated_cost_from_catalog() {
         let mut client = Client::new(HashMap::new(), None, vec![]);
         client
