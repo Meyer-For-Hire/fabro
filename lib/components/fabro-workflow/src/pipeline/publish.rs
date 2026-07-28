@@ -64,13 +64,7 @@ impl Concluded {
             Err(reason) => return Err(self.pull_request_error(reason)),
         };
 
-        let final_sha = self
-            .conclusion
-            .final_git_commit_sha
-            .as_deref()
-            .ok_or_else(|| Error::publish("cannot publish a run without a final git commit SHA"))?;
-
-        self.push_final_commit(run_branch, final_sha).await?;
+        self.push_final_commit(run_branch).await?;
         outcome.pushed_branch = Some(run_branch.to_string());
 
         let Some(pr_config) = options.pr_config.as_ref() else {
@@ -80,6 +74,17 @@ impl Concluded {
         if diff.trim().is_empty() {
             return Ok(());
         }
+
+        // Only pull request creation needs the SHA, to check that the remote
+        // branch really carries this run's work. Pushing does not: the refspec
+        // sends whatever the branch points at.
+        let final_sha = self
+            .conclusion
+            .final_git_commit_sha
+            .as_deref()
+            .ok_or_else(|| {
+                self.pull_request_error("pull request creation requires the run's final commit SHA")
+            })?;
 
         let base_branch = self.run_options.base_branch.as_deref().ok_or_else(|| {
             self.pull_request_error("pull request creation requires a base branch")
@@ -152,7 +157,7 @@ impl Concluded {
         Ok((origin_url, run_branch))
     }
 
-    async fn push_final_commit(&self, run_branch: &str, final_sha: &str) -> Result<(), Error> {
+    async fn push_final_commit(&self, run_branch: &str) -> Result<(), Error> {
         match push_run_branch(self.services.sandbox.as_ref(), run_branch).await {
             Ok(()) => {
                 self.services.emitter.emit(&Event::GitPush {
@@ -170,7 +175,7 @@ impl Concluded {
                     exec_output_tail: exec_output_tail.clone(),
                 });
                 Err(Error::publish_with_source_and_exec_output_tail(
-                    format!("failed to push final commit {final_sha} to branch '{run_branch}'"),
+                    format!("failed to push run branch '{run_branch}'"),
                     error,
                     exec_output_tail,
                 ))

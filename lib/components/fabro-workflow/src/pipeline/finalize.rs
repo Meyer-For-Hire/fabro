@@ -544,12 +544,6 @@ pub async fn conclude(executed: Executed, options: &FinalizeOptions) -> Result<C
     let checkpoint = projection
         .as_ref()
         .and_then(|state| state.current_checkpoint());
-    let final_git_commit_sha = options.last_git_sha.clone().or_else(|| {
-        run_options
-            .git
-            .as_ref()
-            .and_then(|git| git.base_sha.clone())
-    });
     let mut conclusion = build_conclusion_from_parts(
         checkpoint,
         &projection_billing,
@@ -557,7 +551,7 @@ pub async fn conclude(executed: Executed, options: &FinalizeOptions) -> Result<C
         final_status,
         failure_reason,
         wall_time_ms,
-        final_git_commit_sha,
+        options.last_git_sha.clone(),
     );
 
     let (final_patch, diff_summary) =
@@ -1541,6 +1535,66 @@ mod tests {
         let events = events.lock().unwrap();
         let names = events.iter().map(RunEvent::event_name).collect::<Vec<_>>();
         assert_eq!(names, vec!["git.push", "run.completed"]);
+    }
+
+    /// `base_sha` is where the run started, not what it produced. Reporting it
+    /// as the final commit would both mis-state a durable field and make the
+    /// remote-head check reject a branch that was pushed correctly.
+    #[tokio::test]
+    async fn untracked_final_commit_does_not_fall_back_to_base_sha() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_git_repo(repo_dir.path());
+        let emitter = Arc::new(Emitter::new(test_run_id()));
+        let services = test_services(
+            RunStoreHandle::local(seeded_run_store().await),
+            emitter,
+            Arc::new(fabro_agent::LocalSandbox::new(
+                repo_dir.path().to_path_buf(),
+            )),
+            Arc::new(RunMetadataRuntime::new()),
+            None,
+        );
+        let mut run_options = test_run_options(repo_dir.path());
+        run_options.base_branch = Some("main".to_string());
+        run_options.git = Some(GitCheckpointOptions {
+            base_sha:    Some("base-sha".to_string()),
+            run_branch:  Some("fabro/run/test".to_string()),
+            meta_branch: None,
+        });
+        let executed = test_executed(
+            Graph::new("test"),
+            Ok(Outcome::success()),
+            run_options,
+            5,
+            services,
+        );
+        let options = FinalizeOptions {
+            run_dir:          repo_dir.path().to_path_buf(),
+            run_id:           test_run_id(),
+            workflow_name:    "test".to_string(),
+            preserve_sandbox: false,
+            stop_on_terminal: true,
+            last_git_sha:     None,
+        };
+        let mut concluded = conclude(executed, &options).await.unwrap();
+
+        assert_eq!(concluded.conclusion.final_git_commit_sha, None);
+
+        // No pull request wanted, so publish still pushes the branch and the
+        // run succeeds without needing a commit SHA at all.
+        concluded.conclusion.diff.patch = None;
+        let published = crate::pipeline::publish(concluded, &crate::pipeline::PublishOptions {
+            pr_config:  None,
+            github_app: None,
+            origin_url: Some("https://github.com/owner/repo.git".to_string()),
+            model:      "test-model".to_string(),
+        })
+        .await;
+        let finalized = finalize(published, &options).await.unwrap();
+
+        assert!(finalized.outcome.is_ok());
+        assert_eq!(finalized.pushed_branch.as_deref(), Some("fabro/run/test"));
+        assert_eq!(finalized.conclusion.final_git_commit_sha, None);
     }
 
     #[tokio::test]
