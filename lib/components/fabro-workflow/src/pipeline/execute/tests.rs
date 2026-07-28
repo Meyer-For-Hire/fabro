@@ -649,8 +649,7 @@ impl HandlerTrait for SlowHandler {
 }
 
 struct StopsSandboxHandler {
-    sandbox:                   Arc<MockSandbox>,
-    observed_activation_count: Arc<AtomicU32>,
+    sandbox: Arc<MockSandbox>,
 }
 
 #[async_trait]
@@ -663,8 +662,6 @@ impl HandlerTrait for StopsSandboxHandler {
         _run_dir: &Path,
         _services: &crate::handler::EngineServices,
     ) -> std::result::Result<Outcome, Error> {
-        self.observed_activation_count
-            .store(self.sandbox.activate_count(), Ordering::Relaxed);
         self.sandbox
             .stop()
             .await
@@ -829,35 +826,62 @@ async fn execute_runs_simple_workflow() {
 }
 
 #[tokio::test]
+async fn execute_preserves_sandbox_activation_error_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    let sandbox: Arc<dyn Sandbox> =
+        Arc::new(MockSandbox::linux().with_activate_error("provider unavailable"));
+
+    let error = run_graph(
+        make_registry(),
+        test_emitter_arc("test-run"),
+        sandbox,
+        &simple_graph(),
+        &test_run_options(dir.path(), "test-run"),
+    )
+    .await
+    .expect_err("sandbox activation should fail");
+
+    assert_eq!(error.causes(), vec![
+        "failed to activate sandbox before node start",
+        "Mock sandbox activation failed",
+        "provider unavailable",
+    ]);
+}
+
+#[tokio::test]
 async fn execute_reactivates_sandbox_after_a_stage_can_leave_it_stopped() {
     let dir = tempfile::tempdir().unwrap();
     let sandbox = Arc::new(MockSandbox::linux());
-    let observed_activation_count = Arc::new(AtomicU32::new(0));
     let mut registry = make_registry();
     registry.register(
         "start",
         Box::new(StopsSandboxHandler {
-            sandbox:                   Arc::clone(&sandbox),
-            observed_activation_count: Arc::clone(&observed_activation_count),
+            sandbox: Arc::clone(&sandbox),
         }),
     );
     let sandbox_for_run: Arc<dyn Sandbox> = sandbox.clone();
+    let mut run_options = test_run_options(dir.path(), "test-run");
+    run_options
+        .settings
+        .run
+        .artifacts
+        .include
+        .push("**/*".to_string());
 
     let outcome = run_graph(
         registry,
         test_emitter_arc("test-run"),
         sandbox_for_run,
         &simple_graph(),
-        &test_run_options(dir.path(), "test-run"),
+        &run_options,
     )
     .await
     .unwrap();
 
     assert_eq!(outcome.status, StageOutcome::Succeeded);
-    assert_eq!(observed_activation_count.load(Ordering::Relaxed), 1);
     assert_eq!(sandbox.stop_count(), 1);
-    assert_eq!(sandbox.activate_count(), 2);
-    assert_eq!(sandbox.start_count(), 2);
+    assert!(sandbox.walk_files_was_called());
+    assert!(!sandbox.walked_while_inactive());
 }
 
 #[tokio::test]

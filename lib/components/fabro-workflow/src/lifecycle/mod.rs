@@ -284,11 +284,10 @@ impl RunLifecycle<WorkflowGraph> for WorkflowLifecycle {
         }
         // A provider may auto-stop while the run is paused between nodes.
         self.sandbox.activate().await.map_err(|err| {
-            CoreError::Other(format!(
-                "failed to activate sandbox before node {:?}: {}",
-                node.id(),
-                err.display_with_causes()
-            ))
+            CoreError::context(
+                format!("failed to activate sandbox before node {}", node.id()),
+                err,
+            )
         })?;
         if let Some(on_node) = &self.on_node {
             on_node(node.id());
@@ -343,11 +342,13 @@ impl RunLifecycle<WorkflowGraph> for WorkflowLifecycle {
         // Human, wait, and paused stages can return after a long period with
         // no sandbox traffic. Reactivate before artifact and checkpoint work.
         self.sandbox.activate().await.map_err(|err| {
-            CoreError::Other(format!(
-                "failed to activate sandbox after node attempt {:?}: {}",
-                ctx.node.id(),
-                err.display_with_causes()
-            ))
+            CoreError::context(
+                format!(
+                    "failed to activate sandbox after node attempt {}",
+                    ctx.node.id()
+                ),
+                err,
+            )
         })?;
         self.artifact.after_attempt(ctx, state).await?;
         self.event.after_attempt(ctx, state).await?;

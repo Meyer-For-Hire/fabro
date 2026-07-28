@@ -836,6 +836,9 @@ impl Sandbox for LocalSandbox {
     }
 
     async fn activate(&self) -> crate::Result<()> {
+        // Local sandboxes have no provider resource that can stop or pause.
+        // Resume paths still call `start()` to recreate the directory and
+        // verify Bash.
         Ok(())
     }
 

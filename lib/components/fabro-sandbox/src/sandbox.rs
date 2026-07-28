@@ -1134,11 +1134,12 @@ pub trait Sandbox: Send + Sync {
         remote_path: &str,
     ) -> crate::Result<()>;
     async fn initialize(&self) -> crate::Result<()>;
-    /// Ensure the sandbox is active and ready for ordinary operations.
+    /// Ensure the provider resource is running and not paused before access.
     ///
     /// This access-time operation must be idempotent. Providers that can stop
     /// independently should avoid restarting an already-active sandbox. This
-    /// method does not keep a sandbox active between calls.
+    /// lightweight check does not require the full health verification done by
+    /// [`Sandbox::start`], and it does not keep a sandbox active between calls.
     async fn activate(&self) -> crate::Result<()> {
         self.start().await
     }
