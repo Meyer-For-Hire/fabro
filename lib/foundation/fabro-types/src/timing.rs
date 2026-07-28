@@ -18,6 +18,16 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// Non-negative milliseconds between two instants.
+///
+/// Clock skew or an out-of-order replay can put `end` before `start`; those
+/// spans contribute zero rather than wrapping into a large unsigned value.
+#[must_use]
+pub fn elapsed_ms(start: DateTime<Utc>, end: DateTime<Utc>) -> u64 {
+    u64::try_from(end.signed_duration_since(start).num_milliseconds().max(0))
+        .expect("non-negative chrono millisecond durations fit in u64")
+}
+
 /// Timing breakdown for one stage visit.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StageTiming {
@@ -60,6 +70,34 @@ impl StageTiming {
     #[must_use]
     pub fn active_only(inference_time_ms: u64, tool_time_ms: u64) -> Self {
         Self::new(0, inference_time_ms, tool_time_ms)
+    }
+
+    /// Scale the breakdown down so `active_time_ms` does not exceed
+    /// `wall_time_ms`, preserving the inference/tool ratio.
+    ///
+    /// Only meaningful for live estimates of a single in-flight stage, where
+    /// an open bracket left behind by a killed worker would otherwise tick up
+    /// without bound. Finalized timings come from the worker's stopwatch and
+    /// already satisfy the invariant.
+    ///
+    /// Deliberately *not* applied at run level: concurrent branches can
+    /// legitimately sum past run wall time.
+    #[must_use]
+    pub fn clamped_to_wall(&self) -> Self {
+        let active_time_ms = u128::from(self.inference_time_ms) + u128::from(self.tool_time_ms);
+        if active_time_ms <= u128::from(self.wall_time_ms) {
+            return *self;
+        }
+        // Preserve the split rather than truncating one side, so a clamped
+        // stage still shows where its time went. Widen for the multiply: the
+        // quotient is bounded by `wall_time_ms` because the exact, widened
+        // active total exceeds it here, so it always fits back into u64.
+        let scaled =
+            u128::from(self.inference_time_ms) * u128::from(self.wall_time_ms) / active_time_ms;
+        let inference_time_ms =
+            u64::try_from(scaled).expect("scaled inference time is bounded by wall time");
+        let tool_time_ms = self.wall_time_ms.saturating_sub(inference_time_ms);
+        Self::new(self.wall_time_ms, inference_time_ms, tool_time_ms)
     }
 
     /// Sum two timings field-by-field. Used to aggregate visits of one node
@@ -136,13 +174,6 @@ impl RunTiming {
             ..self
         }
     }
-
-    /// Milliseconds elapsed from `start` to `now`, clamped at zero.
-    #[must_use]
-    pub fn wall_time_ms_since(start: DateTime<Utc>, now: DateTime<Utc>) -> u64 {
-        u64::try_from(now.signed_duration_since(start).num_milliseconds().max(0))
-            .expect("non-negative milliseconds fit in u64")
-    }
 }
 
 impl From<StageTiming> for RunTiming {
@@ -158,7 +189,9 @@ impl From<StageTiming> for RunTiming {
 
 #[cfg(test)]
 mod tests {
-    use super::{RunTiming, StageTiming};
+    use chrono::{TimeZone, Utc};
+
+    use super::{RunTiming, StageTiming, elapsed_ms};
 
     #[test]
     fn stage_timing_new_derives_active_as_sum_of_inference_and_tool() {
@@ -187,6 +220,23 @@ mod tests {
         assert_eq!(sum.inference_time_ms, 80);
         assert_eq!(sum.tool_time_ms, 95);
         assert_eq!(sum.active_time_ms, 175);
+    }
+
+    #[test]
+    fn stage_timing_clamp_uses_the_unsaturated_active_total() {
+        let timing = StageTiming::new(u64::MAX, u64::MAX, u64::MAX).clamped_to_wall();
+
+        assert_eq!(timing.inference_time_ms, u64::MAX / 2);
+        assert_eq!(timing.tool_time_ms, u64::MAX.saturating_sub(u64::MAX / 2));
+        assert_eq!(timing.active_time_ms, u64::MAX);
+    }
+
+    #[test]
+    fn elapsed_ms_clamps_out_of_order_instants_to_zero() {
+        let later = Utc.timestamp_opt(100, 0).unwrap();
+        let earlier = Utc.timestamp_opt(99, 0).unwrap();
+
+        assert_eq!(elapsed_ms(later, earlier), 0);
     }
 
     #[test]

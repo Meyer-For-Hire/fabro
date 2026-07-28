@@ -11,7 +11,7 @@ use axum_extra::extract::Query as ExtraQuery;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use bytes::Bytes;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use fabro_api::types::{
     BoardColumn, RunManifest, SubmitAnswerRequest, UpdateRunParentRequest, UpdateRunRequest,
 };
@@ -23,7 +23,7 @@ use fabro_store::{
 };
 use fabro_types::settings::ResolveError;
 use fabro_types::{
-    AutomationRef, Principal, RunClientProvenance, RunId, RunProvenance, RunServerProvenance,
+    AutomationRef, Principal, Run, RunClientProvenance, RunId, RunProvenance, RunServerProvenance,
     RunStatusKind, StageContextWindow, StageContextWindowStaleness,
     StageContextWindowUnavailableReason, StageHandler, StageModelUsage, StageProjection,
     SystemActorKind, WorkflowSettings, parse_blob_ref,
@@ -298,7 +298,7 @@ async fn validate_parent_link(
 }
 
 async fn updated_run_response(state: &AppState, run_id: &RunId) -> Response {
-    match state.stores.run_summaries.get(run_id, Utc::now()).await {
+    match run_summary_at(state, run_id, Utc::now()).await {
         Ok(Some(summary)) => (
             StatusCode::OK,
             Json(state.decorate_run_summary(summary).await),
@@ -309,6 +309,28 @@ async fn updated_run_response(state: &AppState, run_id: &RunId) -> Response {
             ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
         }
     }
+}
+
+/// Read the durable summary and overlay its timing from the live projection.
+///
+/// The SQLite read model stores active timing as of the most recent event.
+/// An open inference or tool bracket keeps accruing between events, so detail
+/// reads need the projection's current estimate while the run is non-terminal.
+async fn run_summary_at(
+    state: &AppState,
+    run_id: &RunId,
+    now: DateTime<Utc>,
+) -> fabro_store::Result<Option<Run>> {
+    let Some(mut summary) = state.stores.run_summaries.get(run_id, now).await? else {
+        return Ok(None);
+    };
+    if summary.timestamps.completed_at.is_none() {
+        let projection = state.stores.runs.get_cached_projection(run_id).await?;
+        if let Some(timing) = projection.and_then(|projection| projection.live_run_timing(now)) {
+            summary.timing = Some(timing);
+        }
+    }
+    Ok(Some(summary))
 }
 
 async fn list_runs(
@@ -932,7 +954,7 @@ async fn get_run_status(
     RequireRunManagementTarget(id, _actor): RequireRunManagementTarget,
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    match state.stores.run_summaries.get(&id, Utc::now()).await {
+    match run_summary_at(&state, &id, Utc::now()).await {
         Ok(Some(run)) => {
             (StatusCode::OK, Json(state.decorate_run_summary(run).await)).into_response()
         }

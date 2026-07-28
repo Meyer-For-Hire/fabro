@@ -5503,6 +5503,50 @@ async fn list_run_stages_exposes_execution_identity_for_resumed_stage() {
     assert_eq!(second["resumed_from_stage_id"], "work@1");
 }
 
+#[tokio::test]
+async fn run_billing_includes_live_stage_timing_in_rows_and_totals() {
+    let state = test_app_state_with_isolated_storage();
+    let app = crate::test_support::build_test_router(Arc::clone(&state));
+    let run_id = RunId::new();
+    create_durable_run_with_events(&state, run_id, &[
+        workflow_event::Event::RunSubmitted {
+            definition_blob: None,
+        },
+        workflow_event::Event::RunStarting,
+        workflow_event::Event::RunRunning,
+        workflow_run_started_event(run_id),
+    ])
+    .await;
+    append_scoped_stage_event(
+        &state,
+        run_id,
+        "work",
+        1,
+        &stage_started_event("work", "command"),
+    )
+    .await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(api(&format!("/runs/{run_id}/billing")))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = response_json!(response, StatusCode::OK).await;
+    let stages = body["stages"].as_array().unwrap();
+
+    assert_eq!(stages.len(), 1);
+    let row_timing = &stages[0]["timing"];
+    assert!(row_timing["active_time_ms"].as_u64().unwrap() > 0);
+    assert_eq!(row_timing["tool_time_ms"], row_timing["active_time_ms"]);
+    assert_eq!(&body["totals"]["timing"], row_timing);
+}
+
 /// `checkpoint.completed_nodes` records every visit, so a looped node appears
 /// once per re-entry. Billing must dedup so a retried node renders as one row
 /// and `runtime_secs` is summed across all visits exactly once.
@@ -7798,6 +7842,51 @@ async fn get_run_status_returns_status() {
     assert!(!body["repository"]["name"].as_str().unwrap().is_empty());
     assert!(body["timestamps"]["created_at"].is_string());
     assert!(body["labels"].is_object());
+}
+
+#[tokio::test]
+async fn get_run_status_advances_live_active_timing_between_events() {
+    let state = test_app_state_with_isolated_storage();
+    let app = crate::test_support::build_test_router(Arc::clone(&state));
+    let run_id = RunId::new();
+    create_durable_run_with_events(&state, run_id, &[
+        workflow_event::Event::RunSubmitted {
+            definition_blob: None,
+        },
+        workflow_event::Event::RunStarting,
+        workflow_event::Event::RunRunning,
+        workflow_run_started_event(run_id),
+    ])
+    .await;
+    append_scoped_stage_event(
+        &state,
+        run_id,
+        "work",
+        1,
+        &stage_started_event("work", "command"),
+    )
+    .await;
+
+    // The SQLite summary stores timing at the StageStarted event. A later
+    // detail read must overlay the in-flight command's active time from the
+    // projection even though no newer event has arrived.
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(api(&format!("/runs/{run_id}")))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = response_json!(response, StatusCode::OK).await;
+    let timing = &body["timing"];
+
+    assert!(timing["active_time_ms"].as_u64().unwrap() > 0);
+    assert_eq!(timing["tool_time_ms"], timing["active_time_ms"]);
+    assert!(timing["wall_time_ms"].as_u64().unwrap() >= timing["active_time_ms"].as_u64().unwrap());
 }
 
 #[tokio::test]

@@ -327,6 +327,18 @@ impl Database {
         Ok(self.projection_cache.get(run_id).await)
     }
 
+    pub async fn get_cached_projection(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Option<Arc<RunProjection>>> {
+        self.warm_projection_cache().await?;
+        Ok(self
+            .projection_cache
+            .projection_snapshot(run_id)
+            .await
+            .map(|(projection, _)| projection))
+    }
+
     pub async fn get_cached_summary(
         &self,
         run_id: &RunId,
