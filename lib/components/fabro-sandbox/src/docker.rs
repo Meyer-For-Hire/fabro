@@ -1481,10 +1481,27 @@ impl Sandbox for DockerSandbox {
             .and_then(|config| config.labels)
             .unwrap_or_default();
         verify_managed_labels(&container_id, &labels, self.run_id.as_ref())?;
-        let active = inspect
+        if inspect
             .state
-            .is_some_and(|state| state.running == Some(true) && state.paused != Some(true));
-        if active {
+            .as_ref()
+            .is_some_and(|state| state.running == Some(true))
+        {
+            if inspect
+                .state
+                .is_some_and(|state| state.paused != Some(true))
+            {
+                return Ok(());
+            }
+            if let Err(e) = self.docker.unpause_container(&container_id).await {
+                if !docker_not_modified(&e) {
+                    return Err(crate::Error::context(
+                        format!(
+                            "Failed to unpause Docker container '{container_id}' with labels {labels:?}"
+                        ),
+                        e,
+                    ));
+                }
+            }
             return Ok(());
         }
         self.start().await
@@ -2052,6 +2069,9 @@ mod tests {
     use std::process::Stdio;
     use std::time::Duration;
 
+    use bollard::API_DEFAULT_VERSION;
+    use httpmock::Method::{GET, POST};
+    use httpmock::MockServer;
     use tokio::io::AsyncWriteExt as _;
     use tokio::process::Command;
 
@@ -2162,6 +2182,56 @@ mod tests {
             Some(0),
             &format!("{BASH_PROBE_MARKER}\n")
         ));
+    }
+
+    #[tokio::test]
+    async fn activate_unpauses_paused_running_container() {
+        let server = MockServer::start_async().await;
+        let inspect = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path_suffix("/containers/test-container/json");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(serde_json::json!({
+                        "Config": {
+                            "Labels": {
+                                "sh.fabro.managed": "true"
+                            }
+                        },
+                        "State": {
+                            "Running": true,
+                            "Paused": true
+                        }
+                    }));
+            })
+            .await;
+        let unpause = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path_suffix("/containers/test-container/unpause");
+                then.status(204);
+            })
+            .await;
+        let start = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path_suffix("/containers/test-container/start");
+                then.status(204);
+            })
+            .await;
+        let docker = Docker::connect_with_http(&server.base_url(), 5, API_DEFAULT_VERSION)
+            .expect("mock Docker client should connect");
+        let sandbox = test_docker_sandbox(docker, "test-container");
+
+        sandbox
+            .activate()
+            .await
+            .expect("a paused running container should be unpaused");
+
+        inspect.assert_calls_async(1).await;
+        unpause.assert_calls_async(1).await;
+        start.assert_calls_async(0).await;
     }
 
     #[test]
@@ -2475,5 +2545,29 @@ mod tests {
         let mut content = String::new();
         entry.read_to_string(&mut content).unwrap();
         assert_eq!(content, "hello");
+    }
+
+    fn test_docker_sandbox(docker: Docker, container_id: &str) -> DockerSandbox {
+        let sandbox = DockerSandbox {
+            docker,
+            config: DockerSandboxOptions::default(),
+            github_app: None,
+            run_id: None,
+            clone_origin_url: None,
+            clone_branch: None,
+            container_id: OnceCell::new(),
+            repo_cloned: OnceCell::new(),
+            working_directory: OnceCell::new(),
+            origin_url: OnceCell::new(),
+            cached_platform: std::sync::OnceLock::new(),
+            cached_os_version: std::sync::OnceLock::new(),
+            rg_available: OnceCell::new(),
+            event_callback: None,
+        };
+        sandbox
+            .container_id
+            .set(container_id.to_string())
+            .expect("test container should initialize once");
+        sandbox
     }
 }
