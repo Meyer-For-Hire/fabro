@@ -102,6 +102,7 @@ export default function RunDetail({ params }: { params: { id: string } }) {
   const { mutate } = useSWRConfig();
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [deletePending, setDeletePending] = useState(false);
+  const [dockHeight, setDockHeight] = useState<number | null>(null);
   const { push, dismiss } = useToast();
   const lifecycleToastStateRef = useRef(createLifecycleToastState());
   const filesCount = runQuery.data?.diff?.files_changed ?? null;
@@ -305,7 +306,16 @@ export default function RunDetail({ params }: { params: { id: string } }) {
         : []),
     ],
   };
-  const dockClearance = hasPendingQuestions ? "18rem" : "5rem";
+  // Reserve exactly the dock's rendered height. The constants are only the
+  // first frame, before the dock has been measured; a fixed reservation lets
+  // a tall question panel cover the content it is asking about.
+  const dockVisible = hasPendingQuestions || !hideSteerBar;
+  const dockClearance =
+    dockVisible && dockHeight !== null
+      ? `${dockHeight}px`
+      : hasPendingQuestions
+        ? "18rem"
+        : "5rem";
   const rootStyle = {
     "--fabro-interview-dock-clearance": dockClearance,
   } as CSSProperties;
@@ -372,6 +382,7 @@ export default function RunDetail({ params }: { params: { id: string } }) {
             isResizing={isResizing}
             steerBarRef={steerBarRef}
             waitingForSteer={waitingForSteer}
+            onHeightChange={setDockHeight}
           />
         </div>
       )}

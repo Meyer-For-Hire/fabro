@@ -1,9 +1,12 @@
 import {
+  useRef,
   useState,
   type ReactNode,
   type RefObject,
 } from "react";
 import { SparklesIcon } from "@heroicons/react/20/solid";
+
+import { useResizeObserver } from "../../hooks/effects";
 
 import AskFabroSidebar, {
   SIDEBAR_WIDTH,
@@ -134,6 +137,7 @@ export function RunDetailDockedControls({
   isResizing,
   steerBarRef,
   waitingForSteer,
+  onHeightChange,
 }: {
   runId: string;
   hideSteerBar: boolean;
@@ -143,11 +147,28 @@ export function RunDetailDockedControls({
   isResizing: boolean;
   steerBarRef: RefObject<SteerBarHandle | null>;
   waitingForSteer: boolean;
+  /**
+   * Reports the dock's rendered height so the page can reserve exactly that
+   * much room beneath the scrolling content.
+   */
+  onHeightChange: (height: number | null) => void;
 }) {
-  if (hideSteerBar && !hasPendingQuestions) return null;
+  const dockRef = useRef<HTMLDivElement | null>(null);
+  const visible = hasPendingQuestions || !hideSteerBar;
+
+  // `offsetHeight` rather than the entry's content box: the dock carries a
+  // top border, and the page has to clear the border too.
+  useResizeObserver(
+    dockRef,
+    () => onHeightChange(dockRef.current?.offsetHeight ?? null),
+    visible,
+  );
+
+  if (!visible) return null;
 
   return (
     <div
+      ref={dockRef}
       className={`fixed bottom-0 left-0 z-30 border-t border-line bg-page ${
         isResizing
           ? ""

@@ -841,7 +841,7 @@ describe("RunDetail full-height child routes", () => {
     });
 
     const statuses = renderer.root.findAll(
-      (node) => node.type === "p" && node.props.role === "status",
+      (node) => node.props.role === "status",
     );
     expect(statuses.map(textFromTestNode)).toContain(
       "Interrupted — waiting for steering",
