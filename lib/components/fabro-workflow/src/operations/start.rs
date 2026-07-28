@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use fabro_auth::{CredentialSource, EnvCredentialSource, VaultCredentialSource};
+use fabro_auth::{CredentialSource, VaultCredentialSource};
 use fabro_interview::{AutoApproveInterviewer, Interviewer};
 use fabro_llm::client::Client as LlmClient;
 use fabro_mcp::config::McpServerSettings;
@@ -81,7 +81,7 @@ struct RunSession {
     workflow_path:     Option<ManifestPath>,
     workflow_bundle:   Option<Arc<WorkflowBundle>>,
     run_control:       Option<Arc<RunControlState>>,
-    vault:             Option<Arc<AsyncRwLock<Vault>>>,
+    vault:             Arc<AsyncRwLock<Vault>>,
     catalog:           Arc<Catalog>,
     fabro_run_tools:   Option<FabroRunToolServices>,
 }
@@ -106,7 +106,7 @@ pub struct StartServices {
     /// Server-resolved GitHub integration permissions to inject into the
     /// sandbox env. Empty when github integration has no permissions.
     pub github_permissions: HashMap<String, String>,
-    pub vault:              Option<Arc<AsyncRwLock<Vault>>>,
+    pub vault:              Arc<AsyncRwLock<Vault>>,
     pub catalog:            Arc<Catalog>,
     pub on_node:            crate::OnNodeCallback,
     pub registry_override:  Option<Arc<HandlerRegistry>>,
@@ -374,7 +374,7 @@ impl RunSession {
             resolve_sandbox_provider(resolved).effective_for(resolved.execution.mode);
         let catalog = Arc::clone(&services.catalog);
         let configured =
-            configured_providers_for_start(services.vault.as_ref(), Arc::clone(&catalog)).await;
+            configured_providers_for_start(&services.vault, Arc::clone(&catalog)).await;
         #[cfg(feature = "test-support")]
         let configured = workflow_test_support::test_configured_provider_ids(
             catalog.as_ref(),
@@ -383,14 +383,11 @@ impl RunSession {
                 .is_some_and(|value| !matches!(value.as_str(), "" | "0" | "false" | "no")),
         );
         let llm = resolve_start_llm(catalog.as_ref(), &configured, resolved)?;
-        let vault_guard = match services.vault.as_ref() {
-            Some(vault) => Some(vault.read().await),
-            None => None,
-        };
+        let vault_guard = services.vault.read().await;
         // Token-only secrets lookup over the vault read guard, shared across
         // every run-boundary resolver. A missing or non-Token secret becomes
         // `None`, so resolution fails closed with a secret error.
-        let secret_lookup = |name: &str| vault_token_lookup(vault_guard.as_deref(), name);
+        let secret_lookup = |name: &str| vault_token_lookup(&vault_guard, name);
         let mcp_servers = resolved
             .agent
             .mcps
@@ -436,10 +433,9 @@ impl RunSession {
                 clone_branch:     record.base_branch().map(str::to_string),
             },
             SandboxProviderKind::Daytona => {
-                let api_key = match vault_guard.as_deref() {
-                    Some(vault) => vault.get(EnvVars::DAYTONA_API_KEY).map(str::to_string),
-                    None => None,
-                };
+                let api_key = vault_guard
+                    .get(EnvVars::DAYTONA_API_KEY)
+                    .map(str::to_string);
                 SandboxSpec::Daytona {
                     config: Box::new(resolve_daytona_config(resolved)),
                     github_app: services.github_app.clone(),
@@ -522,16 +518,13 @@ impl RunSession {
 }
 
 async fn configured_providers_for_start(
-    vault: Option<&Arc<AsyncRwLock<Vault>>>,
+    vault: &Arc<AsyncRwLock<Vault>>,
     catalog: Arc<Catalog>,
 ) -> Vec<ProviderId> {
-    let source: Arc<dyn CredentialSource> = match vault {
-        Some(vault) => Arc::new(VaultCredentialSource::with_env_lookup(
-            Arc::clone(vault),
-            process_env_var,
-        )),
-        None => Arc::new(EnvCredentialSource::new()),
-    };
+    let source: Arc<dyn CredentialSource> = Arc::new(VaultCredentialSource::with_env_lookup(
+        Arc::clone(vault),
+        process_env_var,
+    ));
     match LlmClient::from_source_report(source.as_ref(), catalog).await {
         Ok(report) => report
             .client
@@ -572,8 +565,8 @@ fn process_env_var(name: &str) -> Option<String> {
     std::env::var(name).ok()
 }
 
-fn vault_token_lookup(vault: Option<&Vault>, name: &str) -> Option<String> {
-    vault.and_then(|vault| fabro_auth::vault_get_token(vault, name).ok().flatten())
+fn vault_token_lookup(vault: &Vault, name: &str) -> Option<String> {
+    fabro_auth::vault_get_token(vault, name).ok().flatten()
 }
 
 async fn load_accepted_run_definition(
@@ -1780,7 +1773,7 @@ reasoning = false
         )])));
 
         let session = RunSession::new(&persisted, StartServices {
-            vault: Some(vault),
+            vault,
             ..test_start_services(&store, &storage_root, emitter, registry).await
         })
         .await
@@ -1838,7 +1831,7 @@ reasoning = false
         let vault = Arc::new(AsyncRwLock::new(start_vault(&[])));
 
         let Err(err) = RunSession::new(&persisted, StartServices {
-            vault: Some(vault),
+            vault,
             ..test_start_services(&store, &storage_root, emitter, registry).await
         })
         .await
@@ -2004,7 +1997,7 @@ reasoning = false
             run_control: None,
             github_app: None,
             github_permissions: HashMap::new(),
-            vault: Some(Arc::new(AsyncRwLock::new(start_vault(&[])))),
+            vault: Arc::new(AsyncRwLock::new(start_vault(&[]))),
             catalog: test_catalog(),
             on_node: None,
             registry_override: Some(registry),
@@ -2032,7 +2025,7 @@ reasoning = false
     }
 
     fn vault_secret_lookup(vault: &Vault) -> impl FnMut(&str) -> Option<String> + '_ {
-        move |name| vault_token_lookup(Some(vault), name)
+        move |name| vault_token_lookup(vault, name)
     }
 
     fn prepare_with_step(step: PreparedStep) -> RunPrepareSettings {

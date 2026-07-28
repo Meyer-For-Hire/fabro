@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use fabro_auth::EnvCredentialSource;
+use fabro_auth::test_support;
 use fabro_model::{Catalog, ProviderId};
 use fabro_static::EnvVars;
 use fabro_test::{TwinScenario, TwinScenarios, twin_openai};
@@ -43,12 +43,11 @@ fn test_app_with_openai_agent_backend(openai_base_url: String, api_key: String) 
     );
     let source_api_key = api_key.clone();
     let env_api_key = api_key.clone();
-    let llm_source: Arc<dyn fabro_auth::CredentialSource> = Arc::new(
-        EnvCredentialSource::with_env_lookup(Arc::new(move |name| match name {
+    let llm_source: Arc<dyn fabro_auth::CredentialSource> =
+        test_support::env_credential_source(move |name| match name {
             "OPENAI_API_KEY" => Some(source_api_key.clone()),
             _ => None,
-        })),
-    );
+        });
     let state = fabro_server::test_support::TestAppStateBuilder::new()
         .runtime_settings(settings.server_settings, settings.manifest_run_defaults)
         .max_concurrent_runs(5)

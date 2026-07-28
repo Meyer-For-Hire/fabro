@@ -10,8 +10,6 @@ use tokio::sync::RwLock as AsyncRwLock;
 use tokio::task::spawn_blocking;
 
 use crate::credential::{ApiKeyHeader, OAuthCredential};
-use crate::credential_source::CredentialSource;
-use crate::env_source::EnvCredentialSource;
 use crate::refresh::refresh_oauth_credential;
 use crate::vault_ext::{
     VaultLookupError, vault_get_oauth, vault_get_token, vault_set_oauth, vault_token_lookup,
@@ -515,23 +513,6 @@ fn vault_lookup_error(provider: &ProviderId, name: &str, err: VaultLookupError) 
     }
 }
 
-pub async fn configured_providers_from_process_env(
-    vault: Option<&Arc<AsyncRwLock<Vault>>>,
-    catalog: &Catalog,
-) -> Vec<ProviderId> {
-    match vault {
-        Some(vault_arc) => {
-            let resolver = CredentialResolver::new(Arc::clone(vault_arc));
-            let guard = vault_arc.read().await;
-            resolver.configured_providers(&guard, catalog)
-        }
-        None => {
-            EnvCredentialSource::new()
-                .configured_providers(catalog)
-                .await
-        }
-    }
-}
 #[cfg(test)]
 mod tests {
     use std::error::Error as _;

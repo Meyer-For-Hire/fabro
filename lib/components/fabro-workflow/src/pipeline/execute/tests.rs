@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use fabro_agent::Sandbox;
+use fabro_auth::test_support as auth_test_support;
 use fabro_graphviz::graph::{AttrValue, Edge, Graph, Node};
 use fabro_hooks::HookSettings;
 use fabro_interview::AutoApproveInterviewer;
@@ -286,7 +287,7 @@ async fn execute_test_run_with_options(
                 github_permissions: None,
                 origin_url:         None,
             },
-            vault: None,
+            vault: auth_test_support::empty_vault(),
             git: git_options,
             run_control: None,
             registry_override,
@@ -348,7 +349,7 @@ async fn execute_runs_start_to_exit_and_returns_final_context() {
                 github_permissions: None,
                 origin_url:         None,
             },
-            vault: None,
+            vault: auth_test_support::empty_vault(),
             git: None,
             run_control: None,
             registry_override: None,
@@ -487,7 +488,7 @@ async fn resumed_in_flight_node_starts_a_new_stage_execution() {
                 github_permissions: None,
                 origin_url:         None,
             },
-            vault: None,
+            vault: auth_test_support::empty_vault(),
             git: None,
             run_control: None,
             registry_override: Some(Arc::new(make_registry())),
@@ -598,7 +599,7 @@ async fn run_with_lifecycle(
                 github_permissions: None,
                 origin_url:         None,
             },
-            vault: None,
+            vault: auth_test_support::empty_vault(),
             git: None,
             run_control: None,
             registry_override: Some(Arc::new(registry)),

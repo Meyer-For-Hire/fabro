@@ -137,13 +137,10 @@ pub(crate) async fn execute(
     if let Some(control_manager) = &mut control_manager {
         control_manager.wait_for_first_connection().await?;
     }
-    let vault = load_worker_vault(storage_dir.as_deref()).await?;
+    let vault = load_worker_vault(storage_dir.as_deref(), &run_dir).await?;
     let github_app = {
-        let vault_guard = match &vault {
-            Some(arc) => Some(arc.read().await),
-            None => None,
-        };
-        maybe_build_github_credentials(&run_spec.settings, vault_guard.as_deref())?
+        let vault_guard = vault.read().await;
+        maybe_build_github_credentials(&run_spec.settings, &vault_guard)?
     };
     let services = StartServices {
         run_id,
@@ -272,10 +269,23 @@ impl fabro_tool::RunManifestBuilder for WorkerRunManifestBuilder {
     }
 }
 
-async fn load_worker_vault(storage_dir: Option<&Path>) -> Result<Option<Arc<AsyncRwLock<Vault>>>> {
-    let Some(storage_dir) = storage_dir else {
-        return Ok(None);
-    };
+/// Load the worker's secret vault from the run's storage root.
+///
+/// A worker always runs against a server-created run, which lives under
+/// `<storage>/scratch/<run>`, so the storage root is always resolvable. Failing
+/// here is better than continuing without a vault: credentials would silently
+/// fall back to whatever the worker process happens to have in its environment.
+async fn load_worker_vault(
+    storage_dir: Option<&Path>,
+    run_dir: &Path,
+) -> Result<Arc<AsyncRwLock<Vault>>> {
+    let storage_dir = storage_dir.with_context(|| {
+        format!(
+            "run worker for {} was spawned without --storage-dir; it needs the storage root to \
+             load its secret vault",
+            run_dir.display()
+        )
+    })?;
 
     let storage = Storage::new(storage_dir);
     let vault = SecretStore::open_snapshot(storage.sqlite_path(), storage.secrets_path())
@@ -287,7 +297,7 @@ async fn load_worker_vault(storage_dir: Option<&Path>) -> Result<Option<Arc<Asyn
             )
         })?
         .into_vault();
-    Ok(Some(Arc::new(AsyncRwLock::new(vault))))
+    Ok(Arc::new(AsyncRwLock::new(vault)))
 }
 
 const WORKER_CONTROL_RECONNECT_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
@@ -1112,7 +1122,7 @@ fn stamp_system_worker(mut event: RunEvent) -> RunEvent {
 
 fn maybe_build_github_credentials(
     settings: &WorkflowSettings,
-    vault: Option<&fabro_vault::Vault>,
+    vault: &fabro_vault::Vault,
 ) -> Result<Option<fabro_github::GitHubCredentials>> {
     let resolved_run = &settings.run;
     let resolved_server = ServerSettingsBuilder::load_default().ok();
@@ -1747,7 +1757,9 @@ mod tests {
             .set("ANTHROPIC_API_KEY", "vault-key", SecretType::Token, None)
             .unwrap();
 
-        let loaded = load_worker_vault(Some(temp.path())).await.unwrap().unwrap();
+        let loaded = load_worker_vault(Some(temp.path()), temp.path())
+            .await
+            .unwrap();
         let guard = loaded.read().await;
         let credential = guard.get("ANTHROPIC_API_KEY").unwrap();
 

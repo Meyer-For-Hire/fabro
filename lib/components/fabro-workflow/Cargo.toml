@@ -14,7 +14,7 @@ readme = "README.md"
 doctest = false
 
 [features]
-test-support = []
+test-support = ["fabro-auth/test-support"]
 
 [lints]
 workspace = true
@@ -74,6 +74,7 @@ tempfile = "3"
 toml.workspace = true
 fabro-vault = { path = "../../foundation/fabro-vault" }
 [dev-dependencies]
+fabro-auth = { path = "../../foundation/fabro-auth", features = ["test-support"] }
 base64.workspace = true
 fabro-acp = { path = "../fabro-acp", features = ["test-support"] }
 fabro-workflow = { path = ".", features = ["test-support"] }

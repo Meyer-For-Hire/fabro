@@ -71,6 +71,11 @@ fn spawn_worker_process(
     );
     cmd.args([
         "__run-worker",
+        "--storage-dir",
+        context
+            .storage_dir
+            .to_str()
+            .expect("storage directory path should be valid UTF-8"),
         "--server",
         server,
         "--run-dir",
@@ -215,6 +220,11 @@ fn worker_requires_fabro_worker_token_env() {
         .command()
         .args([
             "__run-worker",
+            "--storage-dir",
+            context
+                .storage_dir
+                .to_str()
+                .expect("storage directory path should be valid UTF-8"),
             "--server",
             "http://127.0.0.1:32276",
             "--run-dir",
@@ -273,6 +283,11 @@ digraph CachedGraph {
     let output = worker_command(&context, run_id.as_str())
         .args([
             "__run-worker",
+            "--storage-dir",
+            context
+                .storage_dir
+                .to_str()
+                .expect("storage directory path should be valid UTF-8"),
             "--server",
             server.as_str(),
             "--run-dir",
@@ -342,6 +357,11 @@ digraph GitHubApp {
     cmd.env("GITHUB_APP_PRIVATE_KEY", "%%%not-base64%%%");
     cmd.args([
         "__run-worker",
+        "--storage-dir",
+        context
+            .storage_dir
+            .to_str()
+            .expect("storage directory path should be valid UTF-8"),
         "--server",
         server.as_str(),
         "--run-dir",
@@ -391,6 +411,11 @@ digraph DetachedStoreOnly {
     let output = worker_command(&context, run_id.as_str())
         .args([
             "__run-worker",
+            "--storage-dir",
+            context
+                .storage_dir
+                .to_str()
+                .expect("storage directory path should be valid UTF-8"),
             "--server",
             server.as_str(),
             "--run-dir",
@@ -609,6 +634,11 @@ digraph Test {
     let mut cmd = worker_command(&context, &run_id);
     cmd.args([
         "__run-worker",
+        "--storage-dir",
+        context
+            .storage_dir
+            .to_str()
+            .expect("storage directory path should be valid UTF-8"),
         "--server",
         &server,
         "--run-dir",
@@ -674,6 +704,11 @@ fn runner_reports_malformed_run_state_without_prefetching_events() {
     let output = worker_command(&context, &run_id)
         .args([
             "__run-worker",
+            "--storage-dir",
+            context
+                .storage_dir
+                .to_str()
+                .expect("storage directory path should be valid UTF-8"),
             "--server",
             &format!("{}/api/v1", server.base_url()),
             "--run-dir",

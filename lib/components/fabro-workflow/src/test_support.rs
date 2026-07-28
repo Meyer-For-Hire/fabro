@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fabro_agent::Sandbox;
-use fabro_auth::{CredentialSource, EnvCredentialSource};
+use fabro_auth::{CredentialSource, test_support as auth_test_support};
 use fabro_graphviz::graph::Graph as GvGraph;
 use fabro_interview::AutoApproveInterviewer;
 use fabro_model::Catalog;
@@ -249,7 +249,7 @@ async fn initialized(
                     "claude-sonnet-4-6".to_string(),
                     options
                         .llm_source
-                        .unwrap_or_else(|| Arc::new(EnvCredentialSource::new())),
+                        .unwrap_or_else(auth_test_support::vault_only_credential_source),
                     Arc::new(Catalog::from_builtin().expect("default catalog should build")),
                     Arc::new(SandboxGitRuntime::new()),
                     Arc::new(RunMetadataRuntime::new()),

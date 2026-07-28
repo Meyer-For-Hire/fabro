@@ -4115,7 +4115,7 @@ async fn execute_run_in_process(state: Arc<AppState>, run_id: RunId) {
         run_control: None,
         github_app,
         github_permissions,
-        vault: Some(Arc::new(AsyncRwLock::new(vault.into_vault()))),
+        vault: Arc::new(AsyncRwLock::new(vault.into_vault())),
         catalog: state.catalog(),
         on_node: None,
         registry_override,

@@ -677,7 +677,7 @@ mod tests {
     use std::time::Duration;
 
     use chrono::Utc;
-    use fabro_auth::{CredentialSource, EnvCredentialSource, VaultCredentialSource};
+    use fabro_auth::{CredentialSource, VaultCredentialSource, test_support as auth_test_support};
     use fabro_graphviz::graph::Graph;
     use fabro_llm::Error as LlmError;
     use fabro_llm::client::Client;
@@ -819,7 +819,7 @@ mod tests {
     }
 
     fn test_llm_source() -> Arc<dyn CredentialSource> {
-        Arc::new(EnvCredentialSource::new())
+        auth_test_support::vault_only_credential_source()
     }
 
     fn test_projection() -> RunProjection {

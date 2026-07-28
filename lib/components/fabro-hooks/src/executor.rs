@@ -836,7 +836,7 @@ impl HookExecutor for HookExecutorImpl {
 
 #[cfg(test)]
 mod tests {
-    use fabro_auth::{CredentialSource, EnvCredentialSource};
+    use fabro_auth::{CredentialSource, test_support};
     use fabro_types::fixtures;
     use fabro_util::env::TestEnv;
 
@@ -855,7 +855,7 @@ mod tests {
     }
 
     fn test_llm_source() -> Arc<dyn CredentialSource> {
-        Arc::new(EnvCredentialSource::new())
+        test_support::vault_only_credential_source()
     }
 
     fn test_catalog() -> Arc<Catalog> {

@@ -645,6 +645,7 @@ mod tests {
     use anyhow::Result;
     use async_trait::async_trait;
     use bytes::Bytes;
+    use fabro_auth::test_support as auth_test_support;
     use fabro_graphviz::graph::Graph;
     use fabro_model::Catalog;
     use fabro_sandbox::test_support::MockSandbox;
@@ -1020,7 +1021,7 @@ mod tests {
             tokio_util::sync::CancellationToken::new(),
             fabro_model::ProviderId::anthropic(),
             "claude-sonnet-4-6".to_string(),
-            Arc::new(fabro_auth::EnvCredentialSource::new()),
+            auth_test_support::vault_only_credential_source(),
             Arc::new(Catalog::from_builtin().expect("default catalog should build")),
             Arc::new(SandboxGitRuntime::new()),
             metadata_runtime,
@@ -1053,7 +1054,7 @@ mod tests {
             tokio_util::sync::CancellationToken::new(),
             fabro_model::ProviderId::anthropic(),
             "claude-sonnet-4-6".to_string(),
-            Arc::new(fabro_auth::EnvCredentialSource::new()),
+            auth_test_support::vault_only_credential_source(),
             Arc::new(Catalog::from_builtin().expect("default catalog should build")),
             Arc::new(SandboxGitRuntime::new()),
             Arc::new(RunMetadataRuntime::new()),
