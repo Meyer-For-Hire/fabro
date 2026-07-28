@@ -2116,6 +2116,7 @@ These legacy events may appear in older run logs. Current CLI backend runs do no
   "properties": {
     "pr_url": "https://github.com/org/repo/pull/42",
     "pr_number": 42,
+    "head_sha": "d34db33f",
     "draft": true
   }
 }
@@ -2125,6 +2126,7 @@ These legacy events may appear in older run logs. Current CLI backend runs do no
 |----------|------|-------------|
 | `pr_url` | string | Pull request URL |
 | `pr_number` | number | Pull request number |
+| `head_sha` | string (optional) | Verified commit SHA at the remote PR head; absent on older events |
 | `draft` | boolean | Whether the PR is a draft |
 
 ### `pull_request.linked`

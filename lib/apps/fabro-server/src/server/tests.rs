@@ -4677,6 +4677,7 @@ channel = "#deploys"
             repo:        "fabro".to_string(),
             base_branch: "main".to_string(),
             head_branch: "fabro/run/test".to_string(),
+            head_sha:    Some("final-sha".to_string()),
             title:       "Ship <prod> & notify".to_string(),
             draft:       false,
         },
@@ -4757,6 +4758,7 @@ channel = "#deploys"
             allow_freeform:  true,
             timeout_seconds: None,
             context_display: None,
+            review_target:   None,
         },
     )
     .await;
@@ -5251,6 +5253,64 @@ fn test_billed_usage(
     .unwrap()
 }
 
+async fn create_billed_retry_run(state: &Arc<AppState>, run_id: RunId) {
+    create_durable_run_with_events(state, run_id, &[
+        workflow_event::Event::RunSubmitted {
+            definition_blob: None,
+        },
+        workflow_event::Event::RunStarting,
+        workflow_event::Event::RunRunning,
+    ])
+    .await;
+
+    append_scoped_stage_event(
+        state,
+        run_id,
+        "verify",
+        1,
+        &workflow_event::Event::StageFailed {
+            node_id:    "verify".to_string(),
+            name:       "Verify".to_string(),
+            index:      1,
+            failure:    FailureDetail::new("try again", FailureCategory::TransientInfra),
+            will_retry: true,
+            timing:     fabro_types::StageTiming::wall_only(1200),
+            billing:    Some(test_billed_usage("gpt-old", 100, 10)),
+            actor:      None,
+        },
+    )
+    .await;
+    append_scoped_stage_event(
+        state,
+        run_id,
+        "verify",
+        2,
+        &workflow_event::Event::StageCompleted {
+            node_id: "verify".to_string(),
+            name: "Verify".to_string(),
+            index: 1,
+            timing: fabro_types::StageTiming::wall_only(800),
+            status: "succeeded".to_string(),
+            preferred_label: None,
+            suggested_next_ids: Vec::new(),
+            billing: Some(test_billed_usage("gpt-new", 200, 20)),
+            failure: None,
+            notes: None,
+            files_touched: Vec::new(),
+            context_updates: None,
+            jump_to_node: None,
+            context_values: None,
+            node_visits: None,
+            loop_failure_signatures: None,
+            restart_failure_signatures: None,
+            response: None,
+            attempt: 2,
+            max_attempts: 2,
+        },
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn list_run_stages_distinguishes_visits() {
     let state = test_app_state_with_isolated_storage();
@@ -5495,6 +5555,50 @@ async fn list_run_stages_exposes_execution_identity_for_resumed_stage() {
     assert_eq!(second["resumed_from_stage_id"], "work@1");
 }
 
+#[tokio::test]
+async fn run_billing_includes_live_stage_timing_in_rows_and_totals() {
+    let state = test_app_state_with_isolated_storage();
+    let app = crate::test_support::build_test_router(Arc::clone(&state));
+    let run_id = RunId::new();
+    create_durable_run_with_events(&state, run_id, &[
+        workflow_event::Event::RunSubmitted {
+            definition_blob: None,
+        },
+        workflow_event::Event::RunStarting,
+        workflow_event::Event::RunRunning,
+        workflow_run_started_event(run_id),
+    ])
+    .await;
+    append_scoped_stage_event(
+        &state,
+        run_id,
+        "work",
+        1,
+        &stage_started_event("work", "command"),
+    )
+    .await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(api(&format!("/runs/{run_id}/billing")))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = response_json!(response, StatusCode::OK).await;
+    let stages = body["stages"].as_array().unwrap();
+
+    assert_eq!(stages.len(), 1);
+    let row_timing = &stages[0]["timing"];
+    assert!(row_timing["active_time_ms"].as_u64().unwrap() > 0);
+    assert_eq!(row_timing["tool_time_ms"], row_timing["active_time_ms"]);
+    assert_eq!(&body["totals"]["timing"], row_timing);
+}
+
 /// `checkpoint.completed_nodes` records every visit, so a looped node appears
 /// once per re-entry. Billing must dedup so a retried node renders as one row
 /// and `runtime_secs` is summed across all visits exactly once.
@@ -5646,65 +5750,9 @@ async fn run_billing_sums_usage_across_retry_visits_and_uses_latest_model() {
     let state = test_app_state_with_isolated_storage();
     let app = crate::test_support::build_test_router(Arc::clone(&state));
     let run_id = RunId::new();
-    let failed_usage = test_billed_usage("gpt-old", 100, 10);
+
+    create_billed_retry_run(&state, run_id).await;
     let success_usage = test_billed_usage("gpt-new", 200, 20);
-
-    create_durable_run_with_events(&state, run_id, &[
-        workflow_event::Event::RunSubmitted {
-            definition_blob: None,
-        },
-        workflow_event::Event::RunStarting,
-        workflow_event::Event::RunRunning,
-    ])
-    .await;
-
-    append_scoped_stage_event(
-        &state,
-        run_id,
-        "verify",
-        1,
-        &workflow_event::Event::StageFailed {
-            node_id:    "verify".to_string(),
-            name:       "Verify".to_string(),
-            index:      1,
-            failure:    FailureDetail::new("try again", FailureCategory::TransientInfra),
-            will_retry: true,
-            timing:     fabro_types::StageTiming::wall_only(1200),
-            billing:    Some(failed_usage),
-            actor:      None,
-        },
-    )
-    .await;
-    append_scoped_stage_event(
-        &state,
-        run_id,
-        "verify",
-        2,
-        &workflow_event::Event::StageCompleted {
-            node_id: "verify".to_string(),
-            name: "Verify".to_string(),
-            index: 1,
-            timing: fabro_types::StageTiming::wall_only(800),
-            status: "succeeded".to_string(),
-            preferred_label: None,
-            suggested_next_ids: Vec::new(),
-            billing: Some(success_usage.clone()),
-            failure: None,
-            notes: None,
-            files_touched: Vec::new(),
-            context_updates: None,
-            jump_to_node: None,
-            context_values: None,
-            node_visits: None,
-            loop_failure_signatures: None,
-            restart_failure_signatures: None,
-            response: None,
-            attempt: 2,
-            max_attempts: 2,
-        },
-    )
-    .await;
-
     let mut latest_outcome: Outcome<Option<fabro_model::BilledModelUsage>> = Outcome::success();
     latest_outcome.usage = Some(success_usage);
     latest_outcome.timing = Some(fabro_types::StageTiming::wall_only(800));
@@ -5738,7 +5786,6 @@ async fn run_billing_sums_usage_across_retry_visits_and_uses_latest_model() {
     .unwrap();
 
     let response = app
-        .clone()
         .oneshot(
             Request::builder()
                 .method("GET")
@@ -5781,6 +5828,76 @@ async fn run_billing_sums_usage_across_retry_visits_and_uses_latest_model() {
     assert_eq!(old_model["billing"]["input_tokens"], 100);
     assert_eq!(new_model["stages"], 1);
     assert_eq!(new_model["billing"]["input_tokens"], 200);
+}
+
+/// The stage popover reads `billing` off the stages list, so it must be scoped
+/// to one visit — unlike the Billing tab's rows, which sum every visit of a
+/// node.
+#[tokio::test]
+async fn list_run_stages_reports_billing_per_visit() {
+    let state = test_app_state_with_isolated_storage();
+    let app = crate::test_support::build_test_router(Arc::clone(&state));
+    let run_id = RunId::new();
+
+    create_billed_retry_run(&state, run_id).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(api(&format!("/runs/{run_id}/stages")))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = response_json!(response, StatusCode::OK).await;
+
+    let first = stage_entry(&body, "verify@1");
+    assert_eq!(first["billing"]["input_tokens"], 100);
+    assert_eq!(first["billing"]["output_tokens"], 10);
+    assert_eq!(first["billing"]["total_usd_micros"], 110);
+
+    let second = stage_entry(&body, "verify@2");
+    assert_eq!(second["billing"]["input_tokens"], 200);
+    assert_eq!(second["billing"]["output_tokens"], 20);
+    assert_eq!(second["billing"]["total_usd_micros"], 220);
+}
+
+#[tokio::test]
+async fn list_run_stages_reports_zero_billing_for_a_stage_that_called_no_model() {
+    let state = test_app_state_with_isolated_storage();
+    let app = crate::test_support::build_test_router(Arc::clone(&state));
+    let run_id = RunId::new();
+
+    create_durable_run_with_events(&state, run_id, &[
+        workflow_event::Event::RunSubmitted {
+            definition_blob: None,
+        },
+        workflow_event::Event::RunStarting,
+        workflow_event::Event::RunRunning,
+    ])
+    .await;
+    let started = stage_started_event("script", "command");
+    append_scoped_stage_event(&state, run_id, "script", 1, &started).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(api(&format!("/runs/{run_id}/stages")))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = response_json!(response, StatusCode::OK).await;
+
+    let billing = &stage_entry(&body, "script@1")["billing"];
+    assert_eq!(billing["input_tokens"], 0);
+    assert_eq!(billing["output_tokens"], 0);
+    // No model ran, so there is nothing to price — not a $0.00 cost.
+    assert!(billing.get("total_usd_micros").is_none());
 }
 
 #[tokio::test]
@@ -6417,6 +6534,7 @@ async fn create_run_with_pull_request_record(
             repo: "widgets".to_string(),
             base_branch: "main".to_string(),
             head_branch: "feature".to_string(),
+            head_sha: Some("final-sha".to_string()),
             title: title.to_string(),
             draft: false,
         },
@@ -6511,7 +6629,7 @@ async fn create_completed_run_ready_for_pull_request(
             status:               "succeeded".to_string(),
             reason:               SuccessReason::Completed,
             total_usd_micros:     None,
-            final_git_commit_sha: None,
+            final_git_commit_sha: Some("final-sha".to_string()),
             final_patch:          Some(final_patch.to_string()),
             diff_summary:         None,
             billing:              None,
@@ -7793,6 +7911,51 @@ async fn get_run_status_returns_status() {
 }
 
 #[tokio::test]
+async fn get_run_status_advances_live_active_timing_between_events() {
+    let state = test_app_state_with_isolated_storage();
+    let app = crate::test_support::build_test_router(Arc::clone(&state));
+    let run_id = RunId::new();
+    create_durable_run_with_events(&state, run_id, &[
+        workflow_event::Event::RunSubmitted {
+            definition_blob: None,
+        },
+        workflow_event::Event::RunStarting,
+        workflow_event::Event::RunRunning,
+        workflow_run_started_event(run_id),
+    ])
+    .await;
+    append_scoped_stage_event(
+        &state,
+        run_id,
+        "work",
+        1,
+        &stage_started_event("work", "command"),
+    )
+    .await;
+
+    // The SQLite summary stores timing at the StageStarted event. A later
+    // detail read must overlay the in-flight command's active time from the
+    // projection even though no newer event has arrived.
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(api(&format!("/runs/{run_id}")))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = response_json!(response, StatusCode::OK).await;
+    let timing = &body["timing"];
+
+    assert!(timing["active_time_ms"].as_u64().unwrap() > 0);
+    assert_eq!(timing["tool_time_ms"], timing["active_time_ms"]);
+    assert!(timing["wall_time_ms"].as_u64().unwrap() >= timing["active_time_ms"].as_u64().unwrap());
+}
+
+#[tokio::test]
 async fn get_run_status_not_found() {
     let app = test_app_with();
     let missing_run_id = fixtures::RUN_64;
@@ -8023,6 +8186,7 @@ async fn submit_pending_interview_answer_rejects_invalid_answer_shape() {
             allow_freeform:  false,
             timeout_seconds: None,
             context_display: None,
+            review_target:   None,
         },
     };
 
@@ -8051,6 +8215,7 @@ fn validate_answer_for_question_accepts_no_for_confirmation() {
         allow_freeform:  false,
         timeout_seconds: None,
         context_display: None,
+        review_target:   None,
     };
 
     let result = validate_answer_for_question(&question, &Answer::no());
@@ -8069,6 +8234,7 @@ fn answer_from_typed_yes_request_maps_to_yes_answer() {
         allow_freeform:  false,
         timeout_seconds: None,
         context_display: None,
+        review_target:   None,
     };
     let req: SubmitAnswerRequest = serde_json::from_value(json!({ "kind": "yes" })).unwrap();
 
@@ -8088,6 +8254,7 @@ fn answer_from_typed_no_request_maps_to_no_answer() {
         allow_freeform:  false,
         timeout_seconds: None,
         context_display: None,
+        review_target:   None,
     };
     let req: SubmitAnswerRequest = serde_json::from_value(json!({ "kind": "no" })).unwrap();
 
@@ -8112,6 +8279,7 @@ fn answer_from_typed_selected_request_validates_and_attaches_option() {
         allow_freeform:  false,
         timeout_seconds: None,
         context_display: None,
+        review_target:   None,
     };
     let req: SubmitAnswerRequest =
         serde_json::from_value(json!({ "kind": "selected", "option_key": "approve" })).unwrap();
@@ -8152,6 +8320,7 @@ fn answer_from_typed_multi_selected_request_validates_option_keys() {
         allow_freeform:  false,
         timeout_seconds: None,
         context_display: None,
+        review_target:   None,
     };
     let req: SubmitAnswerRequest = serde_json::from_value(json!({
         "kind": "multi_selected",
@@ -9050,6 +9219,14 @@ async fn get_run_pull_request_returns_stored_github_association_when_github_pr_i
 #[tokio::test]
 async fn create_run_pull_request_creates_and_persists_record() {
     let github = MockServer::start();
+    let branch_mock = github.mock(|when, then| {
+        when.method("GET")
+            .path("/repos/acme/widgets/branches/fabro/run/42")
+            .header("authorization", "Bearer ghu_test");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(json!({ "commit": { "sha": "final-sha" } }).to_string());
+    });
     let create_mock = github.mock(|when, then| {
         when.method("POST")
             .path("/repos/acme/widgets/pulls")
@@ -9147,6 +9324,7 @@ async fn create_run_pull_request_creates_and_persists_record() {
     assert_eq!(state_body["pull_request"]["repo"], "widgets");
 
     response_mock.assert_async().await;
+    branch_mock.assert();
     create_mock.assert();
 }
 
@@ -9569,6 +9747,11 @@ async fn get_run_state_exposes_pending_interviews() {
             "allow_freeform": false,
             "context_display": null,
             "timeout_seconds": null,
+            "review_target": {
+                "label": "Quarry review exercise",
+                "url": "https://quarry.lithos.computer/tmp/0123456789abcdef0123456789abcdef",
+                "kind": "document"
+            },
         }),
         Some("gate"),
     )
@@ -9648,6 +9831,11 @@ async fn cache_backed_run_endpoints_reflect_events_appended_after_warmup() {
             "allow_freeform": false,
             "context_display": null,
             "timeout_seconds": null,
+            "review_target": {
+                "label": "Quarry review exercise",
+                "url": "https://quarry.lithos.computer/tmp/0123456789abcdef0123456789abcdef",
+                "kind": "document"
+            },
         }),
         Some("review"),
     )
@@ -9705,6 +9893,10 @@ async fn cache_backed_run_endpoints_reflect_events_appended_after_warmup() {
         state_body["pending_interviews"]["q-cache"]["question"]["text"].as_str(),
         Some("Approve cached deploy?")
     );
+    assert_eq!(
+        state_body["pending_interviews"]["q-cache"]["question"]["review_target"]["url"].as_str(),
+        Some("https://quarry.lithos.computer/tmp/0123456789abcdef0123456789abcdef")
+    );
 
     let stages = app
         .clone()
@@ -9735,6 +9927,10 @@ async fn cache_backed_run_endpoints_reflect_events_appended_after_warmup() {
     assert_eq!(
         questions["data"][0]["text"].as_str(),
         Some("Approve cached deploy?")
+    );
+    assert_eq!(
+        questions["data"][0]["review_target"]["label"].as_str(),
+        Some("Quarry review exercise")
     );
 
     let settings = app
@@ -16469,6 +16665,7 @@ async fn list_runs_includes_live_metadata_from_run_state() {
             repo:        "repo".to_string(),
             base_branch: "main".to_string(),
             head_branch: "fabro/run".to_string(),
+            head_sha:    Some("final-sha".to_string()),
             title:       "Fix board metadata".to_string(),
             draft:       false,
         },
@@ -16481,6 +16678,7 @@ async fn list_runs_includes_live_metadata_from_run_state() {
             allow_freeform:  false,
             timeout_seconds: None,
             context_display: None,
+            review_target:   None,
         },
     ] {
         workflow_event::append_event(&run_store, &run_id, &event)

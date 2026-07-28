@@ -19,17 +19,18 @@ use crate::static_reference::{
 
 /// How the template-expansion pass should treat undefined input variables.
 ///
-/// Validate is structural — it should not fail just because the user has not
-/// bound `{{ inputs.* }}` yet. Run-start is strict — missing inputs are real
-/// errors. Splitting the two lets validate work on a bare `.fabro` while
-/// run-start preserves its current hard-fail behavior.
+/// Both validate and run-create render structurally so they can report every
+/// unbound `{{ inputs.* }}` variable in one pass rather than aborting on the
+/// first. Run-create then promotes the resulting warnings to errors, which
+/// keeps its hard-fail behavior.
 #[derive(Clone, Copy, Debug)]
 pub enum RenderMode {
-    /// Undefined inputs are hard errors. Used by run-create.
+    /// Undefined inputs abort the pass with a hard error. No production caller
+    /// uses this today; run-create promotes structural warnings instead.
     Strict,
     /// Undefined inputs render as empty and become warning diagnostics on the
     /// returned `Validated`, so structural lints still run. Used by
-    /// `fabro validate`.
+    /// `fabro validate` and by run-create.
     Structural,
 }
 

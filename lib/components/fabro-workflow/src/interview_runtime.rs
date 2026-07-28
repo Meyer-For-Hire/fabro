@@ -224,6 +224,7 @@ impl AgentQuestionRuntime for WorkflowAgentQuestionRuntime {
                     allow_freeform:  question.allow_freeform,
                     timeout_seconds: None,
                     context_display: question.context_display.clone(),
+                    review_target:   question.review_target.clone(),
                 },
                 &self.stage_scope,
             );

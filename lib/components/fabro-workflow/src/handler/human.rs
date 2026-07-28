@@ -6,7 +6,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use fabro_graphviz::graph::{Graph, Node};
 use fabro_interview::{Answer, AnswerValue, Interviewer, Question, ask_with_timeout};
-use fabro_types::{InterviewOption, Principal, QuestionType, SystemActorKind};
+use fabro_types::{InterviewOption, Principal, QuestionType, ReviewTarget, SystemActorKind};
 use ulid::Ulid;
 
 use super::{EngineServices, Handler, NodeTimeoutPolicy};
@@ -120,6 +120,23 @@ fn build_human_gate_question(
     question.allow_freeform = freeform_target.is_some();
     question.stage.clone_from(&node.id);
     question.timeout_seconds = node.timeout().map(|duration| duration.as_secs_f64());
+
+    if node.review_target() {
+        let value = context.get(keys::REVIEW_TARGET).ok_or_else(|| {
+            format!(
+                "Human gate \"{}\" has review_target=true but context.review_target is missing",
+                node.id
+            )
+        })?;
+        let review_target = serde_json::from_value::<ReviewTarget>(value).map_err(|error| {
+            format!(
+                "Human gate \"{}\" has invalid context.review_target: {error}",
+                node.id
+            )
+        })?;
+        question.text = review_target.question_text();
+        question.review_target = Some(review_target);
+    }
 
     if let Some(serde_json::Value::String(last_node)) = context.get(keys::LAST_STAGE) {
         if let Some(serde_json::Value::String(response)) =
@@ -253,6 +270,7 @@ impl Handler for HumanHandler {
                 allow_freeform:  question.allow_freeform,
                 timeout_seconds: question.timeout_seconds,
                 context_display: question.context_display.clone(),
+                review_target:   question.review_target.clone(),
             },
             &stage_scope,
         );
@@ -639,6 +657,15 @@ mod tests {
         graph
     }
 
+    fn enable_review_target(graph: &mut Graph) {
+        graph
+            .nodes
+            .get_mut("gate")
+            .unwrap()
+            .attrs
+            .insert("review_target".to_string(), AttrValue::Boolean(true));
+    }
+
     #[test]
     fn parse_accelerator_key_bracket() {
         assert_eq!(parse_accelerator_key("[A] Approve"), "A");
@@ -663,6 +690,160 @@ mod tests {
     #[test]
     fn parse_accelerator_key_empty() {
         assert_eq!(parse_accelerator_key(""), "");
+    }
+
+    #[tokio::test]
+    async fn review_target_gate_snapshots_validated_context_into_question_and_event() {
+        let inner = Box::new(AutoApproveInterviewer::engine());
+        let recorder = Arc::new(RecordingInterviewer::new(inner));
+        let handler = HumanHandler::new(recorder.clone());
+        let mut graph = build_graph_with_human_gate();
+        enable_review_target(&mut graph);
+        let node = graph.nodes.get("gate").unwrap();
+        let context = Context::new();
+        let target_value = serde_json::json!({
+            "label": "Quarry review exercise",
+            "url": "https://quarry.lithos.computer/tmp/0123456789abcdef0123456789abcdef",
+            "kind": "document",
+        });
+        context.set(keys::REVIEW_TARGET, target_value.clone());
+        let events = Arc::new(Mutex::new(Vec::new()));
+
+        let outcome = handler
+            .execute(
+                node,
+                &context,
+                &graph,
+                Path::new("/tmp/test"),
+                &make_services_with_events(Arc::clone(&events)),
+            )
+            .await
+            .unwrap();
+
+        let recordings = recorder.recordings();
+        assert_eq!(recordings.len(), 1);
+        let question = &recordings[0].0;
+        assert_eq!(
+            question.text,
+            "Review the Quarry review exercise document, then choose the next action."
+        );
+        assert_eq!(
+            question.review_target.as_ref().map(ReviewTarget::url),
+            Some("https://quarry.lithos.computer/tmp/0123456789abcdef0123456789abcdef")
+        );
+
+        let event_target = events
+            .lock()
+            .expect("event log lock poisoned")
+            .iter()
+            .find_map(|event| match &event.body {
+                EventBody::InterviewStarted(props) => props.review_target.clone(),
+                _ => None,
+            })
+            .expect("interview.started should carry the review target");
+        assert_eq!(event_target.label(), "Quarry review exercise");
+
+        context.apply_updates(&outcome.context_updates);
+        assert_eq!(context.get(keys::REVIEW_TARGET), Some(target_value));
+    }
+
+    #[tokio::test]
+    async fn review_target_gate_fails_before_interview_when_context_is_missing() {
+        let inner = Box::new(AutoApproveInterviewer::engine());
+        let recorder = Arc::new(RecordingInterviewer::new(inner));
+        let handler = HumanHandler::new(recorder.clone());
+        let mut graph = build_graph_with_human_gate();
+        enable_review_target(&mut graph);
+        let node = graph.nodes.get("gate").unwrap();
+
+        let outcome = handler
+            .execute(
+                node,
+                &Context::new(),
+                &graph,
+                Path::new("/tmp/test"),
+                &make_services(),
+            )
+            .await
+            .unwrap();
+
+        assert!(outcome.status.is_failure());
+        assert_eq!(
+            outcome.failure_reason(),
+            Some("Human gate \"gate\" has review_target=true but context.review_target is missing")
+        );
+        assert!(recorder.recordings().is_empty());
+    }
+
+    #[tokio::test]
+    async fn review_target_gate_rejects_unsafe_url_without_echoing_it() {
+        let inner = Box::new(AutoApproveInterviewer::engine());
+        let recorder = Arc::new(RecordingInterviewer::new(inner));
+        let handler = HumanHandler::new(recorder.clone());
+        let mut graph = build_graph_with_human_gate();
+        enable_review_target(&mut graph);
+        let node = graph.nodes.get("gate").unwrap();
+        let context = Context::new();
+        context.set(
+            keys::REVIEW_TARGET,
+            serde_json::json!({
+                "label": "Unsafe review",
+                "url": "javascript:alert(1)",
+                "kind": "document",
+            }),
+        );
+
+        let outcome = handler
+            .execute(
+                node,
+                &context,
+                &graph,
+                Path::new("/tmp/test"),
+                &make_services(),
+            )
+            .await
+            .unwrap();
+
+        let failure = outcome
+            .failure_reason()
+            .expect("invalid review target should fail");
+        assert!(failure.contains("review target URL must use http or https"));
+        assert!(!failure.contains("javascript:alert"));
+        assert!(recorder.recordings().is_empty());
+    }
+
+    #[tokio::test]
+    async fn human_gate_ignores_review_target_context_without_opt_in() {
+        let inner = Box::new(AutoApproveInterviewer::engine());
+        let recorder = Arc::new(RecordingInterviewer::new(inner));
+        let handler = HumanHandler::new(recorder.clone());
+        let graph = build_graph_with_human_gate();
+        let node = graph.nodes.get("gate").unwrap();
+        let context = Context::new();
+        context.set(
+            keys::REVIEW_TARGET,
+            serde_json::json!({
+                "label": "Unsafe review",
+                "url": "javascript:alert(1)",
+                "kind": "document",
+            }),
+        );
+
+        let outcome = handler
+            .execute(
+                node,
+                &context,
+                &graph,
+                Path::new("/tmp/test"),
+                &make_services(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status, crate::outcome::StageOutcome::Succeeded);
+        let recordings = recorder.recordings();
+        assert_eq!(recordings[0].0.text, "Review Changes");
+        assert!(recordings[0].0.review_target.is_none());
     }
 
     #[tokio::test]

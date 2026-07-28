@@ -28,7 +28,12 @@ fn pending_interview_record_round_trips_populated_question() {
             ],
             "allow_freeform": true,
             "timeout_seconds": 30.0,
-            "context_display": "Diff summary"
+            "context_display": "Diff summary",
+            "review_target": {
+                "label": "Quarry review exercise",
+                "url": "https://quarry.lithos.computer/tmp/0123456789abcdef0123456789abcdef",
+                "kind": "document"
+            }
         },
         "started_at": "2026-04-29T12:34:56Z"
     });

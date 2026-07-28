@@ -165,6 +165,7 @@ struct RunPrInputs<'a> {
     goal:              &'a str,
     base_branch:       &'a str,
     run_branch:        &'a str,
+    final_git_sha:     &'a str,
     diff:              &'a str,
     conclusion:        &'a fabro_types::Conclusion,
     normalized_origin: String,
@@ -224,6 +225,17 @@ impl<'a> RunPrInputs<'a> {
                 "run_not_finished",
             )
         })?;
+        let final_git_sha = conclusion
+            .final_git_commit_sha
+            .as_deref()
+            .filter(|sha| !sha.trim().is_empty())
+            .ok_or_else(|| {
+                ApiError::with_code(
+                    StatusCode::BAD_REQUEST,
+                    "Run has no final git commit SHA — the remote branch cannot be verified.",
+                    "missing_final_git_commit",
+                )
+            })?;
         if !force && !conclusion.status.is_successful() {
             return Err(ApiError::with_code(
                 StatusCode::BAD_REQUEST,
@@ -240,6 +252,7 @@ impl<'a> RunPrInputs<'a> {
             goal: run_spec.graph.goal(),
             base_branch,
             run_branch,
+            final_git_sha,
             diff,
             conclusion,
             normalized_origin,
@@ -323,6 +336,7 @@ async fn create_run_pull_request(
         origin_url: &inputs.normalized_origin,
         base_branch: inputs.base_branch,
         head_branch: inputs.run_branch,
+        expected_head_sha: inputs.final_git_sha,
         goal: inputs.goal,
         diff: inputs.diff,
         model: &model,
@@ -334,15 +348,8 @@ async fn create_run_pull_request(
         conclusion: Some(inputs.conclusion),
         run_state: Some(run_state),
     };
-    let created_pull_request = match pull_request::maybe_open_pull_request(request).await {
-        Ok(Some(created)) => created,
-        Ok(None) => {
-            return ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Pull request creation returned no record unexpectedly.",
-            )
-            .into_response();
-        }
+    let created_pull_request = match pull_request::open_pull_request(request).await {
+        Ok(created) => created,
         Err(err) => return ApiError::new(StatusCode::BAD_GATEWAY, err).into_response(),
     };
 
@@ -350,6 +357,7 @@ async fn create_run_pull_request(
         &created_pull_request.link,
         &created_pull_request.base_branch,
         &created_pull_request.head_branch,
+        inputs.final_git_sha,
         &created_pull_request.title,
         true,
     );

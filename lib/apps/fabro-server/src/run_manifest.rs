@@ -35,7 +35,8 @@ use fabro_util::check_report::{CheckDetail, CheckReport, CheckResult, CheckSecti
 use fabro_validate::Severity;
 use fabro_workflow::Error as WorkflowError;
 use fabro_workflow::operations::{
-    CreateRunInput, ValidateInput, WorkflowInput, validate, validate_with_ready_providers,
+    CreateRunInput, ValidateInput, WorkflowInput, validate, validate_with_catalog,
+    validate_with_ready_providers,
 };
 use fabro_workflow::pipeline::Validated;
 use fabro_workflow::run_materialization::materialize_run_with_ready_providers;
@@ -191,12 +192,18 @@ pub(crate) fn validate_prepared_manifest(
     validate_prepared_manifest_with_vars(prepared, catalog, HashMap::new())
 }
 
+pub(crate) fn validate_prepared_manifest_structural(
+    prepared: &PreparedManifest,
+) -> Result<Validated, WorkflowError> {
+    validate(manifest_validate_input(prepared, HashMap::new()))
+}
+
 pub(crate) fn validate_prepared_manifest_with_vars(
     prepared: &PreparedManifest,
     catalog: Arc<Catalog>,
     vars: HashMap<String, String>,
 ) -> Result<Validated, WorkflowError> {
-    validate(manifest_validate_input(prepared, catalog, vars))
+    validate_with_catalog(manifest_validate_input(prepared, vars), catalog)
 }
 
 pub(crate) fn validate_prepared_manifest_for_preflight(
@@ -206,14 +213,14 @@ pub(crate) fn validate_prepared_manifest_for_preflight(
     ready_providers: &[ProviderId],
 ) -> Result<Validated, WorkflowError> {
     validate_with_ready_providers(
-        manifest_validate_input(prepared, catalog, vars),
+        manifest_validate_input(prepared, vars),
+        catalog,
         ready_providers,
     )
 }
 
 fn manifest_validate_input(
     prepared: &PreparedManifest,
-    catalog: Arc<Catalog>,
     vars: HashMap<String, String>,
 ) -> ValidateInput {
     ValidateInput {
@@ -222,7 +229,6 @@ fn manifest_validate_input(
         vars,
         cwd: prepared.cwd.clone(),
         custom_transforms: Vec::new(),
-        catalog,
     }
 }
 

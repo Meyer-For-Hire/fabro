@@ -9,7 +9,7 @@ use fabro_types::{BilledTokenCounts, DiffSummary, EventBody, RunFailure, RunProj
 use fabro_util::error::collect_causes;
 use fabro_util::time::elapsed_ms;
 
-use super::types::{Concluded, Executed, FinalizeOptions};
+use super::types::{Concluded, Executed, FinalizeOptions, Finalized, PublishOutcome, Published};
 use crate::error::{Error, run_failure_from_error, run_failure_from_outcome_failure};
 use crate::event::{Event, RunNoticeCode, RunNoticeLevel};
 use crate::outcome::{Outcome, StageOutcome};
@@ -44,27 +44,16 @@ pub fn classify_engine_result(
             };
             (status, failure, run_status)
         }
-        Err(Error::Cancelled) => (
-            StageOutcome::Failed {
-                retry_requested: false,
-            },
-            Some(run_failure_from_error(
-                &Error::Cancelled,
-                FailureReason::Cancelled,
-            )),
-            RunStatus::Failed {
-                reason: FailureReason::Cancelled,
-            },
-        ),
-        Err(err) => (
-            StageOutcome::Failed {
-                retry_requested: false,
-            },
-            Some(run_failure_from_error(err, FailureReason::WorkflowError)),
-            RunStatus::Failed {
-                reason: FailureReason::WorkflowError,
-            },
-        ),
+        Err(err) => {
+            let reason = err.failure_reason();
+            (
+                StageOutcome::Failed {
+                    retry_requested: false,
+                },
+                Some(run_failure_from_error(err, reason)),
+                RunStatus::Failed { reason },
+            )
+        }
     }
 }
 
@@ -480,10 +469,7 @@ pub(crate) fn build_terminal_event(
     }
 
     let failure = match outcome {
-        Err(Error::Cancelled) => {
-            run_failure_from_error(&Error::Cancelled, FailureReason::Cancelled)
-        }
-        Err(err) => run_failure_from_error(err, FailureReason::WorkflowError),
+        Err(err) => run_failure_from_error(err, err.failure_reason()),
         Ok(outcome) => {
             if let Some(failure) = outcome.failure.as_ref() {
                 run_failure_from_outcome_failure(failure, FailureReason::WorkflowError)
@@ -521,16 +507,13 @@ async fn stop_sandbox_on_terminal(
     Ok(())
 }
 
-/// FINALIZE phase: build conclusion, write the meta branch, emit the terminal
-/// `WorkflowRunCompleted`/`WorkflowRunFailed` event.
-///
-/// The terminal event is emitted here (not from `on_run_end`) so observers
-/// can't act on "done" before the meta branch writes are flushed.
+/// CONCLUDE phase: collect the execution result, final commit, and diff.
 ///
 /// # Errors
 ///
-/// Returns `Error` if persisting terminal state fails.
-pub async fn finalize(executed: Executed, options: &FinalizeOptions) -> Result<Concluded, Error> {
+/// Returns `Error` if the run state needed to build the conclusion cannot be
+/// collected.
+pub async fn conclude(executed: Executed, options: &FinalizeOptions) -> Result<Concluded, Error> {
     let Executed {
         graph,
         outcome,
@@ -561,7 +544,7 @@ pub async fn finalize(executed: Executed, options: &FinalizeOptions) -> Result<C
     let checkpoint = projection
         .as_ref()
         .and_then(|state| state.current_checkpoint());
-    let conclusion = build_conclusion_from_parts(
+    let mut conclusion = build_conclusion_from_parts(
         checkpoint,
         &projection_billing,
         &projection_order,
@@ -571,10 +554,59 @@ pub async fn finalize(executed: Executed, options: &FinalizeOptions) -> Result<C
         options.last_git_sha.clone(),
     );
 
-    let ((final_patch, diff_summary), ()) = tokio::join!(
-        compute_final_patch(&run_options, &services, final_status),
-        write_finalize_commit(&run_options, &services, &conclusion),
-    );
+    let (final_patch, diff_summary) =
+        compute_final_patch(&run_options, &services, final_status).await;
+    conclusion.diff = fabro_types::RunDiff {
+        patch:   final_patch,
+        summary: diff_summary,
+    };
+
+    Ok(Concluded {
+        outcome,
+        conclusion,
+        artifact_count,
+        graph,
+        run_options,
+        services,
+    })
+}
+
+/// FINALIZE phase: persist the final conclusion, emit the terminal event, and
+/// clean up the sandbox.
+///
+/// This runs after PUBLISH so a required push or pull-request failure becomes
+/// the terminal run result.
+///
+/// # Errors
+///
+/// Returns `Error` if persisting terminal state fails.
+pub async fn finalize(published: Published, options: &FinalizeOptions) -> Result<Finalized, Error> {
+    let Published {
+        execution_outcome,
+        publish_outcome,
+        publish_error,
+        mut conclusion,
+        artifact_count,
+        run_options,
+        services,
+    } = published;
+
+    let PublishOutcome {
+        pushed_branch,
+        pr_url,
+    } = publish_outcome;
+    // An execution failure outranks a publish failure: publish only runs after
+    // a successful execution, so the two are never both set.
+    let outcome = match (execution_outcome, publish_error) {
+        (Err(error), _) | (Ok(_), Some(error)) => Err(error),
+        (Ok(outcome), None) => Ok(outcome),
+    };
+
+    let (final_status, failure, _run_status) = classify_engine_result(&outcome);
+    conclusion.status = final_status;
+    conclusion.failure = failure;
+
+    write_finalize_commit(&run_options, &services, &conclusion).await;
 
     if services.metadata_runtime.metadata_degraded() {
         services.emitter.notice(
@@ -588,9 +620,9 @@ pub async fn finalize(executed: Executed, options: &FinalizeOptions) -> Result<C
         &outcome,
         conclusion.timing,
         artifact_count,
-        options.last_git_sha.clone(),
-        final_patch,
-        diff_summary,
+        conclusion.final_git_commit_sha.clone(),
+        conclusion.diff.patch.clone(),
+        conclusion.diff.summary,
         conclusion.billing.clone(),
     );
     services.emitter.emit(&terminal_event);
@@ -626,12 +658,12 @@ pub async fn finalize(executed: Executed, options: &FinalizeOptions) -> Result<C
         );
     }
 
-    Ok(Concluded {
+    Ok(Finalized {
+        run_id: run_options.run_id,
         outcome,
         conclusion,
-        graph,
-        run_options,
-        services,
+        pushed_branch,
+        pr_url,
     })
 }
 
@@ -659,6 +691,7 @@ mod tests {
 
     use super::*;
     use crate::context::Context;
+    use crate::error::ErrorStage;
     use crate::event::{Emitter, StoreProgressLogger, append_event};
     use crate::run_metadata::{RunMetadataRuntime, RunMetadataWriterHandle};
     use crate::run_options::{GitCheckpointOptions, RunOptions};
@@ -715,6 +748,21 @@ mod tests {
             engine: Arc::new(engine),
             model: "test-model".to_string(),
         }
+    }
+
+    async fn finalize_executed(
+        executed: Executed,
+        options: &FinalizeOptions,
+    ) -> Result<Finalized, Error> {
+        let concluded = conclude(executed, options).await?;
+        let published = crate::pipeline::publish(concluded, &crate::pipeline::PublishOptions {
+            pr_config:  None,
+            github_app: None,
+            origin_url: None,
+            model:      "test-model".to_string(),
+        })
+        .await;
+        finalize(published, options).await
     }
 
     fn test_store() -> Arc<Database> {
@@ -869,6 +917,26 @@ mod tests {
     }
 
     use crate::test_support::test_usage;
+
+    #[test]
+    fn publish_error_builds_publish_failed_terminal_event() {
+        let event = build_terminal_event(
+            &Err(Error::publish("GitHub rejected pull request creation")),
+            fabro_types::RunTiming::wall_only(10),
+            0,
+            Some("final-sha".to_string()),
+            Some("diff".to_string()),
+            None,
+            None,
+        );
+
+        match event {
+            Event::WorkflowRunFailed { failure, .. } => {
+                assert_eq!(failure.reason, FailureReason::PublishFailed);
+            }
+            other => panic!("expected run failure, got {other:?}"),
+        }
+    }
 
     #[test]
     fn conclusion_stage_order_follows_projection_first_event_order() {
@@ -1069,7 +1137,7 @@ mod tests {
             services,
         );
 
-        let concluded = finalize(executed, &FinalizeOptions {
+        let concluded = finalize_executed(executed, &FinalizeOptions {
             run_dir:          run_dir.clone(),
             run_id:           test_run_id(),
             workflow_name:    "test".to_string(),
@@ -1250,7 +1318,7 @@ mod tests {
             services,
         );
 
-        finalize(executed, &FinalizeOptions {
+        finalize_executed(executed, &FinalizeOptions {
             run_dir:          repo_dir.path().to_path_buf(),
             run_id:           test_run_id(),
             workflow_name:    "test".to_string(),
@@ -1275,6 +1343,337 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configured_run_branch_without_remote_is_not_reported_as_pushed() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let emitter = Arc::new(Emitter::new(test_run_id()));
+        let events = record_events(&emitter);
+        let services = test_services(
+            RunStoreHandle::local(seeded_run_store().await),
+            emitter,
+            Arc::new(MockSandbox::linux()),
+            Arc::new(RunMetadataRuntime::new()),
+            None,
+        );
+        let mut run_options = test_run_options(repo_dir.path());
+        run_options.git = Some(GitCheckpointOptions {
+            base_sha:    None,
+            run_branch:  Some("fabro/run/test".to_string()),
+            meta_branch: None,
+        });
+        let executed = test_executed(
+            Graph::new("test"),
+            Ok(Outcome::success()),
+            run_options,
+            5,
+            services,
+        );
+        let options = FinalizeOptions {
+            run_dir:          repo_dir.path().to_path_buf(),
+            run_id:           test_run_id(),
+            workflow_name:    "test".to_string(),
+            preserve_sandbox: false,
+            stop_on_terminal: true,
+            last_git_sha:     Some("final-sha".to_string()),
+        };
+        let concluded = conclude(executed, &options).await.unwrap();
+        let published = crate::pipeline::publish(concluded, &crate::pipeline::PublishOptions {
+            pr_config:  None,
+            github_app: None,
+            origin_url: None,
+            model:      "test-model".to_string(),
+        })
+        .await;
+
+        assert_eq!(published.publish_outcome, PublishOutcome::default());
+        assert!(published.publish_error.is_none());
+        let finalized = finalize(published, &options).await.unwrap();
+
+        assert!(finalized.outcome.is_ok());
+        assert_eq!(finalized.pushed_branch, None);
+        let events = events.lock().unwrap();
+        let names = events.iter().map(RunEvent::event_name).collect::<Vec<_>>();
+        assert_eq!(names, vec!["run.completed"]);
+    }
+
+    #[tokio::test]
+    async fn final_push_failure_becomes_terminal_publish_failure() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let sandbox = Arc::new(MockSandbox::linux());
+        let emitter = Arc::new(Emitter::new(test_run_id()));
+        let events = record_events(&emitter);
+        let services = test_services(
+            RunStoreHandle::local(seeded_run_store().await),
+            emitter,
+            sandbox,
+            Arc::new(RunMetadataRuntime::new()),
+            None,
+        );
+        let mut run_options = test_run_options(repo_dir.path());
+        run_options.git = Some(GitCheckpointOptions {
+            base_sha:    None,
+            run_branch:  Some("fabro/run/test".to_string()),
+            meta_branch: None,
+        });
+        let executed = test_executed(
+            Graph::new("test"),
+            Ok(Outcome::success()),
+            run_options,
+            5,
+            services,
+        );
+        let options = FinalizeOptions {
+            run_dir:          repo_dir.path().to_path_buf(),
+            run_id:           test_run_id(),
+            workflow_name:    "test".to_string(),
+            preserve_sandbox: false,
+            stop_on_terminal: true,
+            last_git_sha:     Some("final-sha".to_string()),
+        };
+        let concluded = conclude(executed, &options).await.unwrap();
+        let published = crate::pipeline::publish(concluded, &crate::pipeline::PublishOptions {
+            pr_config:  None,
+            github_app: None,
+            origin_url: Some("https://github.com/owner/repo.git".to_string()),
+            model:      "test-model".to_string(),
+        })
+        .await;
+
+        assert!(matches!(
+            &published.publish_error,
+            Some(Error::Stage {
+                stage: ErrorStage::Publish,
+                ..
+            })
+        ));
+        let finalized = finalize(published, &options).await.unwrap();
+
+        assert!(matches!(
+            finalized.outcome,
+            Err(Error::Stage {
+                stage: ErrorStage::Publish,
+                ..
+            })
+        ));
+        assert_eq!(
+            finalized
+                .conclusion
+                .failure
+                .as_ref()
+                .map(|failure| failure.reason),
+            Some(FailureReason::PublishFailed)
+        );
+        let events = events.lock().unwrap();
+        let names = events.iter().map(RunEvent::event_name).collect::<Vec<_>>();
+        assert_eq!(names, vec!["git.push", "run.failed"]);
+        match &events.last().unwrap().body {
+            EventBody::RunFailed(props) => {
+                assert_eq!(props.failure.reason, FailureReason::PublishFailed);
+            }
+            other => panic!("expected run.failed, got {other:?}"),
+        }
+    }
+
+    /// An empty diff means there is nothing to open a pull request for. The
+    /// branch still gets pushed and the run still succeeds.
+    #[tokio::test]
+    async fn empty_diff_pushes_branch_without_opening_pull_request() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_git_repo(repo_dir.path());
+        let emitter = Arc::new(Emitter::new(test_run_id()));
+        let events = record_events(&emitter);
+        let services = test_services(
+            RunStoreHandle::local(seeded_run_store().await),
+            emitter,
+            Arc::new(fabro_agent::LocalSandbox::new(
+                repo_dir.path().to_path_buf(),
+            )),
+            Arc::new(RunMetadataRuntime::new()),
+            None,
+        );
+        let mut run_options = test_run_options(repo_dir.path());
+        run_options.base_branch = Some("main".to_string());
+        run_options.git = Some(GitCheckpointOptions {
+            base_sha:    None,
+            run_branch:  Some("fabro/run/test".to_string()),
+            meta_branch: None,
+        });
+        let executed = test_executed(
+            Graph::new("test"),
+            Ok(Outcome::success()),
+            run_options,
+            5,
+            services,
+        );
+        let options = FinalizeOptions {
+            run_dir:          repo_dir.path().to_path_buf(),
+            run_id:           test_run_id(),
+            workflow_name:    "test".to_string(),
+            preserve_sandbox: false,
+            stop_on_terminal: true,
+            last_git_sha:     Some("final-sha".to_string()),
+        };
+        let mut concluded = conclude(executed, &options).await.unwrap();
+        concluded.conclusion.diff.patch = None;
+        let published = crate::pipeline::publish(concluded, &crate::pipeline::PublishOptions {
+            pr_config:  Some(fabro_types::settings::run::PullRequestSettings {
+                enabled:        true,
+                draft:          true,
+                auto_merge:     false,
+                merge_strategy: fabro_types::settings::run::MergeStrategy::Squash,
+            }),
+            github_app: None,
+            origin_url: Some("https://github.com/owner/repo.git".to_string()),
+            model:      "test-model".to_string(),
+        })
+        .await;
+
+        assert!(published.publish_error.is_none());
+        let finalized = finalize(published, &options).await.unwrap();
+
+        assert!(finalized.outcome.is_ok());
+        assert_eq!(finalized.pushed_branch.as_deref(), Some("fabro/run/test"));
+        assert_eq!(finalized.pr_url, None);
+        let events = events.lock().unwrap();
+        let names = events.iter().map(RunEvent::event_name).collect::<Vec<_>>();
+        assert_eq!(names, vec!["git.push", "run.completed"]);
+    }
+
+    /// `base_sha` is where the run started, not what it produced. Reporting it
+    /// as the final commit would both mis-state a durable field and make the
+    /// remote-head check reject a branch that was pushed correctly.
+    #[tokio::test]
+    async fn untracked_final_commit_does_not_fall_back_to_base_sha() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_git_repo(repo_dir.path());
+        let emitter = Arc::new(Emitter::new(test_run_id()));
+        let services = test_services(
+            RunStoreHandle::local(seeded_run_store().await),
+            emitter,
+            Arc::new(fabro_agent::LocalSandbox::new(
+                repo_dir.path().to_path_buf(),
+            )),
+            Arc::new(RunMetadataRuntime::new()),
+            None,
+        );
+        let mut run_options = test_run_options(repo_dir.path());
+        run_options.base_branch = Some("main".to_string());
+        run_options.git = Some(GitCheckpointOptions {
+            base_sha:    Some("base-sha".to_string()),
+            run_branch:  Some("fabro/run/test".to_string()),
+            meta_branch: None,
+        });
+        let executed = test_executed(
+            Graph::new("test"),
+            Ok(Outcome::success()),
+            run_options,
+            5,
+            services,
+        );
+        let options = FinalizeOptions {
+            run_dir:          repo_dir.path().to_path_buf(),
+            run_id:           test_run_id(),
+            workflow_name:    "test".to_string(),
+            preserve_sandbox: false,
+            stop_on_terminal: true,
+            last_git_sha:     None,
+        };
+        let mut concluded = conclude(executed, &options).await.unwrap();
+
+        assert_eq!(concluded.conclusion.final_git_commit_sha, None);
+
+        // No pull request wanted, so publish still pushes the branch and the
+        // run succeeds without needing a commit SHA at all.
+        concluded.conclusion.diff.patch = None;
+        let published = crate::pipeline::publish(concluded, &crate::pipeline::PublishOptions {
+            pr_config:  None,
+            github_app: None,
+            origin_url: Some("https://github.com/owner/repo.git".to_string()),
+            model:      "test-model".to_string(),
+        })
+        .await;
+        let finalized = finalize(published, &options).await.unwrap();
+
+        assert!(finalized.outcome.is_ok());
+        assert_eq!(finalized.pushed_branch.as_deref(), Some("fabro/run/test"));
+        assert_eq!(finalized.conclusion.final_git_commit_sha, None);
+    }
+
+    #[tokio::test]
+    async fn pull_request_failure_precedes_terminal_publish_failure() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        init_git_repo(repo_dir.path());
+        let emitter = Arc::new(Emitter::new(test_run_id()));
+        let events = record_events(&emitter);
+        let services = test_services(
+            RunStoreHandle::local(seeded_run_store().await),
+            emitter,
+            Arc::new(fabro_agent::LocalSandbox::new(
+                repo_dir.path().to_path_buf(),
+            )),
+            Arc::new(RunMetadataRuntime::new()),
+            None,
+        );
+        let mut run_options = test_run_options(repo_dir.path());
+        run_options.base_branch = Some("main".to_string());
+        run_options.git = Some(GitCheckpointOptions {
+            base_sha:    None,
+            run_branch:  Some("fabro/run/test".to_string()),
+            meta_branch: None,
+        });
+        let executed = test_executed(
+            Graph::new("test"),
+            Ok(Outcome::success()),
+            run_options,
+            5,
+            services,
+        );
+        let options = FinalizeOptions {
+            run_dir:          repo_dir.path().to_path_buf(),
+            run_id:           test_run_id(),
+            workflow_name:    "test".to_string(),
+            preserve_sandbox: false,
+            stop_on_terminal: true,
+            last_git_sha:     Some("final-sha".to_string()),
+        };
+        let mut concluded = conclude(executed, &options).await.unwrap();
+        concluded.conclusion.diff.patch =
+            Some("diff --git a/a b/a\n+published change\n".to_string());
+        let published = crate::pipeline::publish(concluded, &crate::pipeline::PublishOptions {
+            pr_config:  Some(fabro_types::settings::run::PullRequestSettings {
+                enabled:        true,
+                draft:          true,
+                auto_merge:     false,
+                merge_strategy: fabro_types::settings::run::MergeStrategy::Squash,
+            }),
+            github_app: None,
+            origin_url: Some("https://github.com/owner/repo.git".to_string()),
+            model:      "test-model".to_string(),
+        })
+        .await;
+        let finalized = finalize(published, &options).await.unwrap();
+
+        assert!(matches!(
+            finalized.outcome,
+            Err(Error::Stage {
+                stage: ErrorStage::Publish,
+                ..
+            })
+        ));
+        // The push landed before the pull request failed, so the branch is
+        // still reported — that is exactly the run where the user needs it.
+        assert_eq!(finalized.pushed_branch.as_deref(), Some("fabro/run/test"));
+        let events = events.lock().unwrap();
+        let names = events.iter().map(RunEvent::event_name).collect::<Vec<_>>();
+        assert_eq!(names, vec!["git.push", "pull_request.failed", "run.failed"]);
+        match &events.last().unwrap().body {
+            EventBody::RunFailed(props) => {
+                assert_eq!(props.failure.reason, FailureReason::PublishFailed);
+            }
+            other => panic!("expected run.failed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn finalize_stops_sandbox_on_terminal_without_deleting() {
         let repo_dir = tempfile::tempdir().unwrap();
         let sandbox = Arc::new(MockSandbox::linux());
@@ -1293,7 +1692,7 @@ mod tests {
             services,
         );
 
-        finalize(executed, &FinalizeOptions {
+        finalize_executed(executed, &FinalizeOptions {
             run_dir:          repo_dir.path().to_path_buf(),
             run_id:           test_run_id(),
             workflow_name:    "test".to_string(),
@@ -1327,7 +1726,7 @@ mod tests {
             services,
         );
 
-        finalize(executed, &FinalizeOptions {
+        finalize_executed(executed, &FinalizeOptions {
             run_dir:          repo_dir.path().to_path_buf(),
             run_id:           test_run_id(),
             workflow_name:    "test".to_string(),
@@ -1380,7 +1779,7 @@ mod tests {
             services,
         );
 
-        finalize(executed, &FinalizeOptions {
+        finalize_executed(executed, &FinalizeOptions {
             run_dir:          repo.to_path_buf(),
             run_id:           test_run_id(),
             workflow_name:    "test".to_string(),

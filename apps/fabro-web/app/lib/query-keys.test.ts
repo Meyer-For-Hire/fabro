@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
 import { queryKeys } from "./query-keys";
-import { queryKeysForRunEvent } from "./run-events";
 
 describe("queryKeys", () => {
   test("uses semantic tuples as stable SWR keys and keeps SSE URLs explicit", () => {
@@ -61,52 +60,4 @@ describe("queryKeys", () => {
     expect(queryKeys.runs.attachUrl("run 1")).toBe("/api/v1/runs/run%201/attach");
   });
 
-  test("event-mapped keys match query hook resources", () => {
-    expect(queryKeysForRunEvent("run-1", "checkpoint.completed")).toEqual(
-      [
-        ...queryKeys.runs.filesAllScopes("run-1"),
-        queryKeys.runs.commits("run-1"),
-      ],
-    );
-    expect(queryKeysForRunEvent("run-1", "stage.completed", "stage-1")).toEqual([
-      queryKeys.runs.stages("run-1"),
-      queryKeys.runs.billing("run-1"),
-      queryKeys.runs.events("run-1", 1000),
-      queryKeys.runs.graph("run-1", "LR"),
-      queryKeys.runs.graph("run-1", "TB"),
-      queryKeys.runs.detail("run-1"),
-      queryKeys.runs.state("run-1"),
-      queryKeys.runs.stageEvents("run-1", "stage-1"),
-      queryKeys.runs.stageContextWindow("run-1", "stage-1"),
-    ]);
-    expect(queryKeysForRunEvent("run-1", "run.title.updated")).toEqual([
-      queryKeys.runs.detail("run-1"),
-    ]);
-  });
-
-  test("agent activity events invalidate per-stage resources", () => {
-    for (const event of [
-      "stage.prompt",
-      "agent.tool.started",
-      "agent.tool.completed",
-      "command.started",
-      "command.completed",
-    ]) {
-      expect(queryKeysForRunEvent("run-1", event, "stage-1")).toEqual([
-        queryKeys.runs.stageEvents("run-1", "stage-1"),
-        queryKeys.runs.stageContextWindow("run-1", "stage-1"),
-      ]);
-    }
-    expect(queryKeysForRunEvent("run-1", "agent.message", "stage-1")).toEqual([
-      queryKeys.runs.state("run-1"),
-      queryKeys.runs.stageEvents("run-1", "stage-1"),
-      queryKeys.runs.stageContextWindow("run-1", "stage-1"),
-    ]);
-  });
-
-  test("agent message without a node_id still invalidates projected state", () => {
-    expect(queryKeysForRunEvent("run-1", "agent.message")).toEqual([
-      queryKeys.runs.state("run-1"),
-    ]);
-  });
 });

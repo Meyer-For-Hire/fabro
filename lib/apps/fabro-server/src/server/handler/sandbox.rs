@@ -881,7 +881,7 @@ async fn reconnect_run_sandbox_instance(
             let detail = render_with_causes(&err.to_string(), &collect_causes(err.as_ref()));
             ApiError::new(StatusCode::CONFLICT, detail).into_response()
         })?;
-    sandbox.start().await.map_err(|err| {
+    sandbox.activate().await.map_err(|err| {
         ApiError::new(StatusCode::CONFLICT, err.display_with_causes()).into_response()
     })?;
     Ok(sandbox)
@@ -927,7 +927,7 @@ async fn reconnect_daytona_sandbox_instance(
     .map_err(|err| {
         ApiError::new(StatusCode::CONFLICT, err.display_with_causes()).into_response()
     })?;
-    sandbox.start().await.map_err(|err| {
+    sandbox.activate().await.map_err(|err| {
         ApiError::new(StatusCode::CONFLICT, err.display_with_causes()).into_response()
     })?;
     Ok(sandbox)

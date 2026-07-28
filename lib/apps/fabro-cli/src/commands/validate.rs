@@ -23,11 +23,7 @@ pub(crate) fn run(
         user_settings_path: Some(active_settings_path(None)),
         ..Default::default()
     })?;
-    let response = manifest_validation::validate_manifest(
-        &RunLayer::default(),
-        &built.manifest,
-        base_ctx.catalog()?,
-    )?;
+    let response = manifest_validation::validate_manifest(&RunLayer::default(), &built.manifest)?;
     let diagnostics = api_diagnostics_to_local(&response.workflow.diagnostics);
 
     if base_ctx.json_output() {

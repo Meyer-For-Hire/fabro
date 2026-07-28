@@ -20,6 +20,7 @@
 
 export const FailureReason = {
     WORKFLOW_ERROR: 'workflow_error',
+    PUBLISH_FAILED: 'publish_failed',
     CANCELLED: 'cancelled',
     APPROVAL_DENIED: 'approval_denied',
     TERMINATED: 'terminated',

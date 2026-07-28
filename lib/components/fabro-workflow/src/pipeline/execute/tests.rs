@@ -17,6 +17,7 @@ use fabro_graphviz::graph::{AttrValue, Edge, Graph, Node};
 use fabro_hooks::HookSettings;
 use fabro_interview::AutoApproveInterviewer;
 use fabro_sandbox::SandboxSpec;
+use fabro_sandbox::test_support::MockSandbox;
 use fabro_store::Database;
 use fabro_types::settings::run::RunModelControls;
 use fabro_types::{
@@ -648,6 +649,28 @@ impl HandlerTrait for SlowHandler {
     }
 }
 
+struct StopsSandboxHandler {
+    sandbox: Arc<MockSandbox>,
+}
+
+#[async_trait]
+impl HandlerTrait for StopsSandboxHandler {
+    async fn execute(
+        &self,
+        _node: &Node,
+        _context: &Context,
+        _graph: &Graph,
+        _run_dir: &Path,
+        _services: &crate::handler::EngineServices,
+    ) -> std::result::Result<Outcome, Error> {
+        self.sandbox
+            .stop()
+            .await
+            .map_err(|err| Error::handler_with_source("failed to stop test sandbox", err))?;
+        Ok(Outcome::success())
+    }
+}
+
 struct PanickingHandler;
 
 #[async_trait]
@@ -801,6 +824,65 @@ async fn execute_runs_simple_workflow() {
     .await
     .unwrap();
     assert_eq!(outcome.status, StageOutcome::Succeeded);
+}
+
+#[tokio::test]
+async fn execute_preserves_sandbox_activation_error_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    let sandbox: Arc<dyn Sandbox> =
+        Arc::new(MockSandbox::linux().with_activate_error("provider unavailable"));
+
+    let error = run_graph(
+        make_registry(),
+        test_emitter_arc("test-run"),
+        sandbox,
+        &simple_graph(),
+        &test_run_options(dir.path(), "test-run"),
+    )
+    .await
+    .expect_err("sandbox activation should fail");
+
+    assert_eq!(error.causes(), vec![
+        "failed to activate sandbox before node start",
+        "Mock sandbox activation failed",
+        "provider unavailable",
+    ]);
+}
+
+#[tokio::test]
+async fn execute_reactivates_sandbox_after_a_stage_can_leave_it_stopped() {
+    let dir = tempfile::tempdir().unwrap();
+    let sandbox = Arc::new(MockSandbox::linux());
+    let mut registry = make_registry();
+    registry.register(
+        "start",
+        Box::new(StopsSandboxHandler {
+            sandbox: Arc::clone(&sandbox),
+        }),
+    );
+    let sandbox_for_run: Arc<dyn Sandbox> = sandbox.clone();
+    let mut run_options = test_run_options(dir.path(), "test-run");
+    run_options
+        .settings
+        .run
+        .artifacts
+        .include
+        .push("**/*".to_string());
+
+    let outcome = run_graph(
+        registry,
+        test_emitter_arc("test-run"),
+        sandbox_for_run,
+        &simple_graph(),
+        &run_options,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(outcome.status, StageOutcome::Succeeded);
+    assert_eq!(sandbox.stop_count(), 1);
+    assert!(sandbox.walk_files_was_called());
+    assert!(!sandbox.walked_while_inactive());
 }
 
 #[tokio::test]

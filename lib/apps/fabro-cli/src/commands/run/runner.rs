@@ -110,7 +110,6 @@ pub(crate) async fn execute(
             run_id,
             run_spec.source_directory.as_deref(),
             &run_dir,
-            Arc::clone(&catalog),
         )
     } else {
         None
@@ -235,13 +234,12 @@ fn build_fabro_run_tool_services(
     current_run_id: RunId,
     source_directory: Option<&str>,
     run_dir: &Path,
-    catalog: Arc<Catalog>,
 ) -> Option<FabroRunToolServices> {
     if worker_token.trim().is_empty() {
         return None;
     }
     let backend = ClientBackend::new(Arc::new(client))
-        .with_manifest_builder(Arc::new(WorkerRunManifestBuilder { catalog }));
+        .with_manifest_builder(Arc::new(WorkerRunManifestBuilder));
     Some(FabroRunToolServices {
         backend: Arc::new(backend),
         current_run_id,
@@ -250,9 +248,7 @@ fn build_fabro_run_tool_services(
     })
 }
 
-struct WorkerRunManifestBuilder {
-    catalog: Arc<Catalog>,
-}
+struct WorkerRunManifestBuilder;
 
 impl fabro_tool::RunManifestBuilder for WorkerRunManifestBuilder {
     fn build_run_manifest(
@@ -261,12 +257,7 @@ impl fabro_tool::RunManifestBuilder for WorkerRunManifestBuilder {
         cwd: &Path,
         user_settings_path: &Path,
     ) -> fabro_tool::ToolResult<RunManifest> {
-        run_tool_manifest::build_run_tool_manifest(
-            spec,
-            cwd,
-            user_settings_path,
-            Arc::clone(&self.catalog),
-        )
+        run_tool_manifest::build_run_tool_manifest(spec, cwd, user_settings_path)
     }
 }
 
@@ -1351,6 +1342,7 @@ mod tests {
                 allow_freeform:  false,
                 timeout_seconds: None,
                 context_display: None,
+                review_target:   None,
             })),
             Some(WorkerTitlePhase::Waiting)
         );

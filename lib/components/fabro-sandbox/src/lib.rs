@@ -10,6 +10,9 @@ pub mod sandbox_spec;
 mod clone_source;
 
 #[cfg(any(feature = "docker", feature = "daytona", test))]
+mod clone_retry;
+
+#[cfg(any(feature = "docker", feature = "daytona", test))]
 mod managed_labels;
 
 #[cfg(any(feature = "docker", feature = "daytona", test))]

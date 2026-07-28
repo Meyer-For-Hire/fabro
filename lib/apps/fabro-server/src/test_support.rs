@@ -13,6 +13,7 @@ use axum::middleware::Next;
 use axum::response::Response;
 use axum::{Router, middleware};
 use chrono::Duration as ChronoDuration;
+use fabro_config::user::default_storage_dir;
 use fabro_config::{RunLayer, ServerSettingsBuilder, Storage, envfile};
 use fabro_db::DbPool;
 use fabro_interview::Interviewer;
@@ -253,9 +254,10 @@ impl TestAppStateBuilder {
         self.try_build().expect("test app state should build")
     }
 
-    pub fn try_build(self) -> anyhow::Result<Arc<AppState>> {
+    pub fn try_build(mut self) -> anyhow::Result<Arc<AppState>> {
         let (store, artifact_store) = self.store_bundle.unwrap_or_else(test_store_bundle);
         let vault_path = self.vault_path.unwrap_or_else(test_secret_store_path);
+        self.server_settings = redirect_default_storage_root(self.server_settings, &vault_path);
         if !self.vault_entries.is_empty() {
             let mut vault = Vault::load(vault_path.clone()).expect("test vault should load");
             for (name, value) in &self.vault_entries {
@@ -670,6 +672,27 @@ pub fn test_secret_store_path() -> PathBuf {
     let dir = std::env::temp_dir().join(format!("fabro-test-{}", Ulid::new()));
     std::fs::create_dir_all(&dir).expect("test temp dir should be creatable");
     dir.join("secrets.json")
+}
+
+/// Keeps tests off the developer's real `~/.fabro/storage`.
+///
+/// Settings built for tests usually omit `[server.storage] root`, which
+/// resolves to the production default. Handlers that walk that tree — `df`,
+/// `system/resources`, `prune` — then read whatever runs and scratch
+/// directories the machine happens to have, making tests slow and
+/// machine-dependent, and letting run-creating tests write there.
+///
+/// Only settings still carrying the production default are redirected; a test
+/// that chose its own root keeps it. The redirect goes through
+/// [`ServerSettings::with_storage_override`] so the derived local object-store
+/// roots move with it instead of pointing back at the real storage tree.
+fn redirect_default_storage_root(settings: ServerSettings, vault_path: &Path) -> ServerSettings {
+    if Path::new(&settings.server.storage.root) != default_storage_dir() {
+        return settings;
+    }
+    let root = vault_path.with_file_name("storage");
+    std::fs::create_dir_all(&root).expect("test storage root should be creatable");
+    settings.with_storage_override(&root)
 }
 
 #[must_use]

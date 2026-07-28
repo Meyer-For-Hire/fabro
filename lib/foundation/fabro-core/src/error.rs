@@ -55,6 +55,12 @@ pub enum Error {
     StallTimeout { node_id: String },
     #[error("{detail}")]
     Handler { detail: Box<HandlerErrorDetail> },
+    #[error("{message}")]
+    Context {
+        message: String,
+        #[source]
+        source:  Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
     #[error("{0}")]
     Other(String),
 }
@@ -69,6 +75,16 @@ impl Error {
     pub fn blocked(message: impl Into<String>) -> Self {
         Self::Blocked {
             message: message.into(),
+        }
+    }
+
+    pub fn context(
+        message: impl Into<String>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        Self::Context {
+            message: message.into(),
+            source:  Box::new(source),
         }
     }
 
@@ -94,6 +110,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error as _;
+
     use super::*;
     use crate::outcome::FailureCategory;
 
@@ -151,6 +169,20 @@ mod tests {
             failure:   FailureDetail::new("bad input", FailureCategory::Deterministic),
         });
         assert!(!not_retryable.is_retryable());
+    }
+
+    #[test]
+    fn core_error_context_preserves_source() {
+        let error = Error::context(
+            "failed to activate sandbox",
+            std::io::Error::other("provider unavailable"),
+        );
+
+        assert_eq!(error.to_string(), "failed to activate sandbox");
+        assert_eq!(
+            error.source().map(ToString::to_string).as_deref(),
+            Some("provider unavailable")
+        );
     }
 
     #[test]

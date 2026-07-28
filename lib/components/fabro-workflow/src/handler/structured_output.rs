@@ -224,7 +224,12 @@ pub(crate) fn apply_validated_output(
     }
 }
 
-/// Find all balanced `{...}` JSON object substrings in the text.
+/// Find the outermost balanced `{...}` JSON object substrings in the text, in
+/// document order. Objects nested inside a match are skipped.
+///
+/// An unbalanced `{` does not suppress complete objects around or inside it:
+/// the scan only skips ahead past a *matched* object, so it still walks into a
+/// region that failed to close.
 fn find_json_objects(text: &str) -> Vec<&str> {
     let mut results = Vec::new();
     let bytes = text.as_bytes();
@@ -251,6 +256,7 @@ fn find_json_objects(text: &str) -> Vec<&str> {
                         depth -= 1;
                         if depth == 0 {
                             results.push(&text[start..=j]);
+                            i = j;
                             break;
                         }
                     }
@@ -269,7 +275,8 @@ pub(crate) fn terminal_json_object(text: &str) -> Option<&str> {
     let trimmed = text.trim_end();
     find_json_objects(trimmed)
         .into_iter()
-        .find(|candidate| trimmed.ends_with(candidate))
+        .next_back()
+        .filter(|candidate| trimmed.ends_with(candidate))
 }
 
 pub(crate) fn extract_status_fields(text: &str, outcome: &mut Outcome) -> bool {
@@ -334,21 +341,32 @@ fn validate_custom_response_text(
     validator: &Validator,
     text: &str,
 ) -> Result<ValidatedStructuredOutput, StructuredOutputError> {
+    // Prose after the object can contain braces, so the last candidate is not
+    // always JSON. Take the last one that parses; report its schema errors
+    // rather than falling back to an earlier object that happens to validate.
     let candidates = find_json_objects(text);
-    let Some(candidate) = candidates.last() else {
-        return Err(StructuredOutputError::new(
+    let mut invalid_json = None;
+    for candidate in candidates.iter().rev() {
+        match serde_json::from_str::<Value>(candidate) {
+            Ok(parsed) => {
+                validate_value_against_validator(validator, &parsed)?;
+                return Ok(ValidatedStructuredOutput { value: parsed });
+            }
+            Err(err) if invalid_json.is_none() => invalid_json = Some(err.to_string()),
+            Err(_) => {}
+        }
+    }
+
+    Err(match invalid_json {
+        Some(message) => StructuredOutputError::new(
+            StructuredOutputErrorKind::InvalidJson,
+            format!("invalid JSON object: {message}"),
+        ),
+        None => StructuredOutputError::new(
             StructuredOutputErrorKind::NoJsonObject,
             "no JSON object found in response",
-        ));
-    };
-    let parsed = serde_json::from_str::<Value>(candidate).map_err(|err| {
-        StructuredOutputError::new(
-            StructuredOutputErrorKind::InvalidJson,
-            format!("invalid JSON object: {err}"),
-        )
-    })?;
-    validate_value_against_validator(validator, &parsed)?;
-    Ok(ValidatedStructuredOutput { value: parsed })
+        ),
+    })
 }
 
 fn validate_value_against_validator(
@@ -464,6 +482,24 @@ mod tests {
         }
     }
 
+    /// A schema whose required field is itself an object, so validating the
+    /// innermost `{...}` in the response would fail.
+    fn issue_schema() -> OutputSchemaKind {
+        schema(serde_json::json!({
+            "type": "object",
+            "required": ["issue"],
+            "properties": {
+                "issue": {
+                    "type": "object",
+                    "required": ["number"],
+                    "properties": {
+                        "number": { "type": "integer" }
+                    }
+                }
+            }
+        }))
+    }
+
     #[test]
     fn validates_routing_json_and_applies_fields() {
         let validated = validate_response_text(
@@ -556,6 +592,71 @@ mod tests {
             validate_response_text(&schema, r#"ignore {"other":1} final {"passed":true}"#).unwrap();
 
         assert_eq!(validated.value, serde_json::json!({"passed": true}));
+    }
+
+    #[test]
+    fn validates_custom_schema_against_outermost_object() {
+        let validated =
+            validate_response_text(&issue_schema(), r#"{"issue":{"number":19}}"#).unwrap();
+
+        assert_eq!(
+            validated.value,
+            serde_json::json!({"issue": {"number": 19}})
+        );
+    }
+
+    #[test]
+    fn validates_last_outermost_object_when_response_has_trailing_prose() {
+        let validated = validate_response_text(
+            &issue_schema(),
+            r#"ignore {"issue":{"number":1}} final {"issue":{"number":19}} trailing"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            validated.value,
+            serde_json::json!({"issue": {"number": 19}})
+        );
+    }
+
+    #[test]
+    fn validates_last_parsable_object_when_trailing_prose_contains_braces() {
+        let schema = schema(serde_json::json!({
+            "type": "object",
+            "required": ["passed"],
+            "properties": {
+                "passed": { "type": "boolean" }
+            }
+        }));
+
+        let validated = validate_response_text(
+            &schema,
+            "{\"passed\":true}\n\nLet me know if {this works} for you.",
+        )
+        .unwrap();
+
+        assert_eq!(validated.value, serde_json::json!({"passed": true}));
+    }
+
+    #[test]
+    fn find_json_objects_returns_outermost_objects_only() {
+        let cases = [
+            (r#"{"a":{"b":1}}"#, vec![r#"{"a":{"b":1}}"#]),
+            (r#"{"a":1} {"b":2}"#, vec![r#"{"a":1}"#, r#"{"b":2}"#]),
+            (r#"{"a":1}{"b":2}"#, vec![r#"{"a":1}"#, r#"{"b":2}"#]),
+            // An unclosed outer brace must not hide the complete object inside it.
+            (r#"{ {"a":1}"#, vec![r#"{"a":1}"#]),
+            (r#"{"a":1} {"#, vec![r#"{"a":1}"#]),
+            // An unterminated string swallows the rest of its own candidate.
+            (r#"{"a": "x} {"b":2}"#, vec![r#"{"b":2}"#]),
+            // Braces inside strings are not delimiters.
+            (r#"{"a":"} {"}"#, vec![r#"{"a":"} {"}"#]),
+            ("no json here", vec![]),
+        ];
+
+        for (text, expected) in cases {
+            assert_eq!(find_json_objects(text), expected, "input: {text}");
+        }
     }
 
     #[test]

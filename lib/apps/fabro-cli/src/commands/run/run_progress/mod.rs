@@ -1383,6 +1383,7 @@ mod tests {
             repo:        "fabro".into(),
             base_branch: "main".into(),
             head_branch: "fabro/run/42".into(),
+            head_sha:    Some("final-sha".to_string()),
             title:       "Ship the change".into(),
             draft:       true,
         });

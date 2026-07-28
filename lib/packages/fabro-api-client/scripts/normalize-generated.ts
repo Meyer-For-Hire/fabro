@@ -4,6 +4,10 @@
 // blank lines at end of file. Left alone, every regeneration produces a noisy
 // whitespace diff that masks real spec/client drift. This pass strips trailing
 // whitespace from every line and ends each file with exactly one newline.
+//
+// openapi-generator maps arrays with `uniqueItems` to `Set<T>`, but Axios
+// decodes and encodes their JSON representation as arrays. Keep the generated
+// type aligned with the runtime wire value.
 
 import { Glob } from "bun";
 
@@ -14,6 +18,7 @@ for await (const path of glob.scan(".")) {
   const original = await Bun.file(path).text();
   const normalized =
     original
+      .replace(/\bSet</g, "Array<")
       .split("\n")
       .map((line) => line.replace(/\s+$/, ""))
       .join("\n")
