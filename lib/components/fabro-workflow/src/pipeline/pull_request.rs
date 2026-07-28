@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
 use fabro_auth::CredentialSource;
 use fabro_github::{self as github_app, ssh_url_to_https};
@@ -11,6 +12,7 @@ use fabro_store::RunProjection;
 use fabro_types::PullRequestLink;
 use fabro_types::settings::run::MergeStrategy;
 use fabro_util::text::strip_goal_decoration;
+use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
 use crate::outcome::format_cost as outcome_format_cost;
@@ -470,6 +472,54 @@ pub struct CreatedPullRequest {
     pub head_branch: String,
 }
 
+/// How many times to read the remote branch head before giving up.
+///
+/// `GET /repos/{owner}/{repo}/branches/{branch}` is replica-served, so shortly
+/// after the push that publish just made it can still report the previous
+/// commit — or 404 for a branch that is new on the remote.
+const BRANCH_HEAD_ATTEMPTS: u32 = 3;
+const BRANCH_HEAD_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+/// Confirm the remote branch points at the run's final commit.
+///
+/// Publish failures are terminal, so a replica that has not caught up yet must
+/// not be mistaken for a genuinely stale branch.
+async fn verify_remote_head(
+    req: &OpenPullRequestRequest<'_>,
+    owner: &str,
+    repo: &str,
+) -> Result<(), String> {
+    let mut last_seen = Ok(None);
+    for attempt in 1..=BRANCH_HEAD_ATTEMPTS {
+        last_seen = github_app::branch_head_sha(&req.github, owner, repo, req.head_branch).await;
+        match &last_seen {
+            Ok(Some(head)) if head == req.expected_head_sha => return Ok(()),
+            Ok(head) => debug!(
+                attempt,
+                head = ?head,
+                expected = req.expected_head_sha,
+                "Remote branch head does not match the final commit yet"
+            ),
+            Err(err) => debug!(attempt, error = %err, "Failed to read remote branch head"),
+        }
+        if attempt < BRANCH_HEAD_ATTEMPTS {
+            sleep(BRANCH_HEAD_RETRY_DELAY).await;
+        }
+    }
+
+    Err(match last_seen {
+        Ok(Some(head)) => format!(
+            "remote branch '{}' points to commit {head}, expected final commit {}",
+            req.head_branch, req.expected_head_sha
+        ),
+        Ok(None) => format!(
+            "remote branch '{}' does not exist; expected final commit {}",
+            req.head_branch, req.expected_head_sha
+        ),
+        Err(err) => format!("failed to verify remote branch head: {err:#}"),
+    })
+}
+
 /// Open a pull request for a completed run.
 ///
 /// Callers are responsible for skipping runs with an empty diff; reaching here
@@ -480,6 +530,10 @@ pub async fn open_pull_request(
     let https_url = ssh_url_to_https(req.origin_url);
     let (owner, repo) =
         github_app::parse_github_owner_repo(&https_url).map_err(|err| format!("{err:#}"))?;
+
+    // Verify before generating content: this is the cheap check, and a stale
+    // branch would otherwise cost a full LLM call before failing.
+    verify_remote_head(&req, &owner, &repo).await?;
 
     let content = build_pr_content(
         req.diff,
@@ -495,25 +549,6 @@ pub async fn open_pull_request(
     .map_err(|err| format!("{err:#}"))?;
     let body = truncate_pr_body(&content.body);
     let title = content.title;
-
-    let remote_head = github_app::branch_head_sha(&req.github, &owner, &repo, req.head_branch)
-        .await
-        .map_err(|err| format!("failed to verify remote branch head: {err:#}"))?;
-    match remote_head {
-        Some(remote_head) if remote_head == req.expected_head_sha => {}
-        Some(remote_head) => {
-            return Err(format!(
-                "remote branch '{}' points to commit {remote_head}, expected final commit {}",
-                req.head_branch, req.expected_head_sha
-            ));
-        }
-        None => {
-            return Err(format!(
-                "remote branch '{}' does not exist; expected final commit {}",
-                req.head_branch, req.expected_head_sha
-            ));
-        }
-    }
 
     let created = github_app::create_pull_request(
         &req.github,
@@ -1412,11 +1447,13 @@ mod tests {
 
         assert!(error.contains("stale-sha"));
         assert!(error.contains("final-sha"));
-        httpmock::Mock::new(harness.openai_mock_id, &harness.openai_server)
-            .assert_async()
-            .await;
+        // The branch is re-read to ride out replica lag...
         httpmock::Mock::new(harness.branch_mock_id, &harness.github_server)
-            .assert_async()
+            .assert_calls_async(BRANCH_HEAD_ATTEMPTS as usize)
+            .await;
+        // ...but the check runs first, so no LLM call and no PR creation.
+        httpmock::Mock::new(harness.openai_mock_id, &harness.openai_server)
+            .assert_calls_async(0)
             .await;
         httpmock::Mock::new(harness.github_mock_id, &harness.github_server)
             .assert_calls_async(0)

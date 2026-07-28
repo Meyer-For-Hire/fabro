@@ -1,5 +1,5 @@
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use fabro_graphviz::Error as GraphvizError;
 use fabro_llm::{Error as LlmError, ProviderErrorKind};
@@ -11,6 +11,7 @@ use fabro_types::settings::AmbiguousModelRef;
 use fabro_types::{ExecOutputTail, FailureReason, RunFailure};
 use fabro_util::error::{SharedError, collect_causes, collect_chain, render_with_causes};
 use fabro_validate::Diagnostic;
+use regex::Regex;
 use thiserror::Error as ThisError;
 
 use crate::outcome::{FailureDetail, Outcome, StageOutcome};
@@ -153,13 +154,21 @@ impl miette::Diagnostic for SharedTemplateError {
     }
 }
 
+/// Matches git SHAs and other long hex blobs.
+static HEX_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b[0-9a-f]{7,64}\b").expect("hardcoded regex should compile"));
+
 /// Classify a failure reason string using heuristics.
 ///
 /// This is the fallback when structured error information is not available
 /// (e.g. for `Handler(String)` or `Engine(String)` errors).
 #[must_use]
 pub fn classify_failure_reason(reason: &str) -> FailureCategory {
-    let lower = reason.to_lowercase();
+    // Mask commit SHAs first. They are hex, so one contains "500" or "503"
+    // often enough to matter, which would read as a transient infra hint. The
+    // bare status codes those hints look for are too short to be masked.
+    let lowered = reason.to_lowercase();
+    let lower = HEX_RE.replace_all(&lowered, "<hex>");
 
     if lower.contains("interrupt")
         || (lower.contains("cancel")
@@ -196,13 +205,6 @@ pub fn classify_failure_reason(reason: &str) -> FailureCategory {
 /// semantically identical errors produce the same signature regardless of
 /// line numbers, commit hashes, or timestamps.
 pub fn normalize_failure_reason(reason: &str) -> String {
-    use std::sync::LazyLock;
-
-    use regex::Regex;
-
-    static HEX_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"\b[0-9a-f]{7,64}\b").expect("hardcoded regex should compile")
-    });
     static DIGITS_RE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"\b\d+\b").expect("hardcoded regex should compile"));
     static COMMA_SPACE_RE: LazyLock<Regex> =
@@ -2083,6 +2085,23 @@ mod tests {
                 "mismatch for message: {msg}"
             );
         }
+    }
+
+    /// Commit SHAs are hex, so they contain digit runs like "503" often enough
+    /// to matter. Masking them keeps a deterministic failure from being
+    /// reported as transient just because of the SHA it names.
+    #[test]
+    fn commit_shas_do_not_trip_transient_infra_hints() {
+        let sha = "a503b1c9d4e2f7a8b6c3d0e1f2a3b4c5d6e7f8a9";
+        assert_eq!(
+            classify_failure_reason(&format!("failed to push final commit {sha} to branch 'x'")),
+            FailureCategory::Deterministic
+        );
+        // A real status code is still a transient hint.
+        assert_eq!(
+            classify_failure_reason("push rejected with 503"),
+            FailureCategory::TransientInfra
+        );
     }
 
     #[test]
