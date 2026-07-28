@@ -1,0 +1,45 @@
+Generate a concise, human-readable title for this Fabro workflow run.
+
+Base the title on the workflow identity, workflow goal, and run input values.
+Write it the way a person would title a pull request:
+
+- Start with the verb for the work: Implement, Fix, Migrate, Review, Add. When
+  the goal opens with Markdown heading marks or a document-type prefix such as
+  "Plan:", "Goal:", or "Spec:", that prefix names the document rather than the
+  work — drop it and start from the verb that follows.
+- If the run names an identifier — work order, ticket, issue, PR number — put it
+  next in canonical uppercase, then a colon, then a short description:
+  "Implement WRK-044: Separate routine and nightly verification".
+- Take that description from the most specific human-readable text available.
+  Drop directory paths, date prefixes, and file extensions; turn slug hyphens
+  and underscores into spaces; write the result in sentence case.
+- Keep a repository, branch, or environment only when it is what distinguishes
+  this run from an otherwise identical one.
+- Do not end with a period.
+
+Examples:
+
+- goal "Implement Delivery Work Order docs/planning/orders/2026-03-04-wrk-018-retry-backoff.md"
+  -> "Implement WRK-018: Retry backoff"
+- goal "## Plan: migrate the billing service to Postgres 17"
+  -> "Migrate billing service to Postgres 17"
+- goal "Fix flaky checkout test" with input branch "release-9.2"
+  -> "Fix flaky checkout test on release-9.2"
+
+Return only structured JSON with one field: {"title":"..."}.
+The title must be a single line, not blank, and no more than {{ inputs.max_chars }} characters.
+
+Workflow identity:
+```json
+{{ inputs.workflow_identity }}
+```
+
+Run inputs (raw values, not redacted):
+```json
+{{ inputs.run_inputs }}
+```
+
+Workflow summary:
+```json
+{{ inputs.workflow_summary }}
+```

@@ -723,6 +723,58 @@ reasoning = false
     }
 
     #[test]
+    fn vars_resolve_in_command_script_through_create_pipeline() {
+        let dot = r#"digraph Test {
+            graph [goal="Ship it"]
+            start [shape=Mdiamond, label="Start"]
+            exit  [shape=Msquare,  label="Exit"]
+            work  [label="Work", shape=parallelogram, script="deploy --stage {{ vars.STAGE }}"]
+            start -> work -> exit
+        }"#;
+        let vars = HashMap::from([("STAGE".to_string(), "staging".to_string())]);
+        let validated = validate_dot_with_vars(dot, vars);
+        validated.raise_on_errors().unwrap();
+
+        assert_eq!(
+            validated.graph().nodes["work"]
+                .attrs
+                .get("script")
+                .and_then(fabro_graphviz::graph::AttrValue::as_str),
+            Some("deploy --stage staging"),
+        );
+    }
+
+    /// The script diagnostic must carry the same rule as the prompt one so the
+    /// existing run-create promotion catches an unbound value before a run
+    /// executes a half-interpolated command.
+    #[test]
+    fn unknown_input_in_script_warns_at_validate_then_errors_at_run_create() {
+        let dot = r#"digraph Test {
+            graph [goal="Ship it"]
+            start [shape=Mdiamond, label="Start"]
+            exit  [shape=Msquare,  label="Exit"]
+            work  [label="Work", shape=parallelogram, script="deploy --stage {{ inputs.stage }}"]
+            start -> work -> exit
+        }"#;
+        let mut validated = validate_dot_with_vars(dot, HashMap::new());
+
+        let diagnostic = validated
+            .diagnostics()
+            .iter()
+            .find(|d| d.rule == TEMPLATE_UNDEFINED_VARIABLE_RULE)
+            .expect("expected a template_undefined_variable diagnostic");
+        assert_eq!(diagnostic.severity, Severity::Warning);
+        assert!(
+            diagnostic.message.contains("inputs.stage"),
+            "message: {}",
+            diagnostic.message
+        );
+
+        validated.promote_template_undefined_variables_to_errors();
+        assert!(validated.has_errors());
+    }
+
+    #[test]
     fn promote_template_undefined_rule_turns_warning_into_error() {
         let dot = r#"digraph Test {
             graph [goal="Build {{ inputs.app_dir }}"]

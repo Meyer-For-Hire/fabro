@@ -3,8 +3,8 @@ use std::sync::Arc;
 use super::types::{Parsed, TransformOptions, Transformed};
 use crate::error::Error;
 use crate::transforms::{
-    FileInliningTransform, ImportTransform, StylesheetApplicationTransform, TemplateTransform,
-    Transform,
+    FileInliningTransform, ImportTransform, ScriptInterpolationTransform,
+    StylesheetApplicationTransform, TemplateTransform, Transform,
 };
 
 /// TRANSFORM phase: apply built-in and custom transforms to a parsed graph.
@@ -58,6 +58,13 @@ pub fn transform(parsed: Parsed, options: &TransformOptions) -> Result<Transform
         context:     options.template_context.clone(),
         source_name: options.source_name.clone(),
         source_text: Some(source.clone()),
+        render_mode: options.render_mode,
+    }
+    .apply_with_diagnostics(graph)?;
+    diagnostics.extend(transform_diagnostics);
+    let (graph, transform_diagnostics) = ScriptInterpolationTransform {
+        context:     options.template_context.clone(),
+        source_name: options.source_name.clone(),
         render_mode: options.render_mode,
     }
     .apply_with_diagnostics(graph)?;
@@ -235,6 +242,92 @@ mod tests {
         assert_eq!(
             lint.attrs.get("model"),
             Some(&AttrValue::String("claude-sonnet-4-6".into()))
+        );
+    }
+
+    #[test]
+    fn imported_script_does_not_rescan_substituted_token_syntax() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(
+            &dir.path().join("child.fabro"),
+            r#"digraph child {
+                start [shape=Mdiamond]
+                run [shape=parallelogram, script="printf '%s' {{ inputs.payload }}"]
+                exit [shape=Msquare]
+                start -> run -> exit
+            }"#,
+        );
+        let parsed = parse(
+            r#"digraph Test {
+                graph [goal="Test"]
+                start [shape=Mdiamond]
+                child [import="./child.fabro"]
+                exit [shape=Msquare]
+                start -> child -> exit
+            }"#,
+        )
+        .unwrap();
+        let transformed = transform(parsed, &TransformOptions {
+            current_dir: Some(dir.path().to_path_buf()),
+            file_resolver: Some(Arc::new(FilesystemFileResolver::new(None))),
+            template_context: fabro_template::TemplateContext::new().with_inputs(HashMap::from([
+                (
+                    "payload".to_string(),
+                    toml::Value::String("{{ secrets.API_KEY }}".to_string()),
+                ),
+            ])),
+            ..transform_options()
+        })
+        .unwrap();
+
+        assert_eq!(
+            transformed.graph.nodes["child.run"]
+                .attrs
+                .get("script")
+                .and_then(AttrValue::as_str),
+            Some("printf '%s' '{{ secrets.API_KEY }}'")
+        );
+    }
+
+    #[test]
+    fn imported_script_reports_a_missing_value_once() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(
+            &dir.path().join("child.fabro"),
+            r#"digraph child {
+                start [shape=Mdiamond]
+                run [shape=parallelogram, script="echo {{ inputs.missing }}"]
+                exit [shape=Msquare]
+                start -> run -> exit
+            }"#,
+        );
+        let parsed = parse(
+            r#"digraph Test {
+                graph [goal="Test"]
+                start [shape=Mdiamond]
+                child [import="./child.fabro"]
+                exit [shape=Msquare]
+                start -> child -> exit
+            }"#,
+        )
+        .unwrap();
+        let transformed = transform(parsed, &TransformOptions {
+            current_dir: Some(dir.path().to_path_buf()),
+            file_resolver: Some(Arc::new(FilesystemFileResolver::new(None))),
+            render_mode: crate::operations::RenderMode::Structural,
+            ..transform_options()
+        })
+        .unwrap();
+
+        let missing_value_diagnostics = transformed
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.rule == TEMPLATE_UNDEFINED_VARIABLE_RULE)
+            .count();
+        assert_eq!(
+            missing_value_diagnostics, 1,
+            "{:?}",
+            transformed.diagnostics
         );
     }
 
