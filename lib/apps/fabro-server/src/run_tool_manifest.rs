@@ -1,20 +1,22 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use fabro_api::types;
 use fabro_config::{CliLayer, RunGoalLayer, RunLayer};
 use fabro_manifest::{ManifestBuildInput, RunOverrideInput};
-use fabro_model::Catalog;
 use fabro_tool::{ToolError, ToolResult, ValidatedCreateRunSpec};
 use fabro_types::settings::interp::InterpString;
 
 use crate::manifest_validation;
 
+/// Build and validate a run manifest for the `fabro_run_create` tool.
+///
+/// Validation is structural. The caller is a client — an MCP server or a run
+/// worker — whose catalog is its own, not the server's, so judging model and
+/// provider availability here would reject workflows the server can run.
 pub fn build_run_tool_manifest(
     spec: &ValidatedCreateRunSpec,
     cwd: &Path,
     user_settings_path: &Path,
-    catalog: &Arc<Catalog>,
 ) -> ToolResult<types::RunManifest> {
     let built = fabro_manifest::build_run_manifest(ManifestBuildInput {
         workflow:             PathBuf::from(&spec.workflow),
@@ -29,12 +31,9 @@ pub fn build_run_tool_manifest(
     })
     .map_err(|err| ToolError::from_anyhow(&err))?;
 
-    let mut validation = manifest_validation::validate_manifest_with_catalog(
-        &RunLayer::default(),
-        &built.manifest,
-        catalog,
-    )
-    .map_err(|err| ToolError::from_anyhow(&err))?;
+    let mut validation =
+        manifest_validation::validate_manifest(&RunLayer::default(), &built.manifest)
+            .map_err(|err| ToolError::from_anyhow(&err))?;
     manifest_validation::promote_template_undefined_variables_to_errors(&mut validation);
     if !validation.ok {
         return Err(ToolError::message("workflow manifest validation failed"));
@@ -105,6 +104,63 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    fn create_run_spec(workflow: &str) -> ValidatedCreateRunSpec {
+        ValidatedCreateRunSpec::try_from(CreateRunSpec {
+            workflow:         workflow.to_string(),
+            run_id:           None,
+            parent_id:        None,
+            cwd:              None,
+            goal:             None,
+            goal_file:        None,
+            inputs:           HashMap::new(),
+            labels:           HashMap::new(),
+            model:            None,
+            provider:         None,
+            environment:      None,
+            dry_run:          None,
+            auto_approve:     None,
+            preserve_sandbox: None,
+            start:            None,
+        })
+        .expect("create spec should validate")
+    }
+
+    /// The tool runs on a client, whose catalog is not the server's, so a
+    /// server-owned model must reach the server rather than fail here.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "sync test writes one workflow fixture before building the manifest"
+    )]
+    #[test]
+    fn server_owned_provider_is_not_rejected_by_tool_manifest_validation() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let workflow = dir.path().join("server-model.fabro");
+        std::fs::write(
+            &workflow,
+            r#"digraph ServerModel {
+                graph [goal="Use a server-owned model"]
+                start [shape=Mdiamond]
+                work [prompt="Do work", model="private-model", provider="server-only"]
+                exit [shape=Msquare]
+                start -> work -> exit
+            }"#,
+        )
+        .expect("workflow fixture should be written");
+
+        let manifest = build_run_tool_manifest(
+            &create_run_spec(&workflow.to_string_lossy()),
+            dir.path(),
+            &dir.path().join("settings.toml"),
+        )
+        .expect("tool validation should leave provider availability to the server");
+
+        let encoded = serde_json::to_string(&manifest).expect("manifest should serialize");
+        assert!(
+            encoded.contains("server-only"),
+            "the authored provider should survive into the manifest: {encoded}"
+        );
+    }
 
     #[test]
     fn manifest_args_preserve_input_provenance() {
