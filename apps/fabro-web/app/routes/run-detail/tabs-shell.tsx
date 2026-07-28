@@ -1,7 +1,7 @@
 import { Link, Outlet, type UIMatch } from "react-router";
 
+import { classNames } from "../../lib/class-names";
 import { sandboxTabVisible, type MaybeSandbox } from "../../lib/run-sandbox-lifecycle";
-import { classNames } from "./model";
 
 interface RunDetailTabDefinition {
   name: string;

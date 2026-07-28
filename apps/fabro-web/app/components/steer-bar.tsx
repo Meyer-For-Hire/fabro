@@ -2,14 +2,21 @@ import {
   useImperativeHandle,
   useRef,
   useState,
-  type FormEvent,
-  type KeyboardEvent,
   type Ref,
 } from "react";
+import { StopIcon } from "@heroicons/react/20/solid";
 
 import { ApiError } from "../lib/api-client";
+import { classNames } from "../lib/class-names";
 import { useInterruptRun, useSteerRun } from "../lib/mutations";
+import {
+  DockComposer,
+  RunDockShell,
+  DOCK_HEADER_BUTTON,
+} from "./run-dock";
 import { ErrorMessage } from "./ui";
+
+const STEER_MAX_LENGTH = 8192;
 
 export interface SteerBarProps {
   runId: string;
@@ -28,17 +35,20 @@ export function isInterruptDisabled(
   return waitingForSteer || mutationPending;
 }
 
-export function SteerWaitingStatus({
-  waitingForSteer,
-}: {
-  waitingForSteer: boolean;
-}) {
-  if (!waitingForSteer) return null;
-  return (
-    <p role="status" className="mt-2 text-xs text-amber">
-      Interrupted — waiting for steering
-    </p>
-  );
+/**
+ * A run that is waiting for steering needs the operator, so the dock reopens
+ * itself and stays open until the wait clears. Derived rather than stored, so
+ * collapsing during the wait cannot hide the prompt.
+ */
+export function isSteerDockCollapsed(
+  collapsePreferred: boolean,
+  waitingForSteer: boolean,
+): boolean {
+  return collapsePreferred && !waitingForSteer;
+}
+
+export function steerStatusLabel(waitingForSteer: boolean): string {
+  return waitingForSteer ? "Interrupted — waiting for steering" : "Steering";
 }
 
 export function SteerBar({
@@ -46,31 +56,38 @@ export function SteerBar({
   waitingForSteer = false,
   ref,
 }: SteerBarProps) {
-  const [text, setText] = useState("");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [collapsePreferred, setCollapsePreferred] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const steer = useSteerRun(runId);
   const interrupt = useInterruptRun(runId);
   const pending = steer.isMutating || interrupt.isMutating;
   const interruptDisabled = isInterruptDisabled(waitingForSteer, pending);
+  const collapsed = isSteerDockCollapsed(collapsePreferred, waitingForSteer);
 
-  useImperativeHandle(ref, () => ({
-    focus() {
-      textareaRef.current?.focus();
-    },
-  }));
+  useImperativeHandle(
+    ref,
+    () => ({
+      focus() {
+        if (!collapsed) {
+          textareaRef.current?.focus();
+          return;
+        }
+        setCollapsePreferred(false);
+        setTimeout(() => textareaRef.current?.focus(), 0);
+      },
+    }),
+    [collapsed],
+  );
 
-  const trimmed = text.trim();
-  const canSend = trimmed.length > 0 && !pending;
-
-  async function sendSteering() {
-    if (!canSend) return;
+  async function sendSteering(text: string) {
     setErrorMessage(null);
     try {
-      await steer.trigger({ text: trimmed, interrupt: false });
-      setText("");
+      await steer.trigger({ text, interrupt: false });
+      return true;
     } catch (err) {
       setErrorMessage(formatSteerError(err));
+      return false;
     }
   }
 
@@ -84,59 +101,47 @@ export function SteerBar({
     }
   }
 
-  function handleSubmit(e: FormEvent) {
-    e.preventDefault();
-    void sendSteering();
-  }
-
-  function handleKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      void sendSteering();
-    }
-  }
-
   return (
-    <form
-      onSubmit={handleSubmit}
-      aria-label="Steer running agent"
-      className="mx-auto max-w-4xl px-4 py-3 sm:px-6 lg:px-8"
-    >
-      <div className="flex items-end gap-2">
-        <textarea
-          ref={textareaRef}
-          value={text}
-          onChange={(e) => setText(e.target.value)}
-          onKeyDown={handleKeyDown}
-          placeholder="Steer the agent…"
-          rows={1}
-          maxLength={8192}
-          aria-label="Steering message"
-          className="flex-1 resize-none rounded-md bg-overlay px-3 py-2 text-sm text-fg outline-1 -outline-offset-1 outline-line-strong placeholder:text-fg-muted focus:outline-2 focus:-outline-offset-1 focus:outline-teal-500"
-        />
+    <RunDockShell
+      label="Steer running agent"
+      tone={waitingForSteer ? "alert" : "idle"}
+      status={steerStatusLabel(waitingForSteer)}
+      peek="Send a message to the running agent"
+      collapsed={collapsed}
+      onCollapsedChange={setCollapsePreferred}
+      headerActions={
+        // Interrupt acts on the run, not on the message being composed, so it
+        // sits with the other run-level controls instead of in the composer.
         <button
           type="button"
           onClick={() => void fireInterrupt()}
           disabled={interruptDisabled}
-          className="inline-flex shrink-0 items-center gap-2 rounded-md bg-overlay px-3 py-2 text-sm font-medium text-amber outline-1 -outline-offset-1 outline-amber/40 transition-colors hover:bg-amber/15 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber disabled:cursor-not-allowed disabled:opacity-60"
+          className={classNames(
+            DOCK_HEADER_BUTTON,
+            "text-amber outline-amber/40 hover:bg-amber/15 hover:text-amber focus-visible:outline-amber disabled:hover:bg-overlay disabled:hover:text-amber",
+          )}
         >
+          <StopIcon className="size-3" aria-hidden="true" />
           {interrupt.isMutating ? "Interrupting…" : "Interrupt"}
         </button>
-        <button
-          type="submit"
-          disabled={!canSend}
-          className="inline-flex shrink-0 items-center justify-center rounded-md bg-teal-500 px-4 py-2 text-sm font-medium text-on-primary transition-colors hover:bg-teal-300 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:bg-teal-500"
-        >
-          {steer.isMutating ? "Sending…" : "Send"}
-        </button>
-      </div>
-      {errorMessage && (
-        <div className="mt-2">
-          <ErrorMessage message={errorMessage} />
-        </div>
-      )}
-      <SteerWaitingStatus waitingForSteer={waitingForSteer} />
-    </form>
+      }
+      actions={
+        <>
+          <DockComposer
+            onSubmit={sendSteering}
+            placeholder="Steer the agent…"
+            submitLabel="Send"
+            pendingLabel="Sending…"
+            submitting={steer.isMutating}
+            disabled={pending}
+            ariaLabel="Steering message"
+            maxLength={STEER_MAX_LENGTH}
+            textareaRef={textareaRef}
+          />
+          {errorMessage && <ErrorMessage message={errorMessage} />}
+        </>
+      }
+    />
   );
 }
 

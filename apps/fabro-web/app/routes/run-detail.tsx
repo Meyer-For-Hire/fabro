@@ -71,6 +71,23 @@ const RUN_TIMING_REFRESH_INTERVAL_MS = 30_000;
 
 type LifecycleTrigger = () => Promise<LifecycleMutationResult | undefined>;
 
+export interface DockMeasurement {
+  identity: string;
+  height: number;
+}
+
+export function resolveDockClearance(
+  dockIdentity: string | null,
+  measurement: DockMeasurement | null,
+  hasPendingQuestions: boolean,
+): string {
+  if (dockIdentity === null) return "0px";
+  if (measurement?.identity === dockIdentity) {
+    return `${measurement.height}px`;
+  }
+  return hasPendingQuestions ? "18rem" : "5rem";
+}
+
 export function meta({ data }: any) {
   const run = data?.run;
   return [{ title: run ? `${run.title} — Fabro` : "Run — Fabro" }];
@@ -102,6 +119,8 @@ export default function RunDetail({ params }: { params: { id: string } }) {
   const { mutate } = useSWRConfig();
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [deletePending, setDeletePending] = useState(false);
+  const [dockMeasurement, setDockMeasurement] =
+    useState<DockMeasurement | null>(null);
   const { push, dismiss } = useToast();
   const lifecycleToastStateRef = useRef(createLifecycleToastState());
   const filesCount = runQuery.data?.diff?.files_changed ?? null;
@@ -146,6 +165,15 @@ export default function RunDetail({ params }: { params: { id: string } }) {
       handleLifecycleMutationResult(intent, result);
     },
     [handleLifecycleMutationResult],
+  );
+  const handleDockHeightChange = useCallback(
+    (identity: string, height: number | null) => {
+      setDockMeasurement((current) => {
+        if (height !== null) return { identity, height };
+        return current?.identity === identity ? null : current;
+      });
+    },
+    [],
   );
 
   if (runQuery.isLoading && !run) {
@@ -308,7 +336,19 @@ export default function RunDetail({ params }: { params: { id: string } }) {
         : []),
     ],
   };
-  const dockClearance = hasPendingQuestions ? "18rem" : "5rem";
+  // Reserve exactly the dock's rendered height. The constants are only the
+  // first frame, before the dock has been measured; a fixed reservation lets
+  // a tall question panel cover the content it is asking about.
+  const dockIdentity = hasPendingQuestions
+    ? `${params.id}:interview`
+    : hideSteerBar
+      ? null
+      : `${params.id}:steer`;
+  const dockClearance = resolveDockClearance(
+    dockIdentity,
+    dockMeasurement,
+    hasPendingQuestions,
+  );
   const rootStyle = {
     "--fabro-interview-dock-clearance": dockClearance,
   } as CSSProperties;
@@ -367,14 +407,16 @@ export default function RunDetail({ params }: { params: { id: string } }) {
           />
 
           <RunDetailDockedControls
+            key={dockIdentity ?? "hidden"}
             runId={params.id}
-            hideSteerBar={hideSteerBar}
+            dockIdentity={dockIdentity}
             hasPendingQuestions={hasPendingQuestions}
             pendingQuestions={pendingQuestions}
             sidebarWidth={sidebarWidth}
             isResizing={isResizing}
             steerBarRef={steerBarRef}
             waitingForSteer={waitingForSteer}
+            onHeightChange={handleDockHeightChange}
           />
         </div>
       )}

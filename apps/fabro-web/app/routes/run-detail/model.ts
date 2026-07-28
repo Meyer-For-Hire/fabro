@@ -5,10 +5,6 @@ import {
   type Run,
 } from "../../data/runs";
 
-export function classNames(...classes: Array<string | false | null | undefined>) {
-  return classes.filter(Boolean).join(" ");
-}
-
 export type RunDetailRun = ReturnType<typeof mapRunToRunItem> & {
   statusLabel: string;
   statusDot: string;

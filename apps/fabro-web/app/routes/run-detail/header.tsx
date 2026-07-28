@@ -35,10 +35,11 @@ import {
   formatDurationMs,
   formatRelativeTime,
 } from "../../lib/format";
+import { classNames } from "../../lib/class-names";
 import { useRunPullRequest } from "../../lib/queries";
 import { sandboxRuntime } from "../../lib/run-sandbox-lifecycle";
 import { ActionsMenu, type ActionsMenuProps } from "./actions";
-import { classNames, type RunDetailRun } from "./model";
+import type { RunDetailRun } from "./model";
 
 export interface RunDetailHeaderActions {
   approval: {
