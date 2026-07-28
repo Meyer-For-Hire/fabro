@@ -1,4 +1,5 @@
 import {
+  useCallback,
   useRef,
   useState,
   type ReactNode,
@@ -17,12 +18,12 @@ import {
   SECONDARY_BUTTON_CLASS,
   Tooltip,
 } from "../../components/ui";
+import { classNames } from "../../lib/class-names";
 import {
   AskFabroUnavailableReasonEnum,
   type ApiQuestion,
   type AskFabro,
 } from "@qltysh/fabro-api-client";
-import { classNames } from "./model";
 
 const ASK_FABRO_UNAVAILABLE_TOOLTIPS: Record<
   AskFabroUnavailableReasonEnum,
@@ -130,7 +131,7 @@ function AskFabroTriggerButton({
 
 export function RunDetailDockedControls({
   runId,
-  hideSteerBar,
+  dockIdentity,
   hasPendingQuestions,
   pendingQuestions,
   sidebarWidth,
@@ -140,7 +141,7 @@ export function RunDetailDockedControls({
   onHeightChange,
 }: {
   runId: string;
-  hideSteerBar: boolean;
+  dockIdentity: string | null;
   hasPendingQuestions: boolean;
   pendingQuestions: ApiQuestion[];
   sidebarWidth: number;
@@ -151,16 +152,39 @@ export function RunDetailDockedControls({
    * Reports the dock's rendered height so the page can reserve exactly that
    * much room beneath the scrolling content.
    */
-  onHeightChange: (height: number | null) => void;
+  onHeightChange: (identity: string, height: number | null) => void;
 }) {
   const dockRef = useRef<HTMLDivElement | null>(null);
-  const visible = hasPendingQuestions || !hideSteerBar;
+  const reportedHeightRef = useRef<number | null>(null);
+  const visible = dockIdentity !== null;
+  const reportHeight = useCallback(
+    (height: number | null) => {
+      if (dockIdentity === null || reportedHeightRef.current === height) return;
+      reportedHeightRef.current = height;
+      onHeightChange(dockIdentity, height);
+    },
+    [dockIdentity, onHeightChange],
+  );
+  const setDockRef = useCallback(
+    (node: HTMLDivElement | null) => {
+      dockRef.current = node;
+      if (node === null) reportHeight(null);
+    },
+    [reportHeight],
+  );
 
-  // `offsetHeight` rather than the entry's content box: the dock carries a
-  // top border, and the page has to clear the border too.
   useResizeObserver(
     dockRef,
-    () => onHeightChange(dockRef.current?.offsetHeight ?? null),
+    (entries) => {
+      const entry = entries[0];
+      if (!entry) return;
+      const borderBoxSize = Array.isArray(entry.borderBoxSize)
+        ? entry.borderBoxSize[0]
+        : (entry.borderBoxSize as unknown as ResizeObserverSize);
+      reportHeight(
+        borderBoxSize?.blockSize ?? dockRef.current?.offsetHeight ?? null,
+      );
+    },
     visible,
   );
 
@@ -168,12 +192,12 @@ export function RunDetailDockedControls({
 
   return (
     <div
-      ref={dockRef}
-      className={`fixed bottom-0 left-0 z-30 border-t border-line bg-page ${
-        isResizing
-          ? ""
-          : "transition-[right] duration-300 ease-[cubic-bezier(0.16,1,0.3,1)]"
-      }`}
+      ref={setDockRef}
+      className={classNames(
+        "fixed bottom-0 left-0 z-30 border-t border-line bg-page",
+        !isResizing &&
+          "transition-[right] duration-300 ease-[cubic-bezier(0.16,1,0.3,1)]",
+      )}
       style={{ right: sidebarWidth }}
     >
       {hasPendingQuestions ? (

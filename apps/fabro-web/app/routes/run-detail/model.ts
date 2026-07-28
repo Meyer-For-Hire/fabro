@@ -8,10 +8,6 @@ import {
   type Run,
 } from "../../data/runs";
 
-export function classNames(...classes: Array<string | false | null | undefined>) {
-  return classes.filter(Boolean).join(" ");
-}
-
 export function useTickingNow(intervalMs: number): number {
   const [now, setNow] = useState(() => Date.now());
   useInterval(() => setNow(Date.now()), intervalMs);

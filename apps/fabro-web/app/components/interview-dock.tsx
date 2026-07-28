@@ -18,14 +18,16 @@ import { ApiError } from "../lib/api-client";
 import { displayLabel } from "./interview-label";
 import {
   DockComposer,
-  DockSpinner,
   RunDockShell,
   DOCK_CHOICE_BUTTON,
   DOCK_CHOICE_BUTTON_SELECTED,
   DOCK_HEADER_BUTTON,
-  DOCK_PRIMARY_BUTTON,
 } from "./run-dock";
-import { ErrorMessage } from "./ui";
+import { Spinner } from "./state";
+import {
+  ErrorMessage,
+  PRIMARY_BUTTON_CLASS,
+} from "./ui";
 
 /**
  * Options stack into a list once a label is long enough that a row of pills
@@ -118,7 +120,7 @@ function InterviewQuestionDock({
       }
       body={
         <>
-          <p className="max-w-[78ch] text-pretty text-base/6 font-medium text-fg">
+          <p className="max-w-[78ch] text-base/6 font-medium text-pretty text-fg">
             {question.text}
           </p>
           {question.context_display && (
@@ -154,7 +156,7 @@ function ContextPanel({ text }: { text: string }) {
           aria-hidden="true"
         />
         Context from preceding stage
-        <span className="ml-auto truncate pl-3 font-sans text-xs normal-case tracking-normal group-open:hidden">
+        <span className="ml-auto truncate pl-3 font-sans text-xs tracking-normal normal-case group-open:hidden">
           {contextPreview(text)}
         </span>
       </summary>
@@ -167,9 +169,18 @@ function ContextPanel({ text }: { text: string }) {
 
 /** First line of the context, for the collapsed summary. */
 export function contextPreview(text: string): string {
-  const line = text.split("\n").find((candidate) => candidate.trim()) ?? "";
-  const trimmed = line.trim();
-  return trimmed.length > 60 ? `${trimmed.slice(0, 60).trimEnd()}…` : trimmed;
+  let lineStart = 0;
+  while (lineStart < text.length) {
+    const newline = text.indexOf("\n", lineStart);
+    const lineEnd = newline === -1 ? text.length : newline;
+    const line = text.slice(lineStart, lineEnd).trim();
+    if (line) {
+      return line.length > 60 ? `${line.slice(0, 60).trimEnd()}…` : line;
+    }
+    if (newline === -1) break;
+    lineStart = newline + 1;
+  }
+  return "";
 }
 
 function QuestionBody({
@@ -240,9 +251,13 @@ function YesNoBody({
         aria-label="Answer yes"
         disabled={submitting}
         onClick={() => void onSubmit({ kind: "yes" })}
-        className={DOCK_PRIMARY_BUTTON}
+        className={PRIMARY_BUTTON_CLASS}
       >
-        {submitting ? <DockSpinner /> : <CheckIcon className="size-4" aria-hidden="true" />}
+        {submitting ? (
+          <Spinner className="size-4" />
+        ) : (
+          <CheckIcon className="size-4" aria-hidden="true" />
+        )}
         Yes
       </button>
     </div>
@@ -262,9 +277,13 @@ function ConfirmationBody({
         type="button"
         disabled={submitting}
         onClick={() => void onSubmit({ kind: "yes" })}
-        className={DOCK_PRIMARY_BUTTON}
+        className={PRIMARY_BUTTON_CLASS}
       >
-        {submitting ? <DockSpinner /> : <CheckIcon className="size-4" aria-hidden="true" />}
+        {submitting ? (
+          <Spinner className="size-4" />
+        ) : (
+          <CheckIcon className="size-4" aria-hidden="true" />
+        )}
         Confirm
       </button>
     </div>
@@ -390,9 +409,13 @@ function MultiSelectBody({
           type="button"
           disabled={submitting || selectedKeys.length === 0}
           onClick={() => void onSubmit({ kind: "multi_selected", option_keys: selectedKeys })}
-          className={DOCK_PRIMARY_BUTTON}
+          className={PRIMARY_BUTTON_CLASS}
         >
-          {submitting ? <DockSpinner /> : <CheckIcon className="size-4" aria-hidden="true" />}
+          {submitting ? (
+            <Spinner className="size-4" />
+          ) : (
+            <CheckIcon className="size-4" aria-hidden="true" />
+          )}
           Submit selection
         </button>
       </div>
@@ -414,7 +437,7 @@ function FreeformAnswer({
       onSubmit={(text) => onSubmit({ kind: "text", text })}
       placeholder={placeholder}
       submitLabel="Send"
-      pending={submitting}
+      submitting={submitting}
       ariaLabel="Interview answer"
     />
   );

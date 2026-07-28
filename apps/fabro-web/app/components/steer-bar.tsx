@@ -7,6 +7,7 @@ import {
 import { StopIcon } from "@heroicons/react/20/solid";
 
 import { ApiError } from "../lib/api-client";
+import { classNames } from "../lib/class-names";
 import { useInterruptRun, useSteerRun } from "../lib/mutations";
 import {
   DockComposer,
@@ -64,11 +65,20 @@ export function SteerBar({
   const interruptDisabled = isInterruptDisabled(waitingForSteer, pending);
   const collapsed = isSteerDockCollapsed(collapsePreferred, waitingForSteer);
 
-  useImperativeHandle(ref, () => ({
-    focus() {
-      textareaRef.current?.focus();
-    },
-  }));
+  useImperativeHandle(
+    ref,
+    () => ({
+      focus() {
+        if (!collapsed) {
+          textareaRef.current?.focus();
+          return;
+        }
+        setCollapsePreferred(false);
+        setTimeout(() => textareaRef.current?.focus(), 0);
+      },
+    }),
+    [collapsed],
+  );
 
   async function sendSteering(text: string) {
     setErrorMessage(null);
@@ -106,7 +116,10 @@ export function SteerBar({
           type="button"
           onClick={() => void fireInterrupt()}
           disabled={interruptDisabled}
-          className={`${DOCK_HEADER_BUTTON} text-amber outline-amber/40 hover:bg-amber/15 hover:text-amber focus-visible:outline-amber disabled:hover:bg-overlay disabled:hover:text-amber`}
+          className={classNames(
+            DOCK_HEADER_BUTTON,
+            "text-amber outline-amber/40 hover:bg-amber/15 hover:text-amber focus-visible:outline-amber disabled:hover:bg-overlay disabled:hover:text-amber",
+          )}
         >
           <StopIcon className="size-3" aria-hidden="true" />
           {interrupt.isMutating ? "Interrupting…" : "Interrupt"}
@@ -119,7 +132,8 @@ export function SteerBar({
             placeholder="Steer the agent…"
             submitLabel="Send"
             pendingLabel="Sending…"
-            pending={pending}
+            submitting={steer.isMutating}
+            disabled={pending}
             ariaLabel="Steering message"
             maxLength={STEER_MAX_LENGTH}
             textareaRef={textareaRef}

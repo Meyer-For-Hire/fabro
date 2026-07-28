@@ -7,10 +7,16 @@ import {
   type Ref,
 } from "react";
 import {
-  ArrowPathIcon,
   ArrowUturnLeftIcon,
   ChevronUpIcon,
 } from "@heroicons/react/20/solid";
+
+import { classNames } from "../lib/class-names";
+import { Spinner } from "./state";
+import {
+  INPUT_CLASS,
+  PRIMARY_BUTTON_CLASS,
+} from "./ui";
 
 /**
  * Shared chrome for the two controls docked at the bottom of the run detail
@@ -29,14 +35,8 @@ import {
 /** Ceiling on the expanded dock, so a long body cannot take the page. */
 const DOCK_MAX_HEIGHT = "max-h-[60vh]";
 
-/** Pinned actions never take more than half the dock. */
-const ACTIONS_MAX_HEIGHT = "max-h-[50%]";
-
 export const DOCK_HEADER_BUTTON =
   "inline-flex shrink-0 items-center gap-1.5 rounded-md bg-overlay px-2 py-1 text-xs font-medium text-fg-2 outline-1 -outline-offset-1 outline-line-strong transition-colors hover:bg-overlay-strong hover:text-fg focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-overlay disabled:hover:text-fg-2";
-
-export const DOCK_PRIMARY_BUTTON =
-  "inline-flex items-center justify-center gap-1.5 rounded-lg bg-teal-500 px-3.5 py-2 text-sm font-medium text-on-primary transition-colors hover:bg-teal-300 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:bg-teal-500";
 
 export const DOCK_CHOICE_BUTTON =
   "inline-flex items-center justify-center gap-1.5 rounded-lg bg-overlay px-3.5 py-2 text-left text-sm font-medium text-fg-2 outline-1 -outline-offset-1 outline-line-strong transition-colors hover:bg-overlay-strong hover:text-fg focus-visible:outline-2 focus-visible:-outline-offset-1 focus-visible:outline-teal-500 disabled:cursor-not-allowed disabled:opacity-60";
@@ -57,6 +57,7 @@ export type DockTone = "waiting" | "alert" | "idle";
 export interface RunDockShellProps {
   /** Accessible name for the docked region. */
   label: string;
+  className?: string;
   tone: DockTone;
   /** Short state phrase, e.g. "Awaiting input". */
   status: string;
@@ -76,6 +77,7 @@ export interface RunDockShellProps {
 
 export function RunDockShell({
   label,
+  className,
   tone,
   status,
   stage,
@@ -91,7 +93,11 @@ export function RunDockShell({
   return (
     <section
       aria-label={label}
-      className={`flex flex-col ${collapsed ? "" : DOCK_MAX_HEIGHT}`}
+      className={classNames(
+        "flex flex-col",
+        !collapsed && DOCK_MAX_HEIGHT,
+        className,
+      )}
     >
       <div className="flex shrink-0 items-center gap-2.5 px-5 py-2 sm:px-6">
         <StatusDot tone={tone} />
@@ -145,9 +151,7 @@ export function RunDockShell({
           display classes cannot collide in the cascade. */}
       <div
         id={contentId}
-        className={
-          collapsed ? "hidden" : "flex min-h-0 flex-1 flex-col"
-        }
+        className={collapsed ? "hidden" : "flex min-h-0 flex-1 flex-col"}
       >
         {body && (
           <div className="min-h-0 flex-1 space-y-3 overflow-y-auto border-t border-line px-5 pt-3.5 pb-1 sm:px-6">
@@ -155,9 +159,10 @@ export function RunDockShell({
           </div>
         )}
         <div
-          className={`flex shrink-0 flex-col gap-2.5 overflow-y-auto px-5 pt-2.5 pb-3.5 sm:px-6 ${ACTIONS_MAX_HEIGHT} ${
-            body ? "" : "border-t border-line"
-          }`}
+          className={classNames(
+            "flex max-h-[50%] shrink-0 flex-col gap-2.5 overflow-y-auto px-5 pt-2.5 pb-3.5 sm:px-6",
+            !body && "border-t border-line",
+          )}
         >
           {actions}
         </div>
@@ -186,10 +191,6 @@ function StatusDot({ tone }: { tone: DockTone }) {
   );
 }
 
-export function DockSpinner() {
-  return <ArrowPathIcon className="size-4 animate-spin" aria-hidden="true" />;
-}
-
 export interface DockComposerProps {
   /**
    * Sends the trimmed text. Resolve `true` to clear the box; resolve `false`
@@ -199,8 +200,10 @@ export interface DockComposerProps {
   placeholder: string;
   submitLabel: string;
   pendingLabel?: string;
-  pending: boolean;
+  submitting: boolean;
+  disabled?: boolean;
   ariaLabel: string;
+  className?: string;
   maxLength?: number;
   textareaRef?: Ref<HTMLTextAreaElement>;
 }
@@ -216,15 +219,19 @@ export function DockComposer({
   placeholder,
   submitLabel,
   pendingLabel,
-  pending,
+  submitting,
+  disabled = false,
   ariaLabel,
+  className,
   maxLength,
   textareaRef,
 }: DockComposerProps) {
   const [value, setValue] = useState("");
   const fieldId = useId();
+  const instructionId = `${fieldId}-instruction`;
   const trimmed = value.trim();
-  const canSend = trimmed.length > 0 && !pending;
+  const composerDisabled = disabled || submitting;
+  const canSend = trimmed.length > 0 && !composerDisabled;
 
   async function send() {
     if (!canSend) return;
@@ -238,34 +245,44 @@ export function DockComposer({
   }
 
   function handleKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
-    if (event.key === "Enter" && !event.shiftKey) {
+    if (
+      event.key === "Enter" &&
+      !event.shiftKey &&
+      !event.nativeEvent.isComposing
+    ) {
       event.preventDefault();
       void send();
     }
   }
 
   return (
-    <form onSubmit={handleSubmit} className="group flex items-end gap-2">
+    <form
+      onSubmit={handleSubmit}
+      className={classNames("group flex items-end gap-2", className)}
+    >
       <label className="sr-only" htmlFor={fieldId}>
         {ariaLabel}
       </label>
+      <p id={instructionId} className="sr-only">
+        Press Enter to send. Press Shift+Enter for a new line.
+      </p>
       <textarea
         id={fieldId}
         ref={textareaRef}
-        name="answer"
         aria-label={ariaLabel}
+        aria-describedby={instructionId}
         rows={1}
         value={value}
         maxLength={maxLength}
         onChange={(event) => setValue(event.target.value)}
         onKeyDown={handleKeyDown}
         placeholder={placeholder}
-        disabled={pending}
-        className="block w-full resize-none rounded-lg bg-panel-alt px-3.5 py-2.5 text-base/6 text-fg outline-1 -outline-offset-1 outline-line-strong placeholder:text-fg-muted focus:outline-2 focus:-outline-offset-1 focus:outline-teal-500 disabled:opacity-60 sm:text-sm/5"
+        disabled={composerDisabled}
+        className={`${INPUT_CLASS} min-w-0 flex-1 resize-none disabled:opacity-60`}
       />
       <p
         aria-hidden="true"
-        className="pointer-events-none flex shrink-0 items-center gap-1 pb-2.5 text-xs whitespace-nowrap text-fg-muted opacity-0 transition-opacity group-focus-within:opacity-100"
+        className="pointer-events-none hidden shrink-0 items-center gap-1 pb-2.5 text-xs whitespace-nowrap text-fg-muted opacity-0 transition-opacity group-focus-within:opacity-100 md:flex"
       >
         <kbd className="rounded bg-overlay px-1 font-mono text-[0.6875rem]">
           Enter
@@ -283,17 +300,17 @@ export function DockComposer({
       <button
         type="submit"
         disabled={!canSend}
-        className={DOCK_PRIMARY_BUTTON}
+        className={PRIMARY_BUTTON_CLASS}
       >
-        {pending ? (
-          <DockSpinner />
+        {submitting ? (
+          <Spinner className="size-4" />
         ) : (
           <ArrowUturnLeftIcon
             className="size-3.5 -scale-x-100"
             aria-hidden="true"
           />
         )}
-        {pending && pendingLabel ? pendingLabel : submitLabel}
+        {submitting && pendingLabel ? pendingLabel : submitLabel}
       </button>
     </form>
   );
