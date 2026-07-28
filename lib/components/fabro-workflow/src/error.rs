@@ -7,7 +7,7 @@ use fabro_model::ModelSelectionError;
 use fabro_template::TemplateError;
 pub use fabro_types::failure_signature::FailureSignature;
 pub use fabro_types::outcome::FailureCategory;
-use fabro_types::settings::AmbiguousModelRef;
+use fabro_types::settings::{AmbiguousModelRef, ResolveError};
 use fabro_types::{ExecOutputTail, FailureReason, RunFailure};
 use fabro_util::error::{SharedError, collect_causes, collect_chain, render_with_causes};
 use fabro_validate::Diagnostic;
@@ -280,6 +280,14 @@ pub enum Error {
     #[error("Validation failed")]
     ValidationFailed { diagnostics: Vec<Diagnostic> },
 
+    #[error("Validation error: script interpolation failed in {owner}: {source} ({fix})")]
+    ScriptInterpolation {
+        owner:  String,
+        fix:    String,
+        #[source]
+        source: ResolveError,
+    },
+
     #[error("Model selection failed: {0}")]
     ModelSelection(#[from] ModelSelectionError),
 
@@ -451,6 +459,7 @@ impl Error {
                 .as_ref()
                 .map_or_else(Vec::new, |source| collect_chain(source)),
             Self::Template { source, .. } => collect_chain(source),
+            Self::ScriptInterpolation { source, .. } => collect_chain(source),
             Self::Llm(err) => collect_causes(err),
             _ => Vec::new(),
         }
@@ -478,6 +487,7 @@ impl Error {
             Self::Parse(_)
             | Self::Validation(_)
             | Self::ValidationFailed { .. }
+            | Self::ScriptInterpolation { .. }
             | Self::ModelSelection(_)
             | Self::ModelReference(_)
             | Self::Template { .. }
@@ -501,6 +511,7 @@ impl Error {
             Self::Parse(_)
             | Self::Validation(_)
             | Self::ValidationFailed { .. }
+            | Self::ScriptInterpolation { .. }
             | Self::ModelSelection(_)
             | Self::ModelReference(_)
             | Self::Template { .. }

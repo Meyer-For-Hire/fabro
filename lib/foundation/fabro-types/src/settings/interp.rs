@@ -1,15 +1,19 @@
 //! Interpolation for config strings.
 //!
 //! An [`InterpString`] field may contain narrow `{{ <namespace>.NAME }}`
-//! tokens — no template logic. Three [`Namespace`]s resolve here: `env`,
-//! `vars`, and `secrets`. `inputs` is **template-only**: it is a
-//! recognized namespace so an `{{ inputs.* }}` token fails loudly with a clear
-//! message instead of passing through as literal text, but it never resolves
-//! in an `InterpString` field — it belongs in prompts and goals. Which of the
-//! resolvable namespaces actually apply is scope-determined by the caller
-//! through [`ResolveCtx`]: server-scope settings provide `env` (and eventually
-//! `secrets`), run-scope settings additionally provide `vars`. A token whose
-//! namespace is not available in the resolution context fails loudly.
+//! tokens — no template logic. Which [`Namespace`]s resolve is
+//! scope-determined by the caller through [`ResolveCtx`]: server-scope
+//! settings provide `env` (and eventually `secrets`), run-scope settings
+//! additionally provide `vars`, and a command node `script` provides `inputs`
+//! and `vars` plus the bare `goal` value. A token whose namespace has no lookup
+//! in the resolution context fails loudly rather than passing through as
+//! literal text.
+//!
+//! Most call sites do not wire `inputs`: it is bound where a run's typed
+//! `[run.inputs]` values are in scope, which is the workflow graph, not
+//! general config. Everywhere else an `{{ inputs.* }}` token still parses, so
+//! it fails with a clear message instead of reaching a consumer as literal
+//! text.
 //!
 //! Resolution timing is split: `vars` substitutes early (server-side, at run
 //! creation) via [`InterpString::substitute_with`], while `env`/`secrets`
@@ -28,7 +32,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::variable::is_env_style_name;
 
 /// A config string that may contain `{{ env.NAME }}`, `{{ vars.NAME }}`,
-/// `{{ secrets.NAME }}`, or `{{ inputs.NAME }}` tokens.
+/// `{{ secrets.NAME }}`, `{{ inputs.NAME }}`, or `{{ goal }}` tokens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterpString {
     segments: Vec<Segment>,
@@ -42,6 +46,9 @@ enum Segment {
         name:      String,
     },
 }
+
+/// The sole token body with no `namespace.name` shape.
+const GOAL_TOKEN: &str = "goal";
 
 /// The interpolation namespaces recognized inside `{{ ... }}` tokens.
 #[derive(
@@ -57,6 +64,12 @@ pub enum Namespace {
     Secrets,
     /// `{{ inputs.NAME }}` — workflow run inputs, substituted early.
     Inputs,
+    /// The bare `{{ goal }}` token — the run goal, substituted early.
+    ///
+    /// Unlike the others this names a single value rather than a namespace of
+    /// them, so it has no dotted form: only the exact body `goal` produces it,
+    /// and `{{ goal.anything }}` stays literal text.
+    Goal,
 }
 
 impl Namespace {
@@ -67,15 +80,27 @@ impl Namespace {
             Self::Vars => "variable",
             Self::Secrets => "secret",
             Self::Inputs => "input",
+            Self::Goal => "run goal",
         }
+    }
+
+    /// Whether this namespace is written as a bare token rather than
+    /// `namespace.name`.
+    fn is_bare(self) -> bool {
+        matches!(self, Self::Goal)
     }
 
     /// Parse a trimmed `{{ ... }}` token body into a namespace + name, or
     /// `None` when the body is not a recognized token (it then stays literal).
     fn parse_token(token: &str) -> Option<(Self, String)> {
         let trimmed = token.trim();
+        if trimmed == GOAL_TOKEN {
+            return Some((Self::Goal, GOAL_TOKEN.to_owned()));
+        }
         let (prefix, name) = trimmed.split_once('.')?;
-        let namespace = prefix.parse::<Self>().ok()?;
+        // A bare namespace has no dotted spelling, so `{{ goal.title }}` is not
+        // a token and reaches the consumer as literal text.
+        let namespace = prefix.parse::<Self>().ok().filter(|ns| !ns.is_bare())?;
         namespace
             .is_valid_name(name)
             .then(|| (namespace, name.to_owned()))
@@ -102,6 +127,7 @@ impl Namespace {
                 }
                 chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
             }
+            Self::Goal => name == GOAL_TOKEN,
         }
     }
 }
@@ -118,6 +144,8 @@ pub struct ResolveCtx<'a> {
     env:     Option<LookupFn<'a>>,
     vars:    Option<LookupFn<'a>>,
     secrets: Option<LookupFn<'a>>,
+    inputs:  Option<LookupFn<'a>>,
+    goal:    Option<LookupFn<'a>>,
 }
 
 type LookupFn<'a> = Box<dyn FnMut(&str) -> Option<String> + 'a>;
@@ -146,16 +174,37 @@ impl<'a> ResolveCtx<'a> {
         self
     }
 
+    /// Typed `[run.inputs]` values, available only where a run's inputs are in
+    /// scope. Leaving this unwired — which every config-layer call site does —
+    /// keeps `{{ inputs.* }}` unavailable, so `resolve_with` fails loudly and
+    /// `substitute_with` preserves the token for a goal (an `InterpString`
+    /// that feeds a template) to forward to the template layer.
+    #[must_use]
+    pub fn with_inputs(mut self, lookup: impl FnMut(&str) -> Option<String> + 'a) -> Self {
+        self.inputs = Some(Box::new(lookup));
+        self
+    }
+
+    /// The rendered run goal, available only where a run's goal is in scope.
+    /// Like [`ResolveCtx::with_inputs`], leaving it unwired keeps
+    /// `{{ goal }}` unavailable for that call site.
+    ///
+    /// Takes the value rather than a lookup: unlike a namespace there is
+    /// nothing to look up by name, so a wired goal can never be `Missing`.
+    #[must_use]
+    pub fn with_goal(mut self, goal: impl Into<String>) -> Self {
+        let goal = goal.into();
+        self.goal = Some(Box::new(move |_| Some(goal.clone())));
+        self
+    }
+
     fn lookup_for(&mut self, namespace: Namespace) -> Option<&mut LookupFn<'a>> {
         match namespace {
             Namespace::Env => self.env.as_mut(),
             Namespace::Vars => self.vars.as_mut(),
             Namespace::Secrets => self.secrets.as_mut(),
-            // `inputs` is template-only: an `InterpString` resolve context
-            // never provides it, so an `{{ inputs.* }}` token is always
-            // unavailable here. `substitute_with` still preserves the token so a
-            // goal (an `InterpString` that feeds a template) can forward it.
-            Namespace::Inputs => None,
+            Namespace::Inputs => self.inputs.as_mut(),
+            Namespace::Goal => self.goal.as_mut(),
         }
     }
 }
@@ -267,9 +316,11 @@ impl InterpString {
                 Segment::Literal(text) => out.push_str(text),
                 Segment::Token { namespace, name } => {
                     out.push_str("{{ ");
-                    out.push_str(namespace.into());
-                    out.push('.');
-                    out.push_str(name);
+                    out.push_str((*namespace).into());
+                    if !namespace.is_bare() {
+                        out.push('.');
+                        out.push_str(name);
+                    }
                     out.push_str(" }}");
                 }
             }
@@ -309,7 +360,7 @@ impl InterpString {
     /// for the namespaces it does not — their resolution happens later,
     /// possibly in a different process.
     ///
-    /// This is the early, server-side pass (`vars`/`inputs`); late-bound
+    /// This is the early, server-side pass (`vars`/`inputs`/`goal`); late-bound
     /// namespaces (`env`/`secrets`) survive in token form for their
     /// consumption-time [`InterpString::resolve_with`].
     pub fn substitute_with(&self, ctx: &mut ResolveCtx<'_>) -> Result<Self, ResolveError> {
@@ -463,13 +514,18 @@ impl fmt::Display for ResolveError {
                 self.name, self.name
             ),
             ResolveErrorKind::Unavailable => match namespace {
-                // `inputs` is template-only: it never resolves in an
-                // `InterpString` field. Point the user at where it works.
+                // `inputs` and `goal` resolve only where a run's values are in
+                // scope. Point the user at where that is.
                 Namespace::Inputs => write!(
                     f,
-                    "{{{{ inputs.{} }}}} is only available in prompts and goals, not in other \
-                     config fields",
+                    "{{{{ inputs.{} }}}} is only available in prompts, goals, and command node \
+                     `script` attributes, not in other config fields",
                     self.name
+                ),
+                Namespace::Goal => write!(
+                    f,
+                    "{{{{ goal }}}} is only available in prompts and command node `script` \
+                     attributes, not in other config fields"
                 ),
                 _ => write!(
                     f,
@@ -504,7 +560,7 @@ impl<'de> Deserialize<'de> for InterpString {
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_str(
                     "a string, optionally containing {{ env.NAME }}, {{ vars.NAME }}, \
-                     {{ secrets.NAME }}, or {{ inputs.NAME }} interpolation tokens",
+                     {{ secrets.NAME }}, {{ inputs.NAME }}, or {{ goal }} interpolation tokens",
                 )
             }
 
@@ -657,7 +713,8 @@ mod tests {
             s: InterpString,
         }
 
-        let input = r#"{"s":"{{ env.A }}/{{ vars.B }}/{{ secrets.C }}/{{ inputs.d-key }}"}"#;
+        let input =
+            r#"{"s":"{{ env.A }}/{{ vars.B }}/{{ secrets.C }}/{{ inputs.d-key }}/{{ goal }}"}"#;
         let parsed: Wrap = serde_json::from_str(input).unwrap();
         let rendered = serde_json::to_string(&parsed).unwrap();
         assert_eq!(rendered, input);
@@ -754,10 +811,9 @@ mod tests {
     }
 
     #[test]
-    fn resolve_with_rejects_inputs_as_template_only() {
-        // `inputs` is template-only. An `{{ inputs.* }}` token never resolves
-        // in an `InterpString` field — it fails loudly, pointing the
-        // user at prompts and goals.
+    fn resolve_with_rejects_inputs_when_not_wired() {
+        // A context that does not opt into `inputs` fails loudly, pointing the
+        // user at the scopes where inputs do resolve.
         let s = InterpString::parse("run-{{ inputs.ticket-id }}");
 
         let err = s.resolve_with(&mut ResolveCtx::new()).unwrap_err();
@@ -765,10 +821,113 @@ mod tests {
         assert_eq!(err.namespace, Namespace::Inputs);
         assert_eq!(err.kind, ResolveErrorKind::Unavailable);
         assert!(
-            err.to_string()
-                .contains("only available in prompts and goals"),
+            err.to_string().contains("only available in prompts, goals"),
             "unexpected message: {err}"
         );
+    }
+
+    #[test]
+    fn resolve_with_resolves_inputs_when_wired() {
+        let s = InterpString::parse("run-{{ inputs.ticket-id }}-{{ vars.STAGE }}");
+
+        let resolved = s
+            .resolve_with(
+                &mut ResolveCtx::new()
+                    .with_inputs(lookup_from(&[("ticket-id", "4821")]))
+                    .with_vars(lookup_from(&[("STAGE", "staging")])),
+            )
+            .unwrap();
+
+        assert_eq!(resolved, "run-4821-staging");
+    }
+
+    #[test]
+    fn resolve_with_resolves_the_bare_goal_token_when_wired() {
+        let s = InterpString::parse("gh pr create --title \"{{ goal }}\"");
+
+        let resolved = s
+            .resolve_with(&mut ResolveCtx::new().with_goal("Fix the login bug"))
+            .unwrap();
+
+        assert_eq!(resolved, "gh pr create --title \"Fix the login bug\"");
+    }
+
+    #[test]
+    fn resolve_with_rejects_the_goal_token_when_not_wired() {
+        let s = InterpString::parse("echo {{ goal }}");
+
+        let err = s.resolve_with(&mut ResolveCtx::new()).unwrap_err();
+
+        assert_eq!(err.namespace, Namespace::Goal);
+        assert_eq!(err.kind, ResolveErrorKind::Unavailable);
+        assert!(
+            err.to_string().contains("{{ goal }} is only available"),
+            "unexpected message: {err}"
+        );
+    }
+
+    /// `goal` names a single value, so it has no dotted spelling. Anything of
+    /// the form `{{ goal.x }}` must stay literal rather than becoming a token
+    /// that could never resolve.
+    #[test]
+    fn goal_has_no_dotted_form() {
+        for source in ["{{ goal.title }}", "{{ goal. }}", "{{ goals }}"] {
+            let s = InterpString::parse(source);
+            let resolved = s
+                .resolve_with(&mut ResolveCtx::new().with_goal("Ship it"))
+                .unwrap_or_else(|err| panic!("`{source}` should stay literal, got: {err}"));
+            assert_eq!(resolved, source);
+        }
+    }
+
+    /// Substituted text is output, not more input. A resolved value that
+    /// happens to contain token syntax must land verbatim rather than being
+    /// scanned again — otherwise a goal or input could smuggle in a token the
+    /// call site never wired.
+    #[test]
+    fn resolve_with_does_not_rescan_substituted_values() {
+        let s = InterpString::parse("{{ goal }} | {{ vars.PAYLOAD }}");
+
+        let resolved = s
+            .resolve_with(
+                &mut ResolveCtx::new()
+                    .with_goal("{{ secrets.API_KEY }}")
+                    .with_vars(lookup_from(&[("PAYLOAD", "{{ env.HOME }}")])),
+            )
+            .unwrap();
+
+        assert_eq!(resolved, "{{ secrets.API_KEY }} | {{ env.HOME }}");
+    }
+
+    #[test]
+    fn goal_token_round_trips_through_source_form() {
+        // Unwired, `substitute_with` preserves the token; `as_source` must
+        // reproduce the bare spelling rather than `{{ goal.goal }}`.
+        let s = InterpString::parse("deploy # {{  goal  }}");
+
+        let preserved = s.substitute_with(&mut ResolveCtx::new()).unwrap();
+
+        #[expect(clippy::disallowed_methods, reason = "asserting the source round-trip")]
+        let source = preserved.as_source();
+        assert_eq!(source, "deploy # {{ goal }}");
+    }
+
+    /// Wiring `inputs` at one call site must not make it resolvable anywhere
+    /// else. Every config-layer context leaves it unwired, and this pins that
+    /// the availability stays per-context rather than global.
+    #[test]
+    fn wiring_inputs_does_not_leak_into_other_contexts() {
+        let s = InterpString::parse("{{ inputs.id }}");
+
+        let wired = s
+            .resolve_with(&mut ResolveCtx::new().with_inputs(lookup_from(&[("id", "7")])))
+            .unwrap();
+        assert_eq!(wired, "7");
+
+        let err = s
+            .resolve_with(&mut ResolveCtx::new().with_env(lookup_from(&[("id", "7")])))
+            .unwrap_err();
+        assert_eq!(err.kind, ResolveErrorKind::Unavailable);
     }
 
     #[test]
@@ -825,5 +984,6 @@ mod tests {
         assert_eq!(Namespace::Vars.to_string(), "vars");
         assert_eq!(Namespace::Secrets.to_string(), "secrets");
         assert_eq!(Namespace::Inputs.to_string(), "inputs");
+        assert_eq!(Namespace::Goal.to_string(), "goal");
     }
 }
