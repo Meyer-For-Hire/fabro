@@ -559,7 +559,7 @@ reasoning = false
                 cwd: PathBuf::from("."),
                 custom_transforms: Vec::new(),
             },
-            &test_catalog(),
+            test_catalog(),
         )
         .unwrap()
     }

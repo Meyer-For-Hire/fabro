@@ -32,5 +32,5 @@ fn build_mcp_run_manifest(
         Catalog::from_builtin_with_overrides(&llm_catalog_settings)
             .map_err(|err| ToolError::message(err.to_string()))?,
     );
-    run_tool_manifest::build_run_tool_manifest(spec, cwd, user_settings_path, &catalog)
+    run_tool_manifest::build_run_tool_manifest(spec, cwd, user_settings_path, catalog)
 }

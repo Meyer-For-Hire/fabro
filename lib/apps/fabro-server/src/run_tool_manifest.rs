@@ -14,7 +14,7 @@ pub fn build_run_tool_manifest(
     spec: &ValidatedCreateRunSpec,
     cwd: &Path,
     user_settings_path: &Path,
-    catalog: &Arc<Catalog>,
+    catalog: Arc<Catalog>,
 ) -> ToolResult<types::RunManifest> {
     let built = fabro_manifest::build_run_manifest(ManifestBuildInput {
         workflow:             PathBuf::from(&spec.workflow),

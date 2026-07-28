@@ -829,7 +829,7 @@ async fn run_preflight(
     let (llm_result, ready_providers) = state.resolve_llm_client_with_ready_ids().await;
     let mut validated = match run_manifest::validate_prepared_manifest_for_preflight(
         &prepared,
-        &state.catalog(),
+        state.catalog(),
         vars,
         &ready_providers,
     ) {
@@ -879,15 +879,17 @@ async fn validate_run_manifest(
         return ApiError::bad_request(format!("Run config variable interpolation failed: {err}"))
             .into_response();
     }
-    let validated =
-        match run_manifest::validate_prepared_manifest_with_vars(&prepared, &state.catalog(), vars)
-        {
-            Ok(validated) => validated,
-            Err(WorkflowError::Parse(_)) => {
-                return ApiError::bad_request("Validation failed").into_response();
-            }
-            Err(err) => return ApiError::bad_request(err.to_string()).into_response(),
-        };
+    let validated = match run_manifest::validate_prepared_manifest_with_vars(
+        &prepared,
+        state.catalog(),
+        vars,
+    ) {
+        Ok(validated) => validated,
+        Err(WorkflowError::Parse(_)) => {
+            return ApiError::bad_request("Validation failed").into_response();
+        }
+        Err(err) => return ApiError::bad_request(err.to_string()).into_response(),
+    };
     (
         StatusCode::OK,
         Json(run_manifest::validate_response(&prepared, &validated)),

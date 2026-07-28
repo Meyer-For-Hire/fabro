@@ -35,12 +35,9 @@ pub fn validate(input: ValidateInput) -> Result<Validated, Error> {
 /// Parse, transform, and validate a DOT source string against `catalog`.
 pub fn validate_with_catalog(
     input: ValidateInput,
-    catalog: &Arc<Catalog>,
+    catalog: Arc<Catalog>,
 ) -> Result<Validated, Error> {
-    validate_resolving_models(
-        input,
-        Some(ModelResolutionTransform::new(Arc::clone(catalog))),
-    )
+    validate_resolving_models(input, Some(ModelResolutionTransform::new(catalog)))
 }
 
 /// Parse, transform, and validate, resolving models against the ready
@@ -48,14 +45,14 @@ pub fn validate_with_catalog(
 /// provider-readiness selection failures.
 pub fn validate_with_ready_providers(
     input: ValidateInput,
-    catalog: &Arc<Catalog>,
+    catalog: Arc<Catalog>,
     ready_providers: &[ProviderId],
 ) -> Result<Validated, Error> {
     validate_resolving_models(
         input,
         Some(
             ModelResolutionTransform::for_eligible(
-                Arc::clone(catalog),
+                catalog,
                 ready_providers.iter().cloned().collect(),
             )
             .with_catalog_fallback(true),

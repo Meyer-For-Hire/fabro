@@ -188,7 +188,7 @@ pub(crate) fn prepare_manifest_with_environment_defaults(
 
 pub(crate) fn validate_prepared_manifest(
     prepared: &PreparedManifest,
-    catalog: &Arc<Catalog>,
+    catalog: Arc<Catalog>,
 ) -> Result<Validated, WorkflowError> {
     validate_prepared_manifest_with_vars(prepared, catalog, HashMap::new())
 }
@@ -201,7 +201,7 @@ pub(crate) fn validate_prepared_manifest_structural(
 
 pub(crate) fn validate_prepared_manifest_with_vars(
     prepared: &PreparedManifest,
-    catalog: &Arc<Catalog>,
+    catalog: Arc<Catalog>,
     vars: HashMap<String, String>,
 ) -> Result<Validated, WorkflowError> {
     validate_with_catalog(manifest_validate_input(prepared, vars), catalog)
@@ -209,7 +209,7 @@ pub(crate) fn validate_prepared_manifest_with_vars(
 
 pub(crate) fn validate_prepared_manifest_for_preflight(
     prepared: &PreparedManifest,
-    catalog: &Arc<Catalog>,
+    catalog: Arc<Catalog>,
     vars: HashMap<String, String>,
     ready_providers: &[ProviderId],
 ) -> Result<Validated, WorkflowError> {
@@ -1554,7 +1554,7 @@ digraph Demo {{
         .unwrap();
         let validated = validate_prepared_manifest_for_preflight(
             &prepared,
-            &state.catalog(),
+            state.catalog(),
             HashMap::new(),
             &ready_providers,
         )
@@ -1639,7 +1639,7 @@ enabled = {clone_enabled}
             &manifest,
         )
         .unwrap();
-        let validated = validate_prepared_manifest(&prepared, &test_catalog()).unwrap();
+        let validated = validate_prepared_manifest(&prepared, test_catalog()).unwrap();
         let resolved = materialize_run(
             prepared.settings.clone(),
             validated.graph(),
@@ -2199,7 +2199,7 @@ name = "Control Plane"
             &invalid_manifest(),
         )
         .unwrap();
-        let validated = validate_prepared_manifest(&prepared, &test_catalog()).unwrap();
+        let validated = validate_prepared_manifest(&prepared, test_catalog()).unwrap();
 
         assert!(validated.has_errors());
 
@@ -2244,7 +2244,7 @@ issues = "read"
             &manifest,
         )
         .unwrap();
-        let validated = validate_prepared_manifest(&prepared, &test_catalog()).unwrap();
+        let validated = validate_prepared_manifest(&prepared, test_catalog()).unwrap();
         assert!(!validated.has_errors());
 
         let (response, _ok) = resolve_and_run_preflight(state.as_ref(), &prepared, &validated)
@@ -2294,7 +2294,7 @@ id = "local"
             &manifest,
         )
         .unwrap();
-        let validated = validate_prepared_manifest(&prepared, &test_catalog()).unwrap();
+        let validated = validate_prepared_manifest(&prepared, test_catalog()).unwrap();
 
         assert!(!validated.has_errors());
 
@@ -2403,7 +2403,7 @@ id = "daytona"
             &manifest,
         )
         .unwrap();
-        let validated = validate_prepared_manifest(&prepared, &test_catalog()).unwrap();
+        let validated = validate_prepared_manifest(&prepared, test_catalog()).unwrap();
 
         let (response, _ok) = resolve_and_run_preflight(state.as_ref(), &prepared, &validated)
             .await
@@ -2471,7 +2471,7 @@ digraph Demo {
             &manifest,
         )
         .unwrap();
-        let validated = validate_prepared_manifest(&prepared, &test_catalog()).unwrap();
+        let validated = validate_prepared_manifest(&prepared, test_catalog()).unwrap();
 
         let (response, ok) = resolve_and_run_preflight(state.as_ref(), &prepared, &validated)
             .await
@@ -2585,7 +2585,7 @@ digraph Demo {
             &manifest,
         )
         .unwrap();
-        let Err(error) = validate_prepared_manifest(&prepared, &test_catalog()) else {
+        let Err(error) = validate_prepared_manifest(&prepared, test_catalog()) else {
             panic!("unknown provider should fail static validation");
         };
 
@@ -2652,7 +2652,7 @@ digraph Demo {
         assert!(ready_providers.is_empty());
         let validated = validate_prepared_manifest_for_preflight(
             &prepared,
-            &state.catalog(),
+            state.catalog(),
             HashMap::new(),
             &ready_providers,
         )

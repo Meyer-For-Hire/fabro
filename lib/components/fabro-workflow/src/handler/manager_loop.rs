@@ -131,7 +131,7 @@ fn validate_child_workflow(
             cwd,
             custom_transforms: Vec::new(),
         },
-        &services.run.catalog,
+        Arc::clone(&services.run.catalog),
     )?;
     validated.promote_template_undefined_variables_to_errors();
     validated.raise_on_errors()?;

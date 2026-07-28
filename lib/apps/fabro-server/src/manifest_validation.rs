@@ -25,7 +25,7 @@ pub fn validate_manifest(
 pub fn validate_manifest_with_catalog(
     manifest_run_defaults: &RunLayer,
     manifest: &types::RunManifest,
-    catalog: &Arc<Catalog>,
+    catalog: Arc<Catalog>,
 ) -> Result<types::ValidateResponse> {
     let prepared = prepare(manifest_run_defaults, manifest)?;
     let validated =
