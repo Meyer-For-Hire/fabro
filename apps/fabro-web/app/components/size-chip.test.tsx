@@ -1,25 +1,43 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import TestRenderer, { act } from "react-test-renderer";
 
+import { setupReactTestEnv } from "../lib/test-utils";
 import { SizeChip } from "./size-chip";
 import { Tooltip } from "./ui";
 
-function tooltipLabel(element: React.ReactElement): string {
+let teardownReactTestEnv: (() => void) | undefined;
+const mountedRenderers: TestRenderer.ReactTestRenderer[] = [];
+
+function render(element: React.ReactElement): TestRenderer.ReactTestRenderer {
   let renderer: TestRenderer.ReactTestRenderer | undefined;
   act(() => {
     renderer = TestRenderer.create(element);
   });
-  return renderer!.root.findByType(Tooltip).props.label as string;
+  mountedRenderers.push(renderer!);
+  return renderer!;
+}
+
+function tooltipLabel(element: React.ReactElement): string {
+  return render(element).root.findByType(Tooltip).props.label as string;
 }
 
 describe("SizeChip", () => {
-  test("renders the size letter", () => {
-    let renderer: TestRenderer.ReactTestRenderer | undefined;
-    act(() => {
-      renderer = TestRenderer.create(<SizeChip size="M" />);
-    });
+  beforeEach(() => {
+    teardownReactTestEnv = setupReactTestEnv();
+  });
 
-    expect(JSON.stringify(renderer!.toJSON())).toContain("M");
+  afterEach(() => {
+    act(() => {
+      for (const renderer of mountedRenderers.splice(0)) {
+        renderer.unmount();
+      }
+    });
+    teardownReactTestEnv?.();
+    teardownReactTestEnv = undefined;
+  });
+
+  test("renders the size letter", () => {
+    expect(JSON.stringify(render(<SizeChip size="M" />).toJSON())).toContain("M");
   });
 
   test("appends the cost to the tooltip", () => {

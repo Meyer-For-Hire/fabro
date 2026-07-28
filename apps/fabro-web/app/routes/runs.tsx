@@ -418,7 +418,7 @@ function PrCardFooter({ pr, actions }: { pr: RunItem; actions?: string[] }) {
         </div>
       )}
       {pr.size != null && (
-        <span className={`inline-flex ${hasActions ? "" : "ml-auto"}`}>
+        <span className={hasActions ? "inline-flex" : "ml-auto inline-flex"}>
           <SizeChip size={pr.size} totalUsdMicros={pr.totalUsdMicros} />
         </span>
       )}

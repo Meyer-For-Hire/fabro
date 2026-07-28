@@ -1,3 +1,4 @@
+import { memo } from "react";
 import type { RunSize } from "@qltysh/fabro-api-client";
 
 import { formatUsdMicros } from "../lib/format";
@@ -11,7 +12,7 @@ const SIZE_TONE: Record<RunSize, { className: string; note: string | null }> = {
   XL: { className: "bg-coral/15 text-coral",     note: "unhealthy" },
 };
 
-export function SizeChip({
+export const SizeChip = memo(function SizeChip({
   size,
   totalUsdMicros,
 }: {
@@ -30,4 +31,4 @@ export function SizeChip({
       </span>
     </Tooltip>
   );
-}
+});
