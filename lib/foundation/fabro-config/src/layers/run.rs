@@ -148,8 +148,11 @@ pub struct RunModelLayer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[option(value_type = "string")]
     pub name:      Option<String>,
-    /// Ordered list of fallback model references. Supports `...` splice marker
-    /// at layering time — see [`super::splice_array`].
+    /// Ordered fallback references: bare providers, bare model IDs or aliases,
+    /// or provider-qualified `provider:selector` values. A qualified selector
+    /// may be a model ID, alias, or provider API ID. Legacy `provider/model`
+    /// values remain accepted. Supports the `...` splice marker at layering
+    /// time — see [`super::splice_array`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[option(default = "[]", value_type = "array<string>")]
     pub fallbacks: Vec<ModelRefOrSplice>,
