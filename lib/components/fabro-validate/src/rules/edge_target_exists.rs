@@ -11,13 +11,6 @@ pub(super) fn rule() -> Box<dyn LintRule> {
 struct Rule;
 
 impl Rule {
-    /// An edge endpoint is only usable when the workflow declares it. A node
-    /// the parser synthesized from the edge itself carries no attributes, so it
-    /// would silently run as a default agent stage.
-    fn is_declared(graph: &Graph, node_id: &str) -> bool {
-        graph.nodes.get(node_id).is_some_and(|node| !node.implicit)
-    }
-
     fn diagnostic(&self, node_id: &str, from: &str, to: &str) -> Diagnostic {
         Diagnostic {
             rule: self.name().to_string(),
@@ -47,7 +40,7 @@ impl LintRule for Rule {
         let mut reported = HashSet::new();
         for edge in &graph.edges {
             for endpoint in [&edge.to, &edge.from] {
-                if !Self::is_declared(graph, endpoint) && reported.insert(endpoint) {
+                if !graph.nodes.contains_key(endpoint) && reported.insert(endpoint) {
                     diagnostics.push(self.diagnostic(endpoint, &edge.from, &edge.to));
                 }
             }
@@ -71,8 +64,8 @@ mod tests {
 
     fn undeclared_nodes(graph: &Graph) -> Vec<String> {
         Rule.apply(graph)
-            .iter()
-            .map(|d| d.node_id.clone().expect("diagnostic should name a node"))
+            .into_iter()
+            .map(|d| d.node_id.expect("diagnostic should name a node"))
             .collect()
     }
 

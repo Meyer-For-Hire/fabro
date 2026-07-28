@@ -295,12 +295,10 @@ fn edge_only_node() {
     exit_code: 1
     ----- stdout -----
     ----- stderr -----
-    Workflow: EdgeOnlyNode (3 nodes, 2 edges)
+    Workflow: EdgeOnlyNode (2 nodes, 2 edges)
     Graph: [FIXTURES]/edge_only_node.fabro
     error [node: misspelled_node]: Node 'misspelled_node' is referenced by edge 'start -> misspelled_node' but has no node declaration (edge_target_exists)
       fix: Declare node 'misspelled_node' or correct the edge endpoint
-    warning [node: misspelled_node]: LLM node 'misspelled_node' has no prompt or label attribute (prompt_on_llm_nodes)
-      fix: Add a prompt or label attribute
       × Validation failed
     ");
 }

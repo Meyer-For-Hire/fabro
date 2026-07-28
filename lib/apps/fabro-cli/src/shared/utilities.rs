@@ -66,43 +66,28 @@ fn print_diagnostic(d: &Diagnostic, styles: &Styles, printer: Printer) {
         _ => String::new(),
     };
     let source_prefix = source_prefix(d);
+    let body = if source_prefix.is_empty() {
+        format!("{location}: {}", d.message)
+    } else {
+        format!(": {source_prefix}{}{location}", d.message)
+    };
     match d.severity {
-        Severity::Error if source_prefix.is_empty() => fabro_util::printerr!(
-            printer,
-            "{}{location}: {} ({})",
-            styles.red.apply_to("error"),
-            d.message,
-            styles.dim.apply_to(&d.rule),
-        ),
         Severity::Error => fabro_util::printerr!(
             printer,
-            "{}: {source_prefix}{}{location} ({})",
+            "{}{body} ({})",
             styles.red.apply_to("error"),
-            d.message,
-            styles.dim.apply_to(&d.rule),
-        ),
-        Severity::Warning if source_prefix.is_empty() => fabro_util::printerr!(
-            printer,
-            "{}{location}: {} ({})",
-            styles.yellow.apply_to("warning"),
-            d.message,
             styles.dim.apply_to(&d.rule),
         ),
         Severity::Warning => fabro_util::printerr!(
             printer,
-            "{}: {source_prefix}{}{location} ({})",
+            "{}{body} ({})",
             styles.yellow.apply_to("warning"),
-            d.message,
             styles.dim.apply_to(&d.rule),
         ),
         Severity::Info => fabro_util::printerr!(
             printer,
             "{}",
-            styles.dim.apply_to(if source_prefix.is_empty() {
-                format!("info{location}: {} ({})", d.message, d.rule)
-            } else {
-                format!("info: {source_prefix}{}{location} ({})", d.message, d.rule)
-            }),
+            styles.dim.apply_to(format!("info{body} ({})", d.rule)),
         ),
     }
 }
