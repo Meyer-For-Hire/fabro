@@ -7,23 +7,13 @@ use crate::run_event::InterviewOption;
 const REVIEW_TARGET_LABEL_MAX_CHARS: usize = 200;
 const REVIEW_TARGET_URL_MAX_CHARS: usize = 2048;
 
-/// The type of resource a human should review.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::Display, strum::EnumString,
-)]
+/// The type of resource a human should review. `Display` renders the noun used
+/// in review question text ("document").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::Display)]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum ReviewTargetKind {
     Document,
-}
-
-impl ReviewTargetKind {
-    #[must_use]
-    pub const fn noun(self) -> &'static str {
-        match self {
-            Self::Document => "document",
-        }
-    }
 }
 
 /// A validated external resource presented as the primary subject of a human
@@ -71,12 +61,21 @@ impl ReviewTarget {
         self.kind
     }
 
+    /// The question text shown to a human, with the label rendered as plain
+    /// text.
     #[must_use]
     pub fn question_text(&self) -> String {
+        self.question_text_with_link(&self.label)
+    }
+
+    /// The same sentence as [`Self::question_text`], with the label replaced by
+    /// a client-specific rendering of the link (Slack `<url|label>` syntax, for
+    /// example). This is the single definition of the review question wording.
+    #[must_use]
+    pub fn question_text_with_link(&self, rendered_link: &str) -> String {
         format!(
-            "Review the {} {}, then choose the next action.",
-            self.label,
-            self.kind.noun()
+            "Review the {rendered_link} {}, then choose the next action.",
+            self.kind
         )
     }
 }
@@ -93,7 +92,7 @@ pub enum ReviewTargetError {
     EmptyUrl,
     #[error("review target URL must be at most {REVIEW_TARGET_URL_MAX_CHARS} characters")]
     UrlTooLong,
-    #[error("review target URL must not contain control characters or Slack link delimiters")]
+    #[error("review target URL must not contain control characters or link delimiters")]
     UrlContainsUnsafeCharacters,
     #[error("review target URL must be a valid absolute URL")]
     InvalidUrl,
@@ -154,8 +153,10 @@ impl<'de> Deserialize<'de> for ReviewTarget {
     where
         D: serde::Deserializer<'de>,
     {
+        // Unknown fields are ignored so the OpenAPI contract (which leaves
+        // `additionalProperties` permissive) and this deserializer agree, and
+        // so an unknown key in a persisted event cannot fail the whole event.
         #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
         struct WireReviewTarget {
             label: String,
             url:   String,

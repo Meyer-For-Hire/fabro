@@ -102,11 +102,8 @@ fn header_section(question: &Question, run_web_url: Option<&str>) -> Value {
     let mut text = question.review_target.as_ref().map_or_else(
         || format!("*{}*", escape_slack_controls(&question.text)),
         |target| {
-            format!(
-                "*Review the {} {}, then choose the next action.*",
-                slack_link(target.url(), target.label()),
-                target.kind().noun()
-            )
+            let link = slack_link(target.url(), target.label());
+            format!("*{}*", target.question_text_with_link(&link))
         },
     );
     if !question.stage.is_empty() {

@@ -222,7 +222,7 @@ pub trait Interviewer: Send + Sync {
 // Re-export all implementors at the crate root
 pub use auto_approve::AutoApproveInterviewer;
 pub use callback::CallbackInterviewer;
-pub use console::ConsoleInterviewer;
+pub use console::{ConsoleInterviewer, review_target_line};
 pub use control::{ControlInterviewer, SubmitError};
 pub use control_protocol::{
     WORKER_CONTROL_INVALID_CURSOR_REASON, WORKER_CONTROL_PONG_TIMEOUT_REASON,

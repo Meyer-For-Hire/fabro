@@ -1,76 +1,59 @@
 import { ArrowTopRightOnSquareIcon } from "@heroicons/react/20/solid";
-import {
-  ReviewTargetKind,
-  type ReviewTarget,
-} from "@qltysh/fabro-api-client";
+import type { ReviewTarget } from "@qltysh/fabro-api-client";
 
-const CONTROL_CHARACTER = /[\u0000-\u001f\u007f-\u009f]/u;
-const UNSAFE_LINK_DELIMITER = /[<>|]/u;
-
-function unicodeScalarCount(value: string): number {
-  return Array.from(value).length;
-}
-
-function hasSafeReviewTarget(target: ReviewTarget | null | undefined): target is ReviewTarget {
-  if (
-    !target ||
-    target.kind !== ReviewTargetKind.DOCUMENT ||
-    !target.label.trim() ||
-    target.label !== target.label.trim() ||
-    unicodeScalarCount(target.label) > 200 ||
-    CONTROL_CHARACTER.test(target.label) ||
-    !target.url ||
-    target.url !== target.url.trim() ||
-    unicodeScalarCount(target.url) > 2048 ||
-    CONTROL_CHARACTER.test(target.url) ||
-    UNSAFE_LINK_DELIMITER.test(target.url)
-  ) {
-    return false;
-  }
-
+/**
+ * Re-check the URL before putting it in an `href`. The server already rejects
+ * unsafe targets (see `ReviewTarget::new` in
+ * `lib/foundation/fabro-types/src/interview.rs`), but React does not sanitize
+ * `href`, so a `javascript:` URL reaching this component would execute. Length
+ * and control-character limits stay server-side; they cannot affect the DOM.
+ */
+export function safeReviewTarget(
+  target: ReviewTarget | null | undefined,
+): ReviewTarget | null {
+  if (!target?.url || !target.label) return null;
   try {
     const parsed = new URL(target.url);
-    return (
+    const safe =
       (parsed.protocol === "http:" || parsed.protocol === "https:") &&
       Boolean(parsed.host) &&
       !parsed.username &&
-      !parsed.password
-    );
+      !parsed.password;
+    return safe ? target : null;
   } catch {
-    return false;
+    return null;
   }
 }
 
+/**
+ * The review question sentence, with the target label as an external link.
+ * Mirrors `ReviewTarget::question_text_with_link` in
+ * `lib/foundation/fabro-types/src/interview.rs`.
+ */
 export function ReviewTargetQuestion({
-  reviewTarget,
-  fallbackText,
+  target,
   className,
 }: {
-  reviewTarget: ReviewTarget | null | undefined;
-  fallbackText: string;
+  target: ReviewTarget;
   className?: string;
 }) {
-  if (!hasSafeReviewTarget(reviewTarget)) {
-    return <p className={className}>{fallbackText}</p>;
-  }
-
   return (
     <p className={className}>
       Review the{" "}
       <a
-        href={reviewTarget.url}
+        href={target.url}
         target="_blank"
         rel="noopener noreferrer"
         referrerPolicy="no-referrer"
         className="inline-flex items-baseline gap-1 font-semibold text-teal-300 underline decoration-teal-500/50 underline-offset-2 transition-colors hover:text-fg focus-visible:rounded-sm focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500"
       >
-        <span>{reviewTarget.label}</span>
+        <span>{target.label}</span>
         <ArrowTopRightOnSquareIcon
           className="size-3 shrink-0 self-center"
           aria-hidden="true"
         />
       </a>{" "}
-      document, then choose the next action.
+      {target.kind}, then choose the next action.
     </p>
   );
 }

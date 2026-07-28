@@ -1,10 +1,14 @@
-import { StageOutcome } from "@qltysh/fabro-api-client";
-import type {
-  EventEnvelope,
-  ReviewTarget,
-} from "@qltysh/fabro-api-client";
+import { ReviewTargetKind, StageOutcome } from "@qltysh/fabro-api-client";
+import type { EventEnvelope, ReviewTarget } from "@qltysh/fabro-api-client";
 
-import { getArray, getNumber, getObject, getString, type UnknownRecord } from "../../lib/unknown";
+import {
+  getArray,
+  getNumber,
+  getObject,
+  getString,
+  isRecord,
+  type UnknownRecord,
+} from "../../lib/unknown";
 
 const STAGE_OUTCOMES: ReadonlySet<string> = new Set(Object.values(StageOutcome));
 
@@ -80,12 +84,11 @@ function parseInterviewOptions(value: unknown): InterviewOption[] {
 }
 
 function parseReviewTarget(value: unknown): ReviewTarget | null {
-  if (!value || typeof value !== "object") return null;
-  const record = value as UnknownRecord;
-  const label = getString(record, "label");
-  const url = getString(record, "url");
-  const kind = getString(record, "kind");
-  if (!label || !url || kind !== "document") return null;
+  if (!isRecord(value)) return null;
+  const label = getString(value, "label");
+  const url = getString(value, "url");
+  const kind = getString(value, "kind");
+  if (!label || !url || kind !== ReviewTargetKind.DOCUMENT) return null;
   return { label, url, kind };
 }
 

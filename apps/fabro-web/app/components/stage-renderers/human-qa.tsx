@@ -10,7 +10,10 @@ import {
 import type { EventEnvelope } from "@qltysh/fabro-api-client";
 
 import type { Stage } from "../stage-sidebar";
-import { ReviewTargetQuestion } from "../review-target-question";
+import {
+  ReviewTargetQuestion,
+  safeReviewTarget,
+} from "../review-target-question";
 import { Tooltip } from "../ui";
 import { formatAbsoluteTs, formatDurationMs } from "../../lib/format";
 import { ACTIVE_STAGE_STATES } from "../../lib/stage-sidebar";
@@ -149,6 +152,7 @@ function QuestionBlock({
   stageActive: boolean;
 }) {
   const { question, resolution } = pair;
+  const reviewTarget = safeReviewTarget(question.reviewTarget);
   return (
     <article className="space-y-3">
       <header className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
@@ -169,10 +173,9 @@ function QuestionBlock({
       </header>
 
       <div className="rounded-lg bg-panel p-4 outline-1 -outline-offset-1 outline-line">
-        {question.reviewTarget ? (
+        {reviewTarget ? (
           <ReviewTargetQuestion
-            reviewTarget={question.reviewTarget}
-            fallbackText={question.question}
+            target={reviewTarget}
             className="text-sm/6 text-fg-2"
           />
         ) : (

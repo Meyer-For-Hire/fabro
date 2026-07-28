@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 
 use super::ExecOutputTail;
-use crate::{CommandTermination, ParallelBranchResult, PullRequestLink, StageId, StageOutcome};
+use crate::{
+    CommandTermination, ParallelBranchResult, PullRequestLink, ReviewTarget, StageId, StageOutcome,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct InterviewOption {
@@ -66,7 +68,7 @@ pub struct InterviewStartedProps {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_display: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub review_target:   Option<crate::ReviewTarget>,
+    pub review_target:   Option<ReviewTarget>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

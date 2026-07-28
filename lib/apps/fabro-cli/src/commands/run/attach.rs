@@ -452,13 +452,8 @@ async fn ask_attach_question(question: Question, styles: &'static Styles) -> Ans
         let rendered = styles.render_markdown(context_text);
         eprint!("{rendered}");
     }
-    if let Some(target) = &question.review_target {
-        eprintln!(
-            "Review {}: {} — {}",
-            target.kind().noun(),
-            target.label(),
-            target.url()
-        );
+    if let Some(line) = fabro_interview::review_target_line(&question) {
+        eprintln!("{line}");
     }
     eprintln!("{} {}", styles.bold_cyan.apply_to("?"), question.text);
 

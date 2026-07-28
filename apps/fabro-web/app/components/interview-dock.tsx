@@ -22,8 +22,13 @@ import {
 } from "../lib/mutations";
 import { ApiError } from "../lib/api-client";
 import { displayLabel } from "./interview-label";
-import { ReviewTargetQuestion } from "./review-target-question";
+import {
+  ReviewTargetQuestion,
+  safeReviewTarget,
+} from "./review-target-question";
 import { ErrorMessage } from "./ui";
+
+const QUESTION_TEXT = "text-pretty text-base/6 font-medium text-fg";
 
 const PRIMARY_BUTTON =
   "inline-flex items-center justify-center gap-1.5 rounded-lg bg-teal-500 px-3.5 py-2 text-sm font-medium text-on-primary transition-colors hover:bg-teal-300 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:bg-teal-500";
@@ -78,6 +83,7 @@ function InterviewQuestionDock({
   const submitMutation = useSubmitInterviewAnswer(runId);
   const [error, setError] = useState<string | null>(null);
   const submitting = submitMutation.isMutating;
+  const reviewTarget = safeReviewTarget(question.review_target);
 
   const submit = useCallback(
     async (answer: SubmitInterviewAnswer) => {
@@ -100,11 +106,14 @@ function InterviewQuestionDock({
       />
       <div className="space-y-5 px-5 py-4 sm:px-6">
         <div>
-          <ReviewTargetQuestion
-            reviewTarget={question.review_target}
-            fallbackText={question.text}
-            className="text-pretty text-base/6 font-medium text-fg"
-          />
+          {reviewTarget ? (
+            <ReviewTargetQuestion
+              target={reviewTarget}
+              className={QUESTION_TEXT}
+            />
+          ) : (
+            <p className={QUESTION_TEXT}>{question.text}</p>
+          )}
           <p className="mt-1 text-xs/5 text-fg-muted">
             {questionTypeLabel(question.question_type)}
           </p>
