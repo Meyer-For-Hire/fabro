@@ -9,6 +9,7 @@ use anyhow::Context as _;
 use async_trait::async_trait;
 use daytona_api_client::apis::api_keys_api;
 use daytona_api_client::apis::configuration::Configuration;
+use daytona_api_client::models::SandboxState;
 use daytona_api_client::models::api_key_list::Permissions;
 use daytona_sdk::api_types::SignedPortPreviewUrl;
 use daytona_sdk::toolbox_types::Command as SessionCommandResult;
@@ -61,6 +62,7 @@ pub(crate) const DAYTONA_DASHBOARD_SANDBOXES_URL: &str =
     "https://app.daytona.io/dashboard/sandboxes";
 const FABRO_SANDBOX_USER_AGENT: &str = concat!("fabro-sandbox/", env!("CARGO_PKG_VERSION"));
 const DAYTONA_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+const DAYTONA_START_TIMEOUT: Duration = Duration::from_mins(1);
 /// Upper bound on explicit and Drop-triggered Daytona session deletion so a
 /// stalled REST call cannot block cancellation/timeout paths indefinitely.
 const DAYTONA_SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1367,6 +1369,25 @@ impl Sandbox for DaytonaSandbox {
         Ok(())
     }
 
+    async fn activate(&self) -> crate::Result<()> {
+        let sandbox = self.sandbox()?;
+        let current = self.client.get(&sandbox.name).await.map_err(|e| {
+            crate::Error::context("Failed to inspect Daytona sandbox before activation", e)
+        })?;
+        if current.state == Some(SandboxState::Started) {
+            return Ok(());
+        }
+        if current.state == Some(SandboxState::Starting) {
+            return current
+                .wait_for_start(Some(DAYTONA_START_TIMEOUT))
+                .await
+                .map_err(|e| {
+                    crate::Error::context("Failed to wait for Daytona sandbox activation", e)
+                });
+        }
+        self.start().await
+    }
+
     async fn stop(&self) -> crate::Result<()> {
         self.emit(SandboxEvent::StopStarted {
             provider: "daytona".into(),
@@ -2522,10 +2543,12 @@ fn build_bash_session_command(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicU32;
+
     use daytona_api_client::models::api_key_list::Permissions;
     use fabro_util::error::collect_chain;
-    use httpmock::Method::GET;
-    use httpmock::MockServer;
+    use httpmock::Method::{GET, POST};
+    use httpmock::{HttpMockResponse, MockServer};
 
     use super::*;
     use crate::sandbox::BASH_PROBE_MARKER;
@@ -2625,6 +2648,25 @@ mod tests {
             "lastUsedAt": null,
             "createdAt": "2026-05-01T00:00:00Z",
             "updatedAt": "2026-05-01T00:00:00Z"
+        })
+    }
+
+    fn sandbox_body(name: &str, state: SandboxState) -> serde_json::Value {
+        serde_json::json!({
+            "id": name,
+            "organizationId": "org-1",
+            "name": name,
+            "user": "daytona",
+            "env": {},
+            "labels": {},
+            "public": false,
+            "networkBlockAll": false,
+            "target": "us",
+            "cpu": 2.0,
+            "gpu": 0.0,
+            "memory": 4.0,
+            "disk": 20.0,
+            "state": state.to_string()
         })
     }
 
@@ -2781,6 +2823,107 @@ mod tests {
                 "true".to_string(),
             )]))
         );
+    }
+
+    #[tokio::test]
+    async fn activate_skips_start_when_daytona_reports_started() {
+        let server = MockServer::start_async().await;
+        let get_sandbox = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/sandbox/test-sandbox")
+                    .header("authorization", "Bearer dtn_test");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(sandbox_body("test-sandbox", SandboxState::Started));
+            })
+            .await;
+        let start_sandbox = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/sandbox/test-sandbox/start")
+                    .header("authorization", "Bearer dtn_test");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(sandbox_body("test-sandbox", SandboxState::Started));
+            })
+            .await;
+        let sandbox = mock_daytona_sandbox(&server, "dtn_test", DaytonaConfig::default()).await;
+        let sdk_sandbox = sandbox
+            .client
+            .get("test-sandbox")
+            .await
+            .expect("test sandbox should load");
+        sandbox
+            .sandbox
+            .set(sdk_sandbox)
+            .expect("test sandbox should initialize once");
+
+        let get_calls_before = get_sandbox.calls_async().await;
+        sandbox
+            .activate()
+            .await
+            .expect("an active sandbox should require no restart");
+
+        assert_eq!(get_sandbox.calls_async().await, get_calls_before + 1);
+        start_sandbox.assert_calls_async(0).await;
+    }
+
+    #[tokio::test]
+    async fn activate_waits_for_a_daytona_start_already_in_progress() {
+        let server = MockServer::start_async().await;
+        let response_count = Arc::new(AtomicU32::new(0));
+        let get_sandbox = server
+            .mock_async({
+                let response_count = Arc::clone(&response_count);
+                move |when, then| {
+                    when.method(GET)
+                        .path("/sandbox/test-sandbox")
+                        .header("authorization", "Bearer dtn_test");
+                    then.respond_with(move |_| {
+                        let state = if response_count.fetch_add(1, Ordering::Relaxed) == 1 {
+                            SandboxState::Starting
+                        } else {
+                            SandboxState::Started
+                        };
+                        HttpMockResponse::builder()
+                            .status(200)
+                            .header("content-type", "application/json")
+                            .body(sandbox_body("test-sandbox", state).to_string())
+                            .build()
+                    });
+                }
+            })
+            .await;
+        let start_sandbox = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/sandbox/test-sandbox/start")
+                    .header("authorization", "Bearer dtn_test");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(sandbox_body("test-sandbox", SandboxState::Started));
+            })
+            .await;
+        let sandbox = mock_daytona_sandbox(&server, "dtn_test", DaytonaConfig::default()).await;
+        let sdk_sandbox = sandbox
+            .client
+            .get("test-sandbox")
+            .await
+            .expect("test sandbox should load");
+        sandbox
+            .sandbox
+            .set(sdk_sandbox)
+            .expect("test sandbox should initialize once");
+
+        let get_calls_before = get_sandbox.calls_async().await;
+        sandbox
+            .activate()
+            .await
+            .expect("an in-progress start should be awaited");
+
+        assert_eq!(get_sandbox.calls_async().await, get_calls_before + 2);
+        start_sandbox.assert_calls_async(0).await;
     }
 
     #[tokio::test]

@@ -15,7 +15,7 @@ use bollard::container::{
 use bollard::errors::Error as DockerError;
 use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
 use bollard::image::CreateImageOptions;
-use bollard::models::HostConfig;
+use bollard::models::{ContainerInspectResponse, HostConfig};
 use fabro_github::GitHubCredentials;
 use fabro_types::{CommandOutputStream, CommandTermination, RunId};
 use fabro_util::time::elapsed_ms;
@@ -145,6 +145,13 @@ enum EnsureImageOutcome {
     Pulled,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::Display)]
+#[strum(serialize_all = "lowercase")]
+enum ContainerStartAction {
+    Start,
+    Unpause,
+}
+
 impl DockerSandbox {
     pub fn new(
         config: DockerSandboxOptions,
@@ -154,7 +161,25 @@ impl DockerSandbox {
         clone_branch: Option<String>,
     ) -> crate::Result<Self> {
         let docker = Docker::connect_with_local_defaults().map_err(crate::Error::docker_connect)?;
-        Ok(Self {
+        Ok(Self::with_docker_client(
+            docker,
+            config,
+            github_app,
+            run_id,
+            clone_origin_url,
+            clone_branch,
+        ))
+    }
+
+    fn with_docker_client(
+        docker: Docker,
+        config: DockerSandboxOptions,
+        github_app: Option<GitHubCredentials>,
+        run_id: Option<RunId>,
+        clone_origin_url: Option<String>,
+        clone_branch: Option<String>,
+    ) -> Self {
+        Self {
             docker,
             config,
             github_app,
@@ -169,7 +194,7 @@ impl DockerSandbox {
             cached_os_version: std::sync::OnceLock::new(),
             rg_available: OnceCell::const_new(),
             event_callback: None,
-        })
+        }
     }
 
     pub async fn reconnect(
@@ -755,24 +780,26 @@ impl DockerSandbox {
         verify_managed_labels(container_id, &labels, self.run_id.as_ref())
     }
 
-    async fn inspect_labels(&self, container_id: &str) -> crate::Result<HashMap<String, String>> {
-        let inspect = self
-            .docker
+    async fn inspect_container(
+        &self,
+        container_id: &str,
+    ) -> crate::Result<ContainerInspectResponse> {
+        self.docker
             .inspect_container(container_id, None::<InspectContainerOptions>)
             .await
-            .map_err(|e| {
-                if docker_not_found(&e) {
-                    crate::Error::message(format!("Docker container '{container_id}' is gone"))
+            .map_err(|source| {
+                let message = if docker_not_found(&source) {
+                    format!("Docker container '{container_id}' is gone")
                 } else {
-                    crate::Error::message(format!(
-                        "Failed to inspect Docker container '{container_id}': {e}"
-                    ))
-                }
-            })?;
-        Ok(inspect
-            .config
-            .and_then(|config| config.labels)
-            .unwrap_or_default())
+                    format!("Failed to inspect Docker container '{container_id}'")
+                };
+                crate::Error::context(message, source)
+            })
+    }
+
+    async fn inspect_labels(&self, container_id: &str) -> crate::Result<HashMap<String, String>> {
+        let inspect = self.inspect_container(container_id).await?;
+        Ok(container_labels(&inspect))
     }
 
     async fn ensure_name_available(&self) -> crate::Result<Option<String>> {
@@ -833,6 +860,67 @@ impl DockerSandbox {
             .upload_to_container(container_id, Some(upload_opts), tar_bytes.into())
             .await
             .map_err(|e| crate::Error::context("Failed to upload file to container", e))
+    }
+
+    fn begin_start(&self) -> Instant {
+        self.emit(SandboxEvent::StartStarted {
+            provider: "docker".into(),
+        });
+        Instant::now()
+    }
+
+    async fn set_container_running(
+        &self,
+        container_id: &str,
+        labels: &HashMap<String, String>,
+        action: ContainerStartAction,
+    ) -> crate::Result<()> {
+        let result = match action {
+            ContainerStartAction::Start => {
+                self.docker
+                    .start_container(container_id, None::<StartContainerOptions<String>>)
+                    .await
+            }
+            ContainerStartAction::Unpause => self.docker.unpause_container(container_id).await,
+        };
+        if let Err(source) = result {
+            if !docker_not_modified(&source) {
+                return Err(crate::Error::context(
+                    format!(
+                        "Failed to {action} Docker container '{container_id}' with labels {labels:?}"
+                    ),
+                    source,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    async fn complete_start(
+        &self,
+        started: Instant,
+        container_id: &str,
+        labels: &HashMap<String, String>,
+        action: ContainerStartAction,
+    ) -> crate::Result<()> {
+        if let Err(error) = self
+            .set_container_running(container_id, labels, action)
+            .await
+        {
+            return self.start_error(error);
+        }
+        if let Err(error) = self.probe_bash(None).await {
+            return self.start_error(crate::Error::context(
+                format!("Docker container '{container_id}' health check"),
+                error,
+            ));
+        }
+
+        self.emit(SandboxEvent::StartCompleted {
+            provider:    "docker".into(),
+            duration_ms: elapsed_ms(started),
+        });
+        Ok(())
     }
 
     fn start_error(&self, error: crate::Error) -> crate::Result<()> {
@@ -1230,6 +1318,24 @@ fn verify_managed_labels(
     Ok(())
 }
 
+fn container_labels(inspect: &ContainerInspectResponse) -> HashMap<String, String> {
+    inspect
+        .config
+        .as_ref()
+        .and_then(|config| config.labels.clone())
+        .unwrap_or_default()
+}
+
+fn activation_action(inspect: &ContainerInspectResponse) -> Option<ContainerStartAction> {
+    let Some(state) = inspect.state.as_ref() else {
+        return Some(ContainerStartAction::Start);
+    };
+    if state.running != Some(true) {
+        return Some(ContainerStartAction::Start);
+    }
+    (state.paused == Some(true)).then_some(ContainerStartAction::Unpause)
+}
+
 fn docker_not_found(error: &DockerError) -> bool {
     matches!(error, DockerError::DockerResponseServerError {
         status_code: 404,
@@ -1418,47 +1524,40 @@ impl Sandbox for DockerSandbox {
     }
 
     async fn start(&self) -> crate::Result<()> {
-        self.emit(SandboxEvent::StartStarted {
-            provider: "docker".into(),
-        });
-        let start = Instant::now();
+        let started = self.begin_start();
         let container_id = self.container_id()?.to_string();
-        let labels = match self.inspect_labels(&container_id).await {
-            Ok(labels) => labels,
-            Err(e) => return self.start_error(e),
+        let inspect = match self.inspect_container(&container_id).await {
+            Ok(inspect) => inspect,
+            Err(error) => return self.start_error(error),
         };
-        if let Err(e) = verify_managed_labels(&container_id, &labels, self.run_id.as_ref()) {
-            return self.start_error(e);
+        let labels = container_labels(&inspect);
+        if let Err(error) = verify_managed_labels(&container_id, &labels, self.run_id.as_ref()) {
+            return self.start_error(error);
         }
-
-        if let Err(e) = self
-            .docker
-            .start_container(&container_id, None::<StartContainerOptions<String>>)
+        let action = activation_action(&inspect).unwrap_or(ContainerStartAction::Start);
+        self.complete_start(started, &container_id, &labels, action)
             .await
-        {
-            if !docker_not_modified(&e) {
-                return self.start_error(crate::Error::context(
-                    format!(
-                        "Failed to start Docker container '{container_id}' with labels {labels:?}"
-                    ),
-                    e,
-                ));
+    }
+
+    async fn activate(&self) -> crate::Result<()> {
+        let container_id = self.container_id()?.to_string();
+        let inspect = self.inspect_container(&container_id).await?;
+        let labels = container_labels(&inspect);
+        verify_managed_labels(&container_id, &labels, self.run_id.as_ref())?;
+        let Some(action) = activation_action(&inspect) else {
+            return Ok(());
+        };
+        match action {
+            ContainerStartAction::Unpause => {
+                self.set_container_running(&container_id, &labels, action)
+                    .await
+            }
+            ContainerStartAction::Start => {
+                let started = self.begin_start();
+                self.complete_start(started, &container_id, &labels, action)
+                    .await
             }
         }
-
-        if let Err(e) = self.probe_bash(None).await {
-            return self.start_error(crate::Error::context(
-                format!("Docker container '{container_id}' health check"),
-                e,
-            ));
-        }
-
-        let duration_ms = elapsed_ms(start);
-        self.emit(SandboxEvent::StartCompleted {
-            provider: "docker".into(),
-            duration_ms,
-        });
-        Ok(())
     }
 
     async fn stop(&self) -> crate::Result<()> {
@@ -2023,6 +2122,9 @@ mod tests {
     use std::process::Stdio;
     use std::time::Duration;
 
+    use bollard::API_DEFAULT_VERSION;
+    use httpmock::Method::{GET, POST};
+    use httpmock::MockServer;
     use tokio::io::AsyncWriteExt as _;
     use tokio::process::Command;
 
@@ -2133,6 +2235,54 @@ mod tests {
             Some(0),
             &format!("{BASH_PROBE_MARKER}\n")
         ));
+    }
+
+    #[tokio::test]
+    async fn activate_unpauses_paused_running_container() {
+        let server = MockServer::start_async().await;
+        let inspect = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path_suffix("/containers/test-container/json");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(serde_json::json!({
+                        "Config": {
+                            "Labels": managed_labels::for_run(None)
+                        },
+                        "State": {
+                            "Running": true,
+                            "Paused": true
+                        }
+                    }));
+            })
+            .await;
+        let unpause = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path_suffix("/containers/test-container/unpause");
+                then.status(204);
+            })
+            .await;
+        let start = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path_suffix("/containers/test-container/start");
+                then.status(204);
+            })
+            .await;
+        let docker = Docker::connect_with_http(&server.base_url(), 5, API_DEFAULT_VERSION)
+            .expect("mock Docker client should connect");
+        let sandbox = test_docker_sandbox(docker, "test-container");
+
+        sandbox
+            .activate()
+            .await
+            .expect("a paused running container should be unpaused");
+
+        inspect.assert_calls_async(1).await;
+        unpause.assert_calls_async(1).await;
+        start.assert_calls_async(0).await;
     }
 
     #[test]
@@ -2446,5 +2596,21 @@ mod tests {
         let mut content = String::new();
         entry.read_to_string(&mut content).unwrap();
         assert_eq!(content, "hello");
+    }
+
+    fn test_docker_sandbox(docker: Docker, container_id: &str) -> DockerSandbox {
+        let sandbox = DockerSandbox::with_docker_client(
+            docker,
+            DockerSandboxOptions::default(),
+            None,
+            None,
+            None,
+            None,
+        );
+        sandbox
+            .container_id
+            .set(container_id.to_string())
+            .expect("test container should initialize once");
+        sandbox
     }
 }
