@@ -252,6 +252,21 @@ impl FailureSignatureExt for FailureSignature {
     }
 }
 
+/// Pipeline stage that produced an [`Error::Stage`].
+///
+/// The three stages share a failure shape — a message, an eagerly classified
+/// [`FailureCategory`], an optional command output tail, and an optional
+/// source — and differ only in where they run and whether a retry is possible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, strum::Display)]
+pub enum ErrorStage {
+    /// A node handler failed. Retryable: the engine can re-run the node.
+    Handler,
+    /// The engine itself failed while driving the graph. Retryable.
+    Engine,
+    /// The publish stage failed. Terminal: publish runs once, after execution.
+    Publish,
+}
+
 #[derive(ThisError, Debug, Clone)]
 pub enum Error {
     #[error("Parse error: {0}")]
@@ -276,26 +291,9 @@ pub enum Error {
         source:  SharedTemplateError,
     },
 
-    #[error("Engine error: {message}")]
-    Engine {
-        message:          String,
-        failure_class:    FailureCategory,
-        exec_output_tail: Option<ExecOutputTail>,
-        #[source]
-        source:           Option<SharedError>,
-    },
-
-    #[error("Publish error: {message}")]
-    Publish {
-        message:          String,
-        failure_class:    FailureCategory,
-        exec_output_tail: Option<ExecOutputTail>,
-        #[source]
-        source:           Option<SharedError>,
-    },
-
-    #[error("Handler error: {message}")]
-    Handler {
+    #[error("{stage} error: {message}")]
+    Stage {
+        stage:            ErrorStage,
         message:          String,
         failure_class:    FailureCategory,
         exec_output_tail: Option<ExecOutputTail>,
@@ -334,15 +332,46 @@ pub enum Error {
 impl Error {
     /// Smart constructor for Handler errors. Classifies the failure reason
     /// eagerly.
-    pub fn handler(message: impl Into<String>) -> Self {
+    /// Build a stage error, classifying the message eagerly.
+    fn stage(
+        stage: ErrorStage,
+        message: impl Into<String>,
+        exec_output_tail: Option<ExecOutputTail>,
+    ) -> Self {
         let message = message.into();
         let failure_class = classify_failure_reason(&message);
-        Self::Handler {
+        Self::Stage {
+            stage,
             message,
             failure_class,
-            exec_output_tail: None,
+            exec_output_tail,
             source: None,
         }
+    }
+
+    /// Build a stage error from a source, classifying the rendered chain so
+    /// hints buried in the causes still reach [`Self::failure_category`].
+    fn stage_with_source(
+        stage: ErrorStage,
+        message: impl Into<String>,
+        source: impl Into<anyhow::Error>,
+        exec_output_tail: Option<ExecOutputTail>,
+    ) -> Self {
+        let message = message.into();
+        let source = SharedError::new(source.into());
+        let failure_class =
+            classify_failure_reason(&render_with_causes(&message, &collect_chain(&source)));
+        Self::Stage {
+            stage,
+            message,
+            failure_class,
+            exec_output_tail,
+            source: Some(source),
+        }
+    }
+
+    pub fn handler(message: impl Into<String>) -> Self {
+        Self::stage(ErrorStage::Handler, message, None)
     }
 
     pub fn template(message: impl Into<String>, source: TemplateError) -> Self {
@@ -356,14 +385,7 @@ impl Error {
         message: impl Into<String>,
         exec_output_tail: Option<ExecOutputTail>,
     ) -> Self {
-        let message = message.into();
-        let failure_class = classify_failure_reason(&message);
-        Self::Handler {
-            message,
-            failure_class,
-            exec_output_tail,
-            source: None,
-        }
+        Self::stage(ErrorStage::Handler, message, exec_output_tail)
     }
 
     pub fn handler_with_source(
@@ -378,51 +400,22 @@ impl Error {
         source: impl Into<anyhow::Error>,
         exec_output_tail: Option<ExecOutputTail>,
     ) -> Self {
-        let message = message.into();
-        let source = SharedError::new(source.into());
-        let causes = collect_chain(&source);
-        let rendered = render_with_causes(&message, &causes);
-        let failure_class = classify_failure_reason(&rendered);
-        Self::Handler {
-            message,
-            failure_class,
-            exec_output_tail,
-            source: Some(source),
-        }
+        Self::stage_with_source(ErrorStage::Handler, message, source, exec_output_tail)
     }
 
     pub fn handler_with_anyhow(message: impl Into<String>, source: anyhow::Error) -> Self {
         Self::handler_with_source(message, source)
     }
 
-    /// Smart constructor for Engine errors. Classifies the failure reason
-    /// eagerly.
     pub fn engine(message: impl Into<String>) -> Self {
-        let message = message.into();
-        let failure_class = classify_failure_reason(&message);
-        Self::Engine {
-            message,
-            failure_class,
-            exec_output_tail: None,
-            source: None,
-        }
+        Self::stage(ErrorStage::Engine, message, None)
     }
 
     pub fn engine_with_source(
         message: impl Into<String>,
         source: impl Into<anyhow::Error>,
     ) -> Self {
-        let message = message.into();
-        let source = SharedError::new(source.into());
-        let causes = collect_chain(&source);
-        let rendered = render_with_causes(&message, &causes);
-        let failure_class = classify_failure_reason(&rendered);
-        Self::Engine {
-            message,
-            failure_class,
-            exec_output_tail: None,
-            source: Some(source),
-        }
+        Self::stage_with_source(ErrorStage::Engine, message, source, None)
     }
 
     pub fn engine_with_anyhow(message: impl Into<String>, source: anyhow::Error) -> Self {
@@ -431,14 +424,7 @@ impl Error {
 
     /// Build an error for the required publish stage.
     pub fn publish(message: impl Into<String>) -> Self {
-        let message = message.into();
-        let failure_class = classify_failure_reason(&message);
-        Self::Publish {
-            message,
-            failure_class,
-            exec_output_tail: None,
-            source: None,
-        }
+        Self::stage(ErrorStage::Publish, message, None)
     }
 
     pub fn publish_with_source(
@@ -453,25 +439,13 @@ impl Error {
         source: impl Into<anyhow::Error>,
         exec_output_tail: Option<ExecOutputTail>,
     ) -> Self {
-        let message = message.into();
-        let source = SharedError::new(source.into());
-        let causes = collect_chain(&source);
-        let rendered = render_with_causes(&message, &causes);
-        let failure_class = classify_failure_reason(&rendered);
-        Self::Publish {
-            message,
-            failure_class,
-            exec_output_tail,
-            source: Some(source),
-        }
+        Self::stage_with_source(ErrorStage::Publish, message, source, exec_output_tail)
     }
 
     #[must_use]
     pub fn causes(&self) -> Vec<String> {
         match self {
-            Self::Engine { source, .. }
-            | Self::Publish { source, .. }
-            | Self::Handler { source, .. } => source
+            Self::Stage { source, .. } => source
                 .as_ref()
                 .map_or_else(Vec::new, |source| collect_chain(source)),
             Self::Template { source, .. } => collect_chain(source),
@@ -487,16 +461,16 @@ impl Error {
 
     /// Whether this error category is retryable (transient) or terminal.
     ///
-    /// Retryable: Handler and Engine, I/O, LLM errors when the SDK marks them
-    /// retryable, and Publish errors classified as transient infrastructure
-    /// failures. Terminal: Parse, Validation, OutputSchemaValidation,
-    /// Stylesheet, Checkpoint, and Cancelled.
+    /// Retryable: Handler and Engine stages (the engine can re-run the node),
+    /// I/O, and LLM errors the SDK marks retryable. Terminal: the Publish
+    /// stage (it runs once, after execution), Parse, Validation,
+    /// OutputSchemaValidation, Stylesheet, Checkpoint, and Cancelled.
     #[must_use]
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::Handler { .. } | Self::Engine { .. } | Self::Io(_) => true,
-            Self::Publish { failure_class, .. } => {
-                matches!(failure_class, FailureCategory::TransientInfra)
+            Self::Io(_) => true,
+            Self::Stage { stage, .. } => {
+                matches!(stage, ErrorStage::Handler | ErrorStage::Engine)
             }
             Self::Llm(sdk_err) => sdk_err.retryable(),
             Self::Parse(_)
@@ -533,9 +507,20 @@ impl Error {
             | Self::Unsupported(_)
             | Self::OutputSchemaValidation(_) => FailureCategory::Deterministic,
             Self::Precondition(_) | Self::RunNotFound(_) => FailureCategory::Structural,
-            Self::Handler { failure_class, .. }
-            | Self::Engine { failure_class, .. }
-            | Self::Publish { failure_class, .. } => *failure_class,
+            Self::Stage { failure_class, .. } => *failure_class,
+        }
+    }
+
+    /// The terminal [`FailureReason`] this error maps to on a run.
+    #[must_use]
+    pub fn failure_reason(&self) -> FailureReason {
+        match self {
+            Self::Cancelled => FailureReason::Cancelled,
+            Self::Stage {
+                stage: ErrorStage::Publish,
+                ..
+            } => FailureReason::PublishFailed,
+            _ => FailureReason::WorkflowError,
         }
     }
 
@@ -551,23 +536,13 @@ impl Error {
 
     #[must_use]
     pub fn to_failure_detail(&self) -> FailureDetail {
-        let message = match self {
-            Self::Engine { message, .. }
-            | Self::Publish { message, .. }
-            | Self::Handler { message, .. } => message.clone(),
-            _ => self.to_string(),
-        };
-        let explicit_exec_output_tail = match self {
-            Self::Engine {
-                exec_output_tail, ..
-            }
-            | Self::Publish {
-                exec_output_tail, ..
-            }
-            | Self::Handler {
-                exec_output_tail, ..
-            } => exec_output_tail.clone(),
-            _ => None,
+        let (message, explicit_exec_output_tail) = match self {
+            Self::Stage {
+                message,
+                exec_output_tail,
+                ..
+            } => (message.clone(), exec_output_tail.clone()),
+            _ => (self.to_string(), None),
         };
         FailureDetail {
             message,
@@ -880,7 +855,10 @@ mod tests {
             source,
         });
 
-        assert!(matches!(fabro_error, Error::Engine { .. }));
+        assert!(matches!(fabro_error, Error::Stage {
+            stage: ErrorStage::Engine,
+            ..
+        }));
         let message = fabro_error.to_string();
         assert!(message.contains("deserialize run spec on branch fabro/meta/run-1"));
         assert!(message.contains(&source_message));
@@ -2061,10 +2039,30 @@ mod tests {
         );
     }
 
+    /// Publish runs once, after execution, so no caller can retry it — even
+    /// when the message looks transient. The failure category is still
+    /// classified for reporting.
     #[test]
-    fn publish_error_is_only_retryable_for_transient_failures() {
-        assert!(Error::publish("connection timed out").is_retryable());
+    fn publish_errors_are_terminal() {
+        assert!(!Error::publish("connection timed out").is_retryable());
         assert!(!Error::publish("permission denied").is_retryable());
+        assert_eq!(
+            Error::publish("connection timed out").failure_category(),
+            FailureCategory::TransientInfra
+        );
+    }
+
+    #[test]
+    fn failure_reason_distinguishes_publish_and_cancelled() {
+        assert_eq!(
+            Error::publish("nope").failure_reason(),
+            FailureReason::PublishFailed
+        );
+        assert_eq!(Error::Cancelled.failure_reason(), FailureReason::Cancelled);
+        assert_eq!(
+            Error::engine("boom").failure_reason(),
+            FailureReason::WorkflowError
+        );
     }
 
     #[test]

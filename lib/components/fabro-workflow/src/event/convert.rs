@@ -1321,7 +1321,7 @@ fn event_body_from_event(event: &Event) -> EventBody {
             repo:        repo.clone(),
             base_branch: base_branch.clone(),
             head_branch: head_branch.clone(),
-            head_sha:    (!head_sha.is_empty()).then(|| head_sha.clone()),
+            head_sha:    head_sha.clone(),
             title:       title.clone(),
             draft:       *draft,
         }),

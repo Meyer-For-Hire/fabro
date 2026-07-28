@@ -730,8 +730,9 @@ pub enum Event {
         repo:        String,
         base_branch: String,
         head_branch: String,
-        #[serde(default)]
-        head_sha:    String,
+        /// Absent on events written before the head SHA was recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        head_sha:    Option<String>,
         title:       String,
         draft:       bool,
     },
@@ -782,7 +783,7 @@ impl Event {
             repo: record.repo.clone(),
             base_branch: base_branch.to_string(),
             head_branch: head_branch.to_string(),
-            head_sha: head_sha.to_string(),
+            head_sha: Some(head_sha.to_string()),
             title: title.to_string(),
             draft,
         }

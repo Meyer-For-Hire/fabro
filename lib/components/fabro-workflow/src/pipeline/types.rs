@@ -348,41 +348,23 @@ pub struct Concluded {
     pub services:       Arc<RunServices>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PublishOutcome {
-    NotRequested,
-    NoChanges {
-        pushed_branch: String,
-    },
-    Published {
-        pushed_branch: String,
-        pr_url:        Option<String>,
-    },
-}
-
-impl PublishOutcome {
-    pub fn pushed_branch(&self) -> Option<&str> {
-        match self {
-            Self::NotRequested => None,
-            Self::NoChanges { pushed_branch } | Self::Published { pushed_branch, .. } => {
-                Some(pushed_branch)
-            }
-        }
-    }
-
-    pub fn pr_url(&self) -> Option<&str> {
-        match self {
-            Self::Published { pr_url, .. } => pr_url.as_deref(),
-            Self::NotRequested | Self::NoChanges { .. } => None,
-        }
-    }
+/// What the PUBLISH phase actually accomplished.
+///
+/// Recorded separately from the phase's error so a branch that reached the
+/// remote is still reported when a later step, such as pull request creation,
+/// fails. An all-`None` value means publish had nothing to do.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PublishOutcome {
+    pub pushed_branch: Option<String>,
+    pub pr_url:        Option<String>,
 }
 
 /// Output of the PUBLISH phase.
 #[non_exhaustive]
 pub struct Published {
     pub execution_outcome: Result<Outcome, Error>,
-    pub publish_outcome:   Result<PublishOutcome, Error>,
+    pub publish_outcome:   PublishOutcome,
+    pub publish_error:     Option<Error>,
     pub conclusion:        Conclusion,
     pub artifact_count:    usize,
     pub run_options:       RunOptions,

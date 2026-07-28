@@ -928,16 +928,12 @@ impl RunSession {
             model:      self.pr_model,
         };
 
-        let concluded = match Box::pin(pipeline::conclude(executed, &finalize_opts)).await {
-            Ok(concluded) => concluded,
-            Err(err) => {
-                self.steering_hub.drain_pending_at_run_end();
-                store_progress_logger.flush().await;
-                return Err(err);
-            }
+        let concluding = async {
+            let concluded = Box::pin(pipeline::conclude(executed, &finalize_opts)).await?;
+            let published = Box::pin(pipeline::publish(concluded, &publish_opts)).await;
+            Box::pin(pipeline::finalize(published, &finalize_opts)).await
         };
-        let published = Box::pin(pipeline::publish(concluded, &publish_opts)).await;
-        let finalized = match Box::pin(pipeline::finalize(published, &finalize_opts)).await {
+        let finalized = match concluding.await {
             Ok(finalized) => finalized,
             Err(err) => {
                 self.steering_hub.drain_pending_at_run_end();

@@ -348,15 +348,8 @@ async fn create_run_pull_request(
         conclusion: Some(inputs.conclusion),
         run_state: Some(run_state),
     };
-    let created_pull_request = match pull_request::maybe_open_pull_request(request).await {
-        Ok(Some(created)) => created,
-        Ok(None) => {
-            return ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Pull request creation returned no record unexpectedly.",
-            )
-            .into_response();
-        }
+    let created_pull_request = match pull_request::open_pull_request(request).await {
+        Ok(created) => created,
         Err(err) => return ApiError::new(StatusCode::BAD_GATEWAY, err).into_response(),
     };
 
@@ -364,7 +357,7 @@ async fn create_run_pull_request(
         &created_pull_request.link,
         &created_pull_request.base_branch,
         &created_pull_request.head_branch,
-        &created_pull_request.head_sha,
+        inputs.final_git_sha,
         &created_pull_request.title,
         true,
     );

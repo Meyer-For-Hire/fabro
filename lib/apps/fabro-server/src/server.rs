@@ -4169,9 +4169,15 @@ async fn execute_run_in_process(state: Arc<AppState>, run_id: RunId) {
     let mut runs = state.runs.lock().expect("runs lock poisoned");
     if let Some(managed_run) = runs.get_mut(&run_id) {
         match &result {
-            ExecutionResult::Completed(result) => match result.as_ref() {
-                Ok(started) => match &started.finalized.outcome {
-                    Ok(_) => {
+            ExecutionResult::Completed(result) => {
+                // A run can fail either before it produces a `Started` or in
+                // its own outcome; both carry the same `WorkflowError`.
+                let outcome = match result.as_ref() {
+                    Ok(started) => started.finalized.outcome.as_ref().map(|_| ()),
+                    Err(e) => Err(e),
+                };
+                match outcome {
+                    Ok(()) => {
                         info!(run_id = %run_id, "Run completed");
                         managed_run.status = RunStatus::Succeeded {
                             reason: SuccessReason::Completed,
@@ -4183,44 +4189,16 @@ async fn execute_run_in_process(state: Arc<AppState>, run_id: RunId) {
                             reason: FailureReason::Cancelled,
                         };
                     }
-                    Err(e @ WorkflowError::Publish { .. }) => {
+                    Err(e) => {
                         let detail = e.display_with_causes();
-                        error!(run_id = %run_id, error = %detail, "Run publish failed");
+                        error!(run_id = %run_id, error = %detail, "Run failed");
                         managed_run.status = RunStatus::Failed {
-                            reason: FailureReason::PublishFailed,
+                            reason: e.failure_reason(),
                         };
                         managed_run.error = Some(detail);
                     }
-                    Err(e) => {
-                        error!(run_id = %run_id, error = %e, "Run failed");
-                        managed_run.status = RunStatus::Failed {
-                            reason: FailureReason::WorkflowError,
-                        };
-                        managed_run.error = Some(e.to_string());
-                    }
-                },
-                Err(WorkflowError::Cancelled) => {
-                    info!(run_id = %run_id, "Run cancelled");
-                    managed_run.status = RunStatus::Failed {
-                        reason: FailureReason::Cancelled,
-                    };
                 }
-                Err(e @ WorkflowError::Publish { .. }) => {
-                    let detail = e.display_with_causes();
-                    error!(run_id = %run_id, error = %detail, "Run publish failed");
-                    managed_run.status = RunStatus::Failed {
-                        reason: FailureReason::PublishFailed,
-                    };
-                    managed_run.error = Some(detail);
-                }
-                Err(e) => {
-                    error!(run_id = %run_id, error = %e, "Run failed");
-                    managed_run.status = RunStatus::Failed {
-                        reason: FailureReason::WorkflowError,
-                    };
-                    managed_run.error = Some(e.to_string());
-                }
-            },
+            }
             ExecutionResult::CancelledBySignal => {
                 info!(run_id = %run_id, "Run cancelled");
                 managed_run.status = RunStatus::Failed {

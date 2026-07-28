@@ -441,7 +441,7 @@ pub struct AutoMergeOptions {
     pub merge_strategy: MergeStrategy,
 }
 
-/// Inputs for [`maybe_open_pull_request`].
+/// Inputs for [`open_pull_request`].
 pub struct OpenPullRequestRequest<'a> {
     pub github:            github_app::GitHubContext<'a>,
     pub origin_url:        &'a str,
@@ -468,21 +468,15 @@ pub struct CreatedPullRequest {
     pub title:       String,
     pub base_branch: String,
     pub head_branch: String,
-    pub head_sha:    String,
 }
 
-/// Optionally open a pull request after a successful workflow run.
+/// Open a pull request for a completed run.
 ///
-/// Returns `Ok(Some(CreatedPullRequest))` if a PR was created, `Ok(None)` if
-/// the diff was empty, or `Err` on failure.
-pub async fn maybe_open_pull_request(
+/// Callers are responsible for skipping runs with an empty diff; reaching here
+/// means a pull request is expected, so every failure is an error.
+pub async fn open_pull_request(
     req: OpenPullRequestRequest<'_>,
-) -> Result<Option<CreatedPullRequest>, String> {
-    if req.diff.is_empty() {
-        debug!("Empty diff, skipping pull request creation");
-        return Ok(None);
-    }
-
+) -> Result<CreatedPullRequest, String> {
     let https_url = ssh_url_to_https(req.origin_url);
     let (owner, repo) =
         github_app::parse_github_owner_repo(&https_url).map_err(|err| format!("{err:#}"))?;
@@ -565,13 +559,12 @@ pub async fn maybe_open_pull_request(
         number: created.number,
     };
 
-    Ok(Some(CreatedPullRequest {
+    Ok(CreatedPullRequest {
         link,
         title,
         base_branch: req.base_branch.to_string(),
         head_branch: req.head_branch.to_string(),
-        head_sha: req.expected_head_sha.to_string(),
-    }))
+    })
 }
 
 #[cfg(test)]
@@ -581,7 +574,7 @@ mod tests {
     use std::time::Duration;
 
     use chrono::Utc;
-    use fabro_auth::{CredentialSource, EnvCredentialSource, VaultCredentialSource};
+    use fabro_auth::{CredentialSource, VaultCredentialSource};
     use fabro_graphviz::graph::Graph;
     use fabro_llm::Error as LlmError;
     use fabro_llm::client::Client;
@@ -687,10 +680,6 @@ mod tests {
         ))
     }
 
-    fn test_catalog() -> Arc<Catalog> {
-        Arc::new(Catalog::from_builtin().expect("default catalog should build"))
-    }
-
     fn test_catalog_with_provider_base_url(provider: &str, base_url: &str) -> Arc<Catalog> {
         let mut settings = LlmCatalogSettings::default();
         settings
@@ -716,10 +705,6 @@ mod tests {
             Some(provider_name.to_string()),
             vec![],
         ))
-    }
-
-    fn test_llm_source() -> Arc<dyn CredentialSource> {
-        Arc::new(EnvCredentialSource::new())
     }
 
     fn test_projection() -> RunProjection {
@@ -1401,45 +1386,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_diff_returns_none() {
-        let store = test_store();
-        let run_store = store.create_run(&fixtures::RUN_1).await.unwrap();
-        let run_store_handle: RunStoreHandle = run_store.into();
-        let llm_source = test_llm_source();
-        let creds = fabro_github::GitHubCredentials::App(fabro_github::GitHubAppCredentials {
-            app_id:          "123".to_string(),
-            private_key_pem: "unused".to_string(),
-            slug:            None,
-        });
-        let base_url = github_app::github_api_base_url();
-        let result = maybe_open_pull_request(OpenPullRequestRequest {
-            github:            github_app::GitHubContext::new(&creds, &base_url),
-            origin_url:        "https://github.com/owner/repo.git",
-            base_branch:       "main",
-            head_branch:       "fabro/run/123",
-            expected_head_sha: "final-sha",
-            goal:              "Fix bug",
-            diff:              "",
-            model:             "claude-sonnet-4-20250514",
-            draft:             false,
-            auto_merge:        None,
-            run_store:         &run_store_handle,
-            llm_source:        llm_source.as_ref(),
-            catalog:           test_catalog(),
-            conclusion:        None,
-            run_state:         None,
-        })
-        .await;
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_none());
-    }
-
-    #[tokio::test]
     async fn stale_remote_branch_is_rejected_before_pull_request_creation() {
         let payload = pr_content_json("Fix bug", "Narrative.");
         let harness = setup_fallback_test_harness_with_branch_sha(&payload, "stale-sha").await;
         let github_base_url = harness.github_server.url("");
-        let error = maybe_open_pull_request(OpenPullRequestRequest {
+        let error = open_pull_request(OpenPullRequestRequest {
             github:            fabro_github::GitHubContext::new(&harness.creds, &github_base_url),
             origin_url:        "https://github.com/owner/repo.git",
             base_branch:       "main",
@@ -1614,9 +1565,9 @@ mod tests {
         assert!(body.contains("Generated with [Fabro](https://fabro.sh)"));
     }
 
-    // ── maybe_open_pull_request fallback tests ──────────────────────────
+    // ── open_pull_request fallback tests ──────────────────────────
 
-    /// Set of mock servers and credentials for the `maybe_open_pull_request`
+    /// Set of mock servers and credentials for the `open_pull_request`
     /// fallback path. The builder's `Client::from_source` rebuilds the LLM
     /// client from the credential source, so the in-process MockProvider
     /// cannot intercept — we mock the OpenAI HTTP endpoint instead.
@@ -1812,14 +1763,14 @@ mod tests {
     /// falls back to `pr_title_from_goal` (first line, decoration stripped)
     /// and PR creation succeeds with that title.
     #[tokio::test]
-    async fn maybe_open_pull_request_falls_back_to_goal_title_when_llm_returns_empty_title() {
+    async fn open_pull_request_falls_back_to_goal_title_when_llm_returns_empty_title() {
         let payload = pr_content_json("", "Narrative.");
         let harness = setup_fallback_test_harness(&payload).await;
 
         let github_base_url = harness.github_server.url("");
         let github = github_app::GitHubContext::new(&harness.creds, &github_base_url);
 
-        let result = maybe_open_pull_request(OpenPullRequestRequest {
+        let result = open_pull_request(OpenPullRequestRequest {
             github,
             origin_url: "https://github.com/owner/repo.git",
             base_branch: "main",
@@ -1839,15 +1790,14 @@ mod tests {
         .await
         .expect("PR creation should succeed");
 
-        let record = result.expect("PR record should be Some");
-        assert_eq!(record.title, "Fix telemetry leak");
+        assert_eq!(result.title, "Fix telemetry leak");
         harness.assert_mocks_called_once().await;
     }
 
     /// LLM returns an empty title; the content builder fallback still caps
     /// the deterministic goal title at 72 chars ending with `…`.
     #[tokio::test]
-    async fn maybe_open_pull_request_caps_fallback_title_at_72_chars() {
+    async fn open_pull_request_caps_fallback_title_at_72_chars() {
         let payload = pr_content_json("", "Narrative.");
         let harness = setup_fallback_test_harness(&payload).await;
 
@@ -1857,7 +1807,7 @@ mod tests {
         // Single ~200-char line, no `Plan:` / heading prefix, no newlines.
         let goal = "x".repeat(200);
 
-        let result = maybe_open_pull_request(OpenPullRequestRequest {
+        let result = open_pull_request(OpenPullRequestRequest {
             github,
             origin_url: "https://github.com/owner/repo.git",
             base_branch: "main",
@@ -1877,8 +1827,7 @@ mod tests {
         .await
         .expect("PR creation should succeed");
 
-        let record = result.expect("PR record should be Some");
-        let title = record.title;
+        let title = result.title;
         assert_eq!(title.chars().count(), 72);
         assert!(title.ends_with('\u{2026}'));
         harness.assert_mocks_called_once().await;
