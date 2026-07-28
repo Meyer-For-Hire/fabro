@@ -327,6 +327,7 @@ function DurationPopover({
 }) {
   const endMs = completedAt != null ? Date.parse(completedAt) : now;
   const sinceCreatedMs = Math.max(0, endMs - Date.parse(createdAt));
+  const isRunning = completedAt == null;
   return (
     <>
       <PopoverHeader>Duration</PopoverHeader>
@@ -336,8 +337,14 @@ function DurationPopover({
           <dd className="mt-0.5 font-mono text-fg">{formatDurationMs(sinceCreatedMs)}</dd>
         </div>
         <div>
-          <dt className="text-fg-3">Active (inference + tools)</dt>
+          <dt className="text-fg-3">
+            Active (inference + tools){isRunning ? " — estimated" : ""}
+          </dt>
           <dd className="mt-0.5 font-mono text-fg">{formatDurationMs(timing.active_time_ms)}</dd>
+          <dd className="mt-0.5 text-fg-3">
+            {formatDurationMs(timing.inference_time_ms)} inference ·{" "}
+            {formatDurationMs(timing.tool_time_ms)} tools
+          </dd>
         </div>
       </dl>
     </>

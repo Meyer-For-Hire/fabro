@@ -5259,6 +5259,64 @@ fn test_billed_usage(
     .unwrap()
 }
 
+async fn create_billed_retry_run(state: &Arc<AppState>, run_id: RunId) {
+    create_durable_run_with_events(state, run_id, &[
+        workflow_event::Event::RunSubmitted {
+            definition_blob: None,
+        },
+        workflow_event::Event::RunStarting,
+        workflow_event::Event::RunRunning,
+    ])
+    .await;
+
+    append_scoped_stage_event(
+        state,
+        run_id,
+        "verify",
+        1,
+        &workflow_event::Event::StageFailed {
+            node_id:    "verify".to_string(),
+            name:       "Verify".to_string(),
+            index:      1,
+            failure:    FailureDetail::new("try again", FailureCategory::TransientInfra),
+            will_retry: true,
+            timing:     fabro_types::StageTiming::wall_only(1200),
+            billing:    Some(test_billed_usage("gpt-old", 100, 10)),
+            actor:      None,
+        },
+    )
+    .await;
+    append_scoped_stage_event(
+        state,
+        run_id,
+        "verify",
+        2,
+        &workflow_event::Event::StageCompleted {
+            node_id: "verify".to_string(),
+            name: "Verify".to_string(),
+            index: 1,
+            timing: fabro_types::StageTiming::wall_only(800),
+            status: "succeeded".to_string(),
+            preferred_label: None,
+            suggested_next_ids: Vec::new(),
+            billing: Some(test_billed_usage("gpt-new", 200, 20)),
+            failure: None,
+            notes: None,
+            files_touched: Vec::new(),
+            context_updates: None,
+            jump_to_node: None,
+            context_values: None,
+            node_visits: None,
+            loop_failure_signatures: None,
+            restart_failure_signatures: None,
+            response: None,
+            attempt: 2,
+            max_attempts: 2,
+        },
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn list_run_stages_distinguishes_visits() {
     let state = test_app_state_with_isolated_storage();
@@ -5503,6 +5561,50 @@ async fn list_run_stages_exposes_execution_identity_for_resumed_stage() {
     assert_eq!(second["resumed_from_stage_id"], "work@1");
 }
 
+#[tokio::test]
+async fn run_billing_includes_live_stage_timing_in_rows_and_totals() {
+    let state = test_app_state_with_isolated_storage();
+    let app = crate::test_support::build_test_router(Arc::clone(&state));
+    let run_id = RunId::new();
+    create_durable_run_with_events(&state, run_id, &[
+        workflow_event::Event::RunSubmitted {
+            definition_blob: None,
+        },
+        workflow_event::Event::RunStarting,
+        workflow_event::Event::RunRunning,
+        workflow_run_started_event(run_id),
+    ])
+    .await;
+    append_scoped_stage_event(
+        &state,
+        run_id,
+        "work",
+        1,
+        &stage_started_event("work", "command"),
+    )
+    .await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(api(&format!("/runs/{run_id}/billing")))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = response_json!(response, StatusCode::OK).await;
+    let stages = body["stages"].as_array().unwrap();
+
+    assert_eq!(stages.len(), 1);
+    let row_timing = &stages[0]["timing"];
+    assert!(row_timing["active_time_ms"].as_u64().unwrap() > 0);
+    assert_eq!(row_timing["tool_time_ms"], row_timing["active_time_ms"]);
+    assert_eq!(&body["totals"]["timing"], row_timing);
+}
+
 /// `checkpoint.completed_nodes` records every visit, so a looped node appears
 /// once per re-entry. Billing must dedup so a retried node renders as one row
 /// and `runtime_secs` is summed across all visits exactly once.
@@ -5654,65 +5756,9 @@ async fn run_billing_sums_usage_across_retry_visits_and_uses_latest_model() {
     let state = test_app_state_with_isolated_storage();
     let app = crate::test_support::build_test_router(Arc::clone(&state));
     let run_id = RunId::new();
-    let failed_usage = test_billed_usage("gpt-old", 100, 10);
+
+    create_billed_retry_run(&state, run_id).await;
     let success_usage = test_billed_usage("gpt-new", 200, 20);
-
-    create_durable_run_with_events(&state, run_id, &[
-        workflow_event::Event::RunSubmitted {
-            definition_blob: None,
-        },
-        workflow_event::Event::RunStarting,
-        workflow_event::Event::RunRunning,
-    ])
-    .await;
-
-    append_scoped_stage_event(
-        &state,
-        run_id,
-        "verify",
-        1,
-        &workflow_event::Event::StageFailed {
-            node_id:    "verify".to_string(),
-            name:       "Verify".to_string(),
-            index:      1,
-            failure:    FailureDetail::new("try again", FailureCategory::TransientInfra),
-            will_retry: true,
-            timing:     fabro_types::StageTiming::wall_only(1200),
-            billing:    Some(failed_usage),
-            actor:      None,
-        },
-    )
-    .await;
-    append_scoped_stage_event(
-        &state,
-        run_id,
-        "verify",
-        2,
-        &workflow_event::Event::StageCompleted {
-            node_id: "verify".to_string(),
-            name: "Verify".to_string(),
-            index: 1,
-            timing: fabro_types::StageTiming::wall_only(800),
-            status: "succeeded".to_string(),
-            preferred_label: None,
-            suggested_next_ids: Vec::new(),
-            billing: Some(success_usage.clone()),
-            failure: None,
-            notes: None,
-            files_touched: Vec::new(),
-            context_updates: None,
-            jump_to_node: None,
-            context_values: None,
-            node_visits: None,
-            loop_failure_signatures: None,
-            restart_failure_signatures: None,
-            response: None,
-            attempt: 2,
-            max_attempts: 2,
-        },
-    )
-    .await;
-
     let mut latest_outcome: Outcome<Option<fabro_model::BilledModelUsage>> = Outcome::success();
     latest_outcome.usage = Some(success_usage);
     latest_outcome.timing = Some(fabro_types::StageTiming::wall_only(800));
@@ -5746,7 +5792,6 @@ async fn run_billing_sums_usage_across_retry_visits_and_uses_latest_model() {
     .unwrap();
 
     let response = app
-        .clone()
         .oneshot(
             Request::builder()
                 .method("GET")
@@ -5789,6 +5834,76 @@ async fn run_billing_sums_usage_across_retry_visits_and_uses_latest_model() {
     assert_eq!(old_model["billing"]["input_tokens"], 100);
     assert_eq!(new_model["stages"], 1);
     assert_eq!(new_model["billing"]["input_tokens"], 200);
+}
+
+/// The stage popover reads `billing` off the stages list, so it must be scoped
+/// to one visit — unlike the Billing tab's rows, which sum every visit of a
+/// node.
+#[tokio::test]
+async fn list_run_stages_reports_billing_per_visit() {
+    let state = test_app_state_with_isolated_storage();
+    let app = crate::test_support::build_test_router(Arc::clone(&state));
+    let run_id = RunId::new();
+
+    create_billed_retry_run(&state, run_id).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(api(&format!("/runs/{run_id}/stages")))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = response_json!(response, StatusCode::OK).await;
+
+    let first = stage_entry(&body, "verify@1");
+    assert_eq!(first["billing"]["input_tokens"], 100);
+    assert_eq!(first["billing"]["output_tokens"], 10);
+    assert_eq!(first["billing"]["total_usd_micros"], 110);
+
+    let second = stage_entry(&body, "verify@2");
+    assert_eq!(second["billing"]["input_tokens"], 200);
+    assert_eq!(second["billing"]["output_tokens"], 20);
+    assert_eq!(second["billing"]["total_usd_micros"], 220);
+}
+
+#[tokio::test]
+async fn list_run_stages_reports_zero_billing_for_a_stage_that_called_no_model() {
+    let state = test_app_state_with_isolated_storage();
+    let app = crate::test_support::build_test_router(Arc::clone(&state));
+    let run_id = RunId::new();
+
+    create_durable_run_with_events(&state, run_id, &[
+        workflow_event::Event::RunSubmitted {
+            definition_blob: None,
+        },
+        workflow_event::Event::RunStarting,
+        workflow_event::Event::RunRunning,
+    ])
+    .await;
+    let started = stage_started_event("script", "command");
+    append_scoped_stage_event(&state, run_id, "script", 1, &started).await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(api(&format!("/runs/{run_id}/stages")))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = response_json!(response, StatusCode::OK).await;
+
+    let billing = &stage_entry(&body, "script@1")["billing"];
+    assert_eq!(billing["input_tokens"], 0);
+    assert_eq!(billing["output_tokens"], 0);
+    // No model ran, so there is nothing to price — not a $0.00 cost.
+    assert!(billing.get("total_usd_micros").is_none());
 }
 
 #[tokio::test]
@@ -7798,6 +7913,51 @@ async fn get_run_status_returns_status() {
     assert!(!body["repository"]["name"].as_str().unwrap().is_empty());
     assert!(body["timestamps"]["created_at"].is_string());
     assert!(body["labels"].is_object());
+}
+
+#[tokio::test]
+async fn get_run_status_advances_live_active_timing_between_events() {
+    let state = test_app_state_with_isolated_storage();
+    let app = crate::test_support::build_test_router(Arc::clone(&state));
+    let run_id = RunId::new();
+    create_durable_run_with_events(&state, run_id, &[
+        workflow_event::Event::RunSubmitted {
+            definition_blob: None,
+        },
+        workflow_event::Event::RunStarting,
+        workflow_event::Event::RunRunning,
+        workflow_run_started_event(run_id),
+    ])
+    .await;
+    append_scoped_stage_event(
+        &state,
+        run_id,
+        "work",
+        1,
+        &stage_started_event("work", "command"),
+    )
+    .await;
+
+    // The SQLite summary stores timing at the StageStarted event. A later
+    // detail read must overlay the in-flight command's active time from the
+    // projection even though no newer event has arrived.
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(api(&format!("/runs/{run_id}")))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = response_json!(response, StatusCode::OK).await;
+    let timing = &body["timing"];
+
+    assert!(timing["active_time_ms"].as_u64().unwrap() > 0);
+    assert_eq!(timing["tool_time_ms"], timing["active_time_ms"]);
+    assert!(timing["wall_time_ms"].as_u64().unwrap() >= timing["active_time_ms"].as_u64().unwrap());
 }
 
 #[tokio::test]

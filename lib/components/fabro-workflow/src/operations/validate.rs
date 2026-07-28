@@ -5,12 +5,12 @@ use std::sync::Arc;
 use fabro_model::{Catalog, ProviderId};
 use fabro_types::WorkflowSettings;
 
-use super::create::{preprocess_and_validate, template_context};
+use super::create::{configured_default_provider, preprocess_and_validate, template_context};
 use super::source::{ResolveWorkflowInput, WorkflowInput, resolve_workflow};
 use crate::error::Error;
 use crate::operations::RenderMode;
-use crate::pipeline::Validated;
-use crate::transforms::Transform;
+use crate::pipeline::{TransformOptions, Validated};
+use crate::transforms::{ModelResolutionTransform, Transform};
 
 pub struct ValidateInput {
     pub workflow:          WorkflowInput,
@@ -20,20 +20,24 @@ pub struct ValidateInput {
     pub vars:              HashMap<String, String>,
     pub cwd:               PathBuf,
     pub custom_transforms: Vec<Box<dyn Transform>>,
-    pub catalog:           Arc<Catalog>,
 }
 
-/// Parse, transform, and validate a DOT source string.
+/// Parse, transform, and structurally validate a DOT source string without a
+/// model catalog. Model and provider availability is left to the caller that
+/// owns a catalog — typically the server.
 ///
 /// Returns `Validated` even when validation produced errors. Call
 /// `validated.raise_on_errors()` if the caller wants to fail fast.
 pub fn validate(input: ValidateInput) -> Result<Validated, Error> {
-    let eligible_providers = input
-        .catalog
-        .all_provider_ids()
-        .into_iter()
-        .collect::<Vec<_>>();
-    validate_with_eligible_providers(input, &eligible_providers, false)
+    validate_resolving_models(input, None)
+}
+
+/// Parse, transform, and validate a DOT source string against `catalog`.
+pub fn validate_with_catalog(
+    input: ValidateInput,
+    catalog: Arc<Catalog>,
+) -> Result<Validated, Error> {
+    validate_resolving_models(input, Some(ModelResolutionTransform::new(catalog)))
 }
 
 /// Parse, transform, and validate, resolving models against the ready
@@ -41,45 +45,60 @@ pub fn validate(input: ValidateInput) -> Result<Validated, Error> {
 /// provider-readiness selection failures.
 pub fn validate_with_ready_providers(
     input: ValidateInput,
+    catalog: Arc<Catalog>,
     ready_providers: &[ProviderId],
 ) -> Result<Validated, Error> {
-    validate_with_eligible_providers(input, ready_providers, true)
+    validate_resolving_models(
+        input,
+        Some(
+            ModelResolutionTransform::for_eligible(
+                catalog,
+                ready_providers.iter().cloned().collect(),
+            )
+            .with_catalog_fallback(true),
+        ),
+    )
 }
 
-fn validate_with_eligible_providers(
+/// The workflow's own default provider is only known once the workflow is
+/// resolved, so callers hand in a partially built transform and it is
+/// completed here.
+fn validate_resolving_models(
     input: ValidateInput,
-    eligible_providers: &[ProviderId],
-    catalog_fallback: bool,
+    model_resolution: Option<ModelResolutionTransform>,
 ) -> Result<Validated, Error> {
+    let ValidateInput {
+        workflow,
+        settings,
+        vars,
+        cwd,
+        custom_transforms,
+    } = input;
     let resolved = resolve_workflow(ResolveWorkflowInput {
-        workflow: input.workflow,
-        settings: input.settings,
-        cwd:      input.cwd,
+        workflow,
+        settings,
+        cwd,
     })
     .map_err(|err| Error::Parse(err.to_string()))?;
 
+    let model_resolution = model_resolution.map(|resolution| {
+        resolution.with_default_provider(configured_default_provider(&resolved.settings))
+    });
+
     preprocess_and_validate(
         &resolved.raw_source,
-        resolved
-            .dot_path
-            .as_ref()
-            .map(|path| path.display().to_string()),
-        resolved.current_dir,
-        resolved.file_resolver,
-        input.custom_transforms,
-        template_context(Some(&resolved.settings), input.vars),
         resolved.goal_override.as_deref(),
-        RenderMode::Structural,
-        resolved
-            .settings
-            .run
-            .model
-            .provider
-            .as_deref()
-            .filter(|provider| !provider.is_empty())
-            .map(fabro_model::ProviderId::new),
-        eligible_providers,
-        catalog_fallback,
-        &input.catalog,
+        &TransformOptions {
+            current_dir: resolved.current_dir,
+            file_resolver: resolved.file_resolver,
+            template_context: template_context(Some(&resolved.settings), vars),
+            source_name: resolved
+                .dot_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            render_mode: RenderMode::Structural,
+            custom_transforms,
+            model_resolution,
+        },
     )
 }

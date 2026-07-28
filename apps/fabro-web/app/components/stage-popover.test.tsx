@@ -9,6 +9,7 @@ import { StagePopover } from "./stage-popover";
 import { deriveStageSummary } from "./stage-popover-summary";
 import type { Stage } from "../lib/stage-sidebar";
 import { generatedAxios } from "../lib/api-client";
+import { makeBilledTokenCounts } from "../lib/test-fixtures";
 
 function makeEvent(overrides: Partial<EventEnvelope>): EventEnvelope {
   return {
@@ -34,6 +35,7 @@ function makeStage(overrides: Partial<Stage> = {}): Stage {
     duration:           "1m 30s",
     startedAt:          "2026-05-24T11:58:30Z",
     providerUsed:       { mode: "policy", model: "claude-opus-4-7", reasoning_effort: "high" },
+    billing:            makeBilledTokenCounts(),
     ...overrides,
   };
 }

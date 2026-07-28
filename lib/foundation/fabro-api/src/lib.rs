@@ -69,10 +69,10 @@ pub mod types {
         StageContextWindowCategory, StageContextWindowCountMethod, StageContextWindowProjection,
         StageContextWindowStaleness, StageContextWindowUnavailableReason,
         StageContextWindowWarning, StageHandler, StageId, StageInferenceProjection,
-        StageModelUsage, StageOutcome, StageProjection, StageState, SubAgentProjection,
-        SubAgentStatus, SystemActorKind, SystemIntegrationStatus, SystemIntegrationsResponse,
-        TodoListProjection, TurnId, UpdateVariableRequest, UserPrincipal, Variable,
-        VariableListResponse, WorkflowSettings,
+        StageModelUsage, StageOutcome, StageProjection, StageState, StageToolBatchProjection,
+        SubAgentProjection, SubAgentStatus, SystemActorKind, SystemIntegrationStatus,
+        SystemIntegrationsResponse, TodoListProjection, TurnId, UpdateVariableRequest,
+        UserPrincipal, Variable, VariableListResponse, WorkflowSettings,
     };
 
     pub use crate::generated::types::*;
