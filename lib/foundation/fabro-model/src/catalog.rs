@@ -1359,10 +1359,7 @@ impl Catalog {
         if configured.is_empty() {
             return self.default_model();
         }
-        let configured = configured
-            .iter()
-            .filter_map(|id| self.provider(id).map(|provider| provider.id.clone()))
-            .collect::<HashSet<_>>();
+        let configured = self.canonical_provider_ids(configured);
         self.providers
             .iter()
             .filter(|provider| configured.contains(&provider.id))
@@ -1380,15 +1377,28 @@ impl Catalog {
         if configured.is_empty() {
             return self.default_model();
         }
-        let resolved = configured
+        let configured = self.canonical_provider_ids(configured);
+        let mut fallback = None;
+        for model in self
+            .models
+            .iter()
+            .filter(|model| configured.contains(&model.provider))
+        {
+            if model.small_default {
+                return model;
+            }
+            if model.default && fallback.is_none() {
+                fallback = Some(model);
+            }
+        }
+        fallback.unwrap_or_else(|| self.default_model())
+    }
+
+    fn canonical_provider_ids(&self, provider_ids: &[ProviderId]) -> HashSet<ProviderId> {
+        provider_ids
             .iter()
             .filter_map(|id| self.provider(id).map(|provider| provider.id.clone()))
-            .collect::<HashSet<_>>();
-        self.providers
-            .iter()
-            .filter(|provider| resolved.contains(&provider.id))
-            .find_map(|provider| self.small_default_for_provider(&provider.id))
-            .unwrap_or_else(|| self.default_for_configured_ids(configured))
+            .collect()
     }
 
     /// Probe model for a provider — the cheapest model suitable for

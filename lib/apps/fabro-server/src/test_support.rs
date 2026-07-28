@@ -772,3 +772,48 @@ pub(crate) async fn capture_auth_context(
         .push(slot.snapshot());
     response
 }
+
+#[cfg(test)]
+mod tests {
+    use fabro_types::settings::ObjectStoreSettings;
+
+    use super::*;
+
+    fn local_store_root(store: &ObjectStoreSettings) -> &Path {
+        let ObjectStoreSettings::Local { root } = store else {
+            panic!("test server settings should use a local object store");
+        };
+        Path::new(root)
+    }
+
+    #[test]
+    fn default_storage_redirect_updates_derived_local_store_roots() {
+        let temp_dir = tempfile::tempdir().expect("test temp dir should be created");
+        let vault_path = temp_dir.path().join("secrets.json");
+
+        let settings = redirect_default_storage_root(default_test_server_settings(), &vault_path);
+        let storage_root = temp_dir.path().join("storage");
+
+        assert_eq!(Path::new(&settings.server.storage.root), storage_root);
+        assert_eq!(
+            local_store_root(&settings.server.artifacts.store),
+            storage_root.join("objects/artifacts")
+        );
+        assert_eq!(
+            local_store_root(&settings.server.slatedb.store),
+            storage_root.join("objects/slatedb")
+        );
+    }
+
+    #[test]
+    fn default_storage_redirect_preserves_explicit_storage_root() {
+        let temp_dir = tempfile::tempdir().expect("test temp dir should be created");
+        let vault_path = temp_dir.path().join("secrets.json");
+        let expected =
+            default_test_server_settings().with_storage_override(&temp_dir.path().join("custom"));
+
+        let settings = redirect_default_storage_root(expected.clone(), &vault_path);
+
+        assert_eq!(settings, expected);
+    }
+}

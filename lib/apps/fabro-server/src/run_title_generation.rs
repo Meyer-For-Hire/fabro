@@ -7,6 +7,7 @@ use fabro_llm::types::TimeoutOptions;
 use fabro_model::ProviderId;
 use fabro_template::{TemplateContext, TemplateError};
 use fabro_types::{Graph, MAX_RUN_TITLE_CHARS, RunId};
+use fabro_util::error;
 use serde::Serialize;
 use toml::Value as TomlValue;
 
@@ -38,7 +39,8 @@ pub(crate) async fn generate_title_or_current(input: GenerateTitleInput<'_>) -> 
         Err(err) => {
             // A checked-in template that will not render is a bug, not a
             // transient failure, so this is louder than a generation miss.
-            tracing::warn!(error = %err, "Run title prompt template failed to render");
+            let rendered_error = error::collect_chain(&err).join(": ");
+            tracing::warn!(error = %rendered_error, "Run title prompt template failed to render");
             return current_title;
         }
     };
@@ -83,7 +85,11 @@ fn build_title_prompt(input: &TitlePromptInput<'_>) -> Result<String, TemplateEr
     let template_inputs = HashMap::from([
         (
             "max_chars".to_string(),
-            TomlValue::String(MAX_RUN_TITLE_CHARS.to_string()),
+            TomlValue::Integer(
+                MAX_RUN_TITLE_CHARS
+                    .try_into()
+                    .expect("run title character limit should fit in i64"),
+            ),
         ),
         (
             "workflow_identity".to_string(),
