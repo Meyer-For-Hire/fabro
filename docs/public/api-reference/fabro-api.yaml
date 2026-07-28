@@ -8894,6 +8894,7 @@ components:
       type: string
       enum:
         - workflow_error
+        - publish_failed
         - cancelled
         - approval_denied
         - terminated

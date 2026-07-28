@@ -113,6 +113,7 @@ fn success_reason_json_tokens_match_openapi() {
 #[test]
 fn failure_reason_json_tokens_match_openapi() {
     assert_string_json(FailureReason::WorkflowError, "workflow_error");
+    assert_string_json(FailureReason::PublishFailed, "publish_failed");
     assert_string_json(FailureReason::Cancelled, "cancelled");
     assert_string_json(FailureReason::ApprovalDenied, "approval_denied");
     assert_string_json(FailureReason::Terminated, "terminated");

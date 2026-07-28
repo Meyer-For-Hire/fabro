@@ -596,7 +596,10 @@ async fn mint_installation_token_with_jwt(
     })
 }
 
-/// Request a scoped Installation Access Token with `contents: write`.
+/// Request a scoped Installation Access Token for git writes.
+///
+/// The `workflows` permission is required when a pushed commit creates or
+/// updates files under `.github/workflows/`.
 pub async fn create_installation_access_token(
     client: &impl HttpClient,
     jwt: &str,
@@ -610,7 +613,7 @@ pub async fn create_installation_access_token(
         owner,
         repo,
         base_url,
-        serde_json::json!({ "contents": "write" }),
+        serde_json::json!({ "contents": "write", "workflows": "write" }),
     )
     .await
 }
@@ -894,27 +897,36 @@ fn normalize_https_host_path(url: &str) -> String {
     }
 }
 
-/// Check whether a branch exists in a GitHub repository.
+/// Return the commit SHA at the head of a GitHub branch.
 ///
-/// Uses a GitHub App installation token to query the branches API.
-/// Returns `true` if the branch exists, `false` if it doesn't (404).
-pub async fn branch_exists(
+/// Returns `None` when the branch does not exist.
+pub async fn branch_head_sha(
     ctx: &GitHubContext<'_>,
     owner: &str,
     repo: &str,
     branch: &str,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<Option<String>> {
     let client = ctx.http_client()?;
-    branch_exists_with_client(&client, ctx, owner, repo, branch).await
+    branch_head_sha_with_client(&client, ctx, owner, repo, branch).await
 }
 
-async fn branch_exists_with_client(
+async fn branch_head_sha_with_client(
     client: &impl HttpClient,
     ctx: &GitHubContext<'_>,
     owner: &str,
     repo: &str,
     branch: &str,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<Option<String>> {
+    #[derive(Deserialize)]
+    struct BranchResponse {
+        commit: BranchCommit,
+    }
+
+    #[derive(Deserialize)]
+    struct BranchCommit {
+        sha: String,
+    }
+
     let token = ctx
         .creds
         .resolve_bearer_token(
@@ -922,7 +934,7 @@ async fn branch_exists_with_client(
             owner,
             repo,
             ctx.base_url,
-            serde_json::json!({ "contents": "write" }),
+            serde_json::json!({ "contents": "read" }),
         )
         .await?;
 
@@ -931,12 +943,17 @@ async fn branch_exists_with_client(
     let resp = client
         .request(HttpMethod::Get, &url, &github_headers(&auth), None)
         .await
-        .context("Failed to check branch existence")?;
+        .context("Failed to read remote branch head")?;
 
     match resp.status {
-        200 => Ok(true),
-        404 => Ok(false),
-        status => bail!("Unexpected status {status} checking branch '{branch}'"),
+        200 => {
+            let branch: BranchResponse = resp
+                .json()
+                .context("Failed to parse remote branch response")?;
+            Ok(Some(branch.commit.sha))
+        }
+        404 => Ok(None),
+        status => bail!("Unexpected status {status} reading branch '{branch}'"),
     }
 }
 
@@ -1041,9 +1058,10 @@ pub async fn update_app_webhook_config(
 
 /// Resolve git clone credentials for a GitHub repository.
 ///
-/// Returns `(username, password)` for authenticated cloning.
+/// Returns `(username, password)` for authenticated cloning and pushing.
 /// Always generates a token regardless of repo visibility, since the token
-/// is needed for pushing from the sandbox.
+/// is needed for pushing from the sandbox. The token includes `workflows:
+/// write` so a run can publish workflow-file changes.
 pub async fn resolve_clone_credentials(
     ctx: &GitHubContext<'_>,
     owner: &str,
@@ -1054,18 +1072,28 @@ pub async fn resolve_clone_credentials(
         GitHubCredentials::Installation(token) => token.valid_token()?.to_string(),
         GitHubCredentials::App(_) => {
             let client = ctx.http_client()?;
-            ctx.creds
-                .resolve_bearer_token(
-                    &client,
-                    owner,
-                    repo,
-                    ctx.base_url,
-                    serde_json::json!({ "contents": "write" }),
-                )
-                .await?
+            mint_git_write_token(&client, ctx, owner, repo).await?
         }
     };
     Ok((Some("x-access-token".to_string()), Some(token)))
+}
+
+/// Mint an installation token scoped for git writes, including workflow files.
+async fn mint_git_write_token(
+    client: &impl HttpClient,
+    ctx: &GitHubContext<'_>,
+    owner: &str,
+    repo: &str,
+) -> anyhow::Result<String> {
+    ctx.creds
+        .resolve_bearer_token(
+            client,
+            owner,
+            repo,
+            ctx.base_url,
+            serde_json::json!({ "contents": "write", "workflows": "write" }),
+        )
+        .await
 }
 
 /// Embed a token into an HTTPS URL for authenticated git operations.
@@ -1794,7 +1822,9 @@ mod tests {
                 r#"{"token": "ghs_xxx", "expires_at": "2099-01-01T00:00:00Z"}"#,
             )
             .with_req_header("Authorization", "Bearer test-jwt")
-            .with_req_body(r#"{"permissions":{"contents":"write"},"repositories":["repo"]}"#);
+            .with_req_body(
+                r#"{"permissions":{"contents":"write","workflows":"write"},"repositories":["repo"]}"#,
+            );
 
         let token = create_installation_access_token(&mock, "test-jwt", "owner", "repo", "")
             .await
@@ -1927,12 +1957,21 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // branch_exists
+    // branch_head_sha
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn branch_exists_returns_true_on_200() {
-        let mock = MockHttpClient::new()
+    fn app_creds() -> GitHubCredentials {
+        GitHubCredentials::App(GitHubAppCredentials {
+            app_id:          "test".to_string(),
+            private_key_pem: test_rsa_key().to_string(),
+            slug:            None,
+        })
+    }
+
+    /// Mock the installation-token exchange every App-credentialed call makes
+    /// before it reaches the endpoint under test.
+    fn mock_with_installation_token() -> MockHttpClient {
+        MockHttpClient::new()
             .on(
                 HttpMethod::Get,
                 "/repos/owner/repo/installation",
@@ -1945,20 +1984,19 @@ mod tests {
                 201,
                 r#"{"token": "ghs_test", "expires_at": "2099-01-01T00:00:00Z"}"#,
             )
-            .on(
-                HttpMethod::Get,
-                "/repos/owner/repo/branches/my-branch",
-                200,
-                r#"{"name": "my-branch"}"#,
-            );
+    }
 
-        let pem = test_rsa_key();
-        let creds = GitHubCredentials::App(GitHubAppCredentials {
-            app_id:          "test".to_string(),
-            private_key_pem: pem.to_string(),
-            slug:            None,
-        });
-        let result = branch_exists_with_client(
+    #[tokio::test]
+    async fn branch_head_sha_returns_commit_on_200() {
+        let mock = mock_with_installation_token().on(
+            HttpMethod::Get,
+            "/repos/owner/repo/branches/my-branch",
+            200,
+            r#"{"name": "my-branch", "commit": {"sha": "abc123"}}"#,
+        );
+
+        let creds = app_creds();
+        let result = branch_head_sha_with_client(
             &mock,
             &GitHubContext::new(&creds, ""),
             "owner",
@@ -1966,38 +2004,21 @@ mod tests {
             "my-branch",
         )
         .await;
-        assert!(result.unwrap());
+
+        assert_eq!(result.unwrap(), Some("abc123".to_string()));
     }
 
     #[tokio::test]
-    async fn branch_exists_returns_false_on_404() {
-        let mock = MockHttpClient::new()
-            .on(
-                HttpMethod::Get,
-                "/repos/owner/repo/installation",
-                200,
-                r#"{"id": 1}"#,
-            )
-            .on(
-                HttpMethod::Post,
-                "/app/installations/1/access_tokens",
-                201,
-                r#"{"token": "ghs_test", "expires_at": "2099-01-01T00:00:00Z"}"#,
-            )
-            .on(
-                HttpMethod::Get,
-                "/repos/owner/repo/branches/no-such-branch",
-                404,
-                "",
-            );
+    async fn branch_head_sha_returns_none_on_404() {
+        let mock = mock_with_installation_token().on(
+            HttpMethod::Get,
+            "/repos/owner/repo/branches/no-such-branch",
+            404,
+            "",
+        );
 
-        let pem = test_rsa_key();
-        let creds = GitHubCredentials::App(GitHubAppCredentials {
-            app_id:          "test".to_string(),
-            private_key_pem: pem.to_string(),
-            slug:            None,
-        });
-        let result = branch_exists_with_client(
+        let creds = app_creds();
+        let result = branch_head_sha_with_client(
             &mock,
             &GitHubContext::new(&creds, ""),
             "owner",
@@ -2005,38 +2026,21 @@ mod tests {
             "no-such-branch",
         )
         .await;
-        assert!(!result.unwrap());
+
+        assert_eq!(result.unwrap(), None);
     }
 
     #[tokio::test]
-    async fn branch_exists_returns_error_on_500() {
-        let mock = MockHttpClient::new()
-            .on(
-                HttpMethod::Get,
-                "/repos/owner/repo/installation",
-                200,
-                r#"{"id": 1}"#,
-            )
-            .on(
-                HttpMethod::Post,
-                "/app/installations/1/access_tokens",
-                201,
-                r#"{"token": "ghs_test", "expires_at": "2099-01-01T00:00:00Z"}"#,
-            )
-            .on(
-                HttpMethod::Get,
-                "/repos/owner/repo/branches/broken",
-                500,
-                "",
-            );
+    async fn branch_head_sha_returns_error_on_500() {
+        let mock = mock_with_installation_token().on(
+            HttpMethod::Get,
+            "/repos/owner/repo/branches/broken",
+            500,
+            "",
+        );
 
-        let pem = test_rsa_key();
-        let creds = GitHubCredentials::App(GitHubAppCredentials {
-            app_id:          "test".to_string(),
-            private_key_pem: pem.to_string(),
-            slug:            None,
-        });
-        let result = branch_exists_with_client(
+        let creds = app_creds();
+        let result = branch_head_sha_with_client(
             &mock,
             &GitHubContext::new(&creds, ""),
             "owner",
@@ -2044,22 +2048,23 @@ mod tests {
             "broken",
         )
         .await;
+
         assert!(result.is_err());
     }
 
     #[tokio::test]
-    async fn branch_exists_with_token_uses_direct_bearer_token() {
+    async fn branch_head_sha_with_token_uses_direct_bearer_token() {
         let mock = MockHttpClient::new()
             .on(
                 HttpMethod::Get,
                 "/repos/owner/repo/branches/my-branch",
                 200,
-                r#"{"name": "my-branch"}"#,
+                r#"{"name": "my-branch", "commit": {"sha": "abc123"}}"#,
             )
             .with_req_header("Authorization", "Bearer ghu_test");
 
         let creds = GitHubCredentials::Pat("ghu_test".to_string());
-        let result = branch_exists_with_client(
+        let result = branch_head_sha_with_client(
             &mock,
             &GitHubContext::new(&creds, ""),
             "owner",
@@ -2068,7 +2073,7 @@ mod tests {
         )
         .await;
 
-        assert!(result.unwrap());
+        assert_eq!(result.unwrap(), Some("abc123".to_string()));
     }
 
     // -----------------------------------------------------------------------
@@ -2313,6 +2318,37 @@ mod tests {
                 Some("ghu_test".to_string())
             )
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_clone_credentials_requests_workflow_write_permission() {
+        let mock = MockHttpClient::new()
+            .on(
+                HttpMethod::Get,
+                "/repos/owner/repo/installation",
+                200,
+                r#"{"id": 123}"#,
+            )
+            .on(
+                HttpMethod::Post,
+                "/app/installations/123/access_tokens",
+                201,
+                r#"{"token": "ghs_xxx", "expires_at": "2099-01-01T00:00:00Z"}"#,
+            )
+            .with_req_body(
+                r#"{"permissions":{"contents":"write","workflows":"write"},"repositories":["repo"]}"#,
+            );
+        let credentials = GitHubCredentials::App(GitHubAppCredentials {
+            app_id:          "test".to_string(),
+            private_key_pem: test_rsa_key().to_string(),
+            slug:            None,
+        });
+        let context = GitHubContext::new(&credentials, "");
+        let token = mint_git_write_token(&mock, &context, "owner", "repo")
+            .await
+            .unwrap();
+
+        assert_eq!(token, "ghs_xxx");
     }
 
     #[test]

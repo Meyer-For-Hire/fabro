@@ -4685,6 +4685,7 @@ channel = "#deploys"
             repo:        "fabro".to_string(),
             base_branch: "main".to_string(),
             head_branch: "fabro/run/test".to_string(),
+            head_sha:    Some("final-sha".to_string()),
             title:       "Ship <prod> & notify".to_string(),
             draft:       false,
         },
@@ -6541,6 +6542,7 @@ async fn create_run_with_pull_request_record(
             repo: "widgets".to_string(),
             base_branch: "main".to_string(),
             head_branch: "feature".to_string(),
+            head_sha: Some("final-sha".to_string()),
             title: title.to_string(),
             draft: false,
         },
@@ -6635,7 +6637,7 @@ async fn create_completed_run_ready_for_pull_request(
             status:               "succeeded".to_string(),
             reason:               SuccessReason::Completed,
             total_usd_micros:     None,
-            final_git_commit_sha: None,
+            final_git_commit_sha: Some("final-sha".to_string()),
             final_patch:          Some(final_patch.to_string()),
             diff_summary:         None,
             billing:              None,
@@ -9225,6 +9227,14 @@ async fn get_run_pull_request_returns_stored_github_association_when_github_pr_i
 #[tokio::test]
 async fn create_run_pull_request_creates_and_persists_record() {
     let github = MockServer::start();
+    let branch_mock = github.mock(|when, then| {
+        when.method("GET")
+            .path("/repos/acme/widgets/branches/fabro/run/42")
+            .header("authorization", "Bearer ghu_test");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(json!({ "commit": { "sha": "final-sha" } }).to_string());
+    });
     let create_mock = github.mock(|when, then| {
         when.method("POST")
             .path("/repos/acme/widgets/pulls")
@@ -9322,6 +9332,7 @@ async fn create_run_pull_request_creates_and_persists_record() {
     assert_eq!(state_body["pull_request"]["repo"], "widgets");
 
     response_mock.assert_async().await;
+    branch_mock.assert();
     create_mock.assert();
 }
 
@@ -16662,6 +16673,7 @@ async fn list_runs_includes_live_metadata_from_run_state() {
             repo:        "repo".to_string(),
             base_branch: "main".to_string(),
             head_branch: "fabro/run".to_string(),
+            head_sha:    Some("final-sha".to_string()),
             title:       "Fix board metadata".to_string(),
             draft:       false,
         },

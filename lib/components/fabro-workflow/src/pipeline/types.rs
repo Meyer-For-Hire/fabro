@@ -337,17 +337,41 @@ pub struct Executed {
     pub model:         String,
 }
 
-/// Output of the FINALIZE phase.
+/// Output of the CONCLUDE phase.
 #[non_exhaustive]
 pub struct Concluded {
-    pub outcome:     Result<Outcome, Error>,
-    pub conclusion:  Conclusion,
-    pub graph:       Graph,
-    pub run_options: RunOptions,
-    pub services:    Arc<RunServices>,
+    pub outcome:        Result<Outcome, Error>,
+    pub conclusion:     Conclusion,
+    pub artifact_count: usize,
+    pub graph:          Graph,
+    pub run_options:    RunOptions,
+    pub services:       Arc<RunServices>,
 }
 
-/// Output of the PULL_REQUEST phase.
+/// What the PUBLISH phase actually accomplished.
+///
+/// Recorded separately from the phase's error so a branch that reached the
+/// remote is still reported when a later step, such as pull request creation,
+/// fails. An all-`None` value means publish had nothing to do.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PublishOutcome {
+    pub pushed_branch: Option<String>,
+    pub pr_url:        Option<String>,
+}
+
+/// Output of the PUBLISH phase.
+#[non_exhaustive]
+pub struct Published {
+    pub execution_outcome: Result<Outcome, Error>,
+    pub publish_outcome:   PublishOutcome,
+    pub publish_error:     Option<Error>,
+    pub conclusion:        Conclusion,
+    pub artifact_count:    usize,
+    pub run_options:       RunOptions,
+    pub services:          Arc<RunServices>,
+}
+
+/// Output of the FINALIZE phase.
 #[non_exhaustive]
 pub struct Finalized {
     pub run_id:        RunId,
@@ -380,8 +404,8 @@ pub struct FinalizeOptions {
     pub last_git_sha:     Option<String>,
 }
 
-/// Options for the PULL_REQUEST phase.
-pub struct PullRequestOptions {
+/// Options for the PUBLISH phase.
+pub struct PublishOptions {
     pub pr_config:  Option<PullRequestSettings>,
     pub github_app: Option<fabro_github::GitHubCredentials>,
     pub origin_url: Option<String>,
