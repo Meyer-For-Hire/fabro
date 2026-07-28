@@ -21,7 +21,7 @@ export interface BatchDeleteRunsRequest {
     /**
      * Run IDs to process, in result order.
      */
-    'run_ids': Set<string>;
+    'run_ids': Array<string>;
     /**
      * Whether to force deletion of active runs. Defaults to `false`.
      */

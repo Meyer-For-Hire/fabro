@@ -325,8 +325,8 @@ async fn run_summary_at(
         return Ok(None);
     };
     if summary.timestamps.completed_at.is_none() {
-        let cached = state.stores.runs.get_cached_run(run_id).await?;
-        if let Some(timing) = cached.and_then(|cached| cached.projection.live_run_timing(now)) {
+        let projection = state.stores.runs.get_cached_projection(run_id).await?;
+        if let Some(timing) = projection.and_then(|projection| projection.live_run_timing(now)) {
             summary.timing = Some(timing);
         }
     }

@@ -411,6 +411,12 @@ pub struct StageProjection {
     /// the authority on whether a run is actually stuck.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inference:             Option<StageInferenceProjection>,
+    /// Start of an external ACP agent process, if one is running.
+    ///
+    /// ACP agents do not emit Fabro's internal LLM brackets, so their process
+    /// lifetime is the best available live inference estimate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_started_at:        Option<DateTime<Utc>>,
     #[serde(default)]
     pub agent_control:         AgentControlState,
     pub state:                 StageState,
@@ -568,6 +574,7 @@ impl StageProjection {
             mcp_servers: Vec::new(),
             context_window: None,
             inference: None,
+            acp_started_at: None,
             agent_control: AgentControlState::default(),
             provider_used: None,
             diff: None,
@@ -660,7 +667,9 @@ impl StageProjection {
                 let open_inference = self
                     .inference
                     .as_ref()
-                    .map_or(0, |inference| timing::elapsed_ms(inference.started_at, now));
+                    .map(|inference| inference.started_at)
+                    .or(self.acp_started_at)
+                    .map_or(0, |started_at| timing::elapsed_ms(started_at, now));
                 let open_tool = self
                     .tool_batch
                     .as_ref()
@@ -690,6 +699,30 @@ impl StageProjection {
     /// Fold a closed inference bracket into the live accumulator.
     pub fn accumulate_inference_ms(&mut self, elapsed_ms: u64) {
         self.live_inference_ms = self.live_inference_ms.saturating_add(elapsed_ms);
+    }
+
+    /// Record the start of an external ACP agent process.
+    pub fn open_acp_inference(&mut self, started_at: DateTime<Utc>) {
+        self.close_open_acp_inference(started_at);
+        self.acp_started_at = Some(started_at);
+    }
+
+    /// Close an ACP process with its measured duration.
+    ///
+    /// The duration covers the complete process. Use the larger value so a
+    /// replayed terminal event or a projection restored mid-process cannot
+    /// double-count it.
+    pub fn close_acp_inference(&mut self, duration_ms: u64) {
+        self.acp_started_at = None;
+        self.live_inference_ms = self.live_inference_ms.max(duration_ms);
+    }
+
+    /// Fold an open ACP process into the live accumulator at a run boundary.
+    pub fn close_open_acp_inference(&mut self, now: DateTime<Utc>) {
+        let Some(started_at) = self.acp_started_at.take() else {
+            return;
+        };
+        self.accumulate_inference_ms(timing::elapsed_ms(started_at, now));
     }
 
     /// Record a dispatched tool call, opening a batch if none is outstanding.
@@ -768,6 +801,7 @@ impl StageProjection {
         self.live_inference_ms = 0;
         self.live_tool_ms = 0;
         self.inference = None;
+        self.acp_started_at = None;
         self.tool_batch = None;
     }
 
@@ -927,7 +961,7 @@ impl RunProjection {
     #[must_use]
     pub fn live_run_timing(&self, now: DateTime<Utc>) -> Option<RunTiming> {
         let start = self.start.as_ref()?;
-        let wall_time_ms = RunTiming::wall_time_ms_since(start.start_time, now);
+        let wall_time_ms = timing::elapsed_ms(start.start_time, now);
         let active = self
             .stages
             .values()
@@ -1292,6 +1326,23 @@ mod live_timing_tests {
     }
 
     #[test]
+    fn acp_process_counts_as_live_inference_and_uses_measured_duration() {
+        let mut stage = running(StageHandler::Agent);
+        stage.open_acp_inference(at(30));
+
+        assert_eq!(
+            stage.live_timing(at(45)),
+            StageTiming::new(45_000, 15_000, 0)
+        );
+
+        stage.close_acp_inference(14_500);
+        assert_eq!(
+            stage.live_timing(at(45)),
+            StageTiming::new(45_000, 14_500, 0)
+        );
+    }
+
+    #[test]
     fn prompt_stage_counts_elapsed_as_inference() {
         let stage = running(StageHandler::Prompt);
 
@@ -1425,17 +1476,6 @@ mod live_timing_tests {
             timing.active_time_ms, 180_000,
             "concurrent branches legitimately sum past run wall time"
         );
-    }
-}
-
-#[cfg(test)]
-mod live_timing_legacy_tests {
-    use chrono::{DateTime, TimeZone, Utc};
-
-    use crate::{StageProjection, StageState, StageTiming, first_event_seq};
-
-    fn at(seconds: i64) -> DateTime<Utc> {
-        Utc.timestamp_opt(1_700_000_000 + seconds, 0).unwrap()
     }
 
     #[test]

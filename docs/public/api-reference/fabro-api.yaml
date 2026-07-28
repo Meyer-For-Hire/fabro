@@ -10758,6 +10758,13 @@ components:
             Open inference bracket, if the event log contains one. Present means
             a model request was dispatched and no closing event has been seen —
             not that the model is computing right now.
+        acp_started_at:
+          type: ["string", "null"]
+          format: date-time
+          description: >
+            Start of an external ACP agent process, if one is running. ACP
+            agents do not expose Fabro's internal LLM brackets, so the process
+            lifetime supplies their live inference estimate.
         agent_control:
           $ref: "#/components/schemas/AgentControlState"
           description: Whether the agent is executing normally or waiting for steering after an interrupt.
@@ -12315,6 +12322,8 @@ components:
       type: object
       required:
         - wall_time_ms
+        - inference_time_ms
+        - tool_time_ms
         - active_time_ms
       properties:
         wall_time_ms:
@@ -12354,6 +12363,8 @@ components:
       type: object
       required:
         - wall_time_ms
+        - inference_time_ms
+        - tool_time_ms
         - active_time_ms
       properties:
         wall_time_ms:

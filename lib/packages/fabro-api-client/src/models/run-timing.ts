@@ -19,8 +19,8 @@
  */
 export interface RunTiming {
     'wall_time_ms': number;
-    'inference_time_ms'?: number;
-    'tool_time_ms'?: number;
+    'inference_time_ms': number;
+    'tool_time_ms': number;
     /**
      * Equals `inference_time_ms + tool_time_ms`.
      */

@@ -29,5 +29,5 @@ export interface StageToolBatchProjection {
     /**
      * Calls dispatched but not yet completed, by tool call id.
      */
-    'open_call_ids': Set<string>;
+    'open_call_ids': Array<string>;
 }

@@ -174,12 +174,6 @@ impl RunTiming {
             ..self
         }
     }
-
-    /// Milliseconds elapsed from `start` to `now`, clamped at zero.
-    #[must_use]
-    pub fn wall_time_ms_since(start: DateTime<Utc>, now: DateTime<Utc>) -> u64 {
-        elapsed_ms(start, now)
-    }
 }
 
 impl From<StageTiming> for RunTiming {

@@ -19,6 +19,7 @@ import {
 } from "../components/ui";
 import { mutateRunListCaches } from "../lib/board-cache";
 import { useDemoMode } from "../lib/demo-mode";
+import { useTickingNow } from "../lib/time";
 import { useSWRConfig } from "swr";
 import {
   useArchiveRun,
@@ -56,10 +57,7 @@ import {
   lifecycleActionVisibility,
   updateLifecycleToastState,
 } from "./run-detail/lifecycle-toasts";
-import {
-  buildRunDetailRun,
-  useTickingNow,
-} from "./run-detail/model";
+import { buildRunDetailRun } from "./run-detail/model";
 import {
   buildRunDetailTabs,
   childRouteLayoutFlags,
@@ -118,7 +116,10 @@ export default function RunDetail({ params }: { params: { id: string } }) {
     childrenCount,
   });
   const steerBarRef = useRef<SteerBarHandle | null>(null);
-  const now = useTickingNow(RUN_TIMING_REFRESH_INTERVAL_MS);
+  const now = useTickingNow(
+    summary != null && summary.timestamps.completed_at == null,
+    RUN_TIMING_REFRESH_INTERVAL_MS,
+  );
   const { fullHeight, hideSteerBar } = childRouteLayoutFlags(matches);
 
   useRunEvents(params.id);

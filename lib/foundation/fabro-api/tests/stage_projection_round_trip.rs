@@ -172,6 +172,7 @@ fn stage_projection_without_inference_round_trips() {
 
     let stage: StageProjection = serde_json::from_value(value.clone()).unwrap();
     assert!(stage.inference.is_none());
+    assert!(stage.acp_started_at.is_none());
     assert!(stage.tool_batch.is_none());
     assert_eq!(stage.live_inference_ms, 0);
     assert_eq!(stage.live_tool_ms, 0);
@@ -338,6 +339,7 @@ fn stage_projection_round_trips_representative_json() {
             "first_output_kind": "text",
             "retries": 0
         },
+        "acp_started_at": "2026-04-29T12:34:00Z",
         "agent_control": "running",
         "state": "succeeded"
     });

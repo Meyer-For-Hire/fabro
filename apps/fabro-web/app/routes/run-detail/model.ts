@@ -1,6 +1,3 @@
-import { useState } from "react";
-
-import { useInterval } from "../../hooks/effects";
 import {
   isRunStatus,
   mapRunToRunItem,
@@ -10,12 +7,6 @@ import {
 
 export function classNames(...classes: Array<string | false | null | undefined>) {
   return classes.filter(Boolean).join(" ");
-}
-
-export function useTickingNow(intervalMs: number): number {
-  const [now, setNow] = useState(() => Date.now());
-  useInterval(() => setNow(Date.now()), intervalMs);
-  return now;
 }
 
 export type RunDetailRun = ReturnType<typeof mapRunToRunItem> & {

@@ -21,5 +21,5 @@ export interface BatchRunLifecycleRequest {
     /**
      * Run IDs to process, in result order.
      */
-    'run_ids': Set<string>;
+    'run_ids': Array<string>;
 }

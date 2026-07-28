@@ -118,9 +118,21 @@ const INFERENCE_EVENTS = new Set([
   "agent.error",
   "agent.session.ended",
 ]);
+const INFERENCE_TIMING_EVENTS = new Set([
+  "agent.llm.started",
+  "agent.message",
+  "agent.error",
+  "agent.session.ended",
+]);
 const TOOL_TIMING_EVENTS = new Set([
   "agent.tool.started",
   "agent.tool.completed",
+]);
+const ACP_TIMING_EVENTS = new Set([
+  "agent.acp.started",
+  "agent.acp.completed",
+  "agent.acp.cancelled",
+  "agent.acp.timed_out",
 ]);
 // Todo / task mutation events refresh `getRunState` consumers (so per-stage
 // todo projections update live) and the run events list.
@@ -129,6 +141,14 @@ const TODO_EVENTS = new Set([
   "todo.updated",
   "todo.deleted",
 ]);
+
+function liveTimingKeys(runId: string): Key[] {
+  return [
+    queryKeys.runs.detail(runId),
+    queryKeys.runs.state(runId),
+    queryKeys.runs.billing(runId),
+  ];
+}
 
 export function queryKeysForRunEvent(
   runId: string,
@@ -202,11 +222,9 @@ export function queryKeysForRunEvent(
   }
 
   if (INFERENCE_EVENTS.has(event)) {
-    const keys: Key[] = [
-      queryKeys.runs.detail(runId),
-      queryKeys.runs.state(runId),
-      queryKeys.runs.billing(runId),
-    ];
+    const keys = INFERENCE_TIMING_EVENTS.has(event)
+      ? liveTimingKeys(runId)
+      : [queryKeys.runs.state(runId)];
     if (stageId) {
       keys.push(queryKeys.runs.stageEvents(runId, stageId));
       if (event === "agent.message") {
@@ -217,14 +235,18 @@ export function queryKeysForRunEvent(
   }
 
   if (TOOL_TIMING_EVENTS.has(event)) {
-    const keys: Key[] = [
-      queryKeys.runs.detail(runId),
-      queryKeys.runs.state(runId),
-      queryKeys.runs.billing(runId),
-    ];
+    const keys = liveTimingKeys(runId);
     if (stageId) {
       keys.push(queryKeys.runs.stageEvents(runId, stageId));
       keys.push(queryKeys.runs.stageContextWindow(runId, stageId));
+    }
+    return keys;
+  }
+
+  if (ACP_TIMING_EVENTS.has(event)) {
+    const keys = liveTimingKeys(runId);
+    if (stageId) {
+      keys.push(queryKeys.runs.stageEvents(runId, stageId));
     }
     return keys;
   }

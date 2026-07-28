@@ -131,14 +131,18 @@ describe("queryKeysForRunEvent", () => {
   test("every inference projection transition invalidates live run state", () => {
     for (const event of [
       "agent.llm.started",
-      "agent.llm.first_output",
-      "agent.llm.retry",
       "agent.error",
     ]) {
       expect(queryKeysForRunEvent("run-1", event, "code@1")).toEqual([
         queryKeys.runs.detail("run-1"),
         queryKeys.runs.state("run-1"),
         queryKeys.runs.billing("run-1"),
+        queryKeys.runs.stageEvents("run-1", "code@1"),
+      ]);
+    }
+    for (const event of ["agent.llm.first_output", "agent.llm.retry"]) {
+      expect(queryKeysForRunEvent("run-1", event, "code@1")).toEqual([
+        queryKeys.runs.state("run-1"),
         queryKeys.runs.stageEvents("run-1", "code@1"),
       ]);
     }
@@ -156,6 +160,22 @@ describe("queryKeysForRunEvent", () => {
       queryKeys.runs.state("run-1"),
       queryKeys.runs.billing("run-1"),
     ]);
+  });
+
+  test("ACP timing events invalidate live summaries and stage events", () => {
+    for (const event of [
+      "agent.acp.started",
+      "agent.acp.completed",
+      "agent.acp.cancelled",
+      "agent.acp.timed_out",
+    ]) {
+      expect(queryKeysForRunEvent("run-1", event, "code@1")).toEqual([
+        queryKeys.runs.detail("run-1"),
+        queryKeys.runs.state("run-1"),
+        queryKeys.runs.billing("run-1"),
+        queryKeys.runs.stageEvents("run-1", "code@1"),
+      ]);
+    }
   });
 
   test("tool timing events invalidate live summaries and stage resources", () => {

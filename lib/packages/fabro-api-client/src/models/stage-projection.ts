@@ -131,6 +131,10 @@ export interface StageProjection {
     'context_window'?: StageContextWindowProjection | null;
     'inference'?: StageInferenceProjection | null;
     /**
+     * Start of an external ACP agent process, if one is running. ACP agents do not expose Fabro\'s internal LLM brackets, so the process lifetime supplies their live inference estimate.
+     */
+    'acp_started_at'?: string | null;
+    /**
      * Whether the agent is executing normally or waiting for steering after an interrupt.
      */
     'agent_control': AgentControlState;
