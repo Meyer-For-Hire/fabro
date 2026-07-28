@@ -15,7 +15,7 @@ use daytona_sdk::toolbox_types::Command as SessionCommandResult;
 use daytona_sdk::{DaytonaError, SessionCommandLogsResult};
 use fabro_github::GitHubCredentials;
 use fabro_static::EnvVars;
-use fabro_types::{CommandOutputStream, CommandTermination, RunId};
+use fabro_types::{CommandOutputStream, CommandTermination, RunId, SandboxProviderKind};
 use fabro_util::time::elapsed_ms;
 use rand::Rng;
 use tokio::runtime::Handle;
@@ -1049,6 +1049,10 @@ impl Sandbox for DaytonaSandbox {
                 let layout =
                     clone_source::github_repo_layout(&origin_url, WORKING_DIRECTORY, REPOS_ROOT)
                         .map_err(|err| self.fail_init(init_start, err))?;
+                let token_was_freshly_minted = self
+                    .github_app
+                    .as_ref()
+                    .is_some_and(GitHubCredentials::mints_installation_token);
                 self.emit(SandboxEvent::GitCloneStarted {
                     url:    origin_url.clone(),
                     branch: branch.clone(),
@@ -1056,40 +1060,26 @@ impl Sandbox for DaytonaSandbox {
                 let clone_start = Instant::now();
 
                 let (username, password) = match &self.github_app {
-                    Some(creds) => {
-                        let (owner, repo) = fabro_github::parse_github_owner_repo(&origin_url)
-                            .map_err(|e| {
-                                let err = crate::Error::message(format!(
-                                    "Failed to parse GitHub URL for clone: {e}"
-                                ));
-                                self.emit(SandboxEvent::GitCloneFailed {
-                                    url:    origin_url.clone(),
-                                    error:  err.to_string(),
-                                    causes: err.causes(),
-                                });
-                                self.fail_init(init_start, err)
-                            })?;
-                        fabro_github::resolve_clone_credentials(
-                            &fabro_github::GitHubContext::new(
-                                creds,
-                                &fabro_github::github_api_base_url(),
-                            ),
-                            &owner,
-                            &repo,
-                        )
-                        .await
-                        .map_err(|e| {
-                            let err = crate::Error::message(format!(
-                                "Failed to get GitHub App credentials for clone: {e}"
-                            ));
-                            self.emit(SandboxEvent::GitCloneFailed {
-                                url:    origin_url.clone(),
-                                error:  err.to_string(),
-                                causes: err.causes(),
-                            });
-                            self.fail_init(init_start, err)
-                        })?
-                    }
+                    Some(creds) => fabro_github::resolve_clone_credentials(
+                        &fabro_github::GitHubContext::new(
+                            creds,
+                            &fabro_github::github_api_base_url(),
+                        ),
+                        &layout.owner,
+                        &layout.repo,
+                    )
+                    .await
+                    .map_err(|e| {
+                        let err = crate::Error::message(format!(
+                            "Failed to get GitHub App credentials for clone: {e}"
+                        ));
+                        self.emit(SandboxEvent::GitCloneFailed {
+                            url:    origin_url.clone(),
+                            error:  err.to_string(),
+                            causes: err.causes(),
+                        });
+                        self.fail_init(init_start, err)
+                    })?,
                     None => (None, None),
                 };
 
@@ -1154,13 +1144,11 @@ impl Sandbox for DaytonaSandbox {
                     self.fail_init(init_start, err)
                 })?;
 
-                let clone_token = password.clone();
-                let has_credentials = password.is_some();
                 let clone_result = clone_retry::retry_clone(
-                    "daytona",
-                    |attempt| {
+                    SandboxProviderKind::Daytona,
+                    None,
+                    |_attempt| {
                         let git_svc = &git_svc;
-                        let fs_svc = &fs_svc;
                         let origin = origin_url.as_str();
                         let target = layout.primary_repo_path.as_str();
                         let options = daytona_sdk::GitCloneOptions {
@@ -1169,18 +1157,9 @@ impl Sandbox for DaytonaSandbox {
                             password: password.clone(),
                             ..Default::default()
                         };
-                        async move {
-                            if attempt > 1 {
-                                // git removes the directory it created when it
-                                // exits on its own, but a clone killed part-way
-                                // leaves a partial checkout that the next
-                                // `git clone` would refuse to write into.
-                                let _ = fs_svc.delete_file(target, true).await;
-                            }
-                            git_svc.clone(origin, target, options).await
-                        }
+                        async move { git_svc.clone(origin, target, options).await }
                     },
-                    |err: &DaytonaError| classify_clone_failure(err, has_credentials),
+                    |err: &DaytonaError| classify_clone_failure(err, token_was_freshly_minted),
                 )
                 .await;
 
@@ -1196,7 +1175,7 @@ impl Sandbox for DaytonaSandbox {
                             });
                             self.fail_init(init_start, err)
                         })?;
-                        let symlink_cmd = daytona_symlink_command(&layout);
+                        let symlink_cmd = clone_source::repo_symlink_command(&layout);
                         let symlink_result = process_svc
                             .execute_command(
                                 &wrap_bash_command(&symlink_cmd),
@@ -1248,8 +1227,8 @@ impl Sandbox for DaytonaSandbox {
                         let _ = self.origin_url.set(origin_url.clone());
                         self.set_working_directory(layout.execution_directory.clone())
                             .map_err(|err| self.fail_init(init_start, err))?;
-                        if let Some(token) = clone_token {
-                            match fabro_github::embed_token_in_url(&origin_url, &token) {
+                        if let Some(token) = password.as_deref() {
+                            match fabro_github::embed_token_in_url(&origin_url, token) {
                                 Ok(auth_url) => {
                                     let cmd = format!(
                                         "git -c maintenance.auto=0 remote set-url origin {}",
@@ -1532,7 +1511,7 @@ impl Sandbox for DaytonaSandbox {
         // Only a GitHub App installation token can be re-minted; a static PAT or
         // a pre-minted Installation token is fixed, so re-embedding it changes
         // nothing. Short-circuit to Skipped before the resolve + set-url exec.
-        if !matches!(creds, GitHubCredentials::App(_)) {
+        if !creds.mints_installation_token() {
             return Ok(RefreshOutcome::Skipped);
         }
 
@@ -2492,24 +2471,30 @@ fn daytona_bash_session_probe_outcome(execution: crate::Result<ExecResult>) -> c
 /// inside the sandbox, so its stderr comes back through the toolbox as the
 /// error message — the credential race has to be matched on text. Daytona's own
 /// transport failures are visible structurally.
-fn classify_clone_failure(err: &DaytonaError, has_credentials: bool) -> Option<CloneRetryReason> {
-    let transient_transport = match err {
-        DaytonaError::Timeout { .. } | DaytonaError::RateLimit { .. } => true,
-        DaytonaError::Api { status_code, .. } => (500..600).contains(status_code),
-        DaytonaError::NotFound { .. } | DaytonaError::General(_) => false,
-    };
-    if transient_transport {
-        return Some(CloneRetryReason::TransientInfra);
+fn classify_clone_failure(
+    err: &DaytonaError,
+    token_was_freshly_minted: bool,
+) -> Option<CloneRetryReason> {
+    // A Daytona request timeout does not prove that the remote clone stopped.
+    // Retrying could overlap the still-running first request.
+    if matches!(err, DaytonaError::Timeout { .. }) {
+        return None;
     }
-    clone_retry::classify_message(err.message(), has_credentials)
-}
 
-fn daytona_symlink_command(layout: &clone_source::GitHubRepoLayout) -> String {
-    format!(
-        "ln -s {} {}",
-        shell_quote(&layout.primary_repo_path),
-        shell_quote(&layout.primary_repo_link),
-    )
+    match clone_retry::classify_message(err.message(), token_was_freshly_minted) {
+        clone_retry::CloneMessageClass::Retry(reason) => Some(reason),
+        clone_retry::CloneMessageClass::Permanent => None,
+        clone_retry::CloneMessageClass::Unknown => match err {
+            DaytonaError::RateLimit { .. } => Some(CloneRetryReason::TransientInfra),
+            DaytonaError::Api { status_code, .. } if (500..600).contains(status_code) => {
+                Some(CloneRetryReason::TransientInfra)
+            }
+            DaytonaError::Timeout { .. }
+            | DaytonaError::Api { .. }
+            | DaytonaError::NotFound { .. }
+            | DaytonaError::General(_) => None,
+        },
+    }
 }
 
 /// Wrap Bash source in the canonical non-login Bash transport.
@@ -2880,21 +2865,6 @@ mod tests {
     }
 
     #[test]
-    fn daytona_symlink_command_links_workspace_repo_to_repos_checkout() {
-        let layout = clone_source::github_repo_layout(
-            "https://github.com/fabro-sh/fabro",
-            WORKING_DIRECTORY,
-            REPOS_ROOT,
-        )
-        .unwrap();
-
-        assert_eq!(
-            daytona_symlink_command(&layout),
-            "ln -s /home/daytona/repos/fabro-sh/fabro /home/daytona/workspace/fabro"
-        );
-    }
-
-    #[test]
     fn clone_not_found_after_a_successful_mint_is_retried() {
         // The exact error from run 01KYM99DF27JRRW4XSYZBP27K7: git's stderr,
         // relayed through the toolbox, five seconds after a token was minted.
@@ -2914,7 +2884,6 @@ mod tests {
     #[test]
     fn clone_transient_transport_failures_are_retried() {
         for err in [
-            DaytonaError::timeout("request timed out"),
             DaytonaError::rate_limit("too many requests"),
             DaytonaError::api(503, ""),
         ] {
@@ -2922,6 +2891,34 @@ mod tests {
                 classify_clone_failure(&err, false),
                 Some(CloneRetryReason::TransientInfra),
                 "expected {err:?} to be transient"
+            );
+        }
+    }
+
+    #[test]
+    fn clone_timeout_is_not_retried_without_remote_termination() {
+        let err = DaytonaError::timeout("request timed out");
+
+        assert_eq!(classify_clone_failure(&err, true), None);
+    }
+
+    #[test]
+    fn clone_api_failure_message_takes_precedence_over_status() {
+        let not_found = DaytonaError::api(500, "repository not found: Repository not found.");
+        assert_eq!(
+            classify_clone_failure(&not_found, true),
+            Some(CloneRetryReason::TokenReplication)
+        );
+        assert_eq!(classify_clone_failure(&not_found, false), None);
+
+        for message in [
+            "fatal: destination path 'fabro' already exists",
+            "remote: Permission to fabro-sh/fabro.git denied",
+        ] {
+            assert_eq!(
+                classify_clone_failure(&DaytonaError::api(500, message), true),
+                None,
+                "expected {message:?} to take precedence over HTTP 500"
             );
         }
     }

@@ -1,19 +1,12 @@
 //! Retry for the first repository clone in a clone-based sandbox.
 //!
-//! Clone-based providers mint a GitHub installation access token and clone with
-//! it in the same breath. GitHub replicates a new token to its edge cache sites
-//! asynchronously, so a clone that starts within a second of the mint can be
-//! rejected before the token is visible to the site serving it. On a private
-//! repository that rejection arrives as `Repository not found.`, because GitHub
-//! answers unauthorized reads with 404 rather than 403.
+//! Clone-based providers can mint a GitHub App installation token and clone
+//! with it immediately. GitHub can reject that first clone before the token is
+//! available to the git endpoint. On a private repository, the rejection can
+//! arrive as `Repository not found.` or an authentication failure.
 //!
-//! A successful mint is what makes that message safe to retry.
-//! `resolve_clone_credentials` already fails loudly on every deterministic
-//! explanation for a clone 404: the installation lookup 404s when the App is
-//! not installed for the owner, and token creation 422s when the installation
-//! does not cover the repository. So once credentials are in hand, `not found`
-//! from the clone itself cannot mean "no access" — the repository exists and
-//! the token covers it.
+//! Only a token minted during the current clone operation makes those messages
+//! safe to retry. Static PATs and pre-minted installation tokens fail fast.
 //!
 //! Retries reuse the same token on purpose. Replication of a given token only
 //! makes progress, so each attempt strictly improves the odds, while re-minting
@@ -22,6 +15,7 @@
 use std::future::Future;
 use std::time::Duration;
 
+use fabro_types::SandboxProviderKind;
 use fabro_util::backoff::BackoffPolicy;
 use tokio::time;
 
@@ -37,6 +31,23 @@ pub(crate) enum CloneRetryReason {
     TokenReplication,
     /// The clone failed on infrastructure, unrelated to credentials.
     TransientInfra,
+}
+
+/// What a clone failure message tells us about retry safety.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CloneMessageClass {
+    Retry(CloneRetryReason),
+    Permanent,
+    Unknown,
+}
+
+impl CloneMessageClass {
+    pub(crate) fn retry_reason(self) -> Option<CloneRetryReason> {
+        match self {
+            Self::Retry(reason) => Some(reason),
+            Self::Permanent | Self::Unknown => None,
+        }
+    }
 }
 
 /// Message fragments that mean the clone failed on infrastructure.
@@ -76,24 +87,35 @@ const TOKEN_REPLICATION_HINTS: &[&str] = &[
 
 /// Classify a failed clone by its rendered message.
 ///
-/// `has_credentials` gates the token-replication reading. Without credentials
-/// there is no token to replicate, so `not found` on a public clone means the
-/// URL names a repository that is not there — that should fail immediately
-/// rather than burn 12 seconds of backoff.
-pub(crate) fn classify_message(message: &str, has_credentials: bool) -> Option<CloneRetryReason> {
+/// `token_was_freshly_minted` gates the token-replication reading. A static
+/// credential cannot become valid during backoff, so auth failures for it are
+/// permanent.
+pub(crate) fn classify_message(message: &str, token_was_freshly_minted: bool) -> CloneMessageClass {
     let lower = message.to_ascii_lowercase();
 
     if TRANSIENT_HINTS.iter().any(|hint| lower.contains(hint)) {
-        return Some(CloneRetryReason::TransientInfra);
+        return CloneMessageClass::Retry(CloneRetryReason::TransientInfra);
     }
-    if has_credentials
-        && TOKEN_REPLICATION_HINTS
-            .iter()
-            .any(|hint| lower.contains(hint))
+    if TOKEN_REPLICATION_HINTS
+        .iter()
+        .any(|hint| lower.contains(hint))
     {
-        return Some(CloneRetryReason::TokenReplication);
+        return if token_was_freshly_minted {
+            CloneMessageClass::Retry(CloneRetryReason::TokenReplication)
+        } else {
+            CloneMessageClass::Permanent
+        };
     }
-    None
+    let permanent = lower.contains("could not read username")
+        || lower.contains("terminal prompts disabled")
+        || lower.contains("permission denied")
+        || (lower.contains("permission to") && lower.contains("denied"))
+        || (lower.contains("destination path") && lower.contains("already exists"))
+        || (lower.contains("remote branch") && lower.contains("not found"));
+    if permanent {
+        return CloneMessageClass::Permanent;
+    }
+    CloneMessageClass::Unknown
 }
 
 /// Backoff between clone attempts: 3s, then 9s.
@@ -112,13 +134,13 @@ fn backoff() -> BackoffPolicy {
 
 /// Run a clone, repeating it while the failure looks transient.
 ///
-/// `attempt` receives the 1-based attempt number so the caller can clear
-/// leftovers from the previous try before cloning again. `classify` decides
-/// whether an error is worth repeating; `None` returns it to the caller
-/// untouched. The error from the final attempt is returned as-is, so callers
-/// keep the cause chain they would have had without retries.
+/// `attempt` receives the 1-based attempt number. `classify` decides whether an
+/// error is worth repeating; `None` returns it to the caller untouched. When a
+/// deadline is present, a retry starts only when its backoff fits before that
+/// deadline. The final error is returned as-is.
 pub(crate) async fn retry_clone<T, E, Attempt, Fut, Classify>(
-    provider: &'static str,
+    provider: SandboxProviderKind,
+    deadline: Option<time::Instant>,
     mut attempt: Attempt,
     classify: Classify,
 ) -> Result<T, E>
@@ -137,11 +159,16 @@ where
                     return Err(err);
                 };
                 let delay = backoff.delay_for_attempt(attempt_number);
+                if deadline.is_some_and(|deadline| {
+                    delay >= deadline.saturating_duration_since(time::Instant::now())
+                }) {
+                    return Err(err);
+                }
                 // The failure text can carry git stderr, so log the category
                 // rather than the message. The caller still reports the full
                 // error if the attempts run out.
                 tracing::warn!(
-                    provider,
+                    provider = %provider,
                     attempt = attempt_number,
                     max_attempts = MAX_ATTEMPTS,
                     reason = %reason,
@@ -184,26 +211,33 @@ mod tests {
     fn private_repo_not_found_after_a_successful_mint_is_a_replication_lag() {
         assert_eq!(
             classify_message("repository not found: Repository not found.", true),
-            Some(CloneRetryReason::TokenReplication)
+            CloneMessageClass::Retry(CloneRetryReason::TokenReplication)
         );
     }
 
     #[test]
-    fn not_found_without_credentials_is_a_wrong_url() {
+    fn not_found_without_a_fresh_token_is_permanent() {
         assert_eq!(
             classify_message("repository not found: Repository not found.", false),
-            None
+            CloneMessageClass::Permanent
         );
     }
 
     #[test]
-    fn auth_failure_with_credentials_is_a_replication_lag() {
+    fn auth_failure_with_a_fresh_token_is_a_replication_lag() {
         assert_eq!(
             classify_message(
                 "fatal: Authentication failed for 'https://github.com/owner/repo'",
                 true
             ),
-            Some(CloneRetryReason::TokenReplication)
+            CloneMessageClass::Retry(CloneRetryReason::TokenReplication)
+        );
+        assert_eq!(
+            classify_message(
+                "fatal: Authentication failed for 'https://github.com/owner/repo'",
+                false
+            ),
+            CloneMessageClass::Permanent
         );
     }
 
@@ -217,7 +251,7 @@ mod tests {
         ] {
             assert_eq!(
                 classify_message(message, false),
-                Some(CloneRetryReason::TransientInfra),
+                CloneMessageClass::Retry(CloneRetryReason::TransientInfra),
                 "expected {message:?} to be transient"
             );
         }
@@ -232,10 +266,18 @@ mod tests {
         ] {
             assert_eq!(
                 classify_message(message, true),
-                None,
+                CloneMessageClass::Permanent,
                 "expected {message:?} to fail fast"
             );
         }
+    }
+
+    #[test]
+    fn unrecognized_failures_remain_unknown() {
+        assert_eq!(
+            classify_message("git clone stopped for an unexpected reason", true),
+            CloneMessageClass::Unknown
+        );
     }
 
     #[test]
@@ -250,7 +292,8 @@ mod tests {
         let attempts = Attempts::default();
 
         let result = retry_clone(
-            "test",
+            SandboxProviderKind::Docker,
+            None,
             |attempt| {
                 attempts.record(attempt);
                 async move { Ok::<_, String>(attempt) }
@@ -268,7 +311,8 @@ mod tests {
         let attempts = Attempts::default();
 
         let result = retry_clone(
-            "test",
+            SandboxProviderKind::Docker,
+            None,
             |attempt| {
                 attempts.record(attempt);
                 async move {
@@ -292,7 +336,8 @@ mod tests {
         let attempts = Attempts::default();
 
         let result = retry_clone(
-            "test",
+            SandboxProviderKind::Docker,
+            None,
             |attempt| {
                 attempts.record(attempt);
                 async move { Err::<(), _>(format!("Repository not found. (attempt {attempt})")) }
@@ -314,7 +359,8 @@ mod tests {
         let attempts = Attempts::default();
 
         let result = retry_clone(
-            "test",
+            SandboxProviderKind::Docker,
+            None,
             |attempt| {
                 attempts.record(attempt);
                 async move { Err::<(), _>("permission denied".to_string()) }
@@ -329,5 +375,26 @@ mod tests {
             vec![1],
             "a deterministic failure should not wait out the backoff"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deadline_stops_retry_when_backoff_does_not_fit() {
+        let attempts = Attempts::default();
+        let deadline = time::Instant::now() + Duration::from_secs(2);
+
+        let result = retry_clone(
+            SandboxProviderKind::Docker,
+            Some(deadline),
+            |attempt| {
+                attempts.record(attempt);
+                async move { Err::<(), _>("temporary failure".to_string()) }
+            },
+            ALWAYS_RETRY,
+        )
+        .await;
+
+        assert_eq!(result, Err("temporary failure".to_string()));
+        assert_eq!(attempts.recorded(), vec![1]);
+        assert_eq!(time::Instant::now() + Duration::from_secs(2), deadline);
     }
 }
