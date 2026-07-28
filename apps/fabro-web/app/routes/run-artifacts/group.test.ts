@@ -81,24 +81,46 @@ describe("groupArtifactsByFile", () => {
     expect(files[0].versions).toHaveLength(4);
   });
 
-  test("orders versions newest first using stage start time, not stage name", () => {
+  test("orders versions newest first using the API stage order", () => {
+    const stages = [
+      stage("implement_plan", "2026-07-27T20:00:00Z"),
+      stage("simplify", "2026-07-27T18:43:11Z"),
+    ];
     const files = groupArtifactsByFile(
       [
-        artifact("consolidate_reviews", REPORT, 14323),
-        artifact("fix_review_findings", REPORT, 17483),
         artifact("implement_plan", REPORT, 8422),
         artifact("simplify", REPORT, 13162),
       ],
-      STAGES,
+      stages,
     );
 
     expect(files[0].versions.map((v) => v.stageLabel)).toEqual([
-      "fix_review_findings",
-      "consolidate_reviews",
       "simplify",
       "implement_plan",
     ]);
-    expect(files[0].latest.size).toBe(17483);
+    expect(files[0].versions[0].size).toBe(13162);
+  });
+
+  test.each([
+    ["equal", "2026-07-27T18:43:11Z", "2026-07-27T18:43:11Z"],
+    ["missing", null, null],
+  ])("preserves API order when stage timestamps are %s", (_case, firstAt, secondAt) => {
+    const stages = [
+      stage("implement_plan", firstAt),
+      stage("simplify", secondAt),
+    ];
+    const files = groupArtifactsByFile(
+      [
+        artifact("simplify", REPORT, 13162),
+        artifact("implement_plan", REPORT, 8422),
+      ],
+      stages,
+    );
+
+    expect(files[0].versions.map((v) => v.stageLabel)).toEqual([
+      "simplify",
+      "implement_plan",
+    ]);
   });
 
   test("reports the byte change each capture introduced, oldest capture first", () => {
@@ -155,23 +177,8 @@ describe("groupArtifactsByFile", () => {
     );
 
     expect(files[0].versions.map((v) => v.retry)).toEqual([2, 1]);
-    expect(files[0].latest.size).toBe(13162);
+    expect(files[0].versions[0].size).toBe(13162);
     expect(files[0].versions.map((v) => v.delta)).toEqual([4162, null]);
-  });
-
-  test("falls back to a stable order when stages have not loaded yet", () => {
-    const files = groupArtifactsByFile(
-      [
-        artifact("simplify", REPORT, 13162),
-        artifact("implement_plan", REPORT, 8422),
-      ],
-      [],
-    );
-
-    expect(files[0].versions.map((v) => v.stageLabel)).toEqual([
-      "simplify",
-      "implement_plan",
-    ]);
   });
 
   test("returns no files when every capture came from a control node", () => {

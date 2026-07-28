@@ -20,8 +20,7 @@ export interface ArtifactFile {
   /** Directory prefix including the trailing slash, or "" at the root. */
   dir: string;
   name: string;
-  versions: ArtifactVersion[];
-  latest: ArtifactVersion;
+  versions: readonly [ArtifactVersion, ...ArtifactVersion[]];
 }
 
 export function splitArtifactPath(path: string): { dir: string; name: string } {
@@ -36,29 +35,10 @@ interface StageInfo {
   order: number;
 }
 
-/**
- * Chronological position of each stage, keyed by stage ID.
- *
- * Stage IDs are `node@visit`, where `visit` counts visits to that one node — it
- * is not a run-wide ordinal, so it cannot order stages against each other.
- * `startedAt` is the only run-wide clock available here.
- */
+/** Stage display data keyed by ID, preserving the API's event order. */
 function stageInfoById(stages: readonly Stage[]): Map<string, StageInfo> {
-  const chronological = stages
-    .map((stage, index) => ({ stage, index }))
-    .sort((a, b) => {
-      const at = a.stage.startedAt;
-      const bt = b.stage.startedAt;
-      // Stages that have not started yet sort last but keep a stable order.
-      if (at === null && bt === null) return a.index - b.index;
-      if (at === null) return 1;
-      if (bt === null) return -1;
-      const cmp = at.localeCompare(bt);
-      return cmp !== 0 ? cmp : a.index - b.index;
-    });
-
   const info = new Map<string, StageInfo>();
-  chronological.forEach(({ stage }, order) => {
+  stages.forEach((stage, order) => {
     info.set(stage.id, { label: formatStageLabel(stage), order });
   });
   return info;
@@ -77,21 +57,18 @@ export function groupArtifactsByFile(
   stages: readonly Stage[],
 ): ArtifactFile[] {
   const stageInfo = stageInfoById(stages);
-  const byPath = new Map<string, Array<ArtifactVersion & { order: number }>>();
+  const byPath = new Map<string, [ArtifactVersion, ...ArtifactVersion[]]>();
 
   for (const entry of entries) {
     if (!isVisibleStage(entry.node_slug)) continue;
 
-    // Until the stages request resolves there is no clock to order by, so
-    // unresolved stages fall back to a stable sort on stage ID.
     const info = stageInfo.get(entry.stage_id);
-    const version: ArtifactVersion & { order: number } = {
+    const version: ArtifactVersion = {
       stageId: entry.stage_id,
       stageLabel: info?.label ?? entry.node_slug,
       retry: entry.retry,
       size: entry.size,
       delta: null,
-      order: info?.order ?? Number.MAX_SAFE_INTEGER,
     };
     const bucket = byPath.get(entry.relative_path);
     if (bucket) bucket.push(version);
@@ -103,18 +80,21 @@ export function groupArtifactsByFile(
     // Oldest first, so each version's delta is the change that capture introduced.
     versions.sort(
       (a, b) =>
-        a.order - b.order || a.retry - b.retry || a.stageId.localeCompare(b.stageId),
+        (stageInfo.get(a.stageId)?.order ?? -1) -
+          (stageInfo.get(b.stageId)?.order ?? -1) ||
+        a.retry - b.retry ||
+        a.stageId.localeCompare(b.stageId),
     );
     versions.forEach((version, index) => {
       version.delta = index === 0 ? null : version.size - versions[index - 1].size;
     });
 
-    const newestFirst = versions.slice().reverse();
-    const latest = newestFirst[0];
+    versions.reverse();
+    const latest = versions[0];
     const { dir, name } = splitArtifactPath(path);
     files.push({
-      file: { path, dir, name, versions: newestFirst, latest },
-      order: latest.order,
+      file: { path, dir, name, versions },
+      order: stageInfo.get(latest.stageId)?.order ?? -1,
     });
   }
 
