@@ -388,6 +388,9 @@ fn parse_and_validate_human_gate() {
             type="human"
         ]
 
+        ship_it [prompt="Ship the change"]
+        fixes   [prompt="Apply the requested fixes"]
+
         start -> review_gate
         review_gate -> ship_it [label="[A] Approve"]
         review_gate -> fixes   [label="[F] Fix"]
