@@ -7,7 +7,7 @@ use fabro_types::settings::InterpString;
 use fabro_types::settings::cli::{OutputFormat, OutputVerbosity};
 use fabro_types::settings::server::LogDestination;
 
-use crate::{Combine, ModelRefOrSplice, SettingsLayer, StringOrSplice};
+use crate::{Combine, SettingsLayer, StringOrSplice};
 
 fn parse(input: &str) -> SettingsLayer {
     input
@@ -112,18 +112,10 @@ fallbacks = ["anthropic", "..."]
     );
     let merged = higher.combine(lower);
     let fallbacks = merged.run.unwrap().model.unwrap().fallbacks;
-    let rendered = fallbacks
-        .iter()
-        .map(|entry| match entry {
-            ModelRefOrSplice::ModelRef(model_ref) => model_ref.to_string(),
-            ModelRefOrSplice::Splice => "...".to_string(),
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(rendered, vec![
-        "anthropic",
-        "openrouter:moonshotai/kimi-k3",
-        "gpt-terra",
-    ]);
+    assert_eq!(
+        serde_json::to_value(&fallbacks).unwrap(),
+        serde_json::json!(["anthropic", "openrouter:moonshotai/kimi-k3", "gpt-terra",])
+    );
 }
 
 #[test]

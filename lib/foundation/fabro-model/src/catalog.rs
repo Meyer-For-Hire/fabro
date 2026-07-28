@@ -799,14 +799,14 @@ impl Catalog {
                 .then_with(|| left.id.cmp(&right.id))
         });
         warn_multiple_probe_models(&models_with_settings);
+        let (offering_index, provider_selector_index, canonical_candidates, alias_candidates) =
+            build_model_indexes(&models_with_settings);
         let mut model_settings_by_offering = HashMap::new();
         let mut models = Vec::new();
         for (model, settings) in models_with_settings {
             model_settings_by_offering.insert((model.provider.clone(), model.id.clone()), settings);
             models.push(model);
         }
-        let (offering_index, provider_selector_index, canonical_candidates, alias_candidates) =
-            build_model_indexes(&models, &model_settings_by_offering);
 
         Ok(Self {
             models,
@@ -892,19 +892,13 @@ impl Catalog {
     #[must_use]
     pub fn get_on_provider(&self, provider: &ProviderId, selector: &str) -> Option<&Model> {
         let provider = self.provider(provider)?;
-        let exact = self
-            .provider_selector_index
-            .get(&(provider.id.clone(), selector.to_string()));
-        let index = exact.or_else(|| {
-            let normalized = normalize_legacy_builtin_selector(selector);
-            (normalized.as_ref() != selector)
-                .then(|| {
-                    self.provider_selector_index
-                        .get(&(provider.id.clone(), normalized.into_owned()))
-                })
-                .flatten()
-        });
-        index.and_then(|idx| self.models.get(*idx))
+        let lookup = |selector: &str| {
+            self.provider_selector_index
+                .get(&(provider.id.clone(), selector.to_string()))
+        };
+        let index =
+            lookup(selector).or_else(|| lookup(&normalize_legacy_builtin_selector(selector)))?;
+        self.models.get(*index)
     }
 
     /// Look up a canonical offering by its composite identity.
@@ -1489,15 +1483,12 @@ type ModelIndexes = (
     HashMap<String, Vec<usize>>,
 );
 
-fn build_model_indexes(
-    models: &[Model],
-    model_settings: &HashMap<(ProviderId, ModelId), CatalogModelSettings>,
-) -> ModelIndexes {
+fn build_model_indexes(models: &[(Model, CatalogModelSettings)]) -> ModelIndexes {
     let mut offering_index = HashMap::new();
     let mut provider_selector_index = HashMap::new();
     let mut canonical_candidates = HashMap::<ModelId, Vec<usize>>::new();
     let mut alias_candidates = HashMap::<String, Vec<usize>>::new();
-    for (idx, model) in models.iter().enumerate() {
+    for (idx, (model, settings)) in models.iter().enumerate() {
         offering_index.insert((model.provider.clone(), model.id.clone()), idx);
         provider_selector_index
             .insert((model.provider.clone(), model.id.as_str().to_string()), idx);
@@ -1509,9 +1500,6 @@ fn build_model_indexes(
             provider_selector_index.insert((model.provider.clone(), alias.clone()), idx);
             alias_candidates.entry(alias.clone()).or_default().push(idx);
         }
-        let settings = model_settings
-            .get(&(model.provider.clone(), model.id.clone()))
-            .expect("every catalog model should have resolved settings");
         provider_selector_index.insert((model.provider.clone(), settings.api_id.clone()), idx);
     }
     (

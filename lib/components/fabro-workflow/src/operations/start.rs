@@ -1402,8 +1402,11 @@ reasoning = false
         }]);
     }
 
+    /// A qualified fallback resolves to the same offering whether the selector
+    /// is the canonical model ID or the provider's API ID. The trailing bare
+    /// alias still goes through ready-provider priority selection.
     #[test]
-    fn resolve_fallback_chain_supports_openrouter_kimi_then_portable_terra() {
+    fn resolve_fallback_chain_resolves_qualified_model_id_and_api_id_alike() {
         let overrides: fabro_model::catalog::LlmCatalogSettings = toml::from_str(
             r"
 [providers.openrouter]
@@ -1412,76 +1415,44 @@ enabled = true
         )
         .unwrap();
         let catalog = Catalog::from_builtin_with_overrides(&overrides).unwrap();
-        let settings = ResolvedRunModelSettings {
-            fallbacks: vec![
-                "openrouter:kimi-k3".parse::<ModelRef>().unwrap(),
-                "gpt-terra".parse::<ModelRef>().unwrap(),
-            ],
-            ..ResolvedRunModelSettings::default()
-        };
 
-        let chain = resolve_fallback_chain(
-            &catalog,
-            &ProviderId::new("kimi"),
-            "kimi-k3",
-            &settings,
-            &HashSet::from([
-                ProviderId::new("kimi"),
-                ProviderId::new("openrouter"),
-                ProviderId::openai(),
-            ]),
-        )
-        .unwrap();
+        for selector in ["openrouter:kimi-k3", "openrouter:moonshotai/kimi-k3"] {
+            let settings = ResolvedRunModelSettings {
+                fallbacks: vec![
+                    selector.parse::<ModelRef>().unwrap(),
+                    "gpt-terra".parse::<ModelRef>().unwrap(),
+                ],
+                ..ResolvedRunModelSettings::default()
+            };
 
-        assert_eq!(chain, vec![
-            FallbackTarget {
-                provider: "openrouter".to_string(),
-                model:    "kimi-k3".to_string(),
-            },
-            FallbackTarget {
-                provider: "openai".to_string(),
-                model:    "gpt-5.6-terra".to_string(),
-            },
-        ]);
-    }
+            let chain = resolve_fallback_chain(
+                &catalog,
+                &ProviderId::new("kimi"),
+                "kimi-k3",
+                &settings,
+                &HashSet::from([
+                    ProviderId::new("kimi"),
+                    ProviderId::new("openrouter"),
+                    ProviderId::openai(),
+                ]),
+            )
+            .unwrap();
 
-    #[test]
-    fn resolve_fallback_chain_canonicalizes_provider_api_id() {
-        let overrides: fabro_model::catalog::LlmCatalogSettings = toml::from_str(
-            r"
-[providers.openrouter]
-enabled = true
-",
-        )
-        .unwrap();
-        let catalog = Catalog::from_builtin_with_overrides(&overrides).unwrap();
-        let settings = ResolvedRunModelSettings {
-            fallbacks: vec![
-                "openrouter:moonshotai/kimi-k3".parse::<ModelRef>().unwrap(),
-                "gpt-terra".parse::<ModelRef>().unwrap(),
-            ],
-            ..ResolvedRunModelSettings::default()
-        };
-
-        let chain = resolve_fallback_chain(
-            &catalog,
-            &ProviderId::new("kimi"),
-            "kimi-k3",
-            &settings,
-            &HashSet::from([ProviderId::new("kimi"), ProviderId::new("openrouter")]),
-        )
-        .unwrap();
-
-        assert_eq!(chain, vec![
-            FallbackTarget {
-                provider: "openrouter".to_string(),
-                model:    "kimi-k3".to_string(),
-            },
-            FallbackTarget {
-                provider: "openrouter".to_string(),
-                model:    "gpt-5.6-terra".to_string(),
-            },
-        ]);
+            assert_eq!(
+                chain,
+                vec![
+                    FallbackTarget {
+                        provider: "openrouter".to_string(),
+                        model:    "kimi-k3".to_string(),
+                    },
+                    FallbackTarget {
+                        provider: "openai".to_string(),
+                        model:    "gpt-5.6-terra".to_string(),
+                    },
+                ],
+                "{selector}"
+            );
+        }
     }
 
     #[test]

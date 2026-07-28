@@ -48,7 +48,7 @@ impl fmt::Display for ParseModelRefError {
             Self::TooManySlashes { input } => {
                 write!(
                     f,
-                    "model reference {input:?}: legacy provider/model references allow one \"/\"; use \"provider:selector\" when the selector contains \"/\""
+                    "model reference {input:?}: qualify it as \"provider:selector\" when the selector contains \"/\""
                 )
             }
             Self::EmptySide { input } => {
@@ -72,37 +72,31 @@ impl FromStr for ModelRef {
             return Err(ParseModelRefError::Empty);
         }
 
-        if let Some((provider, selector)) = trimmed.split_once(':') {
-            if provider.is_empty() || selector.is_empty() {
-                return Err(ParseModelRefError::EmptySide {
-                    input: input.to_owned(),
-                });
-            }
-            return Ok(Self::Qualified {
-                provider: provider.to_owned(),
-                selector: selector.to_owned(),
+        // A `:` splits provider from selector. The selector keeps any further
+        // `:` or `/`, so provider API IDs survive intact. Without a `:`, a
+        // single `/` is the legacy qualified form.
+        let (provider, selector) = match trimmed.split_once(':') {
+            Some(qualified) => qualified,
+            None => match trimmed.split_once('/') {
+                Some((_, selector)) if selector.contains('/') => {
+                    return Err(ParseModelRefError::TooManySlashes {
+                        input: input.to_owned(),
+                    });
+                }
+                Some(legacy) => legacy,
+                None => return Ok(Self::Bare(trimmed.to_owned())),
+            },
+        };
+
+        if provider.is_empty() || selector.is_empty() {
+            return Err(ParseModelRefError::EmptySide {
+                input: input.to_owned(),
             });
         }
-
-        let parts: Vec<&str> = trimmed.split('/').collect();
-        match parts.as_slice() {
-            [bare] => Ok(Self::Bare((*bare).to_owned())),
-            [provider, selector] => {
-                if provider.is_empty() || selector.is_empty() {
-                    Err(ParseModelRefError::EmptySide {
-                        input: input.to_owned(),
-                    })
-                } else {
-                    Ok(Self::Qualified {
-                        provider: (*provider).to_owned(),
-                        selector: (*selector).to_owned(),
-                    })
-                }
-            }
-            _ => Err(ParseModelRefError::TooManySlashes {
-                input: input.to_owned(),
-            }),
-        }
+        Ok(Self::Qualified {
+            provider: provider.to_owned(),
+            selector: selector.to_owned(),
+        })
     }
 }
 
@@ -302,7 +296,7 @@ mod tests {
         assert!(matches!(err, ParseModelRefError::TooManySlashes { .. }));
         assert_eq!(
             err.to_string(),
-            r#"model reference "a/b/c": legacy provider/model references allow one "/"; use "provider:selector" when the selector contains "/""#
+            r#"model reference "a/b/c": qualify it as "provider:selector" when the selector contains "/""#
         );
     }
 
