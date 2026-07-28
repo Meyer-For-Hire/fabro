@@ -7,7 +7,7 @@ use fabro_types::settings::InterpString;
 use fabro_types::settings::cli::{OutputFormat, OutputVerbosity};
 use fabro_types::settings::server::LogDestination;
 
-use crate::{Combine, SettingsLayer, StringOrSplice};
+use crate::{Combine, ModelRefOrSplice, SettingsLayer, StringOrSplice};
 
 fn parse(input: &str) -> SettingsLayer {
     input
@@ -101,7 +101,7 @@ fn run_model_fallbacks_splice_inserts_inherited() {
     let lower = parse(
         r#"
 [run.model]
-fallbacks = ["openai", "gpt-5.4"]
+fallbacks = ["openrouter:moonshotai/kimi-k3", "gpt-terra"]
 "#,
     );
     let higher = parse(
@@ -112,7 +112,18 @@ fallbacks = ["anthropic", "..."]
     );
     let merged = higher.combine(lower);
     let fallbacks = merged.run.unwrap().model.unwrap().fallbacks;
-    assert_eq!(fallbacks.len(), 3);
+    let rendered = fallbacks
+        .iter()
+        .map(|entry| match entry {
+            ModelRefOrSplice::ModelRef(model_ref) => model_ref.to_string(),
+            ModelRefOrSplice::Splice => "...".to_string(),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rendered, vec![
+        "anthropic",
+        "openrouter:moonshotai/kimi-k3",
+        "gpt-terra",
+    ]);
 }
 
 #[test]

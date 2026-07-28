@@ -670,14 +670,14 @@ fn resolve_fallback_chain(
             }
             ResolvedModelRef::Model {
                 provider: fallback_provider,
-                model,
+                selector,
             } => {
                 if let Some(provider) = fallback_provider {
                     let provider = canonical_provider_id(catalog, &provider);
                     if !eligible.contains(&provider) {
                         return Err(ModelSelectionError::ProviderUnavailable { provider }.into());
                     }
-                    match catalog.resolve_on_provider(&provider, &model) {
+                    match catalog.resolve_on_provider(&provider, &selector) {
                         Ok(info) => chain.push(FallbackTarget {
                             provider: info.provider.to_string(),
                             model:    info.id.to_string(),
@@ -685,13 +685,13 @@ fn resolve_fallback_chain(
                         Err(ModelSelectionError::UnknownSelectorOnProvider { .. }) => {
                             chain.push(FallbackTarget {
                                 provider: provider.to_string(),
-                                model,
+                                model:    selector,
                             });
                         }
                         Err(error) => return Err(error.into()),
                     }
                 } else {
-                    match catalog.select(&model, None, eligible) {
+                    match catalog.select(&selector, None, eligible) {
                         Ok(info) => chain.push(FallbackTarget {
                             provider: info.provider.to_string(),
                             model:    info.id.to_string(),
@@ -699,7 +699,7 @@ fn resolve_fallback_chain(
                         Err(ModelSelectionError::UnknownSelector { .. }) => {
                             chain.push(FallbackTarget {
                                 provider: provider.to_string(),
-                                model,
+                                model:    selector,
                             });
                         }
                         Err(error) => return Err(error.into()),
@@ -1337,7 +1337,7 @@ reasoning = false
     fn resolve_fallback_chain_resolves_explicit_model_fallbacks() {
         let catalog = test_catalog();
         let settings = ResolvedRunModelSettings {
-            fallbacks: vec!["openai/gpt-5.4-mini".parse::<ModelRef>().unwrap()],
+            fallbacks: vec!["openai:gpt-5.4-mini".parse::<ModelRef>().unwrap()],
             ..ResolvedRunModelSettings::default()
         };
 
@@ -1383,7 +1383,7 @@ reasoning = false
     fn resolve_fallback_chain_resolves_provider_qualified_shared_alias() {
         let catalog = portable_model_catalog();
         let settings = ResolvedRunModelSettings {
-            fallbacks: vec!["openrouter/gpt-56-sol".parse::<ModelRef>().unwrap()],
+            fallbacks: vec!["openrouter:gpt-56-sol".parse::<ModelRef>().unwrap()],
             ..ResolvedRunModelSettings::default()
         };
 
@@ -1400,6 +1400,88 @@ reasoning = false
             provider: "openrouter".to_string(),
             model:    "gpt-5.6-sol".to_string(),
         }]);
+    }
+
+    #[test]
+    fn resolve_fallback_chain_supports_openrouter_kimi_then_portable_terra() {
+        let overrides: fabro_model::catalog::LlmCatalogSettings = toml::from_str(
+            r"
+[providers.openrouter]
+enabled = true
+",
+        )
+        .unwrap();
+        let catalog = Catalog::from_builtin_with_overrides(&overrides).unwrap();
+        let settings = ResolvedRunModelSettings {
+            fallbacks: vec![
+                "openrouter:kimi-k3".parse::<ModelRef>().unwrap(),
+                "gpt-terra".parse::<ModelRef>().unwrap(),
+            ],
+            ..ResolvedRunModelSettings::default()
+        };
+
+        let chain = resolve_fallback_chain(
+            &catalog,
+            &ProviderId::new("kimi"),
+            "kimi-k3",
+            &settings,
+            &HashSet::from([
+                ProviderId::new("kimi"),
+                ProviderId::new("openrouter"),
+                ProviderId::openai(),
+            ]),
+        )
+        .unwrap();
+
+        assert_eq!(chain, vec![
+            FallbackTarget {
+                provider: "openrouter".to_string(),
+                model:    "kimi-k3".to_string(),
+            },
+            FallbackTarget {
+                provider: "openai".to_string(),
+                model:    "gpt-5.6-terra".to_string(),
+            },
+        ]);
+    }
+
+    #[test]
+    fn resolve_fallback_chain_canonicalizes_provider_api_id() {
+        let overrides: fabro_model::catalog::LlmCatalogSettings = toml::from_str(
+            r"
+[providers.openrouter]
+enabled = true
+",
+        )
+        .unwrap();
+        let catalog = Catalog::from_builtin_with_overrides(&overrides).unwrap();
+        let settings = ResolvedRunModelSettings {
+            fallbacks: vec![
+                "openrouter:moonshotai/kimi-k3".parse::<ModelRef>().unwrap(),
+                "gpt-terra".parse::<ModelRef>().unwrap(),
+            ],
+            ..ResolvedRunModelSettings::default()
+        };
+
+        let chain = resolve_fallback_chain(
+            &catalog,
+            &ProviderId::new("kimi"),
+            "kimi-k3",
+            &settings,
+            &HashSet::from([ProviderId::new("kimi"), ProviderId::new("openrouter")]),
+        )
+        .unwrap();
+
+        assert_eq!(chain, vec![
+            FallbackTarget {
+                provider: "openrouter".to_string(),
+                model:    "kimi-k3".to_string(),
+            },
+            FallbackTarget {
+                provider: "openrouter".to_string(),
+                model:    "gpt-5.6-terra".to_string(),
+            },
+        ]);
     }
 
     #[test]

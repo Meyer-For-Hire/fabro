@@ -747,6 +747,12 @@ impl Catalog {
                         &model.provider,
                     )?;
                 }
+                register_model_identifier(
+                    identifiers,
+                    resolved_settings.api_id.clone(),
+                    model.id.clone(),
+                    &model.provider,
+                )?;
 
                 if model.default {
                     defaults_by_provider
@@ -800,7 +806,7 @@ impl Catalog {
             models.push(model);
         }
         let (offering_index, provider_selector_index, canonical_candidates, alias_candidates) =
-            build_model_indexes(&models);
+            build_model_indexes(&models, &model_settings_by_offering);
 
         Ok(Self {
             models,
@@ -879,16 +885,26 @@ impl Catalog {
             .and_then(|idx| self.models.get(*idx))
     }
 
-    /// Look up a selector on exactly one provider, without considering
-    /// provider availability. Historical built-in API identifiers normalize
-    /// to their canonical model slug before lookup.
+    /// Look up a canonical ID, alias, or API ID on exactly one provider,
+    /// without considering provider availability. Exact provider-scoped
+    /// identifiers win before historical built-in API identifiers normalize
+    /// to their canonical model slug.
     #[must_use]
     pub fn get_on_provider(&self, provider: &ProviderId, selector: &str) -> Option<&Model> {
         let provider = self.provider(provider)?;
-        let selector = normalize_legacy_builtin_selector(selector);
-        self.provider_selector_index
-            .get(&(provider.id.clone(), selector.into_owned()))
-            .and_then(|idx| self.models.get(*idx))
+        let exact = self
+            .provider_selector_index
+            .get(&(provider.id.clone(), selector.to_string()));
+        let index = exact.or_else(|| {
+            let normalized = normalize_legacy_builtin_selector(selector);
+            (normalized.as_ref() != selector)
+                .then(|| {
+                    self.provider_selector_index
+                        .get(&(provider.id.clone(), normalized.into_owned()))
+                })
+                .flatten()
+        });
+        index.and_then(|idx| self.models.get(*idx))
     }
 
     /// Look up a canonical offering by its composite identity.
@@ -900,7 +916,7 @@ impl Catalog {
             .and_then(|idx| self.models.get(*idx))
     }
 
-    /// Resolve a selector on exactly one provider.
+    /// Resolve a canonical ID, alias, or API ID on exactly one provider.
     pub fn resolve_on_provider(
         &self,
         provider: &ProviderId,
@@ -926,8 +942,9 @@ impl Catalog {
     /// Historical built-in API identifiers normalize to their canonical model
     /// slug before selection.
     ///
-    /// An explicit provider is a pin. Unqualified selection checks canonical
-    /// IDs before aliases and uses the catalog's provider priority ordering.
+    /// An explicit provider is a pin and also permits that provider's API IDs.
+    /// Unqualified selection checks canonical IDs before aliases and uses the
+    /// catalog's provider priority ordering.
     pub fn select<'a>(
         &'a self,
         selector: &str,
@@ -1472,7 +1489,10 @@ type ModelIndexes = (
     HashMap<String, Vec<usize>>,
 );
 
-fn build_model_indexes(models: &[Model]) -> ModelIndexes {
+fn build_model_indexes(
+    models: &[Model],
+    model_settings: &HashMap<(ProviderId, ModelId), CatalogModelSettings>,
+) -> ModelIndexes {
     let mut offering_index = HashMap::new();
     let mut provider_selector_index = HashMap::new();
     let mut canonical_candidates = HashMap::<ModelId, Vec<usize>>::new();
@@ -1489,6 +1509,10 @@ fn build_model_indexes(models: &[Model]) -> ModelIndexes {
             provider_selector_index.insert((model.provider.clone(), alias.clone()), idx);
             alias_candidates.entry(alias.clone()).or_default().push(idx);
         }
+        let settings = model_settings
+            .get(&(model.provider.clone(), model.id.clone()))
+            .expect("every catalog model should have resolved settings");
+        provider_selector_index.insert((model.provider.clone(), settings.api_id.clone()), idx);
     }
     (
         offering_index,
@@ -4289,6 +4313,109 @@ reasoning = false
                 second,
             } if provider == ProviderId::new("test")
                 && selector == "shared"
+                && first == "one"
+                && second == "two"
+        ));
+    }
+
+    #[test]
+    fn provider_scoped_lookup_accepts_canonical_alias_and_api_id_selectors() {
+        let catalog = Catalog::from_settings(&minimal_settings(
+            r#"
+[providers.test]
+display_name = "Test"
+adapter = "openai"
+agent_profile = "openai"
+aliases = ["test-alias"]
+
+[providers.test.models.one]
+api_id = "vendor/models/one:latest"
+display_name = "One"
+family = "test"
+aliases = ["one-alias"]
+default = true
+
+[providers.test.models.one.limits]
+context_window = 1000
+
+[providers.test.models.one.features]
+tools = false
+vision = false
+reasoning = false
+"#,
+        ))
+        .expect("provider-scoped selector fixture should build");
+
+        for selector in ["one", "one-alias", "vendor/models/one:latest"] {
+            let model = catalog
+                .resolve_on_provider(&ProviderId::new("test-alias"), selector)
+                .unwrap_or_else(|error| {
+                    panic!("selector '{selector}' should resolve on provider alias: {error}")
+                });
+            assert_eq!(model.provider, ProviderId::new("test"), "{selector}");
+            assert_eq!(model.id, "one", "{selector}");
+        }
+
+        assert!(matches!(
+            catalog.select(
+                "vendor/models/one:latest",
+                None,
+                &HashSet::from([ProviderId::new("test")]),
+            ),
+            Err(ModelSelectionError::UnknownSelector { selector })
+                if selector == "vendor/models/one:latest"
+        ));
+    }
+
+    #[test]
+    fn catalog_from_settings_rejects_duplicate_provider_api_ids() {
+        let layer = minimal_settings(
+            r#"
+[providers.test]
+display_name = "Test"
+adapter = "openai"
+agent_profile = "openai"
+
+[providers.test.models.one]
+api_id = "vendor/shared"
+display_name = "One"
+family = "test"
+default = true
+
+[providers.test.models.one.limits]
+context_window = 1000
+
+[providers.test.models.one.features]
+tools = false
+vision = false
+reasoning = false
+
+[providers.test.models.two]
+api_id = "vendor/shared"
+display_name = "Two"
+family = "test"
+
+[providers.test.models.two.limits]
+context_window = 1000
+
+[providers.test.models.two.features]
+tools = false
+vision = false
+reasoning = false
+"#,
+        );
+
+        let err = Catalog::from_settings(&layer).unwrap_err();
+
+        assert!(matches!(
+            err,
+            CatalogBuildError::DuplicateProviderModelSelector {
+                provider,
+                selector,
+                first,
+                second,
+            } if provider == ProviderId::new("test")
+                && selector == "vendor/shared"
                 && first == "one"
                 && second == "two"
         ));

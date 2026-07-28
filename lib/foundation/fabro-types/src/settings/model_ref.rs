@@ -4,8 +4,11 @@
 //!
 //! - a bare token such as `openai` or `gpt-5.4` — the parser cannot tell alone
 //!   whether the token is a provider name or a model alias
-//! - a qualified reference such as `gemini/gemini-flash`, which names both a
-//!   provider and a model
+//! - a qualified reference such as `gemini:gemini-flash`, which names both a
+//!   provider and a model selector
+//! - a legacy qualified reference such as `gemini/gemini-flash`, which is
+//!   accepted on input and serialized using the canonical `provider:selector`
+//!   form
 //!
 //! The parser produces [`ModelRef`]; ambiguity resolution against a known
 //! registry of providers and models happens at consumption time via
@@ -23,8 +26,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 pub enum ModelRef {
     /// A bare token. May be a provider name, a model alias, or a model id.
     Bare(String),
-    /// A provider-qualified model reference.
-    Qualified { provider: String, model: String },
+    /// A provider-qualified model selector.
+    Qualified { provider: String, selector: String },
 }
 
 /// An error returned when parsing a model reference fails.
@@ -32,10 +35,9 @@ pub enum ModelRef {
 pub enum ParseModelRefError {
     /// The input was empty or whitespace only.
     Empty,
-    /// The input contained more than one `/`, which is not a valid qualified
-    /// ref.
+    /// A legacy slash-qualified input contained more than one `/`.
     TooManySlashes { input: String },
-    /// The provider or model side of a qualified reference was empty.
+    /// The provider or selector side of a qualified reference was empty.
     EmptySide { input: String },
 }
 
@@ -46,13 +48,13 @@ impl fmt::Display for ParseModelRefError {
             Self::TooManySlashes { input } => {
                 write!(
                     f,
-                    "model reference {input:?}: expected at most one \"/\" separator between provider and model"
+                    "model reference {input:?}: legacy provider/model references allow one \"/\"; use \"provider:selector\" when the selector contains \"/\""
                 )
             }
             Self::EmptySide { input } => {
                 write!(
                     f,
-                    "model reference {input:?}: provider and model sides must both be non-empty"
+                    "model reference {input:?}: provider and selector sides must both be non-empty"
                 )
             }
         }
@@ -70,18 +72,30 @@ impl FromStr for ModelRef {
             return Err(ParseModelRefError::Empty);
         }
 
+        if let Some((provider, selector)) = trimmed.split_once(':') {
+            if provider.is_empty() || selector.is_empty() {
+                return Err(ParseModelRefError::EmptySide {
+                    input: input.to_owned(),
+                });
+            }
+            return Ok(Self::Qualified {
+                provider: provider.to_owned(),
+                selector: selector.to_owned(),
+            });
+        }
+
         let parts: Vec<&str> = trimmed.split('/').collect();
         match parts.as_slice() {
             [bare] => Ok(Self::Bare((*bare).to_owned())),
-            [provider, model] => {
-                if provider.is_empty() || model.is_empty() {
+            [provider, selector] => {
+                if provider.is_empty() || selector.is_empty() {
                     Err(ParseModelRefError::EmptySide {
                         input: input.to_owned(),
                     })
                 } else {
                     Ok(Self::Qualified {
                         provider: (*provider).to_owned(),
-                        model:    (*model).to_owned(),
+                        selector: (*selector).to_owned(),
                     })
                 }
             }
@@ -96,7 +110,7 @@ impl fmt::Display for ModelRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Bare(token) => f.write_str(token),
-            Self::Qualified { provider, model } => write!(f, "{provider}/{model}"),
+            Self::Qualified { provider, selector } => write!(f, "{provider}:{selector}"),
         }
     }
 }
@@ -113,7 +127,7 @@ impl fmt::Display for AmbiguousModelRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "model reference {:?} is ambiguous: matches provider names {:?} and model names {:?}; qualify it as \"provider/model\"",
+            "model reference {:?} is ambiguous: matches provider names {:?} and model names {:?}; qualify it as \"provider:model\"",
             self.input, self.providers, self.models
         )
     }
@@ -130,7 +144,7 @@ pub enum ResolvedModelRef {
     /// The reference named a model (qualified or unambiguously bare).
     Model {
         provider: Option<String>,
-        model:    String,
+        selector: String,
     },
 }
 
@@ -157,9 +171,9 @@ impl ModelRef {
         registry: &dyn ModelRegistry,
     ) -> Result<ResolvedModelRef, AmbiguousModelRef> {
         match self {
-            Self::Qualified { provider, model } => Ok(ResolvedModelRef::Model {
+            Self::Qualified { provider, selector } => Ok(ResolvedModelRef::Model {
                 provider: Some(provider.clone()),
-                model:    model.clone(),
+                selector: selector.clone(),
             }),
             Self::Bare(token) => {
                 let is_provider = registry.is_provider(token);
@@ -174,7 +188,7 @@ impl ModelRef {
                     // Known and unknown bare models leave provider selection to the runtime.
                     (false, _) => Ok(ResolvedModelRef::Model {
                         provider: None,
-                        model:    token.clone(),
+                        selector: token.clone(),
                     }),
                 }
             }
@@ -197,7 +211,7 @@ impl<'de> Deserialize<'de> for ModelRef {
 
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_str(
-                    r#"a model reference such as "openai", "gpt-5.4", or "gemini/gemini-flash""#,
+                    r#"a model reference such as "openai", "gpt-5.4", or "gemini:gemini-flash""#,
                 )
             }
 
@@ -241,12 +255,43 @@ mod tests {
     }
 
     #[test]
-    fn parses_qualified() {
+    fn parses_colon_qualified() {
+        assert_eq!(
+            "gemini:gemini-flash".parse::<ModelRef>().unwrap(),
+            ModelRef::Qualified {
+                provider: "gemini".into(),
+                selector: "gemini-flash".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_legacy_slash_qualified() {
         assert_eq!(
             "gemini/gemini-flash".parse::<ModelRef>().unwrap(),
             ModelRef::Qualified {
                 provider: "gemini".into(),
-                model:    "gemini-flash".into(),
+                selector: "gemini-flash".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn colon_qualified_selector_may_contain_slashes_and_colons() {
+        assert_eq!(
+            "openrouter:moonshotai/kimi-k3".parse::<ModelRef>().unwrap(),
+            ModelRef::Qualified {
+                provider: "openrouter".into(),
+                selector: "moonshotai/kimi-k3".into(),
+            }
+        );
+        assert_eq!(
+            "bedrock:us.anthropic.claude-haiku-4-5-20251001-v1:0"
+                .parse::<ModelRef>()
+                .unwrap(),
+            ModelRef::Qualified {
+                provider: "bedrock".into(),
+                selector: "us.anthropic.claude-haiku-4-5-20251001-v1:0".into(),
             }
         );
     }
@@ -255,6 +300,10 @@ mod tests {
     fn rejects_too_many_slashes() {
         let err = "a/b/c".parse::<ModelRef>().unwrap_err();
         assert!(matches!(err, ParseModelRefError::TooManySlashes { .. }));
+        assert_eq!(
+            err.to_string(),
+            r#"model reference "a/b/c": legacy provider/model references allow one "/"; use "provider:selector" when the selector contains "/""#
+        );
     }
 
     #[test]
@@ -265,6 +314,14 @@ mod tests {
         ));
         assert!(matches!(
             "foo/".parse::<ModelRef>().unwrap_err(),
+            ParseModelRefError::EmptySide { .. }
+        ));
+        assert!(matches!(
+            ":foo".parse::<ModelRef>().unwrap_err(),
+            ParseModelRefError::EmptySide { .. }
+        ));
+        assert!(matches!(
+            "foo:".parse::<ModelRef>().unwrap_err(),
             ParseModelRefError::EmptySide { .. }
         ));
     }
@@ -296,7 +353,7 @@ mod tests {
         let resolved = ModelRef::Bare("gpt-5.4".into()).resolve(&reg).unwrap();
         assert_eq!(resolved, ResolvedModelRef::Model {
             provider: None,
-            model:    "gpt-5.4".into(),
+            selector: "gpt-5.4".into(),
         });
     }
 
@@ -320,22 +377,33 @@ mod tests {
         };
         let resolved = ModelRef::Qualified {
             provider: "a".into(),
-            model:    "b".into(),
+            selector: "b".into(),
         }
         .resolve(&reg)
         .unwrap();
         assert_eq!(resolved, ResolvedModelRef::Model {
             provider: Some("a".into()),
-            model:    "b".into(),
+            selector: "b".into(),
         });
     }
 
     #[test]
     fn display_round_trip() {
-        for input in ["openai", "gpt-5.4", "gemini/gemini-flash"] {
+        for input in [
+            "openai",
+            "gpt-5.4",
+            "gemini:gemini-flash",
+            "openrouter:moonshotai/kimi-k3",
+        ] {
             let parsed: ModelRef = input.parse().unwrap();
             assert_eq!(parsed.to_string(), input);
         }
+    }
+
+    #[test]
+    fn display_canonicalizes_legacy_slash_separator() {
+        let parsed: ModelRef = "gemini/gemini-flash".parse().unwrap();
+        assert_eq!(parsed.to_string(), "gemini:gemini-flash");
     }
 
     #[test]
@@ -345,12 +413,12 @@ mod tests {
             m: ModelRef,
         }
 
-        let input = r#"{"m":"gemini/gemini-flash"}"#;
+        let input = r#"{"m":"openrouter:moonshotai/kimi-k3"}"#;
         let parsed: Wrap = serde_json::from_str(input).unwrap();
         assert!(matches!(
             parsed.m,
-            ModelRef::Qualified { ref provider, ref model }
-                if provider == "gemini" && model == "gemini-flash"
+            ModelRef::Qualified { ref provider, ref selector }
+                if provider == "openrouter" && selector == "moonshotai/kimi-k3"
         ));
         let rendered = serde_json::to_string(&parsed).unwrap();
         assert_eq!(rendered, input);

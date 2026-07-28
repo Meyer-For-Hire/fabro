@@ -277,7 +277,7 @@ Then launch with:
 fabro run run.toml
 ```
 
-The `fallbacks` array is optional. Each entry may be a bare provider token (like `"gemini"`), a bare model alias (like `"gpt-5.4"`), or a qualified `"provider/model"` reference. Fabro tries them in order when the primary provider is unavailable. In this field, qualified references keep their established provider-pin meaning: `"openai/gpt-5.6-sol"` selects the direct OpenAI offering.
+The `fallbacks` array is optional. Each entry may be a bare provider token (like `"gemini"`), a bare model ID or alias (like `"gpt-terra"`), or a qualified `"provider:selector"` reference. A qualified selector may be the provider's canonical model ID, alias, or API ID, including API IDs with slashes such as `"openrouter:moonshotai/kimi-k3"`. Fabro tries entries in order when the primary provider is unavailable, and qualified references remain provider pins. Legacy `provider/model` references remain accepted for compatibility.
 
 <Note>
 The precedence order is: node-level stylesheet > run config TOML > CLI flags > server defaults. More specific settings always win.

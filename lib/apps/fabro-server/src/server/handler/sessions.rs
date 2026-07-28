@@ -858,8 +858,8 @@ fn canonical_session_model(
     let model_ref = requested
         .parse::<SettingsModelRef>()
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
-    let (qualified_provider, model) = match model_ref {
-        SettingsModelRef::Qualified { provider, model } => {
+    let (qualified_provider, selector) = match model_ref {
+        SettingsModelRef::Qualified { provider, selector } => {
             let requested_provider = ProviderId::new(provider);
             let provider = catalog
                 .provider(&requested_provider)
@@ -877,28 +877,30 @@ fn canonical_session_model(
                     )));
                 }
             }
-            (Some(provider), model)
+            (Some(provider), selector)
         }
-        SettingsModelRef::Bare(model) => {
-            if explicit_provider.is_none() && catalog.provider(&ProviderId::new(&model)).is_some() {
-                let detail = if catalog.is_model_selector(&model) {
+        SettingsModelRef::Bare(selector) => {
+            if explicit_provider.is_none()
+                && catalog.provider(&ProviderId::new(&selector)).is_some()
+            {
+                let detail = if catalog.is_model_selector(&selector) {
                     format!(
-                        "Session model reference '{model}' is ambiguous between a provider and a \
-                         model selector; supply `provider` or use `provider/model`."
+                        "Session model reference '{selector}' is ambiguous between a provider and \
+                         a model selector; supply `provider` or use `provider:model`."
                     )
                 } else {
                     format!(
-                        "Session model reference '{model}' names a provider; include a model ID."
+                        "Session model reference '{selector}' names a provider; include a model ID."
                     )
                 };
                 return Err(ApiError::bad_request(detail));
             }
-            (None, model)
+            (None, selector)
         }
     };
     let provider = qualified_provider.as_ref().or(explicit_provider.as_ref());
     let selected = catalog
-        .resolve_selection(Some(&model), provider, eligible)
+        .resolve_selection(Some(&selector), provider, eligible)
         .map_err(|error| session_selection_error(&error))?;
     Ok((selected.provider, selected.model))
 }
@@ -1599,7 +1601,12 @@ reasoning = false
             (openrouter.clone(), "gpt-5.6-sol".to_string())
         );
         assert_eq!(
-            canonical_session_model(&catalog, &both, Some("openrouter/gpt-56-sol"), None,).unwrap(),
+            canonical_session_model(&catalog, &both, Some("openrouter:gpt-56-sol"), None,).unwrap(),
+            (openrouter.clone(), "gpt-5.6-sol".to_string())
+        );
+        assert_eq!(
+            canonical_session_model(&catalog, &both, Some("openrouter:openai/gpt-5.6-sol"), None,)
+                .unwrap(),
             (openrouter, "gpt-5.6-sol".to_string())
         );
     }
@@ -1670,7 +1677,7 @@ reasoning = false
     }
 
     #[test]
-    fn canonical_session_model_still_treats_non_legacy_qualified_model_as_a_pin() {
+    fn canonical_session_model_treats_colon_qualified_model_as_a_pin() {
         let catalog = portable_session_catalog();
         let openrouter = ProviderId::new("openrouter");
 
@@ -1678,7 +1685,7 @@ reasoning = false
             canonical_session_model(
                 &catalog,
                 &catalog.all_provider_ids(),
-                Some("openrouter/gpt-56-sol"),
+                Some("openrouter:gpt-56-sol"),
                 None,
             )
             .unwrap(),
@@ -1692,7 +1699,7 @@ reasoning = false
         let error = canonical_session_model(
             &catalog,
             &catalog.all_provider_ids(),
-            Some("openrouter/gpt-56-sol"),
+            Some("openrouter:gpt-56-sol"),
             Some(&ProviderId::openai()),
         )
         .unwrap_err();

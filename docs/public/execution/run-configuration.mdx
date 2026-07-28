@@ -140,9 +140,21 @@ name = "claude-sonnet-4-5"
 |---|---|
 | `name` | Canonical model slug or alias (e.g. `claude-sonnet-4-5`, `opus`, `gemini-pro`). See [Models](/core-concepts/models). |
 | `provider` | Optional provider pin. When omitted, Fabro selects among ready offerings by provider priority. When present, an unavailable provider is an error rather than permission to switch. |
-| `fallbacks` | Ordered list of model references to try when the primary is unavailable. Entries can be bare provider tokens (`"openai"`), bare model aliases, or qualified `"provider/model"` references. |
+| `fallbacks` | Ordered list of model references to try when the primary is unavailable. Entries can be bare provider tokens (`"openai"`), bare model IDs or aliases, or qualified `"provider:selector"` references. |
 
 Provider values are catalog provider ID strings. Built-in IDs like `anthropic` and `openai` work, and settings-defined IDs like `proxy` work after they are added under `[llm.providers.<id>]`.
+
+For a qualified fallback, the selector may be that provider's canonical model ID, alias, or API ID. Fabro splits on the first `:`, so provider API IDs may contain `/` or additional colons:
+
+```toml title="run.toml"
+[run.model]
+fallbacks = [
+  "openrouter:kimi-k3",
+  "gpt-terra",
+]
+```
+
+The first entry could equivalently be written as `"openrouter:moonshotai/kimi-k3"` using OpenRouter's API ID; both forms resolve to its canonical `kimi-k3` offering. The unqualified `gpt-terra` alias uses normal ready-provider priority selection. Legacy `provider/model` fallback references remain accepted but are normalized to `provider:model`.
 
 At run creation, Fabro resolves the primary selector and every node selector against the ready-provider snapshot. It persists the selected canonical model slug and provider, so resuming the run does not choose a different provider just because credentials or priorities changed. The configured fallback chain remains available for failures that occur while the materialized run is executing.
 

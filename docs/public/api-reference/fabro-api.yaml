@@ -7941,8 +7941,11 @@ components:
         model:
           type: string
           description: |
-            Catalog model ID or alias. The server selects among ready
-            providers and stores the canonical model ID.
+            Catalog model ID or alias, optionally qualified as
+            `provider:selector`. A provider-qualified selector may be a
+            canonical model ID, alias, or provider API ID. Legacy
+            `provider/model` references remain accepted. The server stores the
+            canonical model ID.
         provider:
           $ref: "#/components/schemas/ProviderId"
           description: Optional provider pin. Provider-qualified model references remain accepted for compatibility.
@@ -14119,6 +14122,13 @@ components:
 
     ModelRef:
       type: string
+      description: |
+        A fallback model reference. Bare values name a provider, canonical
+        model ID, or alias. Provider-qualified values use
+        `provider:selector`; the selector may be a canonical model ID, alias,
+        or provider API ID and may contain `/` or additional colons. Legacy
+        `provider/model` references remain accepted.
+      example: openrouter:moonshotai/kimi-k3
 
     RunModelSettings:
       type: object
