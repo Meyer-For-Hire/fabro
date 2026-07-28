@@ -253,16 +253,28 @@ pub(crate) fn make_agent_tool(
     }
 }
 
-fn required_bool(args: &Value, key: &str) -> Result<bool, String> {
-    args.get(key)
-        .and_then(Value::as_bool)
-        .ok_or_else(|| format!("Missing required boolean parameter: {key}"))
+/// The schema keeps `block` and `timeout` required to match the Claude 5
+/// contract, so these defaults only cover a model that omits them anyway.
+const TASK_OUTPUT_DEFAULT_BLOCK: bool = true;
+const TASK_OUTPUT_DEFAULT_TIMEOUT_MS: u64 = 30_000;
+const TASK_OUTPUT_MAX_TIMEOUT_MS: u64 = 600_000;
+
+fn optional_bool(args: &Value, key: &str, default: bool) -> Result<bool, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| format!("{key} must be a boolean")),
+    }
 }
 
-fn required_u64(args: &Value, key: &str) -> Result<u64, String> {
-    args.get(key)
-        .and_then(Value::as_u64)
-        .ok_or_else(|| format!("Missing required non-negative integer parameter: {key}"))
+fn optional_u64(args: &Value, key: &str, default: u64) -> Result<u64, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| format!("{key} must be a non-negative integer")),
+    }
 }
 
 fn finished_output(
@@ -293,14 +305,14 @@ pub(crate) fn make_task_output_tool(supervisor: SubAgentSupervisor) -> Registere
                     },
                     "block": {
                         "type": "boolean",
-                        "default": true,
+                        "default": TASK_OUTPUT_DEFAULT_BLOCK,
                         "description": "Whether to wait for completion."
                     },
                     "timeout": {
                         "type": "integer",
                         "minimum": 0,
-                        "maximum": 600_000,
-                        "default": 30000,
+                        "maximum": TASK_OUTPUT_MAX_TIMEOUT_MS,
+                        "default": TASK_OUTPUT_DEFAULT_TIMEOUT_MS,
                         "description": "Maximum wait time in milliseconds."
                     }
                 },
@@ -312,10 +324,12 @@ pub(crate) fn make_task_output_tool(supervisor: SubAgentSupervisor) -> Registere
             let supervisor = supervisor.clone();
             Box::pin(async move {
                 let task_id = tools::required_str(&args, "task_id")?;
-                let block = required_bool(&args, "block")?;
-                let timeout_ms = required_u64(&args, "timeout")?;
-                if timeout_ms > 600_000 {
-                    return Err("timeout must be between 0 and 600000 milliseconds".to_string());
+                let block = optional_bool(&args, "block", TASK_OUTPUT_DEFAULT_BLOCK)?;
+                let timeout_ms = optional_u64(&args, "timeout", TASK_OUTPUT_DEFAULT_TIMEOUT_MS)?;
+                if timeout_ms > TASK_OUTPUT_MAX_TIMEOUT_MS {
+                    return Err(format!(
+                        "timeout must be between 0 and {TASK_OUTPUT_MAX_TIMEOUT_MS} milliseconds"
+                    ));
                 }
 
                 match supervisor.status(task_id) {
@@ -666,5 +680,42 @@ mod tests {
         );
 
         supervisor.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn task_output_applies_the_schema_defaults_when_the_model_omits_them() {
+        let supervisor = SubAgentSupervisor::new(3);
+        let session = make_session(vec![text_response("defaulted report")]).await;
+        let task_id = supervisor.spawn(session, "Inspect".to_string(), 0).unwrap();
+        supervisor
+            .wait_with_cancel(&task_id, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        let tool = make_task_output_tool(supervisor.clone());
+        let output = (tool.executor)(json!({ "task_id": task_id }), context())
+            .await
+            .unwrap();
+
+        assert!(output.contains("defaulted report"));
+
+        supervisor.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn task_output_rejects_a_wrongly_typed_optional_parameter() {
+        let supervisor = SubAgentSupervisor::new(3);
+        let tool = make_task_output_tool(supervisor);
+        let error = (tool.executor)(
+            json!({
+                "task_id": "agent-1",
+                "block": "yes"
+            }),
+            context(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error, "block must be a boolean");
     }
 }
