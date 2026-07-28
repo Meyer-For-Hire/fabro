@@ -195,20 +195,6 @@ reasoning_effort = "levels"
         ))
     }
 
-    fn modal_env_catalog() -> Catalog {
-        catalog_with(
-            r#"
-[providers.modal]
-enabled = true
-base_url = "https://example--kimi-k3.modal.run/v1"
-
-[providers.modal.extra_headers]
-"Modal-Key" = "{{ env.MODAL_TOKEN_ID }}"
-"Modal-Secret" = "{{ env.MODAL_TOKEN_SECRET }}"
-"#,
-        )
-    }
-
     #[tokio::test]
     async fn configured_providers_reads_injected_env() {
         let source = test_source(&[("ANTHROPIC_API_KEY", "anthropic-key")]);
@@ -347,7 +333,20 @@ x-portkey-provider = "@bedrock-prod"
 
     #[tokio::test]
     async fn env_source_resolves_modal_proxy_headers_when_explicitly_configured() {
-        let catalog = modal_env_catalog();
+        // The shipped `modal.toml` reads `{{ secrets.* }}`, which this source
+        // cannot resolve. Operators who want env-backed Modal credentials must
+        // override both header sources, as documented in `reference/sdk.mdx`.
+        let catalog = catalog_with(
+            r#"
+[providers.modal]
+enabled = true
+base_url = "https://example--kimi-k3.modal.run/v1"
+
+[providers.modal.extra_headers]
+"Modal-Key" = "{{ env.MODAL_TOKEN_ID }}"
+"Modal-Secret" = "{{ env.MODAL_TOKEN_SECRET }}"
+"#,
+        );
         let source = test_source(&[
             ("MODAL_TOKEN_ID", "wk-test"),
             ("MODAL_TOKEN_SECRET", "ws-test"),

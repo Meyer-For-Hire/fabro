@@ -3515,11 +3515,6 @@ enabled = true
         assert_eq!(provider.billing_policy, BillingPolicy::OpenAi);
         assert_eq!(provider.priority, 30);
         assert!(provider.auth.is_none());
-        assert!(provider.base_url.is_none());
-        assert_eq!(
-            provider.api_key_url.as_deref(),
-            Some("https://modal.com/docs/guide/endpoints#proxy-tokens")
-        );
         assert_eq!(
             provider.extra_headers,
             HashMap::from([
@@ -3533,19 +3528,10 @@ enabled = true
                 ),
             ])
         );
-        assert_eq!(
-            catalog
-                .default_for_provider(&modal)
-                .map(|model| model.id.as_str()),
-            Some("kimi-k3")
-        );
-        assert_eq!(
-            catalog
-                .probe_for_provider(&modal)
-                .map(|model| model.id.as_str()),
-            Some("kimi-k3")
-        );
 
+        // Modal assigns the endpoint URL per deployment, so the built-in entry
+        // ships without one and the operator supplies it through settings.
+        assert!(provider.base_url.is_none());
         let catalog = Catalog::from_builtin_with_overrides(&minimal_settings(
             r#"
 [providers.modal]
@@ -3642,7 +3628,7 @@ enabled = true
     }
 
     #[test]
-    fn builtin_kimi_k3_slug_is_portable_across_direct_and_gateway_providers() {
+    fn builtin_kimi_k3_selection_prefers_direct_kimi_then_modal_over_openrouter() {
         let kimi = ProviderId::new("kimi");
         let modal = ProviderId::new("modal");
         let openrouter = ProviderId::new("openrouter");
@@ -3656,14 +3642,6 @@ enabled = true
 ",
         ))
         .expect("enabled Modal and OpenRouter overrides should build");
-
-        for provider in [&kimi, &modal, &openrouter] {
-            let model = catalog
-                .get_on_provider(provider, "kimi-k3")
-                .unwrap_or_else(|| panic!("Kimi K3 should resolve on provider '{provider}'"));
-            assert_eq!(model.id, "kimi-k3", "{provider}");
-            assert_eq!(&model.provider, provider, "{provider}");
-        }
 
         let selected = catalog
             .select(

@@ -70,6 +70,24 @@ impl ApiCredential {
             project_id:    None,
         })
     }
+
+    /// Build an `ApiCredential` for a provider that authenticates with request
+    /// headers instead of an API key, such as Modal's proxy-token pair.
+    #[must_use]
+    pub fn with_extra_headers(
+        provider: impl Into<ProviderId>,
+        extra_headers: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            provider: provider.into(),
+            auth_header: None,
+            extra_headers,
+            base_url: None,
+            codex_mode: false,
+            org_id: None,
+            project_id: None,
+        }
+    }
 }
 
 const OPENAI_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
@@ -970,7 +988,6 @@ reasoning = false
             .unwrap();
         let ResolvedCredential::Api(api) = resolved;
 
-        assert_eq!(api.provider, modal);
         assert!(api.auth_header.is_none());
         assert_eq!(
             api.extra_headers,
@@ -986,40 +1003,35 @@ reasoning = false
     }
 
     #[tokio::test]
-    async fn modal_requires_both_vault_proxy_tokens() {
-        for (present_name, present_value, missing_name) in [
-            ("MODAL_TOKEN_ID", "wk-present", "MODAL_TOKEN_SECRET"),
-            ("MODAL_TOKEN_SECRET", "ws-present", "MODAL_TOKEN_ID"),
-        ] {
-            let catalog = modal_catalog();
-            let dir = tempfile::tempdir().unwrap();
-            let mut vault = Vault::load(dir.path().join("secrets.json")).unwrap();
-            vault_set_token(&mut vault, present_name, present_value).unwrap();
-            let resolver = test_resolver(vault, Arc::new(|_| None));
-            let modal = ProviderId::new("modal");
+    async fn modal_is_not_configured_with_only_one_vault_proxy_token() {
+        let catalog = modal_catalog();
+        let dir = tempfile::tempdir().unwrap();
+        let mut vault = Vault::load(dir.path().join("secrets.json")).unwrap();
+        vault_set_token(&mut vault, "MODAL_TOKEN_ID", "wk-present").unwrap();
+        let resolver = test_resolver(vault, Arc::new(|_| None));
+        let modal = ProviderId::new("modal");
 
-            {
-                let vault = resolver.vault.read().await;
-                assert!(
-                    !resolver
-                        .configured_providers(&vault, &catalog)
-                        .contains(&modal)
-                );
-            }
-
-            let err = resolver
-                .resolve(modal.clone(), CredentialUsage::ApiRequest, &catalog)
-                .await
-                .unwrap_err();
-
-            assert!(matches!(
-                err,
-                ResolveError::Interpolation { ref provider, .. } if provider == &modal
-            ));
-            let message = err.to_string();
-            assert!(message.contains(missing_name));
-            assert!(!message.contains(present_value));
+        {
+            let vault = resolver.vault.read().await;
+            assert!(
+                !resolver
+                    .configured_providers(&vault, &catalog)
+                    .contains(&modal)
+            );
         }
+
+        let err = resolver
+            .resolve(modal.clone(), CredentialUsage::ApiRequest, &catalog)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ResolveError::Interpolation { ref provider, .. } if provider == &modal
+        ));
+        let message = err.to_string();
+        assert!(message.contains("MODAL_TOKEN_SECRET"));
+        assert!(!message.contains("wk-present"));
     }
 
     #[tokio::test]

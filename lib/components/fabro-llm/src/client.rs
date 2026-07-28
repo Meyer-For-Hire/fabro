@@ -1207,18 +1207,13 @@ base_url = "{}/v1"
         ));
         let modal = ProviderId::new("modal");
         let client = Client::from_credentials(
-            vec![ApiCredential {
-                provider:      modal.clone(),
-                auth_header:   None,
-                extra_headers: HashMap::from([
+            vec![ApiCredential::with_extra_headers(
+                modal.clone(),
+                HashMap::from([
                     ("Modal-Key".to_string(), "wk-test".to_string()),
                     ("Modal-Secret".to_string(), "ws-test".to_string()),
                 ]),
-                base_url:      None,
-                codex_mode:    false,
-                org_id:        None,
-                project_id:    None,
-            }],
+            )],
             catalog,
         )
         .await

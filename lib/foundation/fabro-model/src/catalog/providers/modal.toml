@@ -11,7 +11,7 @@ enabled = false
 "Modal-Secret" = "{{ secrets.MODAL_TOKEN_SECRET }}"
 
 # Modal assigns an endpoint URL when the Shared API or an Auto Endpoint is
-# created. To enable Modal, add the endpoint URL to settings.toml:
+# created. To enable Modal, add the endpoint URL to ~/.fabro/settings.toml:
 #
 # [llm.providers.modal]
 # enabled = true
@@ -22,6 +22,9 @@ enabled = false
 # fabro secret set MODAL_TOKEN_ID wk-...
 # fabro secret set MODAL_TOKEN_SECRET ws-...
 
+# Modal serves the Hugging Face repository id, so `api_id` keeps that
+# capitalization. OpenRouter routes the same model under its own lowercase
+# slug (`moonshotai/kimi-k3`).
 [providers.modal.models."kimi-k3"]
 api_id = "moonshotai/Kimi-K3"
 display_name = "Kimi K3 (via Modal)"
