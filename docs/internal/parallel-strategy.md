@@ -98,6 +98,12 @@ For `for_each`, a missing key, missing blob, invalid JSON, or non-array fails
 before `parallel.started`. A valid empty array emits paired parallel events
 with count zero and jumps directly to the template target's fan-in.
 
+A dry run reaches the fan-out before any upstream node has produced the array,
+so an absent or unusable source stands in one placeholder item and the template
+target is simulated once. Graph-shape mistakes — a non-string source, the wrong
+edge count, a non-LLM target, nested `for_each` — still fail under `--dry-run`,
+because catching those is what a dry run is for.
+
 ## 4. Artifacts and downstream context
 
 Large context values use the normal artifact store. Offloading replaces

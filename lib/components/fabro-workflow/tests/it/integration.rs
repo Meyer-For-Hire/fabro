@@ -7291,8 +7291,10 @@ mod real_llm {
         let checkpoint = state
             .current_checkpoint()
             .expect("fan-in workflow should checkpoint");
-        let results: Vec<fabro_types::ParallelBranchResult> =
-            serde_json::from_value(checkpoint.context_values["parallel.results"].clone()).unwrap();
+        let results: Vec<fabro_types::ParallelBranchResult> = serde_json::from_value(
+            checkpoint.context_values[fabro_workflow::context::keys::PARALLEL_RESULTS].clone(),
+        )
+        .unwrap();
         assert_eq!(
             results
                 .iter()
