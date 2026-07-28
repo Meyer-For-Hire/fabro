@@ -65,6 +65,8 @@ pub struct InterviewStartedProps {
     pub timeout_seconds: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_display: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_target:   Option<crate::ReviewTarget>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

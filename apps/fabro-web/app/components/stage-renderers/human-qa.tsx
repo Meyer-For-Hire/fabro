@@ -10,6 +10,7 @@ import {
 import type { EventEnvelope } from "@qltysh/fabro-api-client";
 
 import type { Stage } from "../stage-sidebar";
+import { ReviewTargetQuestion } from "../review-target-question";
 import { Tooltip } from "../ui";
 import { formatAbsoluteTs, formatDurationMs } from "../../lib/format";
 import { ACTIVE_STAGE_STATES } from "../../lib/stage-sidebar";
@@ -168,7 +169,15 @@ function QuestionBlock({
       </header>
 
       <div className="rounded-lg bg-panel p-4 outline-1 -outline-offset-1 outline-line">
-        <Markdown content={question.question} />
+        {question.reviewTarget ? (
+          <ReviewTargetQuestion
+            reviewTarget={question.reviewTarget}
+            fallbackText={question.question}
+            className="text-sm/6 text-fg-2"
+          />
+        ) : (
+          <Markdown content={question.question} />
+        )}
         {question.contextDisplay && (
           <div className="mt-3 border-t border-line pt-3 text-xs text-fg-muted">
             <Markdown content={question.contextDisplay} />

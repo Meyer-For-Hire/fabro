@@ -3258,6 +3258,7 @@ dependencies = [
  "shlex",
  "strum 0.28.0",
  "tempfile",
+ "thiserror 2.0.18",
  "toml 0.8.23",
  "ulid",
  "url",

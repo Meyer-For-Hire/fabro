@@ -99,7 +99,16 @@ fn truncate_to_limit(text: &str, limit: usize, suffix: &str) -> String {
 /// final text is bounded by Slack's section-text limit so even pathological
 /// inputs cannot produce `invalid_blocks`.
 fn header_section(question: &Question, run_web_url: Option<&str>) -> Value {
-    let mut text = format!("*{}*", escape_slack_controls(&question.text));
+    let mut text = question.review_target.as_ref().map_or_else(
+        || format!("*{}*", escape_slack_controls(&question.text)),
+        |target| {
+            format!(
+                "*Review the {} {}, then choose the next action.*",
+                slack_link(target.url(), target.label()),
+                target.kind().noun()
+            )
+        },
+    );
     if !question.stage.is_empty() {
         let _ = write!(
             text,
@@ -632,6 +641,35 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(header.contains("<http://127.0.0.1:32276/runs/run-1|Open in Fabro>"));
+    }
+
+    #[test]
+    fn header_renders_review_target_as_the_question_link() {
+        let mut q = Question::new(
+            "Review the Quarry review exercise document, then choose the next action.",
+            QuestionType::MultipleChoice,
+        );
+        q.review_target = Some(
+            fabro_types::ReviewTarget::new(
+                "Quarry review exercise",
+                "https://quarry.lithos.computer/tmp/0123456789abcdef0123456789abcdef",
+                fabro_types::ReviewTargetKind::Document,
+            )
+            .unwrap(),
+        );
+
+        let blocks = question_to_blocks("run-1", "q-1", &q, None);
+        let header = serde_json::to_value(&blocks).unwrap()[0]["text"]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        assert_eq!(
+            header,
+            "*Review the \
+             <https://quarry.lithos.computer/tmp/0123456789abcdef0123456789abcdef|Quarry review \
+             exercise> document, then choose the next action.*"
+        );
     }
 
     #[test]

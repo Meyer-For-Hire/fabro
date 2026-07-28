@@ -111,6 +111,17 @@ fn parse_non_tty_freeform_response(prompt_read: PromptRead) -> Answer {
     }
 }
 
+fn review_target_line(question: &Question) -> Option<String> {
+    question.review_target.as_ref().map(|target| {
+        format!(
+            "Review {}: {} — {}",
+            target.kind().noun(),
+            target.label(),
+            target.url()
+        )
+    })
+}
+
 /// Ask a multiple-choice question using dialoguer's `Select` widget on a TTY.
 fn ask_select_interactive(question: &Question) -> Answer {
     let items: Vec<String> = question
@@ -237,6 +248,9 @@ impl Interviewer for ConsoleInterviewer {
                 let rendered = self.styles.render_markdown(context_text);
                 eprint!("{rendered}");
             }
+            if let Some(line) = review_target_line(&question) {
+                eprintln!("{line}");
+            }
             let q = question;
             let answer = task::spawn_blocking(move || match q.question_type {
                 QuestionType::MultipleChoice => ask_select_interactive(&q),
@@ -251,6 +265,9 @@ impl Interviewer for ConsoleInterviewer {
 
         // Non-TTY fallback: line-based stdin reading
         let s = self.styles;
+        if let Some(line) = review_target_line(&question) {
+            eprintln!("{line}");
+        }
         eprintln!("{} {}", s.bold_cyan.apply_to("?"), question.text);
 
         let answer = match question.question_type {
@@ -312,6 +329,27 @@ mod tests {
         assert!(result.is_some());
         let answer = result.unwrap();
         assert_eq!(answer.value, AnswerValue::Selected("A".to_string()));
+    }
+
+    #[test]
+    fn review_target_line_includes_label_and_url() {
+        let mut question = Question::new("Review", QuestionType::MultipleChoice);
+        question.review_target = Some(
+            fabro_types::ReviewTarget::new(
+                "Quarry review exercise",
+                "https://quarry.lithos.computer/tmp/0123456789abcdef0123456789abcdef",
+                fabro_types::ReviewTargetKind::Document,
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(
+            review_target_line(&question).as_deref(),
+            Some(
+                "Review document: Quarry review exercise — \
+                 https://quarry.lithos.computer/tmp/0123456789abcdef0123456789abcdef"
+            )
+        );
     }
 
     #[test]

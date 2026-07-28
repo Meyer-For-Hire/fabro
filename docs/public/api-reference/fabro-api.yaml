@@ -9597,6 +9597,11 @@ components:
           type: ["string", "null"]
           description: Optional contextual text shown alongside the question.
           example: Latest draft
+        review_target:
+          description: Optional validated external resource that is the primary subject of this review question.
+          oneOf:
+            - $ref: "#/components/schemas/ReviewTarget"
+            - type: "null"
 
     QuestionType:
       description: The interaction type of a human-in-the-loop question.
@@ -11102,6 +11107,36 @@ components:
           type: ["string", "null"]
           description: Optional untrusted model-authored option preview captured for clients.
 
+    ReviewTargetKind:
+      description: The type of resource presented for human review.
+      type: string
+      enum:
+        - document
+
+    ReviewTarget:
+      description: A validated external resource presented as the primary subject of a human review question.
+      type: object
+      required:
+        - label
+        - url
+        - kind
+      properties:
+        label:
+          type: string
+          minLength: 1
+          maxLength: 200
+          description: Human-readable link label.
+          example: Quarry review exercise
+        url:
+          type: string
+          format: uri
+          minLength: 1
+          maxLength: 2048
+          description: Absolute HTTP or HTTPS URL opened by the reviewer.
+          example: https://quarry.lithos.computer/tmp/0123456789abcdef0123456789abcdef
+        kind:
+          $ref: "#/components/schemas/ReviewTargetKind"
+
     InterviewQuestionRecord:
       description: Storage shape of an interview question recorded in the event log.
       type: object
@@ -11131,6 +11166,10 @@ components:
           format: double
         context_display:
           type: ["string", "null"]
+        review_target:
+          oneOf:
+            - $ref: "#/components/schemas/ReviewTarget"
+            - type: "null"
 
     PendingInterviewRecord:
       description: Pending interview question plus the time it entered the unresolved set.

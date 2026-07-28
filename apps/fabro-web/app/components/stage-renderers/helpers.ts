@@ -1,5 +1,8 @@
 import { StageOutcome } from "@qltysh/fabro-api-client";
-import type { EventEnvelope } from "@qltysh/fabro-api-client";
+import type {
+  EventEnvelope,
+  ReviewTarget,
+} from "@qltysh/fabro-api-client";
 
 import { getArray, getNumber, getObject, getString, type UnknownRecord } from "../../lib/unknown";
 
@@ -25,6 +28,7 @@ export interface HumanQuestion {
   allowFreeform: boolean;
   timeoutSeconds: number | null;
   contextDisplay: string | null;
+  reviewTarget: ReviewTarget | null;
 }
 
 export type HumanResolution =
@@ -75,6 +79,16 @@ function parseInterviewOptions(value: unknown): InterviewOption[] {
   return out;
 }
 
+function parseReviewTarget(value: unknown): ReviewTarget | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as UnknownRecord;
+  const label = getString(record, "label");
+  const url = getString(record, "url");
+  const kind = getString(record, "kind");
+  if (!label || !url || kind !== "document") return null;
+  return { label, url, kind };
+}
+
 /**
  * Pair `interview.started` events with the matching `interview.completed`,
  * `.timeout`, or `.interrupted` resolution by `question_id`. Unanswered
@@ -98,6 +112,7 @@ export function parseHumanInterviewPairs(events: EventEnvelope[]): HumanIntervie
           allowFreeform: props.allow_freeform === true,
           timeoutSeconds: getNumber(props, "timeout_seconds") ?? null,
           contextDisplay: getString(props, "context_display") ?? null,
+          reviewTarget: parseReviewTarget(props.review_target),
         },
         resolution: null,
       });

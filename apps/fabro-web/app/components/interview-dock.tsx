@@ -22,6 +22,7 @@ import {
 } from "../lib/mutations";
 import { ApiError } from "../lib/api-client";
 import { displayLabel } from "./interview-label";
+import { ReviewTargetQuestion } from "./review-target-question";
 import { ErrorMessage } from "./ui";
 
 const PRIMARY_BUTTON =
@@ -99,9 +100,11 @@ function InterviewQuestionDock({
       />
       <div className="space-y-5 px-5 py-4 sm:px-6">
         <div>
-          <p className="text-pretty text-base/6 font-medium text-fg">
-            {question.text}
-          </p>
+          <ReviewTargetQuestion
+            reviewTarget={question.review_target}
+            fallbackText={question.text}
+            className="text-pretty text-base/6 font-medium text-fg"
+          />
           <p className="mt-1 text-xs/5 text-fg-muted">
             {questionTypeLabel(question.question_type)}
           </p>

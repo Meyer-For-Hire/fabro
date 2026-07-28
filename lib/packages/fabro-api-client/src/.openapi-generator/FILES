@@ -335,6 +335,8 @@ models/replace-mcp-server-request.ts
 models/repo-check-response-permissions.ts
 models/repo-check-response.ts
 models/repository-ref.ts
+models/review-target-kind.ts
+models/review-target.ts
 models/rewind-request.ts
 models/rewind-response.ts
 models/root-response-urls.ts

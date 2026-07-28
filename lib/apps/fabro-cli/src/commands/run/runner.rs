@@ -1361,6 +1361,7 @@ mod tests {
                 allow_freeform:  false,
                 timeout_seconds: None,
                 context_display: None,
+                review_target:   None,
             })),
             Some(WorkerTitlePhase::Waiting)
         );

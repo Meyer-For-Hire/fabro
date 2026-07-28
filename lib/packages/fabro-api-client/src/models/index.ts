@@ -305,6 +305,8 @@ export * from './replace-mcp-server-request';
 export * from './repo-check-response';
 export * from './repo-check-response-permissions';
 export * from './repository-ref';
+export * from './review-target';
+export * from './review-target-kind';
 export * from './rewind-request';
 export * from './rewind-response';
 export * from './root-response';

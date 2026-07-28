@@ -267,6 +267,7 @@ For the first node in each branch, `fidelity` resolves from the fork-to-branch e
 | Attribute | Type | Description |
 |---|---|---|
 | `question_type` | String | Optional interview question type override: `yes_no`, `confirmation`, `multiple_choice`, `multi_select`, or `freeform`. Defaults to `freeform` when the gate only has a freeform edge; otherwise defaults to `multiple_choice`. |
+| `review_target` | Boolean | When `true`, read and validate the typed `review_target` context value, then present it as the primary link in the question. See [Review targets](/workflows/human-in-the-loop#review-targets). |
 | `human.default_choice` | String | Target node to use when the question times out. |
 
 ### Manager loop (sub-workflow) nodes

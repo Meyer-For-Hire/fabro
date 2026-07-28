@@ -719,6 +719,7 @@ impl SlackService {
                     allow_freeform:  props.allow_freeform,
                     timeout_seconds: props.timeout_seconds,
                     context_display: props.context_display.clone(),
+                    review_target:   props.review_target.clone(),
                 });
                 let blocks = slack_blocks::question_to_blocks(
                     &event.run_id.to_string(),
@@ -3708,6 +3709,7 @@ fn runtime_question_from_interview_record(question: &InterviewQuestionRecord) ->
         stage:           question.stage.clone(),
         metadata:        HashMap::new(),
         context_display: question.context_display.clone(),
+        review_target:   question.review_target.clone(),
     }
 }
 
@@ -3721,6 +3723,7 @@ fn api_question_from_interview_record(question: &InterviewQuestionRecord) -> Api
         allow_freeform:  question.allow_freeform,
         timeout_seconds: question.timeout_seconds,
         context_display: question.context_display.clone(),
+        review_target:   question.review_target.clone(),
     }
 }
 

@@ -4,6 +4,7 @@ import { SWRConfig } from "swr";
 import {
   type ApiQuestion,
   QuestionType,
+  ReviewTargetKind,
 } from "@qltysh/fabro-api-client";
 
 import { InterviewDock } from "./interview-dock";
@@ -72,6 +73,58 @@ describe("InterviewDock", () => {
     expect(text).toContain("Approve the deployment plan?");
     expect(text).toContain("approve_plan");
     expect(text).toContain("Awaiting input");
+  });
+
+  test("renders the review target as the link in the question", () => {
+    const url =
+      "https://quarry.lithos.computer/tmp/0123456789abcdef0123456789abcdef";
+    const tree = render(
+      <InterviewDock
+        runId="run-1"
+        questions={[
+          makeQuestion({
+            text: "Review the Quarry review exercise document, then choose the next action.",
+            review_target: {
+              label: "Quarry review exercise",
+              url,
+              kind: ReviewTargetKind.DOCUMENT,
+            },
+          }),
+        ]}
+      />,
+    );
+
+    expect(textContent(tree.toJSON())).toContain(
+      "Review the Quarry review exercise document, then choose the next action.",
+    );
+    const links = tree.root.findAllByType("a");
+    expect(links).toHaveLength(1);
+    expect(links[0].props.href).toBe(url);
+    expect(links[0].props.target).toBe("_blank");
+    expect(links[0].props.rel).toBe("noopener noreferrer");
+    expect(links[0].props.referrerPolicy).toBe("no-referrer");
+  });
+
+  test("does not link an unsafe review target received from the API", () => {
+    const fallback = "Review the document, then choose the next action.";
+    const tree = render(
+      <InterviewDock
+        runId="run-1"
+        questions={[
+          makeQuestion({
+            text: fallback,
+            review_target: {
+              label: "Unsafe target",
+              url: "javascript:alert(1)",
+              kind: ReviewTargetKind.DOCUMENT,
+            },
+          }),
+        ]}
+      />,
+    );
+
+    expect(textContent(tree.toJSON())).toContain(fallback);
+    expect(tree.root.findAllByType("a")).toHaveLength(0);
   });
 
   test("yes/no question shows two buttons", () => {

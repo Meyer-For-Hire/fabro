@@ -4765,6 +4765,7 @@ channel = "#deploys"
             allow_freeform:  true,
             timeout_seconds: None,
             context_display: None,
+            review_target:   None,
         },
     )
     .await;
@@ -8031,6 +8032,7 @@ async fn submit_pending_interview_answer_rejects_invalid_answer_shape() {
             allow_freeform:  false,
             timeout_seconds: None,
             context_display: None,
+            review_target:   None,
         },
     };
 
@@ -8059,6 +8061,7 @@ fn validate_answer_for_question_accepts_no_for_confirmation() {
         allow_freeform:  false,
         timeout_seconds: None,
         context_display: None,
+        review_target:   None,
     };
 
     let result = validate_answer_for_question(&question, &Answer::no());
@@ -8077,6 +8080,7 @@ fn answer_from_typed_yes_request_maps_to_yes_answer() {
         allow_freeform:  false,
         timeout_seconds: None,
         context_display: None,
+        review_target:   None,
     };
     let req: SubmitAnswerRequest = serde_json::from_value(json!({ "kind": "yes" })).unwrap();
 
@@ -8096,6 +8100,7 @@ fn answer_from_typed_no_request_maps_to_no_answer() {
         allow_freeform:  false,
         timeout_seconds: None,
         context_display: None,
+        review_target:   None,
     };
     let req: SubmitAnswerRequest = serde_json::from_value(json!({ "kind": "no" })).unwrap();
 
@@ -8120,6 +8125,7 @@ fn answer_from_typed_selected_request_validates_and_attaches_option() {
         allow_freeform:  false,
         timeout_seconds: None,
         context_display: None,
+        review_target:   None,
     };
     let req: SubmitAnswerRequest =
         serde_json::from_value(json!({ "kind": "selected", "option_key": "approve" })).unwrap();
@@ -8160,6 +8166,7 @@ fn answer_from_typed_multi_selected_request_validates_option_keys() {
         allow_freeform:  false,
         timeout_seconds: None,
         context_display: None,
+        review_target:   None,
     };
     let req: SubmitAnswerRequest = serde_json::from_value(json!({
         "kind": "multi_selected",
@@ -9577,6 +9584,11 @@ async fn get_run_state_exposes_pending_interviews() {
             "allow_freeform": false,
             "context_display": null,
             "timeout_seconds": null,
+            "review_target": {
+                "label": "Quarry review exercise",
+                "url": "https://quarry.lithos.computer/tmp/0123456789abcdef0123456789abcdef",
+                "kind": "document"
+            },
         }),
         Some("gate"),
     )
@@ -9656,6 +9668,11 @@ async fn cache_backed_run_endpoints_reflect_events_appended_after_warmup() {
             "allow_freeform": false,
             "context_display": null,
             "timeout_seconds": null,
+            "review_target": {
+                "label": "Quarry review exercise",
+                "url": "https://quarry.lithos.computer/tmp/0123456789abcdef0123456789abcdef",
+                "kind": "document"
+            },
         }),
         Some("review"),
     )
@@ -9713,6 +9730,10 @@ async fn cache_backed_run_endpoints_reflect_events_appended_after_warmup() {
         state_body["pending_interviews"]["q-cache"]["question"]["text"].as_str(),
         Some("Approve cached deploy?")
     );
+    assert_eq!(
+        state_body["pending_interviews"]["q-cache"]["question"]["review_target"]["url"].as_str(),
+        Some("https://quarry.lithos.computer/tmp/0123456789abcdef0123456789abcdef")
+    );
 
     let stages = app
         .clone()
@@ -9743,6 +9764,10 @@ async fn cache_backed_run_endpoints_reflect_events_appended_after_warmup() {
     assert_eq!(
         questions["data"][0]["text"].as_str(),
         Some("Approve cached deploy?")
+    );
+    assert_eq!(
+        questions["data"][0]["review_target"]["label"].as_str(),
+        Some("Quarry review exercise")
     );
 
     let settings = app
@@ -16489,6 +16514,7 @@ async fn list_runs_includes_live_metadata_from_run_state() {
             allow_freeform:  false,
             timeout_seconds: None,
             context_display: None,
+            review_target:   None,
         },
     ] {
         workflow_event::append_event(&run_store, &run_id, &event)
