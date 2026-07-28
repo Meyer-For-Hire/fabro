@@ -3028,6 +3028,7 @@ dependencies = [
  "fabro-spa",
  "fabro-static",
  "fabro-store",
+ "fabro-template",
  "fabro-test",
  "fabro-tool",
  "fabro-types",

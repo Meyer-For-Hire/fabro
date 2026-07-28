@@ -5,12 +5,17 @@ use fabro_llm::client::Client;
 use fabro_llm::generate::{self, GenerateParams};
 use fabro_llm::types::TimeoutOptions;
 use fabro_model::ProviderId;
+use fabro_template::{TemplateContext, TemplateError};
 use fabro_types::{Graph, MAX_RUN_TITLE_CHARS, RunId};
+use fabro_util::error;
 use serde::Serialize;
 use toml::Value as TomlValue;
 
 const TRUNCATED_MARKER: &str = "...[truncated]";
 const MAX_PROMPT_SECTION_CHARS: usize = 4_000;
+
+const TITLE_PROMPT_NAME: &str = "run_title.md.j2";
+const TITLE_PROMPT_TEMPLATE: &str = include_str!("prompts/run_title.md.j2");
 
 pub(crate) struct TitlePromptInput<'a> {
     pub(crate) run_id:          &'a RunId,
@@ -29,7 +34,16 @@ pub(crate) struct GenerateTitleInput<'a> {
 
 pub(crate) async fn generate_title_or_current(input: GenerateTitleInput<'_>) -> String {
     let current_title = input.prompt.current_title.to_string();
-    let prompt = build_title_prompt(&input.prompt);
+    let prompt = match build_title_prompt(&input.prompt) {
+        Ok(prompt) => prompt,
+        Err(err) => {
+            // A checked-in template that will not render is a bug, not a
+            // transient failure, so this is louder than a generation miss.
+            let rendered_error = error::collect_chain(&err).join(": ");
+            tracing::warn!(error = %rendered_error, "Run title prompt template failed to render");
+            return current_title;
+        }
+    };
     let params = GenerateParams::new(input.model_id, input.client)
         .provider(input.provider_id.to_string())
         .prompt(prompt)
@@ -56,7 +70,7 @@ pub(crate) async fn generate_title_or_current(input: GenerateTitleInput<'_>) -> 
         .unwrap_or(current_title)
 }
 
-fn build_title_prompt(input: &TitlePromptInput<'_>) -> String {
+fn build_title_prompt(input: &TitlePromptInput<'_>) -> Result<String, TemplateError> {
     let workflow_identity = serde_json::json!({
         "run_id": input.run_id.to_string(),
         "current_deterministic_title": input.current_title,
@@ -68,33 +82,30 @@ fn build_title_prompt(input: &TitlePromptInput<'_>) -> String {
     let inputs = pretty_json(input.run_inputs);
     let workflow = pretty_json(input.workflow);
 
-    format!(
-        r#"Generate a concise, human-readable title for this Fabro workflow run.
-
-Base the title on the workflow identity, workflow goal, and run input values.
-Preserve meaningful proper nouns, ticket IDs, repositories, branches, environments, and explicit user goals.
-Return only structured JSON with one field: {{"title":"..."}}.
-The title must be a single line, not blank, and no more than {MAX_RUN_TITLE_CHARS} characters.
-
-Workflow identity:
-```json
-{}
-```
-
-Run inputs (raw values, not redacted):
-```json
-{}
-```
-
-Workflow summary:
-```json
-{}
-```
-"#,
-        truncate_section(&identity, MAX_PROMPT_SECTION_CHARS),
-        truncate_section(&inputs, MAX_PROMPT_SECTION_CHARS),
-        truncate_section(&workflow, MAX_PROMPT_SECTION_CHARS),
-    )
+    let template_inputs = HashMap::from([
+        (
+            "max_chars".to_string(),
+            TomlValue::Integer(
+                MAX_RUN_TITLE_CHARS
+                    .try_into()
+                    .expect("run title character limit should fit in i64"),
+            ),
+        ),
+        (
+            "workflow_identity".to_string(),
+            TomlValue::String(truncate_section(&identity, MAX_PROMPT_SECTION_CHARS)),
+        ),
+        (
+            "run_inputs".to_string(),
+            TomlValue::String(truncate_section(&inputs, MAX_PROMPT_SECTION_CHARS)),
+        ),
+        (
+            "workflow_summary".to_string(),
+            TomlValue::String(truncate_section(&workflow, MAX_PROMPT_SECTION_CHARS)),
+        ),
+    ]);
+    let ctx = TemplateContext::new().with_inputs(template_inputs);
+    fabro_template::render_named(TITLE_PROMPT_NAME, TITLE_PROMPT_TEMPLATE, &ctx)
 }
 
 fn normalize_generated_title(title: &str) -> Option<String> {
@@ -203,6 +214,29 @@ mod tests {
         .unwrap()
     }
 
+    /// Strict rendering already fails on a variable the template asks for and
+    /// the caller does not supply. This covers the other direction: a variable
+    /// dropped from the template renders fine but silently starves the model.
+    #[test]
+    fn prompt_template_renders_every_variable_the_caller_supplies() {
+        let run_id = RunId::new();
+        let graph = title_test_graph();
+        let summary = workflow_summary(&graph);
+        let prompt = build_title_prompt(&TitlePromptInput {
+            run_id:          &run_id,
+            current_title:   "Current",
+            workflow_target: Some("workflow.fabro"),
+            run_inputs:      &HashMap::new(),
+            workflow:        &summary,
+        })
+        .unwrap();
+
+        assert!(prompt.contains(&format!("no more than {MAX_RUN_TITLE_CHARS} characters")));
+        assert!(prompt.contains(&run_id.to_string()));
+        assert!(prompt.contains("\"stage_count\": 4"));
+        assert!(!prompt.contains("{{"));
+    }
+
     #[test]
     fn prompt_includes_goal_inputs_and_workflow_summary_without_redaction() {
         let run_id = RunId::new();
@@ -225,7 +259,8 @@ mod tests {
             workflow_target: Some("workflows/deploy.fabro"),
             run_inputs:      &inputs,
             workflow:        &summary,
-        });
+        })
+        .unwrap();
 
         assert!(prompt.contains("Deploy API token SECRET_123 to production"));
         assert!(prompt.contains("\"api_key\": \"SECRET_123\""));
@@ -251,7 +286,8 @@ mod tests {
             workflow_target: Some("workflow.fabro"),
             run_inputs:      &inputs,
             workflow:        &summary,
-        });
+        })
+        .unwrap();
 
         // Section truncation: per-section budget × 3 + small boilerplate.
         assert!(prompt.chars().count() < MAX_PROMPT_SECTION_CHARS * 3 + 1_000);
