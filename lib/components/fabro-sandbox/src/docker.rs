@@ -37,7 +37,7 @@ use crate::{
     CommandOutputCallback, DEFAULT_EXEC_OUTPUT_TAIL_BYTES, DirEntry, ExecResult,
     ExecStreamingResult, GrepOptions, Sandbox, SandboxEvent, SandboxEventCallback, SandboxFile,
     StderrCollector, StdioProcess, StdioProcessHandle, StdioProcessTermination, WalkOptions,
-    format_lines_numbered, shell_quote,
+    clone_retry, format_lines_numbered, shell_quote,
 };
 
 const DOCKER_BASH_REQUIREMENT: &str = "Docker sandboxes require /bin/bash for every command, with no `sh` fallback; use an \
@@ -656,6 +656,42 @@ impl DockerSandbox {
         Ok(())
     }
 
+    /// Render a failed `git clone` exit into an error, with the auth URL
+    /// masked.
+    fn clone_failure_error(
+        &self,
+        stderr: &str,
+        auth_url: Option<&fabro_redact::DisplaySafeUrl>,
+    ) -> crate::Error {
+        let stderr = redact_auth_url(stderr, auth_url);
+        crate::Error::message(if self.github_app.is_none() {
+            format!(
+                "Git clone failed: {stderr}. If this is a private repository, configure a GitHub App with `fabro install` and install it for your organization."
+            )
+        } else {
+            format!("Failed to clone repo into Docker sandbox: {stderr}")
+        })
+    }
+
+    /// Clear a checkout left behind by a failed clone, before cloning again.
+    ///
+    /// git removes the directory it created when it exits on its own, but a
+    /// clone killed by the exec timeout leaves a partial checkout that the next
+    /// `git clone` would refuse to write into. Best-effort: if the removal
+    /// fails, the retry surfaces the real error.
+    async fn clear_partial_clone(&self, repo_path: &str) {
+        let command = format!("rm -rf {}", shell_quote(repo_path));
+        if let Err(err) = self
+            .docker_exec_shell(&command, 30_000, Some("/"), None, None)
+            .await
+        {
+            tracing::debug!(
+                error = %crate::display_for_log(&err),
+                "Failed to clear partial clone before retry"
+            );
+        }
+    }
+
     async fn clone_github_repo(
         &self,
         origin_url: String,
@@ -690,19 +726,34 @@ impl DockerSandbox {
             .map_or(origin_url.as_str(), |url| url.as_raw_url().as_str());
 
         let command = git_clone_and_link_command(clone_url, branch.as_deref(), &layout);
+        let has_credentials = auth_url.is_some();
 
-        let result = self
-            .docker_exec_shell(&command, 300_000, Some("/"), None, None)
-            .await?;
-        if !result.is_success() {
-            let stderr = redact_auth_url(&result.stderr, auth_url.as_ref());
-            let err = crate::Error::message(if self.github_app.is_none() {
-                format!(
-                    "Git clone failed: {stderr}. If this is a private repository, configure a GitHub App with `fabro install` and install it for your organization."
-                )
-            } else {
-                format!("Failed to clone repo into Docker sandbox: {stderr}")
-            });
+        let clone_result = clone_retry::retry_clone(
+            "docker",
+            |attempt| {
+                let command = command.as_str();
+                let auth_url = auth_url.as_ref();
+                let repo_path = layout.primary_repo_path.as_str();
+                async move {
+                    if attempt > 1 {
+                        self.clear_partial_clone(repo_path).await;
+                    }
+                    let result = self
+                        .docker_exec_shell(command, 300_000, Some("/"), None, None)
+                        .await?;
+                    if result.is_success() {
+                        return Ok(());
+                    }
+                    Err(self.clone_failure_error(&result.stderr, auth_url))
+                }
+            },
+            |err: &crate::Error| {
+                clone_retry::classify_message(&err.display_with_causes(), has_credentials)
+            },
+        )
+        .await;
+
+        if let Err(err) = clone_result {
             self.emit(SandboxEvent::GitCloneFailed {
                 url:    origin_url,
                 error:  err.to_string(),
