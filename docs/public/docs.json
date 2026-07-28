@@ -98,6 +98,7 @@
               "integrations/bedrock",
               "integrations/poolside",
               "integrations/openrouter",
+              "integrations/modal",
               "integrations/fireworks",
               "integrations/slack",
               "integrations/brave-search"

@@ -332,6 +332,51 @@ x-portkey-provider = "@bedrock-prod"
     }
 
     #[tokio::test]
+    async fn env_source_resolves_modal_proxy_headers_when_explicitly_configured() {
+        // The shipped `modal.toml` reads `{{ secrets.* }}`, which this source
+        // cannot resolve. Operators who want env-backed Modal credentials must
+        // override both header sources, as documented in `reference/sdk.mdx`.
+        let catalog = catalog_with(
+            r#"
+[providers.modal]
+enabled = true
+base_url = "https://example--kimi-k3.modal.run/v1"
+
+[providers.modal.extra_headers]
+"Modal-Key" = "{{ env.MODAL_TOKEN_ID }}"
+"Modal-Secret" = "{{ env.MODAL_TOKEN_SECRET }}"
+"#,
+        );
+        let source = test_source(&[
+            ("MODAL_TOKEN_ID", "wk-test"),
+            ("MODAL_TOKEN_SECRET", "ws-test"),
+        ]);
+        let modal = ProviderId::new("modal");
+
+        assert!(source.configured_providers(&catalog).await.contains(&modal));
+
+        let resolved = source.resolve(&catalog).await.unwrap();
+        let credential = resolved
+            .credentials
+            .iter()
+            .find(|credential| credential.provider == modal)
+            .expect("Modal should resolve from the explicit environment header settings");
+
+        assert!(credential.auth_header.is_none());
+        assert_eq!(
+            credential.extra_headers,
+            HashMap::from([
+                ("Modal-Key".to_string(), "wk-test".to_string()),
+                ("Modal-Secret".to_string(), "ws-test".to_string()),
+            ])
+        );
+        assert_eq!(
+            credential.base_url.as_deref(),
+            Some("https://example--kimi-k3.modal.run/v1")
+        );
+    }
+
+    #[tokio::test]
     async fn env_source_secrets_header_token_is_unavailable() {
         let catalog = portkey_catalog(r#"x-team-secret = "{{ secrets.gateway_team_secret }}""#);
         let source = test_source(&[]);

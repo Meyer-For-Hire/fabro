@@ -372,8 +372,21 @@ For env-backed usage, `EnvCredentialSource` checks for API key environment varia
 | `INCEPTION_API_KEY` | Inception |
 | `POOLSIDE_API_KEY` | Poolside |
 | `OPENROUTER_API_KEY` | OpenRouter, when enabled in settings |
+| `MODAL_TOKEN_ID` and `MODAL_TOKEN_SECRET` | Modal, when enabled and configured as below |
 
 The first provider registered becomes the default. Provider base URLs come from the model catalog. For vault-backed usage inside Fabro, use `fabro_auth::VaultCredentialSource` instead.
+
+The built-in Modal definition reads proxy-token headers from the vault. To use `EnvCredentialSource` directly, enable Modal, set its endpoint URL, and override both header sources:
+
+```toml
+[llm.providers.modal]
+enabled = true
+base_url = "https://your-endpoint.modal.run/v1"
+
+[llm.providers.modal.extra_headers]
+"Modal-Key" = "{{ env.MODAL_TOKEN_ID }}"
+"Modal-Secret" = "{{ env.MODAL_TOKEN_SECRET }}"
+```
 
 #### Creating manually
 
