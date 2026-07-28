@@ -1753,6 +1753,7 @@ mod runs {
                 allow_freeform:  false,
                 timeout_seconds: None,
                 context_display: None,
+                review_target:   None,
             },
             ApiQuestion {
                 id:              "q-002".into(),
@@ -1776,6 +1777,7 @@ mod runs {
                 allow_freeform:  true,
                 timeout_seconds: None,
                 context_display: None,
+                review_target:   None,
             },
         ]
     }

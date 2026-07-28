@@ -335,6 +335,7 @@ impl RunProjectionReducer for RunProjection {
                             allow_freeform:  props.allow_freeform,
                             timeout_seconds: props.timeout_seconds,
                             context_display: props.context_display.clone(),
+                            review_target:   props.review_target.clone(),
                         },
                         started_at: ts,
                     });
@@ -3531,6 +3532,14 @@ mod tests {
                     allow_freeform:  true,
                     timeout_seconds: Some(30.0),
                     context_display: Some("Latest draft".to_string()),
+                    review_target:   Some(
+                        fabro_types::ReviewTarget::new(
+                            "Quarry review exercise",
+                            "https://quarry.lithos.computer/tmp/0123456789abcdef0123456789abcdef",
+                            fabro_types::ReviewTargetKind::Document,
+                        )
+                        .unwrap(),
+                    ),
                 }),
                 Some("gate"),
             ))
@@ -3557,6 +3566,14 @@ mod tests {
         assert_eq!(
             pending.question.context_display.as_deref(),
             Some("Latest draft")
+        );
+        assert_eq!(
+            pending
+                .question
+                .review_target
+                .as_ref()
+                .map(fabro_types::ReviewTarget::url),
+            Some("https://quarry.lithos.computer/tmp/0123456789abcdef0123456789abcdef")
         );
 
         state

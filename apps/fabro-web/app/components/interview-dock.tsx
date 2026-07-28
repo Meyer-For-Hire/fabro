@@ -17,6 +17,10 @@ import {
 import { ApiError } from "../lib/api-client";
 import { displayLabel } from "./interview-label";
 import {
+  ReviewTargetQuestion,
+  safeReviewTarget,
+} from "./review-target-question";
+import {
   DockComposer,
   RunDockShell,
   DOCK_CHOICE_BUTTON,
@@ -34,6 +38,9 @@ import {
  * would wrap mid-sentence.
  */
 const STACK_LABEL_LENGTH = 40;
+
+/** Shared by the plain question text and the review target rendering. */
+const QUESTION_TEXT = "max-w-[78ch] text-base/6 font-medium text-pretty text-fg";
 
 type SubmitInterviewAnswer = SubmitInterviewAnswerArg["answer"];
 
@@ -82,6 +89,7 @@ function InterviewQuestionDock({
   const [error, setError] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState(false);
   const submitting = submitMutation.isMutating;
+  const reviewTarget = safeReviewTarget(question.review_target);
 
   const submit = useCallback(
     async (answer: SubmitInterviewAnswer) => {
@@ -120,9 +128,14 @@ function InterviewQuestionDock({
       }
       body={
         <>
-          <p className="max-w-[78ch] text-base/6 font-medium text-pretty text-fg">
-            {question.text}
-          </p>
+          {reviewTarget ? (
+            <ReviewTargetQuestion
+              target={reviewTarget}
+              className={QUESTION_TEXT}
+            />
+          ) : (
+            <p className={QUESTION_TEXT}>{question.text}</p>
+          )}
           {question.context_display && (
             <ContextPanel text={question.context_display} />
           )}

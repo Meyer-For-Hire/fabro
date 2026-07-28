@@ -468,6 +468,8 @@ fn main() {
             &[],
         ),
         ("InterviewOption", "fabro_types::InterviewOption", &[]),
+        ("ReviewTarget", "fabro_types::ReviewTarget", &[]),
+        ("ReviewTargetKind", "fabro_types::ReviewTargetKind", &[]),
         (
             "InterviewQuestionRecord",
             "fabro_types::InterviewQuestionRecord",
