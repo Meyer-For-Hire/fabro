@@ -65,22 +65,14 @@ fn parse_child_graph(node: &Node, services: &EngineServices) -> Result<ParsedChi
         .get("stack.child_dot_source")
         .and_then(|v| v.as_str())
     {
-        let mut validated = validate_with_catalog(
-            ValidateInput {
-                workflow:          WorkflowInput::DotSource {
-                    source:   dot.to_string(),
-                    base_dir: None,
-                },
-                settings:          WorkflowSettings::default(),
-                vars:              std::collections::HashMap::new(),
-                cwd:               cwd.clone(),
-                custom_transforms: Vec::new(),
+        let graph = validate_child_workflow(
+            WorkflowInput::DotSource {
+                source:   dot.to_string(),
+                base_dir: None,
             },
-            &services.run.catalog,
+            cwd,
+            services,
         )?;
-        validated.promote_template_undefined_variables_to_errors();
-        validated.raise_on_errors()?;
-        let (graph, _, _) = validated.into_parts();
         return Ok(ParsedChildWorkflow {
             graph,
             workflow_path: None,
@@ -115,25 +107,36 @@ fn parse_child_graph(node: &Node, services: &EngineServices) -> Result<ParsedChi
             WorkflowInput::Bundled(workflow) => Some(workflow.path.clone()),
             WorkflowInput::Path(_) | WorkflowInput::DotSource { .. } => None,
         };
-        let mut validated = validate_with_catalog(
-            ValidateInput {
-                workflow,
-                settings: WorkflowSettings::default(),
-                vars: std::collections::HashMap::new(),
-                cwd,
-                custom_transforms: Vec::new(),
-            },
-            &services.run.catalog,
-        )?;
-        validated.promote_template_undefined_variables_to_errors();
-        validated.raise_on_errors()?;
-        let (graph, _, _) = validated.into_parts();
+        let graph = validate_child_workflow(workflow, cwd, services)?;
         return Ok(ParsedChildWorkflow {
             graph,
             workflow_path,
         });
     }
     Err(Error::handler("No child workflow source".to_string()))
+}
+
+/// Validate a child workflow against the run's catalog, failing on any error
+/// diagnostic (undefined template variables included).
+fn validate_child_workflow(
+    workflow: WorkflowInput,
+    cwd: PathBuf,
+    services: &EngineServices,
+) -> Result<Graph, Error> {
+    let mut validated = validate_with_catalog(
+        ValidateInput {
+            workflow,
+            settings: WorkflowSettings::default(),
+            vars: HashMap::new(),
+            cwd,
+            custom_transforms: Vec::new(),
+        },
+        &services.run.catalog,
+    )?;
+    validated.promote_template_undefined_variables_to_errors();
+    validated.raise_on_errors()?;
+    let (graph, _, _) = validated.into_parts();
+    Ok(graph)
 }
 
 #[async_trait]

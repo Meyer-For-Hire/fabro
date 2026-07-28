@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -9,8 +9,8 @@ use super::create::{configured_default_provider, preprocess_and_validate, templa
 use super::source::{ResolveWorkflowInput, WorkflowInput, resolve_workflow};
 use crate::error::Error;
 use crate::operations::RenderMode;
-use crate::pipeline::{ModelResolutionOptions, TransformOptions, Validated};
-use crate::transforms::Transform;
+use crate::pipeline::{TransformOptions, Validated};
+use crate::transforms::{ModelResolutionTransform, Transform};
 
 pub struct ValidateInput {
     pub workflow:          WorkflowInput,
@@ -22,17 +22,6 @@ pub struct ValidateInput {
     pub custom_transforms: Vec<Box<dyn Transform>>,
 }
 
-/// Which providers catalog-backed model resolution may select from. The
-/// workflow's own default provider is read from the resolved settings, so it
-/// is not part of the caller's request.
-struct CatalogScope<'a> {
-    catalog:            &'a Arc<Catalog>,
-    eligible_providers: HashSet<ProviderId>,
-    /// Fall back to the full catalog when the eligible providers cannot
-    /// supply a requested model, instead of erroring.
-    catalog_fallback:   bool,
-}
-
 /// Parse, transform, and structurally validate a DOT source string without a
 /// model catalog. Model and provider availability is left to the caller that
 /// owns a catalog — typically the server.
@@ -40,7 +29,7 @@ struct CatalogScope<'a> {
 /// Returns `Validated` even when validation produced errors. Call
 /// `validated.raise_on_errors()` if the caller wants to fail fast.
 pub fn validate(input: ValidateInput) -> Result<Validated, Error> {
-    validate_in_scope(input, None)
+    validate_resolving_models(input, None)
 }
 
 /// Parse, transform, and validate a DOT source string against `catalog`.
@@ -48,13 +37,9 @@ pub fn validate_with_catalog(
     input: ValidateInput,
     catalog: &Arc<Catalog>,
 ) -> Result<Validated, Error> {
-    validate_in_scope(
+    validate_resolving_models(
         input,
-        Some(CatalogScope {
-            catalog,
-            eligible_providers: catalog.all_provider_ids(),
-            catalog_fallback: false,
-        }),
+        Some(ModelResolutionTransform::new(Arc::clone(catalog))),
     )
 }
 
@@ -66,19 +51,24 @@ pub fn validate_with_ready_providers(
     catalog: &Arc<Catalog>,
     ready_providers: &[ProviderId],
 ) -> Result<Validated, Error> {
-    validate_in_scope(
+    validate_resolving_models(
         input,
-        Some(CatalogScope {
-            catalog,
-            eligible_providers: ready_providers.iter().cloned().collect(),
-            catalog_fallback: true,
-        }),
+        Some(
+            ModelResolutionTransform::for_eligible(
+                Arc::clone(catalog),
+                ready_providers.iter().cloned().collect(),
+            )
+            .with_catalog_fallback(true),
+        ),
     )
 }
 
-fn validate_in_scope(
+/// The workflow's own default provider is only known once the workflow is
+/// resolved, so callers hand in a partially built transform and it is
+/// completed here.
+fn validate_resolving_models(
     input: ValidateInput,
-    scope: Option<CatalogScope<'_>>,
+    model_resolution: Option<ModelResolutionTransform>,
 ) -> Result<Validated, Error> {
     let ValidateInput {
         workflow,
@@ -94,11 +84,8 @@ fn validate_in_scope(
     })
     .map_err(|err| Error::Parse(err.to_string()))?;
 
-    let model_resolution = scope.map(|scope| ModelResolutionOptions {
-        catalog:            Arc::clone(scope.catalog),
-        default_provider:   configured_default_provider(&resolved.settings),
-        eligible_providers: scope.eligible_providers,
-        catalog_fallback:   scope.catalog_fallback,
+    let model_resolution = model_resolution.map(|resolution| {
+        resolution.with_default_provider(configured_default_provider(&resolved.settings))
     });
 
     preprocess_and_validate(

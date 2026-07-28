@@ -4853,7 +4853,8 @@ async fn manager_loop_child_workflow_e2e() {
 
 #[tokio::test]
 async fn import_e2e_through_engine() {
-    use fabro_workflow::pipeline::{ModelResolutionOptions, TransformOptions, transform, validate};
+    use fabro_workflow::pipeline::{TransformOptions, transform, validate};
+    use fabro_workflow::transforms::ModelResolutionTransform;
 
     let dir = tempfile::tempdir().unwrap();
     let catalog = std::sync::Arc::new(
@@ -4905,7 +4906,9 @@ async fn import_e2e_through_engine() {
         source_name:       None,
         render_mode:       fabro_workflow::operations::RenderMode::Strict,
         custom_transforms: vec![],
-        model_resolution:  Some(ModelResolutionOptions::new(std::sync::Arc::clone(&catalog))),
+        model_resolution:  Some(ModelResolutionTransform::new(std::sync::Arc::clone(
+            &catalog,
+        ))),
     })
     .unwrap();
     let validated = validate(transformed, Some(catalog.as_ref()), &[]);

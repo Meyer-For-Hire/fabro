@@ -3,8 +3,8 @@ use std::sync::Arc;
 use super::types::{Parsed, TransformOptions, Transformed};
 use crate::error::Error;
 use crate::transforms::{
-    FileInliningTransform, ImportTransform, ModelResolutionTransform,
-    StylesheetApplicationTransform, TemplateTransform, Transform,
+    FileInliningTransform, ImportTransform, StylesheetApplicationTransform, TemplateTransform,
+    Transform,
 };
 
 /// TRANSFORM phase: apply built-in and custom transforms to a parsed graph.
@@ -63,16 +63,9 @@ pub fn transform(parsed: Parsed, options: &TransformOptions) -> Result<Transform
     .apply_with_diagnostics(graph)?;
     diagnostics.extend(transform_diagnostics);
     let graph = StylesheetApplicationTransform.apply(graph)?;
-    let graph = if let Some(model_resolution) = &options.model_resolution {
-        ModelResolutionTransform::for_eligible(
-            Arc::clone(&model_resolution.catalog),
-            model_resolution.eligible_providers.clone(),
-        )
-        .with_default_provider(model_resolution.default_provider.clone())
-        .with_catalog_fallback(model_resolution.catalog_fallback)
-        .apply(graph)?
-    } else {
-        graph
+    let graph = match &options.model_resolution {
+        Some(model_resolution) => model_resolution.apply(graph)?,
+        None => graph,
     };
 
     // Custom transforms
@@ -101,9 +94,8 @@ mod tests {
     use super::*;
     use crate::file_resolver::FilesystemFileResolver;
     use crate::pipeline::parse::parse;
-    use crate::pipeline::types::{
-        GOAL_SELF_REFERENCE_RULE, ModelResolutionOptions, TEMPLATE_UNDEFINED_VARIABLE_RULE,
-    };
+    use crate::pipeline::types::{GOAL_SELF_REFERENCE_RULE, TEMPLATE_UNDEFINED_VARIABLE_RULE};
+    use crate::transforms::ModelResolutionTransform;
 
     fn write_file(path: &Path, contents: &str) {
         if let Some(parent) = path.parent() {
@@ -124,7 +116,7 @@ mod tests {
             source_name:       None,
             render_mode:       crate::operations::RenderMode::Strict,
             custom_transforms: vec![],
-            model_resolution:  Some(ModelResolutionOptions::new(test_catalog())),
+            model_resolution:  Some(ModelResolutionTransform::new(test_catalog())),
         }
     }
 
@@ -180,13 +172,9 @@ mod tests {
         )
         .unwrap();
         let transformed = transform(parsed, &TransformOptions {
-            current_dir:       Some(dir.path().to_path_buf()),
-            file_resolver:     Some(Arc::new(FilesystemFileResolver::new(None))),
-            template_context:  fabro_template::TemplateContext::new(),
-            source_name:       None,
-            render_mode:       crate::operations::RenderMode::Strict,
-            custom_transforms: vec![],
-            model_resolution:  Some(ModelResolutionOptions::new(test_catalog())),
+            current_dir: Some(dir.path().to_path_buf()),
+            file_resolver: Some(Arc::new(FilesystemFileResolver::new(None))),
+            ..transform_options()
         })
         .unwrap();
 
@@ -227,18 +215,15 @@ mod tests {
         )
         .unwrap();
         let transformed = transform(parsed, &TransformOptions {
-            current_dir:       Some(dir.path().to_path_buf()),
-            file_resolver:     Some(Arc::new(FilesystemFileResolver::new(None))),
-            template_context:  fabro_template::TemplateContext::new().with_inputs(HashMap::from([
+            current_dir: Some(dir.path().to_path_buf()),
+            file_resolver: Some(Arc::new(FilesystemFileResolver::new(None))),
+            template_context: fabro_template::TemplateContext::new().with_inputs(HashMap::from([
                 (
                     "task".to_string(),
                     toml::Value::String("Launch".to_string()),
                 ),
             ])),
-            source_name:       None,
-            render_mode:       crate::operations::RenderMode::Strict,
-            custom_transforms: vec![],
-            model_resolution:  Some(ModelResolutionOptions::new(test_catalog())),
+            ..transform_options()
         })
         .unwrap();
 
@@ -357,13 +342,8 @@ mod tests {
         }"#;
         let parsed = parse(dot).unwrap();
         let transformed = transform(parsed, &TransformOptions {
-            current_dir:       None,
-            file_resolver:     None,
-            template_context:  fabro_template::TemplateContext::new(),
-            source_name:       None,
-            render_mode:       crate::operations::RenderMode::Strict,
-            custom_transforms: vec![],
-            model_resolution:  None,
+            model_resolution: None,
+            ..transform_options()
         })
         .unwrap();
         let work = &transformed.graph.nodes["work"];
@@ -394,13 +374,10 @@ mod tests {
         )
         .unwrap();
         let transformed = transform(parsed, &TransformOptions {
-            current_dir:       Some(dir.path().to_path_buf()),
-            file_resolver:     Some(Arc::new(FilesystemFileResolver::new(None))),
-            template_context:  fabro_template::TemplateContext::new(),
-            source_name:       None,
-            render_mode:       crate::operations::RenderMode::Structural,
-            custom_transforms: vec![],
-            model_resolution:  Some(ModelResolutionOptions::new(test_catalog())),
+            current_dir: Some(dir.path().to_path_buf()),
+            file_resolver: Some(Arc::new(FilesystemFileResolver::new(None))),
+            render_mode: crate::operations::RenderMode::Structural,
+            ..transform_options()
         })
         .unwrap();
 

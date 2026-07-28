@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -28,7 +28,7 @@ use crate::runtime_store::RunStoreHandle;
 use crate::services::{EngineServices, FabroRunToolServices, RunServices};
 use crate::stage_execution::StageExecutionSeed;
 use crate::steering_hub::SteeringHub;
-use crate::transforms::{RenderMode, Transform};
+use crate::transforms::{ModelResolutionTransform, RenderMode, Transform};
 use crate::workflow_bundle::WorkflowBundle;
 
 /// Output of the PARSE phase.
@@ -367,30 +367,7 @@ pub struct TransformOptions {
     pub custom_transforms: Vec<Box<dyn Transform>>,
     /// Catalog-backed model resolution to perform. `None` preserves authored
     /// model and provider selectors for catalog-free structural validation.
-    pub model_resolution:  Option<ModelResolutionOptions>,
-}
-
-/// Catalog-backed model resolution options for the TRANSFORM phase.
-pub struct ModelResolutionOptions {
-    pub catalog:            Arc<Catalog>,
-    pub default_provider:   Option<ProviderId>,
-    pub eligible_providers: HashSet<ProviderId>,
-    /// Fall back to the full catalog when the eligible providers cannot
-    /// supply a requested model, instead of erroring.
-    pub catalog_fallback:   bool,
-}
-
-impl ModelResolutionOptions {
-    #[must_use]
-    pub fn new(catalog: Arc<Catalog>) -> Self {
-        let eligible_providers = catalog.all_provider_ids();
-        Self {
-            catalog,
-            default_provider: None,
-            eligible_providers,
-            catalog_fallback: false,
-        }
-    }
+    pub model_resolution:  Option<ModelResolutionTransform>,
 }
 
 /// Options for the FINALIZE phase.

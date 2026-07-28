@@ -24,11 +24,11 @@ use crate::error::Error;
 use crate::event::{Event, append_event, to_run_event_at};
 use crate::file_resolver::FileResolver;
 use crate::pipeline::types::PersistOptions;
-use crate::pipeline::{self, ModelResolutionOptions, Persisted, TransformOptions, Validated};
+use crate::pipeline::{self, Persisted, TransformOptions, Validated};
 use crate::records::RunSpec;
 use crate::run_lookup::default_scratch_base;
 use crate::run_materialization::materialize_run;
-use crate::transforms::RenderMode;
+use crate::transforms::{ModelResolutionTransform, RenderMode};
 use crate::workflow_bundle::{RunDefinition, WorkflowBundle};
 
 #[derive(Clone, Debug)]
@@ -300,12 +300,13 @@ fn create_from_source(
         source_name: options.source_name.clone(),
         render_mode: RenderMode::Structural,
         custom_transforms: Vec::new(),
-        model_resolution: Some(ModelResolutionOptions {
-            catalog:            Arc::clone(&options.catalog),
-            default_provider:   configured_default_provider(&options.settings),
-            eligible_providers: options.configured_providers.iter().cloned().collect(),
-            catalog_fallback:   false,
-        }),
+        model_resolution: Some(
+            ModelResolutionTransform::for_eligible(
+                Arc::clone(&options.catalog),
+                options.configured_providers.iter().cloned().collect(),
+            )
+            .with_default_provider(configured_default_provider(&options.settings)),
+        ),
     })?;
 
     validated.promote_template_undefined_variables_to_errors();
@@ -336,7 +337,7 @@ pub(super) fn preprocess_and_validate(
     let catalog = options
         .model_resolution
         .as_ref()
-        .map(|resolution| resolution.catalog.as_ref());
+        .map(ModelResolutionTransform::catalog);
     Ok(pipeline::validate(transformed, catalog, &[]))
 }
 
@@ -594,12 +595,7 @@ reasoning = false
             source_name: Some("workflow.fabro".to_string()),
             render_mode,
             custom_transforms: Vec::new(),
-            model_resolution: Some(ModelResolutionOptions {
-                catalog:            test_catalog(),
-                default_provider:   None,
-                eligible_providers: test_provider_ids().into_iter().collect(),
-                catalog_fallback:   false,
-            }),
+            model_resolution: Some(ModelResolutionTransform::new(test_catalog())),
         }
     }
 
