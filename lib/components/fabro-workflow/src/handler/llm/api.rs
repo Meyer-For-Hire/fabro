@@ -10,7 +10,7 @@ use fabro_agent::{
     Sandbox, Session, SessionOptions, SessionShutdownReason, StaticEnvProvider, ToolEnvProvider,
     ToolSecrets, WebFetchSummarizer, canonical_tool_name, register_question_tools,
 };
-use fabro_auth::{CredentialSource, EnvCredentialSource};
+use fabro_auth::CredentialSource;
 use fabro_graphviz::graph::{AttrValue, Node};
 use fabro_llm::client::Client;
 use fabro_llm::types::{
@@ -693,22 +693,6 @@ impl AgentApiBackend {
             catalog,
             fabro_run_tools: None,
         }
-    }
-
-    #[must_use]
-    pub fn new_from_env(
-        model: String,
-        provider_id: impl Into<ProviderId>,
-        fallback_chain: Vec<FallbackTarget>,
-        steering_hub: Arc<SteeringHub>,
-    ) -> Self {
-        Self::new(
-            model,
-            provider_id,
-            fallback_chain,
-            Arc::new(EnvCredentialSource::new()),
-            steering_hub,
-        )
     }
 
     #[must_use]
@@ -1729,7 +1713,7 @@ mod tests {
     use fabro_agent::subagent::SessionFactory;
     use fabro_agent::{AgentProfile, LocalSandbox, ToolRegistry};
     use fabro_api::types;
-    use fabro_auth::{EnvCredentialSource, VaultCredentialSource};
+    use fabro_auth::{VaultCredentialSource, test_support as auth_test_support};
     use fabro_llm::provider::{ProviderAdapter, StreamEventStream};
     use fabro_llm::{Error as LlmError, ProviderErrorDetail, ProviderErrorKind};
     use fabro_tool::FabroToolBackend;
@@ -1906,18 +1890,18 @@ reasoning = false
     }
 
     fn mock_api_backend(server: &MockServer) -> AgentApiBackend {
-        let source = EnvCredentialSource::with_env_lookup(Arc::new(|name| {
+        let source = auth_test_support::env_credential_source(|name| {
             if name == "MOCK_API_KEY" {
                 Some("sk-test".to_string())
             } else {
                 None
             }
-        }));
+        });
         AgentApiBackend::new_with_catalog(
             "mock-model".to_string(),
             ProviderId::from("mock"),
             Vec::new(),
-            Arc::new(source),
+            source,
             SteeringHub::for_tests(),
             mock_llm_catalog(server),
         )
@@ -2015,10 +1999,11 @@ reasoning = false
 
     #[test]
     fn agent_backend_stores_config() {
-        let backend = AgentApiBackend::new_from_env(
+        let backend = AgentApiBackend::new(
             "claude-opus-4-6".to_string(),
             ProviderId::openai(),
             Vec::new(),
+            auth_test_support::vault_only_credential_source(),
             SteeringHub::for_tests(),
         );
         assert_eq!(backend.model, "claude-opus-4-6");
@@ -2027,10 +2012,11 @@ reasoning = false
 
     #[test]
     fn agent_backend_initializes_empty_sessions() {
-        let backend = AgentApiBackend::new_from_env(
+        let backend = AgentApiBackend::new(
             "claude-opus-4-6".to_string(),
             ProviderId::anthropic(),
             Vec::new(),
+            auth_test_support::vault_only_credential_source(),
             SteeringHub::for_tests(),
         );
         assert!(backend.sessions.lock().unwrap().is_empty());
@@ -2733,7 +2719,7 @@ enabled = true
             "gpt-5.4".to_string(),
             ProviderId::from("openrouter"),
             Vec::new(),
-            Arc::new(EnvCredentialSource::new()),
+            auth_test_support::vault_only_credential_source(),
             SteeringHub::for_tests(),
             Arc::new(Catalog::from_builtin_with_overrides(&settings).unwrap()),
         );
@@ -2749,7 +2735,7 @@ enabled = true
             "gpt-5.4".to_string(),
             ProviderId::from("openrouter"),
             Vec::new(),
-            Arc::new(EnvCredentialSource::new()),
+            auth_test_support::vault_only_credential_source(),
             SteeringHub::for_tests(),
             Arc::new(Catalog::from_builtin().unwrap()),
         );
@@ -2796,7 +2782,7 @@ reasoning = false
             "acme-llama".to_string(),
             ProviderId::from("acme"),
             Vec::new(),
-            Arc::new(EnvCredentialSource::new()),
+            auth_test_support::vault_only_credential_source(),
             SteeringHub::for_tests(),
             catalog,
         );
@@ -2843,7 +2829,7 @@ reasoning = false
             "acme-claude".to_string(),
             ProviderId::from("acme"),
             Vec::new(),
-            Arc::new(EnvCredentialSource::new()),
+            auth_test_support::vault_only_credential_source(),
             SteeringHub::for_tests(),
             catalog,
         );
@@ -2860,7 +2846,7 @@ reasoning = false
             "claude-sonnet-5".to_string(),
             ProviderId::anthropic(),
             Vec::new(),
-            Arc::new(EnvCredentialSource::new()),
+            auth_test_support::vault_only_credential_source(),
             SteeringHub::for_tests(),
             Arc::new(Catalog::from_builtin().unwrap()),
         );
@@ -2887,7 +2873,7 @@ enabled = true
             "openai/gpt-5.4".to_string(),
             ProviderId::from("openrouter"),
             Vec::new(),
-            Arc::new(EnvCredentialSource::new()),
+            auth_test_support::vault_only_credential_source(),
             SteeringHub::for_tests(),
             catalog,
         );
@@ -2902,10 +2888,11 @@ enabled = true
 
     #[test]
     fn run_model_controls_apply_when_node_omits_controls() {
-        let backend = AgentApiBackend::new_from_env(
+        let backend = AgentApiBackend::new(
             "gpt-5.4".to_string(),
             ProviderId::openai(),
             Vec::new(),
+            auth_test_support::vault_only_credential_source(),
             SteeringHub::for_tests(),
         )
         .with_run_model_controls(fabro_types::settings::run::RunModelControls {
@@ -2922,10 +2909,11 @@ enabled = true
 
     #[test]
     fn node_controls_override_run_model_controls() {
-        let backend = AgentApiBackend::new_from_env(
+        let backend = AgentApiBackend::new(
             "gpt-5.4".to_string(),
             ProviderId::openai(),
             Vec::new(),
+            auth_test_support::vault_only_credential_source(),
             SteeringHub::for_tests(),
         )
         .with_run_model_controls(fabro_types::settings::run::RunModelControls {
@@ -2950,10 +2938,11 @@ enabled = true
 
     #[test]
     fn omitted_reasoning_effort_stays_unset() {
-        let backend = AgentApiBackend::new_from_env(
+        let backend = AgentApiBackend::new(
             "gpt-5.4".to_string(),
             ProviderId::openai(),
             Vec::new(),
+            auth_test_support::vault_only_credential_source(),
             SteeringHub::for_tests(),
         );
         let node = Node::new("work");
@@ -2999,10 +2988,11 @@ enabled = true
             provider: "openai".to_string(),
             model:    "gpt-5.5".to_string(),
         }];
-        let backend = AgentApiBackend::new_from_env(
+        let backend = AgentApiBackend::new(
             "claude-fable-5".to_string(),
             ProviderId::anthropic(),
             fallback_chain.clone(),
+            auth_test_support::vault_only_credential_source(),
             SteeringHub::for_tests(),
         );
         let mut providers = HashMap::new();
@@ -3272,10 +3262,11 @@ enabled = true
 
     #[tokio::test]
     async fn api_backend_shutdown_closes_cached_sessions_once() {
-        let backend = AgentApiBackend::new_from_env(
+        let backend = AgentApiBackend::new(
             "gpt-5.4".to_string(),
             ProviderId::openai(),
             Vec::new(),
+            auth_test_support::vault_only_credential_source(),
             SteeringHub::for_tests(),
         );
         let emitter = Arc::new(Emitter::new(fabro_types::RunId::new()));

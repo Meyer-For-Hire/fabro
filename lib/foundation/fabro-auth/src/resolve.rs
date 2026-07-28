@@ -10,8 +10,6 @@ use tokio::sync::RwLock as AsyncRwLock;
 use tokio::task::spawn_blocking;
 
 use crate::credential::{ApiKeyHeader, OAuthCredential};
-use crate::credential_source::CredentialSource;
-use crate::env_source::EnvCredentialSource;
 use crate::refresh::refresh_oauth_credential;
 use crate::vault_ext::{
     VaultLookupError, vault_get_oauth, vault_get_token, vault_set_oauth, vault_token_lookup,
@@ -238,8 +236,7 @@ impl CredentialResolver {
         };
         if catalog_provider.auth.is_none() {
             let vault = self.vault.read().await;
-            return self
-                .api_credential_from_provider_auth(&vault, catalog_provider, catalog)
+            return Self::api_credential_from_provider_auth(&vault, catalog_provider, catalog)
                 .map(ResolvedCredential::Api);
         }
         let initial_secret = {
@@ -332,9 +329,7 @@ impl CredentialResolver {
         catalog: &Catalog,
     ) -> bool {
         let Some(auth) = &provider.auth else {
-            return self
-                .resolved_extra_headers_for_catalog(vault, &provider.id, catalog)
-                .is_ok();
+            return Self::resolved_extra_headers_for_catalog(vault, &provider.id, catalog).is_ok();
         };
         auth.credentials.iter().any(|credential_ref| {
             self.credential_from_ref(vault, &provider.id, credential_ref)
@@ -372,10 +367,6 @@ impl CredentialResolver {
         }
     }
 
-    fn lookup_env(&self, name: &str) -> Option<String> {
-        (self.env_lookup)(name)
-    }
-
     fn provider_base_url_for_catalog(provider: &ProviderId, catalog: &Catalog) -> Option<String> {
         catalog
             .provider(provider)
@@ -383,7 +374,6 @@ impl CredentialResolver {
     }
 
     fn resolved_extra_headers_for_catalog(
-        &self,
         vault: &Vault,
         provider: &ProviderId,
         catalog: &Catalog,
@@ -391,9 +381,8 @@ impl CredentialResolver {
         let Some(catalog_provider) = catalog.provider(provider) else {
             return Ok(HashMap::new());
         };
-        let mut ctx = ResolveCtx::new()
-            .with_env(|env_name| self.lookup_env(env_name))
-            .with_secrets(|secret_name| vault_token_lookup(vault, secret_name));
+        let mut ctx =
+            ResolveCtx::new().with_secrets(|secret_name| vault_token_lookup(vault, secret_name));
         resolve_extra_headers(provider, &catalog_provider.extra_headers, &mut ctx)
     }
 
@@ -411,7 +400,7 @@ impl CredentialResolver {
             ResolvedSecret::AwsSigv4 => Ok(ApiCredential {
                 provider: provider_id.clone(),
                 auth_header: Some(ApiKeyHeader::AwsSigv4),
-                extra_headers: self.resolved_extra_headers_for_catalog(
+                extra_headers: Self::resolved_extra_headers_for_catalog(
                     vault,
                     provider_id,
                     catalog,
@@ -429,7 +418,7 @@ impl CredentialResolver {
                 let mut cred = ApiCredential {
                     provider: provider_id.clone(),
                     auth_header: Some(auth_header),
-                    extra_headers: self.resolved_extra_headers_for_catalog(
+                    extra_headers: Self::resolved_extra_headers_for_catalog(
                         vault,
                         provider_id,
                         catalog,
@@ -448,7 +437,7 @@ impl CredentialResolver {
                 let mut api_credential = ApiCredential {
                     provider: provider_id.clone(),
                     auth_header: Some(ApiKeyHeader::Bearer(credential.tokens.access_token.clone())),
-                    extra_headers: self.resolved_extra_headers_for_catalog(
+                    extra_headers: Self::resolved_extra_headers_for_catalog(
                         vault,
                         provider_id,
                         catalog,
@@ -471,7 +460,6 @@ impl CredentialResolver {
     }
 
     fn api_credential_from_provider_auth(
-        &self,
         vault: &Vault,
         provider: &CatalogProvider,
         catalog: &Catalog,
@@ -479,8 +467,7 @@ impl CredentialResolver {
         if provider.auth.is_some() {
             return Err(ResolveError::NotConfigured(provider.id.clone()));
         }
-        let extra_headers =
-            self.resolved_extra_headers_for_catalog(vault, &provider.id, catalog)?;
+        let extra_headers = Self::resolved_extra_headers_for_catalog(vault, &provider.id, catalog)?;
         Ok(ApiCredential {
             provider: provider.id.clone(),
             auth_header: None,
@@ -533,23 +520,6 @@ fn vault_lookup_error(provider: &ProviderId, name: &str, err: VaultLookupError) 
     }
 }
 
-pub async fn configured_providers_from_process_env(
-    vault: Option<&Arc<AsyncRwLock<Vault>>>,
-    catalog: &Catalog,
-) -> Vec<ProviderId> {
-    match vault {
-        Some(vault_arc) => {
-            let resolver = CredentialResolver::new(Arc::clone(vault_arc));
-            let guard = vault_arc.read().await;
-            resolver.configured_providers(&guard, catalog)
-        }
-        None => {
-            EnvCredentialSource::new()
-                .configured_providers(catalog)
-                .await
-        }
-    }
-}
 #[cfg(test)]
 mod tests {
     use std::error::Error as _;

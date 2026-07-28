@@ -69,19 +69,17 @@ fn spawn_worker_process(
         "FABRO_WORKER_TOKEN",
         issue_test_worker_jwt(&context.storage_dir, run_id),
     );
-    cmd.args([
-        "__run-worker",
-        "--server",
-        server,
-        "--run-dir",
-        run_dir
-            .to_str()
-            .expect("run directory path should be valid UTF-8"),
-        "--run-id",
-        run_id,
-        "--mode",
-        mode,
-    ]);
+    cmd.arg("__run-worker")
+        .arg("--storage-dir")
+        .arg(&context.storage_dir)
+        .arg("--server")
+        .arg(server)
+        .arg("--run-dir")
+        .arg(run_dir)
+        .arg("--run-id")
+        .arg(run_id)
+        .arg("--mode")
+        .arg(mode);
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -124,8 +122,16 @@ fn child_output(mut child: Child, status: ExitStatus) -> Output {
     }
 }
 
-fn worker_command(context: &fabro_test::TestContext, run_id: &str) -> assert_cmd::Command {
+fn worker_base_command(context: &fabro_test::TestContext) -> assert_cmd::Command {
     let mut cmd = context.command();
+    cmd.arg("__run-worker")
+        .arg("--storage-dir")
+        .arg(&context.storage_dir);
+    cmd
+}
+
+fn worker_command(context: &fabro_test::TestContext, run_id: &str) -> assert_cmd::Command {
+    let mut cmd = worker_base_command(context);
     cmd.env(
         "FABRO_WORKER_TOKEN",
         issue_test_worker_jwt(&context.storage_dir, run_id),
@@ -189,7 +195,7 @@ fn help() {
     ----- stdout -----
     Internal: execute a single workflow run locally
 
-    Usage: fabro __run-worker [OPTIONS] --server <SERVER> --run-dir <RUN_DIR> --run-id <RUN_ID> --mode <MODE>
+    Usage: fabro __run-worker [OPTIONS] --server <SERVER> --storage-dir <STORAGE_DIR> --run-dir <RUN_DIR> --run-id <RUN_ID> --mode <MODE>
 
     Options:
           --json               Output as JSON [env: FABRO_JSON=]
@@ -211,10 +217,8 @@ fn worker_requires_fabro_worker_token_env() {
     let context = auth_context();
     let run_dir = tempfile::tempdir().unwrap();
     let run_id = unique_run_id();
-    let output = context
-        .command()
+    let output = worker_base_command(&context)
         .args([
-            "__run-worker",
             "--server",
             "http://127.0.0.1:32276",
             "--run-dir",
@@ -272,7 +276,6 @@ digraph CachedGraph {
 
     let output = worker_command(&context, run_id.as_str())
         .args([
-            "__run-worker",
             "--server",
             server.as_str(),
             "--run-dir",
@@ -341,7 +344,6 @@ digraph GitHubApp {
     let mut cmd = worker_command(&context, run_id.as_str());
     cmd.env("GITHUB_APP_PRIVATE_KEY", "%%%not-base64%%%");
     cmd.args([
-        "__run-worker",
         "--server",
         server.as_str(),
         "--run-dir",
@@ -390,7 +392,6 @@ digraph DetachedStoreOnly {
     let server = server_target(&context.storage_dir);
     let output = worker_command(&context, run_id.as_str())
         .args([
-            "__run-worker",
             "--server",
             server.as_str(),
             "--run-dir",
@@ -608,7 +609,6 @@ digraph Test {
 
     let mut cmd = worker_command(&context, &run_id);
     cmd.args([
-        "__run-worker",
         "--server",
         &server,
         "--run-dir",
@@ -673,7 +673,6 @@ fn runner_reports_malformed_run_state_without_prefetching_events() {
 
     let output = worker_command(&context, &run_id)
         .args([
-            "__run-worker",
             "--server",
             &format!("{}/api/v1", server.base_url()),
             "--run-dir",

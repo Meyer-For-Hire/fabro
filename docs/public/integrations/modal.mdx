@@ -113,23 +113,34 @@ digraph Example {
 
 ## Direct SDK environment credentials
 
-The built-in Modal provider reads its two headers from the Fabro vault. Direct SDK code that uses `EnvCredentialSource` must explicitly change those header sources to environment variables:
+The built-in Modal provider reads its two headers from the Fabro vault. `EnvCredentialSource` does not configure Modal automatically because Modal uses two headers instead of one API-key reference.
+
+For direct SDK use, enable Modal and set its endpoint URL in the catalog:
 
 ```toml title="settings.toml"
 [llm.providers.modal]
 enabled = true
 base_url = "https://your-endpoint.modal.run/v1"
-
-[llm.providers.modal.extra_headers]
-"Modal-Key" = "{{ env.MODAL_TOKEN_ID }}"
-"Modal-Secret" = "{{ env.MODAL_TOKEN_SECRET }}"
 ```
 
-Then export both values before starting the process:
+Then read both environment variables explicitly and create a typed credential after constructing `catalog` from those settings:
 
-```bash
-export MODAL_TOKEN_ID=wk-...
-export MODAL_TOKEN_SECRET=ws-...
+```rust
+use fabro_auth::ApiCredential;
+use fabro_llm::client::Client;
+use std::collections::HashMap;
+
+let credential = ApiCredential::with_extra_headers(
+    "modal",
+    HashMap::from([
+        ("Modal-Key".to_string(), std::env::var("MODAL_TOKEN_ID")?),
+        (
+            "Modal-Secret".to_string(),
+            std::env::var("MODAL_TOKEN_SECRET")?,
+        ),
+    ]),
+);
+let client = Client::from_credentials(vec![credential], catalog).await?;
 ```
 
 ## Costs

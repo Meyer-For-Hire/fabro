@@ -15,7 +15,7 @@ Goal templates can reference inputs and server-managed variables. Prompt templat
 | `{{ inputs.name }}` | A value from `[run.inputs]`, optionally overridden by CLI input flags |
 | `{{ vars.NAME }}` | A server-managed variable snapshotted when the run is created |
 
-Environment variables and secrets are **not** available in goal or prompt templates. Use `{{ env.NAME }}` and `{{ secrets.NAME }}` only in the configuration fields that support run-boundary interpolation.
+Secrets are **not** available in goal or prompt templates. Use `{{ secrets.NAME }}` only in the configuration fields that support run-boundary interpolation.
 
 ## Run config inputs
 

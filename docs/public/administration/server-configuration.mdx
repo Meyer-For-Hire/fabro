@@ -218,7 +218,7 @@ provider = "s3"
 disk_cache = true
 
 [server.slatedb.s3]
-bucket = "{{ env.SLATEDB_BUCKET }}"
+bucket = "fabro-production"
 region = "us-east-1"
 ```
 
@@ -466,7 +466,7 @@ GitHub App mode stores these secrets in the vault. `fabro install` writes them a
 
 ### Slack integration (optional)
 
-Slack credentials are server-level secrets. Add `[server.integrations.slack]` to enable one Slack connection that is shared by human interview prompts and run lifecycle notifications. `server.integrations.slack.default_channel` is an optional literal channel name used only as the default destination for interview prompts; it does not interpolate `{{ env.* }}`. Lifecycle notifications use `[run.notifications.<name>.slack].channel` in run or workflow configuration.
+Slack credentials are server-level secrets. Add `[server.integrations.slack]` to enable one Slack connection that is shared by human interview prompts and run lifecycle notifications. `server.integrations.slack.default_channel` is an optional literal channel name used only as the default destination for interview prompts; it does not interpolate. Lifecycle notifications use `[run.notifications.<name>.slack].channel` in run or workflow configuration.
 
 Fabro resolves these from the vault only. When `[server.integrations.slack]` is present and both credentials are present, startup logs `Slack integration enabled` and then the Slack Socket Mode connection status. If the Slack config table is absent or `enabled = false`, startup logs `Slack integration disabled by server configuration`. If the table is present but either credential is missing or empty, startup logs `Slack integration disabled; missing credentials` with the missing variable names.
 

@@ -8,7 +8,7 @@ pub(crate) fn build_github_credentials(
     strategy: GithubIntegrationStrategy,
     app_id: Option<&str>,
     app_slug: Option<&str>,
-    vault: Option<&Vault>,
+    vault: &Vault,
 ) -> anyhow::Result<Option<GitHubCredentials>> {
     match strategy {
         GithubIntegrationStrategy::App => {
@@ -31,7 +31,7 @@ pub(crate) fn build_github_credentials(
 
 /// Look up GitHub token: GITHUB_TOKEN env -> vault GITHUB_TOKEN -> GH_TOKEN env
 /// -> vault GH_TOKEN
-fn lookup_github_token(vault: Option<&Vault>) -> Option<String> {
+fn lookup_github_token(vault: &Vault) -> Option<String> {
     lookup_env_or_vault(EnvVars::GITHUB_TOKEN, vault)
         .or_else(|| lookup_env_or_vault(EnvVars::GH_TOKEN, vault))
 }
@@ -40,10 +40,10 @@ fn lookup_github_token(vault: Option<&Vault>) -> Option<String> {
     clippy::disallowed_methods,
     reason = "GitHub credential resolution intentionally falls back from vault to documented process-env names."
 )]
-fn lookup_env_or_vault(name: &str, vault: Option<&Vault>) -> Option<String> {
+fn lookup_env_or_vault(name: &str, vault: &Vault) -> Option<String> {
     std::env::var(name)
         .ok()
-        .or_else(|| vault.and_then(|v| v.get(name).map(str::to_string)))
+        .or_else(|| vault.get(name).map(str::to_string))
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
 }

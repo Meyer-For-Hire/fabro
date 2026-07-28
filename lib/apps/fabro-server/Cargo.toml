@@ -109,6 +109,7 @@ fabro-build-support = { path = "../../foundation/build-support" }
 chrono = { workspace = true }
 
 [dev-dependencies]
+fabro-auth = { path = "../../foundation/fabro-auth", features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tower = "0.5"
 http-body-util = "0.1"

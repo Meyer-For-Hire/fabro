@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use fabro_auth::{CredentialSource, EnvCredentialSource, VaultCredentialSource};
+use fabro_auth::{CredentialSource, VaultCredentialSource};
 use fabro_interview::{AutoApproveInterviewer, Interviewer};
 use fabro_llm::client::Client as LlmClient;
 use fabro_mcp::config::McpServerSettings;
@@ -81,7 +81,7 @@ struct RunSession {
     workflow_path:     Option<ManifestPath>,
     workflow_bundle:   Option<Arc<WorkflowBundle>>,
     run_control:       Option<Arc<RunControlState>>,
-    vault:             Option<Arc<AsyncRwLock<Vault>>>,
+    vault:             Arc<AsyncRwLock<Vault>>,
     catalog:           Arc<Catalog>,
     fabro_run_tools:   Option<FabroRunToolServices>,
 }
@@ -106,7 +106,7 @@ pub struct StartServices {
     /// Server-resolved GitHub integration permissions to inject into the
     /// sandbox env. Empty when github integration has no permissions.
     pub github_permissions: HashMap<String, String>,
-    pub vault:              Option<Arc<AsyncRwLock<Vault>>>,
+    pub vault:              Arc<AsyncRwLock<Vault>>,
     pub catalog:            Arc<Catalog>,
     pub on_node:            crate::OnNodeCallback,
     pub registry_override:  Option<Arc<HandlerRegistry>>,
@@ -374,7 +374,7 @@ impl RunSession {
             resolve_sandbox_provider(resolved).effective_for(resolved.execution.mode);
         let catalog = Arc::clone(&services.catalog);
         let configured =
-            configured_providers_for_start(services.vault.as_ref(), Arc::clone(&catalog)).await;
+            configured_providers_for_start(&services.vault, Arc::clone(&catalog)).await;
         #[cfg(feature = "test-support")]
         let configured = workflow_test_support::test_configured_provider_ids(
             catalog.as_ref(),
@@ -383,22 +383,17 @@ impl RunSession {
                 .is_some_and(|value| !matches!(value.as_str(), "" | "0" | "false" | "no")),
         );
         let llm = resolve_start_llm(catalog.as_ref(), &configured, resolved)?;
-        let vault_guard = match services.vault.as_ref() {
-            Some(vault) => Some(vault.read().await),
-            None => None,
-        };
+        let vault_guard = services.vault.read().await;
         // Token-only secrets lookup over the vault read guard, shared across
         // every run-boundary resolver. A missing or non-Token secret becomes
         // `None`, so resolution fails closed with a secret error.
-        let secret_lookup = |name: &str| vault_token_lookup(vault_guard.as_deref(), name);
+        let secret_lookup = |name: &str| vault_token_lookup(&vault_guard, name);
         let mcp_servers = resolved
             .agent
             .mcps
             .iter()
             .map(|(key, entry)| match entry {
-                ResolvedMcpEntry::Resolved(server) => {
-                    runtime_mcp_server(server, process_env_var, secret_lookup)
-                }
+                ResolvedMcpEntry::Resolved(server) => runtime_mcp_server(server, secret_lookup),
                 // References must be resolved to concrete servers before the run
                 // spec is persisted (server-side run-preparation pass). Reaching
                 // worker startup with an unresolved reference is an invariant
@@ -436,10 +431,9 @@ impl RunSession {
                 clone_branch:     record.base_branch().map(str::to_string),
             },
             SandboxProviderKind::Daytona => {
-                let api_key = match vault_guard.as_deref() {
-                    Some(vault) => vault.get(EnvVars::DAYTONA_API_KEY).map(str::to_string),
-                    None => None,
-                };
+                let api_key = vault_guard
+                    .get(EnvVars::DAYTONA_API_KEY)
+                    .map(str::to_string);
                 SandboxSpec::Daytona {
                     config: Box::new(resolve_daytona_config(resolved)),
                     github_app: services.github_app.clone(),
@@ -453,7 +447,7 @@ impl RunSession {
 
         let toml_env = resolved
             .environment
-            .resolve_env(process_env_var, secret_lookup)
+            .resolve_env(secret_lookup)
             .map_err(|err| Error::engine_with_source("failed to resolve run environment", err))?;
         let github_permissions: Option<HashMap<String, String>> =
             (!services.github_permissions.is_empty()).then(|| services.github_permissions.clone());
@@ -471,8 +465,7 @@ impl RunSession {
         };
 
         let pr_config = resolved.pull_request.clone();
-        let setup_commands =
-            runtime_setup_commands(&resolved.prepare, process_env_var, secret_lookup)?;
+        let setup_commands = runtime_setup_commands(&resolved.prepare, secret_lookup)?;
         drop(vault_guard);
 
         Ok(Self {
@@ -522,16 +515,13 @@ impl RunSession {
 }
 
 async fn configured_providers_for_start(
-    vault: Option<&Arc<AsyncRwLock<Vault>>>,
+    vault: &Arc<AsyncRwLock<Vault>>,
     catalog: Arc<Catalog>,
 ) -> Vec<ProviderId> {
-    let source: Arc<dyn CredentialSource> = match vault {
-        Some(vault) => Arc::new(VaultCredentialSource::with_env_lookup(
-            Arc::clone(vault),
-            process_env_var,
-        )),
-        None => Arc::new(EnvCredentialSource::new()),
-    };
+    let source: Arc<dyn CredentialSource> = Arc::new(VaultCredentialSource::with_env_lookup(
+        Arc::clone(vault),
+        process_env_var,
+    ));
     match LlmClient::from_source_report(source.as_ref(), catalog).await {
         Ok(report) => report
             .client
@@ -566,14 +556,14 @@ fn git_checkpoint_options_from_start(
 
 #[expect(
     clippy::disallowed_methods,
-    reason = "Run startup interpolation owns a process-env lookup facade for {{ env.* }} values."
+    reason = "Run startup reads process env only for explicit provider credential refs and test mode."
 )]
 fn process_env_var(name: &str) -> Option<String> {
     std::env::var(name).ok()
 }
 
-fn vault_token_lookup(vault: Option<&Vault>, name: &str) -> Option<String> {
-    vault.and_then(|vault| fabro_auth::vault_get_token(vault, name).ok().flatten())
+fn vault_token_lookup(vault: &Vault, name: &str) -> Option<String> {
+    fabro_auth::vault_get_token(vault, name).ok().flatten()
 }
 
 async fn load_accepted_run_definition(
@@ -717,25 +707,22 @@ fn canonical_provider_id(catalog: &Catalog, provider_name: &str) -> ProviderId {
         .map_or(provider_id, |provider| provider.id.clone())
 }
 
-/// Build the launch-time MCP config from resolved settings, resolving any
-/// `{{ env.* }}` and `{{ secrets.* }}` tokens in the transport
-/// (`command`/`url`/`env`/`headers`) against the worker process environment and
-/// vault — the run boundary where the MCP is actually launched.
+/// Build the launch-time MCP config from resolved settings. Secret tokens in
+/// the transport (`command`/`url`/`env`/`headers`) resolve from the vault at
+/// the run boundary. Unsupported tokens fail.
 ///
 /// The resolution itself lives on the type
-/// ([`McpServerSettings::resolve_transport_env`]) so `fabro run` (here) and
+/// ([`McpServerSettings::resolve_transport_secrets`]) so `fabro run` (here) and
 /// `fabro exec` share one resolver; this wrapper just adds the server name to
 /// the error. MCP transport strings are carried in source form out of the
-/// config resolve layer so `fabro validate` stays portable (it never requires
-/// env to be set), and a referenced env var or secret that is unset is a hard
-/// error — no fallback to the unresolved source.
+/// config resolve layer so `fabro validate` stays portable. A missing or
+/// non-token secret is a hard error.
 fn runtime_mcp_server(
     settings: &ResolvedMcpServerSettings,
-    env_lookup: impl FnMut(&str) -> Option<String>,
     secrets_lookup: impl FnMut(&str) -> Option<String>,
 ) -> Result<McpServerSettings, Error> {
     settings
-        .resolve_transport_env(env_lookup, secrets_lookup)
+        .resolve_transport_secrets(secrets_lookup)
         .map_err(|err| {
             Error::engine_with_source(
                 format!("failed to resolve MCP server {:?}", settings.name),
@@ -744,25 +731,22 @@ fn runtime_mcp_server(
         })
 }
 
-/// Build the launch-time setup (prepare) commands from resolved settings,
-/// resolving any `{{ env.* }}` and `{{ secrets.* }}` tokens in each step's
-/// command and per-step env against the worker process environment and vault —
-/// the run boundary where the steps actually run.
+/// Build the launch-time setup (prepare) commands from resolved settings.
+/// Secret tokens in each step's command and per-step env resolve from the vault
+/// at the run boundary. Unsupported tokens fail.
 ///
 /// The resolution itself lives on the type
-/// ([`ResolvedRunPrepareSettings::resolve_step_env`]) so prepare-step env
+/// ([`ResolvedRunPrepareSettings::resolve_step_secrets`]) so prepare-step
 /// resolution shares one resolver with the rest of the run-boundary
 /// interpolation. Prepare-step commands and env are carried in source form out
-/// of the config resolve layer so `fabro validate` stays portable (it never
-/// requires env to be set), and a referenced env var or secret that is unset is
-/// a hard error — no fallback to the unresolved source.
+/// of the config resolve layer so `fabro validate` stays portable. A missing or
+/// non-token secret is a hard error.
 fn runtime_setup_commands(
     prepare: &ResolvedRunPrepareSettings,
-    env_lookup: impl FnMut(&str) -> Option<String>,
     secrets_lookup: impl FnMut(&str) -> Option<String>,
 ) -> Result<Vec<SetupCommand>, Error> {
     let resolved = prepare
-        .resolve_step_env(env_lookup, secrets_lookup)
+        .resolve_step_secrets(secrets_lookup)
         .map_err(|err| Error::engine_with_source("failed to resolve prepare step", err))?;
     Ok(resolved
         .steps
@@ -1651,7 +1635,7 @@ reasoning = false
             ..ResolvedMcpServerSettings::default()
         };
 
-        let err = runtime_mcp_server(&settings, |_| None, |_| None).unwrap_err();
+        let err = runtime_mcp_server(&settings, |_| None).unwrap_err();
 
         assert_eq!(
             err.to_string(),
@@ -1673,8 +1657,7 @@ reasoning = false
             )]),
         ));
 
-        let commands =
-            runtime_setup_commands(&prepare, |_| None, vault_secret_lookup(&vault)).unwrap();
+        let commands = runtime_setup_commands(&prepare, vault_secret_lookup(&vault)).unwrap();
 
         assert_eq!(commands.len(), 1);
         assert_eq!(
@@ -1692,8 +1675,7 @@ reasoning = false
             HashMap::new(),
         ));
 
-        let commands =
-            runtime_setup_commands(&prepare, |_| None, vault_secret_lookup(&vault)).unwrap();
+        let commands = runtime_setup_commands(&prepare, vault_secret_lookup(&vault)).unwrap();
         let tokens =
             shlex::split(&commands[0].command).expect("resolved command should remain valid shell");
 
@@ -1721,8 +1703,7 @@ reasoning = false
             ..ResolvedMcpServerSettings::default()
         };
 
-        let resolved =
-            runtime_mcp_server(&settings, |_| None, vault_secret_lookup(&vault)).unwrap();
+        let resolved = runtime_mcp_server(&settings, vault_secret_lookup(&vault)).unwrap();
 
         let ResolvedMcpTransport::Stdio { env, .. } = resolved.transport else {
             panic!("expected stdio transport");
@@ -1741,8 +1722,7 @@ reasoning = false
             HashMap::new(),
         ));
 
-        let Err(err) = runtime_setup_commands(&prepare, |_| None, vault_secret_lookup(&vault))
-        else {
+        let Err(err) = runtime_setup_commands(&prepare, vault_secret_lookup(&vault)) else {
             panic!("missing secret should fail setup command resolution");
         };
 
@@ -1766,8 +1746,7 @@ reasoning = false
             )]),
         ));
 
-        let Err(err) = runtime_setup_commands(&prepare, |_| None, vault_secret_lookup(&vault))
-        else {
+        let Err(err) = runtime_setup_commands(&prepare, vault_secret_lookup(&vault)) else {
             panic!("OAuth secret should fail setup command resolution");
         };
 
@@ -1789,8 +1768,7 @@ reasoning = false
             )]),
         ));
 
-        let Err(err) = runtime_setup_commands(&prepare, |_| None, vault_secret_lookup(&vault))
-        else {
+        let Err(err) = runtime_setup_commands(&prepare, vault_secret_lookup(&vault)) else {
             panic!("file secret should fail setup command resolution");
         };
 
@@ -1848,7 +1826,7 @@ reasoning = false
         )])));
 
         let session = RunSession::new(&persisted, StartServices {
-            vault: Some(vault),
+            vault,
             ..test_start_services(&store, &storage_root, emitter, registry).await
         })
         .await
@@ -1906,7 +1884,7 @@ reasoning = false
         let vault = Arc::new(AsyncRwLock::new(start_vault(&[])));
 
         let Err(err) = RunSession::new(&persisted, StartServices {
-            vault: Some(vault),
+            vault,
             ..test_start_services(&store, &storage_root, emitter, registry).await
         })
         .await
@@ -2072,7 +2050,7 @@ reasoning = false
             run_control: None,
             github_app: None,
             github_permissions: HashMap::new(),
-            vault: Some(Arc::new(AsyncRwLock::new(start_vault(&[])))),
+            vault: Arc::new(AsyncRwLock::new(start_vault(&[]))),
             catalog: test_catalog(),
             on_node: None,
             registry_override: Some(registry),
@@ -2100,7 +2078,7 @@ reasoning = false
     }
 
     fn vault_secret_lookup(vault: &Vault) -> impl FnMut(&str) -> Option<String> + '_ {
-        move |name| vault_token_lookup(Some(vault), name)
+        move |name| vault_token_lookup(vault, name)
     }
 
     fn prepare_with_step(step: PreparedStep) -> RunPrepareSettings {

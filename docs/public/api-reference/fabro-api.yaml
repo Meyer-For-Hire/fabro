@@ -14126,7 +14126,7 @@ components:
           $ref: "#/components/schemas/RunNamespace"
 
     InterpString:
-      description: Resolved config string that may contain env interpolation tokens.
+      description: Config string that can contain typed interpolation tokens.
       type: string
 
     StringMap:
@@ -14344,7 +14344,7 @@ components:
         script-vs-argv distinction via the `type` discriminator: a `script`
         is a raw shell snippet kept verbatim, while a `command` is an argv
         whose elements are shell-quoted and joined at the run boundary (after
-        `{{ env.* }}` resolution) so an interpolated value cannot inject shell
+        `{{ secrets.* }}` resolution) so an interpolated value cannot inject shell
         syntax. Optional per-step `env` is shared by both shapes.
       type: object
       required: [type]
@@ -14749,17 +14749,9 @@ components:
             - type: "null"
           description: >-
             Optional HTTP headers for an http hook. Values support
-            `{{ env.NAME }}` interpolation, scoped to the names listed in
-            `allowed_env_vars`; a token for any other env var fails to resolve
-            and the hook blocks (fail-closed).
-        allowed_env_vars:
-          type: array
-          items:
-            type: string
-          description: >-
-            Allowlist of environment variable names that an http hook header may
-            read via `{{ env.NAME }}`. An empty list (the default) permits no env
-            vars in headers.
+            `{{ vars.NAME }}` interpolation, substituted when the run is
+            created; a token left unresolved at fire time blocks the hook
+            (fail-closed).
         tls:
           $ref: "#/components/schemas/TlsMode"
         prompt:

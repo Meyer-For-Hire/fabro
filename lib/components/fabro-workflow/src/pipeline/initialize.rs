@@ -5,8 +5,7 @@ use std::time::Instant;
 
 use fabro_agent::{Sandbox, ToolSecrets};
 use fabro_auth::{
-    CredentialSource, EnvCredentialSource, ExtraHeadersCredentialSource, VaultCredentialSource,
-    auth_issue_message,
+    CredentialSource, ExtraHeadersCredentialSource, VaultCredentialSource, auth_issue_message,
 };
 use fabro_graphviz::graph;
 use fabro_hooks::{HookContext, HookDecision, HookEvent, HookExecutionContext, HookRunner};
@@ -237,21 +236,12 @@ async fn build_registry(
     }
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "CLI/library workflow runs without a vault explicitly pass the Brave Search process-env credential into tool configuration; server runs pass a vault."
-)]
-async fn tool_secrets_from_configured_sources(
-    vault: Option<&Arc<AsyncRwLock<Vault>>>,
-) -> ToolSecrets {
-    let brave_search_api_key = match vault {
-        Some(vault) => vault
-            .read()
-            .await
-            .get(EnvVars::BRAVE_SEARCH_API_KEY)
-            .map(str::to_string),
-        None => std::env::var(EnvVars::BRAVE_SEARCH_API_KEY).ok(),
-    };
+async fn tool_secrets_from_configured_sources(vault: &Arc<AsyncRwLock<Vault>>) -> ToolSecrets {
+    let brave_search_api_key = vault
+        .read()
+        .await
+        .get(EnvVars::BRAVE_SEARCH_API_KEY)
+        .map(str::to_string);
     ToolSecrets {
         brave_search_api_key,
     }
@@ -267,15 +257,11 @@ fn graph_needs_api_backend(graph: &graph::Graph) -> bool {
 const SESSION_ID_HEADER: &str = "x-session-id";
 
 fn build_llm_source(
-    vault: Option<Arc<AsyncRwLock<Vault>>>,
+    vault: Arc<AsyncRwLock<Vault>>,
     run_id: fabro_types::RunId,
 ) -> Arc<dyn CredentialSource> {
-    let inner: Arc<dyn CredentialSource> = match vault {
-        Some(vault) => Arc::new(VaultCredentialSource::new(vault)),
-        None => Arc::new(EnvCredentialSource::new()),
-    };
     Arc::new(ExtraHeadersCredentialSource::new(
-        inner,
+        Arc::new(VaultCredentialSource::new(vault)),
         HashMap::from([(SESSION_ID_HEADER.to_string(), run_id.to_string())]),
     ))
 }
@@ -298,7 +284,7 @@ pub async fn initialize(
     options.run_options.git = options.git.clone();
 
     let llm_source = build_llm_source(options.vault.clone(), options.run_options.run_id);
-    let tool_secrets = tool_secrets_from_configured_sources(options.vault.as_ref()).await;
+    let tool_secrets = tool_secrets_from_configured_sources(&options.vault).await;
     let catalog = Arc::clone(&options.catalog);
     let sandbox_git = Arc::new(SandboxGitRuntime::new());
     let metadata_runtime = Arc::new(RunMetadataRuntime::new());
@@ -356,14 +342,12 @@ pub async fn initialize(
         let instance = record.instance().ok_or_else(|| {
             Error::Precondition("cannot resume run: run sandbox was not initialized".to_string())
         })?;
-        let daytona_api_key = match &options.vault {
-            Some(vault) => vault
-                .read()
-                .await
-                .get(EnvVars::DAYTONA_API_KEY)
-                .map(str::to_string),
-            None => None,
-        };
+        let daytona_api_key = options
+            .vault
+            .read()
+            .await
+            .get(EnvVars::DAYTONA_API_KEY)
+            .map(str::to_string);
         let sandbox = reconnect_for_run_with_callback(
             instance,
             daytona_api_key,
@@ -665,6 +649,7 @@ mod tests {
     use std::time::Duration;
 
     use fabro_acp::test_support::fake_acp_agent_script;
+    use fabro_auth::test_support as auth_test_support;
     use fabro_graphviz::graph::{AttrValue, Edge, Graph, Node};
     use fabro_interview::AutoApproveInterviewer;
     use fabro_sandbox::SandboxSpec;
@@ -866,7 +851,7 @@ mod tests {
                 github_permissions: None,
                 origin_url:         None,
             },
-            vault:             None,
+            vault:             auth_test_support::empty_vault(),
             git:               None,
             run_control:       None,
             registry_override: None,
@@ -947,7 +932,7 @@ mod tests {
                 github_permissions: None,
                 origin_url:         None,
             },
-            vault:             None,
+            vault:             auth_test_support::empty_vault(),
             git:               None,
             run_control:       None,
             registry_override: None,
@@ -1055,7 +1040,7 @@ mod tests {
         let run_id = test_run_id();
         let expected_session_id = run_id.to_string();
 
-        let source = build_llm_source(Some(vault), run_id);
+        let source = build_llm_source(vault, run_id);
         let resolved = source.resolve(test_catalog().as_ref()).await.unwrap();
 
         assert!(!resolved.credentials.is_empty());
@@ -1138,13 +1123,13 @@ mod tests {
         let store = memory_store();
         let run_store = store.create_run(&test_run_id()).await.unwrap();
         let initialized = initialize(test_persisted(graph, source, &run_dir), InitOptions {
-            run_store:         run_store.into(),
-            dry_run:           false,
-            emitter:           emitter.clone(),
-            sandbox:           SandboxSpec::Local {
+            run_store: run_store.into(),
+            dry_run: false,
+            emitter: emitter.clone(),
+            sandbox: SandboxSpec::Local {
                 working_directory: temp.path().to_path_buf(),
             },
-            llm:               LlmSpec {
+            llm: LlmSpec {
                 model:          "fake-acp".to_string(),
                 provider_id:    fabro_model::ProviderId::openai(),
                 fallback_chain: Vec::new(),
@@ -1152,30 +1137,30 @@ mod tests {
                 model_controls: RunModelControls::default(),
                 dry_run:        false,
             },
-            interviewer:       Arc::new(AutoApproveInterviewer::engine()),
-            steering_hub:      Arc::new(crate::steering_hub::SteeringHub::new(emitter)),
-            catalog:           test_catalog(),
-            lifecycle:         crate::run_options::LifecycleOptions {
+            interviewer: Arc::new(AutoApproveInterviewer::engine()),
+            steering_hub: Arc::new(crate::steering_hub::SteeringHub::new(emitter)),
+            catalog: test_catalog(),
+            lifecycle: crate::run_options::LifecycleOptions {
                 setup_commands:           Vec::new(),
                 setup_command_timeout_ms: 1_000,
             },
-            run_options:       test_settings(&run_dir),
-            workflow_path:     None,
-            workflow_bundle:   None,
-            hooks:             fabro_hooks::HookSettings { hooks: vec![] },
-            sandbox_env:       SandboxEnvSpec {
+            run_options: test_settings(&run_dir),
+            workflow_path: None,
+            workflow_bundle: None,
+            hooks: fabro_hooks::HookSettings { hooks: vec![] },
+            sandbox_env: SandboxEnvSpec {
                 toml_env:           HashMap::new(),
                 github_permissions: None,
                 origin_url:         None,
             },
-            vault:             Some(vault),
-            git:               None,
-            run_control:       None,
+            vault,
+            git: None,
+            run_control: None,
             registry_override: None,
-            artifact_sink:     None,
-            resume:            None,
-            seed_context:      None,
-            fabro_run_tools:   None,
+            artifact_sink: None,
+            resume: None,
+            seed_context: None,
+            fabro_run_tools: None,
         })
         .await
         .unwrap();
@@ -1263,7 +1248,7 @@ mod tests {
                 github_permissions: None,
                 origin_url:         None,
             },
-            vault:             None,
+            vault:             auth_test_support::empty_vault(),
             git:               None,
             run_control:       None,
             registry_override: None,
@@ -1405,7 +1390,7 @@ mod tests {
                 github_permissions: None,
                 origin_url:         None,
             },
-            vault: None,
+            vault: auth_test_support::empty_vault(),
             git: None,
             run_control: None,
             registry_override: None,

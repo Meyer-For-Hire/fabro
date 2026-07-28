@@ -4587,19 +4587,11 @@ async fn slack_lifecycle_missing_channel_is_skipped_without_blocking_other_route
         "100.5",
     )
     .await;
-    let state = test_app_state_with_env_lookup(
-        default_test_server_settings(),
-        fabro_config::RunLayer::default(),
-        5,
-        |name| match name {
-            "SLACK_ROUTE_CHANNEL" => Some("#ops".to_string()),
-            _ => None,
-        },
-    );
+    let state = test_app_state();
     let service = slack_lifecycle_service(server.base_url(), None);
     let run_id = fixtures::RUN_1;
     let settings = workflow_settings_with_run_notifications(
-        r#"
+        r##"
 [run.notifications.missing]
 enabled = true
 provider = "slack"
@@ -4619,8 +4611,8 @@ provider = "slack"
 events = ["run.started"]
 
 [run.notifications.valid.slack]
-channel = "{{ env.SLACK_ROUTE_CHANNEL }}"
-"#,
+channel = "#ops"
+"##,
         Some("Deploy workflow"),
     );
     let run_store = create_slack_notification_run(&state, run_id, settings, "deploy", None).await;
