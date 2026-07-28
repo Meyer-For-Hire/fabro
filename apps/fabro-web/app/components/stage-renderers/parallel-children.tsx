@@ -12,10 +12,10 @@ import { parseParallelOverview } from "./helpers";
 
 /** Branch row view state sourced from a live branch stage or completed result. */
 interface BranchRow {
-  branchIndex: number;
-  id: string;
+  label: string;
   status: StageState;
-  stageHref: string | null;
+  /** Null when no stage backs this branch yet, which also means it is unlinkable. */
+  stageId: string | null;
 }
 
 function StatItem({
@@ -43,8 +43,10 @@ function StatItem({
 
 function ChildRow({
   row,
+  runId,
 }: {
   row: BranchRow;
+  runId: string;
 }) {
   const tone = stageStatusTone(row.status);
 
@@ -56,9 +58,9 @@ function ChildRow({
         {stageStatusLabel(row.status)}
       </span>
       <span className="min-w-0 flex-1 truncate font-mono text-sm text-fg-3">
-        {row.id}
+        {row.label}
       </span>
-      {row.stageHref && (
+      {row.stageId && (
         <ArrowTopRightOnSquareIcon
           className="size-3.5 shrink-0 text-fg-muted transition-colors group-hover:text-fg-2"
           aria-hidden="true"
@@ -69,9 +71,9 @@ function ChildRow({
 
   return (
     <li className="flex items-center gap-3 px-4 py-2.5">
-      {row.stageHref ? (
+      {row.stageId ? (
         <Link
-          to={row.stageHref}
+          to={`/runs/${runId}/stages/${row.stageId}`}
           className="group flex flex-1 items-center gap-3 rounded -m-1 p-1 transition-colors hover:bg-overlay focus-visible:bg-overlay focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-teal-500"
         >
           {inner}
@@ -109,55 +111,46 @@ export function ParallelChildren({
     return byIndex;
   }, [allStages, stage.id]);
 
-  const branchCount = overview.branchCount ?? stagesByBranchIndex.size;
+  // Branch indexes are sparse: a branch queued behind `max_parallel` has no
+  // stage identity yet, and one cancelled while queued never gets one. Size the
+  // list from the highest index seen so a late-starting branch is never hidden.
+  const branchCount = Math.max(
+    overview.branchCount ?? 0,
+    overview.results.length,
+    ...Array.from(stagesByBranchIndex.keys(), (index) => index + 1),
+  );
   const rows = Array.from({ length: branchCount }, (_, index): BranchRow => {
     // A live branch stage is the freshest source; fall back to the completed
     // event's result for runs whose branches predate parallel identity.
     const branchStage = stagesByBranchIndex.get(index);
     if (branchStage) {
       return {
-        branchIndex: index,
-        id: formatStageLabel(branchStage),
+        label: formatStageLabel(branchStage),
         status: branchStage.status,
-        stageHref: `/runs/${runId}/stages/${branchStage.id}`,
+        stageId: branchStage.id,
       };
     }
     const result = overview.results[index];
     if (result) {
-      return {
-        branchIndex: index,
-        id: result.id,
-        status: result.status,
-        stageHref: null,
-      };
+      return { label: result.id, status: result.status, stageId: null };
     }
-    return {
-      branchIndex: index,
-      id: `branch ${index + 1}`,
-      status: StageState.PENDING,
-      stageHref: null,
-    };
+    return { label: `Branch ${index + 1}`, status: StageState.PENDING, stageId: null };
   });
 
-  let liveSuccessCount = 0;
-  let liveFailureCount = 0;
-  for (const branchStage of stagesByBranchIndex.values()) {
-    if (branchStage.status === StageState.SUCCEEDED) liveSuccessCount += 1;
-    else if (branchStage.status === StageState.FAILED) liveFailureCount += 1;
+  // Count what is on screen, so the tiles can never contradict the rows.
+  let successCount = 0;
+  let failureCount = 0;
+  for (const row of rows) {
+    if (row.status === StageState.SUCCEEDED) successCount += 1;
+    else if (row.status === StageState.FAILED) failureCount += 1;
   }
-  const successCount = overview.isComplete
-    ? overview.successCount ?? 0
-    : liveSuccessCount;
-  const failureCount = overview.isComplete
-    ? overview.failureCount ?? 0
-    : liveFailureCount;
 
   return (
     <div className="space-y-6 pl-3 pr-4 sm:pr-6 lg:pr-8">
       <StageMetaBar stage={stage} />
 
       <section className="grid grid-cols-2 gap-x-6 gap-y-4 rounded-lg bg-panel p-5 outline-1 -outline-offset-1 outline-line sm:grid-cols-4">
-        <StatItem label="Branches" value={overview.branchCount ?? "—"} />
+        <StatItem label="Branches" value={branchCount || "—"} />
         <StatItem
           label="Succeeded"
           value={successCount}
@@ -182,8 +175,8 @@ export function ParallelChildren({
           <p className="text-sm text-fg-muted">No branches recorded yet.</p>
         ) : (
           <ul className="divide-y divide-line rounded-lg bg-panel outline-1 -outline-offset-1 outline-line">
-            {rows.map((row) => (
-              <ChildRow key={row.branchIndex} row={row} />
+            {rows.map((row, index) => (
+              <ChildRow key={index} row={row} runId={runId} />
             ))}
           </ul>
         )}

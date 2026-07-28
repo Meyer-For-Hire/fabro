@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { StageState } from "@qltysh/fabro-api-client";
+import { StageOutcome, StageState } from "@qltysh/fabro-api-client";
 import type { EventEnvelope } from "@qltysh/fabro-api-client";
 import TestRenderer, { act } from "react-test-renderer";
 import { MemoryRouter } from "react-router";
@@ -72,18 +72,16 @@ function startedEvent(branchCount: number): EventEnvelope {
   });
 }
 
-function completedEvent(
-  results: Array<{ id: string; status: string }>,
-  successCount: number,
-  failureCount: number,
-): EventEnvelope {
+function completedEvent(results: Array<{ id: string; status: StageOutcome }>): EventEnvelope {
+  const countOf = (status: StageOutcome) =>
+    results.filter((result) => result.status === status).length;
   return event({
     seq: 2,
     event: "parallel.completed",
     properties: {
       duration_ms: 12000,
-      success_count: successCount,
-      failure_count: failureCount,
+      success_count: countOf(StageOutcome.SUCCEEDED),
+      failure_count: countOf(StageOutcome.FAILED),
       results: results.map((result) => ({ ...result, context_updates: {} })),
     },
   });
@@ -158,6 +156,33 @@ describe("ParallelChildren", () => {
     expect(hrefs(renderer)).toEqual(["/runs/run-1/stages/review_glm@1"]);
   });
 
+  test("shows a late-starting branch when lower indexes have no stage yet", () => {
+    // Branches queued behind `max_parallel` reserve no stage identity, so the
+    // observed indexes are sparse. Sizing the list by entry count would drop
+    // the only running branch.
+    const renderer = renderParallel([], [branchStage("review_opus", 2, StageState.RUNNING)]);
+
+    expect(branchRowText(renderer)).toEqual([
+      "PendingBranch 1",
+      "PendingBranch 2",
+      "Runningreview_opus",
+    ]);
+    expect(hrefs(renderer)).toEqual(["/runs/run-1/stages/review_opus@1"]);
+    expect(statValue(renderer, "Branches")).toBe("3");
+  });
+
+  test("renders branches with no stage or result yet as pending placeholders", () => {
+    const renderer = renderParallel([startedEvent(3)], [branchStage("review_glm", 0, StageState.RUNNING)]);
+
+    expect(branchRowText(renderer)).toEqual([
+      "Runningreview_glm",
+      "PendingBranch 2",
+      "PendingBranch 3",
+    ]);
+    expect(statValue(renderer, "Succeeded")).toBe("0");
+    expect(statValue(renderer, "Failed")).toBe("0");
+  });
+
   test("labels a re-entered branch with its visit, matching the sidebar", () => {
     const renderer = renderParallel(
       [startedEvent(1)],
@@ -173,14 +198,10 @@ describe("ParallelChildren", () => {
     const renderer = renderParallel(
       [
         startedEvent(2),
-        completedEvent(
-          [
-            { id: "review", status: "failed" },
-            { id: "review", status: "failed" },
-          ],
-          1,
-          1,
-        ),
+        completedEvent([
+          { id: "review", status: StageOutcome.FAILED },
+          { id: "review", status: StageOutcome.FAILED },
+        ]),
       ],
       [branchStage("review", 0, StageState.SUCCEEDED)],
     );
@@ -196,11 +217,7 @@ describe("ParallelChildren", () => {
     const renderer = renderParallel(
       [
         startedEvent(1),
-        completedEvent(
-          [{ id: "legacy_branch", status: "succeeded" }],
-          1,
-          0,
-        ),
+        completedEvent([{ id: "legacy_branch", status: StageOutcome.SUCCEEDED }]),
       ],
       [],
     );
@@ -218,14 +235,10 @@ describe("ParallelChildren", () => {
     const completed = renderParallel(
       [
         startedEvent(2),
-        completedEvent(
-          [
-            { id: "partial", status: "partially_succeeded" },
-            { id: "skipped", status: "skipped" },
-          ],
-          0,
-          0,
-        ),
+        completedEvent([
+          { id: "partial", status: StageOutcome.PARTIALLY_SUCCEEDED },
+          { id: "skipped", status: StageOutcome.SKIPPED },
+        ]),
       ],
       allStages,
     );
