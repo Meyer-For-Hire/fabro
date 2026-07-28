@@ -9,12 +9,10 @@ import { stageStatusLabel, stageStatusTone } from "../../lib/stage-sidebar";
 import { formatDurationMs } from "../../lib/format";
 import { StageMetaBar } from "./meta-bar";
 import { parseParallelOverview } from "./helpers";
+import type { ParallelBranchSummary } from "./helpers";
 
 /** Branch row view state: completed outcomes plus a synthesized in-flight row. */
-interface BranchRow {
-  id: string;
-  index: number | null;
-  itemLabel: string | null;
+interface BranchRow extends Omit<ParallelBranchSummary, "status"> {
   status: StageState;
 }
 

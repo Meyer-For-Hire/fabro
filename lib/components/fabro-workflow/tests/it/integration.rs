@@ -53,7 +53,9 @@ use fabro_workflow::handler::{Handler, HandlerRegistry};
 use fabro_workflow::outcome::{Outcome, OutcomeExt, StageOutcome};
 use fabro_workflow::records::{Checkpoint, CheckpointExt};
 use fabro_workflow::run_options::{GitCheckpointOptions, RunOptions};
-use fabro_workflow::test_support::{WorkflowRunner, run_graph_with_hooks, test_store_dir};
+use fabro_workflow::test_support::{
+    WorkflowRunner, collect_events, run_graph_with_hooks, test_store_dir,
+};
 use fabro_workflow::transforms::stylesheet::{apply_stylesheet, parse_stylesheet};
 use fabro_workflow::transforms::{StylesheetApplicationTransform, TemplateTransform, Transform};
 use object_store::local::LocalFileSystem;
@@ -1890,15 +1892,6 @@ impl Handler for ContextSetterHandler {
             .insert("my_flag".to_string(), serde_json::json!("set"));
         Ok(outcome)
     }
-}
-
-fn collect_events(emitter: &Emitter) -> Arc<std::sync::Mutex<Vec<RunEvent>>> {
-    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let events_clone = Arc::clone(&events);
-    emitter.on_event(move |event| {
-        events_clone.lock().unwrap().push(event.clone());
-    });
-    events
 }
 
 fn make_full_registry(interviewer: Arc<dyn Interviewer>) -> HandlerRegistry {

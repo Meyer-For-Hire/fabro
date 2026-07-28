@@ -119,6 +119,14 @@ pub async fn mark_run_running(run_store: &fabro_store::RunDatabase, run_id: &fab
         .expect("seed run.running");
 }
 
+/// Record every event the emitter publishes, for assertions after a run.
+pub fn collect_events(emitter: &Emitter) -> Arc<std::sync::Mutex<Vec<fabro_types::RunEvent>>> {
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = Arc::clone(&events);
+    emitter.on_event(move |event| captured.lock().unwrap().push(event.clone()));
+    events
+}
+
 pub fn test_store_dir(run_dir: &std::path::Path) -> PathBuf {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     std::process::id().hash(&mut hasher);

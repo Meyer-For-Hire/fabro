@@ -168,6 +168,15 @@ impl Node {
         self.str_attr("prompt")
     }
 
+    /// The prompt a handler should send, falling back to the node label when
+    /// `prompt` is absent or empty.
+    #[must_use]
+    pub fn prompt_or_label(&self) -> &str {
+        self.prompt()
+            .filter(|prompt| !prompt.is_empty())
+            .unwrap_or_else(|| self.label())
+    }
+
     #[must_use]
     pub fn for_each(&self) -> Option<&str> {
         self.str_attr("for_each")
@@ -643,6 +652,22 @@ mod tests {
         );
 
         assert_eq!(node.output_schema(), Some("routing"));
+    }
+
+    #[test]
+    fn node_prompt_or_label_falls_back_on_absent_and_empty_prompts() {
+        let mut node = Node::new("review");
+        assert_eq!(node.prompt_or_label(), node.label());
+
+        node.attrs
+            .insert("prompt".to_string(), AttrValue::String(String::new()));
+        assert_eq!(node.prompt_or_label(), node.label());
+
+        node.attrs.insert(
+            "prompt".to_string(),
+            AttrValue::String("Review the diff.".to_string()),
+        );
+        assert_eq!(node.prompt_or_label(), "Review the diff.");
     }
 
     #[test]

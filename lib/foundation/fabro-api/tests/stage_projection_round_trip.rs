@@ -176,6 +176,8 @@ fn stage_projection_round_trips_representative_json() {
         "parallel_results": [
             {
                 "id": "review_api",
+                "index": 0,
+                "item_label": "api",
                 "status": "succeeded",
                 "context_updates": {
                     "response.review_api": "looks good",
@@ -184,6 +186,7 @@ fn stage_projection_round_trips_representative_json() {
             },
             {
                 "id": "review_ux",
+                "index": 1,
                 "status": "failed",
                 "context_updates": {}
             }

@@ -29,22 +29,13 @@ impl LintRule for Rule {
         let mut diagnostics = Vec::new();
 
         for node in graph.nodes.values() {
-            let Some(raw_source) = node.attrs.get("for_each") else {
+            if !node.attrs.contains_key("for_each") {
                 continue;
-            };
-
-            let source = raw_source.as_str();
-            if source.is_none_or(|source| source.trim().is_empty()) {
-                diagnostics.push(diagnostic(
-                    &node.id,
-                    format!(
-                        "Node '{}' has an empty or non-string 'for_each' source",
-                        node.id
-                    ),
-                    "Set 'for_each' to a context key such as \"context.candidates\"",
-                ));
             }
 
+            // Reported as an error rather than through `inert_attribute`: an
+            // ignored tuning knob is a warning, but a fan-out that silently
+            // never happens is not.
             if node.handler_type() != Some("parallel") {
                 diagnostics.push(diagnostic(
                     &node.id,
@@ -55,6 +46,20 @@ impl LintRule for Rule {
                     "Remove 'for_each' or change the node to type=\"parallel\"",
                 ));
                 continue;
+            }
+
+            if node
+                .for_each()
+                .is_none_or(|source| source.trim().is_empty())
+            {
+                diagnostics.push(diagnostic(
+                    &node.id,
+                    format!(
+                        "Node '{}' has an empty or non-string 'for_each' source",
+                        node.id
+                    ),
+                    "Set 'for_each' to a context key such as \"context.candidates\"",
+                ));
             }
 
             let outgoing = graph.outgoing_edges(&node.id);

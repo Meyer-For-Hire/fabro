@@ -1,29 +1,29 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use fabro_core::error::Error as CoreError;
-use fabro_graphviz::graph::{AttrValue, Graph, Node};
+use fabro_graphviz::graph::{AttrValue, Graph, Node, is_llm_handler_type};
 use fabro_hooks::{HookContext, HookEvent};
 use fabro_types::{ParallelBranchId, ParallelBranchResult, StageId, StageOutcome};
 use futures::FutureExt;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, SemaphorePermit};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use uuid::Uuid;
 
 use super::{EngineServices, Handler};
-use crate::context::{Context, ParallelBranchPreamble, WorkflowContext, context_diff_public, keys};
+use crate::context::{
+    self, Context, ParallelBranchPreamble, WorkflowContext, context_diff_public, keys,
+};
 use crate::error::Error;
 use crate::event::{Emitter, Event, RunNoticeCode, RunNoticeLevel, StageScope};
 use crate::hook_context::set_hook_node;
-use crate::node_handler::{execute_single_attempt, finalize_retries_exhausted};
 use crate::outcome::{FailureCategory, FailureDetail, Outcome, OutcomeExt};
-use crate::retry::build_retry_policy;
 use crate::run_dir::visit_from_context;
-use crate::{artifact, millis_u64};
+use crate::{artifact, millis_u64, node_handler, retry};
 
 /// Fans out execution to multiple branches concurrently.
 /// Each branch gets an isolated context fork and shares the run sandbox.
@@ -58,8 +58,15 @@ struct BranchWorkItem {
 
 struct BranchPlan {
     work_items:         Vec<BranchWorkItem>,
+    /// The single template target, set only for a `for_each` fan-out. A static
+    /// fan-out has one branch per outgoing edge and no template.
     template_target_id: Option<String>,
-    is_for_each:        bool,
+}
+
+impl BranchPlan {
+    fn is_for_each(&self) -> bool {
+        self.template_target_id.is_some()
+    }
 }
 
 enum ParsedBranchPreamble {
@@ -115,13 +122,6 @@ fn parse_branch_preamble(entry: serde_json::Value) -> Option<ParsedBranchPreambl
     }
 }
 
-fn context_source_value(context: &Context, source: &str) -> Option<serde_json::Value> {
-    if let Some(bare) = source.strip_prefix("context.") {
-        return context.get(source).or_else(|| context.get(bare));
-    }
-    context.get(source)
-}
-
 fn item_label(item: &serde_json::Value, index: usize) -> String {
     item.as_object()
         .and_then(|object| {
@@ -142,7 +142,7 @@ async fn build_branch_plan(
     services: &EngineServices,
 ) -> Result<BranchPlan, Outcome> {
     let edges = graph.outgoing_edges(&node.id);
-    let Some(raw_source) = node.attrs.get("for_each") else {
+    if !node.attrs.contains_key("for_each") {
         return Ok(BranchPlan {
             work_items:         edges
                 .into_iter()
@@ -155,13 +155,9 @@ async fn build_branch_plan(
                 })
                 .collect(),
             template_target_id: None,
-            is_for_each:        false,
         });
-    };
-    let Some(source) = raw_source
-        .as_str()
-        .filter(|source| !source.trim().is_empty())
-    else {
+    }
+    let Some(source) = node.for_each().filter(|source| !source.trim().is_empty()) else {
         return Err(Outcome::fail_deterministic(format!(
             "for_each parallel node '{}' requires a non-empty string source",
             node.id
@@ -180,7 +176,7 @@ async fn build_branch_plan(
             "for_each template target node not found: {target_id}"
         )));
     };
-    if !matches!(target.handler_type(), Some("agent" | "prompt")) {
+    if !is_llm_handler_type(target.handler_type()) {
         return Err(Outcome::fail_deterministic(format!(
             "for_each template target '{target_id}' must be an agent or prompt node"
         )));
@@ -191,7 +187,7 @@ async fn build_branch_plan(
         ));
     }
 
-    let Some(raw_items) = context_source_value(context, source) else {
+    let Some(raw_items) = context::lookup_flat(context, source) else {
         return Err(Outcome::fail_deterministic(format!(
             "for_each source '{source}' was not found in workflow context"
         )));
@@ -222,7 +218,6 @@ async fn build_branch_plan(
             })
             .collect(),
         template_target_id: Some(target_id),
-        is_for_each:        true,
     })
 }
 
@@ -246,11 +241,7 @@ fn target_node_for_item(target: &Node, item: Option<&serde_json::Value>) -> Node
         return target.clone();
     };
     let mut target = target.clone();
-    let base_prompt = target
-        .prompt()
-        .filter(|prompt| !prompt.is_empty())
-        .unwrap_or_else(|| target.label())
-        .to_string();
+    let base_prompt = target.prompt_or_label().to_string();
     target.attrs.insert(
         "prompt".to_string(),
         AttrValue::String(format!("{base_prompt}\n\n{}", render_item_data(item))),
@@ -296,7 +287,12 @@ async fn run_branches(
         Ok(plan) => plan,
         Err(outcome) => return Ok(outcome),
     };
-    let branch_count = branch_plan.work_items.len();
+    let is_for_each = branch_plan.is_for_each();
+    let BranchPlan {
+        work_items,
+        template_target_id,
+    } = branch_plan;
+    let branch_count = work_items.len();
 
     let parallel_stage_scope = StageScope::for_handler(context, &node.id);
     let parallel_group_id = StageId::new(node.id.clone(), parallel_stage_scope.visit);
@@ -323,7 +319,7 @@ async fn run_branches(
     let branch_preambles = parse_branch_preambles(
         context.get(keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES),
         branch_count,
-        branch_plan.is_for_each,
+        is_for_each,
     );
     // Clear the stash before snapshotting so branch contexts never carry the
     // outer array — a nested parallel branch target must not misread it as
@@ -335,7 +331,7 @@ async fn run_branches(
     let parent_snapshot = Arc::new(context.snapshot());
 
     let mut dispatches = Vec::with_capacity(branch_count);
-    for work_item in branch_plan.work_items {
+    for work_item in work_items {
         let branch_index = work_item.index;
         let target_id = work_item.target_id;
         let item_label = work_item.item_label;
@@ -395,62 +391,51 @@ async fn run_branches(
                         ));
                     };
                     let target = target_node_for_item(target, item.as_ref());
-                    let retry_policy = build_retry_policy(&target, &graph);
-                    let mut branch_scope = None;
+                    let retry_policy = retry::build_retry_policy(&target, &graph);
+
+                    let mut permit = acquire_branch_permit(&semaphore, &branch_services).await?;
+                    // Only reserve once the branch is ready to become
+                    // observable, so a branch cancelled while waiting on the
+                    // semaphore never consumes an execution identity.
+                    let execution = branch_services
+                        .run
+                        .stage_executions
+                        .reserve_detached(&target_id, branch_graph_visit);
+                    branch_context.set(
+                        keys::CURRENT_NODE,
+                        serde_json::Value::String(target_id.clone()),
+                    );
+                    branch_context.set(
+                        keys::INTERNAL_STAGE_EXECUTION_ORDINAL,
+                        serde_json::json!(execution.stage_id.visit()),
+                    );
+                    let branch_scope = reserved_scope
+                        .get_or_init(|| {
+                            StageScope::for_parallel_branch(
+                                target_id.clone(),
+                                execution.stage_id.visit(),
+                                group_id.clone(),
+                                parallel_branch_id.clone(),
+                            )
+                        })
+                        .clone();
+                    branch_services.run.emitter.emit_scoped(
+                        &Event::ParallelBranchStarted {
+                            parallel_group_id:     group_id.clone(),
+                            parallel_branch_id:    parallel_branch_id.clone(),
+                            branch:                target_id.clone(),
+                            index:                 branch_index,
+                            item_label:            item_label.clone(),
+                            graph_visit:           Some(execution.graph_visit),
+                            resumed_from_stage_id: None,
+                        },
+                        &branch_scope,
+                    );
+
                     let mut attempt = 0_u32;
                     let outcome = loop {
                         attempt = attempt.saturating_add(1);
-                        let permit = semaphore.acquire();
-                        tokio::pin!(permit);
-                        let cancel_token = branch_services.run.cancel_token();
-                        let permit = tokio::select! {
-                            biased;
-                            () = cancel_token.cancelled() => {
-                                return Err(Error::Cancelled);
-                            }
-                            permit = &mut permit => permit
-                                .map_err(|err| Error::handler_with_source("semaphore error", err))?,
-                        };
-
-                        if branch_scope.is_none() {
-                            let execution = branch_services
-                                .run
-                                .stage_executions
-                                .reserve_detached(&target_id, branch_graph_visit);
-                            branch_context.set(
-                                keys::CURRENT_NODE,
-                                serde_json::Value::String(target_id.clone()),
-                            );
-                            branch_context.set(
-                                keys::INTERNAL_STAGE_EXECUTION_ORDINAL,
-                                serde_json::json!(execution.stage_id.visit()),
-                            );
-                            let scope = reserved_scope
-                                .get_or_init(|| {
-                                    StageScope::for_parallel_branch(
-                                        target_id.clone(),
-                                        execution.stage_id.visit(),
-                                        group_id.clone(),
-                                        parallel_branch_id.clone(),
-                                    )
-                                })
-                                .clone();
-                            branch_services.run.emitter.emit_scoped(
-                                &Event::ParallelBranchStarted {
-                                    parallel_group_id:     group_id.clone(),
-                                    parallel_branch_id:    parallel_branch_id.clone(),
-                                    branch:                target_id.clone(),
-                                    index:                 branch_index,
-                                    item_label:            item_label.clone(),
-                                    graph_visit:           Some(execution.graph_visit),
-                                    resumed_from_stage_id: None,
-                                },
-                                &scope,
-                            );
-                            branch_scope = Some(scope);
-                        }
-
-                        let attempt_result = execute_single_attempt(
+                        let attempt_result = node_handler::execute_single_attempt(
                             &target,
                             &branch_context,
                             &graph,
@@ -458,64 +443,37 @@ async fn run_branches(
                             &branch_services,
                         )
                         .await;
+                        // Back off outside the fan-out slot so a queued branch
+                        // can run while this one waits.
                         drop(permit);
 
+                        // Arms mirror `Executor::execute_with_retry`; the two
+                        // that fall through are the retry cases.
                         let can_retry = attempt < retry_policy.max_attempts;
                         match attempt_result {
-                            Ok(outcome) if outcome.status.retry_requested() && can_retry => {
-                                let delay = retry_policy.backoff.delay_for_attempt(attempt);
-                                emit_branch_retrying(
-                                    &branch_services.run.emitter,
-                                    branch_scope.as_ref().expect(
-                                        "branch scope is reserved before an attempt executes",
-                                    ),
-                                    &target,
-                                    branch_index,
-                                    attempt,
-                                    retry_policy.max_attempts,
-                                    delay,
-                                );
-                                let cancel_token = branch_services.run.cancel_token();
-                                tokio::select! {
-                                    biased;
-                                    () = cancel_token.cancelled() => {
-                                        return Err(Error::Cancelled);
-                                    }
-                                    () = sleep(delay) => {}
-                                }
-                            }
+                            Ok(outcome) if outcome.status.retry_requested() && can_retry => {}
                             Ok(outcome) if outcome.status.retry_requested() => {
-                                break finalize_retries_exhausted(&target, outcome);
+                                break node_handler::finalize_retries_exhausted(&target, outcome);
                             }
                             Ok(outcome) => break outcome,
                             Err(CoreError::Cancelled) => return Err(Error::Cancelled),
-                            Err(err) if can_retry && err.is_retryable() => {
-                                let delay = retry_policy.backoff.delay_for_attempt(attempt);
-                                emit_branch_retrying(
-                                    &branch_services.run.emitter,
-                                    branch_scope.as_ref().expect(
-                                        "branch scope is reserved before an attempt executes",
-                                    ),
-                                    &target,
-                                    branch_index,
-                                    attempt,
-                                    retry_policy.max_attempts,
-                                    delay,
-                                );
-                                let cancel_token = branch_services.run.cancel_token();
-                                tokio::select! {
-                                    biased;
-                                    () = cancel_token.cancelled() => {
-                                        return Err(Error::Cancelled);
-                                    }
-                                    () = sleep(delay) => {}
-                                }
-                            }
-                            Err(err @ CoreError::Handler { .. }) => {
-                                break err.to_fail_outcome();
-                            }
+                            Err(err) if can_retry && err.is_retryable() => {}
+                            Err(err @ CoreError::Handler { .. }) => break err.to_fail_outcome(),
                             Err(err) => break Outcome::fail_classify(err.to_string()),
                         }
+
+                        let delay = retry_policy.backoff.delay_for_attempt(attempt);
+                        emit_branch_retrying(
+                            &branch_services.run.emitter,
+                            &branch_scope,
+                            &target,
+                            branch_index,
+                            attempt,
+                            retry_policy.max_attempts,
+                            delay,
+                        );
+                        backoff_or_cancel(delay, &branch_services).await?;
+                        permit = acquire_branch_permit(&semaphore, &branch_services).await?;
                     };
 
                     let context_updates = branch_context_updates(
@@ -532,9 +490,7 @@ async fn run_branches(
                     };
                     emit_branch_completed(
                         &branch_services.run.emitter,
-                        branch_scope
-                            .as_ref()
-                            .expect("branch scope is reserved before an attempt executes"),
+                        &branch_scope,
                         group_id.clone(),
                         parallel_branch_id.clone(),
                         branch_index,
@@ -643,16 +599,20 @@ async fn run_branches(
         .filter(|branch| branch.outcome.status.is_failure())
         .count();
     let total = results.len();
-    let status = aggregate_status(&results, branch_plan.is_for_each);
+    let status = aggregate_status(&results, is_for_each);
     let is_failure = status.is_failure();
     let jump_to_node = if is_failure {
         None
     } else {
-        branch_plan
-            .template_target_id
-            .as_deref()
-            .and_then(|target| find_join_for_target(target, graph))
-            .or_else(|| find_join_node(&results, graph))
+        template_target_id.as_deref().map_or_else(
+            || {
+                find_join_node(
+                    results.iter().map(|branch| branch.result.id.as_str()),
+                    graph,
+                )
+            },
+            |target| find_join_node([target], graph),
+        )
     };
 
     let mut typed_results = results
@@ -743,6 +703,31 @@ fn branch_context_updates(
     updates
 }
 
+/// Take a fan-out slot, or give up if the run starts cancelling.
+async fn acquire_branch_permit<'a>(
+    semaphore: &'a Semaphore,
+    services: &EngineServices,
+) -> Result<SemaphorePermit<'a>, Error> {
+    let cancel_token = services.run.cancel_token();
+    tokio::select! {
+        biased;
+        () = cancel_token.cancelled() => Err(Error::Cancelled),
+        permit = semaphore.acquire() => {
+            permit.map_err(|err| Error::handler_with_source("semaphore error", err))
+        }
+    }
+}
+
+/// Wait out a retry backoff, or give up if the run starts cancelling.
+async fn backoff_or_cancel(delay: Duration, services: &EngineServices) -> Result<(), Error> {
+    let cancel_token = services.run.cancel_token();
+    tokio::select! {
+        biased;
+        () = cancel_token.cancelled() => Err(Error::Cancelled),
+        () = sleep(delay) => Ok(()),
+    }
+}
+
 /// Emit `ParallelBranchCompleted` for the branch that `scope` identifies;
 /// `scope.node_id` is the branch target by construction
 /// ([`StageScope::for_parallel_branch`]).
@@ -777,7 +762,7 @@ fn emit_branch_retrying(
     index: usize,
     attempt: u32,
     max_attempts: u32,
-    delay: std::time::Duration,
+    delay: Duration,
 ) {
     emitter.emit_scoped(
         &Event::StageRetrying {
@@ -835,30 +820,27 @@ fn aggregate_status(results: &[BranchResult], empty_succeeds: bool) -> StageOutc
     }
 }
 
-fn find_join_for_target(target_id: &str, graph: &Graph) -> Option<String> {
-    let mut targets = graph
-        .outgoing_edges(target_id)
-        .into_iter()
-        .map(|edge| edge.to.clone())
-        .collect::<Vec<_>>();
-    targets.sort();
-    targets.into_iter().next()
-}
-
 /// Find the convergence node by finding a common direct target of every branch.
-fn find_join_node(results: &[BranchResult], graph: &Graph) -> Option<String> {
-    let first_result = results.first()?;
+///
+/// A `for_each` fan-out passes its template target even when no items ran, so
+/// an empty array still joins instead of stopping at the parallel node.
+fn find_join_node<'a>(
+    branch_ids: impl IntoIterator<Item = &'a str>,
+    graph: &Graph,
+) -> Option<String> {
+    let mut branch_ids = branch_ids.into_iter();
     let first_targets = graph
-        .outgoing_edges(&first_result.result.id)
+        .outgoing_edges(branch_ids.next()?)
         .into_iter()
         .map(|edge| edge.to.clone())
         .collect::<HashSet<_>>();
+    let rest = branch_ids.collect::<Vec<_>>();
     let mut common = first_targets
         .into_iter()
         .filter(|target| {
-            results.iter().skip(1).all(|result| {
+            rest.iter().all(|branch_id| {
                 graph
-                    .outgoing_edges(&result.result.id)
+                    .outgoing_edges(branch_id)
                     .into_iter()
                     .any(|edge| &edge.to == target)
             })
@@ -876,10 +858,11 @@ mod tests {
 
     use fabro_graphviz::graph::{AttrValue, Edge};
     use fabro_store::{Database, StageId};
-    use fabro_types::{RunEvent, fixtures, format_blob_ref, test_support};
+    use fabro_types::{fixtures, format_blob_ref, test_support};
     use object_store::memory::InMemory;
 
     use super::*;
+    use crate::test_support::collect_events;
 
     fn make_services() -> EngineServices {
         EngineServices::test_default()
@@ -986,13 +969,6 @@ mod tests {
         (node, graph)
     }
 
-    fn collect_events(emitter: &Emitter) -> Arc<Mutex<Vec<RunEvent>>> {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let captured = Arc::clone(&events);
-        emitter.on_event(move |event| captured.lock().unwrap().push(event.clone()));
-        events
-    }
-
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct ItemAttemptCapture {
         label:         String,
@@ -1062,22 +1038,57 @@ mod tests {
         }
     }
 
-    struct CountingHandler {
-        calls: Arc<AtomicUsize>,
+    /// What a branch target does after recording that it ran.
+    #[derive(Clone, Copy)]
+    enum Scripted {
+        Succeed,
+        Retry,
+        SucceedAfter(Duration),
+        CancelRun,
+    }
+
+    struct ScriptedHandler {
+        calls:    Arc<AtomicUsize>,
+        behavior: Scripted,
+    }
+
+    impl ScriptedHandler {
+        /// Returns the handler alongside its shared call counter.
+        fn new(behavior: Scripted) -> (Box<Self>, Arc<AtomicUsize>) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            (
+                Box::new(Self {
+                    calls: Arc::clone(&calls),
+                    behavior,
+                }),
+                calls,
+            )
+        }
     }
 
     #[async_trait]
-    impl Handler for CountingHandler {
+    impl Handler for ScriptedHandler {
         async fn execute(
             &self,
             _node: &Node,
             _context: &Context,
             _graph: &Graph,
             _run_dir: &Path,
-            _services: &EngineServices,
+            services: &EngineServices,
         ) -> Result<Outcome, Error> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(Outcome::success())
+            match self.behavior {
+                Scripted::Succeed => Ok(Outcome::success()),
+                Scripted::Retry => Ok(Outcome::retry_classify("keep retrying")),
+                Scripted::SucceedAfter(delay) => {
+                    sleep(delay).await;
+                    Ok(Outcome::success())
+                }
+                Scripted::CancelRun => {
+                    services.run.cancel_token().cancel();
+                    Err(Error::Cancelled)
+                }
+            }
         }
     }
 
@@ -1111,65 +1122,6 @@ mod tests {
             } else {
                 Ok(Outcome::success())
             }
-        }
-    }
-
-    struct AlwaysRetryHandler {
-        calls: Arc<AtomicUsize>,
-    }
-
-    #[async_trait]
-    impl Handler for AlwaysRetryHandler {
-        async fn execute(
-            &self,
-            _node: &Node,
-            _context: &Context,
-            _graph: &Graph,
-            _run_dir: &Path,
-            _services: &EngineServices,
-        ) -> Result<Outcome, Error> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(Outcome::retry_classify("keep retrying"))
-        }
-    }
-
-    struct SlowHandler {
-        calls: Arc<AtomicUsize>,
-    }
-
-    #[async_trait]
-    impl Handler for SlowHandler {
-        async fn execute(
-            &self,
-            _node: &Node,
-            _context: &Context,
-            _graph: &Graph,
-            _run_dir: &Path,
-            _services: &EngineServices,
-        ) -> Result<Outcome, Error> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            sleep(Duration::from_millis(100)).await;
-            Ok(Outcome::success())
-        }
-    }
-
-    struct CancellingHandler {
-        calls: Arc<AtomicUsize>,
-    }
-
-    #[async_trait]
-    impl Handler for CancellingHandler {
-        async fn execute(
-            &self,
-            _node: &Node,
-            _context: &Context,
-            _graph: &Graph,
-            _run_dir: &Path,
-            services: &EngineServices,
-        ) -> Result<Outcome, Error> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            services.run.cancel_token().cancel();
-            Err(Error::Cancelled)
         }
     }
 
@@ -1459,34 +1411,6 @@ mod tests {
     }
 
     #[test]
-    fn for_each_source_lookup_prefers_exact_context_key_then_falls_back() {
-        let context = Context::new();
-        context.set("context.items", serde_json::json!(["exact"]));
-        context.set("items", serde_json::json!(["fallback"]));
-
-        assert_eq!(
-            context_source_value(&context, "context.items"),
-            Some(serde_json::json!(["exact"]))
-        );
-        context.set("context.items", serde_json::Value::Null);
-        assert_eq!(
-            context_source_value(&context, "context.items"),
-            Some(serde_json::Value::Null)
-        );
-
-        let fallback = Context::new();
-        fallback.set("items", serde_json::json!(["fallback"]));
-        assert_eq!(
-            context_source_value(&fallback, "context.items"),
-            Some(serde_json::json!(["fallback"]))
-        );
-        assert_eq!(
-            context_source_value(&fallback, "items"),
-            Some(serde_json::json!(["fallback"]))
-        );
-    }
-
-    #[test]
     fn for_each_item_label_uses_name_then_label_then_index() {
         assert_eq!(item_label(&serde_json::json!({"name": "auth"}), 7), "auth");
         assert_eq!(
@@ -1645,13 +1569,9 @@ mod tests {
 
     #[tokio::test]
     async fn for_each_empty_array_succeeds_and_skips_the_template_target() {
-        let calls = Arc::new(AtomicUsize::new(0));
+        let (handler, calls) = ScriptedHandler::new(Scripted::Succeed);
         let mut services = make_services();
-        services.registry = Arc::new(super::super::HandlerRegistry::new(Box::new(
-            CountingHandler {
-                calls: Arc::clone(&calls),
-            },
-        )));
+        services.registry = Arc::new(super::super::HandlerRegistry::new(handler));
         let events = collect_events(&services.run.emitter);
         let (node, graph) = for_each_graph("items", 4);
         let context = test_context();
@@ -1699,13 +1619,9 @@ mod tests {
                 &fabro_types::RunBlobId::new(b"missing")
             ))),
         ] {
-            let calls = Arc::new(AtomicUsize::new(0));
+            let (handler, calls) = ScriptedHandler::new(Scripted::Succeed);
             let mut services = make_services();
-            services.registry = Arc::new(super::super::HandlerRegistry::new(Box::new(
-                CountingHandler {
-                    calls: Arc::clone(&calls),
-                },
-            )));
+            services.registry = Arc::new(super::super::HandlerRegistry::new(handler));
             let events = collect_events(&services.run.emitter);
             let context = test_context();
             if let Some(value) = value {
@@ -1734,13 +1650,9 @@ mod tests {
         for raw_source in [AttrValue::String("   ".to_string()), AttrValue::Integer(4)] {
             let (mut node, graph) = for_each_graph("items", 4);
             node.attrs.insert("for_each".to_string(), raw_source);
-            let calls = Arc::new(AtomicUsize::new(0));
+            let (handler, calls) = ScriptedHandler::new(Scripted::Succeed);
             let mut services = make_services();
-            services.registry = Arc::new(super::super::HandlerRegistry::new(Box::new(
-                CountingHandler {
-                    calls: Arc::clone(&calls),
-                },
-            )));
+            services.registry = Arc::new(super::super::HandlerRegistry::new(handler));
             let events = collect_events(&services.run.emitter);
 
             let outcome = ParallelHandler
@@ -1778,13 +1690,9 @@ mod tests {
             .write_blob(&serde_json::to_vec(&items).unwrap())
             .await
             .unwrap();
-        let calls = Arc::new(AtomicUsize::new(0));
+        let (handler, calls) = ScriptedHandler::new(Scripted::Succeed);
         let mut services = make_services();
-        services.registry = Arc::new(super::super::HandlerRegistry::new(Box::new(
-            CountingHandler {
-                calls: Arc::clone(&calls),
-            },
-        )));
+        services.registry = Arc::new(super::super::HandlerRegistry::new(handler));
         let sandbox_dir = tempfile::tempdir().unwrap();
         services.run = services
             .run
@@ -1964,13 +1872,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn for_each_retry_exhaustion_respects_allow_partial() {
-        let calls = Arc::new(AtomicUsize::new(0));
+        let (handler, calls) = ScriptedHandler::new(Scripted::Retry);
         let mut services = make_services();
-        services.registry = Arc::new(super::super::HandlerRegistry::new(Box::new(
-            AlwaysRetryHandler {
-                calls: Arc::clone(&calls),
-            },
-        )));
+        services.registry = Arc::new(super::super::HandlerRegistry::new(handler));
         let (node, mut graph) = for_each_graph("items", 1);
         let target = graph.nodes.get_mut("reviewer").unwrap();
         target
@@ -1998,11 +1902,10 @@ mod tests {
 
     #[tokio::test]
     async fn for_each_applies_executor_timeout_to_each_attempt() {
-        let calls = Arc::new(AtomicUsize::new(0));
+        let (handler, calls) =
+            ScriptedHandler::new(Scripted::SucceedAfter(Duration::from_millis(100)));
         let mut services = make_services();
-        services.registry = Arc::new(super::super::HandlerRegistry::new(Box::new(SlowHandler {
-            calls: Arc::clone(&calls),
-        })));
+        services.registry = Arc::new(super::super::HandlerRegistry::new(handler));
         let (node, mut graph) = for_each_graph("items", 1);
         graph.nodes.get_mut("reviewer").unwrap().attrs.insert(
             "timeout".to_string(),
@@ -2026,13 +1929,9 @@ mod tests {
 
     #[tokio::test]
     async fn for_each_run_cancellation_cancels_the_group() {
-        let calls = Arc::new(AtomicUsize::new(0));
+        let (handler, calls) = ScriptedHandler::new(Scripted::CancelRun);
         let mut services = make_services();
-        services.registry = Arc::new(super::super::HandlerRegistry::new(Box::new(
-            CancellingHandler {
-                calls: Arc::clone(&calls),
-            },
-        )));
+        services.registry = Arc::new(super::super::HandlerRegistry::new(handler));
         let (node, graph) = for_each_graph("items", 1);
         let context = test_context();
         context.set(
