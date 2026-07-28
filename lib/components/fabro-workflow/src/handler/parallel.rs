@@ -8,6 +8,7 @@ use fabro_core::error::Error as CoreError;
 use fabro_graphviz::graph::{AttrValue, Graph, Node, is_llm_handler_type};
 use fabro_hooks::{HookContext, HookEvent};
 use fabro_types::{ParallelBranchId, ParallelBranchResult, StageId, StageOutcome};
+use fabro_util::text;
 use futures::FutureExt;
 use tokio::sync::{Semaphore, SemaphorePermit};
 use tokio::task::JoinHandle;
@@ -122,6 +123,12 @@ fn parse_branch_preamble(entry: serde_json::Value) -> Option<ParsedBranchPreambl
     }
 }
 
+/// Name a `for_each` item for events, the CLI, and the web UI.
+///
+/// The item comes from a model or a workflow author, so a candidate label is
+/// sanitized before use and the index stands in whenever nothing printable
+/// survives. Sanitizing here keeps every downstream consumer clean rather than
+/// trusting each one to do it.
 fn item_label(item: &serde_json::Value, index: usize) -> String {
     item.as_object()
         .and_then(|object| {
@@ -129,10 +136,11 @@ fn item_label(item: &serde_json::Value, index: usize) -> String {
                 object
                     .get(key)
                     .and_then(serde_json::Value::as_str)
+                    .map(text::sanitize_display_label)
                     .filter(|label| !label.is_empty())
             })
         })
-        .map_or_else(|| index.to_string(), ToOwned::to_owned)
+        .unwrap_or_else(|| index.to_string())
 }
 
 /// Stand-in for one runtime item during a dry run, where the real array does
@@ -492,7 +500,6 @@ async fn run_branches(
                             &branch_services.run.emitter,
                             &branch_scope,
                             &target,
-                            branch_index,
                             attempt,
                             retry_policy.max_attempts,
                             delay,
@@ -780,23 +787,29 @@ fn emit_branch_completed(
     );
 }
 
+/// Emit `StageRetrying` for a branch attempt.
+///
+/// `index` carries the stage execution ordinal, matching the envelope's
+/// `stage_id` and the run-wide meaning every other emitter gives the field.
+/// The branch's position within the fan-out is already on
+/// `parallel.branch.started`, so putting it here instead would give one field
+/// two meanings.
 fn emit_branch_retrying(
     emitter: &Emitter,
     scope: &StageScope,
     node: &Node,
-    index: usize,
     attempt: u32,
     max_attempts: u32,
     delay: Duration,
 ) {
     emitter.emit_scoped(
         &Event::StageRetrying {
-            node_id: node.id.clone(),
-            name: node.label().to_string(),
-            index,
-            attempt: usize::try_from(attempt).unwrap_or(usize::MAX),
+            node_id:      node.id.clone(),
+            name:         node.label().to_string(),
+            index:        scope.visit as usize,
+            attempt:      usize::try_from(attempt).unwrap_or(usize::MAX),
             max_attempts: usize::try_from(max_attempts).unwrap_or(usize::MAX),
-            delay_ms: millis_u64(delay),
+            delay_ms:     millis_u64(delay),
         },
         scope,
     );
@@ -1444,6 +1457,30 @@ mod tests {
             "7"
         );
         assert_eq!(item_label(&serde_json::json!("scalar"), 7), "7");
+    }
+
+    #[test]
+    fn for_each_item_label_falls_back_when_nothing_printable_survives() {
+        // The item comes from a model, so a label that is only whitespace or
+        // only terminal control codes must not become the branch's identity.
+        assert_eq!(item_label(&serde_json::json!({"name": "   "}), 7), "7");
+        assert_eq!(
+            item_label(&serde_json::json!({"name": "\u{1b}[31m\n"}), 7),
+            "7"
+        );
+        assert_eq!(
+            item_label(&serde_json::json!({"name": "  auth  "}), 7),
+            "auth"
+        );
+        assert_eq!(
+            item_label(&serde_json::json!({"name": "\u{1b}[31mauth\u{1b}[0m"}), 7),
+            "auth"
+        );
+        // A blank `name` still yields to `label`.
+        assert_eq!(
+            item_label(&serde_json::json!({"name": " ", "label": "public-api"}), 7),
+            "public-api"
+        );
     }
 
     #[test]
