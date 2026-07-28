@@ -3,7 +3,7 @@ use std::fmt::Write as _;
 use std::io::Cursor;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bollard::Docker;
@@ -15,9 +15,9 @@ use bollard::container::{
 use bollard::errors::Error as DockerError;
 use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
 use bollard::image::CreateImageOptions;
-use bollard::models::HostConfig;
+use bollard::models::{ContainerInspectResponse, HostConfig};
 use fabro_github::GitHubCredentials;
-use fabro_types::{CommandOutputStream, CommandTermination, RunId};
+use fabro_types::{CommandOutputStream, CommandTermination, RunId, SandboxProviderKind};
 use fabro_util::time::elapsed_ms;
 use futures::StreamExt;
 use tokio::io::{AsyncWriteExt, duplex};
@@ -37,7 +37,7 @@ use crate::{
     CommandOutputCallback, DEFAULT_EXEC_OUTPUT_TAIL_BYTES, DirEntry, ExecResult,
     ExecStreamingResult, GrepOptions, Sandbox, SandboxEvent, SandboxEventCallback, SandboxFile,
     StderrCollector, StdioProcess, StdioProcessHandle, StdioProcessTermination, WalkOptions,
-    format_lines_numbered, shell_quote,
+    clone_retry, format_lines_numbered, shell_quote,
 };
 
 const DOCKER_BASH_REQUIREMENT: &str = "Docker sandboxes require /bin/bash for every command, with no `sh` fallback; use an \
@@ -46,6 +46,7 @@ const DOCKER_BASH_REQUIREMENT: &str = "Docker sandboxes require /bin/bash for ev
 pub(crate) const WORKING_DIRECTORY: &str = "/workspace";
 pub(crate) const REPOS_ROOT: &str = "/repos";
 const GIT_CLONE_DEPTH: usize = 10;
+const GIT_CLONE_TIMEOUT: Duration = Duration::from_mins(5);
 #[cfg(test)]
 const EXEC_STOP_POLL_SLEEP_SECONDS: &str = "0.005";
 #[cfg(not(test))]
@@ -54,6 +55,11 @@ const EXEC_STOP_POLL_SLEEP_SECONDS: &str = "0.1";
 const EXEC_TERM_GRACE_SECONDS: &str = "0.02";
 #[cfg(not(test))]
 const EXEC_TERM_GRACE_SECONDS: &str = "0.2";
+
+struct DockerCloneFailure {
+    error:        crate::Error,
+    retry_reason: Option<clone_retry::CloneRetryReason>,
+}
 
 fn env_entry_name(entry: &str) -> &str {
     entry.split_once('=').map_or(entry, |(name, _)| name)
@@ -145,6 +151,13 @@ enum EnsureImageOutcome {
     Pulled,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, strum::Display)]
+#[strum(serialize_all = "lowercase")]
+enum ContainerStartAction {
+    Start,
+    Unpause,
+}
+
 impl DockerSandbox {
     pub fn new(
         config: DockerSandboxOptions,
@@ -154,7 +167,25 @@ impl DockerSandbox {
         clone_branch: Option<String>,
     ) -> crate::Result<Self> {
         let docker = Docker::connect_with_local_defaults().map_err(crate::Error::docker_connect)?;
-        Ok(Self {
+        Ok(Self::with_docker_client(
+            docker,
+            config,
+            github_app,
+            run_id,
+            clone_origin_url,
+            clone_branch,
+        ))
+    }
+
+    fn with_docker_client(
+        docker: Docker,
+        config: DockerSandboxOptions,
+        github_app: Option<GitHubCredentials>,
+        run_id: Option<RunId>,
+        clone_origin_url: Option<String>,
+        clone_branch: Option<String>,
+    ) -> Self {
+        Self {
             docker,
             config,
             github_app,
@@ -169,7 +200,7 @@ impl DockerSandbox {
             cached_os_version: std::sync::OnceLock::new(),
             rg_available: OnceCell::const_new(),
             event_callback: None,
-        })
+        }
     }
 
     pub async fn reconnect(
@@ -656,6 +687,32 @@ impl DockerSandbox {
         Ok(())
     }
 
+    /// Preserve a failed `git clone` result while masking the auth URL.
+    fn clone_failure_error(
+        &self,
+        result: ExecResult,
+        auth_url: Option<&fabro_redact::DisplaySafeUrl>,
+    ) -> crate::Error {
+        let error = result
+            .into_exec_error_with_redactor("git clone", |output| redact_auth_url(output, auth_url));
+        let message = if self.github_app.is_none() {
+            "Git clone failed. If this is a private repository, configure a GitHub App with \
+             `fabro install` and install it for your organization."
+        } else {
+            "Failed to clone repository into Docker sandbox"
+        };
+        crate::Error::context(message, error)
+    }
+
+    fn report_clone_failure(&self, origin_url: &str, err: crate::Error) -> crate::Error {
+        self.emit(SandboxEvent::GitCloneFailed {
+            url:    origin_url.to_string(),
+            error:  err.to_string(),
+            causes: err.causes(),
+        });
+        err
+    }
+
     async fn clone_github_repo(
         &self,
         origin_url: String,
@@ -663,12 +720,10 @@ impl DockerSandbox {
     ) -> crate::Result<()> {
         self.verify_git_available().await?;
         let layout = clone_source::github_repo_layout(&origin_url, WORKING_DIRECTORY, REPOS_ROOT)?;
-
-        self.emit(SandboxEvent::GitCloneStarted {
-            url:    origin_url.clone(),
-            branch: branch.clone(),
-        });
-        let clone_start = Instant::now();
+        let token_was_freshly_minted = self
+            .github_app
+            .as_ref()
+            .is_some_and(GitHubCredentials::mints_installation_token);
 
         let auth_url = match &self.github_app {
             Some(creds) => Some(
@@ -689,26 +744,101 @@ impl DockerSandbox {
             .as_ref()
             .map_or(origin_url.as_str(), |url| url.as_raw_url().as_str());
 
-        let command = git_clone_and_link_command(clone_url, branch.as_deref(), &layout);
+        self.emit(SandboxEvent::GitCloneStarted {
+            url:    origin_url.clone(),
+            branch: branch.clone(),
+        });
+        let clone_start = Instant::now();
 
-        let result = self
-            .docker_exec_shell(&command, 300_000, Some("/"), None, None)
-            .await?;
-        if !result.is_success() {
-            let stderr = redact_auth_url(&result.stderr, auth_url.as_ref());
-            let err = crate::Error::message(if self.github_app.is_none() {
-                format!(
-                    "Git clone failed: {stderr}. If this is a private repository, configure a GitHub App with `fabro install` and install it for your organization."
-                )
-            } else {
-                format!("Failed to clone repo into Docker sandbox: {stderr}")
-            });
-            self.emit(SandboxEvent::GitCloneFailed {
-                url:    origin_url,
-                error:  err.to_string(),
-                causes: err.causes(),
-            });
-            return Err(err);
+        let prepare_command = format!(
+            "mkdir -p {} {}",
+            shell_quote(WORKING_DIRECTORY),
+            shell_quote(&layout.repos_owner_path),
+        );
+        match self
+            .docker_exec_shell(&prepare_command, 10_000, Some("/"), None, None)
+            .await
+        {
+            Ok(result) if result.is_success() => {}
+            Ok(result) => {
+                let err = result.into_exec_error("prepare Docker repository checkout");
+                return Err(self.report_clone_failure(&origin_url, err));
+            }
+            Err(err) => {
+                return Err(self.report_clone_failure(&origin_url, err));
+            }
+        }
+
+        let command = git_clone_command(clone_url, branch.as_deref(), &layout.primary_repo_path);
+        let clone_deadline = time::Instant::now() + GIT_CLONE_TIMEOUT;
+        let clone_result = clone_retry::retry_clone(
+            SandboxProviderKind::Docker,
+            Some(clone_deadline),
+            |_attempt| {
+                let command = command.as_str();
+                let auth_url = auth_url.as_ref();
+                async move {
+                    let remaining = clone_deadline.saturating_duration_since(time::Instant::now());
+                    let timeout_ms = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX);
+                    if timeout_ms == 0 {
+                        return Err(DockerCloneFailure {
+                            error:        crate::Error::message(
+                                "Docker git clone deadline expired before retry",
+                            ),
+                            retry_reason: None,
+                        });
+                    }
+                    let result = self
+                        .docker_exec_shell_streaming(
+                            command,
+                            Some(timeout_ms),
+                            Some("/"),
+                            None,
+                            None,
+                            None,
+                        )
+                        .await
+                        .map_err(|error| DockerCloneFailure {
+                            error:        crate::Error::context(
+                                "Docker git clone transport failed",
+                                error,
+                            ),
+                            retry_reason: None,
+                        })?
+                        .result;
+                    if result.is_success() {
+                        return Ok(());
+                    }
+                    let retry_reason =
+                        classify_docker_clone_result(&result, token_was_freshly_minted);
+                    Err(DockerCloneFailure {
+                        error: self.clone_failure_error(result, auth_url),
+                        retry_reason,
+                    })
+                }
+            },
+            |failure: &DockerCloneFailure| failure.retry_reason,
+        )
+        .await;
+
+        if let Err(failure) = clone_result {
+            let err = failure.error;
+            return Err(self.report_clone_failure(&origin_url, err));
+        }
+
+        let symlink_command = clone_source::repo_symlink_command(&layout);
+        match self
+            .docker_exec_shell(&symlink_command, 10_000, Some("/"), None, None)
+            .await
+        {
+            Ok(result) if result.is_success() => {}
+            Ok(result) => {
+                let err = result.into_exec_error("create Docker workspace repo symlink");
+                return Err(self.report_clone_failure(&origin_url, err));
+            }
+            Err(err) => {
+                return Err(self.report_clone_failure(&origin_url, err));
+            }
         }
 
         let _ = self.repo_cloned.set(true);
@@ -755,24 +885,26 @@ impl DockerSandbox {
         verify_managed_labels(container_id, &labels, self.run_id.as_ref())
     }
 
-    async fn inspect_labels(&self, container_id: &str) -> crate::Result<HashMap<String, String>> {
-        let inspect = self
-            .docker
+    async fn inspect_container(
+        &self,
+        container_id: &str,
+    ) -> crate::Result<ContainerInspectResponse> {
+        self.docker
             .inspect_container(container_id, None::<InspectContainerOptions>)
             .await
-            .map_err(|e| {
-                if docker_not_found(&e) {
-                    crate::Error::message(format!("Docker container '{container_id}' is gone"))
+            .map_err(|source| {
+                let message = if docker_not_found(&source) {
+                    format!("Docker container '{container_id}' is gone")
                 } else {
-                    crate::Error::message(format!(
-                        "Failed to inspect Docker container '{container_id}': {e}"
-                    ))
-                }
-            })?;
-        Ok(inspect
-            .config
-            .and_then(|config| config.labels)
-            .unwrap_or_default())
+                    format!("Failed to inspect Docker container '{container_id}'")
+                };
+                crate::Error::context(message, source)
+            })
+    }
+
+    async fn inspect_labels(&self, container_id: &str) -> crate::Result<HashMap<String, String>> {
+        let inspect = self.inspect_container(container_id).await?;
+        Ok(container_labels(&inspect))
     }
 
     async fn ensure_name_available(&self) -> crate::Result<Option<String>> {
@@ -833,6 +965,67 @@ impl DockerSandbox {
             .upload_to_container(container_id, Some(upload_opts), tar_bytes.into())
             .await
             .map_err(|e| crate::Error::context("Failed to upload file to container", e))
+    }
+
+    fn begin_start(&self) -> Instant {
+        self.emit(SandboxEvent::StartStarted {
+            provider: "docker".into(),
+        });
+        Instant::now()
+    }
+
+    async fn set_container_running(
+        &self,
+        container_id: &str,
+        labels: &HashMap<String, String>,
+        action: ContainerStartAction,
+    ) -> crate::Result<()> {
+        let result = match action {
+            ContainerStartAction::Start => {
+                self.docker
+                    .start_container(container_id, None::<StartContainerOptions<String>>)
+                    .await
+            }
+            ContainerStartAction::Unpause => self.docker.unpause_container(container_id).await,
+        };
+        if let Err(source) = result {
+            if !docker_not_modified(&source) {
+                return Err(crate::Error::context(
+                    format!(
+                        "Failed to {action} Docker container '{container_id}' with labels {labels:?}"
+                    ),
+                    source,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    async fn complete_start(
+        &self,
+        started: Instant,
+        container_id: &str,
+        labels: &HashMap<String, String>,
+        action: ContainerStartAction,
+    ) -> crate::Result<()> {
+        if let Err(error) = self
+            .set_container_running(container_id, labels, action)
+            .await
+        {
+            return self.start_error(error);
+        }
+        if let Err(error) = self.probe_bash(None).await {
+            return self.start_error(crate::Error::context(
+                format!("Docker container '{container_id}' health check"),
+                error,
+            ));
+        }
+
+        self.emit(SandboxEvent::StartCompleted {
+            provider:    "docker".into(),
+            duration_ms: elapsed_ms(started),
+        });
+        Ok(())
     }
 
     fn start_error(&self, error: crate::Error) -> crate::Result<()> {
@@ -1164,19 +1357,17 @@ fn git_clone_command(clone_url: &str, branch: Option<&str>, checkout_path: &str)
     command
 }
 
-fn git_clone_and_link_command(
-    clone_url: &str,
-    branch: Option<&str>,
-    layout: &clone_source::GitHubRepoLayout,
-) -> String {
-    format!(
-        "mkdir -p {} {} && {} && ln -s {} {}",
-        shell_quote(WORKING_DIRECTORY),
-        shell_quote(&layout.repos_owner_path),
-        git_clone_command(clone_url, branch, &layout.primary_repo_path),
-        shell_quote(&layout.primary_repo_path),
-        shell_quote(&layout.primary_repo_link),
-    )
+fn classify_docker_clone_result(
+    result: &ExecResult,
+    token_was_freshly_minted: bool,
+) -> Option<clone_retry::CloneRetryReason> {
+    let stderr = clone_retry::classify_message(&result.stderr, token_was_freshly_minted);
+    match stderr {
+        clone_retry::CloneMessageClass::Unknown => {
+            clone_retry::classify_message(&result.stdout, token_was_freshly_minted).retry_reason()
+        }
+        class => class.retry_reason(),
+    }
 }
 
 fn host_config(config: &DockerSandboxOptions) -> HostConfig {
@@ -1228,6 +1419,24 @@ fn verify_managed_labels(
         }
     }
     Ok(())
+}
+
+fn container_labels(inspect: &ContainerInspectResponse) -> HashMap<String, String> {
+    inspect
+        .config
+        .as_ref()
+        .and_then(|config| config.labels.clone())
+        .unwrap_or_default()
+}
+
+fn activation_action(inspect: &ContainerInspectResponse) -> Option<ContainerStartAction> {
+    let Some(state) = inspect.state.as_ref() else {
+        return Some(ContainerStartAction::Start);
+    };
+    if state.running != Some(true) {
+        return Some(ContainerStartAction::Start);
+    }
+    (state.paused == Some(true)).then_some(ContainerStartAction::Unpause)
 }
 
 fn docker_not_found(error: &DockerError) -> bool {
@@ -1418,47 +1627,40 @@ impl Sandbox for DockerSandbox {
     }
 
     async fn start(&self) -> crate::Result<()> {
-        self.emit(SandboxEvent::StartStarted {
-            provider: "docker".into(),
-        });
-        let start = Instant::now();
+        let started = self.begin_start();
         let container_id = self.container_id()?.to_string();
-        let labels = match self.inspect_labels(&container_id).await {
-            Ok(labels) => labels,
-            Err(e) => return self.start_error(e),
+        let inspect = match self.inspect_container(&container_id).await {
+            Ok(inspect) => inspect,
+            Err(error) => return self.start_error(error),
         };
-        if let Err(e) = verify_managed_labels(&container_id, &labels, self.run_id.as_ref()) {
-            return self.start_error(e);
+        let labels = container_labels(&inspect);
+        if let Err(error) = verify_managed_labels(&container_id, &labels, self.run_id.as_ref()) {
+            return self.start_error(error);
         }
-
-        if let Err(e) = self
-            .docker
-            .start_container(&container_id, None::<StartContainerOptions<String>>)
+        let action = activation_action(&inspect).unwrap_or(ContainerStartAction::Start);
+        self.complete_start(started, &container_id, &labels, action)
             .await
-        {
-            if !docker_not_modified(&e) {
-                return self.start_error(crate::Error::context(
-                    format!(
-                        "Failed to start Docker container '{container_id}' with labels {labels:?}"
-                    ),
-                    e,
-                ));
+    }
+
+    async fn activate(&self) -> crate::Result<()> {
+        let container_id = self.container_id()?.to_string();
+        let inspect = self.inspect_container(&container_id).await?;
+        let labels = container_labels(&inspect);
+        verify_managed_labels(&container_id, &labels, self.run_id.as_ref())?;
+        let Some(action) = activation_action(&inspect) else {
+            return Ok(());
+        };
+        match action {
+            ContainerStartAction::Unpause => {
+                self.set_container_running(&container_id, &labels, action)
+                    .await
+            }
+            ContainerStartAction::Start => {
+                let started = self.begin_start();
+                self.complete_start(started, &container_id, &labels, action)
+                    .await
             }
         }
-
-        if let Err(e) = self.probe_bash(None).await {
-            return self.start_error(crate::Error::context(
-                format!("Docker container '{container_id}' health check"),
-                e,
-            ));
-        }
-
-        let duration_ms = elapsed_ms(start);
-        self.emit(SandboxEvent::StartCompleted {
-            provider: "docker".into(),
-            duration_ms,
-        });
-        Ok(())
     }
 
     async fn stop(&self) -> crate::Result<()> {
@@ -1980,7 +2182,7 @@ impl Sandbox for DockerSandbox {
         // Only a GitHub App installation token can be re-minted; a static PAT or
         // a pre-minted Installation token is fixed, so re-embedding it changes
         // nothing. Short-circuit to Skipped before the resolve + set-url exec.
-        if !matches!(creds, GitHubCredentials::App(_)) {
+        if !creds.mints_installation_token() {
             return Ok(RefreshOutcome::Skipped);
         }
 
@@ -2023,6 +2225,9 @@ mod tests {
     use std::process::Stdio;
     use std::time::Duration;
 
+    use bollard::API_DEFAULT_VERSION;
+    use httpmock::Method::{GET, POST};
+    use httpmock::MockServer;
     use tokio::io::AsyncWriteExt as _;
     use tokio::process::Command;
 
@@ -2135,6 +2340,54 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn activate_unpauses_paused_running_container() {
+        let server = MockServer::start_async().await;
+        let inspect = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path_suffix("/containers/test-container/json");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(serde_json::json!({
+                        "Config": {
+                            "Labels": managed_labels::for_run(None)
+                        },
+                        "State": {
+                            "Running": true,
+                            "Paused": true
+                        }
+                    }));
+            })
+            .await;
+        let unpause = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path_suffix("/containers/test-container/unpause");
+                then.status(204);
+            })
+            .await;
+        let start = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path_suffix("/containers/test-container/start");
+                then.status(204);
+            })
+            .await;
+        let docker = Docker::connect_with_http(&server.base_url(), 5, API_DEFAULT_VERSION)
+            .expect("mock Docker client should connect");
+        let sandbox = test_docker_sandbox(docker, "test-container");
+
+        sandbox
+            .activate()
+            .await
+            .expect("a paused running container should be unpaused");
+
+        inspect.assert_calls_async(1).await;
+        unpause.assert_calls_async(1).await;
+        start.assert_calls_async(0).await;
+    }
+
     #[test]
     fn default_options_are_clone_based() {
         let options = DockerSandboxOptions::default();
@@ -2157,20 +2410,16 @@ mod tests {
     }
 
     #[test]
-    fn clone_and_link_command_creates_workspace_symlink_to_repos_checkout() {
-        let layout = clone_source::github_repo_layout(
-            "https://github.com/fabro-sh/fabro",
-            "/workspace",
-            "/repos",
-        )
-        .unwrap();
-        let command =
-            git_clone_and_link_command("https://github.com/fabro-sh/fabro", Some("main"), &layout);
+    fn clone_result_uses_stderr_before_stdout() {
+        let result = ExecResult {
+            stdout:      "Could not resolve host: github.com".to_string(),
+            stderr:      "fatal: destination path 'fabro' already exists".to_string(),
+            exit_code:   Some(128),
+            termination: CommandTermination::Exited,
+            duration_ms: 1,
+        };
 
-        assert_eq!(
-            command,
-            "mkdir -p /workspace /repos/fabro-sh && git -c maintenance.auto=0 -c gc.auto=0 clone --branch main --single-branch --depth 10 --no-tags -- https://github.com/fabro-sh/fabro /repos/fabro-sh/fabro && ln -s /repos/fabro-sh/fabro /workspace/fabro"
-        );
+        assert_eq!(classify_docker_clone_result(&result, true), None);
     }
 
     #[test]
@@ -2446,5 +2695,21 @@ mod tests {
         let mut content = String::new();
         entry.read_to_string(&mut content).unwrap();
         assert_eq!(content, "hello");
+    }
+
+    fn test_docker_sandbox(docker: Docker, container_id: &str) -> DockerSandbox {
+        let sandbox = DockerSandbox::with_docker_client(
+            docker,
+            DockerSandboxOptions::default(),
+            None,
+            None,
+            None,
+            None,
+        );
+        sandbox
+            .container_id
+            .set(container_id.to_string())
+            .expect("test container should initialize once");
+        sandbox
     }
 }

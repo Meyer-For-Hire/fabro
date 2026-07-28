@@ -52,7 +52,9 @@ fn preflight_invalid_workflow_fails_with_validation_output() {
     Workflow: Invalid (2 nodes, 1 edges)
     Graph: [FIXTURES]/invalid.fabro
     error: Pipeline must have exactly one start node (shape=Mdiamond or id start/Start) (start_node)
+      fix: Add a node with shape=Mdiamond or id 'start'
     error [node: exit]: Exit node 'exit' has 1 outgoing edge(s) but must have none (exit_no_outgoing)
+      fix: Remove outgoing edges from the exit node
       × Validation failed
     ");
 }
@@ -74,7 +76,9 @@ fn preflight_rejects_unbound_template_inputs() {
     Goal: Demo
 
     error: [FIXTURES]/templated_unbound.fabro:2:26: undefined template variable `inputs.app_dir` in graph attribute `goal` (template_undefined_variable)
+      fix: bind `inputs.app_dir` via `[run.inputs]` in workflow.toml, or pass `--input inputs.app_dir=<value>`
     error: [FIXTURES]/templated_unbound.fabro:7:44: undefined template variable `inputs.app_dir` in node `work` attribute `prompt` [node: work] (template_undefined_variable)
+      fix: bind `inputs.app_dir` via `[run.inputs]` in workflow.toml, or pass `--input inputs.app_dir=<value>`
       × Validation failed
     ");
 }

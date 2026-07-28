@@ -127,7 +127,7 @@ pub use run_projection::{
     StageContextWindowBreakdownItem, StageContextWindowCategory, StageContextWindowCountMethod,
     StageContextWindowProjection, StageContextWindowStaleness, StageContextWindowUnavailableReason,
     StageContextWindowWarning, StageInferenceProjection, StageModelUsage, StageProjection,
-    SubAgentProjection, SubAgentStatus, first_event_seq,
+    StageToolBatchProjection, SubAgentProjection, SubAgentStatus, first_event_seq,
 };
 pub use run_sandbox::{
     RunSandbox, RunSandboxFailure, RunSandboxInstance, RunSandboxKind, RunSandboxPlan,

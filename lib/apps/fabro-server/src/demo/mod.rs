@@ -1134,6 +1134,7 @@ mod runs {
             id: stage_id.clone(),
             name: name.to_owned(),
             handler,
+            billing: BilledTokenCounts::default(),
             status,
             wall_time_ms,
             node_id: stage_id.node_id().to_owned(),

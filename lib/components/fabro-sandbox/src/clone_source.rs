@@ -32,6 +32,8 @@ pub(crate) fn github_repo_layout(
             "Clone-based sandboxes currently support GitHub repository origins only: {err}"
         ))
     })?;
+    validate_path_component("owner", &owner)?;
+    validate_path_component("repository", &repo)?;
     let workspace_root = trim_root(workspace_root);
     let repos_root = trim_root(repos_root);
     let repos_owner_path = sandbox::join_sandbox_path(repos_root, &owner);
@@ -46,6 +48,27 @@ pub(crate) fn github_repo_layout(
         execution_directory: primary_repo_link.clone(),
         primary_repo_link,
     })
+}
+
+fn validate_path_component(label: &str, component: &str) -> crate::Result<()> {
+    let is_safe = !matches!(component, "." | "..")
+        && component
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
+    if !is_safe {
+        return Err(crate::Error::message(format!(
+            "GitHub {label} is not a safe repository path component"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn repo_symlink_command(layout: &GitHubRepoLayout) -> String {
+    format!(
+        "ln -s {} {}",
+        sandbox::shell_quote(&layout.primary_repo_path),
+        sandbox::shell_quote(&layout.primary_repo_link),
+    )
 }
 
 fn trim_root(root: &str) -> &str {
@@ -202,6 +225,37 @@ mod tests {
         assert_eq!(layout.primary_repo_path, "/repos/fabro-sh/fabro");
         assert_eq!(layout.primary_repo_link, "/workspace/fabro");
         assert_eq!(layout.execution_directory, "/workspace/fabro");
+    }
+
+    #[test]
+    fn github_layout_rejects_path_traversal_components() {
+        for origin in [
+            "https://github.com/../widgets",
+            "https://github.com/acme/..",
+            "https://github.com/%2e%2e/widgets",
+        ] {
+            let error = github_repo_layout(origin, "/workspace", "/repos")
+                .expect_err("unsafe path component should fail");
+            assert!(
+                error.to_string().contains("safe repository path component"),
+                "got {error} for {origin}"
+            );
+        }
+    }
+
+    #[test]
+    fn repo_symlink_command_quotes_both_paths() {
+        let layout = github_repo_layout(
+            "https://github.com/fabro-sh/fabro",
+            "/work space",
+            "/repo root",
+        )
+        .unwrap();
+
+        assert_eq!(
+            repo_symlink_command(&layout),
+            "ln -s '/repo root/fabro-sh/fabro' '/work space/fabro'"
+        );
     }
 
     #[test]

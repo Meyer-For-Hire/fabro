@@ -392,6 +392,8 @@ pub async fn initialize(
     });
 
     if attach_existing {
+        // Resume needs the full provider health check. `activate()` is the
+        // lighter access-time operation used after a run is already active.
         sandbox
             .start()
             .await

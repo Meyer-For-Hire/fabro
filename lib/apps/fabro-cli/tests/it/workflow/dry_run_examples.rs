@@ -19,6 +19,7 @@ fn dry_run_branching() {
     Goal: Implement and validate a feature
 
     warning [node: implement]: Node 'implement' has goal_gate=true but no retry_target or fallback_retry_target (goal_gate_has_retry)
+      fix: Add retry_target or fallback_retry_target attribute
         Run: [ULID]
         Web UI: http://localhost:3000/runs/[ULID]
         Sandbox: local (ready in [TIME])

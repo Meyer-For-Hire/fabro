@@ -361,6 +361,11 @@ fn main() {
             "fabro_types::StageInferenceProjection",
             &[],
         ),
+        (
+            "StageToolBatchProjection",
+            "fabro_types::StageToolBatchProjection",
+            &[],
+        ),
         ("LlmOutputKind", "fabro_types::LlmOutputKind", &[]),
         ("PermissionLevel", "fabro_types::PermissionLevel", &[]),
         (

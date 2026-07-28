@@ -183,12 +183,32 @@ import {
   lifecycleActionVisibility,
 } from "./run-detail/lifecycle-toasts";
 
-const { default: RunDetail } = await import("./run-detail");
+const {
+  default: RunDetail,
+  resolveDockClearance,
+} = await import("./run-detail");
 mock.restore();
 type LifecycleToastState = import("./run-detail/lifecycle-toasts").LifecycleToastState;
 type RunDetailActionResult = import("./run-detail/lifecycle-toasts").RunDetailActionResult;
 
 const h = createElement;
+
+describe("resolveDockClearance", () => {
+  test("uses only a current dock measurement", () => {
+    const measurement = { identity: "run_1:steer", height: 108 };
+
+    expect(resolveDockClearance(null, measurement, false)).toBe("0px");
+    expect(
+      resolveDockClearance("run_1:interview", measurement, true),
+    ).toBe("18rem");
+    expect(resolveDockClearance("run_2:steer", measurement, false)).toBe(
+      "5rem",
+    );
+    expect(resolveDockClearance("run_1:steer", measurement, false)).toBe(
+      "108px",
+    );
+  });
+});
 
 function makeRunSummary({
   status = "succeeded",
@@ -841,7 +861,7 @@ describe("RunDetail full-height child routes", () => {
     });
 
     const statuses = renderer.root.findAll(
-      (node) => node.type === "p" && node.props.role === "status",
+      (node) => node.props.role === "status",
     );
     expect(statuses.map(textFromTestNode)).toContain(
       "Interrupted — waiting for steering",

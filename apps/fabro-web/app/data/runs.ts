@@ -46,6 +46,7 @@ export interface RunItem {
   createdBy: Principal;
   lastEventAt?: string;
   size?: RunSize;
+  totalUsdMicros?: number;
 }
 
 export const columnStatuses = [
@@ -119,6 +120,7 @@ export function mapRunListItem(item: Run): RunItem {
     additions: item.diff?.additions,
     deletions: item.diff?.deletions,
     size: item.size,
+    totalUsdMicros: item.billing?.total_usd_micros ?? undefined,
   };
 }
 

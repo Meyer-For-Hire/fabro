@@ -10678,7 +10678,38 @@ components:
             - type: "null"
           description: |
             Per-attempt timing breakdown for the latest terminal attempt:
-            wall time plus the active inference/tool breakdown.
+            wall time plus the active inference/tool breakdown. Null while the
+            stage is still in flight; the live estimate is derived from
+            `live_inference_ms`, `live_tool_ms`, and any open bracket.
+        live_inference_ms:
+          type: integer
+          format: uint64
+          minimum: 0
+          default: 0
+          description: |
+            Inference time accumulated from closed brackets during the current
+            attempt. Live estimate only — the authoritative value arrives with
+            the terminal event and lands in `timing`. Excludes the currently
+            open bracket, whose span is measured from `inference.started_at`.
+          example: 78230
+        live_tool_ms:
+          type: integer
+          format: uint64
+          minimum: 0
+          default: 0
+          description: |
+            Tool time accumulated from closed tool batches during the current
+            attempt. A batch spans the first dispatched call through the
+            completion that drains the last outstanding one, so tools running
+            concurrently within a turn are counted once.
+          example: 7588
+        tool_batch:
+          oneOf:
+            - $ref: "#/components/schemas/StageToolBatchProjection"
+            - type: "null"
+          description: |
+            Open tool batch: when the batch started and which calls have not
+            yet reported completion.
         usage:
           $ref: "#/components/schemas/BilledTokenCounts"
         model:
@@ -10732,12 +10763,50 @@ components:
             Open inference bracket, if the event log contains one. Present means
             a model request was dispatched and no closing event has been seen —
             not that the model is computing right now.
+        acp_started_at:
+          type: ["string", "null"]
+          format: date-time
+          description: >
+            Start of an external ACP agent process, if one is running. ACP
+            agents do not expose Fabro's internal LLM brackets, so the process
+            lifetime supplies their live inference estimate.
         agent_control:
           $ref: "#/components/schemas/AgentControlState"
           description: Whether the agent is executing normally or waiting for steering after an interrupt.
         state:
           $ref: "#/components/schemas/StageState"
           description: Lifecycle state of the stage projection.
+
+    StageToolBatchProjection:
+      description: >
+        One open tool batch: tool calls dispatched together that have not all
+        reported completion. `open_call_ids` is a set rather than a count so a
+        duplicated completion in a replayed log cannot drain the batch early.
+      type: object
+      required:
+        - session_id
+        - started_at
+        - open_call_ids
+      properties:
+        session_id:
+          type: string
+          description: >
+            Root agent session that dispatched the batch. Transitions are
+            gated on it so delayed events from a replaced session cannot
+            mutate the current batch.
+        started_at:
+          type: string
+          format: date-time
+          description: >
+            When the batch opened — the first dispatched call observed while no
+            other calls were outstanding.
+        open_call_ids:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            type: string
+          description: Calls dispatched but not yet completed, by tool call id.
 
     StageInferenceProjection:
       description: >
@@ -12283,9 +12352,17 @@ components:
         observed LLM request/stream elapsed time; `tool_time_ms` is tool or
         command execution elapsed time; `active_time_ms` equals
         `inference_time_ms + tool_time_ms`.
+
+        For a terminal stage these come from the worker's own stopwatch and are
+        authoritative. For a stage still in flight they are a live estimate
+        reconstructed from the event log, and `active_time_ms` is clamped to
+        `wall_time_ms`. The estimate is replaced by the authoritative
+        breakdown when the stage reaches a terminal event.
       type: object
       required:
         - wall_time_ms
+        - inference_time_ms
+        - tool_time_ms
         - active_time_ms
       properties:
         wall_time_ms:
@@ -12317,9 +12394,16 @@ components:
         Timing rollup for an entire run. Active fields sum work across stage
         visits, so `active_time_ms` can exceed `wall_time_ms` when parallel
         branches run concurrently.
+
+        For a running run, stages still in flight contribute a live estimate
+        rather than nothing, so wall and active both advance continuously.
+        Unlike `StageTiming`, active is not clamped to wall here — concurrent
+        branches can legitimately sum past run wall time.
       type: object
       required:
         - wall_time_ms
+        - inference_time_ms
+        - tool_time_ms
         - active_time_ms
       properties:
         wall_time_ms:
@@ -12648,6 +12732,7 @@ components:
         - status
         - node_id
         - visit
+        - billing
       properties:
         id:
           $ref: "#/components/schemas/StageId"
@@ -12707,6 +12792,15 @@ components:
           format: date-time
           description: Wall-clock time the latest attempt of this stage started, if known.
           example: "2026-04-29T12:34:56Z"
+        billing:
+          $ref: "#/components/schemas/BilledTokenCounts"
+          description: >-
+            Token counts for this stage execution alone. `total_usd_micros` is
+            the provider-reported cost when there is one, otherwise the server
+            catalog's price for these tokens — the same pricing the
+            `/runs/{id}/billing` rows use. All-zero counts mean the stage made
+            no model calls. Unlike the billing rows, which sum every visit of a
+            node, this covers only this visit.
 
     # ── File Diff Schemas ──────────────────────────────────────────────
 

@@ -194,6 +194,12 @@ pub enum GitHubCredentials {
 }
 
 impl GitHubCredentials {
+    /// Whether resolving these credentials mints a new installation token.
+    #[must_use]
+    pub fn mints_installation_token(&self) -> bool {
+        matches!(self, Self::App(_))
+    }
+
     pub fn from_env(app_id: Option<&str>) -> Result<Option<Self>, String> {
         Ok(GitHubAppCredentials::from_env(app_id)?.map(Self::App))
     }
@@ -372,7 +378,7 @@ pub fn parse_github_owner_repo(url: &str) -> anyhow::Result<(String, String)> {
     let path = path.trim_end_matches('/');
     let path = path.strip_suffix(".git").unwrap_or(path);
 
-    let mut parts = path.splitn(3, '/');
+    let mut parts = path.split('/');
     let owner = parts
         .next()
         .filter(|s| !s.is_empty())
@@ -381,6 +387,9 @@ pub fn parse_github_owner_repo(url: &str) -> anyhow::Result<(String, String)> {
         .next()
         .filter(|s| !s.is_empty())
         .ok_or_else(|| anyhow!("Missing repo in GitHub URL: {display_url}"))?;
+    if parts.next().is_some() {
+        bail!("GitHub URL must identify one repository: {display_url}");
+    }
 
     Ok((owner.to_string(), repo.to_string()))
 }
@@ -1388,6 +1397,16 @@ mod tests {
         assert_eq!(repo, "repo");
     }
 
+    #[test]
+    fn parse_rejects_extra_path_components() {
+        let error = parse_github_owner_repo("https://github.com/owner/repo/issues").unwrap_err();
+
+        assert!(
+            error.to_string().contains("must identify one repository"),
+            "got: {error}"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // ssh_url_to_https
     // -----------------------------------------------------------------------
@@ -2310,6 +2329,24 @@ mod tests {
         };
         assert_eq!(fresh.valid_token().unwrap(), "ghs_fresh");
         assert!(!fresh.near_expiry(std::time::Duration::from_mins(15)));
+    }
+
+    #[test]
+    fn only_app_credentials_mint_installation_tokens() {
+        let app = GitHubCredentials::App(GitHubAppCredentials {
+            app_id:          "test".to_string(),
+            private_key_pem: test_rsa_key().to_string(),
+            slug:            None,
+        });
+        let pat = GitHubCredentials::Pat("ghp_personal".to_string());
+        let installation = GitHubCredentials::Installation(InstallationToken {
+            token:      "ghs_installation".to_string(),
+            expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
+        });
+
+        assert!(app.mints_installation_token());
+        assert!(!pat.mints_installation_token());
+        assert!(!installation.mints_installation_token());
     }
 
     #[test]

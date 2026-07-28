@@ -19,6 +19,7 @@ use fabro_types::{
     SandboxProviderKind, StageCompletion, StageHandler, StageId, StageInferenceProjection,
     StageModelUsage, StageOutcome, StageProjection, StageState, StartRecord, SubAgentProjection,
     SubAgentStatus, TodoListKind, TodoListProjection, TodoProjection, WorkflowRef, first_event_seq,
+    timing,
 };
 use fabro_util::error::render_compact_with_causes;
 
@@ -406,7 +407,7 @@ impl RunProjectionReducer for RunProjection {
                 };
                 stage.response = response;
                 stage.completion = Some(completion);
-                stage.timing = Some(props.timing);
+                stage.set_authoritative_timing(props.timing);
                 if let Some(billing) = &props.billing {
                     stage.usage.replace_with_billed_usage(billing);
                     stage.model = Some(billing.model().clone());
@@ -429,7 +430,7 @@ impl RunProjectionReducer for RunProjection {
                     failure_reason,
                     timestamp: ts,
                 });
-                stage.timing = Some(props.timing);
+                stage.set_authoritative_timing(props.timing);
                 if let Some(billing) = &props.billing {
                     stage.usage.replace_with_billed_usage(billing);
                     stage.model = Some(billing.model().clone());
@@ -450,7 +451,7 @@ impl RunProjectionReducer for RunProjection {
                     context_window.event_seq = Some(event.seq);
                     stage.context_window = Some(context_window);
                 }
-                close_inference_bracket(self, stored, props.visit, event.seq);
+                close_inference_bracket(self, stored, props.visit, event.seq, ts);
             }
             EventBody::AgentLlmStarted(props) => {
                 open_inference_bracket(self, stored, props, event.seq, ts);
@@ -479,10 +480,10 @@ impl RunProjectionReducer for RunProjection {
                 inference.first_output_kind = None;
             }
             EventBody::AgentError(props) => {
-                close_inference_bracket(self, stored, props.visit, event.seq);
+                close_inference_bracket(self, stored, props.visit, event.seq, ts);
             }
             EventBody::AgentSessionEnded(_) => {
-                close_inference_brackets_for_session(self, stored);
+                close_active_brackets_for_session(self, stored, ts);
             }
             EventBody::AgentSessionActivated(props) => {
                 let Some(stage) = stage_at_stored_or_visit(self, stored, props.visit, event.seq)
@@ -498,7 +499,7 @@ impl RunProjectionReducer for RunProjection {
                     return Ok(());
                 };
                 stage.agent_control = AgentControlState::WaitingForSteer;
-                close_inference_bracket(self, stored, props.visit, event.seq);
+                close_inference_bracket(self, stored, props.visit, event.seq, ts);
             }
             EventBody::AgentSteeringInjected(props) => {
                 let Some(stage) = stage_at_stored_or_visit(self, stored, props.visit, event.seq)
@@ -521,12 +522,17 @@ impl RunProjectionReducer for RunProjection {
                 };
                 stage.agent_tools.clone_from(&props.tools);
             }
-            // `AgentAcpStarted` is the start-of-process signal for an external
-            // ACP agent. `provider_used` is intentionally sourced from the
-            // subsequent `AgentSessionActivated` event, which carries the
-            // canonical provider/model. ACP runs without a steering hub never
-            // emit activation and so legitimately leave `provider_used`
-            // unset — matching legacy ACP behavior.
+            EventBody::AgentAcpStarted(props) => {
+                let Some(stage) = stage_at_stored_or_visit(self, stored, props.visit, event.seq)
+                else {
+                    return Ok(());
+                };
+                stage.open_acp_inference(ts);
+                // `provider_used` is intentionally sourced from the subsequent
+                // `AgentSessionActivated` event, which carries the canonical
+                // provider/model. ACP runs without a steering hub never emit
+                // activation and legitimately leave it unset.
+            }
             EventBody::CommandStarted(props) => {
                 let script_invocation = serde_json::to_value(props).map_err(|err| {
                     Error::InvalidEvent(format!("invalid command.started payload: {err}"))
@@ -553,6 +559,7 @@ impl RunProjectionReducer for RunProjection {
                 let Some(stage) = stage_at_current_visit(self, stored, event.seq) else {
                     return Ok(());
                 };
+                stage.close_acp_inference(props.duration_ms);
                 apply_agent_terminal(
                     "agent.acp",
                     stage,
@@ -565,6 +572,7 @@ impl RunProjectionReducer for RunProjection {
                 let Some(stage) = stage_at_current_visit(self, stored, event.seq) else {
                     return Ok(());
                 };
+                stage.close_acp_inference(props.duration_ms);
                 apply_agent_terminal(
                     "agent.acp",
                     stage,
@@ -577,6 +585,7 @@ impl RunProjectionReducer for RunProjection {
                 let Some(stage) = stage_at_current_visit(self, stored, event.seq) else {
                     return Ok(());
                 };
+                stage.close_acp_inference(props.duration_ms);
                 apply_agent_terminal(
                     "agent.acp",
                     stage,
@@ -595,6 +604,11 @@ impl RunProjectionReducer for RunProjection {
                 // Branches bypass the engine's StageStarted/StageCompleted
                 // lifecycle. Seed started_at so the branch stage drives a live
                 // wall-clock timer while it runs (the entry is created Running).
+                let handler = stored
+                    .node_id
+                    .as_deref()
+                    .and_then(|node_id| self.spec().graph.nodes.get(node_id))
+                    .map(|node| StageHandler::from_handler_type(node.handler_type()));
                 let is_new = stored
                     .stage_id
                     .as_ref()
@@ -604,6 +618,9 @@ impl RunProjectionReducer for RunProjection {
                 };
                 if stage.started_at.is_none() {
                     stage.started_at = Some(ts);
+                }
+                if stage.handler.is_none() {
+                    stage.handler = handler;
                 }
                 if is_new {
                     stage.graph_visit = props.graph_visit;
@@ -747,6 +764,11 @@ impl RunProjectionReducer for RunProjection {
                 });
             }
             EventBody::AgentToolStarted(props) => {
+                let root_session_id = if stored.parent_session_id.is_none() {
+                    stored.session_id.clone()
+                } else {
+                    None
+                };
                 let Some(stage) = stage_at_stored_or_visit(self, stored, props.visit, event.seq)
                 else {
                     return Ok(());
@@ -767,6 +789,25 @@ impl RunProjectionReducer for RunProjection {
                         projection.invoked = true;
                     }
                 }
+                // A subagent's tools run inside the root session's tool call,
+                // so the root batch already covers them. Timing them again
+                // would double-count that span.
+                if let Some(session_id) = root_session_id {
+                    stage.open_tool_call(session_id, props.tool_call_id.clone(), ts);
+                }
+            }
+            EventBody::AgentToolCompleted(props) => {
+                if stored.parent_session_id.is_some() {
+                    return Ok(());
+                }
+                let Some(session_id) = stored.session_id.as_deref() else {
+                    return Ok(());
+                };
+                let Some(stage) = stage_at_stored_or_visit(self, stored, props.visit, event.seq)
+                else {
+                    return Ok(());
+                };
+                stage.close_tool_call(session_id, &props.tool_call_id, ts);
             }
             _ => {}
         }
@@ -1032,19 +1073,19 @@ fn open_inference_bracket(
     });
 }
 
-/// Resolve the stage's `inference` slot when it holds a bracket this event is
-/// allowed to mutate.
+/// Resolve the stage owning a bracket this event is allowed to mutate,
+/// borrowing the whole projection so the caller can also fold elapsed time
+/// into the stage's live accumulators.
 ///
-/// `None` when the event came from a child session, when the stage has no
-/// open bracket, or when the bracket belongs to a different session — the
-/// last case matters after failover, which discards the session and builds a
-/// new one within a single visit.
-fn matching_inference_slot<'a>(
+/// Returns `None` for child-session events, for a stage with no open bracket,
+/// and for a bracket belonging to a different session (which is what
+/// post-failover events look like).
+fn matching_inference_stage<'a>(
     state: &'a mut RunProjection,
     stored: &RunEvent,
     visit: u32,
     seq: u32,
-) -> Option<&'a mut Option<StageInferenceProjection>> {
+) -> Option<&'a mut StageProjection> {
     if stored.parent_session_id.is_some() {
         return None;
     }
@@ -1054,7 +1095,7 @@ fn matching_inference_slot<'a>(
         .inference
         .as_ref()
         .is_some_and(|inference| inference.session_id == session_id);
-    opened_here.then_some(&mut stage.inference)
+    opened_here.then_some(stage)
 }
 
 /// Resolve the open inference bracket this event is allowed to mutate.
@@ -1064,17 +1105,39 @@ fn matching_inference_bracket<'a>(
     visit: u32,
     seq: u32,
 ) -> Option<&'a mut StageInferenceProjection> {
-    matching_inference_slot(state, stored, visit, seq)?.as_mut()
+    matching_inference_stage(state, stored, visit, seq)?
+        .inference
+        .as_mut()
 }
 
-/// Close the bracket on a stage-addressed terminal event.
-fn close_inference_bracket(state: &mut RunProjection, stored: &RunEvent, visit: u32, seq: u32) {
-    if let Some(slot) = matching_inference_slot(state, stored, visit, seq) {
-        *slot = None;
-    }
+/// Close the bracket on a stage-addressed terminal event, folding its elapsed
+/// time into the stage's live inference accumulator.
+fn close_inference_bracket(
+    state: &mut RunProjection,
+    stored: &RunEvent,
+    visit: u32,
+    seq: u32,
+    ts: DateTime<Utc>,
+) {
+    let Some(stage) = matching_inference_stage(state, stored, visit, seq) else {
+        return;
+    };
+    close_bracket_on_stage(stage, ts);
 }
 
-/// Close every bracket opened by the session that just ended.
+/// Take the open bracket and add its span to `live_inference_ms`.
+///
+/// Retries inside the bracket are deliberately included: the in-process
+/// stopwatch counts a retried attempt's elapsed time as inference, and
+/// `agent.llm.retry` keeps the bracket open rather than reopening it.
+fn close_bracket_on_stage(stage: &mut StageProjection, ts: DateTime<Utc>) {
+    let Some(inference) = stage.inference.take() else {
+        return;
+    };
+    stage.accumulate_inference_ms(timing::elapsed_ms(inference.started_at, ts));
+}
+
+/// Close every active bracket opened by the session that just ended.
 ///
 /// `agent.session.ended` is the only ordering-safe backstop for terminal
 /// cancel and wall-clock timeout, which tear the session down through
@@ -1089,7 +1152,11 @@ fn close_inference_bracket(state: &mut RunProjection, stored: &RunEvent, visit: 
 /// opened. Implemented as a normal stage lookup it would find no target and
 /// silently no-op, leaving the bracket open forever on exactly the path it
 /// exists to cover.
-fn close_inference_brackets_for_session(state: &mut RunProjection, stored: &RunEvent) {
+fn close_active_brackets_for_session(
+    state: &mut RunProjection,
+    stored: &RunEvent,
+    ts: DateTime<Utc>,
+) {
     if stored.parent_session_id.is_some() {
         return;
     }
@@ -1102,8 +1169,9 @@ fn close_inference_brackets_for_session(state: &mut RunProjection, stored: &RunE
             .as_ref()
             .is_some_and(|inference| inference.session_id == session_id);
         if opened_here {
-            stage.inference = None;
+            close_bracket_on_stage(stage, ts);
         }
+        stage.close_tool_batch_for_session(session_id, ts);
     }
 }
 
@@ -1413,23 +1481,26 @@ fn finalize_unfinished_stages_after_run_failed(
         StageState::Failed
     };
 
-    for (_, stage) in state.iter_stages_mut() {
+    for (_, stage) in state.iter_stages_unordered_mut() {
         if stage.state.is_terminal() {
             continue;
         }
 
+        // Close any brackets still open so their spans are not dropped on the
+        // floor when the live estimate is frozen into `timing` below.
+        close_bracket_on_stage(stage, timestamp);
+        stage.close_open_acp_inference(timestamp);
+        stage.close_open_tool_batch(timestamp);
+
+        // Freeze the live estimate before flipping to a terminal state:
+        // `live_timing` reads `effective_state` and would return wall-only
+        // once the stage no longer looks in-flight.
+        let frozen = stage.live_timing(timestamp);
         stage.state = terminal_state;
-        if stage.timing.is_none() {
-            if let Some(started_at) = stage.started_at {
-                let wall_time_ms = u64::try_from(
-                    timestamp
-                        .signed_duration_since(started_at)
-                        .num_milliseconds()
-                        .max(0),
-                )
-                .expect("non-negative milliseconds fit in u64");
-                stage.timing = Some(fabro_types::StageTiming::wall_only(wall_time_ms));
-            }
+        if stage.timing.is_none() && stage.started_at.is_some() {
+            stage.set_authoritative_timing(frozen);
+        } else {
+            stage.clear_live_timing();
         }
     }
 }
@@ -1546,20 +1617,518 @@ mod tests {
     };
     use fabro_types::settings::run::{DockerfileSource, EnvironmentProvider};
     use fabro_types::{
-        AgentBackend, AgentControlState, AutomationRef, BilledModelUsage, BilledTokenCounts,
-        BlockedReason, Checkpoint, CheckpointRecord, CommandTermination, EventBody,
-        FailureCategory, FailureDetail, FailureReason, Graph, McpServerStatus, Outcome,
-        PendingReason, PermissionLevel, PullRequestLink, QuestionType, ReasoningEffort,
+        AgentBackend, AgentControlState, AttrValue, AutomationRef, BilledModelUsage,
+        BilledTokenCounts, BlockedReason, Checkpoint, CheckpointRecord, CommandTermination,
+        EventBody, FailureCategory, FailureDetail, FailureReason, Graph, McpServerStatus, Node,
+        Outcome, PendingReason, PermissionLevel, PullRequestLink, QuestionType, ReasoningEffort,
         RunApprovalState, RunBlobId, RunControlAction, RunDiff, RunEvent, RunSize, RunSpec,
         RunStatus, Speed, StageContextWindowBreakdownItem, StageContextWindowCategory,
         StageContextWindowCountMethod, StageContextWindowProjection, StageContextWindowStaleness,
-        StageContextWindowWarning, StageModelUsage, StageOutcome, StageState, SubAgentStatus,
-        SuccessReason, WorkflowSettings, first_event_seq, fixtures, test_support,
+        StageContextWindowWarning, StageHandler, StageModelUsage, StageOutcome, StageState,
+        StageTiming, SubAgentStatus, SuccessReason, WorkflowSettings, first_event_seq, fixtures,
+        test_support,
     };
     use serde_json::json;
 
     use super::{RunProjection, RunProjectionReducer, build_summary};
     use crate::{Error, EventEnvelope, StageId};
+
+    /// Live accumulation of inference and tool time while a stage is in
+    /// flight. The finalized breakdown still arrives with the terminal event
+    /// and replaces these; these exist so a long-running stage is not reported
+    /// as doing no work.
+    mod live_active_accumulation {
+        use fabro_types::run_event::{
+            AgentLlmFirstOutputProps, AgentLlmRetryProps, AgentLlmStartedProps,
+            AgentToolCompletedProps, AgentToolStartedProps,
+        };
+        use fabro_types::{
+            LlmOutputKind, LlmRetryPhase, ModelRef, Speed, StageOutcome, StageProjection,
+        };
+
+        use super::*;
+
+        fn stage_id() -> StageId {
+            StageId::new("plan", 1)
+        }
+
+        fn session_event(seq: u32, ts: &str, session_id: &str, body: EventBody) -> EventEnvelope {
+            let mut event = test_stage_event_at(seq, ts, body, stage_id());
+            event.event.session_id = Some(session_id.to_string());
+            event
+        }
+
+        fn agent_event(seq: u32, ts: &str, body: EventBody) -> EventEnvelope {
+            session_event(seq, ts, "session-1", body)
+        }
+
+        /// An event from a sub-agent session nested under the root session.
+        fn child_event(seq: u32, ts: &str, body: EventBody) -> EventEnvelope {
+            let mut event = agent_event(seq, ts, body);
+            event.event.session_id = Some("session-child".to_string());
+            event.event.parent_session_id = Some("session-1".to_string());
+            event
+        }
+
+        fn llm_started() -> EventBody {
+            EventBody::AgentLlmStarted(AgentLlmStartedProps {
+                requested_model: ModelRef {
+                    provider: "anthropic".parse().unwrap(),
+                    model_id: "claude-fable-5".into(),
+                    speed:    Some(Speed::Fast),
+                },
+                visit:           1,
+            })
+        }
+
+        fn tool_started(tool_call_id: &str) -> EventBody {
+            EventBody::AgentToolStarted(AgentToolStartedProps {
+                tool_name:         "Bash".to_string(),
+                tool_call_id:      tool_call_id.to_string(),
+                arguments:         json!({}),
+                visit:             1,
+                tool_call:         None,
+                turn_id:           None,
+                parent_message_id: None,
+            })
+        }
+
+        fn tool_completed(tool_call_id: &str) -> EventBody {
+            EventBody::AgentToolCompleted(AgentToolCompletedProps {
+                tool_name:    "Bash".to_string(),
+                tool_call_id: tool_call_id.to_string(),
+                output:       json!("ok"),
+                is_error:     false,
+                visit:        1,
+                tool_result:  None,
+                turn_id:      None,
+            })
+        }
+
+        fn agent_message() -> EventBody {
+            EventBody::AgentMessage(live_agent_message_props(live_counts(10, 5)))
+        }
+
+        fn started_state() -> RunProjection {
+            let mut state = initialized_projection();
+            state
+                .apply_event(&test_stage_event_at(
+                    1,
+                    "2026-04-07T12:00:00Z",
+                    EventBody::StageStarted(started_props()),
+                    stage_id(),
+                ))
+                .unwrap();
+            state
+        }
+
+        fn stage(state: &RunProjection) -> &StageProjection {
+            state.stage(&stage_id()).unwrap()
+        }
+
+        #[test]
+        fn closing_an_inference_bracket_accumulates_its_span() {
+            let mut state = started_state();
+            state
+                .apply_event(&agent_event(2, "2026-04-07T12:00:05Z", llm_started()))
+                .unwrap();
+            state
+                .apply_event(&agent_event(
+                    3,
+                    "2026-04-07T12:00:06Z",
+                    EventBody::AgentLlmFirstOutput(AgentLlmFirstOutputProps {
+                        kind:  LlmOutputKind::Text,
+                        visit: 1,
+                    }),
+                ))
+                .unwrap();
+            state
+                .apply_event(&agent_event(4, "2026-04-07T12:00:12Z", agent_message()))
+                .unwrap();
+
+            // 12:00:05 -> 12:00:12; first_output is a marker, not the close.
+            assert_eq!(stage(&state).live_inference_ms, 7_000);
+            assert!(stage(&state).inference.is_none());
+        }
+
+        #[test]
+        fn concurrent_tool_calls_count_once_not_per_call() {
+            let mut state = started_state();
+            for (seq, id) in [(2, "call-a"), (3, "call-b"), (4, "call-c")] {
+                state
+                    .apply_event(&agent_event(seq, "2026-04-07T12:00:00Z", tool_started(id)))
+                    .unwrap();
+            }
+            // All three finish 10s later. Summing per-call spans would report
+            // 30s; the batch actually occupied 10s of wall time.
+            for (seq, id) in [(5, "call-a"), (6, "call-b"), (7, "call-c")] {
+                state
+                    .apply_event(&agent_event(
+                        seq,
+                        "2026-04-07T12:00:10Z",
+                        tool_completed(id),
+                    ))
+                    .unwrap();
+            }
+
+            assert_eq!(stage(&state).live_tool_ms, 10_000);
+            assert!(stage(&state).tool_batch.is_none());
+        }
+
+        #[test]
+        fn a_batch_stays_open_until_its_last_call_reports() {
+            let mut state = started_state();
+            state
+                .apply_event(&agent_event(
+                    2,
+                    "2026-04-07T12:00:00Z",
+                    tool_started("call-a"),
+                ))
+                .unwrap();
+            state
+                .apply_event(&agent_event(
+                    3,
+                    "2026-04-07T12:00:02Z",
+                    tool_started("call-b"),
+                ))
+                .unwrap();
+            state
+                .apply_event(&agent_event(
+                    4,
+                    "2026-04-07T12:00:05Z",
+                    tool_completed("call-a"),
+                ))
+                .unwrap();
+
+            assert_eq!(
+                stage(&state).live_tool_ms,
+                0,
+                "batch must not close while call-b is outstanding"
+            );
+
+            state
+                .apply_event(&agent_event(
+                    5,
+                    "2026-04-07T12:00:09Z",
+                    tool_completed("call-b"),
+                ))
+                .unwrap();
+
+            // Measured from the batch open, not from the last call's start.
+            assert_eq!(stage(&state).live_tool_ms, 9_000);
+        }
+
+        #[test]
+        fn successive_batches_accumulate() {
+            let mut state = started_state();
+            for (seq, ts, body) in [
+                (2, "2026-04-07T12:00:00Z", tool_started("call-a")),
+                (3, "2026-04-07T12:00:04Z", tool_completed("call-a")),
+                (4, "2026-04-07T12:00:10Z", tool_started("call-b")),
+                (5, "2026-04-07T12:00:16Z", tool_completed("call-b")),
+            ] {
+                state.apply_event(&agent_event(seq, ts, body)).unwrap();
+            }
+
+            assert_eq!(stage(&state).live_tool_ms, 10_000);
+        }
+
+        #[test]
+        fn a_duplicate_completion_does_not_drain_the_batch_early() {
+            let mut state = started_state();
+            state
+                .apply_event(&agent_event(
+                    2,
+                    "2026-04-07T12:00:00Z",
+                    tool_started("call-a"),
+                ))
+                .unwrap();
+            state
+                .apply_event(&agent_event(
+                    3,
+                    "2026-04-07T12:00:00Z",
+                    tool_started("call-b"),
+                ))
+                .unwrap();
+            // call-a reports twice, as a replayed or duplicated log can.
+            state
+                .apply_event(&agent_event(
+                    4,
+                    "2026-04-07T12:00:03Z",
+                    tool_completed("call-a"),
+                ))
+                .unwrap();
+            state
+                .apply_event(&agent_event(
+                    5,
+                    "2026-04-07T12:00:04Z",
+                    tool_completed("call-a"),
+                ))
+                .unwrap();
+
+            assert_eq!(stage(&state).live_tool_ms, 0);
+            assert!(stage(&state).tool_batch.is_some());
+        }
+
+        #[test]
+        fn a_foreign_session_completion_does_not_mutate_the_open_batch() {
+            let mut state = started_state();
+            state
+                .apply_event(&agent_event(
+                    2,
+                    "2026-04-07T12:00:00Z",
+                    tool_started("call-a"),
+                ))
+                .unwrap();
+            state
+                .apply_event(&session_event(
+                    3,
+                    "2026-04-07T12:00:05Z",
+                    "session-2",
+                    tool_completed("call-a"),
+                ))
+                .unwrap();
+
+            let batch = stage(&state).tool_batch.as_ref().unwrap();
+            assert_eq!(batch.session_id, "session-1");
+            assert!(batch.open_call_ids.contains("call-a"));
+            assert_eq!(stage(&state).live_tool_ms, 0);
+        }
+
+        #[test]
+        fn a_replacement_session_starts_a_separate_tool_batch() {
+            let mut state = started_state();
+            state
+                .apply_event(&agent_event(
+                    2,
+                    "2026-04-07T12:00:00Z",
+                    tool_started("old-call"),
+                ))
+                .unwrap();
+            state
+                .apply_event(&session_event(
+                    3,
+                    "2026-04-07T12:00:05Z",
+                    "session-2",
+                    tool_started("new-call"),
+                ))
+                .unwrap();
+
+            assert_eq!(stage(&state).live_tool_ms, 5_000);
+            let batch = stage(&state).tool_batch.as_ref().unwrap();
+            assert_eq!(batch.session_id, "session-2");
+            assert_eq!(
+                batch.open_call_ids,
+                ["new-call".to_string()].into_iter().collect()
+            );
+
+            // A delayed completion from the old session cannot close the new
+            // session's batch even when call ids happen to collide.
+            state
+                .apply_event(&agent_event(
+                    4,
+                    "2026-04-07T12:00:07Z",
+                    tool_completed("new-call"),
+                ))
+                .unwrap();
+            assert!(stage(&state).tool_batch.is_some());
+
+            state
+                .apply_event(&session_event(
+                    5,
+                    "2026-04-07T12:00:09Z",
+                    "session-2",
+                    tool_completed("new-call"),
+                ))
+                .unwrap();
+            assert_eq!(stage(&state).live_tool_ms, 9_000);
+            assert!(stage(&state).tool_batch.is_none());
+        }
+
+        #[test]
+        fn subagent_tool_calls_do_not_double_count_against_the_root_batch() {
+            let mut state = started_state();
+            state
+                .apply_event(&agent_event(
+                    2,
+                    "2026-04-07T12:00:00Z",
+                    tool_started("root-call"),
+                ))
+                .unwrap();
+            // The sub-agent's own tools run inside the root call's span.
+            state
+                .apply_event(&child_event(
+                    3,
+                    "2026-04-07T12:00:01Z",
+                    tool_started("child-call"),
+                ))
+                .unwrap();
+            state
+                .apply_event(&child_event(
+                    4,
+                    "2026-04-07T12:00:02Z",
+                    tool_completed("child-call"),
+                ))
+                .unwrap();
+            state
+                .apply_event(&agent_event(
+                    5,
+                    "2026-04-07T12:00:08Z",
+                    tool_completed("root-call"),
+                ))
+                .unwrap();
+
+            assert_eq!(stage(&state).live_tool_ms, 8_000);
+        }
+
+        #[test]
+        fn session_end_accumulates_every_open_active_bracket() {
+            let mut state = started_state();
+            state
+                .apply_event(&agent_event(2, "2026-04-07T12:00:05Z", llm_started()))
+                .unwrap();
+            state
+                .apply_event(&agent_event(
+                    3,
+                    "2026-04-07T12:00:07Z",
+                    tool_started("call-a"),
+                ))
+                .unwrap();
+
+            let mut ended = test_stage_event_at(
+                4,
+                "2026-04-07T12:00:20Z",
+                EventBody::AgentSessionEnded(AgentSessionEndedProps {}),
+                stage_id(),
+            );
+            ended.event.session_id = Some("session-1".to_string());
+            state.apply_event(&ended).unwrap();
+
+            assert_eq!(stage(&state).live_inference_ms, 15_000);
+            assert_eq!(stage(&state).live_tool_ms, 13_000);
+            assert!(stage(&state).inference.is_none());
+            assert!(stage(&state).tool_batch.is_none());
+        }
+
+        #[test]
+        fn a_foreign_session_close_leaves_the_bracket_and_accumulator_alone() {
+            let mut state = started_state();
+            state
+                .apply_event(&agent_event(2, "2026-04-07T12:00:05Z", llm_started()))
+                .unwrap();
+
+            // Post-failover: a new session emits the message, so the old
+            // bracket is not this event's to close or bill.
+            let mut foreign =
+                test_stage_event_at(3, "2026-04-07T12:00:20Z", agent_message(), stage_id());
+            foreign.event.session_id = Some("session-2".to_string());
+            state.apply_event(&foreign).unwrap();
+
+            assert_eq!(stage(&state).live_inference_ms, 0);
+            assert!(stage(&state).inference.is_some());
+        }
+
+        #[test]
+        fn a_retry_keeps_accumulating_within_one_bracket() {
+            let mut state = started_state();
+            state
+                .apply_event(&agent_event(2, "2026-04-07T12:00:00Z", llm_started()))
+                .unwrap();
+            state
+                .apply_event(&agent_event(
+                    3,
+                    "2026-04-07T12:00:04Z",
+                    EventBody::AgentLlmRetry(AgentLlmRetryProps {
+                        provider:   "anthropic".to_string(),
+                        model:      "claude-fable-5".to_string(),
+                        attempt:    0,
+                        delay_secs: 0.0,
+                        error:      json!({ "kind": "stream" }),
+                        phase:      Some(LlmRetryPhase::Consume),
+                        visit:      1,
+                    }),
+                ))
+                .unwrap();
+            state
+                .apply_event(&agent_event(4, "2026-04-07T12:00:11Z", agent_message()))
+                .unwrap();
+
+            // The whole bracket counts, retry included, matching the
+            // in-process stopwatch.
+            assert_eq!(stage(&state).live_inference_ms, 11_000);
+            assert_eq!(stage(&state).inference, None);
+        }
+
+        #[test]
+        fn stage_completion_replaces_the_live_estimate_with_finalized_timing() {
+            let mut state = started_state();
+            state
+                .apply_event(&agent_event(2, "2026-04-07T12:00:00Z", llm_started()))
+                .unwrap();
+            state
+                .apply_event(&agent_event(3, "2026-04-07T12:00:09Z", agent_message()))
+                .unwrap();
+            assert_eq!(stage(&state).live_inference_ms, 9_000);
+
+            state
+                .apply_event(&test_stage_event_at(
+                    4,
+                    "2026-04-07T12:00:10Z",
+                    EventBody::StageCompleted(completed_props(10_000, StageOutcome::Succeeded)),
+                    stage_id(),
+                ))
+                .unwrap();
+
+            let stage = stage(&state);
+            assert_eq!(
+                stage.live_timing(test_dt("2026-04-07T12:30:00Z")),
+                stage.timing.unwrap(),
+                "a terminal stage reports its finalized breakdown, not a live estimate"
+            );
+            assert_eq!(stage.live_inference_ms, 0);
+            assert_eq!(stage.live_tool_ms, 0);
+            assert!(stage.inference.is_none());
+            assert!(stage.tool_batch.is_none());
+        }
+
+        #[test]
+        fn run_failure_freezes_open_work_and_clears_live_bookkeeping() {
+            let mut state = started_state();
+            state.status = RunStatus::Running;
+            state
+                .apply_event(&agent_event(2, "2026-04-07T12:00:01Z", llm_started()))
+                .unwrap();
+            state
+                .apply_event(&agent_event(3, "2026-04-07T12:00:04Z", agent_message()))
+                .unwrap();
+            state
+                .apply_event(&agent_event(
+                    4,
+                    "2026-04-07T12:00:05Z",
+                    tool_started("call-a"),
+                ))
+                .unwrap();
+
+            let mut failed = test_event(
+                5,
+                EventBody::RunFailed(run_failed_props(FailureReason::WorkflowError)),
+                None,
+            );
+            failed.event.ts = test_dt("2026-04-07T12:00:10Z");
+            state.apply_event(&failed).unwrap();
+
+            let stage = stage(&state);
+            assert_eq!(
+                stage.timing,
+                Some(fabro_types::StageTiming::new(10_000, 3_000, 5_000))
+            );
+            assert_eq!(stage.state, StageState::Failed);
+            assert_eq!(stage.live_inference_ms, 0);
+            assert_eq!(stage.live_tool_ms, 0);
+            assert!(stage.inference.is_none());
+            assert!(stage.tool_batch.is_none());
+        }
+    }
 
     fn test_event(seq: u32, body: EventBody, node_id: Option<&str>) -> EventEnvelope {
         let event = RunEvent {
@@ -2366,6 +2935,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parallel_branch_started_uses_the_graph_handler_for_live_timing() {
+        for (handler_type, handler, expected) in [
+            (
+                "prompt",
+                StageHandler::Prompt,
+                StageTiming::new(5_000, 5_000, 0),
+            ),
+            (
+                "command",
+                StageHandler::Command,
+                StageTiming::new(5_000, 0, 5_000),
+            ),
+        ] {
+            let mut spec = test_run_spec();
+            let mut node = Node::new("review");
+            node.attrs.insert(
+                "type".to_string(),
+                AttrValue::String(handler_type.to_string()),
+            );
+            spec.graph.nodes.insert(node.id.clone(), node);
+            let mut state = RunProjection::new("Test run".to_string(), spec, Utc::now());
+            let branch = StageId::new("review", 1);
+
+            state
+                .apply_event(&test_stage_event_at(
+                    3,
+                    "2026-04-07T12:00:00Z",
+                    EventBody::ParallelBranchStarted(ParallelBranchStartedProps {
+                        index:                 0,
+                        graph_visit:           None,
+                        resumed_from_stage_id: None,
+                    }),
+                    branch.clone(),
+                ))
+                .unwrap();
+
+            let stage = state.stage(&branch).unwrap();
+            assert_eq!(stage.handler, Some(handler));
+            assert_eq!(stage.live_timing(test_dt("2026-04-07T12:00:05Z")), expected);
+        }
+    }
+
     fn start_stage(state: &mut RunProjection, stage_id: &StageId) {
         state
             .apply_event(&test_stage_event(
@@ -2508,6 +3120,66 @@ mod tests {
         assert_eq!(provider_used.mode, StageModelUsage::MODE_ACP);
         assert_eq!(provider_used.provider.as_deref(), Some("acp"));
         assert_eq!(provider_used.model.as_deref(), Some("fake"));
+    }
+
+    #[test]
+    fn acp_events_accumulate_live_inference_time() {
+        let mut state = initialized_projection();
+        let stage_id = StageId::new("code", 1);
+
+        state
+            .apply_event(&test_stage_event_at(
+                3,
+                "2026-04-07T12:00:00Z",
+                EventBody::StageStarted(StageStartedProps {
+                    graph_visit:           None,
+                    resumed_from_stage_id: None,
+                    index:                 0,
+                    handler_type:          "agent".to_string(),
+                    attempt:               1,
+                    max_attempts:          1,
+                }),
+                stage_id.clone(),
+            ))
+            .unwrap();
+        state
+            .apply_event(&test_stage_event_at(
+                4,
+                "2026-04-07T12:00:05Z",
+                EventBody::AgentAcpStarted(AgentAcpStartedProps {
+                    visit:       1,
+                    command:     "python fake_agent.py".to_string(),
+                    config_name: Some("fake".to_string()),
+                }),
+                stage_id.clone(),
+            ))
+            .unwrap();
+
+        let stage = state.stage(&stage_id).unwrap();
+        assert_eq!(
+            stage.live_timing(test_dt("2026-04-07T12:00:15Z")),
+            StageTiming::new(15_000, 10_000, 0)
+        );
+
+        state
+            .apply_event(&test_stage_event_at(
+                5,
+                "2026-04-07T12:00:17Z",
+                EventBody::AgentAcpCompleted(AgentAcpCompletedProps {
+                    stdout:      "done".to_string(),
+                    stderr:      String::new(),
+                    stop_reason: "end_turn".to_string(),
+                    duration_ms: 12_000,
+                }),
+                stage_id.clone(),
+            ))
+            .unwrap();
+
+        let stage = state.stage(&stage_id).unwrap();
+        assert_eq!(
+            stage.live_timing(test_dt("2026-04-07T12:00:20Z")),
+            StageTiming::new(20_000, 12_000, 0)
+        );
     }
 
     #[test]
