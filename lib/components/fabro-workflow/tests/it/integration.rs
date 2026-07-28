@@ -4857,6 +4857,7 @@ async fn manager_loop_child_workflow_e2e() {
 #[tokio::test]
 async fn import_e2e_through_engine() {
     use fabro_workflow::pipeline::{TransformOptions, transform, validate};
+    use fabro_workflow::transforms::ModelResolutionTransform;
 
     let dir = tempfile::tempdir().unwrap();
     let catalog = std::sync::Arc::new(
@@ -4900,21 +4901,20 @@ async fn import_e2e_through_engine() {
     )
     .expect("parse should succeed");
     let transformed = transform(parsed, &TransformOptions {
-        current_dir:        Some(dir.path().to_path_buf()),
-        file_resolver:      Some(std::sync::Arc::new(
+        current_dir:       Some(dir.path().to_path_buf()),
+        file_resolver:     Some(std::sync::Arc::new(
             fabro_workflow::file_resolver::FilesystemFileResolver::new(None),
         )),
-        template_context:   fabro_template::TemplateContext::new(),
-        source_name:        None,
-        render_mode:        fabro_workflow::operations::RenderMode::Strict,
-        custom_transforms:  vec![],
-        catalog:            std::sync::Arc::clone(&catalog),
-        default_provider:   None,
-        eligible_providers: catalog.all_provider_ids(),
-        catalog_fallback:   false,
+        template_context:  fabro_template::TemplateContext::new(),
+        source_name:       None,
+        render_mode:       fabro_workflow::operations::RenderMode::Strict,
+        custom_transforms: vec![],
+        model_resolution:  Some(ModelResolutionTransform::new(std::sync::Arc::clone(
+            &catalog,
+        ))),
     })
     .unwrap();
-    let validated = validate(transformed, catalog.as_ref(), &[]);
+    let validated = validate(transformed, Some(catalog.as_ref()), &[]);
     validated
         .raise_on_errors()
         .expect("validation should pass after imports expand");

@@ -14,7 +14,7 @@ pub fn build_run_tool_manifest(
     spec: &ValidatedCreateRunSpec,
     cwd: &Path,
     user_settings_path: &Path,
-    catalog: Arc<Catalog>,
+    catalog: &Arc<Catalog>,
 ) -> ToolResult<types::RunManifest> {
     let built = fabro_manifest::build_run_manifest(ManifestBuildInput {
         workflow:             PathBuf::from(&spec.workflow),
@@ -29,9 +29,12 @@ pub fn build_run_tool_manifest(
     })
     .map_err(|err| ToolError::from_anyhow(&err))?;
 
-    let mut validation =
-        manifest_validation::validate_manifest(&RunLayer::default(), &built.manifest, catalog)
-            .map_err(|err| ToolError::from_anyhow(&err))?;
+    let mut validation = manifest_validation::validate_manifest_with_catalog(
+        &RunLayer::default(),
+        &built.manifest,
+        catalog,
+    )
+    .map_err(|err| ToolError::from_anyhow(&err))?;
     manifest_validation::promote_template_undefined_variables_to_errors(&mut validation);
     if !validation.ok {
         return Err(ToolError::message("workflow manifest validation failed"));

@@ -69,6 +69,24 @@ fn simple_does_not_connect_to_configured_server() {
     );
 }
 
+/// Offline validation has no model catalog, so a model or provider the server
+/// owns must pass rather than be reported as unknown.
+#[test]
+fn server_owned_provider_is_not_rejected_by_offline_validation() {
+    let context = test_context!();
+    let mut cmd = context.validate();
+    cmd.arg(fixture("server-model.fabro"));
+    fabro_snapshot!(context.filters(), cmd, @"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+    ----- stderr -----
+    Workflow: ServerModel (3 nodes, 2 edges)
+    Graph: [FIXTURES]/server-model.fabro
+    Validation: OK
+    ");
+}
+
 #[test]
 fn branching() {
     let context = test_context!();

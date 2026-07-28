@@ -263,12 +263,7 @@ impl fabro_tool::RunManifestBuilder for WorkerRunManifestBuilder {
         cwd: &Path,
         user_settings_path: &Path,
     ) -> fabro_tool::ToolResult<RunManifest> {
-        run_tool_manifest::build_run_tool_manifest(
-            spec,
-            cwd,
-            user_settings_path,
-            Arc::clone(&self.catalog),
-        )
+        run_tool_manifest::build_run_tool_manifest(spec, cwd, user_settings_path, &self.catalog)
     }
 }
 
