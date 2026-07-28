@@ -25,7 +25,7 @@ pub use cli::{
     CliLoggingSettings, CliNamespace, CliOutputSettings, CliTargetSettings, CliUpdatesSettings,
 };
 pub use duration::{Duration, ParseDurationError};
-pub use interp::{InterpString, Namespace, ResolveCtx, ResolveError, ResolveErrorKind};
+pub use interp::{InterpString, ResolveCtx, ResolveError, ResolveErrorKind};
 pub use model_ref::{
     AmbiguousModelRef, ModelRef, ModelRegistry, ParseModelRefError, ResolvedModelRef,
 };

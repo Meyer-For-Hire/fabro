@@ -5,8 +5,9 @@
 //! scope-determined by the caller through [`ResolveCtx`]: server-scope
 //! settings provide `env` (and eventually `secrets`), run-scope settings
 //! additionally provide `vars`, and a command node `script` provides `inputs`
-//! and `vars` only. A token whose namespace has no lookup in the resolution
-//! context fails loudly rather than passing through as literal text.
+//! and `vars` plus the bare `goal` value. A token whose namespace has no lookup
+//! in the resolution context fails loudly rather than passing through as
+//! literal text.
 //!
 //! Most call sites do not wire `inputs`: it is bound where a run's typed
 //! `[run.inputs]` values are in scope, which is the workflow graph, not
@@ -31,7 +32,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::variable::is_env_style_name;
 
 /// A config string that may contain `{{ env.NAME }}`, `{{ vars.NAME }}`,
-/// `{{ secrets.NAME }}`, or `{{ inputs.NAME }}` tokens.
+/// `{{ secrets.NAME }}`, `{{ inputs.NAME }}`, or `{{ goal }}` tokens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterpString {
     segments: Vec<Segment>,
@@ -359,7 +360,7 @@ impl InterpString {
     /// for the namespaces it does not — their resolution happens later,
     /// possibly in a different process.
     ///
-    /// This is the early, server-side pass (`vars`/`inputs`); late-bound
+    /// This is the early, server-side pass (`vars`/`inputs`/`goal`); late-bound
     /// namespaces (`env`/`secrets`) survive in token form for their
     /// consumption-time [`InterpString::resolve_with`].
     pub fn substitute_with(&self, ctx: &mut ResolveCtx<'_>) -> Result<Self, ResolveError> {
@@ -559,7 +560,7 @@ impl<'de> Deserialize<'de> for InterpString {
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_str(
                     "a string, optionally containing {{ env.NAME }}, {{ vars.NAME }}, \
-                     {{ secrets.NAME }}, or {{ inputs.NAME }} interpolation tokens",
+                     {{ secrets.NAME }}, {{ inputs.NAME }}, or {{ goal }} interpolation tokens",
                 )
             }
 
@@ -712,7 +713,8 @@ mod tests {
             s: InterpString,
         }
 
-        let input = r#"{"s":"{{ env.A }}/{{ vars.B }}/{{ secrets.C }}/{{ inputs.d-key }}"}"#;
+        let input =
+            r#"{"s":"{{ env.A }}/{{ vars.B }}/{{ secrets.C }}/{{ inputs.d-key }}/{{ goal }}"}"#;
         let parsed: Wrap = serde_json::from_str(input).unwrap();
         let rendered = serde_json::to_string(&parsed).unwrap();
         assert_eq!(rendered, input);
@@ -982,5 +984,6 @@ mod tests {
         assert_eq!(Namespace::Vars.to_string(), "vars");
         assert_eq!(Namespace::Secrets.to_string(), "secrets");
         assert_eq!(Namespace::Inputs.to_string(), "inputs");
+        assert_eq!(Namespace::Goal.to_string(), "goal");
     }
 }

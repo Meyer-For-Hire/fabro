@@ -68,7 +68,7 @@ A [command node](/workflows/stages-and-nodes#command) `script` substitutes `{{ g
 ```dot title="check.fabro"
 digraph Check {
     test [shape=parallelogram, script="cargo test -p {{ inputs.crate }} --profile {{ vars.PROFILE }}"]
-    pr   [shape=parallelogram, script="gh pr create --title \"{{ goal }}\""]
+    pr   [shape=parallelogram, script="gh pr create --title {{ goal }}"]
 }
 ```
 
@@ -80,21 +80,29 @@ report [shape=parallelogram, script="kubectl get pod -o go-template='{{ .status.
 
 There is no `{% if %}`, no filters, and no loops, and `{{ goal }}` has no dotted form — `{{ goal.title }}` stays literal. Put branching in a [conditional node](/workflows/stages-and-nodes#conditional) or in the shell itself.
 
-Values are substituted as-is, without shell quoting — the script is yours to quote. If a value can contain spaces or shell metacharacters, quote it at the use site. This matters most for `{{ goal }}`, which is free-form prose:
+In a shell script, Fabro quotes each substituted value as one shell argument. Put the token where one shell word is valid. Do not add quotes around the token, and do not use a token to inject multiple flags or shell syntax:
 
 ```dot
-build [shape=parallelogram, script="docker build -t \"{{ inputs.image }}\" ."]
+build [shape=parallelogram, script="docker build -t {{ inputs.image }} ."]
 ```
 
-Substituted text is never scanned again, so a goal or input containing `{{ ... }}` reaches the shell as literal characters rather than being interpolated a second time.
+For `language="python"`, Fabro inserts each value as a quoted string literal. Put the token where a Python expression is valid:
+
+```dot
+report [shape=parallelogram, language="python", script="print({{ goal }})"]
+```
+
+Substituted text is never scanned again, so a goal or input containing `{{ ... }}` reaches the command as literal characters rather than being interpolated a second time.
 
 ### `env` and `secrets` are not substituted
 
-`{{ env.NAME }}` and `{{ secrets.NAME }}` are rejected in a `script` with a validation error. A script runs in a shell, so read environment variables the shell way:
+`{{ env.NAME }}` and `{{ secrets.NAME }}` are rejected in a `script` with a validation error. Read environment variables with `$NAME` in a shell script:
 
 ```dot
 deploy [shape=parallelogram, script="deploy --token $DEPLOY_TOKEN"]
 ```
+
+In a Python script, read them with `os.environ["NAME"]`.
 
 To make a secret available that way, put it in the [environment's env map](/execution/run-configuration#run-environment-and-environments-slug), where `{{ secrets.* }}` does resolve — at run start, into the sandbox environment rather than into the script text:
 

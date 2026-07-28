@@ -816,11 +816,19 @@ mod tests {
     }
 
     #[test]
-    fn input_and_var_return_none_when_unbound() {
+    fn workflow_values_return_none_when_unbound() {
         let ctx = TemplateContext::new();
 
+        assert_eq!(ctx.goal(), None);
         assert_eq!(ctx.input("missing"), None);
         assert_eq!(ctx.var("MISSING"), None);
+    }
+
+    #[test]
+    fn goal_returns_the_rendered_value() {
+        let ctx = TemplateContext::new().with_goal("Ship it");
+
+        assert_eq!(ctx.goal(), Some("Ship it"));
     }
 
     /// `input`/`var` exist so non-template consumers render a value the same
