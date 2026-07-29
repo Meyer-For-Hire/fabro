@@ -298,12 +298,11 @@ pub(crate) async fn execute_shell_command(
     );
     ctx.env
         .exec_command_streaming(
-            command,
-            Some(timeout_ms),
-            cwd,
-            tool_env.as_ref(),
-            Some(ctx.cancel.clone()),
-            None,
+            crate::ExecStreamingRequest::new(command)
+                .timeout_ms(Some(timeout_ms))
+                .working_dir(cwd)
+                .env_vars(tool_env.as_ref())
+                .cancel_token(Some(ctx.cancel.clone())),
         )
         .await
         .map_err(|e| format!("{SHELL_NO_PROCESS_RESULT}: {}", e.display_with_causes()))

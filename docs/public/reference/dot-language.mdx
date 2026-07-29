@@ -246,6 +246,7 @@ audit [
 |---|---|---|
 | `script` | String | Shell command to execute |
 | `language` | String | `"shell"` (default) or `"python"` |
+| `stdin_source` | String | Flat runtime context key to pass to standard input. `context.NAME` first checks that exact key, then falls back to `NAME`. Strings are passed unchanged; other values use compact JSON. No newline is added. |
 | `output_schema` | String | Optional structured output validation. Accepts `routing`, `@path/to/schema.json`, or an inline JSON Schema object string. See [Structured output validation](#structured-output-validation). |
 
 ### Parallel (fan-out) nodes

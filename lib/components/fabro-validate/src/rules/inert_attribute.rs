@@ -17,6 +17,7 @@ pub(super) fn rule() -> Box<dyn LintRule> {
 const HANDLER_SPECIFIC_ATTRS: &[(&str, &[&str])] = &[
     ("script", &["command"]),
     ("language", &["command"]),
+    ("stdin_source", &["command", "tool"]),
     ("duration", &["wait"]),
     ("max_parallel", &["parallel"]),
     ("output_retries", &["agent", "prompt"]),
@@ -166,10 +167,12 @@ mod tests {
     #[test]
     fn accepts_attrs_on_their_own_handler_types() {
         let mut g = minimal_graph();
-        g.nodes.insert(
-            "run".to_string(),
-            node_with_attr("run", "parallelogram", "script", "echo hi"),
+        let mut run = node_with_attr("run", "parallelogram", "script", "echo hi");
+        run.attrs.insert(
+            "stdin_source".to_string(),
+            AttrValue::String("context.parallel.results".to_string()),
         );
+        g.nodes.insert("run".to_string(), run);
         g.nodes.insert(
             "audit".to_string(),
             node_with_attr("audit", "parallelogram", "output_schema", "routing"),

@@ -12,9 +12,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::sandbox::{self, StdioProcessControl};
 use crate::{
-    DEFAULT_EXEC_OUTPUT_TAIL_BYTES, DirEntry, ExecResult, GrepOptions, Sandbox, SandboxEvent,
-    SandboxEventCallback, SandboxFile, StderrCollector, StdioProcess, StdioProcessHandle,
-    StdioProcessTermination, WalkOptions,
+    DEFAULT_EXEC_OUTPUT_TAIL_BYTES, DirEntry, ExecResult, ExecStreamingRequest, GrepOptions,
+    Sandbox, SandboxEvent, SandboxEventCallback, SandboxFile, StderrCollector, StdioProcess,
+    StdioProcessHandle, StdioProcessTermination, WalkOptions,
 };
 
 // --- MockSandbox ---
@@ -39,6 +39,8 @@ pub struct MockSandbox {
     pub captured_working_dirs: Mutex<Vec<Option<String>>>,
     /// Captures the `env_vars` argument from `exec_command` calls.
     pub captured_env_vars:     Mutex<Option<HashMap<String, String>>>,
+    /// Captures the bytes passed to a streaming command's standard input.
+    pub captured_stdin:        Mutex<Option<Vec<u8>>>,
     pub active:                AtomicBool,
     pub activate_error:        Option<String>,
     pub activate_calls:        Mutex<u32>,
@@ -159,6 +161,7 @@ impl Default for MockSandbox {
             captured_commands:     Mutex::new(Vec::new()),
             captured_working_dirs: Mutex::new(Vec::new()),
             captured_env_vars:     Mutex::new(None),
+            captured_stdin:        Mutex::new(None),
             active:                AtomicBool::new(true),
             activate_error:        None,
             activate_calls:        Mutex::new(0),
@@ -299,13 +302,21 @@ impl Sandbox for MockSandbox {
 
     async fn exec_command_streaming(
         &self,
-        command: &str,
-        timeout_ms: Option<u64>,
-        working_dir: Option<&str>,
-        env_vars: Option<&std::collections::HashMap<String, String>>,
-        cancel_token: Option<CancellationToken>,
-        output_callback: Option<crate::CommandOutputCallback>,
+        request: ExecStreamingRequest<'_>,
     ) -> crate::Result<crate::ExecStreamingResult> {
+        let ExecStreamingRequest {
+            command,
+            timeout_ms,
+            working_dir,
+            env_vars,
+            cancel_token,
+            stdin,
+            output_callback,
+        } = request;
+        *self
+            .captured_stdin
+            .lock()
+            .expect("captured_stdin lock poisoned") = stdin;
         let result = self
             .exec_command(
                 command,

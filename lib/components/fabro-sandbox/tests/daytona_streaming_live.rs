@@ -110,6 +110,40 @@ mod daytona_streaming_live {
                 "exec_command_streaming should report the Bash-only result",
             )?;
 
+            let stdin = "first line\n$(touch /tmp/must-not-run)\nlast line";
+            let (stdin_result, _) = run_captured_with_stdin(
+                &sandbox,
+                "cat",
+                30_000,
+                None,
+                Some(stdin.as_bytes().to_vec()),
+            )
+            .await?;
+            ensure_eq(
+                &stdin_result.result.exit_code,
+                &Some(0),
+                "exec_command_streaming should close stdin with a successful EOF",
+            )?;
+            ensure_eq(
+                &stdin_result.result.stdout,
+                &stdin.to_string(),
+                "exec_command_streaming should preserve exact stdin bytes",
+            )?;
+            let stdin_cleanup = sandbox
+                .exec_command(
+                    "test ! -e /tmp/must-not-run && \
+                     ! compgen -G '/tmp/fabro-command-stdin-*' >/dev/null",
+                    30_000,
+                    None,
+                    None,
+                    None,
+                )
+                .await?;
+            ensure!(
+                stdin_cleanup.is_success(),
+                "Daytona stdin data must stay inert and its temporary file must be deleted: {stdin_cleanup:?}"
+            );
+
             Ok(())
         }
         .await;
@@ -330,12 +364,12 @@ mod daytona_streaming_live {
         let live_exec = tokio::spawn(async move {
             sandbox_for_exec
                 .exec_command_streaming(
-                    "printf 'live-out\\n'; printf 'live-err\\n' >&2; sleep 30",
-                    Some(60_000),
-                    None,
-                    None,
-                    Some(cancel_for_exec),
-                    Some(callback),
+                    fabro_sandbox::ExecStreamingRequest::new(
+                        "printf 'live-out\\n'; printf 'live-err\\n' >&2; sleep 30",
+                    )
+                    .timeout_ms(Some(60_000))
+                    .cancel_token(Some(cancel_for_exec))
+                    .output_callback(Some(callback)),
                 )
                 .await
         });
@@ -451,16 +485,25 @@ mod daytona_streaming_live {
         timeout_ms: u64,
         cancel_token: Option<CancellationToken>,
     ) -> Result<(ExecStreamingResult, Vec<CapturedChunk>)> {
+        run_captured_with_stdin(sandbox, command, timeout_ms, cancel_token, None).await
+    }
+
+    async fn run_captured_with_stdin(
+        sandbox: &DaytonaSandbox,
+        command: &str,
+        timeout_ms: u64,
+        cancel_token: Option<CancellationToken>,
+        stdin: Option<Vec<u8>>,
+    ) -> Result<(ExecStreamingResult, Vec<CapturedChunk>)> {
         let chunks = Arc::new(Mutex::new(Vec::new()));
         let callback = capture_callback(Arc::clone(&chunks));
         let result = sandbox
             .exec_command_streaming(
-                command,
-                Some(timeout_ms),
-                None,
-                None,
-                cancel_token,
-                Some(callback),
+                fabro_sandbox::ExecStreamingRequest::new(command)
+                    .timeout_ms(Some(timeout_ms))
+                    .cancel_token(cancel_token)
+                    .stdin(stdin)
+                    .output_callback(Some(callback)),
             )
             .await?;
         let chunks = chunks.lock().await.clone();

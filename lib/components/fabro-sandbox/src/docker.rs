@@ -31,13 +31,13 @@ use crate::redact::redact_auth_url;
 use crate::sandbox::{
     self, BASH_ENV_VAR, BASH_PROBE_SCRIPT, BASH_PROBE_TIMEOUT_MS, REMOTE_BASH,
     REMOTE_WALK_TIMEOUT_MS, RefreshOutcome, StdioProcessControl, optional_timeout, resolve_path,
-    validate_bash_probe,
+    validate_bash_probe, write_process_stdin,
 };
 use crate::{
     CommandOutputCallback, DEFAULT_EXEC_OUTPUT_TAIL_BYTES, DirEntry, ExecResult,
-    ExecStreamingResult, GrepOptions, Sandbox, SandboxEvent, SandboxEventCallback, SandboxFile,
-    StderrCollector, StdioProcess, StdioProcessHandle, StdioProcessTermination, WalkOptions,
-    clone_retry, format_lines_numbered, shell_quote,
+    ExecStreamingRequest, ExecStreamingResult, GrepOptions, Sandbox, SandboxEvent,
+    SandboxEventCallback, SandboxFile, StderrCollector, StdioProcess, StdioProcessHandle,
+    StdioProcessTermination, WalkOptions, clone_retry, format_lines_numbered, shell_quote,
 };
 
 const DOCKER_BASH_REQUIREMENT: &str = "Docker sandboxes require /bin/bash for every command, with no `sh` fallback; use an \
@@ -402,12 +402,15 @@ impl DockerSandbox {
         cmd: Vec<String>,
         working_dir: Option<String>,
         env: Option<Vec<String>>,
+        stdin: Option<Vec<u8>>,
         output_callback: Option<CommandOutputCallback>,
     ) -> crate::Result<(Vec<u8>, Vec<u8>, i32)> {
         let exec_opts = CreateExecOptions {
             cmd: Some(cmd),
+            attach_stdin: Some(stdin.is_some()),
             attach_stdout: Some(true),
             attach_stderr: Some(true),
+            tty: Some(false),
             working_dir,
             env: env.map(|e| e.into_iter().collect()),
             ..Default::default()
@@ -417,7 +420,11 @@ impl DockerSandbox {
             &docker,
             &container_id,
             exec_opts,
-            None,
+            Some(StartExecOptions {
+                detach:          false,
+                tty:             false,
+                output_capacity: None,
+            }),
             "Failed to create exec",
             "Failed to start exec",
         )
@@ -426,7 +433,18 @@ impl DockerSandbox {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
-        if let StartExecResults::Attached { mut output, .. } = start_result {
+        let StartExecResults::Attached { mut output, input } = start_result else {
+            return Err(crate::Error::message(
+                "Docker started streaming command without attached standard I/O",
+            ));
+        };
+        let write_stdin = async move {
+            if let Some(stdin) = stdin {
+                write_process_stdin(input, &stdin).await?;
+            }
+            crate::Result::Ok(())
+        };
+        let read_output = async {
             while let Some(chunk) = output.next().await {
                 match chunk {
                     Ok(LogOutput::StdOut { message }) => {
@@ -447,7 +465,9 @@ impl DockerSandbox {
                     }
                 }
             }
-        }
+            crate::Result::Ok(())
+        };
+        tokio::try_join!(write_stdin, read_output)?;
 
         let inspect = docker
             .inspect_exec(&exec_id)
@@ -525,6 +545,7 @@ impl DockerSandbox {
         working_dir: Option<&str>,
         env_vars: Option<&HashMap<String, String>>,
         cancel_token: Option<CancellationToken>,
+        stdin: Option<Vec<u8>>,
         output_callback: Option<CommandOutputCallback>,
     ) -> crate::Result<ExecStreamingResult> {
         let start = Instant::now();
@@ -551,6 +572,7 @@ impl DockerSandbox {
             cmd,
             Some(effective_dir.clone()),
             env,
+            stdin,
             output_callback,
         ));
 
@@ -793,6 +815,7 @@ impl DockerSandbox {
                             command,
                             Some(timeout_ms),
                             Some("/"),
+                            None,
                             None,
                             None,
                             None,
@@ -1781,13 +1804,17 @@ impl Sandbox for DockerSandbox {
 
     async fn exec_command_streaming(
         &self,
-        command: &str,
-        timeout_ms: Option<u64>,
-        working_dir: Option<&str>,
-        env_vars: Option<&HashMap<String, String>>,
-        cancel_token: Option<CancellationToken>,
-        output_callback: Option<CommandOutputCallback>,
+        request: ExecStreamingRequest<'_>,
     ) -> crate::Result<ExecStreamingResult> {
+        let ExecStreamingRequest {
+            command,
+            timeout_ms,
+            working_dir,
+            env_vars,
+            cancel_token,
+            stdin,
+            output_callback,
+        } = request;
         let dir = working_dir.map(|path| self.resolve_container_path(path));
         self.docker_exec_shell_streaming(
             command,
@@ -1795,6 +1822,7 @@ impl Sandbox for DockerSandbox {
             dir.as_deref(),
             env_vars,
             cancel_token,
+            stdin,
             output_callback,
         )
         .await

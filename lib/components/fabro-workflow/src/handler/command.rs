@@ -1,15 +1,16 @@
 use std::path::Path;
 
 use async_trait::async_trait;
-use fabro_agent::CommandOutputCallback;
+use fabro_agent::{CommandOutputCallback, ExecStreamingRequest};
 use fabro_graphviz::graph::{Graph, Node};
 use fabro_types::{CommandTermination, StageTiming};
 use fabro_util::shell::shell_quote;
 
 use super::structured_output::{self, StructuredOutputError};
 use super::{EngineServices, Handler, NodeTimeoutPolicy};
+use crate::artifact;
 use crate::command_log::CommandLogRecorder;
-use crate::context::{Context, keys};
+use crate::context::{self, Context, keys};
 use crate::error::Error;
 use crate::event::{Event, StageScope};
 use crate::outcome::{Outcome, OutcomeExt};
@@ -31,6 +32,9 @@ impl Handler for CommandHandler {
         _run_dir: &Path,
         _services: &EngineServices,
     ) -> Result<Outcome, Error> {
+        if let Err(reason) = stdin_source(node) {
+            return Ok(Outcome::fail_deterministic(reason));
+        }
         let script = node
             .attrs
             .get("script")
@@ -77,6 +81,10 @@ impl Handler for CommandHandler {
             )));
         }
 
+        let stdin = match resolve_stdin(node, context, services).await {
+            Ok(stdin) => stdin,
+            Err(outcome) => return Ok(outcome),
+        };
         let output_schema = structured_output::parse_node_output_schema(node)?;
 
         let command = if language == "python" {
@@ -123,12 +131,12 @@ impl Handler for CommandHandler {
             .run
             .sandbox
             .exec_command_streaming(
-                &command,
-                Some(timeout_ms),
-                None,
-                env_vars,
-                Some(cancel_token.clone()),
-                Some(output_callback),
+                ExecStreamingRequest::new(&command)
+                    .timeout_ms(Some(timeout_ms))
+                    .env_vars(env_vars)
+                    .cancel_token(Some(cancel_token.clone()))
+                    .stdin(stdin)
+                    .output_callback(Some(output_callback)),
             )
             .await;
         cancel_token.cancel();
@@ -215,6 +223,56 @@ impl Handler for CommandHandler {
     }
 }
 
+fn stdin_source(node: &Node) -> std::result::Result<Option<&str>, String> {
+    if !node.attrs.contains_key("stdin_source") {
+        return Ok(None);
+    }
+    node.stdin_source()
+        .filter(|source| !source.trim().is_empty())
+        .map(Some)
+        .ok_or_else(|| {
+            format!(
+                "Command node '{}' requires 'stdin_source' to be a non-empty string",
+                node.id
+            )
+        })
+}
+
+async fn resolve_stdin(
+    node: &Node,
+    context: &Context,
+    services: &EngineServices,
+) -> std::result::Result<Option<Vec<u8>>, Outcome> {
+    let Some(source) = stdin_source(node).map_err(Outcome::fail_deterministic)? else {
+        return Ok(None);
+    };
+    let Some(value) = context::lookup_flat(context, source) else {
+        return Err(Outcome::fail_deterministic(format!(
+            "stdin_source '{source}' was not found in workflow context"
+        )));
+    };
+    let value = artifact::resolve_json_value(&value, &services.run.run_store)
+        .await
+        .map_err(|err| {
+            Outcome::fail_deterministic(format!(
+                "stdin_source '{source}' could not be resolved: {err}"
+            ))
+        })?;
+    let stdin = encode_stdin_value(value).map_err(|err| {
+        Outcome::fail_deterministic(format!(
+            "stdin_source '{source}' could not be serialized: {err}"
+        ))
+    })?;
+    Ok(Some(stdin))
+}
+
+fn encode_stdin_value(value: serde_json::Value) -> serde_json::Result<Vec<u8>> {
+    match value {
+        serde_json::Value::String(text) => Ok(text.into_bytes()),
+        value => serde_json::to_vec(&value),
+    }
+}
+
 fn schema_validation_failure_reason(
     script: &str,
     error: &StructuredOutputError,
@@ -267,6 +325,23 @@ mod tests {
 
     const PASSED_OUTPUT_SCHEMA: &str =
         r#"{"type":"object","required":["passed"],"properties":{"passed":{"type":"boolean"}}}"#;
+
+    #[test]
+    fn stdin_json_encoding_is_compact_and_strings_are_raw() {
+        for (value, expected) in [
+            (serde_json::json!("text"), b"text".as_slice()),
+            (serde_json::json!([1, 2]), br"[1,2]".as_slice()),
+            (
+                serde_json::json!({"ok": true}),
+                br#"{"ok":true}"#.as_slice(),
+            ),
+            (serde_json::json!(42), b"42".as_slice()),
+            (serde_json::json!(false), b"false".as_slice()),
+            (serde_json::Value::Null, b"null".as_slice()),
+        ] {
+            assert_eq!(encode_stdin_value(value).unwrap(), expected);
+        }
+    }
 
     #[derive(Default)]
     struct MemoryRunStoreBackend {
@@ -1326,6 +1401,7 @@ mod tests {
         captured_command:      std::sync::Mutex<Option<String>>,
         captured_env_vars:     std::sync::Mutex<Option<std::collections::HashMap<String, String>>>,
         captured_cancel_token: std::sync::Mutex<Option<bool>>,
+        captured_stdin:        std::sync::Mutex<Option<Vec<u8>>>,
     }
 
     impl SpySandbox {
@@ -1336,6 +1412,7 @@ mod tests {
                 captured_command: std::sync::Mutex::new(None),
                 captured_env_vars: std::sync::Mutex::new(None),
                 captured_cancel_token: std::sync::Mutex::new(None),
+                captured_stdin: std::sync::Mutex::new(None),
             }
         }
 
@@ -1352,11 +1429,16 @@ mod tests {
                 captured_command:      std::sync::Mutex::new(None),
                 captured_env_vars:     std::sync::Mutex::new(None),
                 captured_cancel_token: std::sync::Mutex::new(None),
+                captured_stdin:        std::sync::Mutex::new(None),
             }
         }
 
         fn captured_command(&self) -> Option<String> {
             self.captured_command.lock().unwrap().clone()
+        }
+
+        fn captured_stdin(&self) -> Option<Vec<u8>> {
+            self.captured_stdin.lock().unwrap().clone()
         }
     }
 
@@ -1396,6 +1478,42 @@ mod tests {
                 return Err(fabro_sandbox::Error::message(message.clone()));
             }
             Ok(self.exec_result.clone())
+        }
+        async fn exec_command_streaming(
+            &self,
+            request: fabro_agent::sandbox::ExecStreamingRequest<'_>,
+        ) -> fabro_sandbox::Result<fabro_agent::sandbox::ExecStreamingResult> {
+            *self.captured_stdin.lock().unwrap() = request.stdin;
+            let result = self
+                .exec_command(
+                    request.command,
+                    request.timeout_ms.unwrap_or(u64::MAX),
+                    request.working_dir,
+                    request.env_vars,
+                    request.cancel_token,
+                )
+                .await?;
+            if let Some(callback) = request.output_callback.as_ref() {
+                if !result.stdout.is_empty() {
+                    callback(
+                        fabro_types::CommandOutputStream::Stdout,
+                        result.stdout.as_bytes().to_vec(),
+                    )
+                    .await?;
+                }
+                if !result.stderr.is_empty() {
+                    callback(
+                        fabro_types::CommandOutputStream::Stderr,
+                        result.stderr.as_bytes().to_vec(),
+                    )
+                    .await?;
+                }
+            }
+            Ok(fabro_agent::sandbox::ExecStreamingResult {
+                result,
+                streams_separated: true,
+                live_streaming: false,
+            })
         }
         async fn grep(
             &self,
@@ -1443,6 +1561,166 @@ mod tests {
         let mut services = make_services();
         services.run = services.run.with_sandbox(sandbox);
         services
+    }
+
+    #[tokio::test]
+    async fn stdin_source_serializes_parallel_results_as_compact_json() {
+        let spy = std::sync::Arc::new(SpySandbox::new(fabro_agent::sandbox::ExecResult {
+            stdout:      String::new(),
+            stderr:      String::new(),
+            exit_code:   Some(0),
+            termination: CommandTermination::Exited,
+            duration_ms: 5,
+        }));
+        let handler = CommandHandler;
+        let mut node = Node::new("merge");
+        node.attrs
+            .insert("script".to_string(), AttrValue::String("cat".to_string()));
+        node.attrs.insert(
+            "stdin_source".to_string(),
+            AttrValue::String("context.parallel.results".to_string()),
+        );
+        let parallel_results = serde_json::json!([
+            {
+                "branch": "one",
+                "response": "$(touch /tmp/must-not-run)\nsecond line"
+            },
+            {"branch": "two", "passed": true}
+        ]);
+        let context = Context::new();
+        context.set(keys::PARALLEL_RESULTS, parallel_results.clone());
+        let graph = Graph::new("test");
+        let run_dir = tempfile::tempdir().unwrap();
+        let services = make_spy_services(spy.clone());
+
+        let outcome = handler
+            .execute(&node, &context, &graph, run_dir.path(), &services)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status, StageOutcome::Succeeded);
+        assert_eq!(
+            spy.captured_stdin(),
+            Some(serde_json::to_vec(&parallel_results).unwrap())
+        );
+        assert!(
+            !spy.captured_command()
+                .expect("command should run")
+                .contains("must-not-run"),
+            "stdin content must not be inserted into shell source"
+        );
+    }
+
+    #[tokio::test]
+    async fn stdin_source_passes_strings_without_adding_a_newline() {
+        let spy = std::sync::Arc::new(SpySandbox::new(fabro_agent::sandbox::ExecResult {
+            stdout:      String::new(),
+            stderr:      String::new(),
+            exit_code:   Some(0),
+            termination: CommandTermination::Exited,
+            duration_ms: 5,
+        }));
+        let handler = CommandHandler;
+        let mut node = Node::new("consume");
+        node.attrs
+            .insert("script".to_string(), AttrValue::String("cat".to_string()));
+        node.attrs.insert(
+            "stdin_source".to_string(),
+            AttrValue::String("context.input".to_string()),
+        );
+        let context = Context::new();
+        context.set("input", serde_json::json!("first\nlast"));
+        let graph = Graph::new("test");
+        let run_dir = tempfile::tempdir().unwrap();
+        let services = make_spy_services(spy.clone());
+
+        let outcome = handler
+            .execute(&node, &context, &graph, run_dir.path(), &services)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status, StageOutcome::Succeeded);
+        assert_eq!(
+            spy.captured_stdin().as_deref(),
+            Some(b"first\nlast".as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_stdin_source_fails_before_starting_the_command() {
+        let spy = std::sync::Arc::new(SpySandbox::new(fabro_agent::sandbox::ExecResult {
+            stdout:      String::new(),
+            stderr:      String::new(),
+            exit_code:   Some(0),
+            termination: CommandTermination::Exited,
+            duration_ms: 5,
+        }));
+        let handler = CommandHandler;
+        let mut node = Node::new("consume");
+        node.attrs
+            .insert("script".to_string(), AttrValue::String("cat".to_string()));
+        node.attrs.insert(
+            "stdin_source".to_string(),
+            AttrValue::String("context.missing".to_string()),
+        );
+        let context = Context::new();
+        let graph = Graph::new("test");
+        let run_dir = tempfile::tempdir().unwrap();
+        let services = make_spy_services(spy.clone());
+
+        let outcome = handler
+            .execute(&node, &context, &graph, run_dir.path(), &services)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome.failure_category(),
+            Some(FailureCategory::Deterministic)
+        );
+        assert!(
+            outcome
+                .failure_reason()
+                .unwrap()
+                .contains("was not found in workflow context")
+        );
+        assert_eq!(spy.captured_command(), None);
+    }
+
+    #[tokio::test]
+    async fn simulation_validates_stdin_source_without_resolving_context() {
+        let handler = CommandHandler;
+        let mut valid = Node::new("valid");
+        valid
+            .attrs
+            .insert("script".to_string(), AttrValue::String("cat".to_string()));
+        valid.attrs.insert(
+            "stdin_source".to_string(),
+            AttrValue::String("context.not_available_in_dry_run".to_string()),
+        );
+        let mut invalid = valid.clone();
+        invalid.id = "invalid".to_string();
+        invalid
+            .attrs
+            .insert("stdin_source".to_string(), AttrValue::Integer(7));
+        let context = Context::new();
+        let graph = Graph::new("test");
+        let run_dir = tempfile::tempdir().unwrap();
+        let services = make_services();
+
+        let valid_outcome = handler
+            .simulate(&valid, &context, &graph, run_dir.path(), &services)
+            .await
+            .unwrap();
+        let invalid_outcome = handler
+            .simulate(&invalid, &context, &graph, run_dir.path(), &services)
+            .await
+            .unwrap();
+
+        assert_eq!(valid_outcome.status, StageOutcome::Succeeded);
+        assert_eq!(
+            invalid_outcome.failure_category(),
+            Some(FailureCategory::Deterministic)
+        );
     }
 
     struct RefreshingMinter {

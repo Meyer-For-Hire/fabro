@@ -100,12 +100,23 @@ Runs a shell script inside the configured sandbox and captures its output. The o
 
 ```dot
 test [label="Run Tests", shape=parallelogram, script="cargo test 2>&1 || true"]
+
+merge_results [
+    shape=parallelogram,
+    script="python3 scripts/merge.py",
+    stdin_source="context.parallel.results"
+]
 ```
 
 | Attribute | Description |
 |---|---|
 | `script` | The shell command to execute. Substitutes `{{ goal }}`, `{{ inputs.NAME }}`, and `{{ vars.NAME }}` — see [command node scripts](/workflows/variables#command-node-scripts) |
 | `language` | `"shell"` (default) or `"python"` |
+| `stdin_source` | Flat runtime context key to pass to the command's standard input. `context.NAME` first checks that exact key, then falls back to `NAME`. |
+
+For `stdin_source`, strings are passed unchanged. Other JSON values use compact
+JSON. Fabro does not add a newline. A missing source fails before the command
+starts.
 
 ### Human
 

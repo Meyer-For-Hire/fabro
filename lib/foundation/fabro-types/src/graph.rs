@@ -183,6 +183,11 @@ impl Node {
     }
 
     #[must_use]
+    pub fn stdin_source(&self) -> Option<&str> {
+        self.str_attr("stdin_source")
+    }
+
+    #[must_use]
     pub fn output_schema(&self) -> Option<&str> {
         self.str_attr("output_schema")
     }
@@ -606,6 +611,7 @@ mod tests {
         assert_eq!(node.node_type(), None);
         assert_eq!(node.prompt(), None);
         assert_eq!(node.for_each(), None);
+        assert_eq!(node.stdin_source(), None);
         assert_eq!(node.output_schema(), None);
         assert_eq!(node.output_retries(), 2);
         assert_eq!(node.max_retries(), None);
@@ -685,6 +691,17 @@ mod tests {
         );
 
         assert_eq!(node.for_each(), Some("context.candidates"));
+    }
+
+    #[test]
+    fn node_stdin_source_returns_context_source() {
+        let mut node = Node::new("merge");
+        node.attrs.insert(
+            "stdin_source".to_string(),
+            AttrValue::String("context.parallel.results".to_string()),
+        );
+
+        assert_eq!(node.stdin_source(), Some("context.parallel.results"));
     }
 
     #[test]

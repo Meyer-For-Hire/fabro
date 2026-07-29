@@ -11,7 +11,7 @@ use fabro_types::{CommandOutputStream, CommandTermination};
 use fabro_util::shell;
 use fabro_util::workspace_glob::WorkspaceGlob;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex as TokioMutex;
 use tokio::task::JoinHandle;
 use tokio::time;
@@ -184,23 +184,9 @@ macro_rules! delegate_sandbox {
 
             async fn exec_command_streaming(
                 &self,
-                command: &str,
-                timeout_ms: Option<u64>,
-                working_dir: Option<&str>,
-                env_vars: Option<&std::collections::HashMap<String, String>>,
-                cancel_token: Option<tokio_util::sync::CancellationToken>,
-                output_callback: Option<$crate::CommandOutputCallback>,
+                request: $crate::ExecStreamingRequest<'_>,
             ) -> $crate::Result<$crate::ExecStreamingResult> {
-                self.$field
-                    .exec_command_streaming(
-                        command,
-                        timeout_ms,
-                        working_dir,
-                        env_vars,
-                        cancel_token,
-                        output_callback,
-                    )
-                    .await
+                self.$field.exec_command_streaming(request).await
             }
 
             async fn spawn_stdio_process(
@@ -773,6 +759,96 @@ pub type CommandOutputCallback = Arc<
         + Sync,
 >;
 
+/// Inputs for a streaming command execution.
+///
+/// Standard input is owned so providers can move it into a writer task. This
+/// type does not implement `Debug` because standard input can contain
+/// sensitive workflow data.
+#[non_exhaustive]
+pub struct ExecStreamingRequest<'a> {
+    pub command:         &'a str,
+    pub timeout_ms:      Option<u64>,
+    pub working_dir:     Option<&'a str>,
+    pub env_vars:        Option<&'a HashMap<String, String>>,
+    pub cancel_token:    Option<CancellationToken>,
+    pub stdin:           Option<Vec<u8>>,
+    pub output_callback: Option<CommandOutputCallback>,
+}
+
+impl<'a> ExecStreamingRequest<'a> {
+    #[must_use]
+    pub fn new(command: &'a str) -> Self {
+        Self {
+            command,
+            timeout_ms: None,
+            working_dir: None,
+            env_vars: None,
+            cancel_token: None,
+            stdin: None,
+            output_callback: None,
+        }
+    }
+
+    #[must_use]
+    pub fn timeout_ms(mut self, timeout_ms: Option<u64>) -> Self {
+        self.timeout_ms = timeout_ms;
+        self
+    }
+
+    #[must_use]
+    pub fn working_dir(mut self, working_dir: Option<&'a str>) -> Self {
+        self.working_dir = working_dir;
+        self
+    }
+
+    #[must_use]
+    pub fn env_vars(mut self, env_vars: Option<&'a HashMap<String, String>>) -> Self {
+        self.env_vars = env_vars;
+        self
+    }
+
+    #[must_use]
+    pub fn cancel_token(mut self, cancel_token: Option<CancellationToken>) -> Self {
+        self.cancel_token = cancel_token;
+        self
+    }
+
+    #[must_use]
+    pub fn stdin(mut self, stdin: Option<Vec<u8>>) -> Self {
+        self.stdin = stdin;
+        self
+    }
+
+    #[must_use]
+    pub fn output_callback(mut self, output_callback: Option<CommandOutputCallback>) -> Self {
+        self.output_callback = output_callback;
+        self
+    }
+}
+
+pub(crate) async fn write_process_stdin<W>(mut writer: W, stdin: &[u8]) -> crate::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    if let Err(err) = writer.write_all(stdin).await {
+        if err.kind() != std::io::ErrorKind::BrokenPipe {
+            return Err(crate::Error::context(
+                "Failed to write command standard input",
+                err,
+            ));
+        }
+    }
+    if let Err(err) = writer.shutdown().await {
+        if err.kind() != std::io::ErrorKind::BrokenPipe {
+            return Err(crate::Error::context(
+                "Failed to close command standard input",
+                err,
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn replay_exec_result(
     result: ExecResult,
     streams_separated: bool,
@@ -1028,6 +1104,10 @@ pub trait Sandbox: Send + Sync {
     /// interpreter or shell options, so Bash-only syntax behaves identically
     /// through both.
     ///
+    /// When `request.stdin` is set, providers must write those exact bytes to
+    /// the process's standard input and then close it to deliver EOF. The bytes
+    /// must remain separate from command source and diagnostics.
+    ///
     /// **Production sandboxes must override this.** The default falls back to
     /// the non-streaming [`exec_command`](Self::exec_command) and replays its
     /// output through `output_callback` at the end when one is supplied,
@@ -1036,27 +1116,28 @@ pub trait Sandbox: Send + Sync {
     /// behavior for test mocks but silently drops live output for any real
     /// sandbox that wraps another — decorators in particular must forward to
     /// the inner sandbox's streaming implementation rather than relying on
-    /// this default.
+    /// this default. The fallback rejects `request.stdin` because
+    /// [`exec_command`](Self::exec_command) has no stdin channel.
     async fn exec_command_streaming(
         &self,
-        command: &str,
-        timeout_ms: Option<u64>,
-        working_dir: Option<&str>,
-        env_vars: Option<&std::collections::HashMap<String, String>>,
-        cancel_token: Option<CancellationToken>,
-        output_callback: Option<CommandOutputCallback>,
+        request: ExecStreamingRequest<'_>,
     ) -> crate::Result<ExecStreamingResult> {
-        let fallback_timeout_ms = timeout_ms.unwrap_or(u64::MAX);
+        if request.stdin.is_some() {
+            return Err(crate::Error::message(
+                "This sandbox does not support standard input for streaming commands",
+            ));
+        }
+        let fallback_timeout_ms = request.timeout_ms.unwrap_or(u64::MAX);
         let result = self
             .exec_command(
-                command,
+                request.command,
                 fallback_timeout_ms,
-                working_dir,
-                env_vars,
-                cancel_token,
+                request.working_dir,
+                request.env_vars,
+                request.cancel_token,
             )
             .await?;
-        replay_exec_result(result, true, output_callback.as_ref()).await
+        replay_exec_result(result, true, request.output_callback.as_ref()).await
     }
 
     /// Launch a long-lived process with bidirectional stdio attached.
@@ -1648,13 +1729,13 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_tracing_events_do_not_log_raw_command_fields() {
+    fn sandbox_tracing_events_do_not_log_raw_command_or_stdin_fields() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut failures = Vec::new();
         scan_for_command_tracing(&root, &mut failures);
         assert!(
             failures.is_empty(),
-            "raw command/cmd tracing fields found:\n{}",
+            "raw command/cmd/stdin tracing fields found:\n{}",
             failures.join("\n")
         );
     }
@@ -1920,6 +2001,8 @@ mod tests {
                         || call.contains("command =")
                         || call.contains("cmd,")
                         || call.contains("cmd =")
+                        || call.contains("stdin,")
+                        || call.contains("stdin =")
                     {
                         failures.push(format!(
                             "{}: {}",
