@@ -2684,6 +2684,16 @@ client_id = "client-id"
         );
     }
 
+    #[test]
+    fn manifest_excludes_workflows_permission() {
+        let manifest = build_github_app_manifest("Fabro-test", 12345, "https://app.example.com");
+
+        assert!(
+            manifest["default_permissions"].get("workflows").is_none(),
+            "GitHub App must not be able to write workflow files"
+        );
+    }
+
     #[tokio::test]
     async fn persist_install_outputs_persists_vault_secrets_via_server_when_autostarting() {
         let dir = tempfile::tempdir().unwrap();

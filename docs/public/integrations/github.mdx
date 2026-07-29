@@ -55,7 +55,6 @@ When you choose the GitHub App strategy, the CLI opens GitHub with a pre-filled 
    | Permission | Level | Purpose |
    |---|---|---|
    | Contents | Write | Clone repos, push run branches and checkpoints |
-   | Workflows | Write | Push changes under `.github/workflows/` |
    | Metadata | Read | Look up repository installation status |
    | Pull requests | Write | Create and update PRs from workflows |
    | Checks | Write | Report workflow status on commits |
@@ -65,6 +64,8 @@ When you choose the GitHub App strategy, the CLI opens GitHub with a pre-filled 
    | Organization projects | Write | Read and update organization Projects V2 |
 
 These permissions are included when Fabro registers a new app. For an existing GitHub App, add the missing permissions in the app's settings, then approve the permission update on each installation before workflows can use them.
+
+Fabro's App manifest does not request the Workflows permission, so Apps registered through Fabro cannot publish changes under `.github/workflows/`.
 
 The installer:
 
@@ -220,7 +221,7 @@ When a workflow runs in a remote sandbox (Daytona or Docker), Fabro clones the c
 2. SSH URLs (e.g. `git@github.com:owner/repo.git`) are converted to HTTPS
 3. Fabro signs a short-lived JWT using the App ID and private key (RS256, 10-minute validity)
 4. Using the JWT, Fabro looks up the GitHub App installation for the repository (`GET /repos/\{owner\}/\{repo\}/installation`)
-5. Fabro requests a scoped Installation Access Token with `contents: write` and `workflows: write` permissions on the specific repository
+5. Fabro requests a scoped Installation Access Token with `contents: write` permission on the specific repository
 6. The sandbox clones via HTTPS using `x-access-token` as the username and the token as the password
 
 For public repositories, the clone works without credentials. The token is still generated because it's needed for pushing checkpoints.

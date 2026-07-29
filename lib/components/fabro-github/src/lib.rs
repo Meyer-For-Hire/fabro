@@ -596,10 +596,7 @@ async fn mint_installation_token_with_jwt(
     })
 }
 
-/// Request a scoped Installation Access Token for git writes.
-///
-/// The `workflows` permission is required when a pushed commit creates or
-/// updates files under `.github/workflows/`.
+/// Request a scoped Installation Access Token with `contents: write`.
 pub async fn create_installation_access_token(
     client: &impl HttpClient,
     jwt: &str,
@@ -613,7 +610,7 @@ pub async fn create_installation_access_token(
         owner,
         repo,
         base_url,
-        serde_json::json!({ "contents": "write", "workflows": "write" }),
+        serde_json::json!({ "contents": "write" }),
     )
     .await
 }
@@ -1060,8 +1057,7 @@ pub async fn update_app_webhook_config(
 ///
 /// Returns `(username, password)` for authenticated cloning and pushing.
 /// Always generates a token regardless of repo visibility, since the token
-/// is needed for pushing from the sandbox. The token includes `workflows:
-/// write` so a run can publish workflow-file changes.
+/// is needed for pushing from the sandbox.
 pub async fn resolve_clone_credentials(
     ctx: &GitHubContext<'_>,
     owner: &str,
@@ -1072,14 +1068,14 @@ pub async fn resolve_clone_credentials(
         GitHubCredentials::Installation(token) => token.valid_token()?.to_string(),
         GitHubCredentials::App(_) => {
             let client = ctx.http_client()?;
-            mint_git_write_token(&client, ctx, owner, repo).await?
+            mint_git_contents_write_token(&client, ctx, owner, repo).await?
         }
     };
     Ok((Some("x-access-token".to_string()), Some(token)))
 }
 
-/// Mint an installation token scoped for git writes, including workflow files.
-async fn mint_git_write_token(
+/// Mint an installation token scoped to repository contents writes.
+async fn mint_git_contents_write_token(
     client: &impl HttpClient,
     ctx: &GitHubContext<'_>,
     owner: &str,
@@ -1091,7 +1087,7 @@ async fn mint_git_write_token(
             owner,
             repo,
             ctx.base_url,
-            serde_json::json!({ "contents": "write", "workflows": "write" }),
+            serde_json::json!({ "contents": "write" }),
         )
         .await
 }
@@ -1806,7 +1802,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_iat_success() {
+    async fn create_iat_requests_only_contents_write() {
         let mock = MockHttpClient::new()
             .on(
                 HttpMethod::Get,
@@ -1822,9 +1818,7 @@ mod tests {
                 r#"{"token": "ghs_xxx", "expires_at": "2099-01-01T00:00:00Z"}"#,
             )
             .with_req_header("Authorization", "Bearer test-jwt")
-            .with_req_body(
-                r#"{"permissions":{"contents":"write","workflows":"write"},"repositories":["repo"]}"#,
-            );
+            .with_req_body(r#"{"permissions":{"contents":"write"},"repositories":["repo"]}"#);
 
         let token = create_installation_access_token(&mock, "test-jwt", "owner", "repo", "")
             .await
@@ -2321,7 +2315,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_clone_credentials_requests_workflow_write_permission() {
+    async fn clone_token_requests_only_contents_write() {
         let mock = MockHttpClient::new()
             .on(
                 HttpMethod::Get,
@@ -2335,16 +2329,14 @@ mod tests {
                 201,
                 r#"{"token": "ghs_xxx", "expires_at": "2099-01-01T00:00:00Z"}"#,
             )
-            .with_req_body(
-                r#"{"permissions":{"contents":"write","workflows":"write"},"repositories":["repo"]}"#,
-            );
+            .with_req_body(r#"{"permissions":{"contents":"write"},"repositories":["repo"]}"#);
         let credentials = GitHubCredentials::App(GitHubAppCredentials {
             app_id:          "test".to_string(),
             private_key_pem: test_rsa_key().to_string(),
             slug:            None,
         });
         let context = GitHubContext::new(&credentials, "");
-        let token = mint_git_write_token(&mock, &context, "owner", "repo")
+        let token = mint_git_contents_write_token(&mock, &context, "owner", "repo")
             .await
             .unwrap();
 
