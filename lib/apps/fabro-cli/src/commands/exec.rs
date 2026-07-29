@@ -302,7 +302,7 @@ fn run_mcp_servers_for_exec(
 
 pub(crate) async fn execute(mut args: ExecArgs, ctx: &CommandContext) -> AnyResult<()> {
     use fabro_agent::cli::PermissionLevel as AgentPermissionLevel;
-    use fabro_types::settings::run::AgentPermissions;
+    use fabro_types::settings::cli::AgentPermissions;
 
     let cli = &ctx.user_settings().cli;
     #[cfg(feature = "sleep_inhibitor")]

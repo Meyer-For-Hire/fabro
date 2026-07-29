@@ -3,8 +3,9 @@
     reason = "sync test fixture setup; not on a Tokio path"
 )]
 
-use fabro_types::settings::cli::{CliTargetSettings, OutputFormat, OutputVerbosity};
-use fabro_types::settings::run::AgentPermissions;
+use fabro_types::settings::cli::{
+    AgentPermissions, CliTargetSettings, OutputFormat, OutputVerbosity,
+};
 use temp_env::with_var;
 
 use crate::{SettingsLayer, UserSettingsBuilder};

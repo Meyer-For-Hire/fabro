@@ -899,6 +899,23 @@ mod run_agent_fabro_tools {
     }
 
     #[test]
+    fn rejects_removed_permissions_setting() {
+        let err = r#"
+_version = 1
+
+[run.agent]
+permissions = "read-only"
+"#
+        .parse::<SettingsLayer>()
+        .expect_err("removed run.agent.permissions must be unknown");
+        let message = err.to_string();
+        assert!(
+            message.contains("permissions") || message.contains("unknown field"),
+            "expected unknown-field error mentioning permissions, got: {message}"
+        );
+    }
+
+    #[test]
     fn resolves_true_from_run_agent_table() {
         let settings = super::workflow_settings_from_toml(
             r"

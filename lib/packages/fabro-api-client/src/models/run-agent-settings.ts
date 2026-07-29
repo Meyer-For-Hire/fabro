@@ -15,12 +15,9 @@
 
 // May contain unused imports in some cases
 // @ts-ignore
-import type { AgentPermissions } from './agent-permissions';
-// May contain unused imports in some cases
-// @ts-ignore
 import type { McpServerSettings } from './mcp-server-settings';
 
 export interface RunAgentSettings {
-    'permissions': AgentPermissions | null;
+    'fabro_tools': boolean;
     'mcps': { [key: string]: McpServerSettings; };
 }

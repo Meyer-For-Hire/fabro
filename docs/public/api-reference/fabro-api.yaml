@@ -14627,20 +14627,14 @@ components:
 
     RunAgentSettings:
       type: object
-      required: [permissions, mcps]
+      required: [fabro_tools, mcps]
       properties:
-        permissions:
-          oneOf:
-            - $ref: "#/components/schemas/AgentPermissions"
-            - type: "null"
+        fabro_tools:
+          type: boolean
         mcps:
           type: object
           additionalProperties:
             $ref: "#/components/schemas/McpServerSettings"
-
-    AgentPermissions:
-      type: string
-      enum: [read-only, read-write, full]
 
     McpServerSettings:
       type: object

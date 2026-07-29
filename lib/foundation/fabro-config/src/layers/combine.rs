@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, HashMap};
 
 use fabro_model::{AgentProfileKind, BillingPolicy, CodecKind, ProviderAuthConfig};
-use fabro_types::settings::cli::{CliAuthStrategy, OutputFormat, OutputVerbosity};
+use fabro_types::settings::cli::{
+    AgentPermissions, CliAuthStrategy, OutputFormat, OutputVerbosity,
+};
 use fabro_types::settings::run::{
-    AgentPermissions, ApprovalMode, EnvironmentNetworkMode, EnvironmentProvider, MergeStrategy,
-    RunMode,
+    ApprovalMode, EnvironmentNetworkMode, EnvironmentProvider, MergeStrategy, RunMode,
 };
 use fabro_types::settings::server::{
     GithubIntegrationStrategy, LogDestination, ObjectStoreProvider, ServerAuthMethod,

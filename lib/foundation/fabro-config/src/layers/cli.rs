@@ -1,7 +1,8 @@
 //! Sparse `[cli]` settings layer definitions.
 
-use fabro_types::settings::cli::{CliAuthStrategy, OutputFormat, OutputVerbosity};
-use fabro_types::settings::run::AgentPermissions;
+use fabro_types::settings::cli::{
+    AgentPermissions, CliAuthStrategy, OutputFormat, OutputVerbosity,
+};
 use serde::{Deserialize, Serialize};
 
 use super::maps::StickyMap;

@@ -61,6 +61,8 @@ approval = "auto"
     assert_eq!(json["run"]["goal"]["type"], "inline");
     assert_eq!(json["run"]["goal"]["value"], "Ship it");
     assert_eq!(json["run"]["execution"]["approval"], "auto");
+    assert_eq!(json["run"]["agent"]["fabro_tools"], false);
+    assert!(json["run"]["agent"].get("permissions").is_none());
     assert_eq!(
         json["run"]["environment"]["image"]["docker"],
         "buildpack-deps:noble"

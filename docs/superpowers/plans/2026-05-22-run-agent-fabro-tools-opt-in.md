@@ -135,6 +135,5 @@ cargo +nightly-2026-04-14 clippy -p fabro-types -p fabro-config -p fabro-server 
 
 - `fabro_tools` is a per-run opt-in setting only; this plan does not add a separate server-wide allow/deny policy.
 - Defaulting to `false` intentionally changes existing behavior: runs that need Fabro run tools must set `[run.agent] fabro_tools = true`.
-- `run.agent.permissions` remains about ordinary agent tool permissions and does not imply Fabro API access.
 - `[run.agent.mcps]` remains independent; MCP tools are not enabled or disabled by `fabro_tools`.
 - `fabro mcp start` and standalone MCP exposure of Fabro tools are out of scope.

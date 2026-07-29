@@ -31,7 +31,6 @@ models/activated-skill.ts
 models/agent-control-state.ts
 models/agent-mcp-tool-summary.ts
 models/agent-message-props.ts
-models/agent-permissions.ts
 models/agent-session-activated-props.ts
 models/agent-skill-activation-source.ts
 models/agent-skill-summary.ts
