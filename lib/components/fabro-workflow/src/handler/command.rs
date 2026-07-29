@@ -220,8 +220,10 @@ impl Handler for CommandHandler {
 /// Ceiling on encoded stdin bytes. `stdin_source` values are runtime data —
 /// often model-produced — so their size is not something a workflow author
 /// reviewed; this bounds peak memory and remote uploads the same way
-/// `MAX_FOR_EACH_ITEMS` bounds `for_each` fan-out.
-const MAX_STDIN_BYTES: usize = 10 * 1024 * 1024;
+/// `MAX_FOR_EACH_ITEMS` bounds `for_each` fan-out. Sized for wide fan-in:
+/// a `context.parallel.results` batch from a large `for_each` round easily
+/// carries tens of structured agent outputs.
+const MAX_STDIN_BYTES: usize = 30 * 1024 * 1024;
 
 fn validated_stdin_source(node: &Node) -> Result<Option<&str>, String> {
     match node.context_key_attr("stdin_source") {
