@@ -32,7 +32,8 @@ use crate::artifact_upload::ArtifactSink;
 use crate::context::Context;
 use crate::error::{self, Error};
 use crate::event::{
-    Emitter, Event, EventBody, RunEventLogger, RunEventSink, RunNoticeLevel, append_event_to_sink,
+    Emitter, Event, EventBody, RunEventLogger, RunEventSink, RunNoticeCode, RunNoticeLevel,
+    append_event_to_sink,
 };
 use crate::handler::HandlerRegistry;
 use crate::outcome::{Outcome, StageOutcome};
@@ -59,6 +60,7 @@ struct RunSession {
     emitter:           Arc<Emitter>,
     sandbox:           SandboxSpec,
     llm:               LlmSpec,
+    fallback_notices:  Vec<ModelFallbackNotice>,
     interviewer:       Arc<dyn Interviewer>,
     steering_hub:      Arc<SteeringHub>,
     on_node:           crate::OnNodeCallback,
@@ -87,9 +89,101 @@ struct RunSession {
 }
 
 struct ResolvedStartLlm {
-    model:          String,
-    provider_id:    ProviderId,
-    fallback_chain: Vec<FallbackTarget>,
+    model:            String,
+    provider_id:      ProviderId,
+    fallback_chain:   Vec<FallbackTarget>,
+    fallback_notices: Vec<ModelFallbackNotice>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ResolvedFallbackChain {
+    targets: Vec<FallbackTarget>,
+    notices: Vec<ModelFallbackNotice>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ModelFallbackNotice {
+    ProviderUnconfigured {
+        reference: String,
+        provider:  ProviderId,
+    },
+    NoConfiguredOffering {
+        reference: String,
+    },
+    NoCompatibleModel {
+        reference: String,
+        provider:  ProviderId,
+    },
+    MatchesPrimary {
+        reference: String,
+        target:    FallbackTarget,
+    },
+    Duplicate {
+        reference: String,
+        target:    FallbackTarget,
+    },
+    ChainEmpty,
+}
+
+impl ModelFallbackNotice {
+    fn code(&self) -> RunNoticeCode {
+        match self {
+            Self::ChainEmpty => RunNoticeCode::ModelFallbackChainEmpty,
+            _ => RunNoticeCode::ModelFallbackSkipped,
+        }
+    }
+
+    fn level(&self) -> RunNoticeLevel {
+        match self {
+            Self::MatchesPrimary { .. } | Self::Duplicate { .. } => RunNoticeLevel::Info,
+            Self::ProviderUnconfigured { .. }
+            | Self::NoConfiguredOffering { .. }
+            | Self::NoCompatibleModel { .. }
+            | Self::ChainEmpty => RunNoticeLevel::Warn,
+        }
+    }
+
+    fn message(&self) -> String {
+        match self {
+            Self::ProviderUnconfigured {
+                reference,
+                provider,
+            } => {
+                format!(
+                    "Model fallback `{reference}` was skipped because provider `{provider}` is not configured."
+                )
+            }
+            Self::NoConfiguredOffering { reference } => {
+                format!(
+                    "Model fallback `{reference}` was skipped because none of its providers are configured."
+                )
+            }
+            Self::NoCompatibleModel {
+                reference,
+                provider,
+            } => {
+                format!(
+                    "Model fallback `{reference}` was skipped because provider `{provider}` has no compatible model."
+                )
+            }
+            Self::MatchesPrimary { reference, target } => {
+                format!(
+                    "Model fallback `{reference}` was skipped because it resolves to the primary target `{}:{}`.",
+                    target.provider, target.model
+                )
+            }
+            Self::Duplicate { reference, target } => {
+                format!(
+                    "Model fallback `{reference}` was skipped because target `{}:{}` already appears in the fallback chain.",
+                    target.provider, target.model
+                )
+            }
+            Self::ChainEmpty => {
+                "No usable model fallbacks remain after filtering the configured fallback candidates."
+                    .to_string()
+            }
+        }
+    }
 }
 
 pub struct StartServices {
@@ -482,6 +576,7 @@ impl RunSession {
                 model_controls: resolved.model.controls.clone(),
                 dry_run: resolved.execution.mode == RunMode::DryRun,
             },
+            fallback_notices: llm.fallback_notices,
             interviewer,
             steering_hub: services.steering_hub,
             on_node: services.on_node,
@@ -615,96 +710,153 @@ fn resolve_start_llm(
         settings.model.provider.as_deref(),
         false,
     )?;
-    let fallback_chain =
+    let fallback_resolution =
         resolve_fallback_chain(catalog, &provider_id, &model, &settings.model, &eligible)?;
 
     Ok(ResolvedStartLlm {
         model,
         provider_id,
-        fallback_chain,
+        fallback_chain: fallback_resolution.targets,
+        fallback_notices: fallback_resolution.notices,
     })
 }
 
+/// Resolve fallback candidates against the configured provider snapshot.
+///
+/// Known unconfigured providers, the resolved primary target, and duplicate
+/// targets are omitted while the order of the remaining candidates is kept.
 fn resolve_fallback_chain(
     catalog: &Catalog,
     provider: &ProviderId,
     model: &str,
     settings: &ResolvedRunModelSettings,
     eligible: &HashSet<ProviderId>,
-) -> Result<Vec<FallbackTarget>, Error> {
+) -> Result<ResolvedFallbackChain, Error> {
     if settings.fallbacks.is_empty() {
-        return Ok(Vec::new());
+        return Ok(ResolvedFallbackChain::default());
     }
+
     let primary = catalog.get_on_provider(provider, model);
-    let mut chain = Vec::new();
+    let primary_target = FallbackTarget {
+        provider: provider.to_string(),
+        model:    model.to_string(),
+    };
+    let mut resolution = ResolvedFallbackChain::default();
+    let mut seen = HashSet::new();
 
     for model_ref in &settings.fallbacks {
-        match model_ref.resolve(catalog)? {
+        let reference = model_ref.to_string();
+        let target = match model_ref.resolve(catalog)? {
             ResolvedModelRef::Provider(provider_name) => {
-                let provider_id = canonical_provider_id(catalog, &provider_name);
+                let provider_id = catalog_provider_id(catalog, &provider_name)?;
                 if !eligible.contains(&provider_id) {
-                    return Err(ModelSelectionError::ProviderUnavailable {
-                        provider: provider_id,
-                    }
-                    .into());
+                    resolution
+                        .notices
+                        .push(ModelFallbackNotice::ProviderUnconfigured {
+                            reference,
+                            provider: provider_id,
+                        });
+                    continue;
                 }
-                if let Some(model) =
+                let Some(model) =
                     primary.and_then(|reference| catalog.closest(&provider_id, reference))
-                {
-                    chain.push(FallbackTarget {
-                        provider: provider_id.to_string(),
-                        model:    model.id.to_string(),
-                    });
+                else {
+                    resolution
+                        .notices
+                        .push(ModelFallbackNotice::NoCompatibleModel {
+                            reference,
+                            provider: provider_id,
+                        });
+                    continue;
+                };
+                FallbackTarget {
+                    provider: provider_id.to_string(),
+                    model:    model.id.to_string(),
                 }
             }
             ResolvedModelRef::Model {
                 provider: fallback_provider,
                 selector,
             } => {
-                if let Some(provider) = fallback_provider {
-                    let provider = canonical_provider_id(catalog, &provider);
+                if let Some(provider_name) = fallback_provider {
+                    let provider = catalog_provider_id(catalog, &provider_name)?;
                     if !eligible.contains(&provider) {
-                        return Err(ModelSelectionError::ProviderUnavailable { provider }.into());
+                        resolution
+                            .notices
+                            .push(ModelFallbackNotice::ProviderUnconfigured {
+                                reference,
+                                provider,
+                            });
+                        continue;
                     }
                     match catalog.resolve_on_provider(&provider, &selector) {
-                        Ok(info) => chain.push(FallbackTarget {
+                        Ok(info) => FallbackTarget {
                             provider: info.provider.to_string(),
                             model:    info.id.to_string(),
-                        }),
+                        },
                         Err(ModelSelectionError::UnknownSelectorOnProvider { .. }) => {
-                            chain.push(FallbackTarget {
+                            FallbackTarget {
                                 provider: provider.to_string(),
                                 model:    selector,
-                            });
+                            }
                         }
                         Err(error) => return Err(error.into()),
                     }
                 } else {
                     match catalog.select(&selector, None, eligible) {
-                        Ok(info) => chain.push(FallbackTarget {
+                        Ok(info) => FallbackTarget {
                             provider: info.provider.to_string(),
                             model:    info.id.to_string(),
-                        }),
-                        Err(ModelSelectionError::UnknownSelector { .. }) => {
-                            chain.push(FallbackTarget {
-                                provider: provider.to_string(),
-                                model:    selector,
-                            });
+                        },
+                        Err(ModelSelectionError::NoEligibleOffering { .. }) => {
+                            resolution
+                                .notices
+                                .push(ModelFallbackNotice::NoConfiguredOffering { reference });
+                            continue;
                         }
+                        Err(ModelSelectionError::UnknownSelector { .. }) => FallbackTarget {
+                            provider: provider.to_string(),
+                            model:    selector,
+                        },
                         Err(error) => return Err(error.into()),
                     }
                 }
             }
+        };
+
+        if target == primary_target {
+            resolution
+                .notices
+                .push(ModelFallbackNotice::MatchesPrimary { reference, target });
+            continue;
         }
+
+        let target_key = (target.provider.clone(), target.model.clone());
+        if !seen.insert(target_key) {
+            resolution
+                .notices
+                .push(ModelFallbackNotice::Duplicate { reference, target });
+            continue;
+        }
+        resolution.targets.push(target);
     }
-    Ok(chain)
+
+    if resolution.targets.is_empty() {
+        resolution.notices.push(ModelFallbackNotice::ChainEmpty);
+    }
+
+    Ok(resolution)
 }
 
-fn canonical_provider_id(catalog: &Catalog, provider_name: &str) -> ProviderId {
-    let provider_id = ProviderId::from(provider_name);
+fn catalog_provider_id(
+    catalog: &Catalog,
+    provider_name: &str,
+) -> Result<ProviderId, ModelSelectionError> {
+    let provider = ProviderId::from(provider_name);
     catalog
-        .provider(&provider_id)
-        .map_or(provider_id, |provider| provider.id.clone())
+        .provider(&provider)
+        .map(|provider| provider.id.clone())
+        .ok_or(ModelSelectionError::UnknownProvider { provider })
 }
 
 /// Build the launch-time MCP config from resolved settings. Secret tokens in
@@ -827,6 +979,10 @@ impl RunSession {
 
         let store_progress_logger = RunEventLogger::new(self.event_sink.clone());
         store_progress_logger.register(self.emitter.as_ref());
+        for notice in &self.fallback_notices {
+            self.emitter
+                .notice(notice.level(), notice.code(), notice.message());
+        }
 
         let init_options = InitOptions {
             run_store: self.run_store.clone(),
@@ -1257,6 +1413,19 @@ tools = true
 vision = false
 reasoning = false
 
+[providers.openai.models."gpt-5.4-mini"]
+display_name = "GPT-5.4 Mini"
+family = "gpt-5"
+aliases = ["mini"]
+
+[providers.openai.models."gpt-5.4-mini".limits]
+context_window = 1000
+
+[providers.openai.models."gpt-5.4-mini".features]
+tools = true
+vision = false
+reasoning = false
+
 [providers.openrouter]
 display_name = "OpenRouter"
 adapter = "openai_compatible"
@@ -1284,6 +1453,152 @@ reasoning = false
     }
 
     #[test]
+    fn resolve_start_llm_infers_primary_and_filters_global_fallbacks() {
+        let catalog = portable_model_catalog();
+        let mut settings = ResolvedRunSettings::default();
+        settings.model.name = Some("gpt-56-sol".to_string());
+        settings.model.fallbacks = vec![
+            "openai:gpt-56-sol".parse::<ModelRef>().unwrap(),
+            "openrouter:gpt-56-sol".parse::<ModelRef>().unwrap(),
+            "openrouter:openai/gpt-5.6-sol".parse::<ModelRef>().unwrap(),
+        ];
+
+        let resolved = resolve_start_llm(
+            &catalog,
+            &[ProviderId::new("openrouter"), ProviderId::openai()],
+            &settings,
+        )
+        .unwrap();
+
+        assert_eq!(resolved.provider_id, ProviderId::openai());
+        assert_eq!(resolved.model, "gpt-5.6-sol");
+        assert_eq!(resolved.fallback_chain, vec![FallbackTarget {
+            provider: "openrouter".to_string(),
+            model:    "gpt-5.6-sol".to_string(),
+        }]);
+        assert_eq!(resolved.fallback_notices, vec![
+            ModelFallbackNotice::MatchesPrimary {
+                reference: "openai:gpt-56-sol".to_string(),
+                target:    FallbackTarget {
+                    provider: "openai".to_string(),
+                    model:    "gpt-5.6-sol".to_string(),
+                },
+            },
+            ModelFallbackNotice::Duplicate {
+                reference: "openrouter:openai/gpt-5.6-sol".to_string(),
+                target:    FallbackTarget {
+                    provider: "openrouter".to_string(),
+                    model:    "gpt-5.6-sol".to_string(),
+                },
+            },
+        ]);
+    }
+
+    #[test]
+    fn resolve_fallback_chain_skips_unconfigured_provider_and_preserves_order() {
+        let catalog = test_catalog();
+        let settings = ResolvedRunModelSettings {
+            fallbacks: vec![
+                "gemini".parse::<ModelRef>().unwrap(),
+                "gemini:unused".parse::<ModelRef>().unwrap(),
+                "openai:gpt-5.4-mini".parse::<ModelRef>().unwrap(),
+                "anthropic:claude-fable-5".parse::<ModelRef>().unwrap(),
+            ],
+            ..ResolvedRunModelSettings::default()
+        };
+
+        let resolution = resolve_fallback_chain(
+            catalog.as_ref(),
+            &ProviderId::anthropic(),
+            "claude-opus-4-6",
+            &settings,
+            &HashSet::from([ProviderId::anthropic(), ProviderId::openai()]),
+        )
+        .unwrap();
+
+        assert_eq!(resolution.targets, vec![
+            FallbackTarget {
+                provider: "openai".to_string(),
+                model:    "gpt-5.4-mini".to_string(),
+            },
+            FallbackTarget {
+                provider: "anthropic".to_string(),
+                model:    "claude-fable-5".to_string(),
+            },
+        ]);
+        assert_eq!(resolution.notices, vec![
+            ModelFallbackNotice::ProviderUnconfigured {
+                reference: "gemini".to_string(),
+                provider:  ProviderId::gemini(),
+            },
+            ModelFallbackNotice::ProviderUnconfigured {
+                reference: "gemini:unused".to_string(),
+                provider:  ProviderId::gemini(),
+            },
+        ]);
+        assert_eq!(resolution.notices[0].level(), RunNoticeLevel::Warn);
+        assert_eq!(
+            resolution.notices[0].code(),
+            RunNoticeCode::ModelFallbackSkipped
+        );
+    }
+
+    #[test]
+    fn resolve_fallback_chain_skips_model_without_configured_offering() {
+        let catalog = portable_model_catalog();
+        let settings = ResolvedRunModelSettings {
+            fallbacks: vec!["mini".parse::<ModelRef>().unwrap()],
+            ..ResolvedRunModelSettings::default()
+        };
+
+        let resolution = resolve_fallback_chain(
+            &catalog,
+            &ProviderId::new("openrouter"),
+            "gpt-5.6-sol",
+            &settings,
+            &HashSet::from([ProviderId::new("openrouter")]),
+        )
+        .unwrap();
+
+        assert!(resolution.targets.is_empty());
+        assert_eq!(resolution.notices, vec![
+            ModelFallbackNotice::NoConfiguredOffering {
+                reference: "mini".to_string(),
+            },
+            ModelFallbackNotice::ChainEmpty,
+        ]);
+        assert_eq!(
+            resolution.notices[1].code(),
+            RunNoticeCode::ModelFallbackChainEmpty
+        );
+        assert_eq!(resolution.notices[1].level(), RunNoticeLevel::Warn);
+    }
+
+    #[test]
+    fn resolve_fallback_chain_rejects_unknown_qualified_provider() {
+        let catalog = portable_model_catalog();
+        let settings = ResolvedRunModelSettings {
+            fallbacks: vec!["missing/model".parse::<ModelRef>().unwrap()],
+            ..ResolvedRunModelSettings::default()
+        };
+
+        let error = resolve_fallback_chain(
+            &catalog,
+            &ProviderId::openai(),
+            "gpt-5.6-sol",
+            &settings,
+            &catalog.all_provider_ids(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::ModelSelection(ModelSelectionError::UnknownProvider { provider })
+                if provider == ProviderId::new("missing")
+        ));
+    }
+
+    #[test]
     fn resolve_fallback_chain_resolves_provider_fallbacks() {
         let catalog = test_catalog();
         let settings = ResolvedRunModelSettings {
@@ -1300,7 +1615,7 @@ reasoning = false
         )
         .unwrap();
 
-        assert_eq!(chain, vec![FallbackTarget {
+        assert_eq!(chain.targets, vec![FallbackTarget {
             provider: "openai".to_string(),
             model:    "gpt-5.5".to_string(),
         }]);
@@ -1323,7 +1638,7 @@ reasoning = false
         )
         .unwrap();
 
-        assert_eq!(chain, vec![FallbackTarget {
+        assert_eq!(chain.targets, vec![FallbackTarget {
             provider: "openai".to_string(),
             model:    "gpt-5.4-mini".to_string(),
         }]);
@@ -1346,7 +1661,7 @@ reasoning = false
         )
         .unwrap();
 
-        assert_eq!(chain, vec![FallbackTarget {
+        assert_eq!(chain.targets, vec![FallbackTarget {
             provider: "openrouter".to_string(),
             model:    "gpt-5.6-sol".to_string(),
         }]);
@@ -1369,7 +1684,7 @@ reasoning = false
         )
         .unwrap();
 
-        assert_eq!(chain, vec![FallbackTarget {
+        assert_eq!(chain.targets, vec![FallbackTarget {
             provider: "openrouter".to_string(),
             model:    "gpt-5.6-sol".to_string(),
         }]);
@@ -1412,7 +1727,7 @@ enabled = true
             .unwrap();
 
             assert_eq!(
-                chain,
+                chain.targets,
                 vec![
                     FallbackTarget {
                         provider: "openrouter".to_string(),
@@ -1448,7 +1763,7 @@ enabled = true
         )
         .unwrap();
 
-        assert_eq!(chain, vec![FallbackTarget {
+        assert_eq!(chain.targets, vec![FallbackTarget {
             provider: ProviderId::openai().to_string(),
             model:    "future-model:latest".to_string(),
         }]);
@@ -1474,7 +1789,7 @@ enabled = true
         )
         .unwrap();
 
-        assert_eq!(chain, vec![
+        assert_eq!(chain.targets, vec![
             FallbackTarget {
                 provider: "openai".to_string(),
                 model:    "gpt-5.6-sol".to_string(),
