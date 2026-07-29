@@ -150,6 +150,29 @@ fn artifact_commands_share_populated_run_fixture() {
     ");
     assert_eq!(read_text(&single_dest.join("report.txt")), "two");
 
+    let stage_tree_dest = context.temp_dir.join("artifact-stage-tree");
+    let mut cp_stage_tree = context.command();
+    cp_stage_tree.args([
+        "artifact",
+        "cp",
+        &run.run_id,
+        stage_tree_dest.to_str().unwrap(),
+        "--stage",
+        "create_assets@2",
+        "--tree",
+    ]);
+    fabro_snapshot!(context.filters(), cp_stage_tree, @"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+    Copied 1 artifact(s) to [TEMP_DIR]/artifact-stage-tree
+    ----- stderr -----
+    ");
+    insta::assert_snapshot!(
+        text_tree(&stage_tree_dest).join("\n"),
+        @"create_assets/visit_2/retry_1/assets/shared/report.txt = two"
+    );
+
     let repeated_visit_dest = context.temp_dir.join("artifact-repeated-visit");
     let mut cp_repeated_visit = context.command();
     cp_repeated_visit.args([

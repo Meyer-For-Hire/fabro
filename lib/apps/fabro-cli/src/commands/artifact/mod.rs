@@ -37,7 +37,7 @@ pub(super) async fn resolve_artifacts(
         if node.is_some_and(|value| entry.node_slug != value) {
             continue;
         }
-        let stage_id = entry.stage_id.parse()?;
+        let stage_id = parse_server_stage_id(&entry.stage_id)?;
         if stage.as_ref().is_some_and(|value| &stage_id != value) {
             continue;
         }
@@ -67,9 +67,31 @@ pub(super) async fn resolve_artifacts(
     Ok((run_id, client.clone_for_reuse(), entries))
 }
 
+fn parse_server_stage_id(value: &str) -> Result<StageId> {
+    value
+        .parse()
+        .context("server returned invalid artifact stage ID")
+}
+
 pub(crate) async fn dispatch(ns: ArtifactNamespace, base_ctx: &CommandContext) -> Result<()> {
     match ns.command {
         ArtifactCommand::List(args) => list::list_command(&args, base_ctx).await,
         ArtifactCommand::Cp(args) => cp::cp_command(&args, base_ctx).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_server_stage_id;
+
+    #[test]
+    fn invalid_server_stage_id_preserves_parse_error_context() {
+        let err = parse_server_stage_id("invalid").unwrap_err();
+        let chain = err.chain().map(ToString::to_string).collect::<Vec<_>>();
+
+        assert_eq!(chain, [
+            "server returned invalid artifact stage ID",
+            "stage id must contain '@'",
+        ]);
     }
 }

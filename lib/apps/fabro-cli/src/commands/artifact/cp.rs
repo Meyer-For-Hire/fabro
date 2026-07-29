@@ -181,7 +181,7 @@ fn multi_visit_nodes(entries: &[super::ArtifactEntry]) -> HashSet<&str> {
 
 fn artifact_tree_path(entry: &super::ArtifactEntry, multi_visit_nodes: &HashSet<&str>) -> PathBuf {
     let mut path = PathBuf::from(&entry.node_slug);
-    if multi_visit_nodes.contains(entry.node_slug.as_str()) {
+    if entry.stage_id.visit() != 1 || multi_visit_nodes.contains(entry.node_slug.as_str()) {
         path.push(format!("visit_{}", entry.stage_id.visit()));
     }
     path.join(format!("retry_{}", entry.retry))
