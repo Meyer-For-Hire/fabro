@@ -174,6 +174,36 @@ describe("parseFabro", () => {
     expect(draft.nodes.find((n) => n.id === "plain")?.shape).toBe("box");
   });
 
+  test("shapeless script node keeps command behavior after round trip", () => {
+    const draft = expectOk(
+      parseFabro(`digraph G {
+        start [shape=Mdiamond, label="Start"]
+        exit  [shape=Msquare, label="Exit"]
+        build [script="cargo build"]
+        start -> build -> exit
+      }`),
+    );
+
+    expect(draft.nodes.find((n) => n.id === "build")?.shape).toBe(
+      "parallelogram",
+    );
+
+    const reparsed = expectOk(parseFabro(renderFabro(draft)));
+    expect(reparsed.nodes.find((n) => n.id === "build")?.shape).toBe(
+      "parallelogram",
+    );
+  });
+
+  test("explicit type disables command shape inference", () => {
+    const draft = expectOk(
+      parseFabro(`digraph G {
+        work [type=agent, script="cargo build"]
+      }`),
+    );
+
+    expect(draft.nodes.find((n) => n.id === "work")?.shape).toBe("box");
+  });
+
   test("unknown shape falls back to box", () => {
     const draft = expectOk(
       parseFabro(`digraph G {

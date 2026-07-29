@@ -1,5 +1,14 @@
 use fabro_graphviz::graph::{AttrValue, Edge, Graph, Node};
 
+pub(crate) fn node_with_attrs(id: &str, attrs: &[(&str, &str)]) -> Node {
+    let mut node = Node::new(id);
+    for (key, value) in attrs {
+        node.attrs
+            .insert((*key).to_string(), AttrValue::String((*value).to_string()));
+    }
+    node
+}
+
 pub(crate) fn minimal_graph() -> Graph {
     let mut g = Graph::new("test");
     let mut start = Node::new("start");

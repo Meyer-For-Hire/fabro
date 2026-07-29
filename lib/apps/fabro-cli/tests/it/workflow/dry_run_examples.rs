@@ -149,9 +149,9 @@ fn dry_run_styled() {
 }
 
 #[test]
-fn dry_run_legacy_tool() {
+fn dry_run_inferred_command() {
     let context = test_context!();
-    let workflow = context.install_fixture("legacy_tool.fabro");
+    let workflow = context.install_fixture("inferred_command.fabro");
     let mut cmd = context.run_cmd();
     cmd.args(["--dry-run", "--auto-approve"]);
     cmd.arg(&workflow);
@@ -160,9 +160,9 @@ fn dry_run_legacy_tool() {
     exit_code: 0
     ----- stdout -----
     ----- stderr -----
-    Workflow: LegacyTool (3 nodes, 2 edges)
+    Workflow: InferredCommand (3 nodes, 2 edges)
     Graph: [GRAPH_PATH]
-    Goal: Verify backwards compatibility with old tool naming
+    Goal: Verify a shapeless script node runs as a command
 
         Run: [ULID]
         Web UI: http://localhost:3000/runs/[ULID]

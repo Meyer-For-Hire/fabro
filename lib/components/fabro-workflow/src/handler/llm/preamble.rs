@@ -161,15 +161,8 @@ fn render_compact_stage_details(
     match handler {
         Some("command") => {
             let mut lines = Vec::new();
-            if let Some(n) = node {
-                if let Some(cmd) = n
-                    .attrs
-                    .get("script")
-                    .or_else(|| n.attrs.get("tool_command"))
-                    .and_then(|v| v.as_str())
-                {
-                    lines.push(format!("  - Script: `{cmd}`"));
-                }
+            if let Some(cmd) = node.and_then(Node::script) {
+                lines.push(format!("  - Script: `{cmd}`"));
             }
             if let Some(output_val) = outcome.context_updates.get(keys::COMMAND_OUTPUT) {
                 let output = format_value(output_val);
@@ -215,15 +208,8 @@ fn render_summary_high_stage_section(
 
     match handler {
         Some("command") => {
-            if let Some(n) = node {
-                if let Some(cmd) = n
-                    .attrs
-                    .get("script")
-                    .or_else(|| n.attrs.get("tool_command"))
-                    .and_then(|v| v.as_str())
-                {
-                    lines.push(format!("- Script: `{cmd}`"));
-                }
+            if let Some(cmd) = node.and_then(Node::script) {
+                lines.push(format!("- Script: `{cmd}`"));
             }
             if let Some(output_val) = outcome.context_updates.get(keys::COMMAND_OUTPUT) {
                 if let Some(path) = artifact_path(output_val) {
@@ -531,15 +517,8 @@ fn build_summary_preamble(
                         }
                         match handler {
                             Some("command") => {
-                                if let Some(n) = node {
-                                    if let Some(cmd) = n
-                                        .attrs
-                                        .get("script")
-                                        .or_else(|| n.attrs.get("tool_command"))
-                                        .and_then(|v| v.as_str())
-                                    {
-                                        parts.push(format!("  - Script: `{cmd}`"));
-                                    }
+                                if let Some(cmd) = node.and_then(Node::script) {
+                                    parts.push(format!("  - Script: `{cmd}`"));
                                 }
                             }
                             h if is_llm_handler_type(h) => {

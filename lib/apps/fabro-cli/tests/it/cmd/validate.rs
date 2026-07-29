@@ -154,17 +154,17 @@ fn styled() {
 }
 
 #[test]
-fn legacy_tool() {
+fn inferred_command() {
     let context = test_context!();
     let mut cmd = context.validate();
-    cmd.arg(fixture("legacy_tool.fabro"));
+    cmd.arg(fixture("inferred_command.fabro"));
     fabro_snapshot!(context.filters(), cmd, @"
     success: true
     exit_code: 0
     ----- stdout -----
     ----- stderr -----
-    Workflow: LegacyTool (3 nodes, 2 edges)
-    Graph: [FIXTURES]/legacy_tool.fabro
+    Workflow: InferredCommand (3 nodes, 2 edges)
+    Graph: [FIXTURES]/inferred_command.fabro
     Validation: OK
     ");
 }

@@ -1,5 +1,6 @@
 mod all_conditional_edges;
 mod backend_valid;
+mod command_requires_script;
 mod condition_syntax;
 mod direction_valid;
 mod edge_target_exists;
@@ -63,6 +64,7 @@ pub fn built_in_rules() -> Vec<Box<dyn LintRule>> {
         all_conditional_edges::rule(),
         orphan_custom_outcome::rule(),
         script_absolute_cd::rule(),
+        command_requires_script::rule(),
         import_error::rule(),
         join_policy_removed::rule(),
         unresolved_file_ref::rule(),
