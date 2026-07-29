@@ -14,6 +14,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("Invalid event payload: {0}")]
     InvalidEvent(String),
+    #[error("event rejected by run projection: {reason}")]
+    EventRejected { reason: String },
     #[error("Run not found: {0}")]
     RunNotFound(String),
     #[error("Run already exists: {0}")]
