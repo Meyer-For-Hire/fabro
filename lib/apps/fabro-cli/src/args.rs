@@ -531,6 +531,10 @@ pub(crate) struct ArtifactListArgs {
     #[arg(long)]
     pub(crate) node: Option<String>,
 
+    /// Filter to artifacts from a specific stage visit (node@visit)
+    #[arg(long)]
+    pub(crate) stage: Option<String>,
+
     /// Filter to artifacts from a specific retry attempt
     #[arg(long)]
     pub(crate) retry: Option<u32>,
@@ -552,11 +556,15 @@ pub(crate) struct ArtifactCpArgs {
     #[arg(long)]
     pub(crate) node: Option<String>,
 
+    /// Filter to artifacts from a specific stage visit (node@visit)
+    #[arg(long)]
+    pub(crate) stage: Option<String>,
+
     /// Filter to artifacts from a specific retry attempt
     #[arg(long)]
     pub(crate) retry: Option<u32>,
 
-    /// Preserve {node_slug}/retry_{N}/ directory structure
+    /// Preserve node[/visit_{N}]/retry_{N}/ directory structure
     #[arg(long)]
     pub(crate) tree: bool,
 }

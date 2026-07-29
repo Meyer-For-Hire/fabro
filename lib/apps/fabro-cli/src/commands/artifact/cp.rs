@@ -3,6 +3,7 @@
     reason = "CLI `artifact cp` command: sync file I/O in command handler; not on a Tokio hot path"
 )]
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -20,6 +21,7 @@ pub(super) async fn cp_command(args: &ArtifactCpArgs, base_ctx: &CommandContext)
         &args.server,
         run_id_selector,
         args.node.as_deref(),
+        args.stage.as_deref(),
         args.retry,
     )
     .await?;
@@ -45,7 +47,7 @@ pub(super) async fn cp_command(args: &ArtifactCpArgs, base_ctx: &CommandContext)
                 .map(|entry| format_candidate(entry))
                 .collect();
             bail!(
-                "Path '{path}' matches multiple artifacts: {}. Use --node and/or --retry to disambiguate.",
+                "Path '{path}' matches multiple artifacts: {}. Use --stage and/or --retry to disambiguate.",
                 candidates.join(", ")
             );
         }
@@ -77,10 +79,9 @@ pub(super) async fn cp_command(args: &ArtifactCpArgs, base_ctx: &CommandContext)
 
     let mut copied = Vec::new();
     if args.tree {
+        let multi_visit_nodes = multi_visit_nodes(&entries);
         for entry in &entries {
-            let relative_dest = PathBuf::from(&entry.node_slug)
-                .join(format!("retry_{}", entry.retry))
-                .join(&entry.relative_path);
+            let relative_dest = artifact_tree_path(entry, &multi_visit_nodes);
             let dest_file = args.dest.join(relative_dest);
             write_artifact_file(&client, &run_id, entry, &dest_file).await?;
             copied.push(serde_json::json!({
@@ -99,7 +100,7 @@ pub(super) async fn cp_command(args: &ArtifactCpArgs, base_ctx: &CommandContext)
                 .into_owned();
             if let Some((_, existing)) = by_filename.iter().find(|(name, _)| name == &filename) {
                 bail!(
-                    "Filename collision: '{}' exists in both {} and {}. Use --tree to preserve directory structure, or --node and/or --retry to filter.",
+                    "Filename collision: '{}' exists in both {} and {}. Use --tree to preserve directory structure, or --stage and/or --retry to filter.",
                     filename,
                     format_candidate(existing),
                     format_candidate(entry)
@@ -157,7 +158,34 @@ fn parse_source(source: &str) -> (&str, Option<&str>) {
 }
 
 fn format_candidate(entry: &super::ArtifactEntry) -> String {
-    format!("{}:retry_{}", entry.node_slug, entry.retry)
+    format!("{}:retry_{}", entry.stage_id, entry.retry)
+}
+
+fn multi_visit_nodes(entries: &[super::ArtifactEntry]) -> HashSet<&str> {
+    let mut first_visit_by_node = HashMap::new();
+    let mut multi_visit_nodes = HashSet::new();
+    for entry in entries {
+        let node_slug = entry.node_slug.as_str();
+        let visit = entry.stage_id.visit();
+        if first_visit_by_node
+            .get(node_slug)
+            .is_some_and(|first_visit| *first_visit != visit)
+        {
+            multi_visit_nodes.insert(node_slug);
+        } else {
+            first_visit_by_node.entry(node_slug).or_insert(visit);
+        }
+    }
+    multi_visit_nodes
+}
+
+fn artifact_tree_path(entry: &super::ArtifactEntry, multi_visit_nodes: &HashSet<&str>) -> PathBuf {
+    let mut path = PathBuf::from(&entry.node_slug);
+    if entry.stage_id.visit() != 1 || multi_visit_nodes.contains(entry.node_slug.as_str()) {
+        path.push(format!("visit_{}", entry.stage_id.visit()));
+    }
+    path.join(format!("retry_{}", entry.retry))
+        .join(&entry.relative_path)
 }
 
 #[cfg(test)]
@@ -202,6 +230,6 @@ mod tests {
             size:          6,
         };
 
-        assert_eq!(format_candidate(&entry), "retry_assets:retry_2");
+        assert_eq!(format_candidate(&entry), "retry_assets@2:retry_2");
     }
 }

@@ -27,36 +27,49 @@ fn artifact_commands_share_populated_run_fixture() {
     ----- stdout -----
     [
       {
+        "stage_id": "create_assets@1",
         "node_slug": "create_assets",
         "retry": 1,
         "relative_path": "assets/node_a/summary.txt",
         "size": 5
       },
       {
+        "stage_id": "create_assets@1",
         "node_slug": "create_assets",
         "retry": 1,
         "relative_path": "assets/shared/report.txt",
         "size": 3
       },
       {
+        "stage_id": "create_assets@2",
+        "node_slug": "create_assets",
+        "retry": 1,
+        "relative_path": "assets/shared/report.txt",
+        "size": 3
+      },
+      {
+        "stage_id": "create_colliding@1",
         "node_slug": "create_colliding",
         "retry": 1,
         "relative_path": "assets/other/summary.txt",
         "size": 4
       },
       {
+        "stage_id": "create_colliding@1",
         "node_slug": "create_colliding",
         "retry": 1,
         "relative_path": "assets/retry/report.txt",
         "size": 6
       },
       {
+        "stage_id": "retry_assets@1",
         "node_slug": "retry_assets",
         "retry": 1,
         "relative_path": "assets/retry/report.txt",
         "size": 5
       },
       {
+        "stage_id": "retry_assets@1",
         "node_slug": "retry_assets",
         "retry": 2,
         "relative_path": "assets/retry/report.txt",
@@ -83,10 +96,36 @@ fn artifact_commands_share_populated_run_fixture() {
     ----- stdout -----
     [
       {
+        "stage_id": "retry_assets@1",
         "node_slug": "retry_assets",
         "retry": 2,
         "relative_path": "assets/retry/report.txt",
         "size": 6
+      }
+    ]
+    ----- stderr -----
+    "#);
+
+    let mut list_stage_filtered = context.command();
+    list_stage_filtered.args([
+        "artifact",
+        "list",
+        &run.run_id,
+        "--stage",
+        "create_assets@2",
+        "--json",
+    ]);
+    fabro_snapshot!(filters.clone(), list_stage_filtered, @r#"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+    [
+      {
+        "stage_id": "create_assets@2",
+        "node_slug": "create_assets",
+        "retry": 1,
+        "relative_path": "assets/shared/report.txt",
+        "size": 3
       }
     ]
     ----- stderr -----
@@ -99,8 +138,8 @@ fn artifact_commands_share_populated_run_fixture() {
         "cp",
         &format!("{}:assets/shared/report.txt", run.run_id),
         single_dest.to_str().unwrap(),
-        "--node",
-        "create_assets",
+        "--stage",
+        "create_assets@2",
     ]);
     fabro_snapshot!(context.filters(), cp_single, @"
     success: true
@@ -109,7 +148,50 @@ fn artifact_commands_share_populated_run_fixture() {
     Copied assets/shared/report.txt to [TEMP_DIR]/artifact-one/report.txt
     ----- stderr -----
     ");
-    assert_eq!(read_text(&single_dest.join("report.txt")), "one");
+    assert_eq!(read_text(&single_dest.join("report.txt")), "two");
+
+    let stage_tree_dest = context.temp_dir.join("artifact-stage-tree");
+    let mut cp_stage_tree = context.command();
+    cp_stage_tree.args([
+        "artifact",
+        "cp",
+        &run.run_id,
+        stage_tree_dest.to_str().unwrap(),
+        "--stage",
+        "create_assets@2",
+        "--tree",
+    ]);
+    fabro_snapshot!(context.filters(), cp_stage_tree, @"
+    success: true
+    exit_code: 0
+    ----- stdout -----
+    Copied 1 artifact(s) to [TEMP_DIR]/artifact-stage-tree
+    ----- stderr -----
+    ");
+    insta::assert_snapshot!(
+        text_tree(&stage_tree_dest).join("\n"),
+        @"create_assets/visit_2/retry_1/assets/shared/report.txt = two"
+    );
+
+    let repeated_visit_dest = context.temp_dir.join("artifact-repeated-visit");
+    let mut cp_repeated_visit = context.command();
+    cp_repeated_visit.args([
+        "artifact",
+        "cp",
+        &format!("{}:assets/shared/report.txt", run.run_id),
+        repeated_visit_dest.to_str().unwrap(),
+        "--node",
+        "create_assets",
+        "--retry",
+        "1",
+    ]);
+    fabro_snapshot!(context.filters(), cp_repeated_visit, @"
+    success: false
+    exit_code: 1
+    ----- stdout -----
+    ----- stderr -----
+      × Path 'assets/shared/report.txt' matches multiple artifacts: create_assets@1:retry_1, create_assets@2:retry_1. Use --stage and/or --retry to disambiguate.
+    ");
 
     let tree_dest = context.temp_dir.join("artifact-tree");
     let mut cp_tree = context.command();
@@ -125,14 +207,15 @@ fn artifact_commands_share_populated_run_fixture() {
     success: true
     exit_code: 0
     ----- stdout -----
-    Copied 6 artifact(s) to [TEMP_DIR]/artifact-tree
+    Copied 7 artifact(s) to [TEMP_DIR]/artifact-tree
     ----- stderr -----
     ");
     insta::assert_snapshot!(
         text_tree(&tree_dest).join("\n"),
         @r"
-        create_assets/retry_1/assets/node_a/summary.txt = alpha
-        create_assets/retry_1/assets/shared/report.txt = one
+        create_assets/visit_1/retry_1/assets/node_a/summary.txt = alpha
+        create_assets/visit_1/retry_1/assets/shared/report.txt = one
+        create_assets/visit_2/retry_1/assets/shared/report.txt = two
         create_colliding/retry_1/assets/other/summary.txt = beta
         create_colliding/retry_1/assets/retry/report.txt = second
         retry_assets/retry_1/assets/retry/report.txt = first
@@ -153,7 +236,7 @@ fn artifact_commands_share_populated_run_fixture() {
     exit_code: 1
     ----- stdout -----
     ----- stderr -----
-      × Path 'assets/retry/report.txt' matches multiple artifacts: create_colliding:retry_1, retry_assets:retry_1, retry_assets:retry_2. Use --node and/or --retry to disambiguate.
+      × Path 'assets/retry/report.txt' matches multiple artifacts: create_colliding@1:retry_1, retry_assets@1:retry_1, retry_assets@1:retry_2. Use --stage and/or --retry to disambiguate.
     ");
 
     let flat_dest = context.temp_dir.join("artifact-flat");
@@ -164,6 +247,6 @@ fn artifact_commands_share_populated_run_fixture() {
     exit_code: 1
     ----- stdout -----
     ----- stderr -----
-      × Filename collision: 'summary.txt' exists in both create_assets:retry_1 and create_colliding:retry_1. Use --tree to preserve directory structure, or --node and/or --retry to filter.
+      × Filename collision: 'report.txt' exists in both create_assets@1:retry_1 and create_assets@2:retry_1. Use --tree to preserve directory structure, or --stage and/or --retry to filter.
     ");
 }

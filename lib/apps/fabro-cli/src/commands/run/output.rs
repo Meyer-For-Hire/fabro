@@ -5,7 +5,7 @@ use anyhow::{Context as _, Result};
 use cli_table::format::{Border, Justify, Separator};
 use cli_table::{Cell, CellStruct, Style, Table};
 use fabro_api::types;
-use fabro_types::{PullRequestLink, RunBlobId, RunId, parse_blob_ref};
+use fabro_types::{PullRequestLink, RunBlobId, RunId, StageId, parse_blob_ref};
 use fabro_util::check_report::{CheckDetail, CheckReport, CheckResult, CheckSection, CheckStatus};
 use fabro_util::error::render_with_causes;
 use fabro_util::printer::Printer;
@@ -348,12 +348,16 @@ fn blob_id_from_response(response: &str) -> Option<RunBlobId> {
 async fn list_artifact_display_entries_with_client(
     client: &server_client::Client,
     run_id: &RunId,
-) -> Result<Vec<(String, u32, String)>> {
+) -> Result<Vec<(StageId, u32, String)>> {
     let mut entries = Vec::new();
     for entry in client.list_run_artifacts(run_id).await? {
         let retry = u32::try_from(entry.retry)
             .context("server returned invalid negative artifact retry")?;
-        entries.push((entry.node_slug, retry, entry.relative_path));
+        let stage_id = entry
+            .stage_id
+            .parse()
+            .context("server returned invalid artifact stage ID")?;
+        entries.push((stage_id, retry, entry.relative_path));
     }
     entries.sort();
     Ok(entries)
@@ -373,16 +377,16 @@ async fn print_assets_with_client(
     let use_color = styles.use_color;
 
     let title: Vec<CellStruct> = vec![
-        "NODE".cell().bold(use_color),
+        "STAGE".cell().bold(use_color),
         "RETRY".cell().bold(use_color).justify(Justify::Right),
         "PATH".cell().bold(use_color),
     ];
 
     let rows: Vec<Vec<CellStruct>> = entries
         .iter()
-        .map(|(node_slug, retry, relative_path)| {
+        .map(|(stage_id, retry, relative_path)| {
             vec![
-                node_slug.clone().cell().bold(use_color),
+                stage_id.to_string().cell().bold(use_color),
                 retry.cell().justify(Justify::Right),
                 relative_path.clone().cell(),
             ]
@@ -413,7 +417,7 @@ async fn print_assets_with_client(
         printer,
         "{}",
         styles.dim.apply_to(format!(
-            "Copy with: fabro artifact cp {run_id}:<path> <dest> --node <node_slug> --retry <retry>"
+            "Copy with: fabro artifact cp {run_id}:<path> <dest> --stage <node@visit> --retry <retry>"
         ))
     );
     Ok(())
