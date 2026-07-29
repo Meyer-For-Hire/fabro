@@ -67,7 +67,8 @@ assert_eq!(graph.goal(), "Run tests");
 use fabro_workflow::operations::start;
 use fabro_workflow::pipeline;
 
-// Use `operations::start(...)` for the full initialize -> execute -> finalize flow.
+// Use `operations::start(...)` for the full
+// initialize -> execute -> conclude -> publish -> finalize flow.
 // Use `pipeline::initialize(...)` + `pipeline::execute(...)` when you need partial lifecycle control.
 ```
 

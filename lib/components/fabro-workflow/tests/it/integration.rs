@@ -390,6 +390,9 @@ fn parse_and_validate_human_gate() {
             type="human"
         ]
 
+        ship_it [prompt="Ship the change"]
+        fixes   [prompt="Apply the requested fixes"]
+
         start -> review_gate
         review_gate -> ship_it [label="[A] Approve"]
         review_gate -> fixes   [label="[F] Fix"]
@@ -2158,7 +2161,6 @@ async fn smoke_test_with_mock_codergen_backend() {
 
 #[tokio::test]
 async fn shared_thread_compaction_before_routing_audit_succeeds() {
-    use fabro_auth::EnvCredentialSource;
     use fabro_workflow::steering_hub::SteeringHub;
     use httpmock::Method::POST;
     use httpmock::MockServer;
@@ -2285,9 +2287,9 @@ reasoning = false
     ))
     .expect("test catalog should parse");
     let catalog = Arc::new(Catalog::from_builtin_with_overrides(&settings).unwrap());
-    let source = Arc::new(EnvCredentialSource::with_env_lookup(Arc::new(|name| {
+    let source = auth_test_support::env_credential_source(|name| {
         (name == "COMPACT_API_KEY").then(|| "sk-test".to_string())
-    })));
+    });
     let backend = AgentApiBackend::new_with_catalog(
         "compact-model".to_string(),
         ProviderId::from("compact"),
@@ -2390,7 +2392,6 @@ reasoning = false
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn workflow_persists_authoritative_openrouter_cost_for_agent_stage() {
-    use fabro_auth::EnvCredentialSource;
     use fabro_workflow::steering_hub::SteeringHub;
     use httpmock::Method::POST;
     use httpmock::MockServer;
@@ -2441,9 +2442,9 @@ base_url = "{}"
     ))
     .expect("test catalog should parse");
     let catalog = Arc::new(Catalog::from_builtin_with_overrides(&settings).unwrap());
-    let source = Arc::new(EnvCredentialSource::with_env_lookup(Arc::new(|name| {
+    let source = auth_test_support::env_credential_source(|name| {
         (name == "OPENROUTER_API_KEY").then(|| "sk-test".to_string())
-    })));
+    });
     let backend = AgentApiBackend::new_with_catalog(
         "openai/gpt-5.4".to_string(),
         ProviderId::from("openrouter"),
@@ -4847,6 +4848,7 @@ async fn manager_loop_child_workflow_e2e() {
 #[tokio::test]
 async fn import_e2e_through_engine() {
     use fabro_workflow::pipeline::{TransformOptions, transform, validate};
+    use fabro_workflow::transforms::ModelResolutionTransform;
 
     let dir = tempfile::tempdir().unwrap();
     let catalog = std::sync::Arc::new(
@@ -4890,21 +4892,20 @@ async fn import_e2e_through_engine() {
     )
     .expect("parse should succeed");
     let transformed = transform(parsed, &TransformOptions {
-        current_dir:        Some(dir.path().to_path_buf()),
-        file_resolver:      Some(std::sync::Arc::new(
+        current_dir:       Some(dir.path().to_path_buf()),
+        file_resolver:     Some(std::sync::Arc::new(
             fabro_workflow::file_resolver::FilesystemFileResolver::new(None),
         )),
-        template_context:   fabro_template::TemplateContext::new(),
-        source_name:        None,
-        render_mode:        fabro_workflow::operations::RenderMode::Strict,
-        custom_transforms:  vec![],
-        catalog:            std::sync::Arc::clone(&catalog),
-        default_provider:   None,
-        eligible_providers: catalog.all_provider_ids(),
-        catalog_fallback:   false,
+        template_context:  fabro_template::TemplateContext::new(),
+        source_name:       None,
+        render_mode:       fabro_workflow::operations::RenderMode::Strict,
+        custom_transforms: vec![],
+        model_resolution:  Some(ModelResolutionTransform::new(std::sync::Arc::clone(
+            &catalog,
+        ))),
     })
     .unwrap();
-    let validated = validate(transformed, catalog.as_ref(), &[]);
+    let validated = validate(transformed, Some(catalog.as_ref()), &[]);
     validated
         .raise_on_errors()
         .expect("validation should pass after imports expand");
@@ -6908,6 +6909,7 @@ mod real_llm {
     use std::sync::Arc;
 
     use async_trait::async_trait;
+    use fabro_auth::EnvCredentialSource;
     use fabro_graphviz::graph::Node;
     use fabro_llm::client::Client;
     use fabro_llm::providers::OpenAiAdapter;
@@ -7001,7 +7003,7 @@ mod real_llm {
         }
 
         fabro_test::require_env("ANTHROPIC_API_KEY")?;
-        let source = fabro_auth::EnvCredentialSource::new();
+        let source = EnvCredentialSource::new();
         Some(Arc::new(
             Client::from_source(&source, super::default_catalog())
                 .await
@@ -8601,7 +8603,7 @@ fn subgraph_without_label_no_class_derived() {
 fn hook_runner_from_defs(hooks: Vec<fabro_hooks::HookDefinition>) -> Arc<fabro_hooks::HookRunner> {
     Arc::new(fabro_hooks::HookRunner::new(
         fabro_hooks::HookSettings { hooks },
-        Arc::new(fabro_auth::EnvCredentialSource::new()),
+        auth_test_support::vault_only_credential_source(),
         default_catalog(),
     ))
 }
@@ -10512,6 +10514,7 @@ async fn node_dir_uses_visit_count_on_revisit() {
 // Git checkpoint e2e (Local)
 // ---------------------------------------------------------------------------
 
+use fabro_auth::test_support as auth_test_support;
 use fabro_workflow::handler::fan_in::FanInHandler;
 use fabro_workflow::handler::parallel::ParallelHandler;
 

@@ -103,6 +103,17 @@ describe("mapRunListItem", () => {
 
     expect(mapRunListItem(summary).title).toBe("Untitled run");
   });
+
+  test("carries the billed total so the size chip can show it on hover", () => {
+    expect(mapRunListItem(makeRun()).totalUsdMicros).toBe(500000);
+  });
+
+  test("leaves the billed total undefined for runs without terminal billing", () => {
+    expect(mapRunListItem(makeRun({ billing: null })).totalUsdMicros).toBeUndefined();
+    expect(
+      mapRunListItem(makeRun({ billing: { total_usd_micros: null } })).totalUsdMicros,
+    ).toBeUndefined();
+  });
 });
 
 describe("mapRunToRunItem", () => {

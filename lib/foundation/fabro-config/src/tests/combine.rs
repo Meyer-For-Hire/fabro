@@ -101,7 +101,7 @@ fn run_model_fallbacks_splice_inserts_inherited() {
     let lower = parse(
         r#"
 [run.model]
-fallbacks = ["openai", "gpt-5.4"]
+fallbacks = ["openrouter:moonshotai/kimi-k3", "gpt-terra"]
 "#,
     );
     let higher = parse(
@@ -112,7 +112,10 @@ fallbacks = ["anthropic", "..."]
     );
     let merged = higher.combine(lower);
     let fallbacks = merged.run.unwrap().model.unwrap().fallbacks;
-    assert_eq!(fallbacks.len(), 3);
+    assert_eq!(
+        serde_json::to_value(&fallbacks).unwrap(),
+        serde_json::json!(["anthropic", "openrouter:moonshotai/kimi-k3", "gpt-terra",])
+    );
 }
 
 #[test]

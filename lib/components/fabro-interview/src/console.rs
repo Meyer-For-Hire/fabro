@@ -111,6 +111,18 @@ fn parse_non_tty_freeform_response(prompt_read: PromptRead) -> Answer {
     }
 }
 
+/// The review target line printed above a question in terminal clients, which
+/// cannot render a hyperlink label. The label and resource noun are already in
+/// `question.text`, so only the URL is shown. Shared with `fabro-cli`'s attach
+/// client.
+#[must_use]
+pub fn review_target_line(question: &Question) -> Option<String> {
+    question
+        .review_target
+        .as_ref()
+        .map(|target| format!("Review link: {}", target.url()))
+}
+
 /// Ask a multiple-choice question using dialoguer's `Select` widget on a TTY.
 fn ask_select_interactive(question: &Question) -> Answer {
     let items: Vec<String> = question
@@ -237,6 +249,9 @@ impl Interviewer for ConsoleInterviewer {
                 let rendered = self.styles.render_markdown(context_text);
                 eprint!("{rendered}");
             }
+            if let Some(line) = review_target_line(&question) {
+                eprintln!("{line}");
+            }
             let q = question;
             let answer = task::spawn_blocking(move || match q.question_type {
                 QuestionType::MultipleChoice => ask_select_interactive(&q),
@@ -251,6 +266,9 @@ impl Interviewer for ConsoleInterviewer {
 
         // Non-TTY fallback: line-based stdin reading
         let s = self.styles;
+        if let Some(line) = review_target_line(&question) {
+            eprintln!("{line}");
+        }
         eprintln!("{} {}", s.bold_cyan.apply_to("?"), question.text);
 
         let answer = match question.question_type {
@@ -312,6 +330,33 @@ mod tests {
         assert!(result.is_some());
         let answer = result.unwrap();
         assert_eq!(answer.value, AnswerValue::Selected("A".to_string()));
+    }
+
+    #[test]
+    fn review_target_line_shows_only_the_url() {
+        let target = fabro_types::ReviewTarget::new(
+            "Quarry review exercise",
+            "https://quarry.lithos.computer/tmp/0123456789abcdef0123456789abcdef",
+            fabro_types::ReviewTargetKind::Document,
+        )
+        .unwrap();
+        let mut question = Question::new(target.question_text(), QuestionType::MultipleChoice);
+        question.review_target = Some(target);
+
+        assert_eq!(
+            review_target_line(&question).as_deref(),
+            Some(
+                "Review link: \
+                 https://quarry.lithos.computer/tmp/0123456789abcdef0123456789abcdef"
+            )
+        );
+    }
+
+    #[test]
+    fn review_target_line_is_absent_without_a_target() {
+        let question = Question::new("Approve?", QuestionType::YesNo);
+
+        assert_eq!(review_target_line(&question), None);
     }
 
     #[test]

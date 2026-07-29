@@ -97,6 +97,35 @@ impl TemplateContext {
         Self::new().with_goal("{{ goal }}").with_inputs(inputs)
     }
 
+    /// The rendered goal `{{ goal }}` resolves to, or `None` before the goal
+    /// is known.
+    #[must_use]
+    pub fn goal(&self) -> Option<&str> {
+        self.goal.as_deref()
+    }
+
+    /// The text `{{ inputs.NAME }}` renders to, or `None` when unbound.
+    ///
+    /// Non-template consumers — currently command node `script` interpolation,
+    /// which uses `InterpString` tokens rather than MiniJinja — read values
+    /// through here so an input produces the same text in a script as it does
+    /// in a prompt.
+    #[must_use]
+    pub fn input(&self, name: &str) -> Option<String> {
+        Self::rendered_member(&self.inputs, name)
+    }
+
+    /// The text `{{ vars.NAME }}` renders to, or `None` when unset.
+    #[must_use]
+    pub fn var(&self, name: &str) -> Option<String> {
+        Self::rendered_member(&self.vars, name)
+    }
+
+    fn rendered_member(container: &Value, name: &str) -> Option<String> {
+        let member = container.get_attr(name).ok()?;
+        (!member.is_undefined()).then(|| member.to_string())
+    }
+
     fn into_value(self) -> Value {
         let goal = self.goal.map(Value::from);
         let inputs = self.inputs;
@@ -784,6 +813,53 @@ mod tests {
         let rendered = render("Goal: {{ goal }}", &ctx).unwrap();
 
         assert_eq!(rendered, "Goal: Fix bugs");
+    }
+
+    #[test]
+    fn workflow_values_return_none_when_unbound() {
+        let ctx = TemplateContext::new();
+
+        assert_eq!(ctx.goal(), None);
+        assert_eq!(ctx.input("missing"), None);
+        assert_eq!(ctx.var("MISSING"), None);
+    }
+
+    #[test]
+    fn goal_returns_the_rendered_value() {
+        let ctx = TemplateContext::new().with_goal("Ship it");
+
+        assert_eq!(ctx.goal(), Some("Ship it"));
+    }
+
+    /// `input`/`var` exist so non-template consumers render a value the same
+    /// way a prompt does. Pin that equivalence across the scalar TOML types.
+    #[test]
+    fn input_matches_what_a_template_renders() {
+        let ctx = TemplateContext::new().with_inputs(HashMap::from([
+            ("name".to_string(), toml::Value::String("fabro".into())),
+            ("attempts".to_string(), toml::Value::Integer(3)),
+            ("ratio".to_string(), toml::Value::Float(1.5)),
+            ("fast".to_string(), toml::Value::Boolean(true)),
+        ]));
+
+        for name in ["name", "attempts", "ratio", "fast"] {
+            let rendered = render(&format!("{{{{ inputs.{name} }}}}"), &ctx).unwrap();
+            assert_eq!(ctx.input(name), Some(rendered), "mismatch for `{name}`");
+        }
+    }
+
+    #[test]
+    fn var_matches_what_a_template_renders() {
+        let ctx = TemplateContext::new().with_vars(HashMap::from([(
+            "STAGE".to_string(),
+            "staging".to_string(),
+        )]));
+
+        assert_eq!(ctx.var("STAGE").as_deref(), Some("staging"));
+        assert_eq!(
+            ctx.var("STAGE"),
+            Some(render("{{ vars.STAGE }}", &ctx).unwrap())
+        );
     }
 
     #[test]

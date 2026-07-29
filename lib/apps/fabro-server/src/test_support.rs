@@ -5,6 +5,7 @@ use std::sync::Mutex;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use anyhow::Context as _;
 use axum::extract::Request;
 #[cfg(test)]
 use axum::extract::State as AxumState;
@@ -13,6 +14,7 @@ use axum::middleware::Next;
 use axum::response::Response;
 use axum::{Router, middleware};
 use chrono::Duration as ChronoDuration;
+use fabro_config::user::default_storage_dir;
 use fabro_config::{RunLayer, ServerSettingsBuilder, Storage, envfile};
 use fabro_db::DbPool;
 use fabro_interview::Interviewer;
@@ -253,9 +255,10 @@ impl TestAppStateBuilder {
         self.try_build().expect("test app state should build")
     }
 
-    pub fn try_build(self) -> anyhow::Result<Arc<AppState>> {
+    pub fn try_build(mut self) -> anyhow::Result<Arc<AppState>> {
         let (store, artifact_store) = self.store_bundle.unwrap_or_else(test_store_bundle);
         let vault_path = self.vault_path.unwrap_or_else(test_secret_store_path);
+        self.server_settings = redirect_default_storage_root(self.server_settings, &vault_path)?;
         if !self.vault_entries.is_empty() {
             let mut vault = Vault::load(vault_path.clone()).expect("test vault should load");
             for (name, value) in &self.vault_entries {
@@ -672,6 +675,31 @@ pub fn test_secret_store_path() -> PathBuf {
     dir.join("secrets.json")
 }
 
+/// Keeps tests off the developer's real `~/.fabro/storage`.
+///
+/// Settings built for tests usually omit `[server.storage] root`, which
+/// resolves to the production default. Handlers that walk that tree — `df`,
+/// `system/resources`, `prune` — then read whatever runs and scratch
+/// directories the machine happens to have, making tests slow and
+/// machine-dependent, and letting run-creating tests write there.
+///
+/// Only settings still carrying the production default are redirected; a test
+/// that chose its own root keeps it. The redirect goes through
+/// [`ServerSettings::with_storage_override`] so the derived local object-store
+/// roots move with it instead of pointing back at the real storage tree.
+fn redirect_default_storage_root(
+    settings: ServerSettings,
+    vault_path: &Path,
+) -> anyhow::Result<ServerSettings> {
+    if Path::new(&settings.server.storage.root) != default_storage_dir() {
+        return Ok(settings);
+    }
+    let root = vault_path.with_file_name("storage");
+    std::fs::create_dir_all(&root)
+        .with_context(|| format!("creating test storage root at {}", root.display()))?;
+    Ok(settings.with_storage_override(&root))
+}
+
 #[must_use]
 pub fn test_auth_mode() -> AuthMode {
     AuthMode::Enabled(ConfiguredAuth {
@@ -748,4 +776,72 @@ pub(crate) async fn capture_auth_context(
         .expect("captured auth contexts lock poisoned")
         .push(slot.snapshot());
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use fabro_types::settings::ObjectStoreSettings;
+
+    use super::*;
+
+    fn local_store_root(store: &ObjectStoreSettings) -> &Path {
+        let ObjectStoreSettings::Local { root } = store else {
+            panic!("test server settings should use a local object store");
+        };
+        Path::new(root)
+    }
+
+    #[test]
+    fn default_storage_redirect_updates_derived_local_store_roots() {
+        let temp_dir = tempfile::tempdir().expect("test temp dir should be created");
+        let vault_path = temp_dir.path().join("secrets.json");
+
+        let settings = redirect_default_storage_root(default_test_server_settings(), &vault_path)
+            .expect("default test storage root should redirect");
+        let storage_root = temp_dir.path().join("storage");
+
+        assert_eq!(Path::new(&settings.server.storage.root), storage_root);
+        assert_eq!(
+            local_store_root(&settings.server.artifacts.store),
+            storage_root.join("objects/artifacts")
+        );
+        assert_eq!(
+            local_store_root(&settings.server.slatedb.store),
+            storage_root.join("objects/slatedb")
+        );
+    }
+
+    #[test]
+    fn default_storage_redirect_preserves_explicit_storage_root() {
+        let temp_dir = tempfile::tempdir().expect("test temp dir should be created");
+        let vault_path = temp_dir.path().join("secrets.json");
+        let expected =
+            default_test_server_settings().with_storage_override(&temp_dir.path().join("custom"));
+
+        let settings = redirect_default_storage_root(expected.clone(), &vault_path)
+            .expect("explicit test storage root should be preserved");
+
+        assert_eq!(settings, expected);
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "synchronous fixture setup creates a blocking file before exercising the helper"
+    )]
+    fn default_storage_redirect_preserves_directory_creation_error_chain() {
+        let temp_dir = tempfile::tempdir().expect("test temp dir should be created");
+        let vault_path = temp_dir.path().join("secrets.json");
+        std::fs::write(temp_dir.path().join("storage"), "not a directory")
+            .expect("blocking storage path should be created");
+
+        let error = redirect_default_storage_root(default_test_server_settings(), &vault_path)
+            .expect_err("storage redirect should reject a file at the directory path");
+
+        assert!(error.to_string().contains("creating test storage root at"));
+        assert!(
+            error.chain().count() >= 2,
+            "filesystem error should remain in the source chain"
+        );
+    }
 }

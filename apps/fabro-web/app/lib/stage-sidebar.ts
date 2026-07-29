@@ -1,5 +1,6 @@
 import { StageState } from "@qltysh/fabro-api-client";
 import type {
+  BilledTokenCounts,
   PaginatedRunStageList,
   StageHandler,
   StageModelUsage,
@@ -25,8 +26,17 @@ export interface Stage {
   graphVisit: number | null;
   /** StageId of the prior execution superseded by this resumed replay, if any. */
   resumedFromStageId: string | null;
+  /** Exact StageId of the parent parallel execution, if this is a branch. */
+  parallelGroupId: string | null;
+  /** Zero-based outgoing-edge index within the parent parallel execution. */
+  parallelBranchIndex: number | null;
   startedAt: string | null;
   providerUsed: StageModelUsage | null;
+  /**
+   * Tokens and cost for this visit alone, priced the same way the Billing tab
+   * prices its per-node rows. All-zero counts mean the stage called no model.
+   */
+  billing: BilledTokenCounts;
 }
 
 export const ACTIVE_STAGE_STATES: ReadonlySet<StageState> = new Set([
@@ -96,12 +106,15 @@ export function mapRunStagesToSidebarStages(
       visit: stage.visit,
       graphVisit: stage.graph_visit ?? null,
       resumedFromStageId: stage.resumed_from_stage_id ?? null,
+      parallelGroupId: stage.parallel_group_id ?? null,
+      parallelBranchIndex: stage.parallel_branch_index ?? null,
       status: stage.status,
       duration: stage.wall_time_ms != null
         ? formatDurationMs(stage.wall_time_ms)
         : "--",
       startedAt: stage.started_at ?? null,
       providerUsed: stage.provider_used ?? null,
+      billing: stage.billing,
     });
   }
   return stages;

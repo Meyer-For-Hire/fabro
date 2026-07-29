@@ -208,6 +208,11 @@ impl Node {
     }
 
     #[must_use]
+    pub fn review_target(&self) -> bool {
+        self.bool_attr("review_target").unwrap_or(false)
+    }
+
+    #[must_use]
     pub fn retry_target(&self) -> Option<&str> {
         self.str_attr("retry_target")
     }
@@ -605,6 +610,7 @@ mod tests {
         assert_eq!(node.output_retries(), 2);
         assert_eq!(node.max_retries(), None);
         assert!(!node.goal_gate());
+        assert!(!node.review_target());
         assert_eq!(node.retry_target(), None);
         assert_eq!(node.fallback_retry_target(), None);
         assert_eq!(node.fidelity(), None);
@@ -695,11 +701,14 @@ mod tests {
         node.attrs
             .insert("goal_gate".to_string(), AttrValue::Boolean(true));
         node.attrs
+            .insert("review_target".to_string(), AttrValue::Boolean(true));
+        node.attrs
             .insert("max_retries".to_string(), AttrValue::Integer(3));
 
         assert_eq!(node.label(), "Plan step");
         assert_eq!(node.shape(), "diamond");
         assert!(node.goal_gate());
+        assert!(node.review_target());
         assert_eq!(node.max_retries(), Some(3));
     }
 

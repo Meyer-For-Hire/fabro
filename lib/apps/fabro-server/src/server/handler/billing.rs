@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use fabro_model::Catalog;
 use fabro_types::{
     Graph, RunProjection, StageHandler, StageId, StageProjection, StageState, StageTiming,
 };
@@ -22,6 +23,7 @@ fn run_stage_from_projection(
     stage_id: &StageId,
     stage: &StageProjection,
     graph: &Graph,
+    catalog: &Catalog,
     now: DateTime<Utc>,
 ) -> RunStage {
     let handler = stage.handler.unwrap_or_else(|| {
@@ -32,10 +34,16 @@ fn run_stage_from_projection(
                 .and_then(|node| node.handler_type()),
         )
     });
+    let (parallel_group_id, parallel_branch_index) = stage
+        .parallel_branch_id
+        .as_ref()
+        .map(|branch_id| (branch_id.group().clone(), branch_id.index()))
+        .unzip();
     RunStage {
         id: stage_id.clone(),
         name: stage_id.node_id().to_owned(),
         handler,
+        billing: stage.billed_usage(Some(catalog)).into_owned(),
         status: stage.effective_state(),
         wall_time_ms: stage.live_wall_time_ms(now),
         node_id: stage_id.node_id().to_owned(),
@@ -45,6 +53,8 @@ fn run_stage_from_projection(
         started_at: stage.started_at,
         graph_visit: stage.graph_visit.and_then(std::num::NonZeroU32::new),
         resumed_from_stage_id: stage.resumed_from_stage_id.clone(),
+        parallel_group_id,
+        parallel_branch_index,
     }
 }
 
@@ -67,9 +77,10 @@ async fn list_run_stages(
 
     let now = Utc::now();
     let graph = projection.spec().graph();
+    let catalog = state.catalog();
     let stages = projection
         .iter_stages()
-        .map(|(stage_id, stage)| run_stage_from_projection(stage_id, stage, graph, now))
+        .map(|(stage_id, stage)| run_stage_from_projection(stage_id, stage, graph, &catalog, now))
         .collect::<Vec<_>>();
 
     (StatusCode::OK, Json(ListResponse::new(stages))).into_response()
@@ -175,7 +186,7 @@ fn live_billing_rows(projection: &RunProjection, now: DateTime<Utc>) -> Vec<Live
             index
         });
         let row = &mut rows[index];
-        let stage_timing = billing_stage_timing(stage, now);
+        let stage_timing = stage.live_timing(now);
         row.timing = row.timing.saturating_add(&stage_timing);
 
         if stage_id.visit() >= row.latest_visit {
@@ -186,20 +197,6 @@ fn live_billing_rows(projection: &RunProjection, now: DateTime<Utc>) -> Vec<Live
     }
 
     rows
-}
-
-/// Per-visit timing for a stage. For terminal visits, the stored breakdown is
-/// used directly. For in-flight visits, fall back to the live wall-clock since
-/// `started_at` (no active breakdown yet — that is only finalized at terminal
-/// event time in v1).
-fn billing_stage_timing(stage: &StageProjection, now: DateTime<Utc>) -> StageTiming {
-    if let Some(timing) = stage.timing {
-        return timing;
-    }
-    if let Some(live_wall) = stage.live_wall_time_ms(now) {
-        return StageTiming::wall_only(live_wall);
-    }
-    StageTiming::default()
 }
 
 fn stage_has_billing_row(stage: &StageProjection) -> bool {

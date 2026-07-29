@@ -104,7 +104,7 @@ test [label="Run Tests", shape=parallelogram, script="cargo test 2>&1 || true"]
 
 | Attribute | Description |
 |---|---|
-| `script` | The shell command to execute |
+| `script` | The shell command to execute. Substitutes `{{ goal }}`, `{{ inputs.NAME }}`, and `{{ vars.NAME }}` — see [command node scripts](/workflows/variables#command-node-scripts) |
 | `language` | `"shell"` (default) or `"python"` |
 
 ### Human

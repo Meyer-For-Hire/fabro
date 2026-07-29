@@ -237,6 +237,7 @@ fn projection_query_methods_expose_common_state() {
                 allow_freeform:  true,
                 timeout_seconds: None,
                 context_display: None,
+                review_target:   None,
             },
             started_at: Utc::now(),
         })]);

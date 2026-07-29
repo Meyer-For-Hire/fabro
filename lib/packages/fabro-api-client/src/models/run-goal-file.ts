@@ -17,7 +17,7 @@
 export interface RunGoalFile {
     'type': RunGoalFileTypeEnum;
     /**
-     * Resolved config string that may contain env interpolation tokens.
+     * Config string that can contain typed interpolation tokens.
      */
     'value': string;
 }

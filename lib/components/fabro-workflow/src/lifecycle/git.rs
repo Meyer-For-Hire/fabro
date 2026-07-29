@@ -69,9 +69,22 @@ pub(crate) struct GitCheckpointResult {
 
 #[derive(Debug, Clone)]
 pub(crate) struct PushResult {
-    pub refspec:          String,
+    pub branch:           String,
     pub success:          bool,
     pub exec_output_tail: Option<fabro_types::ExecOutputTail>,
+}
+
+/// Push a run branch to its remote counterpart.
+///
+/// Owns the refspec convention so the checkpoint push and the terminal publish
+/// push cannot drift apart.
+pub(crate) async fn push_run_branch(
+    sandbox: &dyn fabro_sandbox::Sandbox,
+    branch: &str,
+) -> fabro_sandbox::Result<()> {
+    sandbox
+        .git_push_ref(&format!("refs/heads/{branch}:refs/heads/{branch}"))
+        .await
 }
 
 /// Sub-lifecycle responsible for git operations (checkpoint commits, pushes,
@@ -307,15 +320,14 @@ impl RunLifecycle<WorkflowGraph> for GitLifecycle {
                         .as_ref()
                         .and_then(|g| g.run_branch.as_ref())
                     {
-                        let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
                         let (push_ok, exec_output_tail) =
-                            match self.sandbox.git_push_ref(&refspec).await {
+                            match push_run_branch(self.sandbox.as_ref(), branch).await {
                                 Ok(()) => (true, None),
                                 Err(err) => {
                                     let exec_output_tail =
                                         fabro_sandbox::default_redacted_output_tail(&err);
                                     tracing::warn!(
-                                        refspec = %refspec,
+                                        branch = %branch,
                                         error = %fabro_sandbox::display_for_log(&err),
                                         "git push from run lifecycle failed"
                                     );
@@ -329,7 +341,7 @@ impl RunLifecycle<WorkflowGraph> for GitLifecycle {
                                 }
                             };
                         git_result.push_results.push(PushResult {
-                            refspec,
+                            branch: branch.clone(),
                             success: push_ok,
                             exec_output_tail,
                         });
@@ -593,6 +605,7 @@ mod tests {
     use anyhow::Result;
     use async_trait::async_trait;
     use bytes::Bytes;
+    use fabro_auth::test_support as auth_test_support;
     use fabro_core::graph::Graph as CoreGraph;
     use fabro_core::lifecycle::RunLifecycle;
     use fabro_core::state::ExecutionState;
@@ -1261,7 +1274,7 @@ mod tests {
             tokio_util::sync::CancellationToken::new(),
             fabro_model::ProviderId::anthropic(),
             "claude-sonnet-4-6".to_string(),
-            Arc::new(fabro_auth::EnvCredentialSource::new()),
+            auth_test_support::vault_only_credential_source(),
             Arc::new(Catalog::from_builtin().expect("default catalog should build")),
             Arc::new(SandboxGitRuntime::new()),
             Arc::clone(&lifecycle.metadata_runtime),

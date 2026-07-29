@@ -15,6 +15,9 @@
 
 // May contain unused imports in some cases
 // @ts-ignore
+import type { BilledTokenCounts } from './billed-token-counts';
+// May contain unused imports in some cases
+// @ts-ignore
 import type { StageHandler } from './stage-handler';
 // May contain unused imports in some cases
 // @ts-ignore
@@ -57,9 +60,21 @@ export interface RunStage {
      * Canonical stage execution identifier in `node_id@visit` form.
      */
     'resumed_from_stage_id'?: string | null;
+    /**
+     * Exact StageId of the parent parallel execution. Clients can compare this directly with the `id` of a parallel stage. Omitted for stages that are not parallel branches.
+     */
+    'parallel_group_id'?: string;
+    /**
+     * Zero-based outgoing-edge index within the parent parallel execution. Omitted for stages that are not parallel branches.
+     */
+    'parallel_branch_index'?: number;
     'provider_used'?: StageModelUsage | null;
     /**
      * Wall-clock time the latest attempt of this stage started, if known.
      */
     'started_at'?: string | null;
+    /**
+     * Token counts for this stage execution alone. `total_usd_micros` is the provider-reported cost when there is one, otherwise the server catalog\'s price for these tokens — the same pricing the `/runs/{id}/billing` rows use. All-zero counts mean the stage made no model calls. Unlike the billing rows, which sum every visit of a node, this covers only this visit.
+     */
+    'billing': BilledTokenCounts;
 }

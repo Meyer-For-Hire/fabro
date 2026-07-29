@@ -130,7 +130,7 @@ impl NativeToolOptions {
         // Matched exhaustively so a new profile kind has to state its answer
         // rather than silently inheriting the default timeout.
         let default_command_timeout_ms = match profile_kind {
-            AgentProfileKind::Anthropic => 120_000,
+            AgentProfileKind::Anthropic | AgentProfileKind::Claude5 => 120_000,
             // Matches the 60s foreground default Kimi Code's Bash tool
             // documents, which is what these models are used to budgeting
             // against.
@@ -333,12 +333,15 @@ mod tests {
     fn native_tool_options_have_expected_profile_defaults() {
         let openai = NativeToolOptions::for_profile(AgentProfileKind::OpenAi);
         let anthropic = NativeToolOptions::for_profile(AgentProfileKind::Anthropic);
+        let claude5 = NativeToolOptions::for_profile(AgentProfileKind::Claude5);
         let kimi = NativeToolOptions::for_profile(AgentProfileKind::Kimi);
 
         assert_eq!(openai.default_command_timeout_ms, 10_000);
         assert_eq!(openai.max_command_timeout_ms, 600_000);
         assert_eq!(anthropic.default_command_timeout_ms, 120_000);
         assert_eq!(anthropic.max_command_timeout_ms, 600_000);
+        assert_eq!(claude5.default_command_timeout_ms, 120_000);
+        assert_eq!(claude5.max_command_timeout_ms, 600_000);
         assert_eq!(kimi.default_command_timeout_ms, 60_000);
         assert_eq!(kimi.max_command_timeout_ms, 600_000);
     }

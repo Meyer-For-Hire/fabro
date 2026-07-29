@@ -61,11 +61,8 @@ pub(crate) async fn create_run(
         None
     };
 
-    let mut validation = manifest_validation::validate_manifest(
-        &RunLayer::default(),
-        &built.manifest,
-        ctx.catalog()?,
-    )?;
+    let mut validation =
+        manifest_validation::validate_manifest(&RunLayer::default(), &built.manifest)?;
     manifest_validation::promote_template_undefined_variables_to_errors(&mut validation);
     let diagnostics = api_diagnostics_to_local(&validation.workflow.diagnostics);
     if !quiet {

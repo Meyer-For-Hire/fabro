@@ -76,10 +76,9 @@ pub struct ProviderSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url:       Option<String>,
     /// Extra HTTP headers attached to every outgoing provider request after
-    /// credential resolution. Values are interpolation strings: literal text,
-    /// `{{ env.NAME }}`, or `{{ secrets.NAME }}`. Put credentials in a secret
-    /// and reference them with a `{{ secrets.NAME }}` token, not a bare
-    /// literal.
+    /// credential resolution. Values are literal text or
+    /// `{{ secrets.NAME }}` interpolation strings. Put credentials in a secret
+    /// and reference them with a token, not a bare literal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extra_headers:  Option<HashMap<String, InterpString>>,
     /// Higher wins; missing → `0`; ties broken by canonical provider ID.

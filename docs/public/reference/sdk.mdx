@@ -375,6 +375,34 @@ For env-backed usage, `EnvCredentialSource` checks for API key environment varia
 
 The first provider registered becomes the default. Provider base URLs come from the model catalog. For vault-backed usage inside Fabro, use `fabro_auth::VaultCredentialSource` instead.
 
+The built-in Modal definition reads two proxy-token headers from the vault, so `EnvCredentialSource` does not configure it automatically. For direct SDK use, enable Modal and set its endpoint URL in the catalog:
+
+```toml
+[llm.providers.modal]
+enabled = true
+base_url = "https://your-endpoint.modal.run/v1"
+```
+
+Then read the two environment variables explicitly and create a typed credential after constructing `catalog` from those settings:
+
+```rust
+use fabro_auth::ApiCredential;
+use fabro_llm::client::Client;
+use std::collections::HashMap;
+
+let credential = ApiCredential::with_extra_headers(
+    "modal",
+    HashMap::from([
+        ("Modal-Key".to_string(), std::env::var("MODAL_TOKEN_ID")?),
+        (
+            "Modal-Secret".to_string(),
+            std::env::var("MODAL_TOKEN_SECRET")?,
+        ),
+    ]),
+);
+let client = Client::from_credentials(vec![credential], catalog).await?;
+```
+
 #### Creating manually
 
 ```rust

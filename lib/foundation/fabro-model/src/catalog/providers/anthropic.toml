@@ -13,6 +13,7 @@ header = { custom = "x-api-key" }
 display_name = "Claude Fable 5"
 family = "claude-5"
 aliases = ["fable", "claude-fable"]
+agent_profile = "claude-5"
 
 [providers.anthropic.models."claude-fable-5".limits]
 context_window = 1000000
@@ -37,6 +38,7 @@ family = "claude-5"
 training = "2026-05-01"
 knowledge_cutoff = "May 2026"
 aliases = ["opus", "claude-opus"]
+agent_profile = "claude-5"
 
 [providers.anthropic.models."claude-opus-5".limits]
 context_window = 1000000
@@ -62,6 +64,33 @@ cache_input_cost_per_mtok = 0.5
 input_cost_per_mtok = 10.0
 output_cost_per_mtok = 50.0
 cache_input_cost_per_mtok = 1.0
+
+[providers.anthropic.models."claude-sonnet-5"]
+display_name = "Claude Sonnet 5"
+family = "claude-5"
+training = "2026-01-01"
+knowledge_cutoff = "Jan 2026"
+default = true
+aliases = ["sonnet", "claude-sonnet"]
+agent_profile = "claude-5"
+
+[providers.anthropic.models."claude-sonnet-5".limits]
+context_window = 1000000
+max_output = 128000
+
+[providers.anthropic.models."claude-sonnet-5".features]
+tools = true
+vision = true
+reasoning = true
+reasoning_effort = "levels"
+prompt_cache = true
+sampling_params = false
+
+# Introductory pricing through August 31, 2026.
+[providers.anthropic.models."claude-sonnet-5".costs]
+input_cost_per_mtok = 2.0
+output_cost_per_mtok = 10.0
+cache_input_cost_per_mtok = 0.2
 
 [providers.anthropic.models."claude-opus-4-8"]
 display_name = "Claude Opus 4.8"
@@ -188,9 +217,7 @@ display_name = "Claude Sonnet 4.6"
 family = "claude-4"
 training = "2025-08-01"
 knowledge_cutoff = "May 2025"
-default = true
 estimated_output_tps = 50
-aliases = ["sonnet", "claude-sonnet"]
 
 [providers.anthropic.models."claude-sonnet-4-6".limits]
 context_window = 200000

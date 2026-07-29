@@ -294,14 +294,15 @@ mod tests {
         #[rustfmt::skip]
         let expected: &[RouteRow] = &[
             // model id                            deployment_id                          transport             codec                 billing       profile
-            ("claude-fable-5",                     "claude-fable-5",                      T::Anthropic,         C::AnthropicMessages, B::Anthropic, P::Anthropic),
+            ("claude-fable-5",                     "claude-fable-5",                      T::Anthropic,         C::AnthropicMessages, B::Anthropic, P::Claude5),
             ("claude-haiku-4-5",                   "claude-haiku-4-5",                    T::Anthropic,         C::AnthropicMessages, B::Anthropic, P::Anthropic),
             ("claude-opus-4-6",                    "claude-opus-4-6",                     T::Anthropic,         C::AnthropicMessages, B::Anthropic, P::Anthropic),
             ("claude-opus-4-7",                    "claude-opus-4-7",                     T::Anthropic,         C::AnthropicMessages, B::Anthropic, P::Anthropic),
             ("claude-opus-4-8",                    "claude-opus-4-8",                     T::Anthropic,         C::AnthropicMessages, B::Anthropic, P::Anthropic),
-            ("claude-opus-5",                      "claude-opus-5",                       T::Anthropic,         C::AnthropicMessages, B::Anthropic, P::Anthropic),
+            ("claude-opus-5",                      "claude-opus-5",                       T::Anthropic,         C::AnthropicMessages, B::Anthropic, P::Claude5),
             ("claude-sonnet-4-5",                  "claude-sonnet-4-5",                   T::Anthropic,         C::AnthropicMessages, B::Anthropic, P::Anthropic),
             ("claude-sonnet-4-6",                  "claude-sonnet-4-6",                   T::Anthropic,         C::AnthropicMessages, B::Anthropic, P::Anthropic),
+            ("claude-sonnet-5",                    "claude-sonnet-5",                     T::Anthropic,         C::AnthropicMessages, B::Anthropic, P::Claude5),
             ("gemini-3-flash-preview",             "gemini-3-flash-preview",              T::Gemini,            C::GeminiGenerate,    B::Gemini,    P::Gemini),
             ("gemini-3.1-flash-lite",              "gemini-3.1-flash-lite",               T::Gemini,            C::GeminiGenerate,    B::Gemini,    P::Gemini),
             ("gemini-3.1-pro-preview",             "gemini-3.1-pro-preview",              T::Gemini,            C::GeminiGenerate,    B::Gemini,    P::Gemini),
@@ -360,7 +361,7 @@ mod tests {
 
         let by_alias = resolve_route(catalog, select_from_all(catalog, "sonnet"))
             .expect("alias should resolve");
-        let by_id = resolve_route(catalog, select_from_all(catalog, "claude-sonnet-4-6"))
+        let by_id = resolve_route(catalog, select_from_all(catalog, "claude-sonnet-5"))
             .expect("id should resolve");
 
         assert_eq!(by_alias, by_id);

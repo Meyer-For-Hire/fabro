@@ -427,6 +427,7 @@ fn event_body_from_event(event: &Event) -> EventBody {
             allow_freeform,
             timeout_seconds,
             context_display,
+            review_target,
         } => EventBody::InterviewStarted(fabro_types::InterviewStartedProps {
             question_id:     question_id.clone(),
             question:        question.clone(),
@@ -436,6 +437,7 @@ fn event_body_from_event(event: &Event) -> EventBody {
             allow_freeform:  *allow_freeform,
             timeout_seconds: *timeout_seconds,
             context_display: context_display.clone(),
+            review_target:   review_target.clone(),
         }),
         Event::InterviewCompleted {
             actor: _,
@@ -1315,6 +1317,7 @@ fn event_body_from_event(event: &Event) -> EventBody {
             repo,
             base_branch,
             head_branch,
+            head_sha,
             title,
             draft,
         } => EventBody::PullRequestCreated(fabro_types::PullRequestCreatedProps {
@@ -1324,6 +1327,7 @@ fn event_body_from_event(event: &Event) -> EventBody {
             repo:        repo.clone(),
             base_branch: base_branch.clone(),
             head_branch: head_branch.clone(),
+            head_sha:    head_sha.clone(),
             title:       title.clone(),
             draft:       *draft,
         }),

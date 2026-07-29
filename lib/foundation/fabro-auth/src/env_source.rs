@@ -2,17 +2,22 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use fabro_model::catalog::CatalogProvider;
-use fabro_model::{Catalog, CredentialRef, ProviderId};
+use fabro_model::{Catalog, ProviderId};
 use fabro_static::EnvVars;
-use fabro_types::settings::ResolveCtx;
+use fabro_vault::Vault;
+use tokio::sync::RwLock as AsyncRwLock;
 
-use crate::credential_source::{CredentialSource, ResolvedCredentials};
-use crate::resolve::{apply_openai_api_env_context, apply_openai_codex_api_context};
-use crate::{ApiCredential, EnvLookup, ResolveError, build_api_key_header, resolve};
+use crate::resolve::apply_openai_codex_api_context;
+use crate::{CredentialSource, EnvLookup, ResolvedCredentials, VaultCredentialSource};
 
+/// A credential source for provider credentials declared as `env:<NAME>`.
+///
+/// This public SDK facade does not resolve `{{ env.NAME }}` settings
+/// interpolation. Provider extra headers can use literals, but secret
+/// interpolation requires a vault-backed source.
 #[derive(Clone)]
 pub struct EnvCredentialSource {
+    inner:      VaultCredentialSource,
     env_lookup: EnvLookup,
 }
 
@@ -20,7 +25,7 @@ impl EnvCredentialSource {
     #[must_use]
     #[expect(
         clippy::disallowed_methods,
-        reason = "EnvCredentialSource is the provider API-key process-env facade."
+        reason = "EnvCredentialSource is the provider credential process-env facade."
     )]
     pub fn new() -> Self {
         Self::with_env_lookup(Arc::new(|name| std::env::var(name).ok()))
@@ -28,60 +33,14 @@ impl EnvCredentialSource {
 
     #[must_use]
     pub fn with_env_lookup(env_lookup: EnvLookup) -> Self {
-        Self { env_lookup }
+        let vault = Arc::new(AsyncRwLock::new(Vault::from_entries(HashMap::new())));
+        let inner_lookup = Arc::clone(&env_lookup);
+        let inner = VaultCredentialSource::with_env_lookup(vault, move |name| inner_lookup(name));
+        Self { inner, env_lookup }
     }
 
     fn lookup(&self, name: &str) -> Option<String> {
         (self.env_lookup)(name)
-    }
-
-    fn credential_for(
-        &self,
-        provider: &CatalogProvider,
-    ) -> Result<Option<ApiCredential>, ResolveError> {
-        let (auth_header, extra_headers) = match &provider.auth {
-            Some(auth) => {
-                let Some(key) = auth.credentials.iter().find_map(|credential_ref| {
-                    let CredentialRef::Env(name) = credential_ref else {
-                        return None;
-                    };
-                    self.lookup(name)
-                }) else {
-                    return Ok(None);
-                };
-                (
-                    Some(build_api_key_header(auth.header.clone(), key)),
-                    self.resolved_extra_headers(provider)?,
-                )
-            }
-            None => (None, self.resolved_extra_headers(provider)?),
-        };
-
-        let mut cred = ApiCredential {
-            provider: provider.id.clone(),
-            auth_header,
-            extra_headers,
-            base_url: provider.base_url.clone(),
-            codex_mode: false,
-            org_id: None,
-            project_id: None,
-        };
-        if provider.id == ProviderId::openai() && cred.auth_header.is_some() {
-            if let Some(account_id) = self.lookup(EnvVars::CHATGPT_ACCOUNT_ID) {
-                apply_openai_codex_api_context(&mut cred, Some(&account_id), &*self.env_lookup);
-            } else {
-                apply_openai_api_env_context(&mut cred, &*self.env_lookup);
-            }
-        }
-        Ok(Some(cred))
-    }
-
-    fn resolved_extra_headers(
-        &self,
-        provider: &CatalogProvider,
-    ) -> Result<HashMap<String, String>, ResolveError> {
-        let mut ctx = ResolveCtx::new().with_env(|env_name| self.lookup(env_name));
-        resolve::resolve_extra_headers(&provider.id, &provider.extra_headers, &mut ctx)
     }
 }
 
@@ -101,37 +60,21 @@ impl Default for EnvCredentialSource {
 #[async_trait]
 impl CredentialSource for EnvCredentialSource {
     async fn resolve(&self, catalog: &Catalog) -> anyhow::Result<ResolvedCredentials> {
-        let mut credentials = Vec::new();
-        let mut auth_issues = Vec::new();
-
-        for provider in catalog.providers() {
-            match self.credential_for(provider) {
-                Ok(Some(credential)) => credentials.push(credential),
-                Ok(None) => {}
-                Err(ResolveError::NotConfigured(_) | ResolveError::Interpolation { .. })
-                    if provider.auth.is_some() => {}
-                Err(err) => auth_issues.push((provider.id.clone(), err)),
-            }
+        let mut resolved = self.inner.resolve(catalog).await?;
+        if let (Some(account_id), Some(credential)) = (
+            self.lookup(EnvVars::CHATGPT_ACCOUNT_ID),
+            resolved
+                .credentials
+                .iter_mut()
+                .find(|credential| credential.provider == ProviderId::openai()),
+        ) {
+            apply_openai_codex_api_context(credential, Some(&account_id), self.env_lookup.as_ref());
         }
-
-        Ok(ResolvedCredentials {
-            credentials,
-            auth_issues,
-        })
+        Ok(resolved)
     }
 
     async fn configured_providers(&self, catalog: &Catalog) -> Vec<ProviderId> {
-        catalog
-            .providers()
-            .iter()
-            .filter(|provider| match &provider.auth {
-                Some(auth) => auth.credentials.iter().any(|credential_ref| {
-                    matches!(credential_ref, CredentialRef::Env(name) if self.lookup(name).is_some())
-                }),
-                None => self.resolved_extra_headers(provider).is_ok(),
-            })
-            .map(|provider| provider.id.clone())
-            .collect()
+        self.inner.configured_providers(catalog).await
     }
 }
 
@@ -142,6 +85,7 @@ mod tests {
 
     use fabro_model::catalog::LlmCatalogSettings;
     use fabro_model::{Catalog, ProviderId};
+    use fabro_types::settings::interp::Namespace;
 
     use super::EnvCredentialSource;
     use crate::CredentialSource;
@@ -154,66 +98,14 @@ mod tests {
         EnvCredentialSource::with_env_lookup(Arc::new(move |name| entries.get(name).cloned()))
     }
 
-    fn catalog_with(overrides: &str) -> Catalog {
-        let settings: LlmCatalogSettings = toml::from_str(overrides).unwrap();
-        Catalog::from_builtin_with_overrides(&settings).unwrap()
-    }
-
-    fn default_catalog() -> Catalog {
-        catalog_with("")
-    }
-
-    /// A no-auth portkey provider whose only variation is its `extra_headers`
-    /// TOML lines.
-    fn portkey_catalog(extra_headers: &str) -> Catalog {
-        catalog_with(&format!(
-            r#"
-[providers.portkey]
-display_name = "Portkey Bedrock"
-adapter = "anthropic"
-agent_profile = "anthropic"
-base_url = "https://api.portkey.ai/v1"
-
-[providers.portkey.extra_headers]
-{extra_headers}
-
-[models."portkey-claude"]
-provider = "portkey"
-display_name = "Portkey Claude"
-family = "claude"
-default = true
-
-[models."portkey-claude".limits]
-context_window = 200000
-
-[models."portkey-claude".features]
-tools = true
-vision = true
-reasoning = true
-reasoning_effort = "levels"
-"#
-        ))
-    }
-
     #[tokio::test]
-    async fn configured_providers_reads_injected_env() {
+    async fn configured_providers_reads_injected_provider_env() {
         let source = test_source(&[("ANTHROPIC_API_KEY", "anthropic-key")]);
-        let catalog = default_catalog();
+        let catalog = Catalog::from_builtin().unwrap();
 
         assert_eq!(source.configured_providers(&catalog).await, vec![
             ProviderId::anthropic()
         ]);
-    }
-
-    #[tokio::test]
-    async fn resolve_returns_empty_when_no_keys_are_configured() {
-        let source = test_source(&[]);
-        let catalog = default_catalog();
-
-        let resolved = source.resolve(&catalog).await.unwrap();
-
-        assert!(resolved.credentials.is_empty());
-        assert!(resolved.auth_issues.is_empty());
     }
 
     #[tokio::test]
@@ -223,7 +115,7 @@ reasoning_effort = "levels"
             ("CHATGPT_ACCOUNT_ID", "acct_123"),
             ("OPENAI_PROJECT_ID", "project_123"),
         ]);
-        let catalog = default_catalog();
+        let catalog = Catalog::from_builtin().unwrap();
 
         let resolved = source.resolve(&catalog).await.unwrap();
         let credential = resolved.credentials.first().unwrap();
@@ -242,23 +134,8 @@ reasoning_effort = "levels"
     }
 
     #[tokio::test]
-    async fn resolve_uses_catalog_credentials_and_base_url_for_openai_compatible_providers() {
-        let source = test_source(&[("KIMI_API_KEY", "kimi-key")]);
-        let catalog = default_catalog();
-
-        let resolved = source.resolve(&catalog).await.unwrap();
-        let credential = resolved.credentials.first().unwrap();
-
-        assert_eq!(credential.provider, ProviderId::new("kimi"));
-        assert_eq!(
-            credential.base_url.as_deref(),
-            Some("https://api.moonshot.ai/v1")
-        );
-    }
-
-    #[tokio::test]
-    async fn resolve_registers_custom_env_backed_provider() {
-        let catalog = catalog_with(
+    async fn env_settings_interpolation_remains_unsupported() {
+        let settings: LlmCatalogSettings = toml::from_str(
             r#"
 [providers.acme]
 display_name = "Acme"
@@ -269,113 +146,66 @@ base_url = "https://api.acme.test/v1"
 [providers.acme.auth]
 credentials = ["env:ACME_API_KEY"]
 
-[models."acme-large"]
-provider = "acme"
-display_name = "Acme Large"
-family = "acme"
-default = true
-
-[models."acme-large".limits]
-context_window = 128000
-
-[models."acme-large".features]
-tools = true
-vision = false
-reasoning = false
+[providers.acme.extra_headers]
+x-account = "{{ env.ACME_ACCOUNT }}"
 "#,
-        );
-        let source = test_source(&[("ACME_API_KEY", "acme-key")]);
+        )
+        .unwrap();
+        let catalog = Catalog::from_builtin_with_overrides(&settings).unwrap();
+        let source = test_source(&[("ACME_API_KEY", "acme-key"), ("ACME_ACCOUNT", "account-id")]);
 
         let resolved = source.resolve(&catalog).await.unwrap();
-        let credential = resolved
-            .credentials
-            .iter()
-            .find(|credential| credential.provider == ProviderId::new("acme"))
-            .expect("custom provider should resolve from the supplied catalog");
 
-        assert_eq!(
-            credential.auth_header.as_ref().unwrap(),
-            &crate::ApiKeyHeader::Bearer("acme-key".to_string(),)
+        assert!(
+            resolved
+                .credentials
+                .iter()
+                .all(|credential| credential.provider != ProviderId::new("acme"))
         );
-        assert_eq!(
-            credential.base_url.as_deref(),
-            Some("https://api.acme.test/v1")
-        );
+        assert!(resolved.auth_issues.iter().any(|(provider, issue)| {
+            provider == &ProviderId::new("acme")
+                && matches!(
+                    issue,
+                    crate::ResolveError::Interpolation { source, .. }
+                        if source.namespace == Namespace::Env
+                )
+        }));
     }
 
     #[tokio::test]
-    async fn env_source_resolves_literal_and_env_header_tokens() {
-        let catalog = portkey_catalog(
+    async fn modal_env_vars_do_not_replace_vault_secrets() {
+        let settings: LlmCatalogSettings = toml::from_str(
             r#"
-x-portkey-api-key = "{{ env.PORTKEY_API_KEY }}"
-x-portkey-provider = "@bedrock-prod"
+[providers.modal]
+enabled = true
+base_url = "https://example--kimi-k3.modal.run/v1"
 "#,
-        );
-        let source = test_source(&[("PORTKEY_API_KEY", "pk-live")]);
+        )
+        .unwrap();
+        let catalog = Catalog::from_builtin_with_overrides(&settings).unwrap();
+        let source = test_source(&[
+            ("MODAL_TOKEN_ID", "wk-test"),
+            ("MODAL_TOKEN_SECRET", "ws-test"),
+        ]);
+        let modal = ProviderId::new("modal");
 
-        let resolved = source.resolve(&catalog).await.unwrap();
-        let credential = resolved
-            .credentials
-            .iter()
-            .find(|credential| credential.provider == ProviderId::new("portkey"))
-            .expect("no-auth provider should register when extra headers resolve");
-
-        assert!(credential.auth_header.is_none());
-        assert_eq!(
-            credential.extra_headers.get("x-portkey-api-key"),
-            Some(&"pk-live".to_string())
-        );
-        assert_eq!(
-            credential.extra_headers.get("x-portkey-provider"),
-            Some(&"@bedrock-prod".to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn env_source_secrets_header_token_is_unavailable() {
-        let catalog = portkey_catalog(r#"x-team-secret = "{{ secrets.gateway_team_secret }}""#);
-        let source = test_source(&[]);
+        assert!(!source.configured_providers(&catalog).await.contains(&modal));
 
         let resolved = source.resolve(&catalog).await.unwrap();
 
         assert!(
-            !resolved
+            resolved
                 .credentials
                 .iter()
-                .any(|credential| credential.provider == ProviderId::new("portkey"))
+                .all(|credential| credential.provider != modal)
         );
-        let (_, issue) = resolved
-            .auth_issues
-            .iter()
-            .find(|(provider, _)| provider == &ProviderId::new("portkey"))
-            .expect("secrets token should surface as an auth issue");
-        assert!(matches!(
-            issue,
-            crate::ResolveError::Interpolation { provider, .. }
-                if provider == &ProviderId::new("portkey")
-        ));
-        assert!(issue.to_string().contains("gateway_team_secret"));
-    }
-
-    #[tokio::test]
-    async fn env_source_reports_missing_env_header_for_no_auth_provider() {
-        let catalog = portkey_catalog(r#"x-portkey-api-key = "{{ env.PORTKEY_API_KEY }}""#);
-        let source = test_source(&[]);
-
-        let resolved = source.resolve(&catalog).await.unwrap();
-
-        assert!(
-            !resolved
-                .credentials
-                .iter()
-                .any(|credential| credential.provider == ProviderId::new("portkey"))
-        );
-        let (_, issue) = resolved
-            .auth_issues
-            .iter()
-            .find(|(provider, _)| provider == &ProviderId::new("portkey"))
-            .expect("missing env header should surface as an auth issue");
-        assert!(matches!(issue, crate::ResolveError::Interpolation { .. }));
-        assert!(issue.to_string().contains("PORTKEY_API_KEY"));
+        assert!(resolved.auth_issues.iter().any(|(provider, issue)| {
+            provider == &modal
+                && matches!(
+                    issue,
+                    crate::ResolveError::Interpolation { source, .. }
+                        if source.namespace == Namespace::Secrets
+                )
+        }));
     }
 }

@@ -71,7 +71,7 @@ import type { RunScmSettings } from './run-scm-settings';
 export interface RunNamespace {
     'goal': RunGoal | null;
     /**
-     * Resolved config string that may contain env interpolation tokens.
+     * Config string that can contain typed interpolation tokens.
      */
     'working_dir': string | null;
     'metadata': { [key: string]: string; };

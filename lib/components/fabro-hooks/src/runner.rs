@@ -4,7 +4,7 @@ use std::sync::Arc;
 use fabro_agent::Sandbox;
 use fabro_auth::CredentialSource;
 #[cfg(test)]
-use fabro_auth::EnvCredentialSource;
+use fabro_auth::test_support;
 use fabro_model::Catalog;
 
 use crate::config::{HookDefinition, HookSettings};
@@ -46,7 +46,7 @@ impl HookRunner {
         Self {
             config,
             executor,
-            llm_source: Arc::new(EnvCredentialSource::new()),
+            llm_source: test_support::vault_only_credential_source(),
             catalog: Arc::new(Catalog::from_builtin().expect("default catalog should build")),
             compiled_matchers,
         }
@@ -238,7 +238,6 @@ impl HookRunner {
 
 #[cfg(test)]
 mod tests {
-    use fabro_auth::EnvCredentialSource;
     use fabro_types::fixtures;
 
     use super::*;
@@ -279,7 +278,7 @@ mod tests {
     }
 
     fn test_llm_source() -> Arc<dyn CredentialSource> {
-        Arc::new(EnvCredentialSource::new())
+        test_support::vault_only_credential_source()
     }
 
     fn test_catalog() -> Arc<Catalog> {

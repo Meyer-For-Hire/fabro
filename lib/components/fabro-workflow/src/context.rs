@@ -12,6 +12,7 @@ pub mod keys {
     pub const PREFERRED_LABEL: &str = "preferred_label";
     pub const LAST_STAGE: &str = "last_stage";
     pub const LAST_RESPONSE: &str = "last_response";
+    pub const REVIEW_TARGET: &str = "review_target";
 
     // --- graph.* keys ---
     pub const GRAPH_GOAL: &str = "graph.goal";
@@ -142,6 +143,7 @@ pub mod keys {
             assert!(!is_engine_internal_key("outcome"));
             assert!(!is_engine_internal_key("last_stage"));
             assert!(!is_engine_internal_key("review.result"));
+            assert!(!is_engine_internal_key(REVIEW_TARGET));
             assert!(!is_engine_internal_key("user.name"));
         }
     }

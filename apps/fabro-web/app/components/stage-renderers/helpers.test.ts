@@ -98,6 +98,33 @@ describe("parseHumanInterviewPairs", () => {
     });
   });
 
+  test("preserves a typed review target from started events", () => {
+    const events: EventEnvelope[] = [
+      makeEventEnvelope(1, {
+        event: "interview.started",
+        properties: {
+          question_id: "q-1",
+          question:
+            "Review the Quarry review exercise document, then choose the next action.",
+          question_type: "multiple_choice",
+          review_target: {
+            label: "Quarry review exercise",
+            url: "https://quarry.lithos.computer/tmp/0123456789abcdef0123456789abcdef",
+            kind: "document",
+          },
+        },
+      }),
+    ];
+
+    const pairs = parseHumanInterviewPairs(events);
+
+    expect(pairs[0].question.reviewTarget).toEqual({
+      label: "Quarry review exercise",
+      url: "https://quarry.lithos.computer/tmp/0123456789abcdef0123456789abcdef",
+      kind: "document",
+    });
+  });
+
   test("captures timeout and interrupted resolutions", () => {
     const events: EventEnvelope[] = [
       makeEventEnvelope(1, {

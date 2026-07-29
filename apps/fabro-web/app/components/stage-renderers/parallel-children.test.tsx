@@ -1,9 +1,15 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { StageOutcome, StageState } from "@qltysh/fabro-api-client";
 import type { EventEnvelope } from "@qltysh/fabro-api-client";
 import TestRenderer, { act } from "react-test-renderer";
 import { MemoryRouter } from "react-router";
 
-import { makeEventEnvelope, setupReactTestEnv } from "../../lib/test-utils";
+import {
+  makeEventEnvelope,
+  makeStage as baseMakeStage,
+  setupReactTestEnv,
+  textContent,
+} from "../../lib/test-utils";
 import type { Stage } from "../stage-sidebar";
 import { ParallelChildren } from "./parallel-children";
 
@@ -13,35 +19,88 @@ beforeEach(() => {
 });
 afterEach(() => teardown());
 
-const parallelStage: Stage = {
+function makeStage(overrides: Partial<Stage> = {}): Stage {
+  return baseMakeStage({
+    id: "stage@1",
+    name: "stage",
+    nodeId: "stage",
+    graphVisit: 1,
+    startedAt: "2026-04-09T12:00:00Z",
+    ...overrides,
+  });
+}
+
+const parallelStage = makeStage({
   id: "fork@1",
   name: "fork",
   handler: "parallel",
-  status: "succeeded",
+  status: StageState.RUNNING,
   duration: "12s",
   nodeId: "fork",
-  visit: 1,
-  startedAt: "2026-04-09T12:00:00Z",
-  providerUsed: null,
-};
+});
 
-function event(partial: Partial<EventEnvelope>): EventEnvelope {
-  return makeEventEnvelope(partial.seq ?? 1, { event: "parallel.completed", ...partial });
+function branchStage(
+  name: string,
+  index: number,
+  status: StageState,
+  groupId = "fork@1",
+  visit = 1,
+): Stage {
+  return makeStage({
+    id: `${name}@${visit}`,
+    name,
+    nodeId: name,
+    visit,
+    status,
+    parallelGroupId: groupId,
+    parallelBranchIndex: index,
+  });
 }
 
-function renderParallel(events: EventEnvelope[]): TestRenderer.ReactTestRenderer {
+function event(partial: Partial<EventEnvelope>): EventEnvelope {
+  return makeEventEnvelope(partial.seq ?? 1, {
+    event: "parallel.completed",
+    stage_id: "fork@1",
+    ...partial,
+  });
+}
+
+function startedEvent(branchCount: number): EventEnvelope {
+  return event({
+    event: "parallel.started",
+    properties: { branch_count: branchCount },
+  });
+}
+
+function completedEvent(results: Array<{ id: string; status: StageOutcome }>): EventEnvelope {
+  const countOf = (status: StageOutcome) =>
+    results.filter((result) => result.status === status).length;
+  return event({
+    seq: 2,
+    event: "parallel.completed",
+    properties: {
+      duration_ms: 12000,
+      success_count: countOf(StageOutcome.SUCCEEDED),
+      failure_count: countOf(StageOutcome.FAILED),
+      results: results.map((result) => ({ ...result, context_updates: {} })),
+    },
+  });
+}
+
+function renderParallel(
+  events: EventEnvelope[],
+  allStages: Stage[],
+  stage = parallelStage,
+): TestRenderer.ReactTestRenderer {
   let renderer!: TestRenderer.ReactTestRenderer;
   act(() => {
     renderer = TestRenderer.create(
       <MemoryRouter>
         <ParallelChildren
-          stage={parallelStage}
+          stage={stage}
           events={events}
           runId="run-1"
-          allStages={[
-            { ...parallelStage, id: "branch-a@1", name: "branch-a", nodeId: "branch-a", handler: "agent" },
-            { ...parallelStage, id: "branch-b@1", name: "branch-b", nodeId: "branch-b", handler: "agent", status: "failed" },
-          ]}
+          allStages={allStages}
         />
       </MemoryRouter>,
     );
@@ -49,38 +108,149 @@ function renderParallel(events: EventEnvelope[]): TestRenderer.ReactTestRenderer
   return renderer;
 }
 
-describe("ParallelChildren", () => {
-  test("renders branch status and stage links without checkout metadata", () => {
-    const renderer = renderParallel([
-      event({
-        event: "parallel.started",
-        properties: { branch_count: 2 },
-      }),
-      event({
-        seq: 2,
-        event: "parallel.completed",
-        properties: {
-          duration_ms: 12000,
-          success_count: 1,
-          failure_count: 1,
-          results: [
-            { id: "branch-a", status: "succeeded", context_updates: {} },
-            { id: "branch-b", status: "failed", context_updates: {} },
-          ],
-        },
-      }),
-    ]);
+function branchRowText(renderer: TestRenderer.ReactTestRenderer): string[] {
+  return renderer.root.findAllByType("li").map(textContent);
+}
 
-    const rendered = JSON.stringify(renderer.toJSON());
-    expect(rendered).toContain("branch-a");
-    expect(rendered).toContain("Succeeded");
-    expect(rendered).toContain("branch-b");
-    expect(rendered).toContain("Failed");
-    const hrefs = renderer.root.findAllByType("a").map((link) => link.props.href);
-    expect(hrefs).toEqual([
-      "/runs/run-1/stages/branch-a@1",
-      "/runs/run-1/stages/branch-b@1",
+function hrefs(renderer: TestRenderer.ReactTestRenderer): string[] {
+  return renderer.root.findAllByType("a").map((link) => link.props.href);
+}
+
+function statValue(renderer: TestRenderer.ReactTestRenderer, label: string): string {
+  return textContent(renderer.root.findByProps({ "data-stat": label }));
+}
+
+describe("ParallelChildren", () => {
+  test("renders live branch names, statuses, counts, and stage links", () => {
+    const renderer = renderParallel(
+      [startedEvent(2)],
+      [
+        branchStage("review_glm", 0, StageState.SUCCEEDED),
+        branchStage("review_opus", 1, StageState.RUNNING),
+      ],
+    );
+
+    const rows = branchRowText(renderer);
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toContain("Succeeded");
+    expect(rows[0]).toContain("review_glm");
+    expect(rows[1]).toContain("Running");
+    expect(rows[1]).toContain("review_opus");
+    expect(hrefs(renderer)).toEqual([
+      "/runs/run-1/stages/review_glm@1",
+      "/runs/run-1/stages/review_opus@1",
     ]);
+    expect(statValue(renderer, "Succeeded")).toBe("1");
+    expect(statValue(renderer, "Failed")).toBe("0");
+  });
+
+  test("keeps looped fork links scoped to the selected fork visit", () => {
+    const renderer = renderParallel(
+      [startedEvent(1)],
+      [
+        branchStage("review_glm", 0, StageState.SUCCEEDED, "fork@1", 1),
+        branchStage("review_glm", 0, StageState.RUNNING, "fork@2", 2),
+      ],
+    );
+
+    expect(hrefs(renderer)).toEqual(["/runs/run-1/stages/review_glm@1"]);
+  });
+
+  test("shows a late-starting branch when lower indexes have no stage yet", () => {
+    // Branches queued behind `max_parallel` reserve no stage identity, so the
+    // observed indexes are sparse. Sizing the list by entry count would drop
+    // the only running branch.
+    const renderer = renderParallel([], [branchStage("review_opus", 2, StageState.RUNNING)]);
+
+    expect(branchRowText(renderer)).toEqual([
+      "PendingBranch 1",
+      "PendingBranch 2",
+      "Runningreview_opus",
+    ]);
+    expect(hrefs(renderer)).toEqual(["/runs/run-1/stages/review_opus@1"]);
+    expect(statValue(renderer, "Branches")).toBe("3");
+  });
+
+  test("renders branches with no stage or result yet as pending placeholders", () => {
+    const renderer = renderParallel([startedEvent(3)], [branchStage("review_glm", 0, StageState.RUNNING)]);
+
+    expect(branchRowText(renderer)).toEqual([
+      "Runningreview_glm",
+      "PendingBranch 2",
+      "PendingBranch 3",
+    ]);
+    expect(statValue(renderer, "Succeeded")).toBe("0");
+    expect(statValue(renderer, "Failed")).toBe("0");
+  });
+
+  test("labels a re-entered branch with its visit, matching the sidebar", () => {
+    const renderer = renderParallel(
+      [startedEvent(1)],
+      [branchStage("review_glm", 0, StageState.RUNNING, "fork@2", 2)],
+      makeStage({ id: "fork@2", name: "fork", handler: "parallel", visit: 2 }),
+    );
+
+    expect(branchRowText(renderer)).toEqual(["Runningreview_glm@2"]);
+    expect(hrefs(renderer)).toEqual(["/runs/run-1/stages/review_glm@2"]);
+  });
+
+  test("keeps duplicate branch targets in index order and only links recorded stages", () => {
+    const renderer = renderParallel(
+      [
+        startedEvent(2),
+        completedEvent([
+          { id: "review", status: StageOutcome.FAILED },
+          { id: "review", status: StageOutcome.FAILED },
+        ]),
+      ],
+      [branchStage("review", 0, StageState.SUCCEEDED)],
+    );
+
+    const rows = branchRowText(renderer);
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toContain("Succeeded");
+    expect(rows[1]).toContain("Failed");
+    expect(hrefs(renderer)).toEqual(["/runs/run-1/stages/review@1"]);
+  });
+
+  test("renders a completed result without a matching stage as an unlinked row", () => {
+    const renderer = renderParallel(
+      [
+        startedEvent(1),
+        completedEvent([{ id: "legacy_branch", status: StageOutcome.SUCCEEDED }]),
+      ],
+      [],
+    );
+
+    expect(branchRowText(renderer)).toEqual(["Succeededlegacy_branch"]);
+    expect(hrefs(renderer)).toEqual([]);
+  });
+
+  test("counts partial and skipped branches as neither succeeded nor failed", () => {
+    const allStages = [
+      branchStage("partial", 0, StageState.PARTIALLY_SUCCEEDED),
+      branchStage("skipped", 1, StageState.SKIPPED),
+    ];
+    const running = renderParallel([startedEvent(2)], allStages);
+    const completed = renderParallel(
+      [
+        startedEvent(2),
+        completedEvent([
+          { id: "partial", status: StageOutcome.PARTIALLY_SUCCEEDED },
+          { id: "skipped", status: StageOutcome.SKIPPED },
+        ]),
+      ],
+      allStages,
+    );
+
+    expect([
+      statValue(running, "Succeeded"),
+      statValue(running, "Failed"),
+    ]).toEqual(["0", "0"]);
+    expect([
+      statValue(completed, "Succeeded"),
+      statValue(completed, "Failed"),
+    ]).toEqual(["0", "0"]);
   });
 
   test("uses item labels and avoids ambiguous id-only links", () => {

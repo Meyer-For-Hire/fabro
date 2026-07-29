@@ -99,7 +99,13 @@ fn truncate_to_limit(text: &str, limit: usize, suffix: &str) -> String {
 /// final text is bounded by Slack's section-text limit so even pathological
 /// inputs cannot produce `invalid_blocks`.
 fn header_section(question: &Question, run_web_url: Option<&str>) -> Value {
-    let mut text = format!("*{}*", escape_slack_controls(&question.text));
+    let mut text = question.review_target.as_ref().map_or_else(
+        || format!("*{}*", escape_slack_controls(&question.text)),
+        |target| {
+            let link = slack_link(target.url(), target.label());
+            format!("*{}*", target.question_text_with_link(&link))
+        },
+    );
     if !question.stage.is_empty() {
         let _ = write!(
             text,
@@ -420,9 +426,18 @@ fn lifecycle_pull_request_text(pull_request: &RunLifecyclePullRequest<'_>) -> St
     text
 }
 
+/// Render `label` as a link to `url` in Slack's `<url|label>` syntax, falling
+/// back to plain text when the URL cannot be embedded safely.
+///
+/// `escape_slack_controls` covers Slack's documented escapes (`&`, `<`, `>`)
+/// but Slack has no escape for `|`, which separates the URL from the label.
+/// A `|` in the label would split the markup and can make Slack reject the
+/// whole block, so it is replaced inside link labels only. Labels can be
+/// model-authored (a review target label, for example), so this is reachable.
 fn slack_link(url: &str, label: &str) -> String {
     if is_safe_slack_link_url(url) {
-        format!("<{}|{}>", url, escape_slack_controls(label))
+        let label = escape_slack_controls(label).replace('|', "/");
+        format!("<{url}|{label}>")
     } else {
         escape_slack_controls(label)
     }
@@ -632,6 +647,58 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(header.contains("<http://127.0.0.1:32276/runs/run-1|Open in Fabro>"));
+    }
+
+    #[test]
+    fn header_renders_review_target_as_the_question_link() {
+        let mut q = Question::new(
+            "Review the Quarry review exercise document, then choose the next action.",
+            QuestionType::MultipleChoice,
+        );
+        q.review_target = Some(
+            fabro_types::ReviewTarget::new(
+                "Quarry review exercise",
+                "https://quarry.lithos.computer/tmp/0123456789abcdef0123456789abcdef",
+                fabro_types::ReviewTargetKind::Document,
+            )
+            .unwrap(),
+        );
+
+        let blocks = question_to_blocks("run-1", "q-1", &q, None);
+        let header = serde_json::to_value(&blocks).unwrap()[0]["text"]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        assert_eq!(
+            header,
+            "*Review the \
+             <https://quarry.lithos.computer/tmp/0123456789abcdef0123456789abcdef|Quarry review \
+             exercise> document, then choose the next action.*"
+        );
+    }
+
+    #[test]
+    fn review_target_label_pipe_cannot_split_the_slack_link() {
+        let mut q = Question::new("Review", QuestionType::MultipleChoice);
+        q.review_target = Some(
+            fabro_types::ReviewTarget::new(
+                "Draft | v2",
+                "https://quarry.lithos.computer/tmp/0123456789abcdef0123456789abcdef",
+                fabro_types::ReviewTargetKind::Document,
+            )
+            .unwrap(),
+        );
+
+        let blocks = question_to_blocks("run-1", "q-1", &q, None);
+        let header = serde_json::to_value(&blocks).unwrap()[0]["text"]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Exactly one `|`: the one separating the URL from the label.
+        assert_eq!(header.matches('|').count(), 1);
+        assert!(header.contains("|Draft / v2>"));
     }
 
     #[test]

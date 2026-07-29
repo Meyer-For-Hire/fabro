@@ -143,7 +143,7 @@ pub(crate) fn classify_exec_failure(stderr: &str) -> Option<&'static str> {
     } else if lower.contains("could not resolve host") || lower.contains("network is unreachable") {
         Some("network failure inside sandbox - check DNS / egress from the run container")
     } else if lower.contains("repository not found") {
-        Some("github 404 - the App installation may not include this repo")
+        Some("github 404 - repository is unavailable to the current credentials")
     } else if lower.contains("no such remote") && lower.contains("origin") {
         Some("origin remote missing - push credentials could not be installed")
     } else if lower.contains("not a git repository")

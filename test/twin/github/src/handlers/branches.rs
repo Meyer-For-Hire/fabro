@@ -172,6 +172,51 @@ mod tests {
         server.shutdown().await;
     }
 
+    /// Run branches contain slashes (`fabro/run/<id>`). GitHub routes the
+    /// branch as the rest of the path, so the twin must too.
+    #[tokio::test]
+    async fn branch_with_slashes_returns_200() {
+        let pem = test_rsa_private_key();
+        let mut state = AppState::new();
+        state.register_app(AppOptions {
+            app_id:          "100".to_string(),
+            slug:            "test-app".to_string(),
+            owner_login:     "owner".to_string(),
+            public:          true,
+            private_key_pem: pem.to_string(),
+            webhook_secret:  None,
+        });
+        state.add_installation("100", "owner", vec!["repo".to_string()], false);
+        state.add_repository(
+            "owner",
+            "repo",
+            vec!["main".to_string(), "fabro/run/123".to_string()],
+            false,
+        );
+        let server = TestServer::start(state).await;
+
+        let jwt = sign_test_jwt("100", pem);
+        let client = test_http_client();
+        let token = get_installation_token(&client, &jwt, "owner", "repo", server.url()).await;
+
+        let resp = client
+            .get(format!(
+                "{}/repos/owner/repo/branches/fabro/run/123",
+                server.url()
+            ))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["name"], "fabro/run/123");
+
+        server.shutdown().await;
+    }
+
     #[tokio::test]
     async fn branch_not_found_returns_404() {
         let pem = test_rsa_private_key();

@@ -339,18 +339,18 @@ impl ImportTransform {
             .edges
             .retain(|edge| edge.from != placeholder_id && edge.to != placeholder_id);
 
-        for (node_id, node) in imported_graph.nodes {
+        for (node_id, mut merged_node) in imported_graph.nodes {
             if node_id == start_id || node_id == exit_id {
                 continue;
             }
 
             let prefixed_id = format!("{placeholder_id}.{node_id}");
-            let mut merged_node = Node::new(&prefixed_id);
+            merged_node.id.clone_from(&prefixed_id);
+            let imported_attrs = std::mem::take(&mut merged_node.attrs);
             merged_node.attrs.clone_from(&placeholder.default_attrs);
-            merged_node.attrs.extend(node.attrs);
+            merged_node.attrs.extend(imported_attrs);
             Self::remap_retry_target(&mut merged_node.attrs, placeholder_id);
 
-            merged_node.classes = node.classes;
             for class_name in &placeholder.class_names {
                 Self::push_class(&mut merged_node.classes, class_name);
             }
@@ -649,7 +649,10 @@ impl PreparedImport {
         self.graph.nodes.iter().all(|(node_id, node)| {
             ImportTransform::is_start_sentinel(node_id, node)
                 || ImportTransform::is_exit_sentinel(node_id, node)
-        })
+        }) && matches!(
+            self.graph.edges.as_slice(),
+            [edge] if edge.from == self.start_id && edge.to == self.exit_id
+        )
     }
 }
 
@@ -909,6 +912,7 @@ mod tests {
         assert!(!graph.nodes.contains_key("validate"));
         assert!(graph.nodes.contains_key("validate.lint"));
         assert!(graph.nodes.contains_key("validate.test"));
+        assert_eq!(graph.nodes["validate.lint"].id, "validate.lint");
         assert!(!graph.nodes.contains_key("validate.start"));
         assert!(!graph.nodes.contains_key("validate.exit"));
 
@@ -948,6 +952,72 @@ mod tests {
                 .classes
                 .iter()
                 .any(|class_name| class_name == "validate")
+        );
+    }
+
+    #[test]
+    fn edge_only_node_in_imported_fragment_stays_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(
+            &dir.path().join("validate.fabro"),
+            r#"digraph validate {
+                start [shape=Mdiamond]
+                lint [prompt="Run clippy"]
+                exit [shape=Msquare]
+                start -> lint -> typo -> exit
+            }"#,
+        );
+
+        let graph = apply_import(
+            r#"digraph Deploy {
+                start [shape=Mdiamond]
+                validate [import="./validate.fabro"]
+                exit [shape=Msquare]
+                start -> validate -> exit
+            }"#,
+            dir.path(),
+            None,
+        );
+
+        assert!(!graph.nodes.contains_key("validate.typo"));
+        assert!(graph.nodes.contains_key("validate.lint"));
+    }
+
+    #[test]
+    fn edge_only_body_is_not_treated_as_empty_import() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(
+            &dir.path().join("validate.fabro"),
+            r"digraph validate {
+                start [shape=Mdiamond]
+                exit [shape=Msquare]
+                start -> typo -> exit
+            }",
+        );
+
+        let graph = apply_import(
+            r#"digraph Deploy {
+                start [shape=Mdiamond]
+                validate [import="./validate.fabro"]
+                exit [shape=Msquare]
+                start -> validate -> exit
+            }"#,
+            dir.path(),
+            None,
+        );
+
+        assert!(!graph.nodes.contains_key("validate.typo"));
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|edge| edge.from == "start" && edge.to == "validate.typo")
+        );
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|edge| edge.from == "validate.typo" && edge.to == "exit")
         );
     }
 
@@ -1128,6 +1198,48 @@ mod tests {
                 .iter()
                 .any(|class_name| class_name == "runtests")
         );
+    }
+
+    #[test]
+    fn imported_start_and_exit_sentinels_must_be_declared() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = r#"digraph Deploy {
+            start [shape=Mdiamond]
+            validate [import="./validate.fabro"]
+            exit [shape=Msquare]
+            start -> validate -> exit
+        }"#;
+        let cases = [
+            (
+                r#"digraph validate {
+                    work [prompt="Run checks"]
+                    exit [shape=Msquare]
+                    start -> work -> exit
+                }"#,
+                "imported workflow must have exactly one start node, found 0",
+            ),
+            (
+                r#"digraph validate {
+                    start [shape=Mdiamond]
+                    work [prompt="Run checks"]
+                    start -> work -> exit
+                }"#,
+                "imported workflow must have exactly one exit node, found 0",
+            ),
+        ];
+
+        for (source, expected_error) in cases {
+            write_file(&dir.path().join("validate.fabro"), source);
+            let graph = apply_import(host, dir.path(), None);
+
+            assert_eq!(
+                graph.nodes["validate"]
+                    .attrs
+                    .get("import_error")
+                    .and_then(AttrValue::as_str),
+                Some(expected_error)
+            );
+        }
     }
 
     #[test]

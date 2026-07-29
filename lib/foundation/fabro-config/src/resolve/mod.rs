@@ -202,13 +202,12 @@ Authorization = "Bearer {{ env.HOOK_TOKEN }}"
         assert_eq!(
             hook.resolved_hook_type().as_deref(),
             Some(&HookType::Http {
-                url:              InterpString::parse("https://hooks.example.com"),
-                headers:          Some(HashMap::from([(
+                url:     InterpString::parse("https://hooks.example.com"),
+                headers: Some(HashMap::from([(
                     "Authorization".to_string(),
                     InterpString::parse("Bearer {{ env.HOOK_TOKEN }}"),
                 )])),
-                allowed_env_vars: Vec::new(),
-                tls:              TlsMode::Verify,
+                tls:     TlsMode::Verify,
             })
         );
     }

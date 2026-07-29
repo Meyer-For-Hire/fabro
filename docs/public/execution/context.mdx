@@ -40,6 +40,11 @@ Each handler type writes specific keys into the context after execution:
 
 Agents can also emit arbitrary context updates by including a JSON object with a `context_updates` field in their response. See [Transitions](/workflows/transitions#agent-transitions).
 
+The `review_target` key has an optional typed convention for human review
+workflows. A human gate with `review_target=true` reads this exact flat key and
+presents its document URL as the primary question link. See
+[Review targets](/workflows/human-in-the-loop#review-targets).
+
 ### Command nodes
 
 | Key | Value |

@@ -76,7 +76,7 @@ enum WorkerTitlePhase {
 pub(crate) async fn execute(
     run_id: RunId,
     server: String,
-    storage_dir: Option<PathBuf>,
+    storage_dir: PathBuf,
     run_dir: PathBuf,
     mode: RunWorkerMode,
     worker_token: &str,
@@ -110,7 +110,6 @@ pub(crate) async fn execute(
             run_id,
             run_spec.source_directory.as_deref(),
             &run_dir,
-            Arc::clone(&catalog),
         )
     } else {
         None
@@ -137,13 +136,10 @@ pub(crate) async fn execute(
     if let Some(control_manager) = &mut control_manager {
         control_manager.wait_for_first_connection().await?;
     }
-    let vault = load_worker_vault(storage_dir.as_deref()).await?;
+    let vault = load_worker_vault(&storage_dir).await?;
     let github_app = {
-        let vault_guard = match &vault {
-            Some(arc) => Some(arc.read().await),
-            None => None,
-        };
-        maybe_build_github_credentials(&run_spec.settings, vault_guard.as_deref())?
+        let vault_guard = vault.read().await;
+        maybe_build_github_credentials(&run_spec.settings, &vault_guard)?
     };
     let services = StartServices {
         run_id,
@@ -170,7 +166,8 @@ pub(crate) async fn execute(
             .run
             .integrations
             .github
-            .resolve_permissions(process_env_var),
+            .resolve_permissions()
+            .context("failed to resolve github permissions")?,
         vault,
         catalog,
         on_node: None,
@@ -237,13 +234,12 @@ fn build_fabro_run_tool_services(
     current_run_id: RunId,
     source_directory: Option<&str>,
     run_dir: &Path,
-    catalog: Arc<Catalog>,
 ) -> Option<FabroRunToolServices> {
     if worker_token.trim().is_empty() {
         return None;
     }
     let backend = ClientBackend::new(Arc::new(client))
-        .with_manifest_builder(Arc::new(WorkerRunManifestBuilder { catalog }));
+        .with_manifest_builder(Arc::new(WorkerRunManifestBuilder));
     Some(FabroRunToolServices {
         backend: Arc::new(backend),
         current_run_id,
@@ -252,9 +248,7 @@ fn build_fabro_run_tool_services(
     })
 }
 
-struct WorkerRunManifestBuilder {
-    catalog: Arc<Catalog>,
-}
+struct WorkerRunManifestBuilder;
 
 impl fabro_tool::RunManifestBuilder for WorkerRunManifestBuilder {
     fn build_run_manifest(
@@ -263,20 +257,15 @@ impl fabro_tool::RunManifestBuilder for WorkerRunManifestBuilder {
         cwd: &Path,
         user_settings_path: &Path,
     ) -> fabro_tool::ToolResult<RunManifest> {
-        run_tool_manifest::build_run_tool_manifest(
-            spec,
-            cwd,
-            user_settings_path,
-            Arc::clone(&self.catalog),
-        )
+        run_tool_manifest::build_run_tool_manifest(spec, cwd, user_settings_path)
     }
 }
 
-async fn load_worker_vault(storage_dir: Option<&Path>) -> Result<Option<Arc<AsyncRwLock<Vault>>>> {
-    let Some(storage_dir) = storage_dir else {
-        return Ok(None);
-    };
-
+/// Load the worker's secret vault from the run's storage root.
+///
+/// A worker always receives the server storage root so it can load the same
+/// secret vault as the server.
+async fn load_worker_vault(storage_dir: &Path) -> Result<Arc<AsyncRwLock<Vault>>> {
     let storage = Storage::new(storage_dir);
     let vault = SecretStore::open_snapshot(storage.sqlite_path(), storage.secrets_path())
         .await
@@ -287,7 +276,7 @@ async fn load_worker_vault(storage_dir: Option<&Path>) -> Result<Option<Arc<Asyn
             )
         })?
         .into_vault();
-    Ok(Some(Arc::new(AsyncRwLock::new(vault))))
+    Ok(Arc::new(AsyncRwLock::new(vault)))
 }
 
 const WORKER_CONTROL_RECONNECT_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
@@ -1112,7 +1101,7 @@ fn stamp_system_worker(mut event: RunEvent) -> RunEvent {
 
 fn maybe_build_github_credentials(
     settings: &WorkflowSettings,
-    vault: Option<&fabro_vault::Vault>,
+    vault: &fabro_vault::Vault,
 ) -> Result<Option<fabro_github::GitHubCredentials>> {
     let resolved_run = &settings.run;
     let resolved_server = ServerSettingsBuilder::load_default().ok();
@@ -1141,14 +1130,6 @@ fn maybe_build_github_credentials(
     }
 
     Ok(None)
-}
-
-#[expect(
-    clippy::disallowed_methods,
-    reason = "CLI worker InterpString resolution facade for {{ env.* }} values."
-)]
-fn process_env_var(name: &str) -> Option<String> {
-    std::env::var(name).ok()
 }
 
 /// Hard-gate for the CLI worker path: a run-level token is requested, or
@@ -1361,6 +1342,7 @@ mod tests {
                 allow_freeform:  false,
                 timeout_seconds: None,
                 context_display: None,
+                review_target:   None,
             })),
             Some(WorkerTitlePhase::Waiting)
         );
@@ -1747,7 +1729,7 @@ mod tests {
             .set("ANTHROPIC_API_KEY", "vault-key", SecretType::Token, None)
             .unwrap();
 
-        let loaded = load_worker_vault(Some(temp.path())).await.unwrap().unwrap();
+        let loaded = load_worker_vault(temp.path()).await.unwrap();
         let guard = loaded.read().await;
         let credential = guard.get("ANTHROPIC_API_KEY").unwrap();
 
