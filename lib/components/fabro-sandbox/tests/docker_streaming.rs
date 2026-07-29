@@ -52,11 +52,11 @@ async fn streaming_timeout_terminates_docker_exec_before_returning() {
     let marker = "fabro_streaming_timeout_sentinel";
     let command = format!("trap '' HUP TERM; echo start; sleep 5 # {marker}");
     let result = sandbox
-        .exec_command_streaming(
-            ExecStreamingRequest::new(&command)
-                .timeout_ms(Some(200))
-                .output_callback(Some(capture_bytes(Arc::clone(&chunks)))),
-        )
+        .exec_command_streaming(ExecStreamingRequest {
+            timeout_ms: Some(200),
+            output_callback: Some(capture_bytes(Arc::clone(&chunks))),
+            ..ExecStreamingRequest::new(&command)
+        })
         .await
         .expect("streaming command should return a timeout result");
 
@@ -121,11 +121,11 @@ async fn streaming_command_receives_exact_stdin_and_eof() {
 
     let stdin = b"first line\n$(touch /tmp/must-not-run)\nlast line".to_vec();
     let result = sandbox
-        .exec_command_streaming(
-            ExecStreamingRequest::new("cat")
-                .timeout_ms(Some(10_000))
-                .stdin(Some(stdin.clone())),
-        )
+        .exec_command_streaming(ExecStreamingRequest {
+            timeout_ms: Some(10_000),
+            stdin: Some(stdin.clone()),
+            ..ExecStreamingRequest::new("cat")
+        })
         .await
         .expect("streaming command should read stdin and finish at EOF");
     let injection_probe = sandbox
@@ -273,11 +273,11 @@ async fn docker_runs_clean_bash_through_both_command_paths() {
 
     let chunks = Arc::new(Mutex::new(Vec::new()));
     let streaming = sandbox
-        .exec_command_streaming(
-            ExecStreamingRequest::new(command)
-                .timeout_ms(Some(10_000))
-                .output_callback(Some(capture_bytes(Arc::clone(&chunks)))),
-        )
+        .exec_command_streaming(ExecStreamingRequest {
+            timeout_ms: Some(10_000),
+            output_callback: Some(capture_bytes(Arc::clone(&chunks))),
+            ..ExecStreamingRequest::new(command)
+        })
         .await
         .expect("streaming command should run");
 

@@ -297,13 +297,13 @@ pub(crate) async fn execute_shell_command(
         "Injecting sandbox env vars into tool execution"
     );
     ctx.env
-        .exec_command_streaming(
-            crate::ExecStreamingRequest::new(command)
-                .timeout_ms(Some(timeout_ms))
-                .working_dir(cwd)
-                .env_vars(tool_env.as_ref())
-                .cancel_token(Some(ctx.cancel.clone())),
-        )
+        .exec_command_streaming(crate::ExecStreamingRequest {
+            timeout_ms: Some(timeout_ms),
+            working_dir: cwd,
+            env_vars: tool_env.as_ref(),
+            cancel_token: Some(ctx.cancel.clone()),
+            ..crate::ExecStreamingRequest::new(command)
+        })
         .await
         .map_err(|e| format!("{SHELL_NO_PROCESS_RESULT}: {}", e.display_with_causes()))
 }

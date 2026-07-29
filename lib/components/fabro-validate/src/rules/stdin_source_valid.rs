@@ -1,4 +1,5 @@
-use fabro_graphviz::graph::Graph;
+use fabro_graphviz::graph::{ContextKeyAttr, Graph};
+use fabro_types::StageHandler;
 
 use crate::{Diagnostic, LintRule, Severity};
 
@@ -17,17 +18,20 @@ impl LintRule for Rule {
         graph
             .nodes
             .values()
-            .filter(|node| matches!(node.handler_type(), Some("command" | "tool")))
-            .filter(|node| node.attrs.contains_key("stdin_source"))
             .filter(|node| {
-                node.stdin_source()
-                    .is_none_or(|source| source.trim().is_empty())
+                StageHandler::from_handler_type(node.handler_type()) == StageHandler::Command
+            })
+            .filter(|node| {
+                matches!(
+                    node.context_key_attr("stdin_source"),
+                    ContextKeyAttr::Invalid
+                )
             })
             .map(|node| Diagnostic {
                 rule: self.name().to_string(),
                 severity: Severity::Error,
                 message: format!(
-                    "Command node '{}' has an empty or non-string 'stdin_source'",
+                    "Node '{}' has an empty or non-string 'stdin_source'",
                     node.id
                 ),
                 node_id: Some(node.id.clone()),

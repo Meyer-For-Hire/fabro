@@ -420,11 +420,7 @@ impl DockerSandbox {
             &docker,
             &container_id,
             exec_opts,
-            Some(StartExecOptions {
-                detach:          false,
-                tty:             false,
-                output_capacity: None,
-            }),
+            None,
             "Failed to create exec",
             "Failed to start exec",
         )
@@ -540,14 +536,17 @@ impl DockerSandbox {
 
     async fn docker_exec_shell_streaming(
         &self,
-        command: &str,
-        timeout_ms: Option<u64>,
-        working_dir: Option<&str>,
-        env_vars: Option<&HashMap<String, String>>,
-        cancel_token: Option<CancellationToken>,
-        stdin: Option<Vec<u8>>,
-        output_callback: Option<CommandOutputCallback>,
+        request: ExecStreamingRequest<'_>,
     ) -> crate::Result<ExecStreamingResult> {
+        let ExecStreamingRequest {
+            command,
+            timeout_ms,
+            working_dir,
+            env_vars,
+            cancel_token,
+            stdin,
+            output_callback,
+        } = request;
         let start = Instant::now();
         let effective_dir = working_dir
             .unwrap_or_else(|| self.working_directory())
@@ -811,15 +810,11 @@ impl DockerSandbox {
                         });
                     }
                     let result = self
-                        .docker_exec_shell_streaming(
-                            command,
-                            Some(timeout_ms),
-                            Some("/"),
-                            None,
-                            None,
-                            None,
-                            None,
-                        )
+                        .docker_exec_shell_streaming(ExecStreamingRequest {
+                            timeout_ms: Some(timeout_ms),
+                            working_dir: Some("/"),
+                            ..ExecStreamingRequest::new(command)
+                        })
                         .await
                         .map_err(|error| DockerCloneFailure {
                             error:        crate::Error::context(
@@ -1806,25 +1801,13 @@ impl Sandbox for DockerSandbox {
         &self,
         request: ExecStreamingRequest<'_>,
     ) -> crate::Result<ExecStreamingResult> {
-        let ExecStreamingRequest {
-            command,
-            timeout_ms,
-            working_dir,
-            env_vars,
-            cancel_token,
-            stdin,
-            output_callback,
-        } = request;
-        let dir = working_dir.map(|path| self.resolve_container_path(path));
-        self.docker_exec_shell_streaming(
-            command,
-            timeout_ms,
-            dir.as_deref(),
-            env_vars,
-            cancel_token,
-            stdin,
-            output_callback,
-        )
+        let dir = request
+            .working_dir
+            .map(|path| self.resolve_container_path(path));
+        self.docker_exec_shell_streaming(ExecStreamingRequest {
+            working_dir: dir.as_deref(),
+            ..request
+        })
         .await
     }
 

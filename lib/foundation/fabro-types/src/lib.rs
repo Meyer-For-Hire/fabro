@@ -72,8 +72,8 @@ pub use event_envelope::EventEnvelope;
 pub use fabro_model::ReasoningEffort;
 pub use failure_signature::FailureSignature;
 pub use graph::{
-    AttrValue, Edge, Graph, KNOWN_HANDLER_TYPES, Node, is_known_handler_type, is_llm_handler_type,
-    shape_to_handler_type,
+    AttrValue, ContextKeyAttr, Edge, Graph, KNOWN_HANDLER_TYPES, Node, is_known_handler_type,
+    is_llm_handler_type, shape_to_handler_type,
 };
 pub use interview::{
     InterviewQuestionRecord, QuestionType, ReviewTarget, ReviewTargetError, ReviewTargetKind,

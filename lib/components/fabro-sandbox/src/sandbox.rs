@@ -761,10 +761,14 @@ pub type CommandOutputCallback = Arc<
 
 /// Inputs for a streaming command execution.
 ///
+/// Construct with a struct literal over [`ExecStreamingRequest::new`]:
+/// `ExecStreamingRequest { stdin, ..ExecStreamingRequest::new(command) }`.
+/// Providers should destructure exhaustively so a new field is a compile
+/// error rather than silently ignored input.
+///
 /// Standard input is owned so providers can move it into a writer task. This
 /// type does not implement `Debug` because standard input can contain
 /// sensitive workflow data.
-#[non_exhaustive]
 pub struct ExecStreamingRequest<'a> {
     pub command:         &'a str,
     pub timeout_ms:      Option<u64>,
@@ -788,50 +792,27 @@ impl<'a> ExecStreamingRequest<'a> {
             output_callback: None,
         }
     }
-
-    #[must_use]
-    pub fn timeout_ms(mut self, timeout_ms: Option<u64>) -> Self {
-        self.timeout_ms = timeout_ms;
-        self
-    }
-
-    #[must_use]
-    pub fn working_dir(mut self, working_dir: Option<&'a str>) -> Self {
-        self.working_dir = working_dir;
-        self
-    }
-
-    #[must_use]
-    pub fn env_vars(mut self, env_vars: Option<&'a HashMap<String, String>>) -> Self {
-        self.env_vars = env_vars;
-        self
-    }
-
-    #[must_use]
-    pub fn cancel_token(mut self, cancel_token: Option<CancellationToken>) -> Self {
-        self.cancel_token = cancel_token;
-        self
-    }
-
-    #[must_use]
-    pub fn stdin(mut self, stdin: Option<Vec<u8>>) -> Self {
-        self.stdin = stdin;
-        self
-    }
-
-    #[must_use]
-    pub fn output_callback(mut self, output_callback: Option<CommandOutputCallback>) -> Self {
-        self.output_callback = output_callback;
-        self
-    }
 }
 
 pub(crate) async fn write_process_stdin<W>(mut writer: W, stdin: &[u8]) -> crate::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
+    // A command that stops reading its input (`head -1`, an early exit) is
+    // not an error; its exit code is the authoritative result. Local pipes
+    // surface that as `BrokenPipe`, remote transports (a TCP Docker daemon)
+    // as `ConnectionReset`/`ConnectionAborted`.
+    fn command_stopped_reading(err: &std::io::Error) -> bool {
+        matches!(
+            err.kind(),
+            std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+        )
+    }
+
     if let Err(err) = writer.write_all(stdin).await {
-        if err.kind() != std::io::ErrorKind::BrokenPipe {
+        if !command_stopped_reading(&err) {
             return Err(crate::Error::context(
                 "Failed to write command standard input",
                 err,
@@ -839,7 +820,7 @@ where
         }
     }
     if let Err(err) = writer.shutdown().await {
-        if err.kind() != std::io::ErrorKind::BrokenPipe {
+        if !command_stopped_reading(&err) {
             return Err(crate::Error::context(
                 "Failed to close command standard input",
                 err,

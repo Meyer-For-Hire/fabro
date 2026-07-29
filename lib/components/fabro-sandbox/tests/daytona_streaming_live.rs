@@ -363,14 +363,14 @@ mod daytona_streaming_live {
 
         let live_exec = tokio::spawn(async move {
             sandbox_for_exec
-                .exec_command_streaming(
-                    fabro_sandbox::ExecStreamingRequest::new(
+                .exec_command_streaming(fabro_sandbox::ExecStreamingRequest {
+                    timeout_ms: Some(60_000),
+                    cancel_token: Some(cancel_for_exec),
+                    output_callback: Some(callback),
+                    ..fabro_sandbox::ExecStreamingRequest::new(
                         "printf 'live-out\\n'; printf 'live-err\\n' >&2; sleep 30",
                     )
-                    .timeout_ms(Some(60_000))
-                    .cancel_token(Some(cancel_for_exec))
-                    .output_callback(Some(callback)),
-                )
+                })
                 .await
         });
 
@@ -498,13 +498,13 @@ mod daytona_streaming_live {
         let chunks = Arc::new(Mutex::new(Vec::new()));
         let callback = capture_callback(Arc::clone(&chunks));
         let result = sandbox
-            .exec_command_streaming(
-                fabro_sandbox::ExecStreamingRequest::new(command)
-                    .timeout_ms(Some(timeout_ms))
-                    .cancel_token(cancel_token)
-                    .stdin(stdin)
-                    .output_callback(Some(callback)),
-            )
+            .exec_command_streaming(fabro_sandbox::ExecStreamingRequest {
+                timeout_ms: Some(timeout_ms),
+                cancel_token,
+                stdin,
+                output_callback: Some(callback),
+                ..fabro_sandbox::ExecStreamingRequest::new(command)
+            })
             .await?;
         let chunks = chunks.lock().await.clone();
 

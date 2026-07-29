@@ -116,6 +116,19 @@ pub fn shape_to_handler_type(shape: &str) -> Option<&'static str> {
     }
 }
 
+/// Presence and validity of a node attribute whose value names a workflow
+/// context key (`for_each`, `stdin_source`).
+///
+/// Consumers need three states: the attribute is not set, it is set but not a
+/// usable key (non-string or blank), or it carries a key. Modeling this once
+/// keeps lint rules and handlers agreeing on what "valid" means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextKeyAttr<'a> {
+    Absent,
+    Invalid,
+    Present(&'a str),
+}
+
 /// A node in the workflow graph.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Node {
@@ -183,8 +196,14 @@ impl Node {
     }
 
     #[must_use]
-    pub fn stdin_source(&self) -> Option<&str> {
-        self.str_attr("stdin_source")
+    pub fn context_key_attr(&self, name: &str) -> ContextKeyAttr<'_> {
+        let Some(value) = self.attrs.get(name) else {
+            return ContextKeyAttr::Absent;
+        };
+        match value.as_str() {
+            Some(source) if !source.trim().is_empty() => ContextKeyAttr::Present(source),
+            _ => ContextKeyAttr::Invalid,
+        }
     }
 
     #[must_use]
@@ -611,7 +630,10 @@ mod tests {
         assert_eq!(node.node_type(), None);
         assert_eq!(node.prompt(), None);
         assert_eq!(node.for_each(), None);
-        assert_eq!(node.stdin_source(), None);
+        assert_eq!(
+            node.context_key_attr("stdin_source"),
+            ContextKeyAttr::Absent
+        );
         assert_eq!(node.output_schema(), None);
         assert_eq!(node.output_retries(), 2);
         assert_eq!(node.max_retries(), None);
@@ -694,14 +716,25 @@ mod tests {
     }
 
     #[test]
-    fn node_stdin_source_returns_context_source() {
+    fn node_context_key_attr_classifies_presence_and_validity() {
         let mut node = Node::new("merge");
         node.attrs.insert(
             "stdin_source".to_string(),
             AttrValue::String("context.parallel.results".to_string()),
         );
 
-        assert_eq!(node.stdin_source(), Some("context.parallel.results"));
+        assert_eq!(
+            node.context_key_attr("stdin_source"),
+            ContextKeyAttr::Present("context.parallel.results")
+        );
+
+        for invalid in [AttrValue::String("   ".to_string()), AttrValue::Integer(3)] {
+            node.attrs.insert("stdin_source".to_string(), invalid);
+            assert_eq!(
+                node.context_key_attr("stdin_source"),
+                ContextKeyAttr::Invalid
+            );
+        }
     }
 
     #[test]

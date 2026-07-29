@@ -16,9 +16,7 @@ use tokio::time::sleep;
 use uuid::Uuid;
 
 use super::{EngineServices, Handler};
-use crate::context::{
-    self, Context, ParallelBranchPreamble, WorkflowContext, context_diff_public, keys,
-};
+use crate::context::{Context, ParallelBranchPreamble, WorkflowContext, context_diff_public, keys};
 use crate::error::Error;
 use crate::event::{Emitter, Event, RunNoticeCode, RunNoticeLevel, StageScope};
 use crate::hook_context::set_hook_node;
@@ -215,22 +213,23 @@ async fn build_branch_plan(
     // data, so an absent or unusable source stands in one placeholder item.
     // Graph-shape mistakes above still fail, because a dry run should catch
     // those.
-    let resolved = match context::lookup_flat(context, source) {
-        Some(raw_items) => {
-            match artifact::resolve_json_value(&raw_items, &services.run.run_store).await {
-                Ok(value) => Some(value),
-                Err(_) if simulated => None,
-                Err(err) => {
-                    return Err(Outcome::fail_deterministic(format!(
-                        "for_each source '{source}' could not be resolved: {err}"
-                    )));
-                }
-            }
-        }
-        None if simulated => None,
-        None => {
+    let resolved = match artifact::resolve_flat_context_value(
+        context,
+        source,
+        &services.run.run_store,
+    )
+    .await
+    {
+        Ok(Some(value)) => Some(value),
+        Ok(None) | Err(_) if simulated => None,
+        Ok(None) => {
             return Err(Outcome::fail_deterministic(format!(
                 "for_each source '{source}' was not found in workflow context"
+            )));
+        }
+        Err(err) => {
+            return Err(Outcome::fail_deterministic(format!(
+                "for_each source '{source}' could not be resolved: {err}"
             )));
         }
     };

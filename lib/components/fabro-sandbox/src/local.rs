@@ -597,9 +597,21 @@ impl Sandbox for LocalSandbox {
 
         let duration_ms = elapsed_ms(start);
         if let Some(stdin_task) = stdin_task {
-            stdin_task
-                .await
-                .map_err(|e| crate::Error::context("stdin stream task failed", e))??;
+            // The process is gone, so unwritten stdin bytes are unwanted.
+            // Abort instead of joining unbounded: a backgrounded grandchild
+            // that inherited the pipe could otherwise block the writer
+            // forever.
+            stdin_task.abort();
+            match stdin_task.await {
+                Ok(result) => result?,
+                Err(join_error) if join_error.is_cancelled() => {}
+                Err(join_error) => {
+                    return Err(crate::Error::context(
+                        "stdin stream task failed",
+                        join_error,
+                    ));
+                }
+            }
         }
         let stdout_bytes = stdout_task
             .await
@@ -1367,11 +1379,11 @@ mod tests {
         let sandbox = LocalSandbox::new(dir.clone());
 
         let result = sandbox
-            .exec_command_streaming(
-                ExecStreamingRequest::new(BASH_ONLY_COMMAND)
-                    .timeout_ms(Some(5000))
-                    .output_callback(Some(Arc::new(|_, _| Box::pin(async { Ok(()) })))),
-            )
+            .exec_command_streaming(ExecStreamingRequest {
+                timeout_ms: Some(5000),
+                output_callback: Some(Arc::new(|_, _| Box::pin(async { Ok(()) }))),
+                ..ExecStreamingRequest::new(BASH_ONLY_COMMAND)
+            })
             .await
             .unwrap();
 
@@ -1392,11 +1404,11 @@ mod tests {
         let stdin = b"first line\n$(touch must-not-run)\nlast line".to_vec();
 
         let result = sandbox
-            .exec_command_streaming(
-                ExecStreamingRequest::new("cat")
-                    .timeout_ms(Some(5000))
-                    .stdin(Some(stdin.clone())),
-            )
+            .exec_command_streaming(ExecStreamingRequest {
+                timeout_ms: Some(5000),
+                stdin: Some(stdin.clone()),
+                ..ExecStreamingRequest::new("cat")
+            })
             .await
             .unwrap();
 
@@ -1456,12 +1468,12 @@ mod tests {
         assert_eq!(non_streaming.stdout.trim(), "nonlogin");
 
         let streaming = sandbox
-            .exec_command_streaming(
-                ExecStreamingRequest::new(LOGIN_SHELL_REPORT)
-                    .timeout_ms(Some(5000))
-                    .env_vars(Some(&env_vars))
-                    .output_callback(Some(Arc::new(|_, _| Box::pin(async { Ok(()) })))),
-            )
+            .exec_command_streaming(ExecStreamingRequest {
+                timeout_ms: Some(5000),
+                env_vars: Some(&env_vars),
+                output_callback: Some(Arc::new(|_, _| Box::pin(async { Ok(()) }))),
+                ..ExecStreamingRequest::new(LOGIN_SHELL_REPORT)
+            })
             .await
             .unwrap();
         assert_eq!(streaming.result.stdout.trim(), "nonlogin");

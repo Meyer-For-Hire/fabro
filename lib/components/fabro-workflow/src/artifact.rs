@@ -234,19 +234,33 @@ pub async fn resolve_text_or_blob_ref(value: &Value, run_store: &RunStoreHandle)
 /// Managed `file://` references are normalized through their content-addressed
 /// blob id instead of reading an execution-local path. Ordinary strings and
 /// ordinary file references remain unchanged for the caller to validate.
-pub(crate) async fn resolve_json_value(value: &Value, run_store: &RunStoreHandle) -> Result<Value> {
-    let Some(reference) = value.as_str() else {
-        return Ok(value.clone());
-    };
-    let Some(blob_id) =
+pub(crate) async fn resolve_json_value(value: Value, run_store: &RunStoreHandle) -> Result<Value> {
+    let blob_id = value.as_str().and_then(|reference| {
         parse_blob_ref(reference).or_else(|| parse_managed_blob_file_ref(reference))
-    else {
-        return Ok(value.clone());
+    });
+    let Some(blob_id) = blob_id else {
+        return Ok(value);
     };
 
     let bytes = read_required_blob(&blob_id, run_store).await?;
     serde_json::from_slice(&bytes)
         .map_err(|err| Error::engine_with_source("artifact blob was not valid JSON", err))
+}
+
+/// Resolve a flat workflow context key (`context.NAME` or `NAME`) to a
+/// hydrated JSON value.
+///
+/// Returns `Ok(None)` when the key is absent from the context, and `Err` when
+/// the value exists but its blob reference could not be hydrated.
+pub(crate) async fn resolve_flat_context_value(
+    context: &Context,
+    key: &str,
+    run_store: &RunStoreHandle,
+) -> Result<Option<Value>> {
+    let Some(value) = context::lookup_flat(context, key) else {
+        return Ok(None);
+    };
+    resolve_json_value(value, run_store).await.map(Some)
 }
 
 pub async fn resolve_text_or_blob_ref_str(
@@ -584,14 +598,14 @@ mod tests {
         let handle = run_store.clone().into();
 
         assert_eq!(
-            resolve_json_value(&serde_json::json!(format_blob_ref(&blob_id)), &handle)
+            resolve_json_value(serde_json::json!(format_blob_ref(&blob_id)), &handle)
                 .await
                 .unwrap(),
             value
         );
         assert_eq!(
             resolve_json_value(
-                &serde_json::json!(format!("file:///sandbox/.fabro/blobs/{blob_id}.json")),
+                serde_json::json!(format!("file:///sandbox/.fabro/blobs/{blob_id}.json")),
                 &handle,
             )
             .await
@@ -606,7 +620,9 @@ mod tests {
         let value = serde_json::json!([1, 2, 3]);
 
         assert_eq!(
-            resolve_json_value(&value, &run_store.into()).await.unwrap(),
+            resolve_json_value(value.clone(), &run_store.into())
+                .await
+                .unwrap(),
             value
         );
     }
