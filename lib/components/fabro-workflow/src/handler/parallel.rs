@@ -143,6 +143,15 @@ fn item_label(item: &serde_json::Value, index: usize) -> String {
         .unwrap_or_else(|| index.to_string())
 }
 
+/// Most runtime items one `for_each` node will fan out over.
+///
+/// The source array is produced at runtime, often by a model, so its length is
+/// not something a workflow author reviewed. Each item holds a branch task and
+/// eventually a context fork, so an unbounded array degrades into memory
+/// exhaustion rather than a slow run. Refusing with a clear message beats
+/// dying part-way through a fan-out.
+const MAX_FOR_EACH_ITEMS: usize = 1_000;
+
 /// Stand-in for one runtime item during a dry run, where the real array does
 /// not exist yet.
 fn dry_run_placeholder_item() -> serde_json::Value {
@@ -235,6 +244,14 @@ async fn build_branch_plan(
             )));
         }
     };
+    if items.len() > MAX_FOR_EACH_ITEMS {
+        return Err(Outcome::fail_deterministic(format!(
+            "for_each source '{source}' resolved to {} items, above the limit of \
+             {MAX_FOR_EACH_ITEMS}. Filter the array in the node that produces it, or split the \
+             work across runs.",
+            items.len()
+        )));
+    }
 
     Ok(BranchPlan {
         work_items:         items
@@ -373,29 +390,13 @@ async fn run_branches(
             parallel_group_id.clone(),
             u32::try_from(branch_index).unwrap_or(u32::MAX),
         );
-        let branch_context = Context::from_values(parent_snapshot.as_ref().clone());
-        branch_context.set(
-            keys::INTERNAL_PARALLEL_GROUP_ID,
-            serde_json::Value::String(parallel_group_id.to_string()),
-        );
-        branch_context.set(
-            keys::INTERNAL_PARALLEL_BRANCH_ID,
-            serde_json::Value::String(parallel_branch_id.to_string()),
-        );
-        if let Some(entry) = branch_preambles
+        // Only the one entry this branch needs, so the fork below can wait
+        // until the branch actually holds a slot.
+        let branch_preamble = branch_preambles
             .as_ref()
             .and_then(|entries| entries.get(branch_index))
             .and_then(Option::as_ref)
-        {
-            branch_context.set(
-                keys::CURRENT_PREAMBLE,
-                serde_json::Value::String(entry.preamble.clone()),
-            );
-            branch_context.set(
-                keys::INTERNAL_FIDELITY,
-                serde_json::Value::String(entry.fidelity.to_string()),
-            );
-        }
+            .cloned();
 
         let mut branch_services = services.clone();
         branch_services.dry_run = simulated || services.dry_run;
@@ -427,6 +428,30 @@ async fn run_branches(
                     let retry_policy = retry::build_retry_policy(&target, &graph);
 
                     let mut permit = acquire_branch_permit(&semaphore, &branch_services).await?;
+                    // Fork the parent context only once this branch holds a
+                    // slot. Forking at dispatch time would keep one deep copy
+                    // alive per item, so a long `for_each` array would cost
+                    // memory proportional to its length rather than to
+                    // `max_parallel`.
+                    let branch_context = Context::from_values(parent_snapshot.as_ref().clone());
+                    branch_context.set(
+                        keys::INTERNAL_PARALLEL_GROUP_ID,
+                        serde_json::Value::String(group_id.to_string()),
+                    );
+                    branch_context.set(
+                        keys::INTERNAL_PARALLEL_BRANCH_ID,
+                        serde_json::Value::String(parallel_branch_id.to_string()),
+                    );
+                    if let Some(entry) = branch_preamble.as_ref() {
+                        branch_context.set(
+                            keys::CURRENT_PREAMBLE,
+                            serde_json::Value::String(entry.preamble.clone()),
+                        );
+                        branch_context.set(
+                            keys::INTERNAL_FIDELITY,
+                            serde_json::Value::String(entry.fidelity.to_string()),
+                        );
+                    }
                     // Only reserve once the branch is ready to become
                     // observable, so a branch cancelled while waiting on the
                     // semaphore never consumes an execution identity.
@@ -1624,6 +1649,72 @@ mod tests {
             labels,
             std::collections::HashSet::from(["alpha", "beta", "2"])
         );
+    }
+
+    #[tokio::test]
+    async fn for_each_refuses_an_array_above_the_item_limit() {
+        // The array is runtime data, so its length is not something a workflow
+        // author reviewed. Refuse before dispatching rather than exhausting
+        // memory part-way through the fan-out.
+        let (handler, calls) = ScriptedHandler::new(Scripted::Succeed);
+        let mut services = make_services();
+        services.registry = Arc::new(super::super::HandlerRegistry::new(handler));
+        let events = collect_events(&services.run.emitter);
+        let (node, graph) = for_each_graph("items", 4);
+        let context = test_context();
+        context.set(
+            "items",
+            serde_json::Value::Array(vec![
+                serde_json::json!({"name": "x"});
+                MAX_FOR_EACH_ITEMS + 1
+            ]),
+        );
+
+        let outcome = ParallelHandler
+            .execute(&node, &context, &graph, Path::new("/tmp/test"), &services)
+            .await
+            .unwrap();
+
+        assert!(outcome.status.is_failure());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            outcome
+                .failure
+                .as_ref()
+                .is_some_and(|failure| failure.message.contains("above the limit")),
+            "message should name the limit: {:?}",
+            outcome.failure
+        );
+        // Fails before the stage announces itself, like the other contract
+        // violations.
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|event| !event.event_name().starts_with("parallel."))
+        );
+    }
+
+    #[tokio::test]
+    async fn for_each_accepts_an_array_at_the_item_limit() {
+        let (handler, calls) = ScriptedHandler::new(Scripted::Succeed);
+        let mut services = make_services();
+        services.registry = Arc::new(super::super::HandlerRegistry::new(handler));
+        let (node, graph) = for_each_graph("items", 16);
+        let context = test_context();
+        context.set(
+            "items",
+            serde_json::Value::Array(vec![serde_json::json!({"name": "x"}); MAX_FOR_EACH_ITEMS]),
+        );
+
+        let outcome = ParallelHandler
+            .execute(&node, &context, &graph, Path::new("/tmp/test"), &services)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status, StageOutcome::Succeeded);
+        assert_eq!(calls.load(Ordering::SeqCst), MAX_FOR_EACH_ITEMS);
     }
 
     #[tokio::test]

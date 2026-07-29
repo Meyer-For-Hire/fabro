@@ -269,6 +269,10 @@ There is no item interpolation syntax. The fence prevents an item from closing
 its own data block, but it does not restrict an agent's tools; workflow authors
 must give the target only the tool access appropriate for untrusted item data.
 
+A source array above 1000 items fails the parallel stage before any branch
+starts. Filter the array in the node that produces it, or split the work across
+runs.
+
 Dynamic results retain input order. Each result uses the template target ID and
 adds a zero-based `index` plus `item_label`, derived from the item's `name`,
 then `label`, then its index. An empty array succeeds and proceeds directly to

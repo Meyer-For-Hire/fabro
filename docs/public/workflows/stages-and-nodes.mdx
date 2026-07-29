@@ -188,8 +188,8 @@ traverse nested objects.
 
 The template target must be an agent or prompt node, and nested `for_each` is
 rejected. An empty source array succeeds with `parallel.results=[]` and skips
-straight to `aggregate`. Missing, invalid, or non-array sources fail the
-parallel stage before any branches start.
+straight to `aggregate`. Missing, invalid, non-array, or over-long sources fail
+the parallel stage before any branches start; the limit is 1000 items.
 
 Because the checkout is shared, file changes from one branch are immediately visible to the others. Concurrent writes can race or overwrite each other. Fabro does not isolate branch files, lock paths, detect conflicts, or warn about overlapping writes. Design branches to be read-only or assign each branch disjoint files and directories when deterministic workspace changes matter.
 

@@ -29,6 +29,13 @@ leading `context.` and try again. Inline arrays and managed `blob://` or
 `file://` JSON references are accepted. The template target is limited to an
 agent or prompt node, and nested `for_each` is rejected.
 
+A source array above 1000 items fails deterministically before
+`parallel.started`. The array is runtime data, often model-produced, so its
+length is not something a workflow author reviewed. Each branch forks the
+parent context once it holds a `max_parallel` slot, so live memory tracks
+`max_parallel` rather than item count — the limit guards the queue of pending
+branch tasks and the plan itself.
+
 The parent context is not used as shared mutable branch state. A branch can
 change its context fork without exposing those changes as top-level values to
 other branches or to the parent.
