@@ -38,8 +38,7 @@ use fabro_validate::Severity;
 use fabro_workflow::Error as WorkflowError;
 use fabro_workflow::model_fallback::resolve_model_fallbacks;
 use fabro_workflow::operations::{
-    CreateRunInput, ValidateInput, WorkflowInput, validate, validate_with_catalog,
-    validate_with_ready_providers,
+    ValidateInput, WorkflowInput, validate, validate_with_catalog, validate_with_ready_providers,
 };
 use fabro_workflow::pipeline::Validated;
 use fabro_workflow::run_materialization::materialize_run_with_ready_providers;
@@ -56,21 +55,34 @@ pub(crate) struct PreparedManifest {
     pub cwd:              PathBuf,
     pub git:              Option<types::GitContext>,
     pub root_source:      String,
+    #[allow(
+        dead_code,
+        reason = "create now resolves identity in the run compiler adapter"
+    )]
     pub run_id:           Option<RunId>,
+    #[allow(
+        dead_code,
+        reason = "create now resolves lineage in the run compiler adapter"
+    )]
     pub parent_id:        Option<RunId>,
+    #[allow(
+        dead_code,
+        reason = "create now normalizes titles in the run compiler adapter"
+    )]
     pub title:            Option<String>,
     pub settings:         WorkflowSettings,
     pub target_path:      ManifestPath,
+    #[allow(dead_code, reason = "create now owns the bundle through run_compiler")]
     pub workflow_bundle:  WorkflowBundle,
     pub workflow_input:   BundledWorkflow,
     pub source_directory: PathBuf,
 }
 
 #[derive(Clone, Debug, Default)]
-struct ManifestSettingsOverrides {
-    run:             Option<RunLayer>,
-    cli:             Option<CliLayer>,
-    input_overrides: HashMap<String, toml::Value>,
+pub(crate) struct ManifestSettingsOverrides {
+    pub(crate) run:             Option<RunLayer>,
+    pub(crate) cli:             Option<CliLayer>,
+    pub(crate) input_overrides: HashMap<String, toml::Value>,
 }
 
 #[cfg(test)]
@@ -235,34 +247,6 @@ fn manifest_validate_input(
     }
 }
 
-pub(crate) fn create_run_input(
-    prepared: PreparedManifest,
-    configured_providers: Vec<ProviderId>,
-    provenance: RunProvenance,
-    web_url: Option<String>,
-    vars: HashMap<String, String>,
-) -> CreateRunInput {
-    CreateRunInput {
-        workflow: WorkflowInput::Bundled(prepared.workflow_input),
-        settings: prepared.settings,
-        vars,
-        cwd: prepared.cwd,
-        workflow_slug: None,
-        workflow_path: Some(prepared.target_path),
-        workflow_bundle: Some(prepared.workflow_bundle),
-        submitted_manifest_bytes: None,
-        run_id: prepared.run_id,
-        title: prepared.title,
-        automation: None,
-        git: prepared.git,
-        fork_source_ref: None,
-        parent_id: prepared.parent_id,
-        provenance,
-        configured_providers,
-        web_url,
-    }
-}
-
 pub(crate) async fn run_preflight(
     state: &AppState,
     prepared: &PreparedManifest,
@@ -387,7 +371,7 @@ fn settings_layer_with_resolved_dockerfiles(
     Ok(layer)
 }
 
-fn manifest_args_overrides(
+pub(crate) fn manifest_args_overrides(
     args: Option<&types::ManifestArgs>,
 ) -> Result<ManifestSettingsOverrides> {
     let Some(args) = args else {
@@ -468,7 +452,7 @@ fn resolve_manifest_dockerfile(
     Ok(())
 }
 
-fn manifest_project_config_path(
+pub(crate) fn manifest_project_config_path(
     config: &types::ManifestConfig,
     cwd: &Path,
 ) -> Result<ManifestPath> {

@@ -26,8 +26,7 @@ use crate::file_resolver::FileResolver;
 use crate::pipeline::types::PersistOptions;
 use crate::pipeline::{self, Persisted, TransformOptions, Validated};
 use crate::records::RunSpec;
-use crate::run_lookup::default_scratch_base;
-use crate::run_materialization::materialize_run;
+use crate::run_materialization;
 use crate::transforms::{ModelResolutionTransform, RenderMode};
 use crate::workflow_bundle::{RunDefinition, WorkflowBundle};
 
@@ -58,6 +57,36 @@ pub struct CreateRunInput {
     pub web_url: Option<String>,
 }
 
+/// Inputs needed to resolve and compile a workflow for run creation.
+#[derive(Clone, Debug)]
+pub struct CreateRunCompileInput {
+    pub workflow:             WorkflowInput,
+    pub settings:             WorkflowSettings,
+    pub vars:                 HashMap<String, String>,
+    pub cwd:                  PathBuf,
+    pub workflow_path:        Option<ManifestPath>,
+    pub workflow_bundle:      Option<WorkflowBundle>,
+    pub configured_providers: Vec<ProviderId>,
+}
+
+/// Durable metadata joined to a materialized workflow before persistence.
+/// `run_id` is already resolved, and `storage_root` is used to derive the
+/// run's scratch directory during pure input assembly.
+#[derive(Clone, Debug)]
+pub struct CreateRunPersistenceMetadata {
+    pub run_id: RunId,
+    pub storage_root: PathBuf,
+    pub workflow_slug: Option<String>,
+    pub submitted_manifest_bytes: Option<Vec<u8>>,
+    pub title: Option<String>,
+    pub automation: Option<AutomationRef>,
+    pub git: Option<GitContext>,
+    pub fork_source_ref: Option<ForkSourceRef>,
+    pub parent_id: Option<RunId>,
+    pub provenance: RunProvenance,
+    pub web_url: Option<String>,
+}
+
 #[derive(Debug)]
 pub struct CreatedRun {
     pub persisted: Persisted,
@@ -66,20 +95,132 @@ pub struct CreatedRun {
     pub dot_path:  Option<PathBuf>,
 }
 
-struct PersistCreateOptions {
+/// Result of resolving, preprocessing, validating, and promoting a workflow
+/// for run creation. Model selectors in the graph are resolved, while the run
+/// settings still reflect the compiled source and have not been materialized.
+pub struct CompiledRun {
+    validated:            Validated,
     settings:             WorkflowSettings,
-    run_id:               Option<RunId>,
-    run_dir:              Option<PathBuf>,
+    raw_source:           String,
     workflow_slug:        Option<String>,
-    source_name:          Option<String>,
+    workflow_config:      Option<String>,
+    dot_path:             Option<PathBuf>,
+    current_dir:          Option<PathBuf>,
+    file_resolver:        Option<Arc<dyn FileResolver>>,
+    definition:           Option<RunDefinition>,
+    source_directory:     String,
     labels:               HashMap<String, String>,
-    source_directory:     Option<String>,
-    automation:           Option<AutomationRef>,
-    git:                  Option<GitContext>,
-    fork_source_ref:      Option<ForkSourceRef>,
-    provenance:           RunProvenance,
     configured_providers: Vec<ProviderId>,
-    catalog:              Arc<Catalog>,
+}
+
+impl CompiledRun {
+    pub fn validated(&self) -> &Validated {
+        &self.validated
+    }
+
+    pub fn settings(&self) -> &WorkflowSettings {
+        &self.settings
+    }
+
+    pub fn resolved_source(&self) -> &str {
+        &self.raw_source
+    }
+
+    pub fn workflow_slug(&self) -> Option<&str> {
+        self.workflow_slug.as_deref()
+    }
+
+    pub fn workflow_config(&self) -> Option<&str> {
+        self.workflow_config.as_deref()
+    }
+
+    pub fn dot_path(&self) -> Option<&Path> {
+        self.dot_path.as_deref()
+    }
+
+    pub fn current_dir(&self) -> Option<&Path> {
+        self.current_dir.as_deref()
+    }
+
+    pub fn file_resolver(&self) -> Option<Arc<dyn FileResolver>> {
+        self.file_resolver.clone()
+    }
+
+    pub fn definition(&self) -> Option<&RunDefinition> {
+        self.definition.as_ref()
+    }
+
+    pub fn source_directory(&self) -> &str {
+        &self.source_directory
+    }
+
+    pub fn labels(&self) -> &HashMap<String, String> {
+        &self.labels
+    }
+}
+
+/// Compiled workflow with its run-level model settings materialized against
+/// the same provider snapshot used during compilation.
+pub struct MaterializedRun {
+    compiled: CompiledRun,
+    settings: WorkflowSettings,
+}
+
+impl MaterializedRun {
+    pub fn compiled(&self) -> &CompiledRun {
+        &self.compiled
+    }
+
+    pub fn settings(&self) -> &WorkflowSettings {
+        &self.settings
+    }
+}
+
+/// Complete input for creating a durable run. The run ID and run directory
+/// are resolved during assembly, before persistence begins.
+pub struct CreateRunPersistenceInput {
+    materialized: MaterializedRun,
+    run_id: RunId,
+    run_dir: PathBuf,
+    workflow_slug: Option<String>,
+    submitted_manifest_bytes: Option<Vec<u8>>,
+    title: Option<String>,
+    automation: Option<AutomationRef>,
+    git: Option<GitContext>,
+    fork_source_ref: Option<ForkSourceRef>,
+    parent_id: Option<RunId>,
+    provenance: RunProvenance,
+    web_url: Option<String>,
+}
+
+impl CreateRunPersistenceInput {
+    pub fn materialized(&self) -> &MaterializedRun {
+        &self.materialized
+    }
+
+    pub fn run_id(&self) -> RunId {
+        self.run_id
+    }
+
+    pub fn run_dir(&self) -> &Path {
+        &self.run_dir
+    }
+
+    pub fn workflow_slug(&self) -> Option<&str> {
+        self.workflow_slug.as_deref()
+    }
+
+    pub fn submitted_manifest_bytes(&self) -> Option<&[u8]> {
+        self.submitted_manifest_bytes.as_deref()
+    }
+
+    pub fn automation(&self) -> Option<&AutomationRef> {
+        self.automation.as_ref()
+    }
+
+    pub fn definition(&self) -> Option<&RunDefinition> {
+        self.materialized.compiled.definition.as_ref()
+    }
 }
 
 /// Resolve workflow inputs, normalize settings using the caller-provided
@@ -90,96 +231,278 @@ pub async fn create(
     storage_root: PathBuf,
     catalog: Arc<Catalog>,
 ) -> Result<CreatedRun, Error> {
-    let resolved = resolve_workflow(ResolveWorkflowInput {
-        workflow: request.workflow,
-        settings: request.settings,
-        cwd:      request.cwd,
+    let run_id = request.run_id.unwrap_or_default();
+    let persistence_input = spawn_blocking(move || {
+        let CreateRunInput {
+            workflow,
+            settings,
+            vars,
+            cwd,
+            workflow_slug,
+            workflow_path,
+            workflow_bundle,
+            submitted_manifest_bytes,
+            run_id: _,
+            title,
+            automation,
+            git,
+            fork_source_ref,
+            parent_id,
+            provenance,
+            configured_providers,
+            web_url,
+        } = request;
+        let compiled = compile_create_run(
+            CreateRunCompileInput {
+                workflow,
+                settings,
+                vars,
+                cwd,
+                workflow_path,
+                workflow_bundle,
+                configured_providers,
+            },
+            Arc::clone(&catalog),
+        )?;
+        let materialized = materialize_create_run(compiled, catalog.as_ref())?;
+        Ok::<_, Error>(assemble_create_run_persistence_input(
+            materialized,
+            CreateRunPersistenceMetadata {
+                run_id,
+                storage_root,
+                workflow_slug,
+                submitted_manifest_bytes,
+                title,
+                automation,
+                git,
+                fork_source_ref,
+                parent_id,
+                provenance,
+                web_url,
+            },
+        ))
     })
-    .map_err(|err| Error::Parse(err.to_string()))?;
-    let labels = resolved.settings.combined_labels();
-    let settings = resolved.settings.clone();
+    .await
+    .map_err(|err| Error::engine_with_source("workflow create task failed", err))??;
 
-    let CreateRunInput {
-        workflow: _,
-        settings: _,
+    Box::pin(persist_create_run(store, persistence_input)).await
+}
+
+/// Resolve, preprocess, validate, and promote a workflow for run creation.
+///
+/// This stage is synchronous and may read workflow files. Async callers must
+/// run it on a blocking thread.
+pub fn compile_create_run(
+    input: CreateRunCompileInput,
+    catalog: Arc<Catalog>,
+) -> Result<CompiledRun, Error> {
+    let CreateRunCompileInput {
+        workflow,
+        settings,
         vars,
-        cwd: _,
-        workflow_slug,
+        cwd,
         workflow_path,
         workflow_bundle,
-        submitted_manifest_bytes,
+        configured_providers,
+    } = input;
+    let resolved = resolve_workflow(ResolveWorkflowInput {
+        workflow,
+        settings,
+        cwd,
+    })
+    .map_err(|err| Error::Parse(err.to_string()))?;
+    let settings = resolved.settings;
+    let labels = settings.combined_labels();
+    let workflow_config = resolved
+        .workflow_toml_path
+        .as_deref()
+        .and_then(|path| std::fs::read_to_string(path).ok());
+    let source_name = resolved
+        .dot_path
+        .as_ref()
+        .map(|path| path.display().to_string());
+    let definition = match (workflow_path, workflow_bundle) {
+        (Some(workflow_path), Some(workflow_bundle)) => {
+            let bundled = workflow_bundle.workflow(&workflow_path).ok_or_else(|| {
+                Error::Parse("workflow path is missing from workflow bundle".to_string())
+            })?;
+            if bundled.source != resolved.raw_source {
+                return Err(Error::Parse(
+                    "resolved workflow does not match workflow bundle entrypoint".to_string(),
+                ));
+            }
+            Some(RunDefinition::new(workflow_path, workflow_bundle))
+        }
+        (None, None) => None,
+        _ => {
+            return Err(Error::Parse(
+                "workflow path and workflow bundle must be provided together".to_string(),
+            ));
+        }
+    };
+    let mut validated = preprocess_and_validate(
+        &resolved.raw_source,
+        resolved.goal_override.as_deref(),
+        &TransformOptions {
+            current_dir: resolved.current_dir.clone(),
+            file_resolver: resolved.file_resolver.clone(),
+            template_context: template_context(Some(&settings), vars),
+            source_name,
+            render_mode: RenderMode::Structural,
+            custom_transforms: Vec::new(),
+            model_resolution: Some(
+                ModelResolutionTransform::for_eligible(
+                    catalog,
+                    configured_providers.iter().cloned().collect(),
+                )
+                .with_default_provider(configured_default_provider(&settings)),
+            ),
+        },
+    )?;
+
+    validated.promote_template_undefined_variables_to_errors();
+    if validated.has_errors() {
+        return Err(Error::ValidationFailed {
+            diagnostics: validated.diagnostics().to_vec(),
+        });
+    }
+
+    Ok(CompiledRun {
+        validated,
+        settings,
+        raw_source: resolved.raw_source,
+        workflow_slug: resolved.workflow_slug,
+        workflow_config,
+        dot_path: resolved.dot_path,
+        current_dir: resolved.current_dir,
+        file_resolver: resolved.file_resolver,
+        definition,
+        source_directory: resolved.working_directory.to_string_lossy().to_string(),
+        labels,
+        configured_providers,
+    })
+}
+
+/// Materialize run-level model settings from a compiled workflow.
+pub fn materialize_create_run(
+    compiled: CompiledRun,
+    catalog: &Catalog,
+) -> Result<MaterializedRun, Error> {
+    let settings = run_materialization::materialize_run(
+        compiled.settings.clone(),
+        compiled.validated.graph(),
+        catalog,
+        &compiled.configured_providers,
+    )?;
+    Ok(MaterializedRun { compiled, settings })
+}
+
+/// Assemble all inputs needed for persistence without I/O or recompilation.
+pub fn assemble_create_run_persistence_input(
+    materialized: MaterializedRun,
+    metadata: CreateRunPersistenceMetadata,
+) -> CreateRunPersistenceInput {
+    let CreateRunPersistenceMetadata {
         run_id,
+        storage_root,
+        workflow_slug,
+        submitted_manifest_bytes,
         title,
         automation,
         git,
         fork_source_ref,
         parent_id,
         provenance,
-        configured_providers,
         web_url,
-    } = request;
+    } = metadata;
+    let run_dir = Storage::new(storage_root)
+        .run_scratch(&run_id)
+        .root()
+        .to_path_buf();
+    let workflow_slug = workflow_slug.or_else(|| materialized.compiled.workflow_slug.clone());
 
-    let run_id = run_id.unwrap_or_else(RunId::new);
-    let storage = Storage::new(storage_root);
-    let run_dir = storage.run_scratch(&run_id).root().to_path_buf();
-    let source_directory = Some(resolved.working_directory.to_string_lossy().to_string());
+    CreateRunPersistenceInput {
+        materialized,
+        run_id,
+        run_dir,
+        workflow_slug,
+        submitted_manifest_bytes,
+        title,
+        automation,
+        git,
+        fork_source_ref,
+        parent_id,
+        provenance,
+        web_url,
+    }
+}
 
-    let goal_override = resolved.goal_override.clone();
-    let current_dir = resolved.current_dir.clone();
-    let file_resolver = resolved.file_resolver.clone();
-    let resolved_workflow_slug = resolved.workflow_slug.clone();
+/// Persist one already-compiled and materialized run without recompiling it.
+pub async fn persist_create_run(
+    store: &Database,
+    input: CreateRunPersistenceInput,
+) -> Result<CreatedRun, Error> {
+    let CreateRunPersistenceInput {
+        materialized,
+        run_id,
+        run_dir,
+        workflow_slug,
+        submitted_manifest_bytes,
+        title,
+        automation,
+        git,
+        fork_source_ref,
+        parent_id,
+        provenance,
+        web_url,
+    } = input;
+    let MaterializedRun { compiled, settings } = materialized;
+    let CompiledRun {
+        validated,
+        settings: _,
+        raw_source,
+        workflow_slug: _,
+        workflow_config,
+        dot_path,
+        current_dir: _,
+        file_resolver: _,
+        definition,
+        source_directory,
+        labels,
+        configured_providers: _,
+    } = compiled;
     let persisted_run_dir = run_dir.clone();
-    let accepted_definition = match (&workflow_path, &workflow_bundle) {
-        (Some(workflow_path), Some(workflow_bundle)) => Some(RunDefinition::new(
-            workflow_path.clone(),
-            workflow_bundle.clone(),
-        )),
-        _ => None,
-    };
-
-    let raw_source = resolved.raw_source.clone();
-    let source_name = resolved
-        .dot_path
-        .as_ref()
-        .map(|path| path.display().to_string());
     let persisted = spawn_blocking(move || {
-        create_from_source(
-            &raw_source,
-            vars,
-            PersistCreateOptions {
-                settings,
-                run_id: Some(run_id),
-                run_dir: Some(persisted_run_dir),
-                workflow_slug: workflow_slug.or(resolved_workflow_slug),
-                source_name,
-                labels,
-                source_directory,
-                automation,
-                git,
-                fork_source_ref,
-                provenance,
-                configured_providers,
-                catalog,
-            },
-            current_dir,
-            file_resolver,
-            goal_override.as_deref(),
-        )
+        let run_spec = RunSpec {
+            run_id,
+            settings,
+            graph: validated.graph().clone(),
+            graph_source: Some(validated.source().to_string()),
+            workflow_slug,
+            automation,
+            source_directory: Some(source_directory),
+            labels,
+            provenance,
+            manifest_blob: None,
+            definition_blob: None,
+            git,
+            fork_source_ref,
+        };
+        pipeline::persist(validated, PersistOptions {
+            run_dir: persisted_run_dir,
+            run_spec,
+        })
     })
     .await
     .map_err(|err| Error::engine_with_source("workflow create task failed", err))??;
 
-    let workflow_config = resolved
-        .workflow_toml_path
-        .as_deref()
-        .and_then(|path| std::fs::read_to_string(path).ok());
     persist_created_run(
         store,
         &persisted,
-        &resolved.raw_source,
+        &raw_source,
         workflow_config,
         submitted_manifest_bytes.as_deref(),
-        accepted_definition.as_ref(),
+        definition.as_ref(),
         title,
         parent_id,
         web_url,
@@ -190,7 +513,7 @@ pub async fn create(
         persisted,
         run_id,
         run_dir,
-        dot_path: resolved.dot_path,
+        dot_path,
     })
 }
 
@@ -285,40 +608,6 @@ fn store_error(err: impl std::fmt::Display) -> Error {
     Error::engine(err.to_string())
 }
 
-fn create_from_source(
-    dot_source: &str,
-    vars: HashMap<String, String>,
-    options: PersistCreateOptions,
-    current_dir: Option<PathBuf>,
-    file_resolver: Option<Arc<dyn FileResolver>>,
-    goal_override: Option<&str>,
-) -> Result<Persisted, Error> {
-    let mut validated = preprocess_and_validate(dot_source, goal_override, &TransformOptions {
-        current_dir,
-        file_resolver,
-        template_context: template_context(Some(&options.settings), vars),
-        source_name: options.source_name.clone(),
-        render_mode: RenderMode::Structural,
-        custom_transforms: Vec::new(),
-        model_resolution: Some(
-            ModelResolutionTransform::for_eligible(
-                Arc::clone(&options.catalog),
-                options.configured_providers.iter().cloned().collect(),
-            )
-            .with_default_provider(configured_default_provider(&options.settings)),
-        ),
-    })?;
-
-    validated.promote_template_undefined_variables_to_errors();
-    if validated.has_errors() {
-        return Err(Error::ValidationFailed {
-            diagnostics: validated.diagnostics().to_vec(),
-        });
-    }
-
-    persist_validated(validated, options)
-}
-
 /// Parse, transform, and validate `dot_source`.
 ///
 /// `options.model_resolution` drives both halves of catalog awareness: it
@@ -376,59 +665,6 @@ fn apply_goal_override(graph: &mut Graph, goal_override: Option<&str>) {
     }
 }
 
-fn persist_validated(
-    validated: Validated,
-    options: PersistCreateOptions,
-) -> Result<Persisted, Error> {
-    let PersistCreateOptions {
-        settings,
-        run_id,
-        run_dir,
-        workflow_slug,
-        source_name: _,
-        labels,
-        source_directory,
-        automation,
-        git,
-        fork_source_ref,
-        provenance,
-        configured_providers,
-        catalog,
-    } = options;
-
-    let settings = materialize_run(
-        settings,
-        validated.graph(),
-        catalog.as_ref(),
-        &configured_providers,
-    )?;
-
-    let run_id = run_id.unwrap_or_else(RunId::new);
-    let run_dir = run_dir.unwrap_or_else(|| default_run_dir(&run_id));
-
-    let run_spec = RunSpec {
-        run_id,
-        settings,
-        graph: validated.graph().clone(),
-        graph_source: Some(validated.source().to_string()),
-        workflow_slug,
-        automation,
-        source_directory,
-        labels,
-        provenance,
-        manifest_blob: None,
-        definition_blob: None,
-        git,
-        fork_source_ref,
-    };
-
-    pipeline::persist(validated, PersistOptions { run_dir, run_spec })
-}
-
-pub(crate) fn default_run_dir(run_id: &RunId) -> PathBuf {
-    make_run_dir(&default_scratch_base(), run_id)
-}
-
 pub fn make_run_dir(scratch_base: &Path, run_id: &RunId) -> PathBuf {
     fabro_config::RunScratch::for_run(scratch_base, run_id)
         .root()
@@ -456,6 +692,7 @@ mod tests {
     use object_store::memory::InMemory;
 
     use super::*;
+    use crate::file_resolver::FileResolver;
     use crate::operations::{ValidateInput, validate, validate_with_catalog};
     use crate::pipeline::types::{GOAL_SELF_REFERENCE_RULE, TEMPLATE_UNDEFINED_VARIABLE_RULE};
     use crate::transforms::Transform;
@@ -545,6 +782,38 @@ reasoning = false
 
     fn test_provider_ids() -> Vec<ProviderId> {
         Catalog::builtin().all_provider_ids().into_iter().collect()
+    }
+
+    fn compile_input(request: &CreateRunInput) -> CreateRunCompileInput {
+        CreateRunCompileInput {
+            workflow:             request.workflow.clone(),
+            settings:             request.settings.clone(),
+            vars:                 request.vars.clone(),
+            cwd:                  request.cwd.clone(),
+            workflow_path:        request.workflow_path.clone(),
+            workflow_bundle:      request.workflow_bundle.clone(),
+            configured_providers: request.configured_providers.clone(),
+        }
+    }
+
+    fn persistence_metadata(
+        request: &CreateRunInput,
+        run_id: RunId,
+        storage_root: &Path,
+    ) -> CreateRunPersistenceMetadata {
+        CreateRunPersistenceMetadata {
+            run_id,
+            storage_root: storage_root.to_path_buf(),
+            workflow_slug: request.workflow_slug.clone(),
+            submitted_manifest_bytes: request.submitted_manifest_bytes.clone(),
+            title: request.title.clone(),
+            automation: request.automation.clone(),
+            git: request.git.clone(),
+            fork_source_ref: request.fork_source_ref.clone(),
+            parent_id: request.parent_id,
+            provenance: request.provenance.clone(),
+            web_url: request.web_url.clone(),
+        }
     }
 
     fn validate_dot(dot_source: &str, settings: WorkflowSettings) -> Validated {
@@ -1334,6 +1603,244 @@ reasoning = false
                 .get("prompt")
                 .and_then(AttrValue::as_str),
             Some("Bundled prompt")
+        );
+    }
+
+    #[test]
+    fn assemble_create_run_persistence_input_resolves_complete_durable_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage_root = dir.path().join("storage");
+        let automation = AutomationRef {
+            id:         "nightly".to_string(),
+            name:       Some("Nightly".to_string()),
+            trigger_id: Some("schedule_1".to_string()),
+        };
+        let request = CreateRunInput {
+            workflow: WorkflowInput::DotSource {
+                source:   MINIMAL_DOT.to_string(),
+                base_dir: None,
+            },
+            settings: test_default_settings(),
+            vars: HashMap::new(),
+            cwd: dir.path().to_path_buf(),
+            workflow_slug: Some("request-slug".to_string()),
+            workflow_path: None,
+            workflow_bundle: None,
+            submitted_manifest_bytes: Some(b"submitted manifest".to_vec()),
+            run_id: Some(fixtures::RUN_1),
+            title: Some("Assembled run".to_string()),
+            automation: Some(automation.clone()),
+            git: None,
+            fork_source_ref: None,
+            parent_id: Some(fixtures::RUN_2),
+            provenance: test_support::test_run_provenance(),
+            configured_providers: test_provider_ids(),
+            web_url: Some("https://fabro.test/runs/1".to_string()),
+        };
+        let catalog = test_catalog();
+        let resolved_run_id = fixtures::RUN_64;
+
+        let compiled = compile_create_run(compile_input(&request), Arc::clone(&catalog)).unwrap();
+        let materialized = materialize_create_run(compiled, catalog.as_ref()).unwrap();
+        let metadata = persistence_metadata(&request, resolved_run_id, &storage_root);
+        let input = assemble_create_run_persistence_input(materialized, metadata);
+
+        assert_eq!(input.run_id(), resolved_run_id);
+        assert_eq!(
+            input.run_dir(),
+            Storage::new(&storage_root)
+                .run_scratch(&resolved_run_id)
+                .root()
+        );
+        assert_eq!(input.workflow_slug(), Some("request-slug"));
+        assert_eq!(
+            input.submitted_manifest_bytes(),
+            Some(b"submitted manifest".as_slice())
+        );
+        assert_eq!(input.automation(), Some(&automation));
+        assert_eq!(
+            input.materialized().settings().run.model.name.as_deref(),
+            Some("claude-sonnet-5")
+        );
+    }
+
+    #[test]
+    fn compile_create_run_rejects_mismatched_bundle_definition() {
+        let workflow_path = ManifestPath::from_wire("workflows/main.fabro").unwrap();
+        let compiled_workflow = BundledWorkflow {
+            path:   workflow_path.clone(),
+            source: MINIMAL_DOT.to_string(),
+            config: None,
+            files:  HashMap::new(),
+        };
+        let mismatched_bundle =
+            WorkflowBundle::new(HashMap::from([(workflow_path.clone(), BundledWorkflow {
+                source: MINIMAL_DOT.replace("Build feature", "Different goal"),
+                ..compiled_workflow.clone()
+            })]));
+
+        let Err(error) = compile_create_run(
+            CreateRunCompileInput {
+                workflow:             WorkflowInput::Bundled(compiled_workflow),
+                settings:             test_default_settings(),
+                vars:                 HashMap::new(),
+                cwd:                  PathBuf::from("/tmp/project"),
+                workflow_path:        Some(workflow_path),
+                workflow_bundle:      Some(mismatched_bundle),
+                configured_providers: test_provider_ids(),
+            },
+            test_catalog(),
+        ) else {
+            panic!("mismatched accepted definition should fail");
+        };
+
+        assert!(matches!(error, Error::Parse(message) if message ==
+            "resolved workflow does not match workflow bundle entrypoint"));
+    }
+
+    #[test]
+    fn compile_create_run_exposes_resolved_metadata_and_definition() {
+        let workflow_path = ManifestPath::from_wire("workflows/main.fabro").unwrap();
+        let bundled = BundledWorkflow {
+            path:   workflow_path.clone(),
+            source: MINIMAL_DOT.to_string(),
+            config: None,
+            files:  HashMap::new(),
+        };
+        let bundle = WorkflowBundle::new(HashMap::from([(workflow_path.clone(), bundled.clone())]));
+        let compiled = compile_create_run(
+            CreateRunCompileInput {
+                workflow:             WorkflowInput::Bundled(bundled),
+                settings:             test_default_settings(),
+                vars:                 HashMap::new(),
+                cwd:                  PathBuf::from("/tmp/project"),
+                workflow_path:        Some(workflow_path.clone()),
+                workflow_bundle:      Some(bundle),
+                configured_providers: test_provider_ids(),
+            },
+            test_catalog(),
+        )
+        .unwrap();
+
+        assert_eq!(compiled.resolved_source(), MINIMAL_DOT);
+        assert_eq!(compiled.current_dir(), Some(Path::new("workflows")));
+        assert_eq!(compiled.dot_path(), Some(workflow_path.as_path()));
+        assert!(compiled.file_resolver().is_some());
+        assert_eq!(compiled.labels(), &compiled.settings().combined_labels());
+        let materialized = materialize_create_run(compiled, test_catalog().as_ref()).unwrap();
+        let input =
+            assemble_create_run_persistence_input(materialized, CreateRunPersistenceMetadata {
+                run_id: fixtures::RUN_1,
+                storage_root: PathBuf::from("/tmp/storage"),
+                workflow_slug: None,
+                submitted_manifest_bytes: None,
+                title: None,
+                automation: None,
+                git: None,
+                fork_source_ref: None,
+                parent_id: None,
+                provenance: test_support::test_run_provenance(),
+                web_url: None,
+            });
+        let definition = input
+            .definition()
+            .expect("bundled create input should retain a run definition");
+        assert_eq!(definition.workflow_path, workflow_path);
+    }
+
+    #[tokio::test]
+    async fn persist_create_run_uses_compiled_graph_without_recompiling_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage_root = dir.path().join("storage");
+        let dot_path = dir.path().join("workflow.fabro");
+        let compiled_source = MINIMAL_DOT.replace("Build feature", "Compiled goal");
+        std::fs::write(&dot_path, &compiled_source).unwrap();
+        let automation = AutomationRef {
+            id:         "nightly".to_string(),
+            name:       Some("Nightly".to_string()),
+            trigger_id: Some("schedule_1".to_string()),
+        };
+        let request = CreateRunInput {
+            workflow: WorkflowInput::Path(dot_path.clone()),
+            settings: test_default_settings(),
+            vars: HashMap::new(),
+            cwd: dir.path().to_path_buf(),
+            workflow_slug: Some("compiled-slug".to_string()),
+            workflow_path: None,
+            workflow_bundle: None,
+            submitted_manifest_bytes: Some(b"submitted manifest".to_vec()),
+            run_id: Some(fixtures::RUN_2),
+            title: Some("Compiled run".to_string()),
+            automation: Some(automation.clone()),
+            git: None,
+            fork_source_ref: None,
+            parent_id: None,
+            provenance: test_support::test_run_provenance(),
+            configured_providers: test_provider_ids(),
+            web_url: None,
+        };
+        let catalog = test_catalog();
+        let workflow_config_path = dir.path().join("workflow.toml");
+        std::fs::write(
+            &workflow_config_path,
+            "_version = 1\n[workflow]\ngraph = \"workflow.fabro\"\n",
+        )
+        .unwrap();
+        let compiled = compile_create_run(compile_input(&request), Arc::clone(&catalog)).unwrap();
+        assert_eq!(
+            compiled.workflow_config(),
+            Some("_version = 1\n[workflow]\ngraph = \"workflow.fabro\"\n")
+        );
+
+        std::fs::write(&dot_path, "this is no longer a graph").unwrap();
+        std::fs::write(&workflow_config_path, "changed after compilation").unwrap();
+
+        let materialized = materialize_create_run(compiled, catalog.as_ref()).unwrap();
+        let metadata = persistence_metadata(&request, fixtures::RUN_2, &storage_root);
+        let input = assemble_create_run_persistence_input(materialized, metadata);
+        let store = memory_store();
+        let created = persist_create_run(store.as_ref(), input).await.unwrap();
+
+        assert_eq!(created.run_id, fixtures::RUN_2);
+        assert_eq!(created.dot_path.as_deref(), Some(dot_path.as_path()));
+        assert_eq!(created.persisted.graph().goal(), "Compiled goal");
+        assert_eq!(created.persisted.source(), compiled_source);
+
+        let run_store = store.open_run_reader(&fixtures::RUN_2).await.unwrap();
+        let state = run_store.state().await.unwrap();
+        assert_eq!(state.spec.graph.goal(), "Compiled goal");
+        assert_eq!(state.spec.automation, Some(automation));
+        let events = run_store.list_events().await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.event.event_name())
+                .collect::<Vec<_>>(),
+            vec!["run.created", "run.submitted"]
+        );
+        let EventBody::RunCreated(created) = &events[0].event.body else {
+            panic!("first durable event should be run.created");
+        };
+        assert_eq!(
+            created.workflow_source.as_deref(),
+            Some(compiled_source.as_str())
+        );
+        assert_eq!(
+            created.workflow_config.as_deref(),
+            Some("_version = 1\n[workflow]\ngraph = \"workflow.fabro\"\n")
+        );
+        let manifest_blob = created
+            .manifest_blob
+            .as_ref()
+            .expect("submitted manifest should be persisted");
+        assert_eq!(
+            run_store
+                .read_blob(manifest_blob)
+                .await
+                .unwrap()
+                .expect("submitted manifest blob should exist")
+                .as_ref(),
+            b"submitted manifest"
         );
     }
 
