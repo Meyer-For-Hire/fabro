@@ -233,7 +233,7 @@ fn validated_stdin_source(node: &Node) -> Result<Option<&str>, String> {
     match node.context_key_attr("stdin_source") {
         ContextKeyAttr::Absent => Ok(None),
         ContextKeyAttr::Invalid => Err(format!(
-            "Command node '{}' requires 'stdin_source' to be a non-empty string",
+            "Node '{}' requires 'stdin_source' to be a non-empty string",
             node.id
         )),
         ContextKeyAttr::Present(source) => Ok(Some(source)),
