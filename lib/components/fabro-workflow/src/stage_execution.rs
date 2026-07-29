@@ -155,6 +155,23 @@ impl StageExecutionTracker {
         Self::reserve_locked(&mut state, node_id, graph_visit)
     }
 
+    /// Allocate an execution ordinal without changing the node's active
+    /// lifecycle scope or consuming resume provenance.
+    ///
+    /// Parallel branch dispatches use detached reservations because several
+    /// executions of one template node may run concurrently, while the parent
+    /// parallel stage remains the owner of resume provenance.
+    pub(crate) fn reserve_detached(&self, node_id: &str, graph_visit: u32) -> Arc<StageExecution> {
+        let mut state = self.lock();
+        let node = state.entry(node_id.to_owned()).or_default();
+        node.high_water = node.high_water.saturating_add(1);
+        Arc::new(StageExecution {
+            stage_id: StageId::new(node_id, node.high_water),
+            graph_visit,
+            resumed_from: None,
+        })
+    }
+
     /// The active scope for the node, reserving one only when none exists.
     /// Later attempts within one execution and checkpoint pre-steps reuse the
     /// first attempt's reservation.
@@ -303,6 +320,34 @@ mod tests {
         assert_eq!(second.resumed_from, None);
     }
 
+    #[test]
+    fn detached_reservation_preserves_active_scope_and_resume_provenance() {
+        let projection = projection_with_stages(&[("work", 1, 6)]);
+        let seed = StageExecutionSeed::from_projection(&projection, 5);
+        let tracker = StageExecutionTracker::seeded(seed);
+
+        let detached = tracker.reserve_detached("work", 1);
+        assert_eq!(detached.stage_id, StageId::new("work", 2));
+        assert_eq!(detached.resumed_from, None);
+        assert_eq!(tracker.active("work"), None);
+
+        let normal = tracker.reserve("work", 1);
+        assert_eq!(normal.stage_id, StageId::new("work", 3));
+        assert_eq!(normal.resumed_from, Some(StageId::new("work", 1)));
+        assert_eq!(tracker.active("work"), Some(normal));
+    }
+
+    #[test]
+    fn detached_reservation_does_not_replace_existing_active_scope() {
+        let tracker = StageExecutionTracker::default();
+        let active = tracker.reserve("work", 1);
+
+        let detached = tracker.reserve_detached("work", 1);
+
+        assert_eq!(detached.stage_id, StageId::new("work", 2));
+        assert_eq!(tracker.active("work"), Some(active));
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn concurrent_reservations_stay_unique_per_node() {
         let tracker = StageExecutionTracker::default();
@@ -319,6 +364,25 @@ mod tests {
         }
         ordinals.sort_unstable();
         assert_eq!(ordinals, (1..=8).collect::<Vec<_>>());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_detached_reservations_stay_unique_without_becoming_active() {
+        let tracker = StageExecutionTracker::default();
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let tracker = tracker.clone();
+                tokio::spawn(async move { tracker.reserve_detached("branch", 1).stage_id.visit() })
+            })
+            .collect();
+
+        let mut ordinals = Vec::new();
+        for handle in handles {
+            ordinals.push(handle.await.expect("reservation task panicked"));
+        }
+        ordinals.sort_unstable();
+        assert_eq!(ordinals, (1..=8).collect::<Vec<_>>());
+        assert_eq!(tracker.active("branch"), None);
     }
 
     #[tokio::test(flavor = "multi_thread")]

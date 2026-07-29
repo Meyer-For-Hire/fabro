@@ -252,4 +252,65 @@ describe("ParallelChildren", () => {
       statValue(completed, "Failed"),
     ]).toEqual(["0", "0"]);
   });
+
+  test("uses item labels and avoids ambiguous id-only links", () => {
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(
+        <MemoryRouter>
+          <ParallelChildren
+            stage={parallelStage}
+            events={[
+              event({
+                properties: {
+                  duration_ms: 100,
+                  success_count: 2,
+                  failure_count: 0,
+                  results: [
+                    {
+                      id: "reviewer",
+                      index: 0,
+                      item_label: "auth",
+                      status: "succeeded",
+                      context_updates: {},
+                    },
+                    {
+                      id: "reviewer",
+                      index: 1,
+                      item_label: "api",
+                      status: "succeeded",
+                      context_updates: {},
+                    },
+                  ],
+                },
+              }),
+            ]}
+            runId="run-1"
+            allStages={[
+              {
+                ...parallelStage,
+                id: "reviewer@1",
+                name: "reviewer",
+                nodeId: "reviewer",
+                handler: "agent",
+              },
+              {
+                ...parallelStage,
+                id: "reviewer@2",
+                name: "reviewer",
+                nodeId: "reviewer",
+                handler: "agent",
+              },
+            ]}
+          />
+        </MemoryRouter>,
+      );
+    });
+
+    const rendered = JSON.stringify(renderer.toJSON());
+    expect(rendered).toContain("auth");
+    expect(rendered).toContain("api");
+    expect(rendered).toContain("reviewer");
+    expect(renderer.root.findAllByType("a")).toHaveLength(0);
+  });
 });

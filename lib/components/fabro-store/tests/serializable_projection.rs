@@ -145,6 +145,8 @@ fn serializable_projection_round_trips_and_trims_bulky_node_fields() {
     stage.script_timing = Some(json!({ "duration_ms": 10 }));
     let parallel_results = vec![ParallelBranchResult {
         id:              "review".to_string(),
+        index:           Some(0),
+        item_label:      None,
         status:          StageOutcome::Succeeded,
         context_updates: BTreeMap::from([("response.review".to_string(), json!("looks good"))]),
     }];

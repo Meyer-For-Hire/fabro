@@ -91,9 +91,73 @@ fork [shape=component, max_parallel=2]
 
 This is useful when branches are resource-intensive (e.g., each running a full agent session with tool calls) and you want to limit concurrency.
 
+## Review a runtime candidate list
+
+Static branches work when the review perspectives are known while writing the
+graph. A security scan often discovers its review candidates at runtime. Write
+that array to a flat context key, then use `for_each` to run one reviewer per
+candidate:
+
+```dot
+discover [
+    shape=tab,
+    output_schema="routing",
+    prompt="Identify security review candidates. Return only JSON with \
+      context_updates.candidates as an array of objects. Give every object a \
+      name, path, and reason."
+]
+
+review_batch [
+    shape=component,
+    for_each="context.candidates",
+    max_parallel=4
+]
+
+reviewer [
+    label="Candidate Reviewer",
+    prompt="Inspect this candidate for exploitable security problems. Report \
+      evidence, severity, and a concrete remediation."
+]
+
+aggregate [
+    shape=tripleoctagon,
+    prompt="Synthesize all candidate reviews. Call out candidates whose branch failed."
+]
+
+discover -> review_batch
+review_batch -> reviewer
+reviewer -> aggregate
+```
+
+The `routing` output schema merges `context_updates.candidates` into the flat
+`candidates` context key. `review_batch` accepts that inline array or its
+automatically offloaded managed artifact reference. It clones `reviewer` for
+each item, appends the item as pretty JSON inside a fresh
+`<untrusted-{16 lowercase hex}>` fence with a matching closing tag, and keeps
+`parallel.results` in candidate order.
+
+Each result has `id="reviewer"`, a zero-based `index`, and an `item_label`
+chosen from the item's `name`, then `label`, then index. An empty candidate
+array succeeds and proceeds directly to `aggregate`. Mixed success and failure
+also proceeds; only an all-failed batch fails the parallel stage.
+
+Retries and executor-enforced timeouts apply independently to each candidate.
+A retry keeps the same result index and branch identity, and releases its
+`max_parallel` slot while waiting for backoff. If a run stops partway through
+the batch, resuming it reruns every item because per-item checkpoints are not
+created.
+
+<Warning>
+The randomized fence prevents candidate text from closing its own data block,
+but it does not sandbox a tool-enabled reviewer. Candidate data can still try
+to influence the model. Limit the target agent's tools and permissions to the
+minimum needed for the review.
+</Warning>
+
 ## What you've learned
 
 - **Fan-out nodes** (`shape=component`) spawn concurrent branches and wait for all of them
+- `for_each` runs one agent or prompt template for every item in a runtime array
 - Parallel branches share one checkout, so workflows must prevent or tolerate file races
 - **Fan-in nodes** (`shape=tripleoctagon`) can synthesize `parallel.results` with a prompt
 - Fan-in never selects or restores workspace state, and no results file is created

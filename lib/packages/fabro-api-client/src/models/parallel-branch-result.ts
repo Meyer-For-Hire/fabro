@@ -22,6 +22,14 @@ import type { StageOutcome } from './stage-outcome';
  */
 export interface ParallelBranchResult {
     'id': string;
+    /**
+     * Zero-based input item or outgoing-edge position. Absent only on parallel results written before indexed branch identity was added.
+     */
+    'index'?: number;
+    /**
+     * Human-readable for_each item identity, derived from name, then label, then the zero-based input index.
+     */
+    'item_label'?: string;
     'status': StageOutcome;
     'context_updates': { [key: string]: any; };
 }

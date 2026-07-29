@@ -56,10 +56,7 @@ impl Handler for PromptHandler {
         services: &EngineServices,
     ) -> Result<Outcome, Error> {
         // 1. Build prompt (prepend fidelity preamble if present)
-        let raw_prompt = node
-            .prompt()
-            .filter(|p| !p.is_empty())
-            .unwrap_or_else(|| node.label());
+        let raw_prompt = node.prompt_or_label();
         let preamble = context.preamble();
         let prompt = if preamble.is_empty() {
             raw_prompt.to_string()

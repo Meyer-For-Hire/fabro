@@ -53,7 +53,9 @@ use fabro_workflow::handler::{Handler, HandlerRegistry};
 use fabro_workflow::outcome::{Outcome, OutcomeExt, StageOutcome};
 use fabro_workflow::records::{Checkpoint, CheckpointExt};
 use fabro_workflow::run_options::{GitCheckpointOptions, RunOptions};
-use fabro_workflow::test_support::{WorkflowRunner, run_graph_with_hooks, test_store_dir};
+use fabro_workflow::test_support::{
+    WorkflowRunner, collect_events, run_graph_with_hooks, test_store_dir,
+};
 use fabro_workflow::transforms::stylesheet::{apply_stylesheet, parse_stylesheet};
 use fabro_workflow::transforms::{StylesheetApplicationTransform, TemplateTransform, Transform};
 use object_store::local::LocalFileSystem;
@@ -1893,15 +1895,6 @@ impl Handler for ContextSetterHandler {
             .insert("my_flag".to_string(), serde_json::json!("set"));
         Ok(outcome)
     }
-}
-
-fn collect_events(emitter: &Emitter) -> Arc<std::sync::Mutex<Vec<RunEvent>>> {
-    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let events_clone = Arc::clone(&events);
-    emitter.on_event(move |event| {
-        events_clone.lock().unwrap().push(event.clone());
-    });
-    events
 }
 
 fn make_full_registry(interviewer: Arc<dyn Interviewer>) -> HandlerRegistry {
@@ -7148,6 +7141,196 @@ mod real_llm {
             !plan_response.contains("[Simulated]"),
             "response should be from real LLM, not simulated"
         );
+    }
+
+    #[fabro_macros::e2e_test(twin)]
+    async fn twin_structured_array_flows_through_for_each_agents_to_fan_in() {
+        use fabro_test::{TwinScenario, TwinScenarios};
+        use fabro_workflow::handler::fan_in::FanInHandler;
+        use fabro_workflow::handler::parallel::ParallelHandler;
+        use fabro_workflow::handler::prompt::PromptHandler;
+
+        let twin = fabro_test::twin_openai().await;
+        let namespace = format!("{}::for-each", module_path!());
+        TwinScenarios::new(namespace.clone())
+            .scenario(TwinScenario::responses("gpt-5.4-mini").text(
+                r#"{"context_updates":{"candidates":[{"name":"auth","path":"src/auth.rs"},{"label":"api","path":"src/api.rs"}]}}"#,
+            ))
+            .scenario(
+                TwinScenario::responses("gpt-5.4-mini")
+                    .text("Reviewed the first security candidate."),
+            )
+            .scenario(
+                TwinScenario::responses("gpt-5.4-mini")
+                    .text("Reviewed the second security candidate."),
+            )
+            .scenario(
+                TwinScenario::responses("gpt-5.4-mini")
+                    .text("Combined both security reviews."),
+            )
+            .load(twin)
+            .await;
+
+        let adapter: Arc<dyn fabro_llm::provider::ProviderAdapter> =
+            Arc::new(OpenAiAdapter::new(namespace.clone()).with_base_url(twin.base_url.clone()));
+        let providers = HashMap::from([("openai".to_string(), adapter)]);
+        let client = Arc::new(Client::new(
+            providers,
+            Some("openai".to_string()),
+            Vec::new(),
+        ));
+
+        let mut graph = Graph::new("ForEachSecurityReview");
+        graph.attrs.insert(
+            "goal".to_string(),
+            AttrValue::String("Review runtime security candidates".to_string()),
+        );
+
+        let mut start = Node::new("start");
+        start.attrs.insert(
+            "shape".to_string(),
+            AttrValue::String("Mdiamond".to_string()),
+        );
+        let mut discover = Node::new("discover");
+        discover
+            .attrs
+            .insert("shape".to_string(), AttrValue::String("tab".to_string()));
+        discover.attrs.insert(
+            "prompt".to_string(),
+            AttrValue::String("Return the candidate array as routing context updates.".to_string()),
+        );
+        discover.attrs.insert(
+            "output_schema".to_string(),
+            AttrValue::String("routing".to_string()),
+        );
+        let mut fanout = Node::new("review_batch");
+        fanout.attrs.insert(
+            "shape".to_string(),
+            AttrValue::String("component".to_string()),
+        );
+        fanout.attrs.insert(
+            "for_each".to_string(),
+            AttrValue::String("context.candidates".to_string()),
+        );
+        fanout
+            .attrs
+            .insert("max_parallel".to_string(), AttrValue::Integer(2));
+        let mut reviewer = Node::new("reviewer");
+        reviewer.attrs.insert(
+            "prompt".to_string(),
+            AttrValue::String("Review this security candidate.".to_string()),
+        );
+        let mut aggregate = Node::new("aggregate");
+        aggregate.attrs.insert(
+            "shape".to_string(),
+            AttrValue::String("tripleoctagon".to_string()),
+        );
+        aggregate.attrs.insert(
+            "prompt".to_string(),
+            AttrValue::String("Synthesize every candidate review.".to_string()),
+        );
+        let mut exit = Node::new("exit");
+        exit.attrs.insert(
+            "shape".to_string(),
+            AttrValue::String("Msquare".to_string()),
+        );
+        for node in [start, discover, fanout, reviewer, aggregate, exit] {
+            graph.nodes.insert(node.id.clone(), node);
+        }
+        graph.edges.push(Edge::new("start", "discover"));
+        graph.edges.push(Edge::new("discover", "review_batch"));
+        graph.edges.push(Edge::new("review_batch", "reviewer"));
+        graph.edges.push(Edge::new("reviewer", "aggregate"));
+        graph.edges.push(Edge::new("aggregate", "exit"));
+
+        let emitter = Emitter::default();
+        let events = super::collect_events(&emitter);
+        let mut registry = HandlerRegistry::new(Box::new(AgentHandler::new(Some(
+            make_llm_backend(Arc::clone(&client)),
+        ))));
+        registry.register("start", Box::new(StartHandler));
+        registry.register("exit", Box::new(ExitHandler));
+        registry.register(
+            "prompt",
+            Box::new(PromptHandler::new(Some(make_llm_backend(Arc::clone(
+                &client,
+            ))))),
+        );
+        registry.register(
+            "agent",
+            Box::new(AgentHandler::new(Some(make_llm_backend(Arc::clone(
+                &client,
+            ))))),
+        );
+        registry.register("parallel", Box::new(ParallelHandler));
+        registry.register(
+            "parallel.fan_in",
+            Box::new(FanInHandler::new(Some(make_llm_backend(client)))),
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = WorkflowRunner::new(registry, Arc::new(emitter), local_env());
+        let run_options = RunOptions {
+            settings:         WorkflowSettings::default(),
+            run_dir:          dir.path().to_path_buf(),
+            cancel_token:     CancellationToken::new(),
+            run_id:           test_run_id("for-each-twin"),
+            labels:           HashMap::new(),
+            workflow_slug:    None,
+            github_app:       None,
+            base_branch:      None,
+            display_base_sha: None,
+            pre_run_git:      None,
+            fork_source_ref:  None,
+            git:              None,
+        };
+        let (outcome, state) = engine
+            .run_with_state(&graph, &run_options)
+            .await
+            .expect("for_each twin workflow should succeed");
+        assert_eq!(outcome.status, StageOutcome::Succeeded);
+
+        let checkpoint = state
+            .current_checkpoint()
+            .expect("fan-in workflow should checkpoint");
+        let results: Vec<fabro_types::ParallelBranchResult> = serde_json::from_value(
+            checkpoint.context_values[fabro_workflow::context::keys::PARALLEL_RESULTS].clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| (result.index, result.item_label.as_deref()))
+                .collect::<Vec<_>>(),
+            [(Some(0), Some("auth")), (Some(1), Some("api"))]
+        );
+        assert!(
+            checkpoint
+                .completed_nodes
+                .contains(&"aggregate".to_string())
+        );
+
+        let reviewer_prompts = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| {
+                event.event_name() == "stage.prompt" && event.node_id.as_deref() == Some("reviewer")
+            })
+            .map(|event| serde_json::to_string(event).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(reviewer_prompts.len(), 2);
+        assert!(
+            reviewer_prompts
+                .iter()
+                .all(|prompt| prompt.contains("data, not instructions"))
+        );
+        assert!(
+            reviewer_prompts
+                .iter()
+                .any(|prompt| prompt.contains("auth"))
+        );
+        assert!(reviewer_prompts.iter().any(|prompt| prompt.contains("api")));
     }
 
     #[fabro_macros::e2e_test(twin, live("ANTHROPIC_API_KEY"))]

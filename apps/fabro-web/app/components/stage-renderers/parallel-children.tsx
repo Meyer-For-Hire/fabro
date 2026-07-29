@@ -9,10 +9,17 @@ import { formatStageLabel, stageStatusLabel, stageStatusTone } from "../../lib/s
 import { formatDurationMs } from "../../lib/format";
 import { StageMetaBar } from "./meta-bar";
 import { parseParallelOverview } from "./helpers";
+import type { ParallelBranchSummary } from "./helpers";
 
 /** Branch row view state sourced from a live branch stage or completed result. */
 interface BranchRow {
   label: string;
+  /**
+   * Secondary text, set only when `label` is a `for_each` item name. Every
+   * branch of one fan-out runs the same template node, so the node name is
+   * context rather than identity.
+   */
+  detail: string | null;
   status: StageState;
   /** Null when no stage backs this branch yet, which also means it is unlinkable. */
   stageId: string | null;
@@ -57,8 +64,13 @@ function ChildRow({
       >
         {stageStatusLabel(row.status)}
       </span>
-      <span className="min-w-0 flex-1 truncate font-mono text-sm text-fg-3">
-        {row.label}
+      <span className="min-w-0 flex flex-1 items-baseline gap-2">
+        <span className="truncate font-mono text-sm text-fg-3">{row.label}</span>
+        {row.detail && (
+          <span className="shrink-0 font-mono text-[11px] text-fg-muted">
+            {row.detail}
+          </span>
+        )}
       </span>
       {row.stageId && (
         <ArrowTopRightOnSquareIcon
@@ -111,30 +123,55 @@ export function ParallelChildren({
     return byIndex;
   }, [allStages, stage.id]);
 
+  // Key results by their own `index` rather than array position, so a row
+  // lines up with the branch stage carrying the same index.
+  const resultsByIndex = useMemo(() => {
+    const byIndex = new Map<number, ParallelBranchSummary>();
+    overview.results.forEach((result, position) => {
+      byIndex.set(result.index ?? position, result);
+    });
+    return byIndex;
+  }, [overview.results]);
+
   // Branch indexes are sparse: a branch queued behind `max_parallel` has no
   // stage identity yet, and one cancelled while queued never gets one. Size the
   // list from the highest index seen so a late-starting branch is never hidden.
   const branchCount = Math.max(
     overview.branchCount ?? 0,
-    overview.results.length,
+    ...Array.from(resultsByIndex.keys(), (index) => index + 1),
     ...Array.from(stagesByBranchIndex.keys(), (index) => index + 1),
   );
   const rows = Array.from({ length: branchCount }, (_, index): BranchRow => {
+    // A `for_each` branch is named by its item. Without that name every row of
+    // one fan-out would read as the same template node.
+    const result = resultsByIndex.get(index);
+    const itemLabel = result?.itemLabel ?? null;
     // A live branch stage is the freshest source; fall back to the completed
     // event's result for runs whose branches predate parallel identity.
     const branchStage = stagesByBranchIndex.get(index);
     if (branchStage) {
+      const stageLabel = formatStageLabel(branchStage);
       return {
-        label: formatStageLabel(branchStage),
+        label: itemLabel ?? stageLabel,
+        detail: itemLabel ? stageLabel : null,
         status: branchStage.status,
         stageId: branchStage.id,
       };
     }
-    const result = overview.results[index];
     if (result) {
-      return { label: result.id, status: result.status, stageId: null };
+      return {
+        label: itemLabel ?? result.id,
+        detail: itemLabel ? result.id : null,
+        status: result.status,
+        stageId: null,
+      };
     }
-    return { label: `Branch ${index + 1}`, status: StageState.PENDING, stageId: null };
+    return {
+      label: `Branch ${index + 1}`,
+      detail: null,
+      status: StageState.PENDING,
+      stageId: null,
+    };
   });
 
   // Count what is on screen, so the tiles can never contradict the rows.

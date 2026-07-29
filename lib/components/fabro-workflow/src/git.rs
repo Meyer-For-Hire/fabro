@@ -448,6 +448,8 @@ mod tests {
             failure_count: 0,
             results:       vec![fabro_types::ParallelBranchResult {
                 id:              "a".to_string(),
+                index:           Some(0),
+                item_label:      None,
                 status:          fabro_types::StageOutcome::Succeeded,
                 context_updates: std::collections::BTreeMap::new(),
             }],

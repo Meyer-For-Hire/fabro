@@ -10617,6 +10617,17 @@ components:
       properties:
         id:
           type: string
+        index:
+          type: integer
+          minimum: 0
+          description: >-
+            Zero-based input item or outgoing-edge position. Absent only on
+            parallel results written before indexed branch identity was added.
+        item_label:
+          type: string
+          description: >-
+            Human-readable for_each item identity, derived from name, then
+            label, then the zero-based input index.
         status:
           $ref: "#/components/schemas/StageOutcome"
         context_updates:

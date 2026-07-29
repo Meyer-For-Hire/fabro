@@ -7,8 +7,10 @@ This document defines Fabro's parallel fan-out (`shape=component`) and fan-in
 
 ## 1. Execution model
 
-A parallel node dispatches one branch for each outgoing edge. A branch executes
-the single target node on that edge; parallel branches are not subgraph walks.
+A static parallel node dispatches one branch for each outgoing edge. A
+`for_each` parallel node has one outgoing template edge and dispatches one
+branch for each item in a runtime JSON array. A branch executes the single
+target node on that edge; parallel branches are not subgraph walks.
 Every branch:
 
 - receives an independent fork of the parent workflow context;
@@ -21,6 +23,18 @@ Branches execute concurrently. `max_parallel` limits the number that may run at
 once and defaults to 4. The parallel node always waits for every branch task,
 even when a branch fails or run cancellation begins. There is no early-success
 join mode.
+
+`for_each` sources use flat context lookup: try the declared key, then strip a
+leading `context.` and try again. Inline arrays and managed `blob://` or
+`file://` JSON references are accepted. The template target is limited to an
+agent or prompt node, and nested `for_each` is rejected.
+
+A source array above 1000 items fails deterministically before
+`parallel.started`. The array is runtime data, often model-produced, so its
+length is not something a workflow author reviewed. Each branch forks the
+parent context once it holds a `max_parallel` slot, so live memory tracks
+`max_parallel` rather than item count — the limit guards the queue of pending
+branch tasks and the plan itself.
 
 The parent context is not used as shared mutable branch state. A branch can
 change its context fork without exposing those changes as top-level values to
@@ -55,15 +69,19 @@ The shared result type is:
 ```rust
 ParallelBranchResult {
     id: String,
+    index: Option<usize>,
+    item_label: Option<String>,
     status: StageOutcome,
     context_updates: BTreeMap<String, serde_json::Value>,
 }
 ```
 
-The parallel handler stores one result per outgoing edge in
-`parallel.results`. Results preserve outgoing-edge order, independent of branch
-completion order. `parallel.branch_count` stores the number of dispatched
-branches.
+The parallel handler stores one result per outgoing edge or runtime item in
+`parallel.results`. Results preserve outgoing-edge or input order, independent
+of branch completion order. New results always contain `index`; it is optional
+only so records written before indexed identity still deserialize.
+`item_label` is set for `for_each` from item `name`, then `label`, then index.
+`parallel.branch_count` stores the number of dispatched branches.
 
 `context_updates` includes changes made in the branch context and updates
 returned by the branch outcome. This applies to successful and failed branches,
@@ -79,7 +97,19 @@ The parallel stage outcome is:
 
 - `succeeded` when every branch succeeds;
 - `failed` when every branch fails;
-- `partially_succeeded` for mixed outcomes, partial outcomes, and zero branches.
+- `partially_succeeded` for mixed outcomes, partial outcomes, and a static
+  fan-out with zero branches;
+- `succeeded` for a valid `for_each` source with zero items.
+
+For `for_each`, a missing key, missing blob, invalid JSON, or non-array fails
+before `parallel.started`. A valid empty array emits paired parallel events
+with count zero and jumps directly to the template target's fan-in.
+
+A dry run reaches the fan-out before any upstream node has produced the array,
+so an absent or unusable source stands in one placeholder item and the template
+target is simulated once. Graph-shape mistakes — a non-string source, the wrong
+edge count, a non-LLM target, nested `for_each` — still fail under `--dry-run`,
+because catching those is what a dry run is for.
 
 ## 4. Artifacts and downstream context
 
@@ -123,14 +153,23 @@ winner, restore files, or choose workspace state.
 Parallel execution emits:
 
 - `parallel.started` with `visit` and `branch_count`;
-- `parallel.branch.started` with stable branch identity and index;
-- `parallel.branch.completed` with index, duration, and status;
+- `parallel.branch.started` with stable branch identity, index, and optional
+  item label;
+- `parallel.branch.completed` with index, optional item label, duration, and
+  status;
 - `parallel.completed` with counts and the ordered typed result array.
 
-Every branch task emits one terminal branch completion event, including handler
-failure, cancellation before semaphore acquisition, panic, or join failure.
 The final typed array is also projected into
-`StageProjection.parallel_results`.
+`StageProjection.parallel_results`. Raw runtime items are recorded once in the
+existing `stage.prompt` event and are not duplicated in branch events or
+results.
+
+Branch attempts use the same artifact, panic, and executor-timeout envelope as
+ordinary nodes, wrapped in a branch-local retry loop. A retry preserves its
+branch identity, stage scope, item label, context fork, and result index. It
+releases the concurrency permit during backoff and reacquires it before the
+next attempt. Generic graph lifecycle callbacks, edge selection, thread reuse,
+and per-item checkpoints are intentionally excluded.
 
 ## 7. Cancellation
 

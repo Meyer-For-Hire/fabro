@@ -5603,6 +5603,7 @@ async fn list_run_stages_exposes_parallel_branch_identity() {
         parallel_branch_id:    parallel_branch_id.clone(),
         branch:                "review_glm".to_string(),
         index:                 4,
+        item_label:            None,
         graph_visit:           Some(3),
         resumed_from_stage_id: None,
     };
