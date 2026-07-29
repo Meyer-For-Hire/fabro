@@ -18,6 +18,10 @@ fn timeout_ms(node: &Node) -> Option<u64> {
     node.timeout().map(crate::millis_u64)
 }
 
+fn non_blank_script(node: &Node) -> Option<&str> {
+    node.script().filter(|script| !script.trim().is_empty())
+}
+
 /// Executes an external script configured via node attributes.
 pub struct CommandHandler;
 
@@ -31,12 +35,9 @@ impl Handler for CommandHandler {
         _run_dir: &Path,
         _services: &EngineServices,
     ) -> Result<Outcome, Error> {
-        let script = node
-            .attrs
-            .get("script")
-            .or_else(|| node.attrs.get("tool_command"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let Some(script) = non_blank_script(node) else {
+            return Ok(Outcome::fail_classify("No script specified"));
+        };
 
         let mut outcome = Outcome::simulated(&node.id);
         outcome.notes = Some(format!("[Simulated] Command skipped: {script}"));
@@ -54,16 +55,9 @@ impl Handler for CommandHandler {
         run_dir: &Path,
         services: &EngineServices,
     ) -> Result<Outcome, Error> {
-        let script = node
-            .attrs
-            .get("script")
-            .or_else(|| node.attrs.get("tool_command"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-
-        if script.is_empty() {
+        let Some(script) = non_blank_script(node) else {
             return Ok(Outcome::fail_classify("No script specified"));
-        }
+        };
 
         let language = node
             .attrs
@@ -402,22 +396,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn script_handler_no_script() {
+    async fn missing_and_blank_scripts_fail_execution_and_simulation() {
         let handler = CommandHandler;
-        let node = Node::new("script_node");
         let context = Context::new();
         let graph = Graph::new("test");
         let run_dir = tempfile::tempdir().unwrap();
-
         let services = make_services();
-        let outcome = handler
-            .execute(&node, &context, &graph, run_dir.path(), &services)
-            .await
-            .unwrap();
-        assert_eq!(outcome.status, StageOutcome::Failed {
-            retry_requested: false,
-        });
-        assert_eq!(outcome.failure_reason(), Some("No script specified"));
+
+        for script in [None, Some("  \t\n")] {
+            let mut node = Node::new("script_node");
+            if let Some(script) = script {
+                node.attrs
+                    .insert("script".to_string(), AttrValue::String(script.to_string()));
+            }
+
+            let outcomes = [
+                handler
+                    .execute(&node, &context, &graph, run_dir.path(), &services)
+                    .await
+                    .unwrap(),
+                handler
+                    .simulate(&node, &context, &graph, run_dir.path(), &services)
+                    .await
+                    .unwrap(),
+            ];
+
+            for outcome in outcomes {
+                assert_eq!(outcome.status, StageOutcome::Failed {
+                    retry_requested: false,
+                });
+                assert_eq!(outcome.failure_reason(), Some("No script specified"));
+            }
+        }
     }
 
     #[tokio::test]
@@ -1264,7 +1274,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_command_attribute_fallback() {
+    async fn tool_command_attribute_is_not_read() {
         let handler = CommandHandler;
         let mut node = Node::new("script_node");
         node.attrs.insert(
@@ -1280,13 +1290,10 @@ mod tests {
             .execute(&node, &context, &graph, run_dir.path(), &services)
             .await
             .unwrap();
-        assert_eq!(outcome.status, StageOutcome::Succeeded);
-        let command_output = outcome.context_updates.get(keys::COMMAND_OUTPUT).unwrap();
-        assert!(
-            command_text(&services, command_output)
-                .await
-                .contains("legacy")
-        );
+        assert_eq!(outcome.status, StageOutcome::Failed {
+            retry_requested: false,
+        });
+        assert!(outcome.failure_reason().unwrap().contains("No script"));
     }
 
     #[tokio::test]

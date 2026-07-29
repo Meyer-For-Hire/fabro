@@ -153,9 +153,20 @@ impl Node {
         self.str_attr("label").unwrap_or(&self.id)
     }
 
+    /// The node's Graphviz shape, which contributes to handler selection.
+    ///
+    /// An explicit `shape` or `type` attribute disables inference. Otherwise,
+    /// the presence of `script` infers `parallelogram`. Everything else falls
+    /// back to `box`.
     #[must_use]
     pub fn shape(&self) -> &str {
-        self.str_attr("shape").unwrap_or("box")
+        if let Some(shape) = self.str_attr("shape") {
+            return shape;
+        }
+        if self.node_type().is_none() && self.attrs.contains_key("script") {
+            return "parallelogram";
+        }
+        "box"
     }
 
     #[must_use]
@@ -166,6 +177,12 @@ impl Node {
     #[must_use]
     pub fn prompt(&self) -> Option<&str> {
         self.str_attr("prompt")
+    }
+
+    /// The shell or Python source a command node runs.
+    #[must_use]
+    pub fn script(&self) -> Option<&str> {
+        self.str_attr("script")
     }
 
     /// The prompt a handler should send, falling back to the node label when
@@ -315,8 +332,10 @@ impl Node {
     /// mapping.
     #[must_use]
     pub fn handler_type(&self) -> Option<&str> {
-        if let Some(t) = self.node_type() {
-            return Some(t);
+        match self.node_type() {
+            Some("tool") => return Some("command"),
+            Some(node_type) => return Some(node_type),
+            None => {}
         }
         shape_to_handler_type(self.shape())
     }
@@ -605,6 +624,7 @@ mod tests {
         assert_eq!(node.shape(), "box");
         assert_eq!(node.node_type(), None);
         assert_eq!(node.prompt(), None);
+        assert_eq!(node.script(), None);
         assert_eq!(node.for_each(), None);
         assert_eq!(node.output_schema(), None);
         assert_eq!(node.output_retries(), 2);
@@ -625,6 +645,66 @@ mod tests {
         assert_eq!(node.retry_policy(), None);
         assert_eq!(node.max_visits(), None);
         assert!(node.project_memory());
+    }
+
+    fn node_with(id: &str, attrs: &[(&str, &str)]) -> Node {
+        let mut node = Node::new(id);
+        for (key, value) in attrs {
+            node.attrs
+                .insert((*key).to_string(), AttrValue::String((*value).to_string()));
+        }
+        node
+    }
+
+    #[test]
+    fn shapeless_script_node_infers_command() {
+        let node = node_with("build", &[("script", "cargo build")]);
+        assert_eq!(node.shape(), "parallelogram");
+        assert_eq!(node.handler_type(), Some("command"));
+    }
+
+    #[test]
+    fn shapeless_node_without_script_stays_agent() {
+        let node = node_with("plan", &[("prompt", "Plan the work")]);
+        assert_eq!(node.shape(), "box");
+        assert_eq!(node.handler_type(), Some("agent"));
+    }
+
+    #[test]
+    fn explicit_shape_wins_over_script_inference() {
+        let node = node_with("odd", &[("shape", "box"), ("script", "cargo build")]);
+        assert_eq!(node.shape(), "box");
+        assert_eq!(node.handler_type(), Some("agent"));
+    }
+
+    #[test]
+    fn explicit_type_wins_over_script_inference() {
+        let node = node_with("odd", &[("type", "agent"), ("script", "cargo build")]);
+        assert_eq!(node.shape(), "box");
+        assert_eq!(node.handler_type(), Some("agent"));
+    }
+
+    #[test]
+    fn any_script_attribute_value_infers_command() {
+        // The command-requires-script lint reports this; inference only asks
+        // whether the attribute is present so the diagnostic lands on a
+        // command node rather than a silently-agent one.
+        let empty = node_with("empty", &[("script", "")]);
+        assert_eq!(empty.shape(), "parallelogram");
+        assert_eq!(empty.handler_type(), Some("command"));
+
+        let mut non_string = Node::new("non_string");
+        non_string
+            .attrs
+            .insert("script".to_string(), AttrValue::Integer(123));
+        assert_eq!(non_string.shape(), "parallelogram");
+        assert_eq!(non_string.handler_type(), Some("command"));
+    }
+
+    #[test]
+    fn legacy_tool_type_resolves_to_command() {
+        let node = node_with("build", &[("type", "tool")]);
+        assert_eq!(node.handler_type(), Some("command"));
     }
 
     #[test]

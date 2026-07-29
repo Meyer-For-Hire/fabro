@@ -147,7 +147,7 @@ export function parseFabro(src: string): ParseResult {
 }
 
 function buildNode(id: string, attrs: Record<string, AttrValue>): Node {
-  const shape = coerceShape(attrs.shape, id);
+  const shape = coerceShape(attrs, id);
   const label = typeof attrs.label === "string" ? attrs.label : id;
   const node: Node = { id, label, shape };
   if (typeof attrs.prompt === "string") node.prompt = attrs.prompt;
@@ -159,10 +159,18 @@ function buildNode(id: string, attrs: Record<string, AttrValue>): Node {
   return node;
 }
 
-function coerceShape(raw: AttrValue | undefined, nodeId: string): Shape {
+function coerceShape(
+  attrs: Record<string, AttrValue>,
+  nodeId: string,
+): Shape {
+  const raw = attrs.shape;
   if (typeof raw !== "string") {
-    // Shape omitted: default to start/exit terminals if id matches,
-    // otherwise `box` (Fabro's agent default).
+    // Without an explicit shape or type, `script` selects the command
+    // handler. Keep the inferred shape when the draft is rendered again.
+    if (typeof attrs.type !== "string" && attrs.script !== undefined) {
+      return "parallelogram";
+    }
+    // The playground also infers terminal shapes from reserved ids.
     if (nodeId === "start") return "mdiamond";
     if (nodeId === "exit") return "msquare";
     return "box";

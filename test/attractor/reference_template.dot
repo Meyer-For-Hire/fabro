@@ -43,11 +43,11 @@ digraph reference_template {
         start [shape=Mdiamond, label="Start"]
 
         // Toolchain gate — fail fast before LLM stages.
-        // Replace tool_command with project-specific checks.
+        // Replace script with project-specific checks.
         check_toolchain [
             shape=parallelogram,
             max_retries=0,
-            tool_command="echo 'Replace with project-specific toolchain checks'; exit 0"
+            script="echo 'Replace with project-specific toolchain checks'; exit 0"
         ]
 
         // PROMPT: expand_spec
@@ -187,42 +187,42 @@ digraph reference_template {
         check_implement [shape=diamond, label="Implement OK?"]
 
         // Auto-fix formatting before verify gate.
-        // Replace tool_command with project-specific auto-formatter.
+        // Replace script with project-specific auto-formatter.
         fix_fmt [
             shape=parallelogram,
             max_retries=0,
-            tool_command="echo 'Replace with project-specific auto-formatter'; exit 0"
+            script="echo 'Replace with project-specific auto-formatter'; exit 0"
         ]
 
-        // Replace tool_command with project-specific formatter check.
+        // Replace script with project-specific formatter check.
         verify_fmt [
             shape=parallelogram,
             max_retries=0,
-            tool_command="echo 'Replace with project-specific formatter check'; exit 0"
+            script="echo 'Replace with project-specific formatter check'; exit 0"
         ]
         check_fmt [shape=diamond, label="Fmt OK?"]
 
-        // Replace tool_command with project-specific build command.
+        // Replace script with project-specific build command.
         verify_build [
             shape=parallelogram,
-            tool_command="echo 'Replace with project-specific build check'; exit 0"
+            script="echo 'Replace with project-specific build check'; exit 0"
         ]
         check_build [shape=diamond, label="Build OK?"]
 
-        // Replace tool_command with project-specific test command.
+        // Replace script with project-specific test command.
         verify_test [
             shape=parallelogram,
-            tool_command="echo 'Replace with project-specific test check'; exit 0"
+            script="echo 'Replace with project-specific test check'; exit 0"
         ]
         check_test [shape=diamond, label="Tests OK?"]
 
-        // Replace tool_command with artifact hygiene check.
+        // Replace script with artifact hygiene check.
         // Confirm deliverables meet their interface contract (exports, endpoints,
         // CLI behavior, observable outputs); file existence alone is insufficient.
         verify_artifacts [
             shape=parallelogram,
             max_retries=0,
-            tool_command="echo 'Replace with artifact hygiene check'; exit 0"
+            script="echo 'Replace with artifact hygiene check'; exit 0"
         ]
         check_artifacts [shape=diamond, label="Artifacts OK?"]
 

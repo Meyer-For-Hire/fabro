@@ -1,0 +1,11 @@
+digraph InferredCommand {
+    graph [goal="Verify a shapeless script node runs as a command"]
+    rankdir=LR
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare, label="Exit"]
+
+    echo_task [label="Echo", script="echo hello"]
+
+    start -> echo_task -> exit
+}
