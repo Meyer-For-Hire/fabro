@@ -449,6 +449,10 @@ impl Client {
             return Ok(());
         }
 
+        // Refresh tokens are single-use. Hold the cross-process lock from the
+        // fresh store read through rotation and persistence. AuthStore methods
+        // take the shorter auth-file lock inside this guard.
+        let _refresh_guard = oauth_session.auth_store.acquire_refresh_lock().await?;
         let Some(entry) = oauth_session.auth_store.get(&oauth_session.target)? else {
             self.rebuild_with_fallback(oauth_session).await?;
             return Err(session_expired());
@@ -460,6 +464,10 @@ impl Client {
             }
             AuthEntry::OAuth(entry) => entry,
         };
+        if oauth_entry.access_token != failed_access_token {
+            self.rebuild_client(Some(oauth_entry.access_token)).await?;
+            return Ok(());
+        }
         if oauth_entry.refresh_token_expires_at <= chrono::Utc::now() {
             oauth_session.auth_store.remove(&oauth_session.target)?;
             self.rebuild_with_fallback(oauth_session).await?;
@@ -2571,6 +2579,78 @@ mod tests {
             Some(old_token.to_string()),
             Some(stored_token.to_string()),
         ]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concurrent_clients_refresh_a_rotating_token_once() {
+        let server = MockServer::start_async().await;
+        let refresh_mock = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/auth/cli/refresh")
+                    .header("authorization", "Bearer refresh-octocat");
+                then.status(200)
+                    .delay(Duration::from_millis(100))
+                    .header("Content-Type", "application/json")
+                    .json_body(json!({
+                        "access_token": "access-refreshed",
+                        "access_token_expires_at": (chrono::Utc::now()
+                            + ChronoDuration::minutes(10))
+                            .to_rfc3339(),
+                        "refresh_token": "refresh-refreshed",
+                        "refresh_token_expires_at": (chrono::Utc::now()
+                            + ChronoDuration::days(30))
+                            .to_rfc3339(),
+                        "subject": {
+                            "idp_issuer": "https://github.com",
+                            "idp_subject": "12345",
+                            "login": "octocat",
+                            "name": "Name octocat",
+                            "email": "octocat@example.com"
+                        }
+                    }));
+            })
+            .await;
+        let temp = tempfile::tempdir().unwrap();
+        let auth_store = AuthStore::new(temp.path().join("auth.json"));
+        let target = ServerTarget::http_url(server.base_url()).unwrap();
+        let entry = oauth_entry("octocat");
+        auth_store
+            .put(&target, AuthEntry::OAuth(entry.clone()))
+            .unwrap();
+
+        let first = Client::builder()
+            .target(target.clone())
+            .credential(Credential::OAuth(entry.clone()))
+            .oauth_session(OAuthSession::new(target.clone(), auth_store.clone()))
+            .connect()
+            .await
+            .unwrap();
+        let second = Client::builder()
+            .target(target.clone())
+            .credential(Credential::OAuth(entry))
+            .oauth_session(OAuthSession::new(target, auth_store))
+            .connect()
+            .await
+            .unwrap();
+
+        let (first_result, second_result) = tokio::join!(
+            first.refresh_access_token("access-octocat"),
+            second.refresh_access_token("access-octocat"),
+        );
+
+        first_result.unwrap();
+        second_result.unwrap();
+        refresh_mock.assert_calls_async(1).await;
+        assert_eq!(
+            first.current_state().bearer_token.as_deref(),
+            Some("access-refreshed")
+        );
+        assert_eq!(
+            second.current_state().bearer_token.as_deref(),
+            Some("access-refreshed")
+        );
     }
 
     #[tokio::test]

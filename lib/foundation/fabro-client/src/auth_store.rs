@@ -18,6 +18,9 @@ use fs2::FileExt;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+#[cfg(unix)]
+use tokio::task;
+use tokio::task::JoinError;
 
 use crate::target::ServerTarget;
 
@@ -106,11 +109,18 @@ pub enum LockError {
         path:   PathBuf,
         source: std::io::Error,
     },
+    #[error("failed to wait for auth store lock at {path}: {source}")]
+    Task { path: PathBuf, source: JoinError },
 }
 
 #[derive(Debug, Clone)]
 pub struct AuthStore {
     path: PathBuf,
+}
+
+#[cfg(unix)]
+pub(crate) struct RefreshLockGuard {
+    _file: std::fs::File,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -191,6 +201,25 @@ impl AuthStore {
                 .map(|(key, entry)| Ok((parse_stored_target(&key)?, entry)))
                 .collect::<Result<Vec<_>, AuthStoreError>>()
         })
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn acquire_refresh_lock(&self) -> Result<RefreshLockGuard, AuthStoreError> {
+        let store = self.clone();
+        let lock_path = self.refresh_lock_path();
+        // Another CLI can hold this lock through a network request, so keep
+        // the blocking wait off the Tokio worker threads.
+        task::spawn_blocking(move || store.acquire_refresh_lock_blocking())
+            .await
+            .map_err(|source| LockError::Task {
+                path: lock_path,
+                source,
+            })?
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) async fn acquire_refresh_lock(&self) -> Result<(), AuthStoreError> {
+        Err(AuthStoreError::UnsupportedPlatform)
     }
 
     fn read_auth_file(&self) -> Result<AuthFile, AuthStoreError> {
@@ -278,6 +307,37 @@ impl AuthStore {
 
     fn lock_path(&self) -> PathBuf {
         self.path.with_extension("lock")
+    }
+
+    #[cfg(unix)]
+    fn refresh_lock_path(&self) -> PathBuf {
+        self.path.with_extension("refresh.lock")
+    }
+
+    #[cfg(unix)]
+    fn acquire_refresh_lock_blocking(&self) -> Result<RefreshLockGuard, AuthStoreError> {
+        self.ensure_parent_dir()?;
+        let path = self.refresh_lock_path();
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|source| LockError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        match FileExt::try_lock_exclusive(&lock_file) {
+            Ok(()) => {}
+            Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
+                lock_file
+                    .lock_exclusive()
+                    .map_err(|source| classify_lock_error(path, source))?;
+            }
+            Err(source) => return Err(classify_lock_error(path, source).into()),
+        }
+        Ok(RefreshLockGuard { _file: lock_file })
     }
 
     #[cfg(unix)]
