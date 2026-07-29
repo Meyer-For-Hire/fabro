@@ -26,6 +26,7 @@ mod script_absolute_cd;
 mod selection_valid;
 mod start_no_incoming;
 mod start_node;
+mod stdin_source_valid;
 mod stylesheet_model_known;
 mod stylesheet_syntax;
 mod terminal_node;
@@ -57,6 +58,7 @@ pub fn built_in_rules() -> Vec<Box<dyn LintRule>> {
         prompt_on_llm_nodes::rule(),
         freeform_edge_count::rule(),
         for_each_contract::rule(),
+        stdin_source_valid::rule(),
         direction_valid::rule(),
         reserved_keyword_node_id::rule(),
         all_conditional_edges::rule(),

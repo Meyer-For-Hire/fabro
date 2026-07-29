@@ -1,4 +1,5 @@
 use fabro_graphviz::graph::{self, Graph, Node};
+use fabro_types::StageHandler;
 
 use crate::{Diagnostic, LintRule, Severity};
 
@@ -6,23 +7,39 @@ pub(super) fn rule() -> Box<dyn LintRule> {
     Box::new(Rule)
 }
 
-/// Attributes that only specific handler types read, paired with the handler
-/// types that consume them. On every other node type the attribute is inert:
-/// accepted by the parser and read by nothing at runtime.
+/// Attributes that only specific handlers read, paired with the handlers that
+/// consume them. On every other node type the attribute is inert: accepted by
+/// the parser and read by nothing at runtime.
+///
+/// Node types are compared after canonicalization through
+/// [`StageHandler::from_handler_type`], so alias types (`tool` runs the
+/// command handler) accept the same attributes as their canonical form.
 ///
 /// Attributes read by several handlers (`timeout`), resolved for every node
 /// (`fidelity`, `retry_policy`, `max_visits`, `goal_gate`), or injectable via
 /// model stylesheets (`model`, `provider`, `reasoning_effort`, `speed`,
 /// `backend`) are deliberately not listed.
-const HANDLER_SPECIFIC_ATTRS: &[(&str, &[&str])] = &[
-    ("script", &["command"]),
-    ("language", &["command"]),
-    ("duration", &["wait"]),
-    ("max_parallel", &["parallel"]),
-    ("output_retries", &["agent", "prompt"]),
-    ("output_schema", &["agent", "prompt", "command"]),
-    ("prompt", &["agent", "prompt", "parallel.fan_in"]),
-    ("review_target", &["human"]),
+const HANDLER_SPECIFIC_ATTRS: &[(&str, &[StageHandler])] = &[
+    ("script", &[StageHandler::Command]),
+    ("language", &[StageHandler::Command]),
+    ("stdin_source", &[StageHandler::Command]),
+    ("duration", &[StageHandler::Wait]),
+    ("max_parallel", &[StageHandler::Parallel]),
+    ("output_retries", &[
+        StageHandler::Agent,
+        StageHandler::Prompt,
+    ]),
+    ("output_schema", &[
+        StageHandler::Agent,
+        StageHandler::Prompt,
+        StageHandler::Command,
+    ]),
+    ("prompt", &[
+        StageHandler::Agent,
+        StageHandler::Prompt,
+        StageHandler::ParallelFanIn,
+    ]),
+    ("review_target", &[StageHandler::Human]),
 ];
 
 const SCRIPT_PROMPT_CONFLICT_RULE: &str = "script_prompt_conflict";
@@ -65,12 +82,13 @@ impl LintRule for Rule {
 
             // An unknown shape or type is covered by the type_known rule; a
             // node this rule cannot classify is skipped rather than guessed at.
-            let Some(handler) = node.handler_type() else {
+            let Some(raw_type) = node.handler_type() else {
                 continue;
             };
-            if !graph::is_known_handler_type(handler) {
+            if !graph::is_known_handler_type(raw_type) {
                 continue;
             }
+            let handler = StageHandler::from_handler_type(Some(raw_type));
             for (attr, consumers) in HANDLER_SPECIFIC_ATTRS {
                 if !node.attrs.contains_key(*attr) {
                     continue;
@@ -81,19 +99,22 @@ impl LintRule for Rule {
                 if consumers.contains(&handler) {
                     continue;
                 }
+                let consumer_names = consumers
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 diagnostics.push(Diagnostic {
                     rule: self.name().to_string(),
                     severity: Severity::Warning,
                     message: format!(
-                        "Node '{}' (type '{handler}') sets '{attr}', which is only read by {} nodes and has no effect here",
+                        "Node '{}' (type '{raw_type}') sets '{attr}', which is only read by {consumer_names} nodes and has no effect here",
                         node.id,
-                        consumers.join(", "),
                     ),
                     node_id: Some(node.id.clone()),
                     edge: None,
                     fix: Some(format!(
-                        "Remove '{attr}' or change the node to a type that reads it ({})",
-                        consumers.join(", "),
+                        "Remove '{attr}' or change the node to a type that reads it ({consumer_names})",
                     )),
                     ..Diagnostic::default()
                 });
@@ -260,10 +281,12 @@ mod tests {
     #[test]
     fn accepts_attrs_on_their_own_handler_types() {
         let mut g = test_support::minimal_graph();
-        g.nodes.insert(
-            "run".to_string(),
-            node_with_attr("run", "parallelogram", "script", "echo hi"),
+        let mut run = node_with_attr("run", "parallelogram", "script", "echo hi");
+        run.attrs.insert(
+            "stdin_source".to_string(),
+            AttrValue::String("context.parallel.results".to_string()),
         );
+        g.nodes.insert("run".to_string(), run);
         g.nodes.insert(
             "audit".to_string(),
             node_with_attr("audit", "parallelogram", "output_schema", "routing"),

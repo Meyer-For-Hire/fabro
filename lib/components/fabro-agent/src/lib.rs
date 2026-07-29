@@ -58,9 +58,9 @@ pub use question_tools::{
     OPENAI_REQUEST_USER_INPUT_TOOL, register_question_tools,
 };
 pub use sandbox::{
-    CommandOutputCallback, DirEntry, ExecResult, ExecStreamingResult, GrepOptions, RefreshOutcome,
-    Sandbox, SandboxEvent, SandboxEventCallback, StderrCollector, StdioProcess, StdioProcessHandle,
-    format_lines_numbered, shell_quote,
+    CommandOutputCallback, DirEntry, ExecResult, ExecStreamingRequest, ExecStreamingResult,
+    GrepOptions, RefreshOutcome, Sandbox, SandboxEvent, SandboxEventCallback, StderrCollector,
+    StdioProcess, StdioProcessHandle, format_lines_numbered, shell_quote,
 };
 pub use session::{
     CompletionCoordinator, Session, SessionControlHandle, SessionInputTiming,

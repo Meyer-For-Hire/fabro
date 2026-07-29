@@ -33,9 +33,9 @@ use crate::sandbox::{
     REMOTE_WALK_TIMEOUT_MS, RefreshOutcome, optional_timeout, resolve_path, validate_bash_probe,
 };
 use crate::{
-    CommandOutputCallback, DirEntry, ExecResult, ExecStreamingResult, GrepOptions, Sandbox,
-    SandboxEvent, SandboxEventCallback, SandboxFile, StdioProcess, WalkOptions, managed_labels,
-    shell_quote,
+    CommandOutputCallback, DirEntry, ExecResult, ExecStreamingRequest, ExecStreamingResult,
+    GrepOptions, Sandbox, SandboxEvent, SandboxEventCallback, SandboxFile, StdioProcess,
+    WalkOptions, managed_labels, shell_quote,
 };
 
 /// Remediation shown when a Daytona sandbox has no usable Bash.
@@ -64,9 +64,10 @@ pub(crate) const DAYTONA_DASHBOARD_SANDBOXES_URL: &str =
 const FABRO_SANDBOX_USER_AGENT: &str = concat!("fabro-sandbox/", env!("CARGO_PKG_VERSION"));
 const DAYTONA_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 const DAYTONA_START_TIMEOUT: Duration = Duration::from_mins(1);
-/// Upper bound on explicit and Drop-triggered Daytona session deletion so a
-/// stalled REST call cannot block cancellation/timeout paths indefinitely.
-const DAYTONA_SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Upper bound on explicit and Drop-triggered Daytona cleanup calls (session
+/// deletion, temporary stdin files) so a stalled REST call cannot block
+/// cancellation/timeout paths indefinitely.
+const DAYTONA_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Permissions a Daytona API key needs for Fabro's snapshot and sandbox flow.
 pub const REQUIRED_DAYTONA_PERMISSIONS: &[Permissions] = &[
@@ -1799,21 +1800,35 @@ impl Sandbox for DaytonaSandbox {
 
     async fn exec_command_streaming(
         &self,
-        command: &str,
-        timeout_ms: Option<u64>,
-        working_dir: Option<&str>,
-        env_vars: Option<&HashMap<String, String>>,
-        cancel_token: Option<CancellationToken>,
-        output_callback: Option<CommandOutputCallback>,
+        request: ExecStreamingRequest<'_>,
     ) -> crate::Result<ExecStreamingResult> {
+        let ExecStreamingRequest {
+            command,
+            timeout_ms,
+            working_dir,
+            env_vars,
+            cancel_token,
+            stdin,
+            output_callback,
+        } = request;
         let sandbox = self.sandbox()?;
         let start = Instant::now();
         let cwd = working_dir.map_or_else(
             || self.working_directory().to_string(),
             |d| self.resolve_path(d),
         );
-
-        let mut session = DaytonaSession::create(sandbox).await?;
+        let stdin_upload = async {
+            match stdin {
+                Some(stdin) => DaytonaStdinFile::create(sandbox, &stdin).await.map(Some),
+                None => Ok(None),
+            }
+        };
+        let (mut stdin_file, mut session) =
+            tokio::try_join!(stdin_upload, DaytonaSession::create(sandbox))?;
+        let command_with_stdin = stdin_file
+            .as_ref()
+            .map(|stdin_file| stdin_file.redirect(command));
+        let command = command_with_stdin.as_deref().unwrap_or(command);
 
         let session_command = build_bash_session_command(command, &cwd, env_vars);
         let session_exec = match session.execute(&session_command, true, true).await {
@@ -1955,7 +1970,7 @@ impl Sandbox for DaytonaSandbox {
         let stdout = String::from_utf8_lossy(&stdout_seen.lock().await).into_owned();
         let stderr = String::from_utf8_lossy(&stderr_seen.lock().await).into_owned();
 
-        Ok(ExecStreamingResult {
+        let result = ExecStreamingResult {
             result: ExecResult {
                 stdout,
                 stderr,
@@ -1967,7 +1982,11 @@ impl Sandbox for DaytonaSandbox {
             },
             streams_separated,
             live_streaming: saw_live_chunk.load(Ordering::Relaxed),
-        })
+        };
+        if let Some(stdin_file) = stdin_file.as_mut() {
+            stdin_file.close().await;
+        }
+        Ok(result)
     }
 
     async fn spawn_stdio_process(
@@ -2132,6 +2151,105 @@ async fn finish_daytona_log_stream(
     }
 }
 
+/// A temporary Daytona file used to provide exact stdin bytes and EOF.
+///
+/// Daytona sessions accept input strings but do not expose a reliable EOF
+/// operation. A file redirection preserves arbitrary bytes and gives the
+/// command EOF without embedding workflow data in shell source.
+struct DaytonaStdinFile {
+    fs:   Option<daytona_sdk::FileSystemService>,
+    path: String,
+}
+
+impl DaytonaStdinFile {
+    async fn create(sandbox: &daytona_sdk::Sandbox, stdin: &[u8]) -> crate::Result<Self> {
+        let fs = sandbox
+            .fs()
+            .await
+            .map_err(|err| crate::Error::context("Failed to get Daytona file service", err))?;
+        let path = format!(
+            "/tmp/fabro-command-stdin-{:016x}",
+            rand::rng().random::<u64>()
+        );
+        fs.upload_file_bytes(&path, stdin)
+            .await
+            .map_err(|err| crate::Error::context("Failed to upload Daytona command stdin", err))?;
+        Ok(Self { fs: Some(fs), path })
+    }
+
+    /// Wrap `command` so it reads this file as its standard input.
+    fn redirect(&self, command: &str) -> String {
+        redirect_command_stdin(command, &self.path)
+    }
+
+    /// Idempotent, best-effort deletion bounded by
+    /// [`DAYTONA_CLEANUP_TIMEOUT`]. Failures are logged rather than surfaced
+    /// so cleanup can never fail a command that already completed.
+    async fn close(&mut self) {
+        let Some(fs) = self.fs.as_ref() else {
+            return;
+        };
+        let deletion =
+            time::timeout(DAYTONA_CLEANUP_TIMEOUT, fs.delete_file(&self.path, false)).await;
+
+        // Keep the service owned until the delete future completes. If this
+        // method is cancelled at the await above, Drop still has everything it
+        // needs to retry cleanup.
+        self.fs.take();
+        match deletion {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                tracing::warn!(error = %err, "Failed to delete Daytona command stdin");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    timeout_ms =
+                        u64::try_from(DAYTONA_CLEANUP_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
+                    "Timed out deleting Daytona command stdin"
+                );
+            }
+        }
+    }
+}
+
+impl Drop for DaytonaStdinFile {
+    fn drop(&mut self) {
+        let Some(fs) = self.fs.take() else {
+            return;
+        };
+        let path = std::mem::take(&mut self.path);
+        match Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    match time::timeout(DAYTONA_CLEANUP_TIMEOUT, fs.delete_file(&path, false)).await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            tracing::warn!(
+                                error = %err,
+                                "Failed to delete Daytona command stdin from Drop"
+                            );
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                timeout_ms = u64::try_from(DAYTONA_CLEANUP_TIMEOUT.as_millis())
+                                    .unwrap_or(u64::MAX),
+                                "Timed out deleting Daytona command stdin from Drop"
+                            );
+                        }
+                    }
+                });
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "Could not schedule Daytona command stdin cleanup"
+                );
+            }
+        }
+    }
+}
+
 /// RAII wrapper around a Daytona toolbox session.
 ///
 /// Holds the per-session [`ProcessService`] handle and the session id. Callers
@@ -2200,14 +2318,14 @@ impl DaytonaSession {
     /// Idempotent: a second call after the process service is consumed is a
     /// no-op.
     ///
-    /// `delete_session` is bounded by [`DAYTONA_SESSION_CLOSE_TIMEOUT`] so a
+    /// `delete_session` is bounded by [`DAYTONA_CLEANUP_TIMEOUT`] so a
     /// stalled Daytona REST call cannot block cancellation paths indefinitely.
     async fn close(&mut self, reason: &'static str) {
         let Some(svc) = self.process_svc.as_ref() else {
             return;
         };
         let deletion = time::timeout(
-            DAYTONA_SESSION_CLOSE_TIMEOUT,
+            DAYTONA_CLEANUP_TIMEOUT,
             svc.delete_session(&self.session_id),
         )
         .await;
@@ -2230,7 +2348,7 @@ impl DaytonaSession {
                 tracing::warn!(
                     session_id = %self.session_id,
                     reason,
-                    timeout_ms = u64::try_from(DAYTONA_SESSION_CLOSE_TIMEOUT.as_millis())
+                    timeout_ms = u64::try_from(DAYTONA_CLEANUP_TIMEOUT.as_millis())
                         .unwrap_or(u64::MAX),
                     "timed out deleting Daytona session"
                 );
@@ -2248,11 +2366,8 @@ impl Drop for DaytonaSession {
         match Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
-                    match time::timeout(
-                        DAYTONA_SESSION_CLOSE_TIMEOUT,
-                        svc.delete_session(&session_id),
-                    )
-                    .await
+                    match time::timeout(DAYTONA_CLEANUP_TIMEOUT, svc.delete_session(&session_id))
+                        .await
                     {
                         Ok(Ok(())) => {}
                         Ok(Err(err)) => {
@@ -2265,9 +2380,8 @@ impl Drop for DaytonaSession {
                         Err(_) => {
                             tracing::warn!(
                                 session_id,
-                                timeout_ms =
-                                    u64::try_from(DAYTONA_SESSION_CLOSE_TIMEOUT.as_millis())
-                                        .unwrap_or(u64::MAX),
+                                timeout_ms = u64::try_from(DAYTONA_CLEANUP_TIMEOUT.as_millis())
+                                    .unwrap_or(u64::MAX),
                                 "Daytona session leaked; timed out deleting from Drop"
                             );
                         }
@@ -2548,6 +2662,10 @@ fn wrap_bash_session_script(script: &str) -> String {
     format!("{REMOTE_BASH} -c {}", shell_quote(script))
 }
 
+fn redirect_command_stdin(command: &str, stdin_path: &str) -> String {
+    format!("(\n{command}\n) < {}", shell_quote(stdin_path))
+}
+
 /// Build a command for Daytona's streaming session transport.
 ///
 /// Both [`Sandbox::exec_command_streaming`] and the lifecycle probe call this
@@ -2567,7 +2685,7 @@ mod tests {
 
     use daytona_api_client::models::api_key_list::Permissions;
     use fabro_util::error::collect_chain;
-    use httpmock::Method::{GET, POST};
+    use httpmock::Method::{DELETE, GET, POST};
     use httpmock::{HttpMockResponse, MockServer};
 
     use super::*;
@@ -3237,6 +3355,80 @@ mod tests {
         auth.assert_async().await;
     }
 
+    #[tokio::test]
+    async fn daytona_stdin_file_uploads_exact_bytes_and_is_deleted() {
+        let server = MockServer::start_async().await;
+        let server_url = server.base_url();
+        let sandbox_response = server
+            .mock_async(|when, then| {
+                when.method(GET).path("/sandbox/sandbox-stdin");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(serde_json::json!({
+                        "id": "sandbox-stdin",
+                        "organizationId": "org-1",
+                        "name": "stdin-test",
+                        "user": "daytona",
+                        "env": {},
+                        "labels": {},
+                        "public": false,
+                        "networkBlockAll": false,
+                        "target": "us",
+                        "cpu": 2.0,
+                        "gpu": 0.0,
+                        "memory": 4.0,
+                        "disk": 20.0,
+                        "state": "started"
+                    }));
+            })
+            .await;
+        let toolbox_response = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/sandbox/sandbox-stdin/toolbox-proxy-url");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(serde_json::json!({"url": server_url}));
+            })
+            .await;
+        let upload = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/sandbox-stdin/files/upload")
+                    .body_includes("opaque\n$(not shell)\nlast");
+                then.status(200);
+            })
+            .await;
+        let delete = server
+            .mock_async(|when, then| {
+                when.method(DELETE)
+                    .path("/sandbox-stdin/files")
+                    .query_param("recursive", "false");
+                then.status(200);
+            })
+            .await;
+        let client = build_daytona_client_with(
+            Some("dtn_test".to_string()),
+            Some(server.base_url()),
+            None,
+            Some(fabro_test::test_http_client()),
+        )
+        .await
+        .expect("create Daytona client");
+        let sandbox = client.get("sandbox-stdin").await.expect("get mock sandbox");
+
+        let mut file = DaytonaStdinFile::create(&sandbox, b"opaque\n$(not shell)\nlast")
+            .await
+            .expect("upload stdin file");
+        assert!(file.path.starts_with("/tmp/fabro-command-stdin-"));
+        file.close().await;
+
+        sandbox_response.assert_async().await;
+        toolbox_response.assert_async().await;
+        upload.assert_async().await;
+        delete.assert_async().await;
+    }
+
     /// Recover the inner command a wrapper carries, proving it survives the
     /// base64 transport byte-for-byte.
     fn decode_wrapped_command(wrapped: &str) -> String {
@@ -3362,6 +3554,37 @@ mod tests {
             "the streaming path must enter the canonical Bash exactly once"
         );
         assert!(!wrapped.contains("base64"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test executes the generated stdin redirection to verify exact bytes and EOF"
+    )]
+    fn stdin_file_redirection_applies_to_the_whole_command() {
+        let dir = tempfile::tempdir().expect("create stdin transport temp dir");
+        let stdin_path = dir.path().join("stdin data");
+        let injection_path = dir.path().join("must-not-run");
+        let stdin = format!(
+            "first line\n$(touch {})\nlast line",
+            injection_path.display()
+        );
+        std::fs::write(&stdin_path, &stdin).expect("write stdin fixture");
+        let command = redirect_command_stdin(
+            "IFS= read -r first\nprintf '%s\\n' \"$first\"\ncat",
+            stdin_path.to_str().expect("temp path should be UTF-8"),
+        );
+
+        let output = std::process::Command::new(REMOTE_BASH)
+            .args(["-c", &command])
+            .env_remove(BASH_ENV_VAR)
+            .output()
+            .expect("execute redirected command");
+
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), stdin);
+        assert!(!injection_path.exists());
     }
 
     #[cfg(unix)]

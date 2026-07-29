@@ -100,6 +100,11 @@ Runs a shell script inside the configured sandbox and captures its output. The o
 
 ```dot
 test [label="Run Tests", script="cargo test 2>&1 || true"]
+
+merge_results [
+    script="python3 scripts/merge.py",
+    stdin_source="context.parallel.results"
+]
 ```
 
 When a node has no explicit `shape` or `type`, the presence of `script` makes it a command node. Writing `shape=parallelogram` explicitly is still valid and does the same thing.
@@ -108,6 +113,11 @@ When a node has no explicit `shape` or `type`, the presence of `script` makes it
 |---|---|
 | `script` | The shell command to execute (required). Substitutes `{{ goal }}`, `{{ inputs.NAME }}`, and `{{ vars.NAME }}` — see [command node scripts](/workflows/variables#command-node-scripts) |
 | `language` | `"shell"` (default) or `"python"` |
+| `stdin_source` | Flat runtime context key to pass to the command's standard input. `context.NAME` first checks that exact key, then falls back to `NAME`. |
+
+For `stdin_source`, strings are passed unchanged. Other JSON values use compact
+JSON. Fabro does not add a newline. A missing source, or a value larger than
+10 MiB, fails before the command starts.
 
 ### Human
 

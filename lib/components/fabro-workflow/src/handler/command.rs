@@ -1,13 +1,14 @@
 use std::path::Path;
 
 use async_trait::async_trait;
-use fabro_agent::CommandOutputCallback;
-use fabro_graphviz::graph::{Graph, Node};
+use fabro_agent::{CommandOutputCallback, ExecStreamingRequest};
+use fabro_graphviz::graph::{ContextKeyAttr, Graph, Node};
 use fabro_types::{CommandTermination, StageTiming};
 use fabro_util::shell::shell_quote;
 
 use super::structured_output::{self, StructuredOutputError};
 use super::{EngineServices, Handler, NodeTimeoutPolicy};
+use crate::artifact;
 use crate::command_log::CommandLogRecorder;
 use crate::context::{Context, keys};
 use crate::error::Error;
@@ -35,6 +36,9 @@ impl Handler for CommandHandler {
         _run_dir: &Path,
         _services: &EngineServices,
     ) -> Result<Outcome, Error> {
+        if let Err(reason) = validated_stdin_source(node) {
+            return Ok(Outcome::fail_deterministic(reason));
+        }
         let Some(script) = non_blank_script(node) else {
             return Ok(Outcome::fail_classify("No script specified"));
         };
@@ -71,6 +75,10 @@ impl Handler for CommandHandler {
             )));
         }
 
+        let stdin = match resolve_stdin(node, context, services).await {
+            Ok(stdin) => stdin,
+            Err(outcome) => return Ok(outcome),
+        };
         let output_schema = structured_output::parse_node_output_schema(node)?;
 
         let command = if language == "python" {
@@ -116,14 +124,14 @@ impl Handler for CommandHandler {
         let result = services
             .run
             .sandbox
-            .exec_command_streaming(
-                &command,
-                Some(timeout_ms),
-                None,
+            .exec_command_streaming(ExecStreamingRequest {
+                timeout_ms: Some(timeout_ms),
                 env_vars,
-                Some(cancel_token.clone()),
-                Some(output_callback),
-            )
+                cancel_token: Some(cancel_token.clone()),
+                stdin,
+                output_callback: Some(output_callback),
+                ..ExecStreamingRequest::new(&command)
+            })
             .await;
         cancel_token.cancel();
         let streaming = match result {
@@ -209,6 +217,68 @@ impl Handler for CommandHandler {
     }
 }
 
+/// Ceiling on encoded stdin bytes. `stdin_source` values are runtime data —
+/// often model-produced — so their size is not something a workflow author
+/// reviewed; this bounds peak memory and remote uploads the same way
+/// `MAX_FOR_EACH_ITEMS` bounds `for_each` fan-out.
+const MAX_STDIN_BYTES: usize = 10 * 1024 * 1024;
+
+fn validated_stdin_source(node: &Node) -> Result<Option<&str>, String> {
+    match node.context_key_attr("stdin_source") {
+        ContextKeyAttr::Absent => Ok(None),
+        ContextKeyAttr::Invalid => Err(format!(
+            "Node '{}' requires 'stdin_source' to be a non-empty string",
+            node.id
+        )),
+        ContextKeyAttr::Present(source) => Ok(Some(source)),
+    }
+}
+
+async fn resolve_stdin(
+    node: &Node,
+    context: &Context,
+    services: &EngineServices,
+) -> Result<Option<Vec<u8>>, Outcome> {
+    let Some(source) = validated_stdin_source(node).map_err(Outcome::fail_deterministic)? else {
+        return Ok(None);
+    };
+    let value = match artifact::resolve_flat_context_value(context, source, &services.run.run_store)
+        .await
+    {
+        Ok(Some(value)) => value,
+        Ok(None) => {
+            return Err(Outcome::fail_deterministic(format!(
+                "stdin_source '{source}' was not found in workflow context"
+            )));
+        }
+        Err(err) => {
+            return Err(Outcome::fail_deterministic(format!(
+                "stdin_source '{source}' could not be resolved: {err}"
+            )));
+        }
+    };
+    let stdin = encode_stdin_value(value).map_err(|err| {
+        Outcome::fail_deterministic(format!(
+            "stdin_source '{source}' could not be serialized: {err}"
+        ))
+    })?;
+    if stdin.len() > MAX_STDIN_BYTES {
+        return Err(Outcome::fail_deterministic(format!(
+            "stdin_source '{source}' resolved to {} bytes, above the limit of {MAX_STDIN_BYTES}. \
+             Reduce the value in the node that produces it, or pass it through a file instead.",
+            stdin.len()
+        )));
+    }
+    Ok(Some(stdin))
+}
+
+fn encode_stdin_value(value: serde_json::Value) -> serde_json::Result<Vec<u8>> {
+    match value {
+        serde_json::Value::String(text) => Ok(text.into_bytes()),
+        value => serde_json::to_vec(&value),
+    }
+}
+
 fn schema_validation_failure_reason(
     script: &str,
     error: &StructuredOutputError,
@@ -249,6 +319,7 @@ mod tests {
 
     use bytes::Bytes;
     use fabro_graphviz::graph::AttrValue;
+    use fabro_sandbox::test_support::MockSandbox;
     use fabro_store::{Database, RunDatabase, StageId};
     use fabro_types::{Graph, RunProjection, RunSpec, WorkflowSettings, fixtures, test_support};
     use object_store::memory::InMemory;
@@ -261,6 +332,23 @@ mod tests {
 
     const PASSED_OUTPUT_SCHEMA: &str =
         r#"{"type":"object","required":["passed"],"properties":{"passed":{"type":"boolean"}}}"#;
+
+    #[test]
+    fn stdin_json_encoding_is_compact_and_strings_are_raw() {
+        for (value, expected) in [
+            (serde_json::json!("text"), b"text".as_slice()),
+            (serde_json::json!([1, 2]), br"[1,2]".as_slice()),
+            (
+                serde_json::json!({"ok": true}),
+                br#"{"ok":true}"#.as_slice(),
+            ),
+            (serde_json::json!(42), b"42".as_slice()),
+            (serde_json::json!(false), b"false".as_slice()),
+            (serde_json::Value::Null, b"null".as_slice()),
+        ] {
+            assert_eq!(encode_stdin_value(value).unwrap(), expected);
+        }
+    }
 
     #[derive(Default)]
     struct MemoryRunStoreBackend {
@@ -765,7 +853,7 @@ mod tests {
         let context = Context::new();
         let graph = Graph::new("test");
         let run_dir = tempfile::tempdir().unwrap();
-        let mut services = make_spy_services(spy.clone());
+        let mut services = make_sandbox_services(spy.clone());
         let event_names = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured_event_names = Arc::clone(&event_names);
         let emitter = Arc::new(crate::event::Emitter::new(fixtures::RUN_1));
@@ -1446,10 +1534,156 @@ mod tests {
         }
     }
 
-    fn make_spy_services(sandbox: std::sync::Arc<SpySandbox>) -> EngineServices {
+    fn make_sandbox_services(sandbox: std::sync::Arc<dyn fabro_agent::Sandbox>) -> EngineServices {
         let mut services = make_services();
         services.run = services.run.with_sandbox(sandbox);
         services
+    }
+
+    #[tokio::test]
+    async fn stdin_source_serializes_parallel_results_as_compact_json() {
+        let mock = std::sync::Arc::new(MockSandbox::default());
+        let handler = CommandHandler;
+        let mut node = Node::new("merge");
+        node.attrs
+            .insert("script".to_string(), AttrValue::String("cat".to_string()));
+        node.attrs.insert(
+            "stdin_source".to_string(),
+            AttrValue::String("context.parallel.results".to_string()),
+        );
+        let parallel_results = serde_json::json!([
+            {
+                "branch": "one",
+                "response": "$(touch /tmp/must-not-run)\nsecond line"
+            },
+            {"branch": "two", "passed": true}
+        ]);
+        let context = Context::new();
+        context.set(keys::PARALLEL_RESULTS, parallel_results.clone());
+        let graph = Graph::new("test");
+        let run_dir = tempfile::tempdir().unwrap();
+        let services = make_sandbox_services(mock.clone());
+
+        let outcome = handler
+            .execute(&node, &context, &graph, run_dir.path(), &services)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status, StageOutcome::Succeeded);
+        assert_eq!(
+            *mock.captured_stdin.lock().unwrap(),
+            Some(serde_json::to_vec(&parallel_results).unwrap())
+        );
+        assert!(
+            !mock
+                .captured_command
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("command should run")
+                .contains("must-not-run"),
+            "stdin content must not be inserted into shell source"
+        );
+    }
+
+    #[tokio::test]
+    async fn stdin_source_passes_strings_without_adding_a_newline() {
+        let mock = std::sync::Arc::new(MockSandbox::default());
+        let handler = CommandHandler;
+        let mut node = Node::new("consume");
+        node.attrs
+            .insert("script".to_string(), AttrValue::String("cat".to_string()));
+        node.attrs.insert(
+            "stdin_source".to_string(),
+            AttrValue::String("context.input".to_string()),
+        );
+        let context = Context::new();
+        context.set("input", serde_json::json!("first\nlast"));
+        let graph = Graph::new("test");
+        let run_dir = tempfile::tempdir().unwrap();
+        let services = make_sandbox_services(mock.clone());
+
+        let outcome = handler
+            .execute(&node, &context, &graph, run_dir.path(), &services)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.status, StageOutcome::Succeeded);
+        assert_eq!(
+            mock.captured_stdin.lock().unwrap().as_deref(),
+            Some(b"first\nlast".as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_stdin_source_fails_before_starting_the_command() {
+        let mock = std::sync::Arc::new(MockSandbox::default());
+        let handler = CommandHandler;
+        let mut node = Node::new("consume");
+        node.attrs
+            .insert("script".to_string(), AttrValue::String("cat".to_string()));
+        node.attrs.insert(
+            "stdin_source".to_string(),
+            AttrValue::String("context.missing".to_string()),
+        );
+        let context = Context::new();
+        let graph = Graph::new("test");
+        let run_dir = tempfile::tempdir().unwrap();
+        let services = make_sandbox_services(mock.clone());
+
+        let outcome = handler
+            .execute(&node, &context, &graph, run_dir.path(), &services)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome.failure_category(),
+            Some(FailureCategory::Deterministic)
+        );
+        assert!(
+            outcome
+                .failure_reason()
+                .unwrap()
+                .contains("was not found in workflow context")
+        );
+        assert_eq!(*mock.captured_command.lock().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn simulation_validates_stdin_source_without_resolving_context() {
+        let handler = CommandHandler;
+        let mut valid = Node::new("valid");
+        valid
+            .attrs
+            .insert("script".to_string(), AttrValue::String("cat".to_string()));
+        valid.attrs.insert(
+            "stdin_source".to_string(),
+            AttrValue::String("context.not_available_in_dry_run".to_string()),
+        );
+        let mut invalid = valid.clone();
+        invalid.id = "invalid".to_string();
+        invalid
+            .attrs
+            .insert("stdin_source".to_string(), AttrValue::Integer(7));
+        let context = Context::new();
+        let graph = Graph::new("test");
+        let run_dir = tempfile::tempdir().unwrap();
+        let services = make_services();
+
+        let valid_outcome = handler
+            .simulate(&valid, &context, &graph, run_dir.path(), &services)
+            .await
+            .unwrap();
+        let invalid_outcome = handler
+            .simulate(&invalid, &context, &graph, run_dir.path(), &services)
+            .await
+            .unwrap();
+
+        assert_eq!(valid_outcome.status, StageOutcome::Succeeded);
+        assert_eq!(
+            invalid_outcome.failure_category(),
+            Some(FailureCategory::Deterministic)
+        );
     }
 
     struct RefreshingMinter {
@@ -1487,7 +1721,7 @@ mod tests {
         let graph = Graph::new("test");
         let run_dir = tempfile::tempdir().unwrap();
 
-        let services = make_spy_services(spy.clone());
+        let services = make_sandbox_services(spy.clone());
         let outcome = handler
             .execute(&node, &context, &graph, run_dir.path(), &services)
             .await
@@ -1537,7 +1771,7 @@ mod tests {
                 &context,
                 &graph,
                 run_dir.path(),
-                &make_spy_services(spy.clone()),
+                &make_sandbox_services(spy.clone()),
             )
             .await
             .unwrap();
@@ -1568,7 +1802,7 @@ mod tests {
         let graph = Graph::new("test");
         let run_dir = tempfile::tempdir().unwrap();
 
-        let mut services = make_spy_services(spy.clone());
+        let mut services = make_sandbox_services(spy.clone());
         services
             .base_env
             .insert("MY_VAR".to_string(), "my_value".to_string());
@@ -1597,7 +1831,7 @@ mod tests {
         let minter = std::sync::Arc::new(RefreshingMinter {
             calls: std::sync::atomic::AtomicUsize::new(0),
         });
-        let mut services = make_spy_services(spy.clone());
+        let mut services = make_sandbox_services(spy.clone());
         services.github_token = Some(std::sync::Arc::new(
             crate::github_token_source::GitHubTokenSource::mintable(minter.clone()),
         ));
@@ -1658,7 +1892,7 @@ mod tests {
         let graph = Graph::new("test");
         let run_dir = tempfile::tempdir().unwrap();
 
-        let mut services = make_spy_services(spy.clone());
+        let mut services = make_sandbox_services(spy.clone());
         services.run = services
             .run
             .with_cancel_token(tokio_util::sync::CancellationToken::new());
@@ -1697,7 +1931,7 @@ mod tests {
                 &context,
                 &graph,
                 run_dir.path(),
-                &make_spy_services(spy),
+                &make_sandbox_services(spy),
             )
             .await
             .unwrap_err();
@@ -1784,7 +2018,7 @@ mod tests {
         let context = Context::new();
         let graph = Graph::new("test");
         let run_dir = tempfile::tempdir().unwrap();
-        let services = make_spy_services(std::sync::Arc::new(SpySandbox::fail("No such file")));
+        let services = make_sandbox_services(std::sync::Arc::new(SpySandbox::fail("No such file")));
 
         let err = handler
             .execute(&node, &context, &graph, run_dir.path(), &services)
