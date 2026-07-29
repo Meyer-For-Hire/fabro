@@ -13,6 +13,7 @@ pub(super) async fn list_command(args: &ArtifactListArgs, base_ctx: &CommandCont
         &args.server,
         &args.run_id,
         args.node.as_deref(),
+        args.stage.as_deref(),
         args.retry,
     )
     .await?;
@@ -31,7 +32,7 @@ pub(super) async fn list_command(args: &ArtifactListArgs, base_ctx: &CommandCont
     let use_color = styles.use_color;
 
     let title: Vec<CellStruct> = vec![
-        "NODE".cell().bold(use_color),
+        "STAGE".cell().bold(use_color),
         "RETRY".cell().bold(use_color).justify(Justify::Right),
         "PATH".cell().bold(use_color),
     ];
@@ -40,7 +41,7 @@ pub(super) async fn list_command(args: &ArtifactListArgs, base_ctx: &CommandCont
         .iter()
         .map(|entry| {
             vec![
-                entry.node_slug.clone().cell().bold(use_color),
+                entry.stage_id.to_string().cell().bold(use_color),
                 entry.retry.cell().justify(Justify::Right),
                 entry.relative_path.clone().cell(),
             ]

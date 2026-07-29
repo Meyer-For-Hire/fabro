@@ -931,6 +931,7 @@ async fn seed_artifact_run(context: &TestContext) -> RunSetup {
     for (stage_id, retry, path, contents) in [
         ("create_assets@1", 1, "assets/node_a/summary.txt", "alpha"),
         ("create_assets@1", 1, "assets/shared/report.txt", "one"),
+        ("create_assets@2", 1, "assets/shared/report.txt", "two"),
         ("create_colliding@1", 1, "assets/other/summary.txt", "beta"),
         ("create_colliding@1", 1, "assets/retry/report.txt", "second"),
         ("retry_assets@1", 1, "assets/retry/report.txt", "first"),
@@ -1455,7 +1456,7 @@ async fn append_seeded_artifact_run_events(
         "run.completed",
         serde_json::json!({
             "timing": {"wall_time_ms": 123, "inference_time_ms": 0, "tool_time_ms": 0, "active_time_ms": 0},
-            "artifact_count": 6,
+            "artifact_count": 7,
             "status": "succeeded",
             "reason": "completed",
             "total_usd_micros": null,

@@ -10,7 +10,6 @@ use crate::server_client::Client;
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub(super) struct ArtifactEntry {
-    #[serde(skip_serializing)]
     pub(super) stage_id:      StageId,
     pub(super) node_slug:     String,
     pub(super) retry:         u32,
@@ -23,14 +22,23 @@ pub(super) async fn resolve_artifacts(
     server: &ServerTargetArgs,
     run_selector: &str,
     node: Option<&str>,
+    stage: Option<&str>,
     retry: Option<u32>,
 ) -> Result<(RunId, Client, Vec<ArtifactEntry>)> {
+    let stage = stage
+        .map(str::parse::<StageId>)
+        .transpose()
+        .context("invalid artifact stage filter")?;
     let ctx = base_ctx.with_target(server)?;
     let client = ctx.server().await?;
     let run_id = client.resolve_run(run_selector).await?.id;
     let mut entries = Vec::new();
     for entry in client.list_run_artifacts(&run_id).await? {
         if node.is_some_and(|value| entry.node_slug != value) {
+            continue;
+        }
+        let stage_id = entry.stage_id.parse()?;
+        if stage.as_ref().is_some_and(|value| &stage_id != value) {
             continue;
         }
         let entry_retry = u32::try_from(entry.retry)
@@ -41,7 +49,7 @@ pub(super) async fn resolve_artifacts(
         let size =
             u64::try_from(entry.size).context("server returned invalid negative artifact size")?;
         entries.push(ArtifactEntry {
-            stage_id: entry.stage_id.parse()?,
+            stage_id,
             node_slug: entry.node_slug,
             retry: entry_retry,
             relative_path: entry.relative_path,
