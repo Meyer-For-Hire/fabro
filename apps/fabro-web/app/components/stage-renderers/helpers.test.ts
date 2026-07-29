@@ -98,6 +98,33 @@ describe("parseHumanInterviewPairs", () => {
     });
   });
 
+  test("preserves a typed review target from started events", () => {
+    const events: EventEnvelope[] = [
+      makeEventEnvelope(1, {
+        event: "interview.started",
+        properties: {
+          question_id: "q-1",
+          question:
+            "Review the Quarry review exercise document, then choose the next action.",
+          question_type: "multiple_choice",
+          review_target: {
+            label: "Quarry review exercise",
+            url: "https://quarry.lithos.computer/tmp/0123456789abcdef0123456789abcdef",
+            kind: "document",
+          },
+        },
+      }),
+    ];
+
+    const pairs = parseHumanInterviewPairs(events);
+
+    expect(pairs[0].question.reviewTarget).toEqual({
+      label: "Quarry review exercise",
+      url: "https://quarry.lithos.computer/tmp/0123456789abcdef0123456789abcdef",
+      kind: "document",
+    });
+  });
+
   test("captures timeout and interrupted resolutions", () => {
     const events: EventEnvelope[] = [
       makeEventEnvelope(1, {
@@ -172,12 +199,46 @@ describe("parseParallelOverview", () => {
       failureCount: 1,
       durationMs: 12000,
       results: [
-        { id: "branch-a", status: "succeeded" },
-        { id: "branch-b", status: "succeeded" },
-        { id: "branch-c", status: "failed" },
+        { id: "branch-a", index: null, itemLabel: null, status: "succeeded" },
+        { id: "branch-b", index: null, itemLabel: null, status: "succeeded" },
+        { id: "branch-c", index: null, itemLabel: null, status: "failed" },
       ],
       isComplete: true,
     });
+  });
+
+  test("parses dynamic item identity from results", () => {
+    const events: EventEnvelope[] = [
+      makeEventEnvelope(1, {
+        event: "parallel.completed",
+        properties: {
+          duration_ms: 20,
+          success_count: 2,
+          failure_count: 0,
+          results: [
+            {
+              id: "reviewer",
+              index: 0,
+              item_label: "auth",
+              status: "succeeded",
+              context_updates: {},
+            },
+            {
+              id: "reviewer",
+              index: 1,
+              item_label: "api",
+              status: "succeeded",
+              context_updates: {},
+            },
+          ],
+        },
+      }),
+    ];
+
+    expect(parseParallelOverview(events).results).toEqual([
+      { id: "reviewer", index: 0, itemLabel: "auth", status: "succeeded" },
+      { id: "reviewer", index: 1, itemLabel: "api", status: "succeeded" },
+    ]);
   });
 
   test("reports in-flight when only the started event is present", () => {

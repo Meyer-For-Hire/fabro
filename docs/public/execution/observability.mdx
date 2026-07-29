@@ -66,6 +66,13 @@ Envelope fields:
 
 Only `id`, `ts`, `run_id`, and `event` are always present. Optional fields are omitted when they do not apply.
 
+For runtime `for_each` branches, `parallel.branch.started` and
+`parallel.branch.completed` include the zero-based `index` and an optional
+`item_label`. They do not include the raw item. The final prompt is recorded by
+the existing `stage.prompt` event, including the fenced item data, so event
+streams, run dumps, and retained logs are source-bearing data. Apply the same
+access controls and retention policy you use for workflow inputs.
+
 ## Reading the event stream
 
 Because event payload lives in `properties`, most shell queries should look there.

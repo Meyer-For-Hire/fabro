@@ -5,7 +5,7 @@
 /// `Outcome`/`Context`.
 use fabro_graphviz::condition::{Clause, ConditionExpr, Op};
 
-use crate::context::{Context, keys};
+use crate::context::{self, Context, keys};
 use crate::outcome::Outcome;
 
 // ---------------------------------------------------------------------------
@@ -19,18 +19,7 @@ fn resolve_key(key: &str, outcome: &Outcome, context: &Context) -> String {
     if key == keys::PREFERRED_LABEL {
         return outcome.preferred_label.as_deref().unwrap_or("").to_string();
     }
-    if let Some(path) = key.strip_prefix("context.") {
-        if let Some(val) = context.get(key) {
-            return json_value_to_string(&val);
-        }
-        if let Some(val) = context.get(path) {
-            return json_value_to_string(&val);
-        }
-        return String::new();
-    }
-    context
-        .get(key)
-        .map_or_else(String::new, |val| json_value_to_string(&val))
+    context::lookup_flat(context, key).map_or_else(String::new, |val| json_value_to_string(&val))
 }
 
 fn resolve_key_value(key: &str, outcome: &Outcome, context: &Context) -> serde_json::Value {
@@ -45,16 +34,7 @@ fn resolve_key_value(key: &str, outcome: &Outcome, context: &Context) -> serde_j
                 serde_json::Value::String(s.to_string())
             });
     }
-    if let Some(path) = key.strip_prefix("context.") {
-        if let Some(val) = context.get(key) {
-            return val;
-        }
-        if let Some(val) = context.get(path) {
-            return val;
-        }
-        return serde_json::Value::Null;
-    }
-    context.get(key).unwrap_or(serde_json::Value::Null)
+    context::lookup_flat(context, key).unwrap_or(serde_json::Value::Null)
 }
 
 fn json_value_to_string(val: &serde_json::Value) -> String {

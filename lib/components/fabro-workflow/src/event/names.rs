@@ -175,6 +175,7 @@ mod tests {
                 parallel_branch_id:    ParallelBranchId::new(StageId::new("plan", 1), 0),
                 branch:                "fork".to_string(),
                 index:                 0,
+                item_label:            None,
             }),
             "parallel.branch.started"
         );

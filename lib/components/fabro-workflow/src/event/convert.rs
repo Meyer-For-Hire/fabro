@@ -382,21 +382,25 @@ fn event_body_from_event(event: &Event) -> EventBody {
         }),
         Event::ParallelBranchStarted {
             index,
+            item_label,
             graph_visit,
             resumed_from_stage_id,
             ..
         } => EventBody::ParallelBranchStarted(fabro_types::ParallelBranchStartedProps {
             index: *index,
+            item_label: item_label.clone(),
             graph_visit: *graph_visit,
             resumed_from_stage_id: resumed_from_stage_id.clone(),
         }),
         Event::ParallelBranchCompleted {
             index,
+            item_label,
             duration_ms,
             status,
             ..
         } => EventBody::ParallelBranchCompleted(fabro_types::ParallelBranchCompletedProps {
             index:       *index,
+            item_label:  item_label.clone(),
             duration_ms: *duration_ms,
             status:      *status,
         }),
@@ -423,6 +427,7 @@ fn event_body_from_event(event: &Event) -> EventBody {
             allow_freeform,
             timeout_seconds,
             context_display,
+            review_target,
         } => EventBody::InterviewStarted(fabro_types::InterviewStartedProps {
             question_id:     question_id.clone(),
             question:        question.clone(),
@@ -432,6 +437,7 @@ fn event_body_from_event(event: &Event) -> EventBody {
             allow_freeform:  *allow_freeform,
             timeout_seconds: *timeout_seconds,
             context_display: context_display.clone(),
+            review_target:   review_target.clone(),
         }),
         Event::InterviewCompleted {
             actor: _,
@@ -1311,6 +1317,7 @@ fn event_body_from_event(event: &Event) -> EventBody {
             repo,
             base_branch,
             head_branch,
+            head_sha,
             title,
             draft,
         } => EventBody::PullRequestCreated(fabro_types::PullRequestCreatedProps {
@@ -1320,6 +1327,7 @@ fn event_body_from_event(event: &Event) -> EventBody {
             repo:        repo.clone(),
             base_branch: base_branch.clone(),
             head_branch: head_branch.clone(),
+            head_sha:    head_sha.clone(),
             title:       title.clone(),
             draft:       *draft,
         }),
@@ -1811,6 +1819,7 @@ mod tests {
             parallel_branch_id: ParallelBranchId::new(group_id, 1),
             branch:             "review".to_string(),
             index:              1,
+            item_label:         Some("api".to_string()),
             duration_ms:        42,
             status:             StageOutcome::Succeeded,
         });
@@ -1819,6 +1828,7 @@ mod tests {
             stored.properties().unwrap(),
             serde_json::json!({
                 "index": 1,
+                "item_label": "api",
                 "duration_ms": 42,
                 "status": "succeeded",
             })
@@ -1836,6 +1846,8 @@ mod tests {
             results:       vec![
                 ::fabro_types::ParallelBranchResult {
                     id:              "review_api".to_string(),
+                    index:           Some(0),
+                    item_label:      Some("api".to_string()),
                     status:          StageOutcome::Succeeded,
                     context_updates: BTreeMap::from([(
                         "response.review_api".to_string(),
@@ -1844,6 +1856,8 @@ mod tests {
                 },
                 ::fabro_types::ParallelBranchResult {
                     id:              "review_ux".to_string(),
+                    index:           Some(1),
+                    item_label:      Some("ux".to_string()),
                     status:          StageOutcome::Failed {
                         retry_requested: false,
                     },
@@ -1865,11 +1879,15 @@ mod tests {
                 "results": [
                     {
                         "id": "review_api",
+                        "index": 0,
+                        "item_label": "api",
                         "status": "succeeded",
                         "context_updates": {"response.review_api": "looks good"},
                     },
                     {
                         "id": "review_ux",
+                        "index": 1,
+                        "item_label": "ux",
                         "status": "failed",
                         "context_updates": {"response.review_ux": "needs work"},
                     },
@@ -1887,6 +1905,7 @@ mod tests {
             parallel_branch_id:    ParallelBranchId::new(StageId::new("fanout", 2), 1),
             branch:                "review".to_string(),
             index:                 1,
+            item_label:            Some("api".to_string()),
         });
         assert_eq!(stored.parallel_group_id, Some(StageId::new("fanout", 2)));
         assert_eq!(

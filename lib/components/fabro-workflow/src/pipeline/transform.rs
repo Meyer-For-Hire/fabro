@@ -3,7 +3,7 @@ use std::sync::Arc;
 use super::types::{Parsed, TransformOptions, Transformed};
 use crate::error::Error;
 use crate::transforms::{
-    FileInliningTransform, ImportTransform, ModelResolutionTransform,
+    FileInliningTransform, ImportTransform, ScriptInterpolationTransform,
     StylesheetApplicationTransform, TemplateTransform, Transform,
 };
 
@@ -62,14 +62,18 @@ pub fn transform(parsed: Parsed, options: &TransformOptions) -> Result<Transform
     }
     .apply_with_diagnostics(graph)?;
     diagnostics.extend(transform_diagnostics);
+    let (graph, transform_diagnostics) = ScriptInterpolationTransform {
+        context:     options.template_context.clone(),
+        source_name: options.source_name.clone(),
+        render_mode: options.render_mode,
+    }
+    .apply_with_diagnostics(graph)?;
+    diagnostics.extend(transform_diagnostics);
     let graph = StylesheetApplicationTransform.apply(graph)?;
-    let graph = ModelResolutionTransform::for_eligible(
-        Arc::clone(&options.catalog),
-        options.eligible_providers.clone(),
-    )
-    .with_default_provider(options.default_provider.clone())
-    .with_catalog_fallback(options.catalog_fallback)
-    .apply(graph)?;
+    let graph = match &options.model_resolution {
+        Some(model_resolution) => model_resolution.apply(graph)?,
+        None => graph,
+    };
 
     // Custom transforms
     let graph = options
@@ -98,6 +102,7 @@ mod tests {
     use crate::file_resolver::FilesystemFileResolver;
     use crate::pipeline::parse::parse;
     use crate::pipeline::types::{GOAL_SELF_REFERENCE_RULE, TEMPLATE_UNDEFINED_VARIABLE_RULE};
+    use crate::transforms::ModelResolutionTransform;
 
     fn write_file(path: &Path, contents: &str) {
         if let Some(parent) = path.parent() {
@@ -112,16 +117,13 @@ mod tests {
 
     fn transform_options() -> TransformOptions {
         TransformOptions {
-            current_dir:        None,
-            file_resolver:      None,
-            template_context:   fabro_template::TemplateContext::new(),
-            source_name:        None,
-            render_mode:        crate::operations::RenderMode::Strict,
-            custom_transforms:  vec![],
-            catalog:            test_catalog(),
-            default_provider:   None,
-            eligible_providers: Catalog::builtin().all_provider_ids(),
-            catalog_fallback:   false,
+            current_dir:       None,
+            file_resolver:     None,
+            template_context:  fabro_template::TemplateContext::new(),
+            source_name:       None,
+            render_mode:       crate::operations::RenderMode::Strict,
+            custom_transforms: vec![],
+            model_resolution:  Some(ModelResolutionTransform::new(test_catalog())),
         }
     }
 
@@ -157,7 +159,7 @@ mod tests {
         let transformed = transform(parsed, &transform_options()).unwrap();
         assert_eq!(
             transformed.graph.nodes["work"].attrs.get("model"),
-            Some(&AttrValue::String("claude-sonnet-4-6".into()))
+            Some(&AttrValue::String("claude-sonnet-5".into()))
         );
     }
 
@@ -177,16 +179,9 @@ mod tests {
         )
         .unwrap();
         let transformed = transform(parsed, &TransformOptions {
-            current_dir:        Some(dir.path().to_path_buf()),
-            file_resolver:      Some(Arc::new(FilesystemFileResolver::new(None))),
-            template_context:   fabro_template::TemplateContext::new(),
-            source_name:        None,
-            render_mode:        crate::operations::RenderMode::Strict,
-            custom_transforms:  vec![],
-            catalog:            test_catalog(),
-            default_provider:   None,
-            eligible_providers: Catalog::builtin().all_provider_ids(),
-            catalog_fallback:   false,
+            current_dir: Some(dir.path().to_path_buf()),
+            file_resolver: Some(Arc::new(FilesystemFileResolver::new(None))),
+            ..transform_options()
         })
         .unwrap();
 
@@ -227,21 +222,15 @@ mod tests {
         )
         .unwrap();
         let transformed = transform(parsed, &TransformOptions {
-            current_dir:        Some(dir.path().to_path_buf()),
-            file_resolver:      Some(Arc::new(FilesystemFileResolver::new(None))),
-            template_context:   fabro_template::TemplateContext::new().with_inputs(HashMap::from(
-                [(
+            current_dir: Some(dir.path().to_path_buf()),
+            file_resolver: Some(Arc::new(FilesystemFileResolver::new(None))),
+            template_context: fabro_template::TemplateContext::new().with_inputs(HashMap::from([
+                (
                     "task".to_string(),
                     toml::Value::String("Launch".to_string()),
-                )],
-            )),
-            source_name:        None,
-            render_mode:        crate::operations::RenderMode::Strict,
-            custom_transforms:  vec![],
-            catalog:            test_catalog(),
-            default_provider:   None,
-            eligible_providers: Catalog::builtin().all_provider_ids(),
-            catalog_fallback:   false,
+                ),
+            ])),
+            ..transform_options()
         })
         .unwrap();
 
@@ -252,7 +241,93 @@ mod tests {
         );
         assert_eq!(
             lint.attrs.get("model"),
-            Some(&AttrValue::String("claude-sonnet-4-6".into()))
+            Some(&AttrValue::String("claude-sonnet-5".into()))
+        );
+    }
+
+    #[test]
+    fn imported_script_does_not_rescan_substituted_token_syntax() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(
+            &dir.path().join("child.fabro"),
+            r#"digraph child {
+                start [shape=Mdiamond]
+                run [shape=parallelogram, script="printf '%s' {{ inputs.payload }}"]
+                exit [shape=Msquare]
+                start -> run -> exit
+            }"#,
+        );
+        let parsed = parse(
+            r#"digraph Test {
+                graph [goal="Test"]
+                start [shape=Mdiamond]
+                child [import="./child.fabro"]
+                exit [shape=Msquare]
+                start -> child -> exit
+            }"#,
+        )
+        .unwrap();
+        let transformed = transform(parsed, &TransformOptions {
+            current_dir: Some(dir.path().to_path_buf()),
+            file_resolver: Some(Arc::new(FilesystemFileResolver::new(None))),
+            template_context: fabro_template::TemplateContext::new().with_inputs(HashMap::from([
+                (
+                    "payload".to_string(),
+                    toml::Value::String("{{ secrets.API_KEY }}".to_string()),
+                ),
+            ])),
+            ..transform_options()
+        })
+        .unwrap();
+
+        assert_eq!(
+            transformed.graph.nodes["child.run"]
+                .attrs
+                .get("script")
+                .and_then(AttrValue::as_str),
+            Some("printf '%s' '{{ secrets.API_KEY }}'")
+        );
+    }
+
+    #[test]
+    fn imported_script_reports_a_missing_value_once() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(
+            &dir.path().join("child.fabro"),
+            r#"digraph child {
+                start [shape=Mdiamond]
+                run [shape=parallelogram, script="echo {{ inputs.missing }}"]
+                exit [shape=Msquare]
+                start -> run -> exit
+            }"#,
+        );
+        let parsed = parse(
+            r#"digraph Test {
+                graph [goal="Test"]
+                start [shape=Mdiamond]
+                child [import="./child.fabro"]
+                exit [shape=Msquare]
+                start -> child -> exit
+            }"#,
+        )
+        .unwrap();
+        let transformed = transform(parsed, &TransformOptions {
+            current_dir: Some(dir.path().to_path_buf()),
+            file_resolver: Some(Arc::new(FilesystemFileResolver::new(None))),
+            render_mode: crate::operations::RenderMode::Structural,
+            ..transform_options()
+        })
+        .unwrap();
+
+        let missing_value_diagnostics = transformed
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.rule == TEMPLATE_UNDEFINED_VARIABLE_RULE)
+            .count();
+        assert_eq!(
+            missing_value_diagnostics, 1,
+            "{:?}",
+            transformed.diagnostics
         );
     }
 
@@ -350,6 +425,33 @@ mod tests {
     }
 
     #[test]
+    fn structural_transform_preserves_catalog_owned_model_selection() {
+        let dot = r#"digraph Test {
+            graph [goal="Test"]
+            start [shape=Mdiamond]
+            work [prompt="Do work", model="private-model", provider="server-only"]
+            exit [shape=Msquare]
+            start -> work -> exit
+        }"#;
+        let parsed = parse(dot).unwrap();
+        let transformed = transform(parsed, &TransformOptions {
+            model_resolution: None,
+            ..transform_options()
+        })
+        .unwrap();
+        let work = &transformed.graph.nodes["work"];
+
+        assert_eq!(
+            work.attrs.get("model").and_then(AttrValue::as_str),
+            Some("private-model")
+        );
+        assert_eq!(
+            work.attrs.get("provider").and_then(AttrValue::as_str),
+            Some("server-only")
+        );
+    }
+
+    #[test]
     fn transform_reports_goal_self_reference_once_across_passes() {
         // FileInlining renders the goal for prompt context, but TemplateTransform
         // is the only pass that should emit the self-reference diagnostic.
@@ -365,16 +467,10 @@ mod tests {
         )
         .unwrap();
         let transformed = transform(parsed, &TransformOptions {
-            current_dir:        Some(dir.path().to_path_buf()),
-            file_resolver:      Some(Arc::new(FilesystemFileResolver::new(None))),
-            template_context:   fabro_template::TemplateContext::new(),
-            source_name:        None,
-            render_mode:        crate::operations::RenderMode::Structural,
-            custom_transforms:  vec![],
-            catalog:            test_catalog(),
-            default_provider:   None,
-            eligible_providers: Catalog::builtin().all_provider_ids(),
-            catalog_fallback:   false,
+            current_dir: Some(dir.path().to_path_buf()),
+            file_resolver: Some(Arc::new(FilesystemFileResolver::new(None))),
+            render_mode: crate::operations::RenderMode::Structural,
+            ..transform_options()
         })
         .unwrap();
 

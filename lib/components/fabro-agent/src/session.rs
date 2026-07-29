@@ -368,6 +368,18 @@ struct BuiltRequest {
     context_window: StageContextWindowProjection,
 }
 
+/// Whether an input's `/name` tokens should be treated as skill references.
+///
+/// Only text the user actually typed can invoke a skill. Harness-synthesized
+/// input carries whatever a child agent wrote, where `/tmp` is a path rather
+/// than an invocation: expanding it would either fail the parent turn on an
+/// unknown name or splice a skill template in place of the envelope.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SkillExpansion {
+    Apply,
+    Skip,
+}
+
 pub struct Session {
     id: String,
     /// Root agent session ID for this session's agent tree. A root session
@@ -1318,10 +1330,14 @@ impl Session {
             })
         });
 
-        // Process the initial input, then drain any followups
+        // Process the initial input, then drain followups. Claude-compatible
+        // background-agent results join this same boundary queue: they never
+        // interrupt inference or a tool call, and all results already ready at
+        // a boundary are delivered in one additional parent turn.
         let mut result = self
             .run_single_input(
                 input,
+                SkillExpansion::Apply,
                 &agent_tool_runtime,
                 &mut timing,
                 &mut usage,
@@ -1336,10 +1352,34 @@ impl Session {
                     .lock()
                     .expect("followup queue lock poisoned")
                     .pop_front();
-                let Some(followup) = followup else { break };
+                let next_input = if let Some(followup) = followup {
+                    Some((followup, SkillExpansion::Apply))
+                } else if let Some(supervisor) = self.subagent_supervisor.clone() {
+                    match supervisor
+                        .next_parent_notification_turn(&self.cancel_token)
+                        .await
+                    {
+                        Ok(Some(turn)) => Some((turn, SkillExpansion::Skip)),
+                        Ok(None) => None,
+                        Err(Error::Interrupted(InterruptReason::Cancelled)) => {
+                            result = Err(self.interrupted_error());
+                            None
+                        }
+                        Err(error) => {
+                            result = Err(error);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                let Some((next_input, skill_expansion)) = next_input else {
+                    break;
+                };
                 result = self
                     .run_single_input(
-                        &followup,
+                        &next_input,
+                        skill_expansion,
                         &agent_tool_runtime,
                         &mut timing,
                         &mut usage,
@@ -1377,6 +1417,7 @@ impl Session {
     async fn run_single_input(
         &mut self,
         input: &str,
+        skill_expansion: SkillExpansion,
         agent_tool_runtime: &AgentToolRuntime,
         timing: &mut SessionInputTiming,
         usage_accumulator: &mut TokenCounts,
@@ -1391,7 +1432,7 @@ impl Session {
         self.transition(SessionState::Thinking);
 
         // Expand skill references in input
-        let expanded = if self.skills.is_empty() {
+        let expanded = if self.skills.is_empty() || skill_expansion == SkillExpansion::Skip {
             ExpandedInput {
                 text:       input.to_string(),
                 skill_name: None,
@@ -3038,6 +3079,121 @@ mod tests {
         assert!(
             matches!(&turns[3], Message::Assistant { content, .. } if content == "Followup response")
         );
+    }
+
+    #[tokio::test]
+    async fn background_agent_notifications_are_batched_into_one_parent_turn() {
+        let supervisor = SubAgentSupervisor::new(3);
+        let first = make_session(vec![text_response("first result")]).await;
+        let second = make_session(vec![text_response("second result")]).await;
+        let first_id = supervisor
+            .spawn_with_parent_notification(
+                first,
+                "first task".to_string(),
+                "Inspect first".to_string(),
+                0,
+            )
+            .unwrap();
+        let second_id = supervisor
+            .spawn_with_parent_notification(
+                second,
+                "second task".to_string(),
+                "Inspect second".to_string(),
+                0,
+            )
+            .unwrap();
+
+        // Make both results ready before the parent reaches its safe turn
+        // boundary so batching is deterministic.
+        supervisor
+            .wait_with_cancel(&first_id, &CancellationToken::new())
+            .await
+            .unwrap();
+        supervisor
+            .wait_with_cancel(&second_id, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        let provider = Arc::new(ScriptedStreamProvider::new(vec![
+            ScriptedStreamCall::Response(Box::new(text_response("Parent is waiting"))),
+            ScriptedStreamCall::Response(Box::new(text_response("Synthesized both results"))),
+        ]));
+        let mut parent =
+            make_session_with_provider_and_manager(provider, Some(supervisor.clone())).await;
+
+        let output = parent
+            .process_input_with_output("Delegate both tasks")
+            .await
+            .unwrap();
+
+        assert_eq!(output.as_deref(), Some("Synthesized both results"));
+        let turns = parent.history().turns();
+        assert_eq!(turns.len(), 4);
+        let Message::User {
+            content: notification,
+            ..
+        } = &turns[2]
+        else {
+            panic!("third turn should deliver the background results");
+        };
+        assert_eq!(notification.matches("<task-notification>").count(), 2);
+        assert!(notification.contains(&first_id));
+        assert!(notification.contains(&second_id));
+        assert!(notification.contains("first result"));
+        assert!(notification.contains("second result"));
+
+        supervisor.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn background_agent_output_is_not_parsed_for_skill_references() {
+        let supervisor = SubAgentSupervisor::new(3);
+        let child = make_session(vec![text_response("Cleaned up /tmp and exited")]).await;
+        let child_id = supervisor
+            .spawn_with_parent_notification(
+                child,
+                "clean up".to_string(),
+                "Clean scratch files".to_string(),
+                0,
+            )
+            .unwrap();
+        supervisor
+            .wait_with_cancel(&child_id, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        let provider = Arc::new(ScriptedStreamProvider::new(vec![
+            ScriptedStreamCall::Response(Box::new(text_response("Delegated"))),
+            ScriptedStreamCall::Response(Box::new(text_response("Acknowledged"))),
+        ]));
+        let mut parent =
+            make_session_with_provider_and_manager(provider, Some(supervisor.clone())).await;
+        parent.skills = vec![Skill {
+            name:        "commit".to_string(),
+            description: "Make a commit".to_string(),
+            template:    "Review changes and commit.".to_string(),
+        }];
+
+        // A child that mentions a bare path must not fail the parent turn on
+        // `Unknown skill: /tmp`, nor have its report replaced by a skill body.
+        let output = parent
+            .process_input_with_output("Delegate the cleanup")
+            .await
+            .unwrap();
+
+        assert_eq!(output.as_deref(), Some("Acknowledged"));
+        let turns = parent.history().turns();
+        let Message::User {
+            content: notification,
+            ..
+        } = &turns[2]
+        else {
+            panic!("third turn should deliver the background result");
+        };
+        assert!(notification.contains("Cleaned up /tmp and exited"));
+        assert!(!notification.contains("Review changes and commit."));
+
+        supervisor.shutdown_all().await;
     }
 
     #[tokio::test]

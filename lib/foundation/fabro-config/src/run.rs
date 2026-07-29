@@ -11,8 +11,8 @@
 
 use std::path::{Path, PathBuf};
 
-use fabro_types::settings::InterpString;
 use fabro_types::settings::run::{ResolvedGoalSource, ResolvedRunGoal, RunGoal, RunNamespace};
+use fabro_types::settings::{InterpString, ResolveCtx, ResolveError};
 
 use crate::load::{load_settings_path, resolve_goal_file_path};
 use crate::parse::{SettingsSource, validate_settings_source};
@@ -60,8 +60,8 @@ pub fn resolve_graph_path(workflow_toml: &Path, graph_relative: &str) -> PathBuf
 
 #[derive(Debug)]
 pub enum ResolveRunGoalError {
-    EnvLookup {
-        var: String,
+    Interpolation {
+        source: ResolveError,
     },
     Io {
         path:   PathBuf,
@@ -72,10 +72,9 @@ pub enum ResolveRunGoalError {
 impl std::fmt::Display for ResolveRunGoalError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::EnvLookup { var } => write!(
-                f,
-                "run.goal.file references env var `{var}` which is not set"
-            ),
+            Self::Interpolation { source } => {
+                write!(f, "run.goal.file interpolation failed: {source}")
+            }
             Self::Io { path, source } => {
                 write!(f, "failed to read goal file {}: {source}", path.display())
             }
@@ -86,7 +85,7 @@ impl std::fmt::Display for ResolveRunGoalError {
 impl std::error::Error for ResolveRunGoalError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::EnvLookup { .. } => None,
+            Self::Interpolation { source } => Some(source),
             Self::Io { source, .. } => Some(source),
         }
     }
@@ -118,9 +117,11 @@ fn resolve_goal_file(
     file: &InterpString,
     base_dir: &Path,
 ) -> std::result::Result<ResolvedRunGoal, ResolveRunGoalError> {
+    // `{{ vars.* }}` is substituted server-side at run creation, so the path is
+    // literal by this point; anything left unresolved fails closed.
     let resolved = file
-        .resolve(process_env_var)
-        .map_err(|err| ResolveRunGoalError::EnvLookup { var: err.name })?;
+        .resolve_with(&mut ResolveCtx::new())
+        .map_err(|source| ResolveRunGoalError::Interpolation { source })?;
     let path = resolve_goal_file_path(&resolved, base_dir);
     let text = std::fs::read_to_string(&path).map_err(|source| ResolveRunGoalError::Io {
         path: path.clone(),
@@ -130,14 +131,6 @@ fn resolve_goal_file(
         text,
         source: ResolvedGoalSource::File { path },
     })
-}
-
-#[expect(
-    clippy::disallowed_methods,
-    reason = "Run config interpolation owns a process-env lookup facade for {{ env.* }} values."
-)]
-fn process_env_var(name: &str) -> Option<String> {
-    std::env::var(name).ok()
 }
 
 #[expect(

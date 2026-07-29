@@ -2053,6 +2053,7 @@ fn build_github_app_manifest(
         "public": false,
         "default_permissions": {
             "contents": "write",
+            "workflows": "write",
             "metadata": "read",
             "pull_requests": "write",
             "checks": "write",
@@ -2354,10 +2355,26 @@ mod tests {
         InstallObjectStoreCredentialMode, InstallObjectStoreInput, InstallObjectStoreProvider,
         InstallObjectStoreState, InstallSandboxProviderState, InstallSandboxState,
         InstallTokenQuery, LlmProvidersInput, PendingInstall, ServerConfigInput, ServerSecrets,
-        classify_object_store_validation_error, detect_canonical_url, install_object_store_lookup,
-        lock_unpoisoned, post_install_finish, provider_base_url_override,
-        resolve_install_object_store_state, token_is_valid, write_artifact_store_metadata,
+        build_github_app_manifest, classify_object_store_validation_error, detect_canonical_url,
+        install_object_store_lookup, lock_unpoisoned, post_install_finish,
+        provider_base_url_override, resolve_install_object_store_state, token_is_valid,
+        write_artifact_store_metadata,
     };
+
+    #[test]
+    fn github_app_manifest_allows_workflow_file_writes() {
+        let manifest = build_github_app_manifest(
+            "Fabro Test",
+            "https://fabro.example/setup",
+            "https://fabro.example/auth/callback/github",
+            "https://fabro.example/setup",
+        );
+
+        assert_eq!(
+            manifest["default_permissions"]["workflows"],
+            serde_json::Value::String("write".to_string())
+        );
+    }
 
     #[test]
     fn token_validation_accepts_any_matching_source() {

@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use fabro_auth::{CredentialSource, EnvCredentialSource, VaultCredentialSource};
+use fabro_auth::{CredentialSource, VaultCredentialSource};
 use fabro_interview::{AutoApproveInterviewer, Interviewer};
 use fabro_llm::client::Client as LlmClient;
 use fabro_mcp::config::McpServerSettings;
@@ -15,12 +15,12 @@ use fabro_sandbox::from_environment::{
 };
 use fabro_sandbox::{DockerSandboxOptions, SandboxSpec};
 use fabro_static::EnvVars;
+use fabro_types::settings::ResolvedModelRef;
 use fabro_types::settings::run::{
     ApprovalMode, McpServerSettings as ResolvedMcpServerSettings, PullRequestSettings,
     ResolvedMcpEntry, RunMode, RunModelSettings as ResolvedRunModelSettings,
     RunNamespace as ResolvedRunSettings, RunPrepareSettings as ResolvedRunPrepareSettings,
 };
-use fabro_types::settings::{ModelRegistry, ResolvedModelRef};
 use fabro_types::{ManifestPath, RunId, RunRunnableSource, SandboxProviderKind};
 use fabro_vault::Vault;
 use tokio::runtime::Handle;
@@ -37,8 +37,8 @@ use crate::event::{
 use crate::handler::HandlerRegistry;
 use crate::outcome::{Outcome, StageOutcome};
 use crate::pipeline::{
-    self, FinalizeOptions, Finalized, InitOptions, LlmSpec, Persisted, PullRequestOptions,
-    ResumeState, SandboxEnvSpec, build_conclusion_from_store, classify_engine_result,
+    self, FinalizeOptions, Finalized, InitOptions, LlmSpec, Persisted, PublishOptions, ResumeState,
+    SandboxEnvSpec, build_conclusion_from_store, classify_engine_result,
 };
 #[cfg(test)]
 use crate::records::Checkpoint;
@@ -81,7 +81,7 @@ struct RunSession {
     workflow_path:     Option<ManifestPath>,
     workflow_bundle:   Option<Arc<WorkflowBundle>>,
     run_control:       Option<Arc<RunControlState>>,
-    vault:             Option<Arc<AsyncRwLock<Vault>>>,
+    vault:             Arc<AsyncRwLock<Vault>>,
     catalog:           Arc<Catalog>,
     fabro_run_tools:   Option<FabroRunToolServices>,
 }
@@ -106,7 +106,7 @@ pub struct StartServices {
     /// Server-resolved GitHub integration permissions to inject into the
     /// sandbox env. Empty when github integration has no permissions.
     pub github_permissions: HashMap<String, String>,
-    pub vault:              Option<Arc<AsyncRwLock<Vault>>>,
+    pub vault:              Arc<AsyncRwLock<Vault>>,
     pub catalog:            Arc<Catalog>,
     pub on_node:            crate::OnNodeCallback,
     pub registry_override:  Option<Arc<HandlerRegistry>>,
@@ -374,7 +374,7 @@ impl RunSession {
             resolve_sandbox_provider(resolved).effective_for(resolved.execution.mode);
         let catalog = Arc::clone(&services.catalog);
         let configured =
-            configured_providers_for_start(services.vault.as_ref(), Arc::clone(&catalog)).await;
+            configured_providers_for_start(&services.vault, Arc::clone(&catalog)).await;
         #[cfg(feature = "test-support")]
         let configured = workflow_test_support::test_configured_provider_ids(
             catalog.as_ref(),
@@ -383,22 +383,17 @@ impl RunSession {
                 .is_some_and(|value| !matches!(value.as_str(), "" | "0" | "false" | "no")),
         );
         let llm = resolve_start_llm(catalog.as_ref(), &configured, resolved)?;
-        let vault_guard = match services.vault.as_ref() {
-            Some(vault) => Some(vault.read().await),
-            None => None,
-        };
+        let vault_guard = services.vault.read().await;
         // Token-only secrets lookup over the vault read guard, shared across
         // every run-boundary resolver. A missing or non-Token secret becomes
         // `None`, so resolution fails closed with a secret error.
-        let secret_lookup = |name: &str| vault_token_lookup(vault_guard.as_deref(), name);
+        let secret_lookup = |name: &str| vault_token_lookup(&vault_guard, name);
         let mcp_servers = resolved
             .agent
             .mcps
             .iter()
             .map(|(key, entry)| match entry {
-                ResolvedMcpEntry::Resolved(server) => {
-                    runtime_mcp_server(server, process_env_var, secret_lookup)
-                }
+                ResolvedMcpEntry::Resolved(server) => runtime_mcp_server(server, secret_lookup),
                 // References must be resolved to concrete servers before the run
                 // spec is persisted (server-side run-preparation pass). Reaching
                 // worker startup with an unresolved reference is an invariant
@@ -436,10 +431,9 @@ impl RunSession {
                 clone_branch:     record.base_branch().map(str::to_string),
             },
             SandboxProviderKind::Daytona => {
-                let api_key = match vault_guard.as_deref() {
-                    Some(vault) => vault.get(EnvVars::DAYTONA_API_KEY).map(str::to_string),
-                    None => None,
-                };
+                let api_key = vault_guard
+                    .get(EnvVars::DAYTONA_API_KEY)
+                    .map(str::to_string);
                 SandboxSpec::Daytona {
                     config: Box::new(resolve_daytona_config(resolved)),
                     github_app: services.github_app.clone(),
@@ -453,7 +447,7 @@ impl RunSession {
 
         let toml_env = resolved
             .environment
-            .resolve_env(process_env_var, secret_lookup)
+            .resolve_env(secret_lookup)
             .map_err(|err| Error::engine_with_source("failed to resolve run environment", err))?;
         let github_permissions: Option<HashMap<String, String>> =
             (!services.github_permissions.is_empty()).then(|| services.github_permissions.clone());
@@ -471,8 +465,7 @@ impl RunSession {
         };
 
         let pr_config = resolved.pull_request.clone();
-        let setup_commands =
-            runtime_setup_commands(&resolved.prepare, process_env_var, secret_lookup)?;
+        let setup_commands = runtime_setup_commands(&resolved.prepare, secret_lookup)?;
         drop(vault_guard);
 
         Ok(Self {
@@ -522,16 +515,13 @@ impl RunSession {
 }
 
 async fn configured_providers_for_start(
-    vault: Option<&Arc<AsyncRwLock<Vault>>>,
+    vault: &Arc<AsyncRwLock<Vault>>,
     catalog: Arc<Catalog>,
 ) -> Vec<ProviderId> {
-    let source: Arc<dyn CredentialSource> = match vault {
-        Some(vault) => Arc::new(VaultCredentialSource::with_env_lookup(
-            Arc::clone(vault),
-            process_env_var,
-        )),
-        None => Arc::new(EnvCredentialSource::new()),
-    };
+    let source: Arc<dyn CredentialSource> = Arc::new(VaultCredentialSource::with_env_lookup(
+        Arc::clone(vault),
+        process_env_var,
+    ));
     match LlmClient::from_source_report(source.as_ref(), catalog).await {
         Ok(report) => report
             .client
@@ -566,14 +556,14 @@ fn git_checkpoint_options_from_start(
 
 #[expect(
     clippy::disallowed_methods,
-    reason = "Run startup interpolation owns a process-env lookup facade for {{ env.* }} values."
+    reason = "Run startup reads process env only for explicit provider credential refs and test mode."
 )]
 fn process_env_var(name: &str) -> Option<String> {
     std::env::var(name).ok()
 }
 
-fn vault_token_lookup(vault: Option<&Vault>, name: &str) -> Option<String> {
-    vault.and_then(|vault| fabro_auth::vault_get_token(vault, name).ok().flatten())
+fn vault_token_lookup(vault: &Vault, name: &str) -> Option<String> {
+    fabro_auth::vault_get_token(vault, name).ok().flatten()
 }
 
 async fn load_accepted_run_definition(
@@ -645,12 +635,11 @@ fn resolve_fallback_chain(
     if settings.fallbacks.is_empty() {
         return Ok(Vec::new());
     }
-    let registry = CatalogModelRegistry { catalog };
     let primary = catalog.get_on_provider(provider, model);
     let mut chain = Vec::new();
 
     for model_ref in &settings.fallbacks {
-        match model_ref.resolve(&registry)? {
+        match model_ref.resolve(catalog)? {
             ResolvedModelRef::Provider(provider_name) => {
                 let provider_id = canonical_provider_id(catalog, &provider_name);
                 if !eligible.contains(&provider_id) {
@@ -670,14 +659,14 @@ fn resolve_fallback_chain(
             }
             ResolvedModelRef::Model {
                 provider: fallback_provider,
-                model,
+                selector,
             } => {
                 if let Some(provider) = fallback_provider {
                     let provider = canonical_provider_id(catalog, &provider);
                     if !eligible.contains(&provider) {
                         return Err(ModelSelectionError::ProviderUnavailable { provider }.into());
                     }
-                    match catalog.resolve_on_provider(&provider, &model) {
+                    match catalog.resolve_on_provider(&provider, &selector) {
                         Ok(info) => chain.push(FallbackTarget {
                             provider: info.provider.to_string(),
                             model:    info.id.to_string(),
@@ -685,13 +674,13 @@ fn resolve_fallback_chain(
                         Err(ModelSelectionError::UnknownSelectorOnProvider { .. }) => {
                             chain.push(FallbackTarget {
                                 provider: provider.to_string(),
-                                model,
+                                model:    selector,
                             });
                         }
                         Err(error) => return Err(error.into()),
                     }
                 } else {
-                    match catalog.select(&model, None, eligible) {
+                    match catalog.select(&selector, None, eligible) {
                         Ok(info) => chain.push(FallbackTarget {
                             provider: info.provider.to_string(),
                             model:    info.id.to_string(),
@@ -699,7 +688,7 @@ fn resolve_fallback_chain(
                         Err(ModelSelectionError::UnknownSelector { .. }) => {
                             chain.push(FallbackTarget {
                                 provider: provider.to_string(),
-                                model,
+                                model:    selector,
                             });
                         }
                         Err(error) => return Err(error.into()),
@@ -718,39 +707,22 @@ fn canonical_provider_id(catalog: &Catalog, provider_name: &str) -> ProviderId {
         .map_or(provider_id, |provider| provider.id.clone())
 }
 
-struct CatalogModelRegistry<'a> {
-    catalog: &'a Catalog,
-}
-
-impl ModelRegistry for CatalogModelRegistry<'_> {
-    fn is_provider(&self, token: &str) -> bool {
-        self.catalog.provider(&ProviderId::from(token)).is_some()
-    }
-
-    fn is_model(&self, token: &str) -> bool {
-        self.catalog.is_model_selector(token)
-    }
-}
-
-/// Build the launch-time MCP config from resolved settings, resolving any
-/// `{{ env.* }}` and `{{ secrets.* }}` tokens in the transport
-/// (`command`/`url`/`env`/`headers`) against the worker process environment and
-/// vault — the run boundary where the MCP is actually launched.
+/// Build the launch-time MCP config from resolved settings. Secret tokens in
+/// the transport (`command`/`url`/`env`/`headers`) resolve from the vault at
+/// the run boundary. Unsupported tokens fail.
 ///
 /// The resolution itself lives on the type
-/// ([`McpServerSettings::resolve_transport_env`]) so `fabro run` (here) and
+/// ([`McpServerSettings::resolve_transport_secrets`]) so `fabro run` (here) and
 /// `fabro exec` share one resolver; this wrapper just adds the server name to
 /// the error. MCP transport strings are carried in source form out of the
-/// config resolve layer so `fabro validate` stays portable (it never requires
-/// env to be set), and a referenced env var or secret that is unset is a hard
-/// error — no fallback to the unresolved source.
+/// config resolve layer so `fabro validate` stays portable. A missing or
+/// non-token secret is a hard error.
 fn runtime_mcp_server(
     settings: &ResolvedMcpServerSettings,
-    env_lookup: impl FnMut(&str) -> Option<String>,
     secrets_lookup: impl FnMut(&str) -> Option<String>,
 ) -> Result<McpServerSettings, Error> {
     settings
-        .resolve_transport_env(env_lookup, secrets_lookup)
+        .resolve_transport_secrets(secrets_lookup)
         .map_err(|err| {
             Error::engine_with_source(
                 format!("failed to resolve MCP server {:?}", settings.name),
@@ -759,25 +731,22 @@ fn runtime_mcp_server(
         })
 }
 
-/// Build the launch-time setup (prepare) commands from resolved settings,
-/// resolving any `{{ env.* }}` and `{{ secrets.* }}` tokens in each step's
-/// command and per-step env against the worker process environment and vault —
-/// the run boundary where the steps actually run.
+/// Build the launch-time setup (prepare) commands from resolved settings.
+/// Secret tokens in each step's command and per-step env resolve from the vault
+/// at the run boundary. Unsupported tokens fail.
 ///
 /// The resolution itself lives on the type
-/// ([`ResolvedRunPrepareSettings::resolve_step_env`]) so prepare-step env
+/// ([`ResolvedRunPrepareSettings::resolve_step_secrets`]) so prepare-step
 /// resolution shares one resolver with the rest of the run-boundary
 /// interpolation. Prepare-step commands and env are carried in source form out
-/// of the config resolve layer so `fabro validate` stays portable (it never
-/// requires env to be set), and a referenced env var or secret that is unset is
-/// a hard error — no fallback to the unresolved source.
+/// of the config resolve layer so `fabro validate` stays portable. A missing or
+/// non-token secret is a hard error.
 fn runtime_setup_commands(
     prepare: &ResolvedRunPrepareSettings,
-    env_lookup: impl FnMut(&str) -> Option<String>,
     secrets_lookup: impl FnMut(&str) -> Option<String>,
 ) -> Result<Vec<SetupCommand>, Error> {
     let resolved = prepare
-        .resolve_step_env(env_lookup, secrets_lookup)
+        .resolve_step_secrets(secrets_lookup)
         .map_err(|err| Error::engine_with_source("failed to resolve prepare step", err))?;
     Ok(resolved
         .steps
@@ -794,7 +763,7 @@ fn runtime_setup_commands(
 }
 
 impl RunSession {
-    /// Shared engine: initialize, execute, finalize, pull_request.
+    /// Shared engine: initialize, execute, conclude, publish, finalize.
     async fn run(
         self,
         persisted: Persisted,
@@ -921,22 +890,26 @@ impl RunSession {
                 .expect("last_git_sha mutex should not be poisoned: no code panics while holding this lock")
                 .clone(),
         };
-        let pr_opts = PullRequestOptions {
+        let publish_opts = PublishOptions {
             pr_config:  self.pr_config,
             github_app: self.pr_github_app,
             origin_url: self.pr_origin_url,
             model:      self.pr_model,
         };
 
-        let concluded = match Box::pin(pipeline::finalize(executed, &finalize_opts)).await {
-            Ok(concluded) => concluded,
+        let concluding = async {
+            let concluded = Box::pin(pipeline::conclude(executed, &finalize_opts)).await?;
+            let published = Box::pin(pipeline::publish(concluded, &publish_opts)).await;
+            Box::pin(pipeline::finalize(published, &finalize_opts)).await
+        };
+        let finalized = match concluding.await {
+            Ok(finalized) => finalized,
             Err(err) => {
                 self.steering_hub.drain_pending_at_run_end();
                 store_progress_logger.flush().await;
                 return Err(err);
             }
         };
-        let finalized = Box::pin(pipeline::pull_request(concluded, &pr_opts)).await;
         // Emit `agent.steer.dropped { reason: run_ended }` for any
         // unconsumed pending steers on the success path, then flush. The
         // scopeguard above re-runs as a no-op (drain is idempotent on an
@@ -1337,7 +1310,7 @@ reasoning = false
     fn resolve_fallback_chain_resolves_explicit_model_fallbacks() {
         let catalog = test_catalog();
         let settings = ResolvedRunModelSettings {
-            fallbacks: vec!["openai/gpt-5.4-mini".parse::<ModelRef>().unwrap()],
+            fallbacks: vec!["openai:gpt-5.4-mini".parse::<ModelRef>().unwrap()],
             ..ResolvedRunModelSettings::default()
         };
 
@@ -1383,7 +1356,7 @@ reasoning = false
     fn resolve_fallback_chain_resolves_provider_qualified_shared_alias() {
         let catalog = portable_model_catalog();
         let settings = ResolvedRunModelSettings {
-            fallbacks: vec!["openrouter/gpt-56-sol".parse::<ModelRef>().unwrap()],
+            fallbacks: vec!["openrouter:gpt-56-sol".parse::<ModelRef>().unwrap()],
             ..ResolvedRunModelSettings::default()
         };
 
@@ -1399,6 +1372,85 @@ reasoning = false
         assert_eq!(chain, vec![FallbackTarget {
             provider: "openrouter".to_string(),
             model:    "gpt-5.6-sol".to_string(),
+        }]);
+    }
+
+    /// A qualified fallback resolves to the same offering whether the selector
+    /// is the canonical model ID or the provider's API ID. The trailing bare
+    /// alias still goes through ready-provider priority selection.
+    #[test]
+    fn resolve_fallback_chain_resolves_qualified_model_id_and_api_id_alike() {
+        let overrides: fabro_model::catalog::LlmCatalogSettings = toml::from_str(
+            r"
+[providers.openrouter]
+enabled = true
+",
+        )
+        .unwrap();
+        let catalog = Catalog::from_builtin_with_overrides(&overrides).unwrap();
+
+        for selector in ["openrouter:kimi-k3", "openrouter:moonshotai/kimi-k3"] {
+            let settings = ResolvedRunModelSettings {
+                fallbacks: vec![
+                    selector.parse::<ModelRef>().unwrap(),
+                    "gpt-terra".parse::<ModelRef>().unwrap(),
+                ],
+                ..ResolvedRunModelSettings::default()
+            };
+
+            let chain = resolve_fallback_chain(
+                &catalog,
+                &ProviderId::new("kimi"),
+                "kimi-k3",
+                &settings,
+                &HashSet::from([
+                    ProviderId::new("kimi"),
+                    ProviderId::new("openrouter"),
+                    ProviderId::openai(),
+                ]),
+            )
+            .unwrap();
+
+            assert_eq!(
+                chain,
+                vec![
+                    FallbackTarget {
+                        provider: "openrouter".to_string(),
+                        model:    "kimi-k3".to_string(),
+                    },
+                    FallbackTarget {
+                        provider: "openai".to_string(),
+                        model:    "gpt-5.6-terra".to_string(),
+                    },
+                ],
+                "{selector}"
+            );
+        }
+    }
+
+    /// A colon in a model ID does not make it provider-qualified, so an
+    /// unknown colon-bearing selector still passes through to a provider
+    /// instead of failing the run with an unknown-provider error.
+    #[test]
+    fn resolve_fallback_chain_passes_through_colon_bearing_model_ids() {
+        let catalog = portable_model_catalog();
+        let settings = ResolvedRunModelSettings {
+            fallbacks: vec!["future-model:latest".parse::<ModelRef>().unwrap()],
+            ..ResolvedRunModelSettings::default()
+        };
+
+        let chain = resolve_fallback_chain(
+            &catalog,
+            &ProviderId::openai(),
+            "gpt-5.6-sol",
+            &settings,
+            &HashSet::from([ProviderId::openai(), ProviderId::new("openrouter")]),
+        )
+        .unwrap();
+
+        assert_eq!(chain, vec![FallbackTarget {
+            provider: ProviderId::openai().to_string(),
+            model:    "future-model:latest".to_string(),
         }]);
     }
 
@@ -1583,7 +1635,7 @@ reasoning = false
             ..ResolvedMcpServerSettings::default()
         };
 
-        let err = runtime_mcp_server(&settings, |_| None, |_| None).unwrap_err();
+        let err = runtime_mcp_server(&settings, |_| None).unwrap_err();
 
         assert_eq!(
             err.to_string(),
@@ -1605,8 +1657,7 @@ reasoning = false
             )]),
         ));
 
-        let commands =
-            runtime_setup_commands(&prepare, |_| None, vault_secret_lookup(&vault)).unwrap();
+        let commands = runtime_setup_commands(&prepare, vault_secret_lookup(&vault)).unwrap();
 
         assert_eq!(commands.len(), 1);
         assert_eq!(
@@ -1624,8 +1675,7 @@ reasoning = false
             HashMap::new(),
         ));
 
-        let commands =
-            runtime_setup_commands(&prepare, |_| None, vault_secret_lookup(&vault)).unwrap();
+        let commands = runtime_setup_commands(&prepare, vault_secret_lookup(&vault)).unwrap();
         let tokens =
             shlex::split(&commands[0].command).expect("resolved command should remain valid shell");
 
@@ -1653,8 +1703,7 @@ reasoning = false
             ..ResolvedMcpServerSettings::default()
         };
 
-        let resolved =
-            runtime_mcp_server(&settings, |_| None, vault_secret_lookup(&vault)).unwrap();
+        let resolved = runtime_mcp_server(&settings, vault_secret_lookup(&vault)).unwrap();
 
         let ResolvedMcpTransport::Stdio { env, .. } = resolved.transport else {
             panic!("expected stdio transport");
@@ -1673,8 +1722,7 @@ reasoning = false
             HashMap::new(),
         ));
 
-        let Err(err) = runtime_setup_commands(&prepare, |_| None, vault_secret_lookup(&vault))
-        else {
+        let Err(err) = runtime_setup_commands(&prepare, vault_secret_lookup(&vault)) else {
             panic!("missing secret should fail setup command resolution");
         };
 
@@ -1698,8 +1746,7 @@ reasoning = false
             )]),
         ));
 
-        let Err(err) = runtime_setup_commands(&prepare, |_| None, vault_secret_lookup(&vault))
-        else {
+        let Err(err) = runtime_setup_commands(&prepare, vault_secret_lookup(&vault)) else {
             panic!("OAuth secret should fail setup command resolution");
         };
 
@@ -1721,8 +1768,7 @@ reasoning = false
             )]),
         ));
 
-        let Err(err) = runtime_setup_commands(&prepare, |_| None, vault_secret_lookup(&vault))
-        else {
+        let Err(err) = runtime_setup_commands(&prepare, vault_secret_lookup(&vault)) else {
             panic!("file secret should fail setup command resolution");
         };
 
@@ -1780,7 +1826,7 @@ reasoning = false
         )])));
 
         let session = RunSession::new(&persisted, StartServices {
-            vault: Some(vault),
+            vault,
             ..test_start_services(&store, &storage_root, emitter, registry).await
         })
         .await
@@ -1838,7 +1884,7 @@ reasoning = false
         let vault = Arc::new(AsyncRwLock::new(start_vault(&[])));
 
         let Err(err) = RunSession::new(&persisted, StartServices {
-            vault: Some(vault),
+            vault,
             ..test_start_services(&store, &storage_root, emitter, registry).await
         })
         .await
@@ -2004,7 +2050,7 @@ reasoning = false
             run_control: None,
             github_app: None,
             github_permissions: HashMap::new(),
-            vault: Some(Arc::new(AsyncRwLock::new(start_vault(&[])))),
+            vault: Arc::new(AsyncRwLock::new(start_vault(&[]))),
             catalog: test_catalog(),
             on_node: None,
             registry_override: Some(registry),
@@ -2032,7 +2078,7 @@ reasoning = false
     }
 
     fn vault_secret_lookup(vault: &Vault) -> impl FnMut(&str) -> Option<String> + '_ {
-        move |name| vault_token_lookup(Some(vault), name)
+        move |name| vault_token_lookup(vault, name)
     }
 
     fn prepare_with_step(step: PreparedStep) -> RunPrepareSettings {

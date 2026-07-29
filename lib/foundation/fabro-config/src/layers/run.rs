@@ -148,8 +148,11 @@ pub struct RunModelLayer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[option(value_type = "string")]
     pub name:      Option<String>,
-    /// Ordered list of fallback model references. Supports `...` splice marker
-    /// at layering time — see [`super::splice_array`].
+    /// Ordered fallback references: bare providers, bare model IDs or aliases,
+    /// or provider-qualified `provider:selector` values. A qualified selector
+    /// may be a model ID, alias, or provider API ID. Legacy `provider/model`
+    /// values remain accepted. Supports the `...` splice marker at layering
+    /// time — see [`super::splice_array`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[option(default = "[]", value_type = "array<string>")]
     pub fallbacks: Vec<ModelRefOrSplice>,
@@ -730,40 +733,38 @@ impl<'de> Deserialize<'de> for McpEntryLayer {
 pub struct HookEntry {
     /// Optional merge identity. Hooks with the same `id` replace in place.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub id:               Option<String>,
+    pub id:              Option<String>,
     /// Display-only human name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name:             Option<String>,
-    pub event:            HookEvent,
+    pub name:            Option<String>,
+    pub event:           HookEvent,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub matcher:          Option<String>,
+    pub matcher:         Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub blocking:         Option<bool>,
+    pub blocking:        Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeout:          Option<Duration>,
+    pub timeout:         Option<Duration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sandbox:          Option<bool>,
+    pub sandbox:         Option<bool>,
     // Exactly one of the following groups is expected:
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub script:           Option<InterpString>,
+    pub script:          Option<InterpString>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub command:          Option<Vec<InterpString>>,
+    pub command:         Option<Vec<InterpString>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub url:              Option<InterpString>,
+    pub url:             Option<InterpString>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub headers:          HashMap<String, InterpString>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub allowed_env_vars: Vec<String>,
+    pub headers:         HashMap<String, InterpString>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tls:              Option<HookTlsMode>,
+    pub tls:             Option<HookTlsMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prompt:           Option<InterpString>,
+    pub prompt:          Option<InterpString>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model:            Option<InterpString>,
+    pub model:           Option<InterpString>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_tool_rounds:  Option<u32>,
+    pub max_tool_rounds: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent:            Option<HookAgentMarker>,
+    pub agent:           Option<HookAgentMarker>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

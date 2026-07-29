@@ -5,17 +5,16 @@ use fabro_model::{AgentProfileKind, Catalog, ProviderId};
 use super::EnvContext;
 use crate::agent_profile::AgentProfile;
 use crate::config::NativeToolOptions;
-use crate::profiles::{self, BaseProfile, EmbeddedPrompt};
+use crate::profiles::{
+    self, BaseProfile, EmbeddedPrompt, ProfileDeps, impl_base_profile_accessors,
+};
 use crate::sandbox::Sandbox;
 use crate::skills::Skill;
-use crate::todo_runtime::TodoRuntime;
 use crate::todo_tools::{
     make_task_create_tool, make_task_get_tool, make_task_list_tool, make_task_update_tool,
 };
 use crate::tool_registry::ToolRegistry;
-use crate::tools::{
-    WEB_SEARCH_TOOL_NAME, WebFetchSummarizer, make_edit_file_tool, register_core_tools,
-};
+use crate::tools::{WEB_SEARCH_TOOL_NAME, make_edit_file_tool, register_core_tools};
 
 pub struct AnthropicProfile {
     base: BaseProfile,
@@ -26,21 +25,20 @@ const CORE_PROMPT: &str = include_str!("prompts/anthropic.md.j2");
 impl AnthropicProfile {
     #[must_use]
     pub fn new(model: impl Into<String>) -> Self {
-        let options = NativeToolOptions::for_profile(AgentProfileKind::Anthropic);
-        Self::with_native_tools(model, &options, None)
+        let deps =
+            ProfileDeps::standalone(NativeToolOptions::for_profile(AgentProfileKind::Anthropic));
+        Self::with_native_tools(model, &deps)
     }
 
-    pub(crate) fn with_native_tools(
-        model: impl Into<String>,
-        options: &NativeToolOptions,
-        summarizer: Option<WebFetchSummarizer>,
-    ) -> Self {
+    pub(crate) fn with_native_tools(model: impl Into<String>, deps: &ProfileDeps) -> Self {
         let mut registry = ToolRegistry::new();
 
-        register_core_tools(&mut registry, options, summarizer);
+        register_core_tools(&mut registry, &deps.options, deps.summarizer.clone());
         registry.register(make_edit_file_tool());
-        // Anthropic task tools share one runtime per profile instance.
-        let todo_runtime = Arc::new(TodoRuntime::new());
+        // Task tools scope their list by `root_session_id`, so a root session
+        // and its children address one logical list. They must therefore
+        // resolve it through the one runtime the builder shares between them.
+        let todo_runtime = Arc::clone(&deps.todo_runtime);
         registry.register(make_task_create_tool(todo_runtime.clone()));
         registry.register(make_task_update_tool(todo_runtime.clone()));
         registry.register(make_task_get_tool(todo_runtime.clone()));
@@ -72,29 +70,7 @@ impl AnthropicProfile {
 }
 
 impl AgentProfile for AnthropicProfile {
-    fn profile_kind(&self) -> AgentProfileKind {
-        self.base.profile_kind
-    }
-
-    fn provider_id(&self) -> ProviderId {
-        self.base.provider_id.clone()
-    }
-
-    fn model(&self) -> &str {
-        &self.base.model
-    }
-
-    fn catalog(&self) -> Option<&Catalog> {
-        self.base.catalog.as_deref()
-    }
-
-    fn tool_registry(&self) -> &ToolRegistry {
-        &self.base.registry
-    }
-
-    fn tool_registry_mut(&mut self) -> &mut ToolRegistry {
-        &mut self.base.registry
-    }
+    impl_base_profile_accessors!();
 
     fn build_system_prompt(
         &self,

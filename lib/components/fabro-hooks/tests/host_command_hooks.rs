@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use fabro_agent::{LocalSandbox, Sandbox};
-use fabro_auth::{CredentialSource, EnvCredentialSource};
+use fabro_auth::{CredentialSource, test_support};
 use fabro_hooks::{
     HookContext, HookDecision, HookDefinition, HookEvent, HookExecutionContext, HookRunner,
     HookSettings, InterpString,
@@ -12,7 +12,7 @@ use fabro_types::RunId;
 use tokio::fs;
 
 fn test_llm_source() -> Arc<dyn CredentialSource> {
-    Arc::new(EnvCredentialSource::new())
+    test_support::vault_only_credential_source()
 }
 
 fn test_catalog() -> Arc<Catalog> {

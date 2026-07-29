@@ -1036,7 +1036,7 @@ pub(crate) struct RunWorkerArgs {
 
     /// Fabro storage directory for loading worker-visible secrets
     #[arg(long, hide = true)]
-    pub(crate) storage_dir: Option<PathBuf>,
+    pub(crate) storage_dir: PathBuf,
 
     /// Run scratch directory
     #[arg(long)]

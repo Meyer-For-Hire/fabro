@@ -40,7 +40,7 @@ fn materialize_run_applies_graph_and_catalog_defaults() {
     .unwrap();
     let resolved = &materialized.run;
 
-    assert_eq!(resolved.model.name.as_deref(), Some("claude-sonnet-4-6"));
+    assert_eq!(resolved.model.name.as_deref(), Some("claude-sonnet-5"));
     assert_eq!(resolved.model.provider.as_deref(), Some("anthropic"));
     assert_eq!(
         materialized.run.goal.as_ref(),

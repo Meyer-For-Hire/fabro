@@ -1134,6 +1134,7 @@ mod runs {
             id: stage_id.clone(),
             name: name.to_owned(),
             handler,
+            billing: BilledTokenCounts::default(),
             status,
             wall_time_ms,
             node_id: stage_id.node_id().to_owned(),
@@ -1143,6 +1144,8 @@ mod runs {
             started_at: None,
             graph_visit: None,
             resumed_from_stage_id: None,
+            parallel_group_id: None,
+            parallel_branch_index: None,
         }
     }
 
@@ -1280,6 +1283,7 @@ mod runs {
     fn parse_failure_reason(reason: &str) -> Option<FailureReason> {
         match reason {
             "workflow_error" => Some(FailureReason::WorkflowError),
+            "publish_failed" => Some(FailureReason::PublishFailed),
             "cancelled" => Some(FailureReason::Cancelled),
             "approval_denied" => Some(FailureReason::ApprovalDenied),
             "terminated" => Some(FailureReason::Terminated),
@@ -1752,6 +1756,7 @@ mod runs {
                 allow_freeform:  false,
                 timeout_seconds: None,
                 context_display: None,
+                review_target:   None,
             },
             ApiQuestion {
                 id:              "q-002".into(),
@@ -1775,6 +1780,7 @@ mod runs {
                 allow_freeform:  true,
                 timeout_seconds: None,
                 context_display: None,
+                review_target:   None,
             },
         ]
     }

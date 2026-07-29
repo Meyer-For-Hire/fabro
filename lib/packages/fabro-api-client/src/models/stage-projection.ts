@@ -60,6 +60,9 @@ import type { StageState } from './stage-state';
 import type { StageTiming } from './stage-timing';
 // May contain unused imports in some cases
 // @ts-ignore
+import type { StageToolBatchProjection } from './stage-tool-batch-projection';
+// May contain unused imports in some cases
+// @ts-ignore
 import type { SubAgentProjection } from './sub-agent-projection';
 // May contain unused imports in some cases
 // @ts-ignore
@@ -87,6 +90,10 @@ export interface StageProjection {
      * Ordered per-branch results produced by a parallel stage.
      */
     'parallel_results'?: Array<ParallelBranchResult> | null;
+    /**
+     * Durable identity of one branch within a parallel execution, in `{parallel_group_id}:{index}` form.
+     */
+    'parallel_branch_id'?: string | null;
     'output'?: string | null;
     'output_bytes'?: number | null;
     'live_streaming'?: boolean | null;
@@ -96,6 +103,15 @@ export interface StageProjection {
      */
     'started_at'?: string | null;
     'timing'?: StageTiming | null;
+    /**
+     * Inference time accumulated from closed brackets during the current attempt. Live estimate only — the authoritative value arrives with the terminal event and lands in `timing`. Excludes the currently open bracket, whose span is measured from `inference.started_at`.
+     */
+    'live_inference_ms'?: number;
+    /**
+     * Tool time accumulated from closed tool batches during the current attempt. A batch spans the first dispatched call through the completion that drains the last outstanding one, so tools running concurrently within a turn are counted once.
+     */
+    'live_tool_ms'?: number;
+    'tool_batch'?: StageToolBatchProjection | null;
     'usage': BilledTokenCounts;
     'model'?: BillingModelRef | null;
     'todos'?: TodoListProjection | null;
@@ -118,6 +134,10 @@ export interface StageProjection {
     'mcp_servers'?: Array<McpServerProjection>;
     'context_window'?: StageContextWindowProjection | null;
     'inference'?: StageInferenceProjection | null;
+    /**
+     * Start of an external ACP agent process, if one is running. ACP agents do not expose Fabro\'s internal LLM brackets, so the process lifetime supplies their live inference estimate.
+     */
+    'acp_started_at'?: string | null;
     /**
      * Whether the agent is executing normally or waiting for steering after an interrupt.
      */

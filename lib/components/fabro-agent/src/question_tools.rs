@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -149,6 +150,42 @@ struct AnthropicOption {
     preview:     Option<String>,
 }
 
+/// Contract rules the JSON Schema cannot express, and which differ between
+/// the two harnesses sharing one normalizer.
+struct QuestionLimits {
+    questions: RangeInclusive<usize>,
+    questions_error: &'static str,
+    /// `None` leaves the option count unbounded.
+    options: Option<RangeInclusive<usize>>,
+    options_error: &'static str,
+    max_header_chars: Option<usize>,
+    /// Claude 5's schema marks `header` and every option `description`
+    /// required, so both are validated rather than passed through as given.
+    require_header_and_descriptions: bool,
+    /// Claude 5 renders multi-select without a preview pane.
+    allow_preview_with_multi_select: bool,
+}
+
+const ANTHROPIC_QUESTION_LIMITS: QuestionLimits = QuestionLimits {
+    questions: 1..=usize::MAX,
+    questions_error: "questions must contain at least one question",
+    options: None,
+    options_error: "",
+    max_header_chars: None,
+    require_header_and_descriptions: false,
+    allow_preview_with_multi_select: true,
+};
+
+const CLAUDE5_QUESTION_LIMITS: QuestionLimits = QuestionLimits {
+    questions: 1..=4,
+    questions_error: "questions must contain between one and four questions",
+    options: Some(2..=4),
+    options_error: "each question must contain between two and four options",
+    max_header_chars: Some(12),
+    require_header_and_descriptions: true,
+    allow_preview_with_multi_select: false,
+};
+
 #[must_use]
 pub fn is_question_tool(name: &str) -> bool {
     matches!(
@@ -167,6 +204,9 @@ pub fn register_question_tools(profile_kind: AgentProfileKind, registry: &mut To
         // question/option shape, so the Anthropic-style tool is a match.
         AgentProfileKind::Anthropic | AgentProfileKind::Kimi => {
             registry.register(make_anthropic_question_tool());
+        }
+        AgentProfileKind::Claude5 => {
+            registry.register(make_claude5_question_tool());
         }
         AgentProfileKind::Gemini => {}
     }
@@ -260,7 +300,85 @@ fn make_anthropic_question_tool() -> RegisteredTool {
         executor:   Arc::new(|args, ctx| {
             Box::pin(async move {
                 let parsed: AnthropicQuestionToolArgs = parse_tool_args(args)?;
-                let questions = normalize_anthropic_questions(parsed)?;
+                let questions =
+                    normalize_anthropic_questions(parsed, &ANTHROPIC_QUESTION_LIMITS)?;
+                let answers = execute_question_tool(ctx, questions).await?;
+                format_anthropic_answers(&answers)
+            })
+        }),
+        source:     ToolSource::Native,
+    }
+}
+
+fn make_claude5_question_tool() -> RegisteredTool {
+    RegisteredTool {
+        definition: ToolDefinition {
+            name:        ANTHROPIC_ASK_USER_QUESTION_TOOL.to_string(),
+            description: "Ask the human up to four questions when a decision is genuinely theirs to make. The UI automatically provides an Other option for custom text.".to_string(),
+            parameters:  json!({
+                "type": "object",
+                "properties": {
+                    "questions": {
+                        "description": "Questions to ask the user (1-4 questions)",
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 4,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "question": {
+                                    "description": "The complete, clear, and specific question to ask.",
+                                    "type": "string"
+                                },
+                                "header": {
+                                    "description": "Very short label displayed as a chip/tag (max 12 chars).",
+                                    "type": "string"
+                                },
+                                "options": {
+                                    "description": "Two to four choices. Do not include Other; the UI adds it automatically.",
+                                    "type": "array",
+                                    "minItems": 2,
+                                    "maxItems": 4,
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "label": {
+                                                "description": "Concise display text for the option.",
+                                                "type": "string"
+                                            },
+                                            "description": {
+                                                "description": "What the option means and its relevant trade-offs.",
+                                                "type": "string"
+                                            },
+                                            "preview": {
+                                                "description": "Optional Markdown preview for single-select visual comparisons.",
+                                                "type": "string"
+                                            }
+                                        },
+                                        "required": ["label", "description"],
+                                        "additionalProperties": false
+                                    }
+                                },
+                                "multiSelect": {
+                                    "description": "Whether the user may select multiple options.",
+                                    "default": false,
+                                    "type": "boolean"
+                                }
+                            },
+                            "required": ["question", "header", "options", "multiSelect"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["questions"],
+                "additionalProperties": false
+            }),
+        },
+        executor:   Arc::new(|args, ctx| {
+            Box::pin(async move {
+                let parsed: AnthropicQuestionToolArgs = parse_tool_args(args)?;
+                let questions =
+                    normalize_anthropic_questions(parsed, &CLAUDE5_QUESTION_LIMITS)?;
                 let answers = execute_question_tool(ctx, questions).await?;
                 format_anthropic_answers(&answers)
             })
@@ -325,25 +443,71 @@ fn normalize_openai_questions(args: OpenAiQuestionToolArgs) -> Result<Vec<AgentQ
 
 fn normalize_anthropic_questions(
     args: AnthropicQuestionToolArgs,
+    limits: &QuestionLimits,
 ) -> Result<Vec<AgentQuestion>, String> {
-    if args.questions.is_empty() {
-        return Err("questions must contain at least one question".to_string());
+    if !limits.questions.contains(&args.questions.len()) {
+        return Err(limits.questions_error.to_string());
     }
+
     args.questions
         .into_iter()
         .map(|question| {
             let original_question = non_empty(&question.question, "question")?;
+            let header = if limits.require_header_and_descriptions {
+                let header = non_empty(
+                    question.header.as_deref().unwrap_or_default(),
+                    "question header",
+                )?;
+                if limits
+                    .max_header_chars
+                    .is_some_and(|max| header.chars().count() > max)
+                {
+                    return Err(format!(
+                        "question header must contain at most {} characters",
+                        limits.max_header_chars.unwrap_or_default()
+                    ));
+                }
+                Some(header)
+            } else {
+                question.header
+            };
+
+            if let Some(bounds) = &limits.options {
+                if !bounds.contains(&question.options.len()) {
+                    return Err(limits.options_error.to_string());
+                }
+            }
+            if !limits.allow_preview_with_multi_select
+                && question.multi_select
+                && question
+                    .options
+                    .iter()
+                    .any(|option| option.preview.is_some())
+            {
+                return Err(
+                    "option previews are not supported for multi-select questions".to_string(),
+                );
+            }
+
+            // The lenient contract renders the question and header exactly as
+            // supplied; the strict one has already trimmed them.
+            let text = if limits.require_header_and_descriptions {
+                display_text(header.as_deref(), &original_question)
+            } else {
+                display_text(header.as_deref(), &question.question)
+            };
+
             Ok(AgentQuestion {
                 original_id: None,
-                text: display_text(question.header.as_deref(), &question.question),
-                header: question.header,
+                text,
+                header,
                 original_question,
                 question_type: if question.multi_select {
                     QuestionType::MultiSelect
                 } else {
                     QuestionType::MultipleChoice
                 },
-                options: options_from_anthropic(question.options),
+                options: options_from_anthropic(question.options, limits)?,
                 allow_freeform: true,
             })
         })
@@ -365,19 +529,34 @@ fn options_from_openai(options: Vec<OpenAiOption>) -> Vec<InterviewOption> {
         .collect()
 }
 
-fn options_from_anthropic(options: Vec<AnthropicOption>) -> Vec<InterviewOption> {
+fn options_from_anthropic(
+    options: Vec<AnthropicOption>,
+    limits: &QuestionLimits,
+) -> Result<Vec<InterviewOption>, String> {
     options
         .into_iter()
         .enumerate()
-        .map(|(idx, option)| InterviewOption {
-            key:         option_key(idx),
-            label:       option.label,
-            description: option
-                .description
-                .map(|value| bounded_display_field(&value, OPTION_DESCRIPTION_MAX_CHARS)),
-            preview:     option
-                .preview
-                .map(|value| bounded_display_field(&value, OPTION_PREVIEW_MAX_CHARS)),
+        .map(|(idx, option)| {
+            let (label, description) = if limits.require_header_and_descriptions {
+                (
+                    non_empty(&option.label, "option label")?,
+                    Some(non_empty(
+                        option.description.as_deref().unwrap_or_default(),
+                        "option description",
+                    )?),
+                )
+            } else {
+                (option.label, option.description)
+            };
+            Ok(InterviewOption {
+                key: option_key(idx),
+                label,
+                description: description
+                    .map(|value| bounded_display_field(&value, OPTION_DESCRIPTION_MAX_CHARS)),
+                preview: option
+                    .preview
+                    .map(|value| bounded_display_field(&value, OPTION_PREVIEW_MAX_CHARS)),
+            })
         })
         .collect()
 }
@@ -472,6 +651,7 @@ fn format_anthropic_answers(answers: &[AgentQuestionAnswer]) -> Result<String, S
 mod tests {
     use super::*;
     use crate::native_tool::ToolVocabulary;
+    use crate::test_support::MockSandbox;
 
     fn answered(
         original_id: Option<&str>,
@@ -529,7 +709,7 @@ mod tests {
         }))
         .unwrap();
 
-        let questions = normalize_anthropic_questions(args).unwrap();
+        let questions = normalize_anthropic_questions(args, &ANTHROPIC_QUESTION_LIMITS).unwrap();
 
         assert_eq!(questions[0].question_type, QuestionType::MultiSelect);
         assert_eq!(
@@ -601,8 +781,198 @@ mod tests {
         assert!(kimi.get(ANTHROPIC_ASK_USER_QUESTION_TOOL).is_some());
         assert!(kimi.get(OPENAI_REQUEST_USER_INPUT_TOOL).is_none());
 
+        let mut claude5 = ToolRegistry::with_vocabulary(ToolVocabulary::Claude5);
+        register_question_tools(AgentProfileKind::Claude5, &mut claude5);
+        let tool = claude5.get(ANTHROPIC_ASK_USER_QUESTION_TOOL).unwrap();
+        assert_eq!(tool.definition.parameters["additionalProperties"], false);
+        assert_eq!(
+            tool.definition.parameters["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["questions"]
+        );
+        assert_eq!(
+            tool.definition.parameters["properties"]["questions"]["maxItems"],
+            4
+        );
+        assert!(claude5.get(OPENAI_REQUEST_USER_INPUT_TOOL).is_none());
+
         let mut gemini = ToolRegistry::new();
         register_question_tools(AgentProfileKind::Gemini, &mut gemini);
         assert!(gemini.names().is_empty());
+    }
+
+    #[test]
+    fn claude5_question_contract_is_strict_and_preserves_preview() {
+        let args: AnthropicQuestionToolArgs = serde_json::from_value(json!({
+            "questions": [{
+                "header": "Approach",
+                "question": "Which approach should we use?",
+                "multiSelect": false,
+                "options": [
+                    {
+                        "label": "Simple",
+                        "description": "Use the smallest implementation.",
+                        "preview": "fn simple() {}"
+                    },
+                    {
+                        "label": "Flexible",
+                        "description": "Allow future extension."
+                    }
+                ]
+            }]
+        }))
+        .unwrap();
+
+        let questions = normalize_anthropic_questions(args, &CLAUDE5_QUESTION_LIMITS).unwrap();
+
+        assert_eq!(questions[0].header.as_deref(), Some("Approach"));
+        assert_eq!(
+            questions[0].options[0].preview.as_deref(),
+            Some("fn simple() {}")
+        );
+        assert!(questions[0].allow_freeform);
+    }
+
+    /// The Claude 5 payload is deserialized through the lenient struct now, so
+    /// the rules its own struct used to enforce are the normalizer's job.
+    #[test]
+    fn claude5_limits_reject_what_the_lenient_contract_allows() {
+        let question = |patch: serde_json::Value| {
+            let mut base = json!({
+                "question": "Which approach?",
+                "header": "Approach",
+                "multiSelect": false,
+                "options": [
+                    {"label": "First", "description": "One"},
+                    {"label": "Second", "description": "Two"}
+                ]
+            });
+            let object = base.as_object_mut().unwrap();
+            for (key, value) in patch.as_object().unwrap() {
+                if value.is_null() {
+                    object.remove(key);
+                } else {
+                    object.insert(key.clone(), value.clone());
+                }
+            }
+            base
+        };
+        let normalize = |questions: serde_json::Value| {
+            let args: AnthropicQuestionToolArgs =
+                serde_json::from_value(json!({"questions": questions})).unwrap();
+            normalize_anthropic_questions(args, &CLAUDE5_QUESTION_LIMITS)
+        };
+
+        // A missing header and a missing option description used to be caught
+        // by serde; the normalizer has to reject them now.
+        assert!(normalize(json!([question(json!({"header": null}))])).is_err());
+        assert!(
+            normalize(json!([question(json!({
+                "options": [{"label": "First"}, {"label": "Second"}]
+            }))]))
+            .is_err()
+        );
+
+        assert!(
+            normalize(json!([question(json!({"header": "ThirteenChars"}))])).is_err(),
+            "header longer than 12 characters"
+        );
+        assert!(
+            normalize(json!([question(json!({
+                "options": [{"label": "Only", "description": "One"}]
+            }))]))
+            .is_err(),
+            "fewer than two options"
+        );
+        assert!(
+            normalize(json!(vec![question(json!({})); 5])).is_err(),
+            "more than four questions"
+        );
+
+        assert!(normalize(json!([question(json!({}))])).is_ok());
+    }
+
+    /// The same payloads stay acceptable under the lenient contract, so the
+    /// shared normalizer has not tightened the Anthropic tool.
+    #[test]
+    fn anthropic_limits_still_accept_optional_headers_and_descriptions() {
+        let args: AnthropicQuestionToolArgs = serde_json::from_value(json!({
+            "questions": [{
+                "question": "Which approach?",
+                "options": [{"label": "First"}]
+            }]
+        }))
+        .unwrap();
+
+        let questions = normalize_anthropic_questions(args, &ANTHROPIC_QUESTION_LIMITS).unwrap();
+        assert_eq!(questions.len(), 1);
+        assert_eq!(questions[0].header, None);
+        assert_eq!(questions[0].options[0].description, None);
+    }
+
+    #[test]
+    fn claude5_rejects_previews_for_multi_select_questions() {
+        let args: AnthropicQuestionToolArgs = serde_json::from_value(json!({
+            "questions": [{
+                "header": "Features",
+                "question": "Which features should we enable?",
+                "multiSelect": true,
+                "options": [
+                    {
+                        "label": "Auth",
+                        "description": "Enable authentication.",
+                        "preview": "auth = true"
+                    },
+                    {
+                        "label": "Metrics",
+                        "description": "Enable metrics."
+                    }
+                ]
+            }]
+        }))
+        .unwrap();
+
+        assert!(normalize_anthropic_questions(args, &CLAUDE5_QUESTION_LIMITS).is_err());
+    }
+
+    #[tokio::test]
+    async fn claude5_question_tool_rejects_subagent_sessions() {
+        let tool = make_claude5_question_tool();
+        let error = (tool.executor)(
+            json!({
+                "questions": [{
+                    "header": "Approach",
+                    "question": "Which approach?",
+                    "multiSelect": false,
+                    "options": [
+                        {
+                            "label": "Simple",
+                            "description": "Use the simple approach."
+                        },
+                        {
+                            "label": "Flexible",
+                            "description": "Use the flexible approach."
+                        }
+                    ]
+                }]
+            }),
+            ToolContext {
+                env:                 Arc::new(MockSandbox::default()),
+                cancel:              CancellationToken::new(),
+                tool_env_provider:   None,
+                session_id:          Some("child".to_string()),
+                root_session_id:     Some("root".to_string()),
+                tool_call_id:        Some("call".to_string()),
+                agent_event_emitter: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("only available to the root agent"));
     }
 }

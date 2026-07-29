@@ -3,21 +3,11 @@ import type { PaginatedRunStageList, StageHandler, StageState } from "@qltysh/fa
 
 import type { Stage } from "../components/stage-sidebar";
 import { aggregateGraphNodeStatus, formatStageLabel, mapRunStagesToSidebarStages } from "./stage-sidebar";
+import { makeBilledTokenCounts } from "./test-fixtures";
+import { makeStage as baseMakeStage } from "./test-utils";
 
 function makeStage(nodeId: string, visit: number, status: StageState): Stage {
-  return {
-    id: `${nodeId}@${visit}`,
-    name: nodeId,
-    handler: "agent",
-    nodeId,
-    visit,
-    graphVisit: null,
-    resumedFromStageId: null,
-    status,
-    duration: "--",
-    startedAt: null,
-    providerUsed: null,
-  };
+  return baseMakeStage({ id: `${nodeId}@${visit}`, name: nodeId, nodeId, visit, status });
 }
 
 describe("mapRunStagesToSidebarStages", () => {
@@ -38,6 +28,15 @@ describe("mapRunStagesToSidebarStages", () => {
             model: "gpt-5.5",
             reasoning_effort: "high",
           },
+          billing: makeBilledTokenCounts({
+            input_tokens: 28_640,
+            output_tokens: 7_550,
+            total_tokens: 43_690,
+            reasoning_tokens: 1_200,
+            cache_read_tokens: 4_800,
+            cache_write_tokens: 1_500,
+            total_usd_micros: 720_000,
+          }),
         },
         {
           id: "apply-changes@2",
@@ -46,6 +45,7 @@ describe("mapRunStagesToSidebarStages", () => {
           status: "running",
           node_id: "apply",
           visit: 2,
+          billing: makeBilledTokenCounts(),
         },
       ],
       meta: { has_more: false },
@@ -64,6 +64,10 @@ describe("mapRunStagesToSidebarStages", () => {
       model: "gpt-5.5",
       reasoning_effort: "high",
     });
+    // Each visit keeps its own tokens and cost, so the stage popover never
+    // shows a sibling visit's usage.
+    expect(result[0].billing.total_usd_micros).toBe(720_000);
+    expect(result[1].billing.total_usd_micros).toBeUndefined();
     expect(formatStageLabel(result[0])).toBe("Apply Changes");
 
     expect(result[1].id).toBe("apply-changes@2");
@@ -83,6 +87,7 @@ describe("mapRunStagesToSidebarStages", () => {
           status: "succeeded",
           node_id: "start",
           visit: 1,
+          billing: makeBilledTokenCounts(),
         },
         {
           id: "verify@1",
@@ -91,6 +96,7 @@ describe("mapRunStagesToSidebarStages", () => {
           status: "succeeded",
           node_id: "verify",
           visit: 1,
+          billing: makeBilledTokenCounts(),
         },
         {
           id: "exit@1",
@@ -99,6 +105,7 @@ describe("mapRunStagesToSidebarStages", () => {
           status: "succeeded",
           node_id: "exit",
           visit: 1,
+          billing: makeBilledTokenCounts(),
         },
       ],
       meta: { has_more: false },
@@ -118,6 +125,7 @@ describe("mapRunStagesToSidebarStages", () => {
           status: "running",
           node_id: "verify",
           visit: 1,
+          billing: makeBilledTokenCounts(),
         },
       ],
       meta: { has_more: false },
@@ -137,6 +145,7 @@ describe("mapRunStagesToSidebarStages", () => {
           node_id: "work",
           visit: 1,
           graph_visit: 1,
+          billing: makeBilledTokenCounts(),
         },
         {
           id: "work@2",
@@ -147,6 +156,7 @@ describe("mapRunStagesToSidebarStages", () => {
           visit: 2,
           graph_visit: 1,
           resumed_from_stage_id: "work@1",
+          billing: makeBilledTokenCounts(),
         },
       ],
       meta: { has_more: false },
@@ -172,6 +182,7 @@ describe("mapRunStagesToSidebarStages", () => {
           status: "succeeded",
           node_id: "verify",
           visit: 1,
+          billing: makeBilledTokenCounts(),
         },
       ],
       meta: { has_more: false },
@@ -180,6 +191,28 @@ describe("mapRunStagesToSidebarStages", () => {
     const result = mapRunStagesToSidebarStages(stages);
     expect(result[0].graphVisit).toBeNull();
     expect(result[0].resumedFromStageId).toBeNull();
+  });
+
+  test("maps parallel branch identity without parsing it in the client", () => {
+    const stages: PaginatedRunStageList = {
+      data: [
+        {
+          id: "review_opus@2",
+          name: "review_opus",
+          handler: "agent",
+          status: "running",
+          node_id: "review_opus",
+          visit: 2,
+          parallel_group_id: "review_fork@1",
+          parallel_branch_index: 3,
+        },
+      ],
+      meta: { has_more: false },
+    };
+
+    const result = mapRunStagesToSidebarStages(stages);
+    expect(result[0].parallelGroupId).toBe("review_fork@1");
+    expect(result[0].parallelBranchIndex).toBe(3);
   });
 
   test("preserves the authoritative handler for renderer dispatch", () => {
@@ -192,6 +225,7 @@ describe("mapRunStagesToSidebarStages", () => {
           status: "pending",
           node_id: "approval",
           visit: 1,
+          billing: makeBilledTokenCounts(),
         },
       ],
       meta: { has_more: false },

@@ -17,27 +17,46 @@ use fabro_types::{
 use crate::tool_registry::ToolContext;
 use crate::types::AgentEvent;
 
+/// Projections and their ID counters, behind one lock so a list and its
+/// counter can never be observed out of step.
+#[derive(Debug, Default)]
+struct TodoRuntimeState {
+    lists:         BTreeMap<String, TodoListProjection>,
+    task_counters: BTreeMap<String, u64>,
+}
+
 /// Shared, thread-safe todo projection. Wrap it in `Arc` and clone the
 /// `Arc` into each tool closure that needs it.
 #[derive(Debug, Default)]
 pub struct TodoRuntime {
-    lists: Mutex<BTreeMap<String, TodoListProjection>>,
+    state: Mutex<TodoRuntimeState>,
 }
 
 impl TodoRuntime {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            lists: Mutex::new(BTreeMap::new()),
+            state: Mutex::new(TodoRuntimeState::default()),
         }
+    }
+
+    /// Allocate the next monotonically increasing Claude task ID for a list.
+    ///
+    /// Keeping the counter beside the projection lets root and child profiles
+    /// safely create tasks in the same shared list.
+    pub(crate) fn next_task_id(&self, list_id: &str) -> u64 {
+        let mut guard = self.state.lock().expect("todo runtime lock poisoned");
+        let counter = guard.task_counters.entry(list_id.to_string()).or_default();
+        *counter = counter.saturating_add(1);
+        *counter
     }
 
     /// Snapshot the projection for `list_id`. Used by tests and by the
     /// list-style tools that need a stable view.
     #[must_use]
     pub fn snapshot(&self, list_id: &str) -> Option<TodoListProjection> {
-        let guard = self.lists.lock().expect("todo runtime lock poisoned");
-        guard.get(list_id).cloned()
+        let guard = self.state.lock().expect("todo runtime lock poisoned");
+        guard.lists.get(list_id).cloned()
     }
 
     /// Insert (or replace) a todo and emit `todo.created`.
@@ -63,8 +82,9 @@ impl TodoRuntime {
             metadata:    todo.metadata.clone(),
         };
         {
-            let mut guard = self.lists.lock().expect("todo runtime lock poisoned");
+            let mut guard = self.state.lock().expect("todo runtime lock poisoned");
             guard
+                .lists
                 .entry(list_id)
                 .or_insert_with(|| TodoListProjection::new(kind, props.list_id.clone()))
                 .upsert(todo);
@@ -81,8 +101,8 @@ impl TodoRuntime {
         }
 
         let applied = {
-            let mut guard = self.lists.lock().expect("todo runtime lock poisoned");
-            let Some(list) = guard.get_mut(&props.list_id) else {
+            let mut guard = self.state.lock().expect("todo runtime lock poisoned");
+            let Some(list) = guard.lists.get_mut(&props.list_id) else {
                 return false;
             };
             list.apply_patch(&props.todo_id, &TodoPatch::from_props(&props))
@@ -103,8 +123,8 @@ impl TodoRuntime {
         todo_id: String,
     ) -> bool {
         let removed = {
-            let mut guard = self.lists.lock().expect("todo runtime lock poisoned");
-            let Some(list) = guard.get_mut(&list_id) else {
+            let mut guard = self.state.lock().expect("todo runtime lock poisoned");
+            let Some(list) = guard.lists.get_mut(&list_id) else {
                 return false;
             };
             list.remove(&todo_id)

@@ -228,6 +228,27 @@ pub async fn resolve_text_or_blob_ref(value: &Value, run_store: &RunStoreHandle)
     }
 }
 
+/// Resolve a structured JSON value from inline context or a Fabro-managed
+/// blob reference.
+///
+/// Managed `file://` references are normalized through their content-addressed
+/// blob id instead of reading an execution-local path. Ordinary strings and
+/// ordinary file references remain unchanged for the caller to validate.
+pub(crate) async fn resolve_json_value(value: &Value, run_store: &RunStoreHandle) -> Result<Value> {
+    let Some(reference) = value.as_str() else {
+        return Ok(value.clone());
+    };
+    let Some(blob_id) =
+        parse_blob_ref(reference).or_else(|| parse_managed_blob_file_ref(reference))
+    else {
+        return Ok(value.clone());
+    };
+
+    let bytes = read_required_blob(&blob_id, run_store).await?;
+    serde_json::from_slice(&bytes)
+        .map_err(|err| Error::engine_with_source("artifact blob was not valid JSON", err))
+}
+
 pub async fn resolve_text_or_blob_ref_str(
     current: &str,
     run_store: &RunStoreHandle,
@@ -553,6 +574,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_json_value_hydrates_blob_and_managed_file_references() {
+        let run_store = make_run_store("structured-json-resolution").await;
+        let value = serde_json::json!([{"name": "api"}, {"name": "web"}]);
+        let blob_id = run_store
+            .write_blob(&serde_json::to_vec(&value).unwrap())
+            .await
+            .unwrap();
+        let handle = run_store.clone().into();
+
+        assert_eq!(
+            resolve_json_value(&serde_json::json!(format_blob_ref(&blob_id)), &handle)
+                .await
+                .unwrap(),
+            value
+        );
+        assert_eq!(
+            resolve_json_value(
+                &serde_json::json!(format!("file:///sandbox/.fabro/blobs/{blob_id}.json")),
+                &handle,
+            )
+            .await
+            .unwrap(),
+            value
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_json_value_preserves_inline_json() {
+        let run_store = make_run_store("inline-json-resolution").await;
+        let value = serde_json::json!([1, 2, 3]);
+
+        assert_eq!(
+            resolve_json_value(&value, &run_store.into()).await.unwrap(),
+            value
+        );
+    }
+
+    #[tokio::test]
     async fn offload_preserves_parallel_results_and_replaces_large_context_updates() {
         let run_store = make_run_store("parallel-result-artifact-offload").await;
         let large_response = "r".repeat(BLOB_OFFLOAD_THRESHOLD + 1);
@@ -564,6 +623,8 @@ mod tests {
         let expected_report_blob = RunBlobId::new(&serde_json::to_vec(&large_report).unwrap());
         let mut typed_results = vec![ParallelBranchResult {
             id:              "branch_a".to_string(),
+            index:           Some(0),
+            item_label:      None,
             status:          fabro_types::StageOutcome::Succeeded,
             context_updates: std::collections::BTreeMap::from([
                 (

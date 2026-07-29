@@ -5,13 +5,15 @@ use fabro_model::{AgentProfileKind, Catalog, ProviderId};
 use super::EnvContext;
 use crate::agent_profile::AgentProfile;
 use crate::config::NativeToolOptions;
-use crate::profiles::{self, BaseProfile, EmbeddedPrompt};
+use crate::profiles::{
+    self, BaseProfile, EmbeddedPrompt, ProfileDeps, impl_base_profile_accessors,
+};
 use crate::sandbox::Sandbox;
 use crate::skills::Skill;
 use crate::tool_registry::ToolRegistry;
 use crate::tools::{
-    WEB_SEARCH_TOOL_NAME, WebFetchSummarizer, make_edit_file_tool, make_list_dir_tool,
-    make_read_many_files_tool, register_core_tools,
+    WEB_SEARCH_TOOL_NAME, make_edit_file_tool, make_list_dir_tool, make_read_many_files_tool,
+    register_core_tools,
 };
 
 const CORE_PROMPT: &str = include_str!("prompts/gemini.md.j2");
@@ -23,18 +25,15 @@ pub struct GeminiProfile {
 impl GeminiProfile {
     #[must_use]
     pub fn new(model: impl Into<String>) -> Self {
-        let options = NativeToolOptions::for_profile(AgentProfileKind::Gemini);
-        Self::with_native_tools(model, &options, None)
+        let deps =
+            ProfileDeps::standalone(NativeToolOptions::for_profile(AgentProfileKind::Gemini));
+        Self::with_native_tools(model, &deps)
     }
 
-    pub(crate) fn with_native_tools(
-        model: impl Into<String>,
-        options: &NativeToolOptions,
-        summarizer: Option<WebFetchSummarizer>,
-    ) -> Self {
+    pub(crate) fn with_native_tools(model: impl Into<String>, deps: &ProfileDeps) -> Self {
         let mut registry = ToolRegistry::new();
 
-        register_core_tools(&mut registry, options, summarizer);
+        register_core_tools(&mut registry, &deps.options, deps.summarizer.clone());
         registry.register(make_edit_file_tool());
         registry.register(make_read_many_files_tool());
         registry.register(make_list_dir_tool());
@@ -65,29 +64,7 @@ impl GeminiProfile {
 }
 
 impl AgentProfile for GeminiProfile {
-    fn profile_kind(&self) -> AgentProfileKind {
-        self.base.profile_kind
-    }
-
-    fn provider_id(&self) -> ProviderId {
-        self.base.provider_id.clone()
-    }
-
-    fn model(&self) -> &str {
-        &self.base.model
-    }
-
-    fn catalog(&self) -> Option<&Catalog> {
-        self.base.catalog.as_deref()
-    }
-
-    fn tool_registry(&self) -> &ToolRegistry {
-        &self.base.registry
-    }
-
-    fn tool_registry_mut(&mut self) -> &mut ToolRegistry {
-        &mut self.base.registry
-    }
+    impl_base_profile_accessors!();
 
     fn build_system_prompt(
         &self,

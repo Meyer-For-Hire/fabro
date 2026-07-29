@@ -88,6 +88,17 @@ export const STAGE_ACTIVITY_EVENT_TYPES = [
 ] as const;
 export type StageActivityEventType = (typeof STAGE_ACTIVITY_EVENT_TYPES)[number];
 const STAGE_ACTIVITY_EVENTS = new Set<string>(STAGE_ACTIVITY_EVENT_TYPES);
+// Parallel branches bypass the engine's `stage.started` / `stage.completed`
+// lifecycle (the parallel handler dispatches each branch directly), so
+// `STAGE_EVENTS` never fires for them. Without this set the stages list never
+// refetches while a fork runs and branch rows stay frozen at their first
+// observed state.
+const PARALLEL_EVENTS = new Set([
+  "parallel.started",
+  "parallel.branch.started",
+  "parallel.branch.completed",
+  "parallel.completed",
+]);
 const INTERVIEW_EVENTS = new Set([
   "interview.started",
   "interview.completed",
@@ -118,6 +129,22 @@ const INFERENCE_EVENTS = new Set([
   "agent.error",
   "agent.session.ended",
 ]);
+const INFERENCE_TIMING_EVENTS = new Set([
+  "agent.llm.started",
+  "agent.message",
+  "agent.error",
+  "agent.session.ended",
+]);
+const TOOL_TIMING_EVENTS = new Set([
+  "agent.tool.started",
+  "agent.tool.completed",
+]);
+const ACP_TIMING_EVENTS = new Set([
+  "agent.acp.started",
+  "agent.acp.completed",
+  "agent.acp.cancelled",
+  "agent.acp.timed_out",
+]);
 // Todo / task mutation events refresh `getRunState` consumers (so per-stage
 // todo projections update live) and the run events list.
 const TODO_EVENTS = new Set([
@@ -125,6 +152,14 @@ const TODO_EVENTS = new Set([
   "todo.updated",
   "todo.deleted",
 ]);
+
+function liveTimingKeys(runId: string): Key[] {
+  return [
+    queryKeys.runs.detail(runId),
+    queryKeys.runs.state(runId),
+    queryKeys.runs.billing(runId),
+  ];
+}
 
 export function queryKeysForRunEvent(
   runId: string,
@@ -179,10 +214,29 @@ export function queryKeysForRunEvent(
     return keys;
   }
 
+  if (PARALLEL_EVENTS.has(event)) {
+    const keys: Key[] = [
+      queryKeys.runs.stages(runId),
+      queryKeys.runs.events(runId, 1000),
+      queryKeys.runs.graph(runId, "LR"),
+      queryKeys.runs.graph(runId, "TB"),
+    ];
+    if (stageId) {
+      keys.push(queryKeys.runs.stageEvents(runId, stageId));
+    }
+    return keys;
+  }
+
   if (STEERING_EVENTS.has(event)) {
     const keys: Key[] = [queryKeys.runs.events(runId, 1000)];
     if (AGENT_CONTROL_STATE_EVENTS.has(event)) {
       keys.unshift(queryKeys.runs.state(runId));
+    }
+    if (event === "agent.round.interrupted") {
+      keys.unshift(
+        queryKeys.runs.detail(runId),
+        queryKeys.runs.billing(runId),
+      );
     }
     if (stageId) {
       keys.push(queryKeys.runs.stageEvents(runId, stageId));
@@ -192,12 +246,31 @@ export function queryKeysForRunEvent(
   }
 
   if (INFERENCE_EVENTS.has(event)) {
-    const keys: Key[] = [queryKeys.runs.state(runId)];
+    const keys = INFERENCE_TIMING_EVENTS.has(event)
+      ? liveTimingKeys(runId)
+      : [queryKeys.runs.state(runId)];
     if (stageId) {
       keys.push(queryKeys.runs.stageEvents(runId, stageId));
       if (event === "agent.message") {
         keys.push(queryKeys.runs.stageContextWindow(runId, stageId));
       }
+    }
+    return keys;
+  }
+
+  if (TOOL_TIMING_EVENTS.has(event)) {
+    const keys = liveTimingKeys(runId);
+    if (stageId) {
+      keys.push(queryKeys.runs.stageEvents(runId, stageId));
+      keys.push(queryKeys.runs.stageContextWindow(runId, stageId));
+    }
+    return keys;
+  }
+
+  if (ACP_TIMING_EVENTS.has(event)) {
+    const keys = liveTimingKeys(runId);
+    if (stageId) {
+      keys.push(queryKeys.runs.stageEvents(runId, stageId));
     }
     return keys;
   }

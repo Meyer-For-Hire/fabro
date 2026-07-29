@@ -186,6 +186,20 @@ impl Node {
         self.str_attr("script")
     }
 
+    /// The prompt a handler should send, falling back to the node label when
+    /// `prompt` is absent or empty.
+    #[must_use]
+    pub fn prompt_or_label(&self) -> &str {
+        self.prompt()
+            .filter(|prompt| !prompt.is_empty())
+            .unwrap_or_else(|| self.label())
+    }
+
+    #[must_use]
+    pub fn for_each(&self) -> Option<&str> {
+        self.str_attr("for_each")
+    }
+
     #[must_use]
     pub fn output_schema(&self) -> Option<&str> {
         self.str_attr("output_schema")
@@ -209,6 +223,11 @@ impl Node {
     #[must_use]
     pub fn goal_gate(&self) -> bool {
         self.bool_attr("goal_gate").unwrap_or(false)
+    }
+
+    #[must_use]
+    pub fn review_target(&self) -> bool {
+        self.bool_attr("review_target").unwrap_or(false)
     }
 
     #[must_use]
@@ -604,10 +623,12 @@ mod tests {
         assert_eq!(node.shape(), "box");
         assert_eq!(node.node_type(), None);
         assert_eq!(node.prompt(), None);
+        assert_eq!(node.for_each(), None);
         assert_eq!(node.output_schema(), None);
         assert_eq!(node.output_retries(), 2);
         assert_eq!(node.max_retries(), None);
         assert!(!node.goal_gate());
+        assert!(!node.review_target());
         assert_eq!(node.retry_target(), None);
         assert_eq!(node.fallback_retry_target(), None);
         assert_eq!(node.fidelity(), None);
@@ -705,6 +726,33 @@ mod tests {
     }
 
     #[test]
+    fn node_prompt_or_label_falls_back_on_absent_and_empty_prompts() {
+        let mut node = Node::new("review");
+        assert_eq!(node.prompt_or_label(), node.label());
+
+        node.attrs
+            .insert("prompt".to_string(), AttrValue::String(String::new()));
+        assert_eq!(node.prompt_or_label(), node.label());
+
+        node.attrs.insert(
+            "prompt".to_string(),
+            AttrValue::String("Review the diff.".to_string()),
+        );
+        assert_eq!(node.prompt_or_label(), "Review the diff.");
+    }
+
+    #[test]
+    fn node_for_each_returns_context_source() {
+        let mut node = Node::new("fanout");
+        node.attrs.insert(
+            "for_each".to_string(),
+            AttrValue::String("context.candidates".to_string()),
+        );
+
+        assert_eq!(node.for_each(), Some("context.candidates"));
+    }
+
+    #[test]
     fn node_with_attrs() {
         let mut node = Node::new("plan");
         node.attrs.insert(
@@ -718,11 +766,14 @@ mod tests {
         node.attrs
             .insert("goal_gate".to_string(), AttrValue::Boolean(true));
         node.attrs
+            .insert("review_target".to_string(), AttrValue::Boolean(true));
+        node.attrs
             .insert("max_retries".to_string(), AttrValue::Integer(3));
 
         assert_eq!(node.label(), "Plan step");
         assert_eq!(node.shape(), "diamond");
         assert!(node.goal_gate());
+        assert!(node.review_target());
         assert_eq!(node.max_retries(), Some(3));
     }
 

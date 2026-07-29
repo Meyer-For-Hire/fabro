@@ -85,11 +85,43 @@ describe("queryKeysForRunEvent", () => {
 
   test("interrupt settlement invalidates projected control state and stage activity", () => {
     expect(queryKeysForRunEvent("run-1", "agent.round.interrupted", "nap@1")).toEqual([
+      queryKeys.runs.detail("run-1"),
+      queryKeys.runs.billing("run-1"),
       queryKeys.runs.state("run-1"),
       queryKeys.runs.events("run-1", 1000),
       queryKeys.runs.stageEvents("run-1", "nap@1"),
       queryKeys.runs.stageContextWindow("run-1", "nap@1"),
     ]);
+  });
+
+  test("parallel branch lifecycle invalidates the stages list backing live branch rows", () => {
+    // Branches bypass stage.started/stage.completed, so these events are the
+    // only signal that a branch row's status changed.
+    expect(queryKeysForRunEvent("run-1", "parallel.branch.started", "review_glm@1")).toEqual([
+      queryKeys.runs.stages("run-1"),
+      queryKeys.runs.events("run-1", 1000),
+      queryKeys.runs.graph("run-1", "LR"),
+      queryKeys.runs.graph("run-1", "TB"),
+      queryKeys.runs.stageEvents("run-1", "review_glm@1"),
+    ]);
+    expect(queryKeysForRunEvent("run-1", "parallel.branch.completed", "review_glm@1")).toEqual([
+      queryKeys.runs.stages("run-1"),
+      queryKeys.runs.events("run-1", 1000),
+      queryKeys.runs.graph("run-1", "LR"),
+      queryKeys.runs.graph("run-1", "TB"),
+      queryKeys.runs.stageEvents("run-1", "review_glm@1"),
+    ]);
+  });
+
+  test("fork lifecycle invalidates run-scoped resources without a stage id", () => {
+    for (const event of ["parallel.started", "parallel.completed"]) {
+      expect(queryKeysForRunEvent("run-1", event)).toEqual([
+        queryKeys.runs.stages("run-1"),
+        queryKeys.runs.events("run-1", 1000),
+        queryKeys.runs.graph("run-1", "LR"),
+        queryKeys.runs.graph("run-1", "TB"),
+      ]);
+    }
   });
 
   test("cancel requests invalidate the durable run summary", () => {
@@ -129,10 +161,16 @@ describe("queryKeysForRunEvent", () => {
   test("every inference projection transition invalidates live run state", () => {
     for (const event of [
       "agent.llm.started",
-      "agent.llm.first_output",
-      "agent.llm.retry",
       "agent.error",
     ]) {
+      expect(queryKeysForRunEvent("run-1", event, "code@1")).toEqual([
+        queryKeys.runs.detail("run-1"),
+        queryKeys.runs.state("run-1"),
+        queryKeys.runs.billing("run-1"),
+        queryKeys.runs.stageEvents("run-1", "code@1"),
+      ]);
+    }
+    for (const event of ["agent.llm.first_output", "agent.llm.retry"]) {
       expect(queryKeysForRunEvent("run-1", event, "code@1")).toEqual([
         queryKeys.runs.state("run-1"),
         queryKeys.runs.stageEvents("run-1", "code@1"),
@@ -141,13 +179,45 @@ describe("queryKeysForRunEvent", () => {
     expect(
       queryKeysForRunEvent("run-1", "agent.message", "code@1"),
     ).toEqual([
+      queryKeys.runs.detail("run-1"),
       queryKeys.runs.state("run-1"),
+      queryKeys.runs.billing("run-1"),
       queryKeys.runs.stageEvents("run-1", "code@1"),
       queryKeys.runs.stageContextWindow("run-1", "code@1"),
     ]);
     expect(queryKeysForRunEvent("run-1", "agent.session.ended")).toEqual([
+      queryKeys.runs.detail("run-1"),
       queryKeys.runs.state("run-1"),
+      queryKeys.runs.billing("run-1"),
     ]);
+  });
+
+  test("ACP timing events invalidate live summaries and stage events", () => {
+    for (const event of [
+      "agent.acp.started",
+      "agent.acp.completed",
+      "agent.acp.cancelled",
+      "agent.acp.timed_out",
+    ]) {
+      expect(queryKeysForRunEvent("run-1", event, "code@1")).toEqual([
+        queryKeys.runs.detail("run-1"),
+        queryKeys.runs.state("run-1"),
+        queryKeys.runs.billing("run-1"),
+        queryKeys.runs.stageEvents("run-1", "code@1"),
+      ]);
+    }
+  });
+
+  test("tool timing events invalidate live summaries and stage resources", () => {
+    for (const event of ["agent.tool.started", "agent.tool.completed"]) {
+      expect(queryKeysForRunEvent("run-1", event, "code@1")).toEqual([
+        queryKeys.runs.detail("run-1"),
+        queryKeys.runs.state("run-1"),
+        queryKeys.runs.billing("run-1"),
+        queryKeys.runs.stageEvents("run-1", "code@1"),
+        queryKeys.runs.stageContextWindow("run-1", "code@1"),
+      ]);
+    }
   });
 
   test("watchdog timeout refreshes the stage events for that stage", () => {

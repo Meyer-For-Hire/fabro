@@ -12,6 +12,7 @@ pub mod keys {
     pub const PREFERRED_LABEL: &str = "preferred_label";
     pub const LAST_STAGE: &str = "last_stage";
     pub const LAST_RESPONSE: &str = "last_response";
+    pub const REVIEW_TARGET: &str = "review_target";
 
     // --- graph.* keys ---
     pub const GRAPH_GOAL: &str = "graph.goal";
@@ -142,6 +143,7 @@ pub mod keys {
             assert!(!is_engine_internal_key("outcome"));
             assert!(!is_engine_internal_key("last_stage"));
             assert!(!is_engine_internal_key("review.result"));
+            assert!(!is_engine_internal_key(REVIEW_TARGET));
             assert!(!is_engine_internal_key("user.name"));
         }
     }
@@ -180,6 +182,18 @@ pub(crate) fn context_diff_public(
         .into_iter()
         .filter(|(key, _)| !keys::is_engine_internal_key(key))
         .collect()
+}
+
+/// Read a context key the way workflow authors write one: the declared key
+/// first, then the same key with a leading `context.` stripped.
+///
+/// The lookup is flat. `context.plan.title` reads the literal keys
+/// `context.plan.title` and `plan.title`; it never walks into a nested object.
+pub(crate) fn lookup_flat(context: &Context, key: &str) -> Option<serde_json::Value> {
+    if let Some(bare) = key.strip_prefix("context.") {
+        return context.get(key).or_else(|| context.get(bare));
+    }
+    context.get(key)
 }
 
 /// One entry of the [`keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES`] stash.
@@ -271,6 +285,36 @@ mod tests {
         let ctx = Context::new();
         ctx.set("key", serde_json::json!("value"));
         assert_eq!(ctx.get("key"), Some(serde_json::json!("value")));
+    }
+
+    #[test]
+    fn lookup_flat_prefers_the_exact_key_then_strips_the_context_prefix() {
+        let ctx = Context::new();
+        ctx.set("context.items", serde_json::json!(["exact"]));
+        ctx.set("items", serde_json::json!(["fallback"]));
+
+        assert_eq!(
+            lookup_flat(&ctx, "context.items"),
+            Some(serde_json::json!(["exact"]))
+        );
+        // An explicit null is a value, not a miss, so it wins over the bare key.
+        ctx.set("context.items", serde_json::Value::Null);
+        assert_eq!(
+            lookup_flat(&ctx, "context.items"),
+            Some(serde_json::Value::Null)
+        );
+
+        let bare_only = Context::new();
+        bare_only.set("items", serde_json::json!(["fallback"]));
+        assert_eq!(
+            lookup_flat(&bare_only, "context.items"),
+            Some(serde_json::json!(["fallback"]))
+        );
+        assert_eq!(
+            lookup_flat(&bare_only, "items"),
+            Some(serde_json::json!(["fallback"]))
+        );
+        assert_eq!(lookup_flat(&bare_only, "context.missing"), None);
     }
 
     #[test]

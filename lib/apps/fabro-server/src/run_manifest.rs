@@ -35,7 +35,8 @@ use fabro_util::check_report::{CheckDetail, CheckReport, CheckResult, CheckSecti
 use fabro_validate::Severity;
 use fabro_workflow::Error as WorkflowError;
 use fabro_workflow::operations::{
-    CreateRunInput, ValidateInput, WorkflowInput, validate, validate_with_ready_providers,
+    CreateRunInput, ValidateInput, WorkflowInput, validate, validate_with_catalog,
+    validate_with_ready_providers,
 };
 use fabro_workflow::pipeline::Validated;
 use fabro_workflow::run_materialization::materialize_run_with_ready_providers;
@@ -44,7 +45,6 @@ use futures_util::stream::{self, StreamExt};
 use tokio::process::Command;
 use tokio::time;
 
-use crate::interp::process_env_var;
 use crate::server::AppState;
 use crate::server_secrets::LlmClientResult;
 
@@ -192,12 +192,18 @@ pub(crate) fn validate_prepared_manifest(
     validate_prepared_manifest_with_vars(prepared, catalog, HashMap::new())
 }
 
+pub(crate) fn validate_prepared_manifest_structural(
+    prepared: &PreparedManifest,
+) -> Result<Validated, WorkflowError> {
+    validate(manifest_validate_input(prepared, HashMap::new()))
+}
+
 pub(crate) fn validate_prepared_manifest_with_vars(
     prepared: &PreparedManifest,
     catalog: Arc<Catalog>,
     vars: HashMap<String, String>,
 ) -> Result<Validated, WorkflowError> {
-    validate(manifest_validate_input(prepared, catalog, vars))
+    validate_with_catalog(manifest_validate_input(prepared, vars), catalog)
 }
 
 pub(crate) fn validate_prepared_manifest_for_preflight(
@@ -207,14 +213,14 @@ pub(crate) fn validate_prepared_manifest_for_preflight(
     ready_providers: &[ProviderId],
 ) -> Result<Validated, WorkflowError> {
     validate_with_ready_providers(
-        manifest_validate_input(prepared, catalog, vars),
+        manifest_validate_input(prepared, vars),
+        catalog,
         ready_providers,
     )
 }
 
 fn manifest_validate_input(
     prepared: &PreparedManifest,
-    catalog: Arc<Catalog>,
     vars: HashMap<String, String>,
 ) -> ValidateInput {
     ValidateInput {
@@ -223,7 +229,6 @@ fn manifest_validate_input(
         vars,
         cwd: prepared.cwd.clone(),
         custom_transforms: Vec::new(),
-        catalog,
     }
 }
 
@@ -584,9 +589,10 @@ async fn build_preflight_report(
         llm_result,
     )
     .await;
-    run_github_token_check(&mut checks, prepared, &resolved_run, github_app).await;
+    let github_token_ok =
+        run_github_token_check(&mut checks, prepared, &resolved_run, github_app).await;
 
-    let checks_ok = sandbox_ok && repository_access_ok && llm_ok;
+    let checks_ok = sandbox_ok && repository_access_ok && llm_ok && github_token_ok;
 
     Ok((
         CheckReport {
@@ -1204,48 +1210,63 @@ async fn run_github_token_check(
     prepared: &PreparedManifest,
     resolved_run: &RunNamespace,
     github_app: Option<fabro_github::GitHubCredentials>,
-) {
+) -> bool {
     if !resolved_run.integrations.github.is_token_requested() {
-        return;
+        return true;
     }
 
     // Resolve InterpString permission values eagerly for token minting and
     // for display in the preflight report.
-    let github_permissions = resolved_run
-        .integrations
-        .github
-        .resolve_permissions(process_env_var);
+    let github_permissions = match resolved_run.integrations.github.resolve_permissions() {
+        Ok(permissions) => permissions,
+        Err(err) => {
+            checks.push(CheckResult {
+                name:        "GitHub Token".into(),
+                status:      CheckStatus::Error,
+                summary:     "invalid permissions".into(),
+                details:     vec![],
+                remediation: Some(format!("Failed to resolve GitHub permissions: {err}")),
+            });
+            return false;
+        }
+    };
 
     let perm_details = github_permissions
         .iter()
         .map(|(key, value)| CheckDetail::new(format!("{key}: {value}")))
         .collect::<Vec<_>>();
-    match (&github_app, prepared.git.as_ref()) {
-        (Some(creds), Some(git)) => {
-            match mint_github_token(creds, &git.origin_url, &github_permissions).await {
-                Ok(_) => checks.push(CheckResult {
+    if let (Some(creds), Some(git)) = (&github_app, prepared.git.as_ref()) {
+        match mint_github_token(creds, &git.origin_url, &github_permissions).await {
+            Ok(_) => {
+                checks.push(CheckResult {
                     name:        "GitHub Token".into(),
                     status:      CheckStatus::Pass,
                     summary:     "minted".into(),
                     details:     perm_details,
                     remediation: None,
-                }),
-                Err(err) => checks.push(CheckResult {
+                });
+                true
+            }
+            Err(err) => {
+                checks.push(CheckResult {
                     name:        "GitHub Token".into(),
                     status:      CheckStatus::Error,
                     summary:     "failed".into(),
                     details:     perm_details,
                     remediation: Some(format!("Failed to mint GitHub token: {err}")),
-                }),
+                });
+                false
             }
         }
-        _ => checks.push(CheckResult {
+    } else {
+        checks.push(CheckResult {
             name:        "GitHub Token".into(),
             status:      CheckStatus::Warning,
             summary:     "skipped".into(),
             details:     perm_details,
             remediation: Some("No GitHub credentials or origin URL available".to_string()),
-        }),
+        });
+        true
     }
 }
 
@@ -2257,6 +2278,55 @@ issues = "read"
                 .iter()
                 .map(|c| c.name.as_str())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn preflight_rejects_unresolved_github_permissions() {
+        let state = crate::test_support::test_app_state();
+        let mut manifest = minimal_manifest();
+        manifest.workflows.get_mut("workflow.fabro").unwrap().config =
+            Some(types::ManifestWorkflowConfig {
+                path:   "workflow.toml".to_string(),
+                source: r#"_version = 1
+
+[run.environment]
+id = "local"
+
+[run.integrations.github.permissions]
+issues = "{{ env.GITHUB_ISSUES_PERMISSION }}"
+"#
+                .to_string(),
+            });
+
+        let prepared = prepare_manifest(
+            &manifest_run_defaults(Some(&default_settings_fixture())),
+            &manifest,
+        )
+        .unwrap();
+        let validated = validate_prepared_manifest(&prepared, test_catalog()).unwrap();
+        assert!(!validated.has_errors());
+
+        let (response, ok) = resolve_and_run_preflight(state.as_ref(), &prepared, &validated)
+            .await
+            .unwrap();
+        let github_token_check = response.checks.sections[0]
+            .checks
+            .iter()
+            .find(|check| check.name == "GitHub Token")
+            .expect("GitHub Token check should report invalid permissions");
+
+        assert!(!ok);
+        assert_eq!(
+            github_token_check.status,
+            types::PreflightCheckResultStatus::Error
+        );
+        assert_eq!(github_token_check.summary, "invalid permissions");
+        assert!(
+            github_token_check
+                .remediation
+                .as_deref()
+                .is_some_and(|message| message.contains("GITHUB_ISSUES_PERMISSION"))
         );
     }
 

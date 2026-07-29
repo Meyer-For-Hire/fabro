@@ -7,6 +7,8 @@ mod refresh;
 mod resolve;
 mod sql_vault_source;
 mod strategy;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 mod vault_ext;
 mod vault_source;
 
@@ -21,7 +23,6 @@ pub use refresh::refresh_oauth_credential;
 pub use resolve::{
     ApiCredential, CredentialResolver, CredentialUsage, EnvLookup, ResolveError,
     ResolvedCredential, auth_issue_message, build_api_key_header,
-    configured_providers_from_process_env,
 };
 pub use sql_vault_source::SqlVaultCredentialSource;
 pub use strategy::{

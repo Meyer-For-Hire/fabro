@@ -1217,7 +1217,7 @@ async fn reconnect_run_sandbox(
         .await
         .map_err(|err| ApiError::new(StatusCode::CONFLICT, err.to_string()))?;
     sandbox
-        .start()
+        .activate()
         .await
         .map_err(|err| ApiError::new(StatusCode::CONFLICT, err.display_with_causes()))?;
     Ok(sandbox)

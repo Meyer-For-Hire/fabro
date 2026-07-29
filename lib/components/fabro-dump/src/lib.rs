@@ -607,6 +607,8 @@ mod tests {
         stage.script_timing = Some(serde_json::json!({ "duration_ms": 10 }));
         stage.parallel_results = Some(vec![fabro_types::ParallelBranchResult {
             id:              "review".to_string(),
+            index:           Some(0),
+            item_label:      None,
             status:          fabro_types::StageOutcome::Succeeded,
             context_updates: std::collections::BTreeMap::from([(
                 "response.review".to_string(),

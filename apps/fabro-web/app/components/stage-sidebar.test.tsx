@@ -2,24 +2,9 @@ import { describe, expect, test } from "bun:test";
 import TestRenderer, { act } from "react-test-renderer";
 import { MemoryRouter } from "react-router";
 
+import { makeStage } from "../lib/test-utils";
 import { StageSidebar, type Stage } from "./stage-sidebar";
 
-function makeStage(overrides: Partial<Stage> = {}): Stage {
-  return {
-    id:        "implement@1",
-    name:      "implement",
-    handler:   "agent",
-    nodeId:    "implement",
-    visit:     1,
-    graphVisit: null,
-    resumedFromStageId: null,
-    status:    "running",
-    duration:  "--",
-    startedAt: null,
-    providerUsed: null,
-    ...overrides,
-  };
-}
 
 function renderSidebar(stages: Stage[]): string {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;

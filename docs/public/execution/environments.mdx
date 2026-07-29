@@ -152,16 +152,16 @@ preserve = true
 
 ## Environment value interpolation
 
-Environment `env` values can mix literal text with `{{ vars.NAME }}`, `{{ env.NAME }}`, and `{{ secrets.NAME }}` tokens:
+Environment `env` values can mix literal text with `{{ vars.NAME }}` and `{{ secrets.NAME }}` tokens:
 
 ```toml title="workflow.toml"
 [environments.fabro-dev.env]
 DEPLOY_ENV = "{{ vars.DEPLOY_ENV }}"
-SERVICE_URL = "https://api.{{ env.REGION }}.example.com"
+SERVICE_URL = "https://api.{{ vars.REGION }}.example.com"
 SERVICE_TOKEN = "{{ secrets.SERVICE_TOKEN }}"
 ```
 
-Server-managed variables resolve when the run is created. Worker environment variables and token secrets resolve immediately before the sandbox starts, so resolved secret values are not persisted in the run definition. A missing or non-token secret fails closed. For backward compatibility, a value containing only missing `{{ env.* }}` references is passed through in source form.
+Server-managed variables resolve when the run is created. Token secrets resolve immediately before the sandbox starts, so resolved secret values are not persisted in the run definition. A missing or non-token secret fails closed, as does any `{{ env.* }}` reference: the process environment is not a configuration source.
 
 ## Selecting an environment from the CLI
 

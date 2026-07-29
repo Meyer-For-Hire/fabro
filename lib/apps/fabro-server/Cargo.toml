@@ -41,6 +41,7 @@ fabro-manifest = { path = "../../components/fabro-manifest" }
 fabro-mcp-store = { path = "../../components/fabro-mcp-store" }
 fabro-model = { path = "../../foundation/fabro-model" }
 fabro-proc = { path = "../../foundation/fabro-proc" }
+fabro-template = { path = "../../foundation/fabro-template" }
 fabro-tool = { path = "../../components/fabro-tool" }
 fabro-types = { path = "../../foundation/fabro-types" }
 fabro-util = { path = "../../foundation/fabro-util" }
@@ -108,6 +109,7 @@ fabro-build-support = { path = "../../foundation/build-support" }
 chrono = { workspace = true }
 
 [dev-dependencies]
+fabro-auth = { path = "../../foundation/fabro-auth", features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tower = "0.5"
 http-body-util = "0.1"

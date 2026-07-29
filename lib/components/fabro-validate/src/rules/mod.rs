@@ -6,6 +6,7 @@ mod direction_valid;
 mod edge_target_exists;
 mod exit_no_outgoing;
 mod fidelity_valid;
+mod for_each_contract;
 mod freeform_edge_count;
 mod goal_gate_has_retry;
 mod import_error;
@@ -56,6 +57,7 @@ pub fn built_in_rules() -> Vec<Box<dyn LintRule>> {
         goal_gate_has_retry::rule(),
         prompt_on_llm_nodes::rule(),
         freeform_edge_count::rule(),
+        for_each_contract::rule(),
         direction_valid::rule(),
         reserved_keyword_node_id::rule(),
         all_conditional_edges::rule(),

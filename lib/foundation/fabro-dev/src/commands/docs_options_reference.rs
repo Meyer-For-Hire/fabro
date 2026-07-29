@@ -109,7 +109,7 @@ permissions = "read-write""#,
             r#"[run.model]
 provider = "anthropic"
 name = "claude-sonnet-4-5"
-fallbacks = ["openai", "gpt-5.4"]"#,
+fallbacks = ["openrouter:kimi-k3", "gpt-terra"]"#,
         ),
         Section::of::<fabro_config::CliLoggingLayer>(
             "[cli.logging]",
@@ -231,7 +231,7 @@ aliases = ["gateway"]
 credentials = ["env:ACME_GATEWAY_API_KEY", "vault:ACME_GATEWAY_API_KEY"]
 
 [llm.providers.proxy.extra_headers]
-x-portkey-api-key = "{{ env.PORTKEY_API_KEY }}"
+x-portkey-api-key = "{{ secrets.portkey_api_key }}"
 x-portkey-config = "@bedrock-prod"
 x-team-secret = "{{ secrets.gateway_team_secret }}"
 ```
@@ -246,7 +246,7 @@ x-team-secret = "{{ secrets.gateway_team_secret }}"
 | `auth` | table | omitted | API-key auth config. Omit the table entirely for providers that need no API key; any `extra_headers` are still attached. |
 | `auth.credentials` | array<string> | required when `auth` present | Ordered credential refs. Accepted forms are `vault:<NAME>`, `env:<NAME>`, and `aws_sigv4` (sign requests from the AWS default credential chain — Bedrock). Literal secret strings are rejected. |
 | `auth.header` | `"bearer"` or `{ custom = "Header-Name" }` | `"bearer"` | Primary API-key header policy. Omit when the provider uses a standard bearer token. |
-| `extra_headers` | table | `{}` | Additional headers attached to provider requests. Values are interpolation strings: literal text, an `{{ env.NAME }}` token, or a `{{ secrets.NAME }}` token. Put credentials in a secret and reference them with a `{{ secrets.NAME }}` token, not a bare literal. |
+| `extra_headers` | table | `{}` | Additional headers attached to provider requests. Values are literal text or `{{ secrets.NAME }}` interpolation strings. Put credentials in a secret and reference them with a token, not a bare literal. |
 | `priority` | integer | `0` | Higher-priority ready providers win unqualified model and default selection; ties use canonical provider ID. |
 | `enabled` | boolean | `true` | Set `false` to disable a provider after lower-precedence layers define it. |
 | `aliases` | array<string> | `[]` | Additional provider names accepted by model routing and fallback config. |

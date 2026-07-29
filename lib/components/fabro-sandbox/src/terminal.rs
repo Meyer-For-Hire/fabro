@@ -64,7 +64,7 @@ pub async fn open_terminal_for_run(
                 runtime.clone_branch.clone(),
             )
             .await?;
-            sandbox.start().await?;
+            sandbox.activate().await?;
             let api_key = resolve_daytona_api_key(daytona_api_key)?;
             let organization_id = resolve_daytona_organization_id(daytona_organization_id);
             let session = DaytonaTerminalSession::open(
@@ -95,7 +95,7 @@ pub async fn open_terminal_for_run(
                 run_id,
             )
             .await?;
-            sandbox.start().await?;
+            sandbox.activate().await?;
             let session = DockerTerminalSession::open(&sandbox, size).await?;
             Ok(Box::new(session))
         }

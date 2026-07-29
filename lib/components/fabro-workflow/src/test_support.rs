@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fabro_agent::Sandbox;
-use fabro_auth::{CredentialSource, EnvCredentialSource};
+use fabro_auth::{CredentialSource, test_support as auth_test_support};
 use fabro_graphviz::graph::Graph as GvGraph;
 use fabro_interview::AutoApproveInterviewer;
 use fabro_model::Catalog;
@@ -117,6 +117,14 @@ pub async fn mark_run_running(run_store: &fabro_store::RunDatabase, run_id: &fab
     append_event(run_store, run_id, &Event::RunRunning)
         .await
         .expect("seed run.running");
+}
+
+/// Record every event the emitter publishes, for assertions after a run.
+pub fn collect_events(emitter: &Emitter) -> Arc<std::sync::Mutex<Vec<fabro_types::RunEvent>>> {
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = Arc::clone(&events);
+    emitter.on_event(move |event| captured.lock().unwrap().push(event.clone()));
+    events
 }
 
 pub fn test_store_dir(run_dir: &std::path::Path) -> PathBuf {
@@ -249,7 +257,7 @@ async fn initialized(
                     "claude-sonnet-4-6".to_string(),
                     options
                         .llm_source
-                        .unwrap_or_else(|| Arc::new(EnvCredentialSource::new())),
+                        .unwrap_or_else(auth_test_support::vault_only_credential_source),
                     Arc::new(Catalog::from_builtin().expect("default catalog should build")),
                     Arc::new(SandboxGitRuntime::new()),
                     Arc::new(RunMetadataRuntime::new()),
