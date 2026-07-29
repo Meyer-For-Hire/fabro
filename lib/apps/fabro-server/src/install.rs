@@ -2053,7 +2053,6 @@ fn build_github_app_manifest(
         "public": false,
         "default_permissions": {
             "contents": "write",
-            "workflows": "write",
             "metadata": "read",
             "pull_requests": "write",
             "checks": "write",
@@ -2362,7 +2361,7 @@ mod tests {
     };
 
     #[test]
-    fn github_app_manifest_allows_workflow_file_writes() {
+    fn github_app_manifest_excludes_workflows_permission() {
         let manifest = build_github_app_manifest(
             "Fabro Test",
             "https://fabro.example/setup",
@@ -2370,9 +2369,9 @@ mod tests {
             "https://fabro.example/setup",
         );
 
-        assert_eq!(
-            manifest["default_permissions"]["workflows"],
-            serde_json::Value::String("write".to_string())
+        assert!(
+            manifest["default_permissions"].get("workflows").is_none(),
+            "GitHub App must not be able to write workflow files"
         );
     }
 
