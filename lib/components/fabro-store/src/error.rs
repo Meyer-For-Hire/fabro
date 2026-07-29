@@ -37,7 +37,7 @@ pub enum Error {
         run_id: String,
         field:  &'static str,
     },
-    #[error("invalid status transition: {0}")]
+    #[error(transparent)]
     InvalidTransition(#[from] fabro_types::InvalidTransition),
     #[error("{0}")]
     Other(String),

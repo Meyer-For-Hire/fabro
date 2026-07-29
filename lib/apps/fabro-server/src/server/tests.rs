@@ -6366,31 +6366,38 @@ async fn create_unreadable_durable_run(state: &Arc<AppState>, run_id: RunId) {
     workflow_event::append_event(&run_store, &run_id, &workflow_event::Event::RunRunning)
         .await
         .unwrap();
-    let payload = fabro_store::EventPayload::new(
-        json!({
-            "id": "evt-unreadable-run-completed",
-            "ts": "2026-05-05T20:46:33Z",
-            "run_id": run_id,
-            "event": "run.completed",
-            "properties": {
-                "timing": {
-                    "wall_time_ms": 1,
-                    "inference_time_ms": 0,
-                    "tool_time_ms": 0,
-                    "active_time_ms": 0
+    // Appends now validate before write, so a corrupted log can only exist if
+    // it predates that check. Write the poison event directly to simulate one.
+    state
+        .stores
+        .runs
+        .test_put_unvalidated_run_event(
+            &run_id,
+            5,
+            &json!({
+                "id": "evt-unreadable-run-completed",
+                "ts": "2026-05-05T20:46:33Z",
+                "run_id": run_id,
+                "event": "run.completed",
+                "properties": {
+                    "timing": {
+                        "wall_time_ms": 1,
+                        "inference_time_ms": 0,
+                        "tool_time_ms": 0,
+                        "active_time_ms": 0
+                    },
+                    "artifact_count": 0,
+                    "status": "legacy-status",
+                    "reason": "completed",
                 },
-                "artifact_count": 0,
-                "status": "legacy-status",
-                "reason": "completed",
-            },
-        }),
-        &run_id,
-    )
-    .unwrap();
-    let err = run_store
-        .append_event(&payload)
+            }),
+        )
         .await
-        .expect_err("invalid projection event should be persisted but rejected by projection");
+        .unwrap();
+    let err = run_store
+        .state()
+        .await
+        .expect_err("poison event should make the run projection unreadable");
     assert!(
         err.to_string().contains("invalid completed stage status"),
         "unexpected projection error: {err}"

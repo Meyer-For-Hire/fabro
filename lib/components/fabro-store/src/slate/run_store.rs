@@ -214,6 +214,23 @@ impl RunDatabase {
         Ok(cache.state.clone())
     }
 
+    /// Current projection for validating an append allocated at `seq`. In the
+    /// steady state the local cache already sits at `seq - 1` because
+    /// `state_lock` serializes appends, so this skips the storage scan that
+    /// `projected_state_option_locked` issues.
+    async fn projected_state_for_append_locked(
+        &self,
+        seq: u32,
+    ) -> Result<Option<Arc<RunProjection>>> {
+        {
+            let cache = self.inner.projection_cache.lock().await;
+            if cache.last_seq.saturating_add(1) == seq {
+                return Ok(cache.state.clone());
+            }
+        }
+        self.projected_state_option_locked().await
+    }
+
     async fn install_derived_state_after_append(
         &self,
         event: &EventEnvelope,
@@ -242,8 +259,8 @@ impl RunDatabase {
                 warn!(
                     run_id = %self.inner.run_id,
                     source_last_seq = event.seq,
-                    error = ?err,
-                    "failed to update SQLite run summary after committed append"
+                    error = %err,
+                    "Failed to update SQLite run summary after committed append"
                 );
             }
         }
@@ -325,18 +342,19 @@ impl RunDatabase {
             seq,
             event: RunEvent::try_from(payload)?,
         };
-        let current_projection = self.projected_state_option_locked().await?;
-        let next_projection = match current_projection {
-            Some(projection) => {
-                let mut projection = (*projection).clone();
-                projection.apply_event(&event).map_err(event_rejected)?;
-                projection
-            }
-            None => {
-                RunProjection::apply_events(std::slice::from_ref(&event)).map_err(event_rejected)?
-            }
-        };
-        let cached = CachedRunProjection::from_projection(self.inner.run_id, next_projection, seq);
+        // Validation reduces through the exact code replay uses, so an event
+        // is written iff replay can reduce it. `Arc::make_mut` copy-on-writes,
+        // leaving the local projection cache untouched on rejection.
+        let mut next_state = self.projected_state_for_append_locked(seq).await?;
+        apply_cached_projection_event(&mut next_state, &event)
+            .map_err(|err| event_rejected(&err))?;
+        let next_projection =
+            next_state.expect("apply_cached_projection_event sets the state on success");
+        let cached = CachedRunProjection::from_projection(
+            self.inner.run_id,
+            Arc::unwrap_or_clone(next_projection),
+            seq,
+        );
         let event_bytes = serde_json::to_vec(payload)?;
         self.inner
             .db
@@ -345,8 +363,9 @@ impl RunDatabase {
                 event_bytes,
             )
             .await?;
-        // Box the derived-update future so this frequently awaited append API
-        // does not pass a large state machine into every caller.
+        // Box::pin keeps this future small enough for the
+        // clippy::large_futures budget of append_event_envelope's many
+        // callers.
         Box::pin(self.install_derived_state_after_append(&event, cached)).await;
         Ok(event)
     }
@@ -564,12 +583,10 @@ impl RunDatabase {
     }
 }
 
-fn event_rejected(error: Error) -> Error {
-    let reason = match error {
-        Error::InvalidTransition(transition) => transition.to_string(),
-        error => error.to_string(),
-    };
-    Error::EventRejected { reason }
+fn event_rejected(error: &Error) -> Error {
+    Error::EventRejected {
+        reason: error.to_string(),
+    }
 }
 
 fn allocate_event_seq(event_seq: &AtomicU32) -> Result<u32> {

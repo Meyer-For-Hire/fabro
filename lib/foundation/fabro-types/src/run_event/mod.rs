@@ -12,7 +12,7 @@ pub use fabro_model::BilledTokenCounts;
 pub use infra::*;
 pub use misc::*;
 pub use run::*;
-use serde::de::Error as DeError;
+use serde::de::Error as _;
 use serde::ser::Error as SerError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value, json};
@@ -761,57 +761,6 @@ impl RunEvent {
             actor:              raw.actor,
             event:              &raw.event,
             properties:         &raw.properties,
-        })
-    }
-
-    pub fn from_ref(value: &Value) -> serde_json::Result<Self> {
-        fn opt_field<T: for<'a> Deserialize<'a>>(
-            obj: &Map<String, Value>,
-            key: &str,
-        ) -> serde_json::Result<Option<T>> {
-            match obj.get(key) {
-                Some(value) if !value.is_null() => Ok(Some(T::deserialize(value)?)),
-                _ => Ok(None),
-            }
-        }
-
-        let obj = value.as_object().ok_or_else(|| {
-            <serde_json::Error as DeError>::custom("run event must be a JSON object")
-        })?;
-        let opt_str = |key: &str| obj.get(key).and_then(Value::as_str).map(str::to_string);
-        let id = obj.get("id").and_then(Value::as_str).ok_or_else(|| {
-            <serde_json::Error as DeError>::custom("missing or non-string field: id")
-        })?;
-        let ts = obj
-            .get("ts")
-            .ok_or_else(|| <serde_json::Error as DeError>::custom("missing field: ts"))
-            .and_then(DateTime::<Utc>::deserialize)?;
-        let run_id = obj
-            .get("run_id")
-            .ok_or_else(|| <serde_json::Error as DeError>::custom("missing field: run_id"))
-            .and_then(RunId::deserialize)?;
-        let event = obj.get("event").and_then(Value::as_str).ok_or_else(|| {
-            <serde_json::Error as DeError>::custom("missing or non-string field: event")
-        })?;
-        let properties = obj
-            .get("properties")
-            .cloned()
-            .unwrap_or_else(default_properties);
-        Self::from_parts(RunEventParts {
-            id: id.to_string(),
-            ts,
-            run_id,
-            node_id: opt_str("node_id"),
-            node_label: opt_str("node_label"),
-            stage_id: opt_field(obj, "stage_id")?,
-            parallel_group_id: opt_field(obj, "parallel_group_id")?,
-            parallel_branch_id: opt_field(obj, "parallel_branch_id")?,
-            session_id: opt_str("session_id"),
-            parent_session_id: opt_str("parent_session_id"),
-            tool_call_id: opt_str("tool_call_id"),
-            actor: opt_field(obj, "actor")?,
-            event,
-            properties: &properties,
         })
     }
 
