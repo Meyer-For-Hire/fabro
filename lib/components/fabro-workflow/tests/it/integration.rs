@@ -1483,11 +1483,17 @@ fn stylesheet_application_by_specificity() {
 }
 
 #[test]
-fn stylesheet_application_via_parsed_graph() {
+fn stylesheet_comments_apply_via_parsed_graph() {
     let input = r#"digraph StyleTest {
         graph [
             goal="Test stylesheet",
-            model_stylesheet="* { model: sonnet; }"
+            model_stylesheet="
+                /* Apply Sonnet by default. */
+                * {
+                    /* Comments can appear between declarations. */
+                    model: sonnet;
+                }
+            "
         ]
         start [shape=Mdiamond]
         exit  [shape=Msquare]

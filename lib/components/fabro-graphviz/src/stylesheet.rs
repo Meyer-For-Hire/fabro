@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use crate::error::Error;
 
 /// A parsed stylesheet selector.
@@ -51,6 +53,7 @@ pub struct Stylesheet {
 ///
 /// Returns an error if the input contains invalid stylesheet syntax.
 pub fn parse_stylesheet(input: &str) -> Result<Stylesheet, Error> {
+    let input = strip_css_comments(input)?;
     let input = input.trim();
     if input.is_empty() {
         return Ok(Stylesheet { rules: Vec::new() });
@@ -81,6 +84,63 @@ pub fn parse_stylesheet(input: &str) -> Result<Stylesheet, Error> {
     }
 
     Ok(Stylesheet { rules })
+}
+
+fn strip_css_comments(input: &str) -> Result<Cow<'_, str>, Error> {
+    let bytes = input.as_bytes();
+    let mut output: Option<String> = None;
+    let mut copied_through = 0;
+    let mut quote = None;
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if let Some(quote_char) = quote {
+            if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+            } else {
+                if bytes[i] == quote_char {
+                    quote = None;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        match bytes[i] {
+            b'\'' | b'"' => {
+                quote = Some(bytes[i]);
+                i += 1;
+            }
+            b'\\' if i + 1 < bytes.len() => {
+                i += 2;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                let comment_body_start = i + 2;
+                let Some(relative_end) = input[comment_body_start..].find("*/") else {
+                    return Err(Error::Stylesheet("unterminated CSS comment".into()));
+                };
+                let comment_end = comment_body_start + relative_end + 2;
+
+                let output = output.get_or_insert_with(|| String::with_capacity(input.len()));
+                output.push_str(&input[copied_through..i]);
+                // CSS comments do not join the tokens on either side. Preserve
+                // that boundary for this parser with one whitespace character.
+                output.push(' ');
+
+                copied_through = comment_end;
+                i = comment_end;
+            }
+            _ => i += 1,
+        }
+    }
+
+    match output {
+        Some(mut output) => {
+            output.push_str(&input[copied_through..]);
+            Ok(Cow::Owned(output))
+        }
+        None => Ok(Cow::Borrowed(input)),
+    }
 }
 
 fn parse_selector(remaining: &mut &str) -> Result<Selector, Error> {
@@ -214,6 +274,65 @@ mod tests {
         ";
         let ss = parse_stylesheet(input).unwrap();
         assert_eq!(ss.rules.len(), 3);
+    }
+
+    #[test]
+    fn parse_css_comments_between_tokens() {
+        let input = r"
+            /* Defaults apply to every node. */
+            */* selector */{/* before property */
+                model/* before colon */:/* before value */claude-sonnet-4-5/* after value */;
+            /* before closing brace */}
+            /* Use Opus for coding nodes. */
+            .code { model: claude-opus-4-6; }
+        ";
+
+        let ss = parse_stylesheet(input).unwrap();
+        assert_eq!(ss.rules.len(), 2);
+        assert_eq!(ss.rules[0].selector, Selector::Universal);
+        assert_eq!(ss.rules[0].declarations[0].property, "model");
+        assert_eq!(ss.rules[0].declarations[0].value, "claude-sonnet-4-5");
+        assert_eq!(ss.rules[1].selector, Selector::Class("code".into()));
+    }
+
+    #[test]
+    fn parse_comment_only_stylesheet() {
+        let ss = parse_stylesheet("/* no rules */").unwrap();
+        assert!(ss.rules.is_empty());
+    }
+
+    #[test]
+    fn comments_do_not_join_tokens() {
+        let result = parse_stylesheet("* { mo/**/del: sonnet; }");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn comments_close_at_first_terminator() {
+        let ss = parse_stylesheet("/* outer /* inner */ * { model: sonnet; }").unwrap();
+        assert_eq!(ss.rules.len(), 1);
+        assert_eq!(ss.rules[0].selector, Selector::Universal);
+    }
+
+    #[test]
+    fn comment_markers_inside_strings_are_preserved() {
+        let ss = parse_stylesheet("* { model: 'not-a/* comment */'; }").unwrap();
+        assert_eq!(ss.rules[0].declarations[0].value, "'not-a/* comment */'");
+    }
+
+    #[test]
+    fn parse_error_unterminated_comment() {
+        let error = parse_stylesheet("/* no terminator").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Stylesheet error: unterminated CSS comment"
+        );
+    }
+
+    #[test]
+    fn parse_error_line_comment() {
+        let result = parse_stylesheet("// not a CSS comment\n* { model: sonnet; }");
+        assert!(result.is_err());
     }
 
     #[test]
