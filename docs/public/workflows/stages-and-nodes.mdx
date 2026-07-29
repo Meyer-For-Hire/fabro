@@ -11,7 +11,7 @@ This distinction matters for observability and debugging: the workflow graph sho
 
 ## Node types
 
-Every node's Graphviz `shape` attribute determines its execution behavior. If no shape is specified, the node defaults to an agent.
+An explicit `type` attribute selects a node's execution behavior. Otherwise, its Graphviz `shape` selects the behavior. When both are omitted, a node with `script` is a command node and every other node defaults to an agent.
 
 ### Start
 
@@ -35,7 +35,7 @@ exit [shape=Msquare, label="Exit"]
 
 ### Agent
 
-**Shape:** `box` (default — a node with no shape and no `script` is an agent node)
+**Shape:** `box` (default when `shape`, `type`, and `script` are omitted)
 
 Runs an LLM with access to tools — bash, file editing, sub-agents — in an agentic loop. The agent works autonomously, calling tools as needed, until it decides the task is complete.
 
@@ -94,7 +94,7 @@ Prompt nodes accept the same attributes as agent nodes (`prompt`, `reasoning_eff
 
 ### Command
 
-**Shape:** `parallelogram` (optional — inferred from `script`)
+**Shape:** `parallelogram` (optional when `shape` and `type` are omitted — inferred from `script`)
 
 Runs a shell script inside the configured sandbox and captures its output. The output is available to downstream nodes as context. This ensures command nodes execute in the same environment as agent nodes.
 
@@ -102,7 +102,7 @@ Runs a shell script inside the configured sandbox and captures its output. The o
 test [label="Run Tests", script="cargo test 2>&1 || true"]
 ```
 
-`script` is what makes a node a command node, so the shape can be left off. Writing `shape=parallelogram` explicitly is still valid and does the same thing.
+When a node has no explicit `shape` or `type`, the presence of `script` makes it a command node. Writing `shape=parallelogram` explicitly is still valid and does the same thing.
 
 | Attribute | Description |
 |---|---|

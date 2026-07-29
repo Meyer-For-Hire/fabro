@@ -23,7 +23,6 @@ mod reachability;
 mod reserved_keyword_node_id;
 mod retry_target_exists;
 mod script_absolute_cd;
-mod script_prompt_conflict;
 mod selection_valid;
 mod start_no_incoming;
 mod start_node;
@@ -63,7 +62,6 @@ pub fn built_in_rules() -> Vec<Box<dyn LintRule>> {
         all_conditional_edges::rule(),
         orphan_custom_outcome::rule(),
         script_absolute_cd::rule(),
-        script_prompt_conflict::rule(),
         command_requires_script::rule(),
         import_error::rule(),
         join_policy_removed::rule(),

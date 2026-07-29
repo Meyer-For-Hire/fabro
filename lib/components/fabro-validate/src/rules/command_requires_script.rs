@@ -45,24 +45,15 @@ mod tests {
     use fabro_graphviz::graph::{AttrValue, Node};
 
     use super::Rule;
-    use crate::rules::test_support::minimal_graph;
+    use crate::rules::test_support;
     use crate::{LintRule, Severity};
-
-    fn node_with(id: &str, attrs: &[(&str, &str)]) -> Node {
-        let mut node = Node::new(id);
-        for (key, value) in attrs {
-            node.attrs
-                .insert((*key).to_string(), AttrValue::String((*value).to_string()));
-        }
-        node
-    }
 
     #[test]
     fn errors_on_command_shape_without_script() {
-        let mut g = minimal_graph();
+        let mut g = test_support::minimal_graph();
         g.nodes.insert(
             "run".to_string(),
-            node_with("run", &[("shape", "parallelogram"), ("label", "Build")]),
+            test_support::node_with_attrs("run", &[("shape", "parallelogram"), ("label", "Build")]),
         );
 
         let d = Rule.apply(&g);
@@ -75,9 +66,11 @@ mod tests {
 
     #[test]
     fn errors_on_explicit_command_type_without_script() {
-        let mut g = minimal_graph();
-        g.nodes
-            .insert("run".to_string(), node_with("run", &[("type", "command")]));
+        let mut g = test_support::minimal_graph();
+        g.nodes.insert(
+            "run".to_string(),
+            test_support::node_with_attrs("run", &[("type", "command")]),
+        );
 
         let d = Rule.apply(&g);
 
@@ -86,29 +79,51 @@ mod tests {
     }
 
     #[test]
-    fn errors_on_blank_script() {
-        let mut g = minimal_graph();
+    fn errors_on_legacy_tool_type_without_script() {
+        let mut g = test_support::minimal_graph();
         g.nodes.insert(
             "run".to_string(),
-            node_with("run", &[("shape", "parallelogram"), ("script", "   ")]),
+            test_support::node_with_attrs("run", &[("type", "tool")]),
         );
 
         assert_eq!(Rule.apply(&g).len(), 1);
     }
 
     #[test]
-    fn accepts_command_node_with_script() {
-        let mut g = minimal_graph();
+    fn errors_on_blank_script() {
+        let mut g = test_support::minimal_graph();
         g.nodes.insert(
             "run".to_string(),
-            node_with("run", &[
+            test_support::node_with_attrs("run", &[("shape", "parallelogram"), ("script", "   ")]),
+        );
+
+        assert_eq!(Rule.apply(&g).len(), 1);
+    }
+
+    #[test]
+    fn errors_on_non_string_script() {
+        let mut g = test_support::minimal_graph();
+        let mut node = Node::new("run");
+        node.attrs
+            .insert("script".to_string(), AttrValue::Integer(123));
+        g.nodes.insert("run".to_string(), node);
+
+        assert_eq!(Rule.apply(&g).len(), 1);
+    }
+
+    #[test]
+    fn accepts_command_node_with_script() {
+        let mut g = test_support::minimal_graph();
+        g.nodes.insert(
+            "run".to_string(),
+            test_support::node_with_attrs("run", &[
                 ("shape", "parallelogram"),
                 ("script", "cargo build"),
             ]),
         );
         g.nodes.insert(
             "build".to_string(),
-            node_with("build", &[("script", "cargo build")]),
+            test_support::node_with_attrs("build", &[("script", "cargo build")]),
         );
 
         assert!(Rule.apply(&g).is_empty());
@@ -116,14 +131,14 @@ mod tests {
 
     #[test]
     fn ignores_non_command_nodes() {
-        let mut g = minimal_graph();
+        let mut g = test_support::minimal_graph();
         g.nodes.insert(
             "plan".to_string(),
-            node_with("plan", &[("prompt", "do it")]),
+            test_support::node_with_attrs("plan", &[("prompt", "do it")]),
         );
         g.nodes.insert(
             "gate".to_string(),
-            node_with("gate", &[("shape", "hexagon")]),
+            test_support::node_with_attrs("gate", &[("shape", "hexagon")]),
         );
 
         assert!(Rule.apply(&g).is_empty());
