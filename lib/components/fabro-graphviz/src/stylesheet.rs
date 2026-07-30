@@ -51,6 +51,7 @@ pub struct Stylesheet {
 ///
 /// Returns an error if the input contains invalid stylesheet syntax.
 pub fn parse_stylesheet(input: &str) -> Result<Stylesheet, Error> {
+    let input = strip_css_comments(input)?;
     let input = input.trim();
     if input.is_empty() {
         return Ok(Stylesheet { rules: Vec::new() });
@@ -66,7 +67,7 @@ pub fn parse_stylesheet(input: &str) -> Result<Stylesheet, Error> {
         if !remaining.starts_with('{') {
             return Err(Error::Stylesheet(format!(
                 "expected '{{' after selector, got: {:?}",
-                &remaining[..remaining.len().min(20)]
+                excerpt(remaining)
             )));
         }
         remaining = remaining[1..].trim();
@@ -81,6 +82,35 @@ pub fn parse_stylesheet(input: &str) -> Result<Stylesheet, Error> {
     }
 
     Ok(Stylesheet { rules })
+}
+
+fn strip_css_comments(input: &str) -> Result<String, Error> {
+    let mut output = String::with_capacity(input.len());
+    let mut remaining = input;
+
+    while let Some(start) = remaining.find("/*") {
+        let body = &remaining[start + 2..];
+        let Some(end) = body.find("*/") else {
+            return Err(Error::Stylesheet(format!(
+                "unterminated CSS comment: {:?}",
+                excerpt(&remaining[start..])
+            )));
+        };
+
+        output.push_str(&remaining[..start]);
+        // CSS comments do not join the tokens on either side. Preserve
+        // that boundary for this parser with one whitespace character.
+        output.push(' ');
+        remaining = &body[end + 2..];
+    }
+
+    output.push_str(remaining);
+    Ok(output)
+}
+
+/// A short excerpt of `input` for error messages, cut on a character boundary.
+fn excerpt(input: &str) -> String {
+    input.chars().take(20).collect()
 }
 
 fn parse_selector(remaining: &mut &str) -> Result<Selector, Error> {
@@ -117,7 +147,7 @@ fn parse_selector(remaining: &mut &str) -> Result<Selector, Error> {
         if end == 0 {
             return Err(Error::Stylesheet(format!(
                 "expected selector ('*', '#id', '.class', or shape name), got: {:?}",
-                &remaining[..remaining.len().min(20)]
+                excerpt(remaining)
             )));
         }
         let shape = remaining[..end].to_string();
@@ -214,6 +244,72 @@ mod tests {
         ";
         let ss = parse_stylesheet(input).unwrap();
         assert_eq!(ss.rules.len(), 3);
+    }
+
+    #[test]
+    fn parse_css_comments_between_tokens() {
+        let input = r"
+            /* Defaults apply to every node. */
+            */* selector */{/* before property */
+                model/* before colon */:/* before value */claude-sonnet-4-5/* after value */;
+            /* before closing brace */}
+            /* Use Opus for coding nodes. */
+            .code { model: claude-opus-4-6; }
+        ";
+
+        let ss = parse_stylesheet(input).unwrap();
+        assert_eq!(ss.rules.len(), 2);
+        assert_eq!(ss.rules[0].selector, Selector::Universal);
+        assert_eq!(ss.rules[0].declarations[0].property, "model");
+        assert_eq!(ss.rules[0].declarations[0].value, "claude-sonnet-4-5");
+        assert_eq!(ss.rules[1].selector, Selector::Class("code".into()));
+    }
+
+    #[test]
+    fn parse_comment_only_stylesheet() {
+        let ss = parse_stylesheet("/* no rules */").unwrap();
+        assert!(ss.rules.is_empty());
+    }
+
+    #[test]
+    fn comments_do_not_join_tokens() {
+        let result = parse_stylesheet("* { mo/**/del: sonnet; }");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn comments_close_at_first_terminator() {
+        let ss = parse_stylesheet("/* outer /* inner */ * { model: sonnet; }").unwrap();
+        assert_eq!(ss.rules.len(), 1);
+        assert_eq!(ss.rules[0].selector, Selector::Universal);
+    }
+
+    #[test]
+    fn parse_error_unterminated_comment() {
+        let error = parse_stylesheet("/* no terminator").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            r#"Stylesheet error: unterminated CSS comment: "/* no terminator""#
+        );
+    }
+
+    #[test]
+    fn parse_error_line_comment() {
+        let error = parse_stylesheet("// not a CSS comment\n* { model: sonnet; }").unwrap_err();
+        assert!(
+            error.to_string().contains("expected selector"),
+            "`//` should be reported as a bad selector, got: {error}"
+        );
+    }
+
+    #[test]
+    fn parse_error_excerpt_splits_on_character_boundary() {
+        // A multi-byte character straddling the excerpt cutoff must not panic.
+        let error = parse_stylesheet("/* ünterminated cömment, well over 20 bytes").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            r#"Stylesheet error: unterminated CSS comment: "/* ünterminated cömm""#
+        );
     }
 
     #[test]
