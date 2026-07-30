@@ -417,6 +417,14 @@ impl FallbackTarget {
     }
 }
 
+impl std::fmt::Display for FallbackTarget {
+    /// Renders as `provider:model`, matching the qualified form accepted by
+    /// model references.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.provider, self.model)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CatalogProvider {
     pub id:             ProviderId,
@@ -976,11 +984,7 @@ impl Catalog {
             .collect::<HashSet<_>>();
 
         if let Some(explicit_provider) = explicit_provider {
-            let provider = self.provider(explicit_provider).ok_or_else(|| {
-                ModelSelectionError::UnknownProvider {
-                    provider: explicit_provider.clone(),
-                }
-            })?;
+            let provider = self.require_provider(explicit_provider)?;
             if !eligible.contains(&provider.id) {
                 return Err(ModelSelectionError::ProviderUnavailable {
                     provider: provider.id.clone(),
