@@ -30,6 +30,8 @@ pub enum RunNoticeCode {
     GitPushFailed,
     GithubTokenFailed,
     GithubTokenRefreshLimited,
+    ModelFallbackChainEmpty,
+    ModelFallbackSkipped,
     PullRequestFailed,
     SandboxCleanupFailed,
     SandboxGitUnavailable,

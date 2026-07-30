@@ -405,6 +405,26 @@ pub struct FallbackTarget {
     pub model:    String,
 }
 
+impl FallbackTarget {
+    /// Build a target from anything that renders as a provider name and model
+    /// ID, so callers holding [`ProviderId`]/[`ModelId`] or bare passthrough
+    /// selectors all use one constructor.
+    pub fn new(provider: impl std::fmt::Display, model: impl std::fmt::Display) -> Self {
+        Self {
+            provider: provider.to_string(),
+            model:    model.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for FallbackTarget {
+    /// Renders as `provider:model`, matching the qualified form accepted by
+    /// model references.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.provider, self.model)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CatalogProvider {
     pub id:             ProviderId,
@@ -910,17 +930,30 @@ impl Catalog {
             .and_then(|idx| self.models.get(*idx))
     }
 
+    /// Look up a provider by ID or alias, failing when the catalog has no such
+    /// provider.
+    pub fn require_provider(
+        &self,
+        provider: &ProviderId,
+    ) -> Result<&CatalogProvider, ModelSelectionError> {
+        self.provider(provider)
+            .ok_or_else(|| ModelSelectionError::UnknownProvider {
+                provider: provider.clone(),
+            })
+    }
+
+    /// Canonicalize a provider name or alias to its catalog ID.
+    pub fn provider_id(&self, name: &str) -> Result<ProviderId, ModelSelectionError> {
+        Ok(self.require_provider(&ProviderId::from(name))?.id.clone())
+    }
+
     /// Resolve a canonical ID, alias, or API ID on exactly one provider.
     pub fn resolve_on_provider(
         &self,
         provider: &ProviderId,
         selector: &str,
     ) -> Result<&Model, ModelSelectionError> {
-        let provider =
-            self.provider(provider)
-                .ok_or_else(|| ModelSelectionError::UnknownProvider {
-                    provider: provider.clone(),
-                })?;
+        let provider = self.require_provider(provider)?;
         if let Some(model) = self.get_on_provider(&provider.id, selector) {
             return Ok(model);
         }
@@ -951,11 +984,7 @@ impl Catalog {
             .collect::<HashSet<_>>();
 
         if let Some(explicit_provider) = explicit_provider {
-            let provider = self.provider(explicit_provider).ok_or_else(|| {
-                ModelSelectionError::UnknownProvider {
-                    provider: explicit_provider.clone(),
-                }
-            })?;
+            let provider = self.require_provider(explicit_provider)?;
             if !eligible.contains(&provider.id) {
                 return Err(ModelSelectionError::ProviderUnavailable {
                     provider: provider.id.clone(),
@@ -1056,11 +1085,7 @@ impl Catalog {
         provider: &ProviderId,
         eligible_providers: &HashSet<ProviderId>,
     ) -> Result<ProviderId, ModelSelectionError> {
-        let provider =
-            self.provider(provider)
-                .ok_or_else(|| ModelSelectionError::UnknownProvider {
-                    provider: provider.clone(),
-                })?;
+        let provider = self.require_provider(provider)?;
         let ready = eligible_providers.iter().any(|eligible| {
             self.provider(eligible)
                 .is_some_and(|eligible| eligible.id == provider.id)
@@ -1482,10 +1507,8 @@ impl Catalog {
             .iter()
             .filter_map(|provider_str| {
                 let provider = ProviderId::from(provider_str.clone());
-                self.closest(&provider, reference).map(|m| FallbackTarget {
-                    provider: provider_str.clone(),
-                    model:    m.id.to_string(),
-                })
+                self.closest(&provider, reference)
+                    .map(|m| FallbackTarget::new(provider_str, &m.id))
             })
             .collect()
     }
