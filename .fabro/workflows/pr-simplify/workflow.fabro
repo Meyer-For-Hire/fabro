@@ -1,7 +1,7 @@
 digraph PrSimplify {
     graph [
         goal="Run the simplify code-review pass on PR #{{ inputs.pr }}: review the changes for reuse, quality, and efficiency, apply the fixes, and update the existing PR in place.",
-        default_model="claude-fable-5",
+        default_model="claude-opus",
         rankdir=LR
     ]
 

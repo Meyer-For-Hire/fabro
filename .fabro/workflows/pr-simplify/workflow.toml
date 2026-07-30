@@ -8,11 +8,11 @@ _version = 1
 #
 # Required input — the PR number — is passed at run time:
 #
-#     fabro run pr-simplify -I pr=547                 # defaults to Fable
+#     fabro run pr-simplify -I pr=547                 # defaults to Opus
 #     fabro run pr-simplify -I pr=547 --model gpt-55  # override the model
 #
-# The graph sets default_model=claude-fable-5, so every stage (orchestrator +
-# review subagents) runs on Fable unless you pass --model, which wins over the
+# The graph sets default_model=claude-opus, so every stage (orchestrator +
+# review subagents) runs on Opus unless you pass --model, which wins over the
 # default (configured model / --model beats the graph default_model, which
 # beats the catalog default). The apply stage reads the model it is actually
 # running as and labels the PR `simplify:<that-model>`, so the label always
