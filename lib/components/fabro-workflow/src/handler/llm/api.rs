@@ -1334,6 +1334,11 @@ impl AgentApiBackend {
 
     /// Emit `agent.failover` for the plan's most recent
     /// [`FallbackPlan::advance`].
+    ///
+    /// `from` is the previously attempted candidate, which may have failed
+    /// during activation without ever serving traffic; `error` says why it
+    /// was abandoned. Consecutive events therefore chain — one event's `to`
+    /// is the next event's `from` — recording every candidate the plan tried.
     fn emit_failover(
         node: &Node,
         emitter: &Emitter,
