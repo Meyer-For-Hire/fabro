@@ -6366,34 +6366,32 @@ async fn create_unreadable_durable_run(state: &Arc<AppState>, run_id: RunId) {
     workflow_event::append_event(&run_store, &run_id, &workflow_event::Event::RunRunning)
         .await
         .unwrap();
-    // Appends now validate before write, so a corrupted log can only exist if
-    // it predates that check. Write the poison event directly to simulate one.
-    state
-        .stores
-        .runs
-        .test_put_unvalidated_run_event(
-            &run_id,
-            5,
-            &json!({
-                "id": "evt-unreadable-run-completed",
-                "ts": "2026-05-05T20:46:33Z",
-                "run_id": run_id,
-                "event": "run.completed",
-                "properties": {
-                    "timing": {
-                        "wall_time_ms": 1,
-                        "inference_time_ms": 0,
-                        "tool_time_ms": 0,
-                        "active_time_ms": 0
-                    },
-                    "artifact_count": 0,
-                    "status": "legacy-status",
-                    "reason": "completed",
-                },
-            }),
-        )
-        .await
-        .unwrap();
+    let seq = run_store.last_event_seq().await.unwrap().unwrap() + 1;
+    let completed = workflow_event::to_run_event_at(
+        &run_id,
+        &workflow_event::Event::WorkflowRunCompleted {
+            timing:               fabro_types::RunTiming::wall_only(1),
+            artifact_count:       0,
+            status:               "legacy-status".to_string(),
+            reason:               SuccessReason::Completed,
+            total_usd_micros:     None,
+            final_git_commit_sha: None,
+            final_patch:          None,
+            diff_summary:         None,
+            billing:              None,
+        },
+        "2026-05-05T20:46:33Z".parse().unwrap(),
+        None,
+    );
+    let payload = workflow_event::build_redacted_event_payload(&completed, &run_id).unwrap();
+    fabro_store::test_support::put_unvalidated_run_event(
+        &state.stores.runs,
+        &run_id,
+        seq,
+        payload.as_value(),
+    )
+    .await
+    .unwrap();
     let err = run_store
         .state()
         .await

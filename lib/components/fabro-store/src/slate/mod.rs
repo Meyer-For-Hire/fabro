@@ -322,10 +322,8 @@ impl Database {
         Ok(unreadable)
     }
 
-    /// Writes a raw event record without append validation, simulating a
-    /// pre-existing poison event in the log for unreadable-run tests.
     #[cfg(any(test, feature = "test-support"))]
-    pub async fn test_put_unvalidated_run_event(
+    pub(crate) async fn put_unvalidated_run_event(
         &self,
         run_id: &RunId,
         seq: u32,
@@ -541,7 +539,7 @@ mod tests {
     use object_store::path::Path;
 
     use super::*;
-    use crate::{EventPayload, keys, test_util};
+    use crate::{EventPayload, keys, test_support as store_test_support};
 
     fn dt(value: &str) -> DateTime<Utc> {
         value.parse().unwrap()
@@ -590,7 +588,7 @@ mod tests {
     }
 
     async fn make_summary_store() -> (tempfile::TempDir, Arc<RunSummaryStore>) {
-        let (directory, store) = test_util::sqlite_summary_store().await;
+        let (directory, store) = store_test_support::sqlite_summary_store().await;
         (directory, Arc::new(store))
     }
 
@@ -931,13 +929,18 @@ mod tests {
             .await
             .unwrap_err();
 
-        let Error::EventRejected { reason } = err else {
+        let Error::EventRejected { source } = err else {
             panic!("expected event rejection");
         };
-        assert_eq!(
-            reason,
-            "invalid status transition: runnable -> failed(workflow_error)"
-        );
+        assert!(matches!(
+            *source,
+            Error::InvalidTransition(fabro_types::InvalidTransition {
+                from: RunStatus::Runnable,
+                to:   RunStatus::Failed {
+                    reason: FailureReason::WorkflowError,
+                },
+            })
+        ));
         assert_eq!(run.list_events().await.unwrap(), events_before);
         assert_eq!(run.state().await.unwrap().status, RunStatus::Runnable);
         let cached = store.get_cached_run(&run_id).await.unwrap().unwrap();
@@ -971,7 +974,7 @@ mod tests {
 
     #[tokio::test]
     async fn committed_append_succeeds_when_summary_update_fails_and_is_repairable() {
-        let (_object_store, store) = make_store();
+        let (object_store, store) = make_store();
         let (directory, summaries) = make_summary_store().await;
         store.attach_run_summary_store(Arc::clone(&summaries));
         let run_id = test_run_id("run-1");
@@ -996,7 +999,8 @@ mod tests {
         let stored = run.get_event(2).await.unwrap().unwrap();
         assert_eq!(stored.event, result.unwrap().event);
 
-        let repaired_summaries = test_util::sqlite_summary_store_at(directory.path()).await;
+        let repaired_summaries =
+            Arc::new(store_test_support::sqlite_summary_store_at(directory.path()).await);
         let stale = repaired_summaries
             .get(&run_id, Utc::now())
             .await
@@ -1004,11 +1008,9 @@ mod tests {
             .unwrap();
         assert_ne!(stale.title, "Committed title");
 
-        let entries = store
-            .list_cached_runs(&ListRunsQuery::default(), Utc::now())
-            .await
-            .unwrap();
-        repaired_summaries.reconcile(&entries).await.unwrap();
+        let reopened = Database::new(object_store, "runs/", Duration::from_millis(1), None);
+        reopened.attach_run_summary_store(Arc::clone(&repaired_summaries));
+        reopened.warm_projection_cache().await.unwrap();
         let repaired = repaired_summaries
             .get(&run_id, Utc::now())
             .await
@@ -1541,7 +1543,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .test_put_unvalidated_run_event(
+            .put_unvalidated_run_event(
                 &bad_run_id,
                 1,
                 &serde_json::json!({ "not": "a valid run event" }),
@@ -1590,7 +1592,7 @@ mod tests {
             .unwrap();
         run_settings.remove("integrations");
         store
-            .test_put_unvalidated_run_event(
+            .put_unvalidated_run_event(
                 &bad_run_id,
                 1,
                 &serde_json::json!({
