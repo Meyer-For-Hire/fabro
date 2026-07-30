@@ -1352,9 +1352,9 @@ impl AgentApiBackend {
             &Event::Failover {
                 stage: node.id.clone(),
                 props: FailoverProps {
-                    original_provider: plan.original.target.provider.to_string(),
-                    original_model: plan.original.target.model.to_string(),
-                    attempt: plan.attempt(),
+                    original_provider: Some(plan.original.target.provider.to_string()),
+                    original_model: Some(plan.original.target.model.to_string()),
+                    attempt: Some(plan.attempt()),
                     from_provider: from.target.provider.to_string(),
                     from_model: from.target.model.to_string(),
                     to_provider: to.target.provider.to_string(),
@@ -3521,9 +3521,9 @@ enabled = true
             .unwrap()
             .clone()
             .expect("agent.failover should be emitted");
-        assert_eq!(failover.original_provider, "anthropic");
-        assert_eq!(failover.original_model, "claude-fable-5");
-        assert_eq!(failover.attempt, 1);
+        assert_eq!(failover.original_provider.as_deref(), Some("anthropic"));
+        assert_eq!(failover.original_model.as_deref(), Some("claude-fable-5"));
+        assert_eq!(failover.attempt, Some(1));
         assert_eq!(failover.from_provider, "anthropic");
         assert_eq!(failover.from_model, "claude-fable-5");
         assert_eq!(failover.to_provider, "openai");

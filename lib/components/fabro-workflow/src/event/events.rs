@@ -1392,9 +1392,9 @@ impl Event {
             Self::Failover { stage, props } => {
                 warn!(
                     stage,
-                    original_provider = %props.original_provider,
-                    original_model = %props.original_model,
-                    attempt = props.attempt,
+                    original_provider = ?props.original_provider,
+                    original_model = ?props.original_model,
+                    attempt = ?props.attempt,
                     from_provider = %props.from_provider,
                     from_model = %props.from_model,
                     to_provider = %props.to_provider,
