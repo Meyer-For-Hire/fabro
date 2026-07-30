@@ -25,11 +25,10 @@
 //! [`RunCompilerError`] into HTTP responses.
 
 use std::collections::HashMap;
-use std::error::Error as StdError;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use fabro_config::parse::{self, SettingsSource};
+use fabro_config::parse::{self, ParseError, SettingsSource};
 use fabro_config::{
     CliLayer, EnvironmentDockerfileLayer, EnvironmentImageLayer, EnvironmentLayer, MergeMap,
     RunLayer, SettingsLayer, WorkflowSettingsBuilder,
@@ -49,12 +48,21 @@ use fabro_workflow::operations::{
 use fabro_workflow::workflow_bundle::{BundledWorkflow, WorkflowBundle};
 use tokio::task;
 
-/// One project settings source already normalized into the manifest path
-/// namespace used by the workflow bundle.
+/// One project settings source in the acquired source's path namespace.
 #[derive(Debug)]
 pub(crate) struct ProjectSettingsSource {
-    pub(crate) path: ManifestPath,
+    pub(crate) path: std::result::Result<ManifestPath, ProjectSettingsPathError>,
     pub(crate) toml: String,
+}
+
+/// A project settings path that the source adapter could not normalize.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ProjectSettingsPathError {
+    #[error("project settings path is missing")]
+    Missing,
+
+    #[error("invalid project settings path: {path}")]
+    Invalid { path: String },
 }
 
 /// Transport-neutral inputs for compiling one submitted run.
@@ -77,7 +85,7 @@ pub(crate) struct RawRunCompilerInput {
     pub(crate) cli_overrides: Option<CliLayer>,
     pub(crate) input_overrides: HashMap<String, toml::Value>,
     pub(crate) inline_goal_override: Option<String>,
-    pub(crate) run_id: RunId,
+    pub(crate) run_id: Option<RunId>,
     pub(crate) title: Option<String>,
     pub(crate) parent_id: Option<RunId>,
     pub(crate) git: Option<GitContext>,
@@ -106,7 +114,20 @@ pub(crate) struct NormalizedRun {
     cli_overrides: Option<CliLayer>,
     input_overrides: HashMap<String, toml::Value>,
     inline_goal_override: Option<String>,
-    metadata: CreateRunPersistenceMetadata,
+    metadata: RunMetadata,
+}
+
+struct RunMetadata {
+    run_id: Option<RunId>,
+    storage_root: PathBuf,
+    workflow_slug: Option<String>,
+    submitted_manifest_bytes: Option<Vec<u8>>,
+    title: Option<String>,
+    automation: Option<AutomationRef>,
+    git: Option<GitContext>,
+    parent_id: Option<RunId>,
+    provenance: RunProvenance,
+    web_url: Option<String>,
 }
 
 /// Settings-layered output. Variable substitution is a separate stage so
@@ -118,7 +139,7 @@ pub(crate) struct LayeredRun {
     workflow:        BundledWorkflow,
     settings:        WorkflowSettings,
     cwd:             PathBuf,
-    metadata:        CreateRunPersistenceMetadata,
+    metadata:        RunMetadata,
 }
 
 /// Variable-substituted stage output. Callers may inspect the resolved
@@ -133,8 +154,31 @@ impl PreparedRun {
         &self.layered.settings
     }
 
+    pub(crate) fn with_identity(
+        mut self,
+        run_id: Option<RunId>,
+        parent_id: Option<RunId>,
+        title: Option<String>,
+    ) -> Self {
+        self.layered.metadata.run_id = run_id;
+        self.layered.metadata.parent_id = parent_id;
+        self.layered.metadata.title = title;
+        self
+    }
+
     pub(crate) fn parent_id(&self) -> Option<RunId> {
         self.layered.metadata.parent_id
+    }
+
+    pub(crate) fn resolve_run_id(mut self) -> (Self, RunId) {
+        let run_id = self.layered.metadata.run_id.unwrap_or_default();
+        self.layered.metadata.run_id = Some(run_id);
+        (self, run_id)
+    }
+
+    pub(crate) fn with_web_url(mut self, web_url: Option<String>) -> Self {
+        self.layered.metadata.web_url = web_url;
+        self
     }
 }
 
@@ -142,13 +186,13 @@ impl PreparedRun {
 /// assembly.
 struct GraphCompiledRun {
     compiled: CompiledRun,
-    metadata: CreateRunPersistenceMetadata,
+    metadata: RunMetadata,
 }
 
 /// Model-pinned stage output ready for pure persistence-input assembly.
 pub(crate) struct PinnedRun {
     materialized: MaterializedRun,
-    metadata:     CreateRunPersistenceMetadata,
+    metadata:     RunMetadata,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -158,7 +202,7 @@ pub(crate) enum RunCompilerError {
     #[error(transparent)]
     InvalidSource(#[from] InvalidSourceError),
 
-    /// A settings source failed to parse, or the layered settings failed to
+    /// A settings source or path is invalid, or the layered settings failed to
     /// resolve.
     #[error(transparent)]
     InvalidSettings(Box<InvalidSettingsError>),
@@ -202,7 +246,7 @@ pub(crate) enum InvalidSettingsError {
     Parse {
         path:   ManifestPath,
         #[source]
-        source: Box<dyn StdError + Send + Sync>,
+        source: ParseError,
     },
 
     #[error(transparent)]
@@ -213,6 +257,9 @@ pub(crate) enum InvalidSettingsError {
         #[source]
         source: fabro_config::ResolveErrors,
     },
+
+    #[error("{}", project_path_error(.source))]
+    ProjectPath { source: ProjectSettingsPathError },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -229,6 +276,17 @@ pub(crate) enum VariableInterpolationError {
 }
 
 pub(crate) type Result<T> = std::result::Result<T, RunCompilerError>;
+
+fn project_path_error(source: &ProjectSettingsPathError) -> String {
+    match source {
+        ProjectSettingsPathError::Missing => {
+            "invalid manifest project config path: missing path".to_string()
+        }
+        ProjectSettingsPathError::Invalid { path } => {
+            format!("invalid manifest project config path: {path}")
+        }
+    }
+}
 
 fn invalid_settings(source: InvalidSettingsError) -> RunCompilerError {
     RunCompilerError::InvalidSettings(Box::new(source))
@@ -284,9 +342,12 @@ pub(crate) fn normalize_source(input: RawRunCompilerInput) -> Result<NormalizedR
     let project_layers = project_settings
         .into_iter()
         .map(|project| {
+            let path = project
+                .path
+                .map_err(|source| invalid_settings(InvalidSettingsError::ProjectPath { source }))?;
             settings_layer_with_resolved_dockerfiles(
                 &project.toml,
-                &project.path,
+                &path,
                 &workflow.files,
                 SettingsSource::Project,
             )
@@ -308,7 +369,7 @@ pub(crate) fn normalize_source(input: RawRunCompilerInput) -> Result<NormalizedR
         cli_overrides,
         input_overrides,
         inline_goal_override,
-        metadata: CreateRunPersistenceMetadata {
+        metadata: RunMetadata {
             run_id,
             storage_root,
             workflow_slug,
@@ -316,7 +377,6 @@ pub(crate) fn normalize_source(input: RawRunCompilerInput) -> Result<NormalizedR
             title,
             automation,
             git,
-            fork_source_ref: None,
             parent_id,
             provenance,
             web_url,
@@ -469,7 +529,31 @@ pub(crate) fn assemble_run(pinned: PinnedRun) -> CreateRunPersistenceInput {
         materialized,
         metadata,
     } = pinned;
-    operations::assemble_create_run_persistence_input(materialized, metadata)
+    let RunMetadata {
+        run_id,
+        storage_root,
+        workflow_slug,
+        submitted_manifest_bytes,
+        title,
+        automation,
+        git,
+        parent_id,
+        provenance,
+        web_url,
+    } = metadata;
+    operations::assemble_create_run_persistence_input(materialized, CreateRunPersistenceMetadata {
+        run_id: run_id.expect("run ID should be resolved before compilation"),
+        storage_root,
+        workflow_slug,
+        submitted_manifest_bytes,
+        title,
+        automation,
+        git,
+        fork_source_ref: None,
+        parent_id,
+        provenance,
+        web_url,
+    })
 }
 
 /// Parse one bundle-relative settings source, rejecting keys that are not
@@ -485,17 +569,14 @@ pub(crate) fn settings_layer_with_resolved_dockerfiles(
     files: &HashMap<ManifestPath, String>,
     settings_source: SettingsSource,
 ) -> Result<SettingsLayer> {
-    let parse_error = |source: Box<dyn StdError + Send + Sync>| {
+    let parse_error = |source| {
         invalid_settings(InvalidSettingsError::Parse {
             path: config_path.clone(),
             source,
         })
     };
-    let mut layer = source
-        .parse::<SettingsLayer>()
-        .map_err(|source| parse_error(Box::new(source)))?;
-    parse::validate_settings_source(&layer, settings_source)
-        .map_err(|source| parse_error(Box::new(source)))?;
+    let mut layer = source.parse::<SettingsLayer>().map_err(parse_error)?;
+    parse::validate_settings_source(&layer, settings_source).map_err(parse_error)?;
     resolve_dockerfiles(&mut layer, config_path, files)?;
     Ok(layer)
 }
@@ -634,7 +715,7 @@ mod tests {
             cli_overrides: None,
             input_overrides: HashMap::new(),
             inline_goal_override: None,
-            run_id: RunId::new(),
+            run_id: Some(RunId::new()),
             title: None,
             parent_id: None,
             git: None,
@@ -765,7 +846,7 @@ include = ["reports/{{ vars.owner }}/*.json"]
 "#;
         let mut input = raw_input(Some(workflow_toml), HashMap::new());
         input.project_settings.push(ProjectSettingsSource {
-            path: manifest_path(".fabro/project.toml"),
+            path: Ok(manifest_path(".fabro/project.toml")),
             toml: r#"
 _version = 1
 
@@ -908,7 +989,7 @@ include = ["reports/{{ vars.path }}/*.json"]
         };
         let submitted = b"submitted manifest".to_vec();
         let mut input = raw_input(None, HashMap::new());
-        input.run_id = run_id;
+        input.run_id = Some(run_id);
         input.parent_id = Some(parent_id);
         input.title = Some("Compiler boundary".to_string());
         input.workflow_slug = Some("compiler-boundary".to_string());

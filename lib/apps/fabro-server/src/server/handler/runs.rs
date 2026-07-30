@@ -25,10 +25,10 @@ use fabro_store::{
     RunSummaryListQuery, RunSummarySort, RunSummarySortDirection, RunSummaryVisibility,
 };
 use fabro_types::{
-    AutomationRef, GitContext, ManifestPath, Principal, Run, RunClientProvenance, RunId,
-    RunProvenance, RunServerProvenance, RunStatusKind, StageContextWindow,
-    StageContextWindowStaleness, StageContextWindowUnavailableReason, StageHandler,
-    StageModelUsage, StageProjection, SystemActorKind, parse_blob_ref,
+    AutomationRef, ManifestPath, Principal, Run, RunClientProvenance, RunId, RunProvenance,
+    RunServerProvenance, RunStatusKind, StageContextWindow, StageContextWindowStaleness,
+    StageContextWindowUnavailableReason, StageHandler, StageModelUsage, StageProjection,
+    SystemActorKind, parse_blob_ref,
 };
 use fabro_util::version::FABRO_VERSION;
 use fabro_workflow::command_log::{command_log_path, read_json_string_blob, read_log_slice};
@@ -50,7 +50,9 @@ use crate::principal_middleware::{
     RequireCommandLog, RequireRunManagementTarget, RequireRunScoped, RequireRunStageScoped,
     RequiredRunManagementActor, RequiredUser,
 };
-use crate::run_compiler::{self, ProjectSettingsSource, RawRunCompilerInput, RunCompilerError};
+use crate::run_compiler::{
+    self, ProjectSettingsPathError, ProjectSettingsSource, RawRunCompilerInput, RunCompilerError,
+};
 use crate::run_files::{list_run_commits, list_run_files};
 use crate::run_manifest;
 use crate::run_selector::{ResolveRunError, resolve_run_by_selector};
@@ -565,15 +567,10 @@ struct ManifestRunCompilerAdapter {
     cli_overrides:        Option<CliLayer>,
     input_overrides:      HashMap<String, toml::Value>,
     inline_goal_override: Option<String>,
-    run_id:               Option<RunId>,
-    parent_id:            Option<RunId>,
-    title:                Option<String>,
-    git:                  Option<GitContext>,
 }
 
-fn adapt_manifest_for_run_compiler(
+fn adapt_manifest_source_for_run_compiler(
     manifest: &RunManifest,
-    explicit_run_id: Option<RunId>,
 ) -> anyhow::Result<ManifestRunCompilerAdapter> {
     if manifest.version != 1 {
         anyhow::bail!("unsupported manifest version {}", manifest.version);
@@ -582,9 +579,6 @@ fn adapt_manifest_for_run_compiler(
     let entrypoint = ManifestPath::from_wire(&manifest.target.path)
         .ok_or_else(|| anyhow::anyhow!("invalid manifest target path: {}", manifest.target.path))?;
     let workflow_bundle = run_manifest::workflow_bundle_from_manifest(&manifest.workflows)?;
-    // The compiler rejects a missing entrypoint with this same message, but
-    // checking here keeps the legacy error precedence: a missing entrypoint
-    // wins over invalid args, title, or run IDs.
     if workflow_bundle.workflow(&entrypoint).is_none() {
         anyhow::bail!("manifest target path is missing from workflows map");
     }
@@ -595,13 +589,11 @@ fn adapt_manifest_for_run_compiler(
         .iter()
         .filter(|config| config.type_ == ManifestConfigType::Project)
         .filter_map(|config| config.source.as_ref().map(|source| (config, source)))
-        .map(|(config, source)| {
-            Ok(ProjectSettingsSource {
-                path: run_manifest::manifest_project_config_path(config, &cwd)?,
-                toml: source.clone(),
-            })
+        .map(|(config, source)| ProjectSettingsSource {
+            path: normalize_project_settings_path(config.path.as_deref(), &cwd),
+            toml: source.clone(),
         })
-        .collect::<anyhow::Result<Vec<_>>>()?;
+        .collect();
     let user_toml = manifest
         .configs
         .iter()
@@ -613,6 +605,46 @@ fn adapt_manifest_for_run_compiler(
         .as_ref()
         .filter(|goal| goal.type_ != ManifestGoalType::Graph)
         .map(|goal| goal.text.clone());
+
+    Ok(ManifestRunCompilerAdapter {
+        workflow_bundle,
+        entrypoint,
+        cwd,
+        project_settings,
+        user_toml,
+        run_overrides: overrides.run,
+        cli_overrides: overrides.cli,
+        input_overrides: overrides.input_overrides,
+        inline_goal_override,
+    })
+}
+
+fn normalize_project_settings_path(
+    path: Option<&str>,
+    cwd: &std::path::Path,
+) -> Result<ManifestPath, ProjectSettingsPathError> {
+    let path = path.ok_or(ProjectSettingsPathError::Missing)?;
+    let path_ref = std::path::Path::new(path);
+    let manifest_path = if path_ref.is_absolute() {
+        ManifestPath::from_absolute(path_ref, cwd)
+    } else {
+        ManifestPath::from_wire(path)
+    };
+    manifest_path.ok_or_else(|| ProjectSettingsPathError::Invalid {
+        path: path.to_string(),
+    })
+}
+
+struct ManifestRunIdentity {
+    run_id:    Option<RunId>,
+    parent_id: Option<RunId>,
+    title:     Option<String>,
+}
+
+fn manifest_run_identity(
+    manifest: &RunManifest,
+    explicit_run_id: Option<RunId>,
+) -> anyhow::Result<ManifestRunIdentity> {
     let title = manifest
         .title
         .as_ref()
@@ -630,21 +662,10 @@ fn adapt_manifest_for_run_compiler(
         .map(str::parse::<RunId>)
         .transpose()
         .context("invalid parent run ID")?;
-
-    Ok(ManifestRunCompilerAdapter {
-        workflow_bundle,
-        entrypoint,
-        cwd,
-        project_settings,
-        user_toml,
-        run_overrides: overrides.run,
-        cli_overrides: overrides.cli,
-        input_overrides: overrides.input_overrides,
-        inline_goal_override,
+    Ok(ManifestRunIdentity {
         run_id: explicit_run_id.or(manifest_run_id),
         parent_id,
         title,
-        git: manifest.git.clone(),
     })
 }
 
@@ -689,11 +710,10 @@ pub(crate) async fn create_run_from_manifest(
     let manifest_run_defaults = state.manifest_run_defaults();
     let manifest_environment_defaults = state.environment_store().catalog_layer();
     let manifest_mcp_server_catalog = state.mcp_server_store().catalog_settings();
-    let manifest_adapter = match adapt_manifest_for_run_compiler(&manifest, explicit_run_id) {
+    let manifest_adapter = match adapt_manifest_source_for_run_compiler(&manifest) {
         Ok(adapter) => adapter,
         Err(err) => return ApiError::bad_request(err.to_string()).into_response(),
     };
-    let run_id = manifest_adapter.run_id.unwrap_or_default();
     let title_generation_target = manifest_adapter.entrypoint.clone();
     let raw_compiler_input = RawRunCompilerInput {
         workflow_bundle: manifest_adapter.workflow_bundle,
@@ -708,14 +728,14 @@ pub(crate) async fn create_run_from_manifest(
         cli_overrides: manifest_adapter.cli_overrides,
         input_overrides: manifest_adapter.input_overrides,
         inline_goal_override: manifest_adapter.inline_goal_override,
-        run_id,
-        title: manifest_adapter.title,
-        parent_id: manifest_adapter.parent_id,
-        git: manifest_adapter.git,
+        run_id: None,
+        title: None,
+        parent_id: None,
+        git: manifest.git.clone(),
         storage_root: state.server_storage_dir(),
         workflow_slug: None,
         provenance: run_provenance(&headers, &actor),
-        web_url: state.run_web_url(&run_id),
+        web_url: None,
         submitted_manifest_bytes: Some(submitted_manifest_bytes),
         automation,
     };
@@ -738,6 +758,13 @@ pub(crate) async fn create_run_from_manifest(
         Ok(prepared) => prepared,
         Err(err) => return run_compiler_error_response(err),
     };
+    let identity = match manifest_run_identity(&manifest, explicit_run_id) {
+        Ok(identity) => identity,
+        Err(err) => return ApiError::bad_request(err.to_string()).into_response(),
+    };
+    let prepared = prepared.with_identity(identity.run_id, identity.parent_id, identity.title);
+    let (prepared, run_id) = prepared.resolve_run_id();
+    let prepared = prepared.with_web_url(state.run_web_url(&run_id));
     let provider = run_manifest::effective_sandbox_provider(&prepared.settings().run);
     if let Some(error) =
         run_manifest::sandbox_provider_policy_error(&state.server_settings(), provider)

@@ -152,9 +152,6 @@ pub(crate) fn prepare_manifest_with_environment_defaults(
     {
         settings.run.goal = Some(RunGoal::Inline(InterpString::parse(&goal.text)));
     }
-    // Validation-only parses: the create path resolves title and identity in
-    // its manifest adapter, but preflight/validate keep rejecting invalid
-    // values with the same messages.
     manifest
         .title
         .as_ref()
@@ -390,7 +387,7 @@ pub(crate) fn manifest_args_overrides(
     })
 }
 
-pub(crate) fn manifest_project_config_path(
+fn manifest_project_config_path(
     config: &types::ManifestConfig,
     cwd: &Path,
 ) -> Result<ManifestPath> {

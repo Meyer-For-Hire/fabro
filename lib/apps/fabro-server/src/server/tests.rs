@@ -3904,6 +3904,105 @@ async fn create_run_from_manifest_pins_compiler_http_error_mappings() {
 }
 
 #[tokio::test]
+async fn create_run_from_manifest_preserves_competing_preparation_error_precedence() {
+    let mut workflow_before_title = minimal_manifest_json(MINIMAL_DOT);
+    workflow_before_title["workflows"]["workflow.fabro"]["config"] = json!({
+        "path": "workflow.toml",
+        "source": "_version = 1\n[run.unknown]\nvalue = true\n",
+    });
+    workflow_before_title["title"] = json!("   ");
+
+    let mut project_parse_before_later_path = minimal_manifest_json(MINIMAL_DOT);
+    project_parse_before_later_path["configs"] = json!([
+        {
+            "type": "project",
+            "path": "/tmp/.fabro/project.toml",
+            "source": "_version = 1\n[run.unknown]\nvalue = true\n",
+        },
+        {
+            "type": "project",
+            "source": "_version = 1\n",
+        },
+    ]);
+
+    for (manifest_json, expected_detail) in [
+        (workflow_before_title, "Failed to parse run config TOML"),
+        (
+            project_parse_before_later_path,
+            "Failed to parse run config TOML",
+        ),
+    ] {
+        let state = TestAppStateBuilder::new().build();
+        let manifest: RunManifest = serde_json::from_value(manifest_json).unwrap();
+        let submitted_manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+
+        let response = Box::pin(handler::runs::create_run_from_manifest(
+            state,
+            handler::runs::CreateRunFromManifestRequest {
+                manifest,
+                submitted_manifest_bytes,
+                explicit_run_id: None,
+                explicit_title_supplied: true,
+                actor: Principal::System {
+                    system_kind: SystemActorKind::Engine,
+                },
+                headers: HeaderMap::new(),
+                automation: None,
+            },
+        ))
+        .await;
+
+        let body = response_json!(response, StatusCode::BAD_REQUEST).await;
+        assert_eq!(body["errors"][0]["detail"], expected_detail);
+    }
+}
+
+#[tokio::test]
+async fn create_run_from_manifest_resolves_generated_id_after_variable_snapshot() {
+    let state = TestAppStateBuilder::new()
+        .env_lookup(|_| None)
+        .vault_entries([(EnvVars::OPENAI_API_KEY, "test-openai-api-key")])
+        .build();
+    let variable = state
+        .stores
+        .variables
+        .set("OWNER", "payments", None)
+        .await
+        .expect("test variable should persist");
+    let manifest: RunManifest = serde_json::from_value(minimal_manifest_json(
+        r#"digraph Test {
+            graph [goal="Test"]
+            start [shape=Mdiamond]
+            work [prompt="Ship {{ vars.OWNER }}"]
+            exit [shape=Msquare]
+            start -> work -> exit
+        }"#,
+    ))
+    .unwrap();
+    let submitted_manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+
+    let response = Box::pin(handler::runs::create_run_from_manifest(
+        state,
+        handler::runs::CreateRunFromManifestRequest {
+            manifest,
+            submitted_manifest_bytes,
+            explicit_run_id: None,
+            explicit_title_supplied: false,
+            actor: Principal::System {
+                system_kind: SystemActorKind::Engine,
+            },
+            headers: HeaderMap::new(),
+            automation: None,
+        },
+    ))
+    .await;
+
+    let body = response_json!(response, StatusCode::CREATED).await;
+    let run_id = body["id"].as_str().unwrap().parse::<RunId>().unwrap();
+    assert!(run_id.created_at() >= variable.updated_at);
+}
+
+#[tokio::test]
 async fn fake_automation_materializer_injection_captures_input_and_returns_manifest() {
     let materialized_manifest: RunManifest =
         serde_json::from_value(minimal_manifest_json(MINIMAL_DOT)).unwrap();
