@@ -14,7 +14,7 @@ use fabro_auth::CredentialSource;
 use fabro_graphviz::graph::{AttrValue, Node};
 use fabro_llm::client::Client;
 use fabro_llm::types::{
-    Message, ReasoningEffort, Request, Response, Speed, TokenCounts,
+    Message, ReasoningEffort, Request, Response, ResponseFormat, Speed, TokenCounts,
     ToolDefinition as LlmToolDefinition,
 };
 use fabro_mcp::config::McpServerSettings;
@@ -24,7 +24,7 @@ use fabro_model::{
     AgentProfileKind, Catalog, FallbackTarget, ModelHandle, ModelRef, ProviderId, UsdMicros,
 };
 use fabro_types::settings::run::RunModelControls;
-use fabro_types::{PermissionLevel, RunId, SessionCapability, StageId, StageTiming};
+use fabro_types::{FailoverProps, PermissionLevel, RunId, SessionCapability, StageId, StageTiming};
 use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -41,8 +41,8 @@ use super::routing::ProviderContext;
 use crate::context::WorkflowContext;
 use crate::context::keys::Fidelity;
 use crate::error::Error;
-use crate::event::{Emitter, Event, RunNoticeCode, RunNoticeLevel, StageScope};
-use crate::model_fallback::{ModelFallbackPolicy, canonical_model_id};
+use crate::event::{Emitter, Event, StageScope};
+use crate::model_fallback::{ModelFallbackNotice, ModelFallbackPolicy};
 use crate::outcome::billed_model_usage_from_llm;
 use crate::services::FabroRunToolServices;
 use crate::steering_hub::{ActiveControlHandle, SteeringHub};
@@ -632,18 +632,21 @@ fn spawn_event_forwarder(
 /// For `full` fidelity nodes sharing a thread key, sessions are cached
 /// and reused so the LLM sees the full conversation history.
 pub struct AgentApiBackend {
-    model:              String,
-    provider_id:        ProviderId,
-    fallbacks:          ModelFallbackPolicy,
-    sessions:           Mutex<HashMap<String, CachedAgentSession>>,
-    tool_env:           Option<Arc<dyn ToolEnvProvider>>,
-    mcp_servers:        Vec<McpServerSettings>,
-    tool_secrets:       ToolSecrets,
-    run_model_controls: RunModelControls,
-    source:             Arc<dyn CredentialSource>,
-    steering_hub:       Arc<SteeringHub>,
-    catalog:            Arc<Catalog>,
-    fabro_run_tools:    Option<FabroRunToolServices>,
+    model:                String,
+    provider_id:          ProviderId,
+    fallbacks:            ModelFallbackPolicy,
+    sessions:             Mutex<HashMap<String, CachedAgentSession>>,
+    /// Messages of fallback-plan notices already emitted for this run, so the
+    /// same configuration warning is not repeated on every LLM call.
+    emitted_plan_notices: Mutex<HashSet<String>>,
+    tool_env:             Option<Arc<dyn ToolEnvProvider>>,
+    mcp_servers:          Vec<McpServerSettings>,
+    tool_secrets:         ToolSecrets,
+    run_model_controls:   RunModelControls,
+    source:               Arc<dyn CredentialSource>,
+    steering_hub:         Arc<SteeringHub>,
+    catalog:              Arc<Catalog>,
+    fabro_run_tools:      Option<FabroRunToolServices>,
 }
 
 struct CachedAgentSession {
@@ -659,35 +662,125 @@ struct LlmRoute {
 
 #[derive(Clone, Debug)]
 struct FallbackPlan {
-    original:           FallbackTarget,
-    requested_controls: EffectiveRequestControls,
-    current:            LlmRoute,
-    remaining:          Vec<LlmRoute>,
-    next_index:         usize,
-}
-
-struct FallbackPlanNotice {
-    code:    RunNoticeCode,
-    message: String,
+    original:  LlmRoute,
+    remaining: Vec<LlmRoute>,
+    /// 0 addresses the original route; N addresses `remaining[N - 1]`.
+    position:  usize,
 }
 
 impl FallbackPlan {
-    #[must_use]
-    fn has_next(&self) -> bool {
-        self.next_index < self.remaining.len()
+    fn current(&self) -> &LlmRoute {
+        self.route_at(self.position)
     }
 
-    fn advance(&mut self) -> Option<(LlmRoute, u32)> {
-        let route = self.remaining.get(self.next_index)?.clone();
-        self.next_index = self.next_index.saturating_add(1);
-        self.current = route.clone();
-        Some((route, u32::try_from(self.next_index).unwrap_or(u32::MAX)))
+    /// The route that was active before the most recent [`Self::advance`].
+    fn previous(&self) -> &LlmRoute {
+        self.route_at(self.position.saturating_sub(1))
     }
+
+    fn route_at(&self, position: usize) -> &LlmRoute {
+        position
+            .checked_sub(1)
+            .map_or(&self.original, |index| &self.remaining[index])
+    }
+
+    fn attempt(&self) -> u32 {
+        u32::try_from(self.position).unwrap_or(u32::MAX)
+    }
+
+    #[must_use]
+    fn has_next(&self) -> bool {
+        self.position < self.remaining.len()
+    }
+
+    /// Move to the next fallback route. Returns false when the plan is
+    /// exhausted.
+    fn advance(&mut self) -> bool {
+        if self.has_next() {
+            self.position += 1;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Request controls resolved for one fallback target.
+enum FallbackControls {
+    /// The target can serve the request with these controls.
+    Usable(EffectiveRequestControls),
+    /// The target advertises reasoning levels, but none is near the requested
+    /// effort.
+    NoNearbyReasoningLevel(ReasoningEffort),
 }
 
 struct OneShotCompletion {
     response: Response,
     model:    ModelRef,
+}
+
+/// One agent invocation's live session, cancel bridge, activation lease,
+/// event forwarding, and accounting state.
+///
+/// Failover discards and replaces the session while the accumulated usage,
+/// cost, and timing keep counting across routes.
+struct LiveAgentInvocation {
+    session:            Session,
+    bridge:             SessionCancelBridgeGuard,
+    lease:              Option<Arc<ActivationLease>>,
+    event_forwarder:    EventForwarder,
+    file_tracking:      Arc<Mutex<FileTracking>>,
+    total_usage:        TokenCounts,
+    total_cost:         Option<UsdMicros>,
+    inference_duration: Duration,
+    tool_duration:      Duration,
+}
+
+impl LiveAgentInvocation {
+    /// Tear down the current session: detach the cancel bridge, release the
+    /// lease, shut the session down, and stop event forwarding.
+    async fn abort_and_discard(&mut self, emitter: &Arc<Emitter>) {
+        self.bridge.abort();
+        discard_session(
+            &mut self.session,
+            &mut self.lease,
+            &mut self.event_forwarder,
+            emitter,
+        )
+        .await;
+        self.event_forwarder.abort();
+    }
+
+    /// Tear down the session for a failed agent call and classify the error.
+    /// Terminal and cancelled errors come back as `Err` for the caller to
+    /// propagate; a failover-eligible error comes back as `Ok` so the caller
+    /// can continue the fallback plan.
+    async fn discard_for_error(
+        &mut self,
+        error: fabro_agent::Error,
+        allow_failover: bool,
+        emitter: &Arc<Emitter>,
+    ) -> Result<fabro_llm::Error, Error> {
+        let disposition = classify_agent_error(error, allow_failover);
+        self.abort_and_discard(emitter).await;
+        match disposition {
+            AgentApiErrorDisposition::Cancelled => Err(Error::Cancelled),
+            AgentApiErrorDisposition::Terminal(error) => Err(error),
+            AgentApiErrorDisposition::FailoverEligible(error) => Ok(error),
+        }
+    }
+
+    fn record_input_timing(&mut self) {
+        let timing = self.session.last_input_timing();
+        self.inference_duration = self.inference_duration.saturating_add(timing.inference);
+        self.tool_duration = self.tool_duration.saturating_add(timing.tool);
+    }
+
+    async fn record_input_usage(&mut self) {
+        self.event_forwarder.wait_for_processing_end().await;
+        self.total_usage += self.session.last_input_usage();
+        UsdMicros::accumulate(&mut self.total_cost, self.session.last_input_cost());
+    }
 }
 
 impl AgentApiBackend {
@@ -724,6 +817,7 @@ impl AgentApiBackend {
             provider_id,
             fallbacks,
             sessions: Mutex::new(HashMap::new()),
+            emitted_plan_notices: Mutex::new(HashSet::new()),
             tool_env: None,
             mcp_servers: Vec::new(),
             tool_secrets: ToolSecrets::default(),
@@ -795,17 +889,28 @@ impl AgentApiBackend {
         &self,
         target: &FallbackTarget,
         requested: EffectiveRequestControls,
-    ) -> Option<EffectiveRequestControls> {
-        let requested_effort = requested.reasoning_effort?;
-        let provider = ProviderId::new(&target.provider);
-        let offering = self.catalog.get_on_provider(&provider, &target.model)?;
-        let settings = self.catalog.settings_for(offering)?;
-        let effective_effort =
-            requested_effort.closest_supported(&settings.controls.reasoning_effort)?;
-        Some(EffectiveRequestControls {
-            reasoning_effort: Some(effective_effort),
-            speed:            requested.speed,
-        })
+    ) -> FallbackControls {
+        let Some(requested_effort) = requested.reasoning_effort else {
+            return FallbackControls::Usable(requested);
+        };
+        let Some(offering) = self
+            .catalog
+            .get_on_provider(&target.provider, target.model.as_str())
+        else {
+            // A catalog-unknown passthrough target has no advertised controls.
+            // Preserve the request and let the provider validate it.
+            return FallbackControls::Usable(requested);
+        };
+        let effective_effort = self.catalog.settings_for(offering).and_then(|settings| {
+            requested_effort.closest_supported(&settings.controls.reasoning_effort)
+        });
+        match effective_effort {
+            Some(effort) => FallbackControls::Usable(EffectiveRequestControls {
+                reasoning_effort: Some(effort),
+                speed:            requested.speed,
+            }),
+            None => FallbackControls::NoNearbyReasoningLevel(requested_effort),
+        }
     }
 
     fn fallback_plan(
@@ -813,24 +918,18 @@ impl AgentApiBackend {
         model: &str,
         provider: &ProviderId,
         requested_controls: EffectiveRequestControls,
-    ) -> (FallbackPlan, Vec<FallbackPlanNotice>) {
-        let primary_model = canonical_model_id(self.catalog.as_ref(), provider, model);
-        let original = FallbackTarget::new(provider, primary_model);
-        let current = LlmRoute {
-            target:   original.clone(),
+    ) -> (FallbackPlan, Vec<ModelFallbackNotice>) {
+        let primary_model = self.catalog.canonical_model_id(provider, model);
+        let original = LlmRoute {
+            target:   FallbackTarget::new(provider, &primary_model),
             controls: requested_controls,
         };
-        let Some(configured) = self
-            .fallbacks
-            .chain_for(self.catalog.as_ref(), provider, model)
-        else {
+        let Some(configured) = self.fallbacks.chain_for_canonical(&primary_model) else {
             return (
                 FallbackPlan {
                     original,
-                    requested_controls,
-                    current,
                     remaining: Vec::new(),
-                    next_index: 0,
+                    position: 0,
                 },
                 Vec::new(),
             );
@@ -839,40 +938,21 @@ impl AgentApiBackend {
         let mut remaining = Vec::new();
         let mut notices = Vec::new();
         for target in configured {
-            if target == &original
-                || remaining
-                    .iter()
-                    .any(|route: &LlmRoute| route.target == *target)
-            {
+            // The resolver already de-duplicated the chain; only the primary
+            // target, which the resolver cannot know, needs filtering here.
+            if *target == original.target {
                 continue;
             }
 
-            let controls = match requested_controls.reasoning_effort {
-                None => requested_controls,
-                Some(requested_effort) => {
-                    match self.fallback_controls_for_target(target, requested_controls) {
-                        Some(controls) => controls,
-                        None if self
-                            .catalog
-                            .get_on_provider(&ProviderId::new(&target.provider), &target.model)
-                            .is_none() =>
-                        {
-                            // A catalog-unknown passthrough target has no
-                            // advertised controls. Preserve the request and let
-                            // the provider validate it.
-                            requested_controls
-                        }
-                        None => {
-                            notices.push(FallbackPlanNotice {
-                                code: RunNoticeCode::ModelFallbackSkipped,
-                                message: format!(
-                                    "Model fallback `{target}` for requested model `{}` was skipped because it has no reasoning level near `{requested_effort}`.",
-                                    original.model
-                                ),
-                            });
-                            continue;
-                        }
-                    }
+            let controls = match self.fallback_controls_for_target(target, requested_controls) {
+                FallbackControls::Usable(controls) => controls,
+                FallbackControls::NoNearbyReasoningLevel(requested_effort) => {
+                    notices.push(ModelFallbackNotice::NoNearbyReasoningLevel {
+                        requested_model: original.target.model.to_string(),
+                        target: target.clone(),
+                        requested_effort,
+                    });
+                    continue;
                 }
             };
             remaining.push(LlmRoute {
@@ -882,56 +962,37 @@ impl AgentApiBackend {
         }
 
         if !configured.is_empty() && remaining.is_empty() {
-            notices.push(FallbackPlanNotice {
-                code: RunNoticeCode::ModelFallbackChainEmpty,
-                message: format!(
-                    "No usable model fallbacks remain for requested model `{}` and primary target `{original}`.",
-                    original.model
-                ),
+            notices.push(ModelFallbackNotice::ChainEmpty {
+                requested_model: original.target.model.to_string(),
             });
         }
 
         (
             FallbackPlan {
                 original,
-                requested_controls,
-                current,
                 remaining,
-                next_index: 0,
+                position: 0,
             },
             notices,
         )
     }
 
     fn emit_fallback_plan_notices(
-        notices: &[FallbackPlanNotice],
+        &self,
+        notices: &[ModelFallbackNotice],
         emitter: &Emitter,
         stage_scope: &StageScope,
     ) {
+        let mut emitted = self
+            .emitted_plan_notices
+            .lock()
+            .expect("notices mutex is never poisoned: no code panics while holding this lock");
         for notice in notices {
-            emitter.emit_scoped(
-                &Event::RunNotice {
-                    level:            RunNoticeLevel::Warn,
-                    code:             notice.code.to_string(),
-                    message:          notice.message.clone(),
-                    exec_output_tail: None,
-                },
-                stage_scope,
-            );
+            let message = notice.message();
+            if emitted.insert(message.clone()) {
+                emitter.notice_scoped(notice.level(), notice.code(), message, stage_scope);
+            }
         }
-    }
-
-    #[cfg(test)]
-    async fn create_session(
-        &self,
-        node: &Node,
-        sandbox: &Arc<dyn Sandbox>,
-        tool_hooks: Option<Arc<dyn fabro_agent::ToolHookCallback>>,
-    ) -> Result<Session, Error> {
-        let (cached, _) = self
-            .create_session_with_plan(node, sandbox, tool_hooks)
-            .await?;
-        Ok(cached.session)
     }
 
     async fn create_session_with_plan(
@@ -939,7 +1000,7 @@ impl AgentApiBackend {
         node: &Node,
         sandbox: &Arc<dyn Sandbox>,
         tool_hooks: Option<Arc<dyn fabro_agent::ToolHookCallback>>,
-    ) -> Result<(CachedAgentSession, Vec<FallbackPlanNotice>), Error> {
+    ) -> Result<(CachedAgentSession, Vec<ModelFallbackNotice>), Error> {
         let model = node.model().unwrap_or(&self.model);
         let provider = routing::resolve_node_provider_context(
             self.catalog.as_ref(),
@@ -949,13 +1010,15 @@ impl AgentApiBackend {
         )?;
         let controls = self.resolve_effective_request_controls(node)?;
         let (fallback_plan, notices) = self.fallback_plan(model, &provider.provider_id, controls);
-        let route = &fallback_plan.current;
-        let route_provider =
-            self.resolve_provider_context(&route.target.model, Some(&route.target.provider))?;
+        let route = fallback_plan.current();
+        let route_provider = self.resolve_provider_context(
+            route.target.model.as_str(),
+            Some(route.target.provider.as_str()),
+        )?;
         let session = Self::create_session_for(
-            &route.target.model,
+            route.target.model.as_str(),
             route_provider,
-            controls,
+            route.controls,
             node,
             sandbox,
             self.source.as_ref(),
@@ -1125,172 +1188,124 @@ impl AgentApiBackend {
         Ok(lease)
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "failover owns one agent invocation's live session, event bridge, accounting, and cancellation state"
-    )]
+    /// Continue the fallback plan after a failover-eligible agent error.
+    ///
+    /// The caller must already have torn down the failed session (see
+    /// [`LiveAgentInvocation::discard_for_error`]); this method only builds
+    /// and drives replacement sessions.
     async fn failover_agent_session(
         &self,
         fallback_plan: &mut FallbackPlan,
         initial_error: fabro_llm::Error,
-        node: &Node,
+        request: &CodergenRunRequest<'_>,
         input: &str,
-        agent_tool_runtime: fabro_agent::AgentToolRuntime,
-        sandbox: &Arc<dyn Sandbox>,
-        tool_hooks: Option<Arc<dyn fabro_agent::ToolHookCallback>>,
-        cancel_token: &CancellationToken,
-        emitter: &Arc<Emitter>,
         stage_scope: &StageScope,
         stage_id: &StageId,
-        thread_id: Option<&str>,
-        file_tracking: &Arc<Mutex<FileTracking>>,
-        session: &mut Session,
-        bridge: &mut SessionCancelBridgeGuard,
-        lease: &mut Option<Arc<ActivationLease>>,
-        event_forwarder: &mut EventForwarder,
-        total_usage: &mut TokenCounts,
-        total_cost: &mut Option<UsdMicros>,
-        inference_duration: &mut Duration,
-        tool_duration: &mut Duration,
+        live: &mut LiveAgentInvocation,
     ) -> Result<(), Error> {
-        let mut error_message = initial_error.to_string();
+        let emitter = request.emitter;
         let mut last_error = Error::Llm(initial_error);
 
-        bridge.abort();
-        discard_session(session, lease, event_forwarder, emitter).await;
-        event_forwarder.abort();
-
-        while fallback_plan.has_next() {
-            let from = fallback_plan.current.clone();
-            let Some((route, attempt)) = fallback_plan.advance() else {
-                break;
-            };
+        while fallback_plan.advance() {
             Self::emit_failover(
-                node,
+                request.node,
                 emitter,
                 stage_scope,
                 fallback_plan,
-                &from,
-                &route,
-                attempt,
-                &error_message,
+                &last_error.to_string(),
             );
+            let route = fallback_plan.current().clone();
 
-            let target_provider = match self
-                .resolve_provider_context(&route.target.model, Some(&route.target.provider))
-            {
+            let target_provider = match self.resolve_provider_context(
+                route.target.model.as_str(),
+                Some(route.target.provider.as_str()),
+            ) {
                 Ok(provider) => provider,
                 Err(error) => {
-                    error_message = error.to_string();
                     last_error = error;
                     continue;
                 }
             };
 
-            if cancel_token.is_cancelled() {
+            if request.cancel_token.is_cancelled() {
                 return Err(Error::Cancelled);
             }
             let new_session = Self::create_session_for(
-                &route.target.model,
+                route.target.model.as_str(),
                 target_provider,
                 route.controls,
-                node,
-                sandbox,
+                request.node,
+                request.sandbox,
                 self.source.as_ref(),
                 Arc::clone(&self.catalog),
                 self.tool_env.as_ref(),
-                tool_hooks.clone(),
+                request.tool_hooks.clone(),
                 self.mcp_servers.clone(),
                 self.tool_secrets.clone(),
                 self.fabro_run_tools.clone(),
             )
             .await;
-            if cancel_token.is_cancelled() {
+            if request.cancel_token.is_cancelled() {
                 return Err(Error::Cancelled);
             }
-            *session = match new_session {
+            live.session = match new_session {
                 Ok(session) => session,
                 Err(error) => {
-                    error_message = error.to_string();
                     last_error = error;
                     continue;
                 }
             };
-            bridge.replace(cancel_token.clone(), session);
-            *event_forwarder = spawn_event_forwarder(
-                session,
-                node.id.clone(),
+            live.bridge
+                .replace(request.cancel_token.clone(), &live.session);
+            live.event_forwarder = spawn_event_forwarder(
+                &live.session,
+                request.node.id.clone(),
                 stage_scope.clone(),
                 Arc::clone(emitter),
-                Arc::clone(file_tracking),
+                Arc::clone(&live.file_tracking),
             );
 
-            begin_session_lifecycle(session, emitter, None);
-            if let Err(error) = session.initialize().await {
-                match classify_agent_error(error, fallback_plan.has_next()) {
-                    AgentApiErrorDisposition::Cancelled => {
-                        bridge.abort();
-                        discard_session(session, lease, event_forwarder, emitter).await;
-                        return Err(Error::Cancelled);
-                    }
-                    AgentApiErrorDisposition::Terminal(error) => {
-                        bridge.abort();
-                        discard_session(session, lease, event_forwarder, emitter).await;
-                        return Err(error);
-                    }
-                    AgentApiErrorDisposition::FailoverEligible(error) => {
-                        error_message = error.to_string();
-                        last_error = Error::Llm(error);
-                        bridge.abort();
-                        discard_session(session, lease, event_forwarder, emitter).await;
-                        event_forwarder.abort();
-                        continue;
-                    }
-                }
+            begin_session_lifecycle(&live.session, emitter, None);
+            if let Err(error) = live.session.initialize().await {
+                let allow_failover = fallback_plan.has_next();
+                last_error = Error::Llm(
+                    live.discard_for_error(error, allow_failover, emitter)
+                        .await?,
+                );
+                continue;
             }
 
-            match self.attach_session_to_hub(session, stage_id, thread_id, emitter) {
-                Ok(active_lease) => *lease = Some(active_lease),
+            match self.attach_session_to_hub(
+                &mut live.session,
+                stage_id,
+                request.thread_id,
+                emitter,
+            ) {
+                Ok(active_lease) => live.lease = Some(active_lease),
                 Err(error) => {
-                    bridge.abort();
-                    discard_session(session, lease, event_forwarder, emitter).await;
+                    live.abort_and_discard(emitter).await;
                     return Err(error);
                 }
             }
-            emit_agent_tools_available(session, &node.id, stage_id, emitter);
+            emit_agent_tools_available(&live.session, &request.node.id, stage_id, emitter);
 
-            let process_result = session
-                .process_input_with_runtime(input, agent_tool_runtime.clone())
+            let process_result = live
+                .session
+                .process_input_with_runtime(input, request.agent_tool_runtime.clone())
                 .await;
-            let timing = session.last_input_timing();
-            *inference_duration = inference_duration.saturating_add(timing.inference);
-            *tool_duration = tool_duration.saturating_add(timing.tool);
+            live.record_input_timing();
             match process_result {
                 Ok(()) => {
-                    event_forwarder.wait_for_processing_end().await;
-                    *total_usage += session.last_input_usage();
-                    UsdMicros::accumulate(total_cost, session.last_input_cost());
+                    live.record_input_usage().await;
                     return Ok(());
                 }
-                Err(error) => match classify_agent_error(error, fallback_plan.has_next()) {
-                    AgentApiErrorDisposition::Cancelled => {
-                        bridge.abort();
-                        discard_session(session, lease, event_forwarder, emitter).await;
-                        return Err(Error::Cancelled);
-                    }
-                    AgentApiErrorDisposition::Terminal(error) => {
-                        bridge.abort();
-                        discard_session(session, lease, event_forwarder, emitter).await;
-                        return Err(error);
-                    }
-                    AgentApiErrorDisposition::FailoverEligible(error) => {
-                        error_message = error.to_string();
-                        last_error = Error::Llm(error);
-                        bridge.abort();
-                        discard_session(session, lease, event_forwarder, emitter).await;
-                        event_forwarder.abort();
-                    }
-                },
+                Err(error) => {
+                    let allow_failover = fallback_plan.has_next();
+                    last_error = Error::Llm(
+                        live.discard_for_error(error, allow_failover, emitter)
+                            .await?,
+                    );
+                }
             }
         }
 
@@ -1317,38 +1332,69 @@ impl AgentApiBackend {
         }
     }
 
+    /// Emit `agent.failover` for the plan's most recent
+    /// [`FallbackPlan::advance`].
     fn emit_failover(
         node: &Node,
         emitter: &Emitter,
         stage_scope: &StageScope,
         plan: &FallbackPlan,
-        from: &LlmRoute,
-        to: &LlmRoute,
-        attempt: u32,
         error: &str,
     ) {
+        let from = plan.previous();
+        let to = plan.current();
         emitter.emit_scoped(
             &Event::Failover {
                 stage: node.id.clone(),
-                original_provider: plan.original.provider.clone(),
-                original_model: plan.original.model.clone(),
-                attempt,
-                from_provider: from.target.provider.clone(),
-                from_model: from.target.model.clone(),
-                to_provider: to.target.provider.clone(),
-                to_model: to.target.model.clone(),
-                requested_reasoning_effort: plan
-                    .requested_controls
-                    .reasoning_effort
-                    .map(|effort| effort.to_string()),
-                effective_reasoning_effort: to
-                    .controls
-                    .reasoning_effort
-                    .map(|effort| effort.to_string()),
-                error: error.to_string(),
+                props: FailoverProps {
+                    original_provider: plan.original.target.provider.to_string(),
+                    original_model: plan.original.target.model.to_string(),
+                    attempt: plan.attempt(),
+                    from_provider: from.target.provider.to_string(),
+                    from_model: from.target.model.to_string(),
+                    to_provider: to.target.provider.to_string(),
+                    to_model: to.target.model.to_string(),
+                    requested_reasoning_effort: plan.original.controls.reasoning_effort,
+                    effective_reasoning_effort: to.controls.reasoning_effort,
+                    error: error.to_string(),
+                },
             },
             stage_scope,
         );
+    }
+
+    fn route_max_tokens(&self, node: &Node, route: &LlmRoute) -> Option<i64> {
+        node.max_tokens().or_else(|| {
+            self.catalog
+                .get_on_provider(&route.target.provider, route.target.model.as_str())
+                .and_then(|model| model.limits.max_output)
+        })
+    }
+
+    /// Build a one-shot completion request addressed to `route`.
+    fn route_request(
+        &self,
+        node: &Node,
+        route: &LlmRoute,
+        messages: Vec<Message>,
+        response_format: Option<ResponseFormat>,
+    ) -> Request {
+        Request {
+            model: route.target.model.to_string(),
+            messages,
+            provider: Some(route.target.provider.to_string()),
+            tools: None,
+            tool_choice: None,
+            response_format,
+            temperature: None,
+            top_p: None,
+            max_tokens: self.route_max_tokens(node, route),
+            stop_sequences: None,
+            reasoning_effort: route.controls.reasoning_effort,
+            speed: route.controls.speed,
+            metadata: None,
+            provider_options: None,
+        }
     }
 
     async fn complete_one_shot_request(
@@ -1357,54 +1403,32 @@ impl AgentApiBackend {
         node: &Node,
         emitter: &Arc<Emitter>,
         stage_scope: &StageScope,
-        request: &Request,
+        mut request: Request,
         plan: &mut FallbackPlan,
     ) -> Result<OneShotCompletion, Error> {
-        let mut active_request = request.clone();
         loop {
-            match client.complete(&active_request).await {
+            match client.complete(&request).await {
                 Ok(response) => {
+                    let route = plan.current();
                     return Ok(OneShotCompletion {
                         response,
                         model: ModelRef {
-                            provider: ProviderId::from(plan.current.target.provider.clone()),
-                            model_id: plan.current.target.model.clone().into(),
-                            speed:    plan.current.controls.speed,
+                            provider: route.target.provider.clone(),
+                            model_id: route.target.model.clone(),
+                            speed:    route.controls.speed,
                         },
                     });
                 }
                 Err(error) if error.failover_eligible() && plan.has_next() => {
                     let error_message = error.to_string();
-                    let from = plan.current.clone();
-                    let Some((to, attempt)) = plan.advance() else {
-                        return Err(Error::Llm(error));
-                    };
-                    Self::emit_failover(
+                    plan.advance();
+                    Self::emit_failover(node, emitter, stage_scope, plan, &error_message);
+                    request = self.route_request(
                         node,
-                        emitter,
-                        stage_scope,
-                        plan,
-                        &from,
-                        &to,
-                        attempt,
-                        &error_message,
+                        plan.current(),
+                        request.messages,
+                        request.response_format,
                     );
-                    let max_tokens = node.max_tokens().or_else(|| {
-                        self.catalog
-                            .get_on_provider(
-                                &ProviderId::new(&to.target.provider),
-                                &to.target.model,
-                            )
-                            .and_then(|model| model.limits.max_output)
-                    });
-                    active_request = Request {
-                        model: to.target.model,
-                        provider: Some(to.target.provider),
-                        max_tokens,
-                        reasoning_effort: to.controls.reasoning_effort,
-                        speed: to.controls.speed,
-                        ..active_request
-                    };
                 }
                 Err(error) => return Err(Error::Llm(error)),
             }
@@ -1438,7 +1462,7 @@ impl CodergenBackend for AgentApiBackend {
         let controls = self.resolve_effective_request_controls(node)?;
         let (mut fallback_plan, notices) =
             self.fallback_plan(model, &provider.provider_id, controls);
-        Self::emit_fallback_plan_notices(&notices, emitter, stage_scope);
+        self.emit_fallback_plan_notices(&notices, emitter, stage_scope);
 
         let mut messages = Vec::new();
         if let Some(sys) = system_prompt {
@@ -1456,31 +1480,12 @@ impl CodergenBackend for AgentApiBackend {
         let mut inference_duration = Duration::ZERO;
 
         loop {
-            let route = &fallback_plan.current;
-            let max_tokens = node.max_tokens().or_else(|| {
-                self.catalog
-                    .get_on_provider(
-                        &ProviderId::new(&route.target.provider),
-                        &route.target.model,
-                    )
-                    .and_then(|model| model.limits.max_output)
-            });
-            let request = Request {
-                model: route.target.model.clone(),
-                messages: messages.clone(),
-                provider: Some(route.target.provider.clone()),
-                reasoning_effort: route.controls.reasoning_effort,
-                speed: route.controls.speed,
-                tools: None,
-                tool_choice: None,
-                response_format: response_format.clone(),
-                temperature: None,
-                top_p: None,
-                max_tokens,
-                stop_sequences: None,
-                metadata: None,
-                provider_options: None,
-            };
+            let request = self.route_request(
+                node,
+                fallback_plan.current(),
+                messages.clone(),
+                response_format.clone(),
+            );
 
             let inference_start = Instant::now();
             let completion_result = self
@@ -1489,7 +1494,7 @@ impl CodergenBackend for AgentApiBackend {
                     node,
                     emitter,
                     stage_scope,
-                    &request,
+                    request,
                     &mut fallback_plan,
                 )
                 .await;
@@ -1545,67 +1550,49 @@ impl CodergenBackend for AgentApiBackend {
 
     async fn run(&self, request: CodergenRunRequest<'_>) -> Result<CodergenResult, Error> {
         let node = request.node;
-        let prompt = request.prompt;
-        let context = request.context;
-        let thread_id = request.thread_id;
         let emitter = request.emitter;
-        let sandbox = request.sandbox;
-        let tool_hooks = request.tool_hooks;
-        let cancel_token = request.cancel_token;
-        let agent_tool_runtime = request.agent_tool_runtime;
         let output_schema = structured_output::parse_node_output_schema(node)?;
 
-        let fidelity = context.fidelity();
+        let fidelity = request.context.fidelity();
         let reuse_key = if fidelity == Fidelity::Full {
-            thread_id.map(String::from)
+            request.thread_id.map(String::from)
         } else {
             None
         };
 
-        let mut bridge = SessionCancelBridgeGuard::new();
-
         // Take a cached session if reusing, otherwise create a new one. Cancel
         // checks bracket `Client::from_source(...)` so cancellation arriving
         // during credential refresh is not lost.
-        if cancel_token.is_cancelled() {
+        if request.cancel_token.is_cancelled() {
             return Err(Error::Cancelled);
         }
-        let (cached, is_reused, fallback_notices) = if let Some(ref key) = reuse_key {
-            let existing = self
-                .sessions
+        let cached_session = reuse_key.as_ref().and_then(|key| {
+            self.sessions
                 .lock()
                 .expect("sessions mutex is never poisoned: no code panics while holding this lock")
-                .remove(key);
-            if let Some(cached) = existing {
-                (cached, true, Vec::new())
-            } else {
-                let created = self
-                    .create_session_with_plan(node, sandbox, tool_hooks.clone())
-                    .await;
-                if cancel_token.is_cancelled() {
-                    return Err(Error::Cancelled);
-                }
-                let (cached, notices) = created?;
-                (cached, false, notices)
-            }
+                .remove(key)
+        });
+        let is_reused = cached_session.is_some();
+        let (cached, fallback_notices) = if let Some(cached) = cached_session {
+            (cached, Vec::new())
         } else {
             let created = self
-                .create_session_with_plan(node, sandbox, tool_hooks.clone())
+                .create_session_with_plan(node, request.sandbox, request.tool_hooks.clone())
                 .await;
-            if cancel_token.is_cancelled() {
+            if request.cancel_token.is_cancelled() {
                 return Err(Error::Cancelled);
             }
-            let (cached, notices) = created?;
-            (cached, false, notices)
+            created?
         };
         let CachedAgentSession {
-            mut session,
+            session,
             mut fallback_plan,
         } = cached;
-        if cancel_token.is_cancelled() {
+        if request.cancel_token.is_cancelled() {
             return Err(Error::Cancelled);
         }
-        bridge.replace(cancel_token.clone(), &session);
+        let mut bridge = SessionCancelBridgeGuard::new();
+        bridge.replace(request.cancel_token.clone(), &session);
 
         tracing::info!(
             node = %node.id,
@@ -1620,11 +1607,11 @@ impl CodergenBackend for AgentApiBackend {
             touched: HashSet::new(),
             last:    None,
         }));
-        let stage_scope = StageScope::for_handler(context, &node.id);
-        Self::emit_fallback_plan_notices(&fallback_notices, emitter, &stage_scope);
+        let stage_scope = StageScope::for_handler(request.context, &node.id);
+        self.emit_fallback_plan_notices(&fallback_notices, emitter, &stage_scope);
 
         // Subscribe to session events: forward to pipeline emitter + track files.
-        let mut event_forwarder = spawn_event_forwarder(
+        let event_forwarder = spawn_event_forwarder(
             &session,
             node.id.clone(),
             stage_scope.clone(),
@@ -1632,55 +1619,44 @@ impl CodergenBackend for AgentApiBackend {
             Arc::clone(&file_tracking),
         );
 
-        let mut total_usage = TokenCounts::default();
-        let mut total_cost = None;
-        let mut inference_duration = Duration::ZERO;
-        let mut tool_duration = Duration::ZERO;
-
         // Activate with the steering hub after initialization so HTTP
         // `POST /runs/{id}/steer` calls reach this session. The activation
         // lease is shared with the natural-completion coordinator and is
         // released on every exit path.
         let stage_id = stage_scope.stage_id();
-        let mut lease: Option<Arc<ActivationLease>> = None;
+        let mut live = LiveAgentInvocation {
+            session,
+            bridge,
+            lease: None,
+            event_forwarder,
+            file_tracking,
+            total_usage: TokenCounts::default(),
+            total_cost: None,
+            inference_duration: Duration::ZERO,
+            tool_duration: Duration::ZERO,
+        };
 
         let allow_failover_primary = fallback_plan.has_next();
         let init_result = if is_reused {
             Ok(())
         } else {
-            begin_session_lifecycle(&session, emitter, None);
-            match session.initialize().await {
-                Ok(()) => Ok(()),
-                Err(err) => match classify_agent_error(err, allow_failover_primary) {
-                    AgentApiErrorDisposition::Cancelled => {
-                        bridge.abort();
-                        discard_session(&mut session, &mut lease, &mut event_forwarder, emitter)
-                            .await;
-                        return Err(Error::Cancelled);
-                    }
-                    AgentApiErrorDisposition::Terminal(err) => {
-                        bridge.abort();
-                        discard_session(&mut session, &mut lease, &mut event_forwarder, emitter)
-                            .await;
-                        return Err(err);
-                    }
-                    AgentApiErrorDisposition::FailoverEligible(sdk_err) => {
-                        Err(fabro_agent::Error::Llm(sdk_err))
-                    }
-                },
-            }
+            begin_session_lifecycle(&live.session, emitter, None);
+            live.session.initialize().await
         };
 
         // If initialize failed with a failover-eligible error, treat as a
         // process_input failover trigger; otherwise run process_input.
         let result = match init_result {
             Ok(()) => {
-                match self.attach_session_to_hub(&mut session, &stage_id, thread_id, emitter) {
-                    Ok(active_lease) => lease = Some(active_lease),
+                match self.attach_session_to_hub(
+                    &mut live.session,
+                    &stage_id,
+                    request.thread_id,
+                    emitter,
+                ) {
+                    Ok(active_lease) => live.lease = Some(active_lease),
                     Err(err) => {
-                        bridge.abort();
-                        discard_session(&mut session, &mut lease, &mut event_forwarder, emitter)
-                            .await;
+                        live.abort_and_discard(emitter).await;
                         return Err(err);
                     }
                 }
@@ -1689,18 +1665,15 @@ impl CodergenBackend for AgentApiBackend {
                 // and exposure mode are immutable for the session's lifetime,
                 // so re-emitting on every subsequent prompt is wasted work.
                 if !is_reused {
-                    emit_agent_tools_available(&session, &node.id, &stage_id, emitter);
+                    emit_agent_tools_available(&live.session, &node.id, &stage_id, emitter);
                 }
-                let process_result = session
-                    .process_input_with_runtime(prompt, agent_tool_runtime.clone())
+                let process_result = live
+                    .session
+                    .process_input_with_runtime(request.prompt, request.agent_tool_runtime.clone())
                     .await;
-                let timing = session.last_input_timing();
-                inference_duration = inference_duration.saturating_add(timing.inference);
-                tool_duration = tool_duration.saturating_add(timing.tool);
+                live.record_input_timing();
                 if process_result.is_ok() {
-                    event_forwarder.wait_for_processing_end().await;
-                    total_usage += session.last_input_usage();
-                    UsdMicros::accumulate(&mut total_cost, session.last_input_cost());
+                    live.record_input_usage().await;
                 }
                 process_result
             }
@@ -1711,63 +1684,39 @@ impl CodergenBackend for AgentApiBackend {
         // belongs to the originally requested model.
         let result: Result<(), Error> = match result {
             Ok(()) => Ok(()),
-            Err(err) => match classify_agent_error(err, allow_failover_primary) {
-                AgentApiErrorDisposition::Cancelled => {
-                    bridge.abort();
-                    discard_session(&mut session, &mut lease, &mut event_forwarder, emitter).await;
-                    return Err(Error::Cancelled);
-                }
-                AgentApiErrorDisposition::Terminal(err) => {
-                    bridge.abort();
-                    discard_session(&mut session, &mut lease, &mut event_forwarder, emitter).await;
-                    return Err(err);
-                }
-                AgentApiErrorDisposition::FailoverEligible(sdk_err) => {
-                    self.failover_agent_session(
-                        &mut fallback_plan,
-                        sdk_err,
-                        node,
-                        prompt,
-                        agent_tool_runtime.clone(),
-                        sandbox,
-                        tool_hooks.clone(),
-                        &cancel_token,
-                        emitter,
-                        &stage_scope,
-                        &stage_id,
-                        thread_id,
-                        &file_tracking,
-                        &mut session,
-                        &mut bridge,
-                        &mut lease,
-                        &mut event_forwarder,
-                        &mut total_usage,
-                        &mut total_cost,
-                        &mut inference_duration,
-                        &mut tool_duration,
-                    )
-                    .await
-                }
-            },
+            Err(err) => {
+                let sdk_err = live
+                    .discard_for_error(err, allow_failover_primary, emitter)
+                    .await?;
+                self.failover_agent_session(
+                    &mut fallback_plan,
+                    sdk_err,
+                    &request,
+                    request.prompt,
+                    &stage_scope,
+                    &stage_id,
+                    &mut live,
+                )
+                .await
+            }
         };
 
         // On error, discard the session (don't cache failed state). The
         // bridge's `Drop` will abort the spawned task on early return.
         if let Err(err) = result {
-            bridge.abort();
-            discard_session(&mut session, &mut lease, &mut event_forwarder, emitter).await;
+            live.abort_and_discard(emitter).await;
             return Err(err);
         }
 
-        let mut response = last_assistant_response(&session);
+        let mut response = last_assistant_response(&live.session);
         if let Some(schema) = &output_schema {
             let mut repair_attempts = 0_i64;
             loop {
-                let last_file_touched = last_touched_file(&file_tracking);
+                let last_file_touched = last_touched_file(&live.file_tracking);
                 match validate_agent_output_sources(
                     schema,
                     &response,
-                    sandbox,
+                    request.sandbox,
                     last_file_touched.as_deref(),
                 )
                 .await
@@ -1775,87 +1724,42 @@ impl CodergenBackend for AgentApiBackend {
                     Ok(_) => break,
                     Err(error) => {
                         if repair_attempts >= node.output_retries() {
-                            bridge.abort();
-                            discard_session(
-                                &mut session,
-                                &mut lease,
-                                &mut event_forwarder,
-                                emitter,
-                            )
-                            .await;
+                            live.abort_and_discard(emitter).await;
                             return Err(Error::OutputSchemaValidation(
                                 structured_output::exhausted_failure_reason(node.output_retries()),
                             ));
                         }
                         let repair_message = error.repair_message(schema);
-                        let repair_result = session
+                        let repair_result = live
+                            .session
                             .process_input_with_runtime(
                                 &repair_message,
                                 fabro_agent::AgentToolRuntime::default(),
                             )
                             .await;
-                        let timing = session.last_input_timing();
-                        inference_duration = inference_duration.saturating_add(timing.inference);
-                        tool_duration = tool_duration.saturating_add(timing.tool);
+                        live.record_input_timing();
                         match repair_result {
                             Ok(()) => {
-                                event_forwarder.wait_for_processing_end().await;
-                                total_usage += session.last_input_usage();
-                                UsdMicros::accumulate(&mut total_cost, session.last_input_cost());
+                                live.record_input_usage().await;
                                 repair_attempts += 1;
-                                response = last_assistant_response(&session);
+                                response = last_assistant_response(&live.session);
                             }
-                            Err(err) => match classify_agent_error(err, fallback_plan.has_next()) {
-                                AgentApiErrorDisposition::Cancelled => {
-                                    bridge.abort();
-                                    discard_session(
-                                        &mut session,
-                                        &mut lease,
-                                        &mut event_forwarder,
-                                        emitter,
-                                    )
-                                    .await;
-                                    return Err(Error::Cancelled);
-                                }
-                                AgentApiErrorDisposition::Terminal(err) => {
-                                    bridge.abort();
-                                    discard_session(
-                                        &mut session,
-                                        &mut lease,
-                                        &mut event_forwarder,
-                                        emitter,
-                                    )
-                                    .await;
-                                    return Err(err);
-                                }
-                                AgentApiErrorDisposition::FailoverEligible(sdk_err) => {
-                                    self.failover_agent_session(
-                                        &mut fallback_plan,
-                                        sdk_err,
-                                        node,
-                                        prompt,
-                                        agent_tool_runtime.clone(),
-                                        sandbox,
-                                        tool_hooks.clone(),
-                                        &cancel_token,
-                                        emitter,
-                                        &stage_scope,
-                                        &stage_id,
-                                        thread_id,
-                                        &file_tracking,
-                                        &mut session,
-                                        &mut bridge,
-                                        &mut lease,
-                                        &mut event_forwarder,
-                                        &mut total_usage,
-                                        &mut total_cost,
-                                        &mut inference_duration,
-                                        &mut tool_duration,
-                                    )
-                                    .await?;
-                                    response = last_assistant_response(&session);
-                                }
-                            },
+                            Err(err) => {
+                                let allow_failover = fallback_plan.has_next();
+                                let sdk_err =
+                                    live.discard_for_error(err, allow_failover, emitter).await?;
+                                self.failover_agent_session(
+                                    &mut fallback_plan,
+                                    sdk_err,
+                                    &request,
+                                    request.prompt,
+                                    &stage_scope,
+                                    &stage_id,
+                                    &mut live,
+                                )
+                                .await?;
+                                response = last_assistant_response(&live.session);
+                            }
                         }
                     }
                 }
@@ -1865,22 +1769,30 @@ impl CodergenBackend for AgentApiBackend {
         let stage_usage = billed_model_usage_from_llm(
             self.catalog.as_ref(),
             &ModelRef {
-                provider: session.provider_id(),
-                model_id: session.model().into(),
-                speed:    session.speed(),
+                provider: live.session.provider_id(),
+                model_id: live.session.model().into(),
+                speed:    live.session.speed(),
             },
-            &total_usage,
+            &live.total_usage,
         )?
-        .with_reported_cost(total_cost);
+        .with_reported_cost(live.total_cost);
 
-        if let Some(lease) = lease.take() {
+        if let Some(lease) = live.lease.take() {
             lease.release();
         }
 
         // Cache session back for reuse on success. Detach the bridge first so
         // the cached session is not left wired to this run's cancel token.
+        live.bridge.abort();
+        let LiveAgentInvocation {
+            session,
+            event_forwarder,
+            file_tracking,
+            inference_duration,
+            tool_duration,
+            ..
+        } = live;
         if let Some(key) = reuse_key {
-            bridge.abort();
             drop(event_forwarder);
             self.sessions
                 .lock()
@@ -1890,7 +1802,8 @@ impl CodergenBackend for AgentApiBackend {
                     fallback_plan,
                 });
         } else {
-            bridge.abort();
+            let mut session = session;
+            let mut event_forwarder = event_forwarder;
             let session_id = session.id().to_string();
             session.shutdown(SessionShutdownReason::Completed).await;
             event_forwarder.wait_for_session_end().await;
@@ -3124,9 +3037,11 @@ reasoning = false
             Arc::new(LocalSandbox::new(workspace.path().to_path_buf()));
 
         let mut session = backend
-            .create_session(&node, &sandbox, Some(hooks))
+            .create_session_with_plan(&node, &sandbox, Some(hooks))
             .await
-            .unwrap();
+            .unwrap()
+            .0
+            .session;
         session
             .process_input("PARENT_PROMPT_MARKER: spawn a helper subagent")
             .await
@@ -3474,15 +3389,20 @@ enabled = true
         );
 
         assert!(notices.is_empty());
-        let (sol, first_attempt) = plan.advance().expect("Sol should be first");
-        let (opus, second_attempt) = plan.advance().expect("Opus should be second");
-        assert_eq!(sol.target, FallbackTarget::new("openai", "gpt-5.6-sol"));
+        assert!(plan.advance(), "Sol should be first");
         assert_eq!(
-            opus.target,
+            plan.current().target,
+            FallbackTarget::new("openai", "gpt-5.6-sol")
+        );
+        assert_eq!(plan.attempt(), 1);
+        assert!(plan.advance(), "Opus should be second");
+        assert_eq!(
+            plan.current().target,
             FallbackTarget::new("anthropic", "claude-opus-5")
         );
-        assert_eq!((first_attempt, second_attempt), (1, 2));
+        assert_eq!(plan.attempt(), 2);
         assert!(!plan.has_next());
+        assert!(!plan.advance());
     }
 
     #[tokio::test]
@@ -3517,10 +3437,7 @@ enabled = true
 
     #[tokio::test]
     async fn one_shot_falls_back_after_refusal_error() {
-        let configured_targets = vec![FallbackTarget {
-            provider: "openai".to_string(),
-            model:    "gpt-5.5".to_string(),
-        }];
+        let configured_targets = vec![FallbackTarget::new("openai", "gpt-5.5")];
         let fallback_policy = ModelFallbackPolicy::new(std::collections::BTreeMap::from([(
             "claude-fable-5".to_string(),
             configured_targets,
@@ -3585,7 +3502,7 @@ enabled = true
                 &node,
                 &emitter,
                 &stage_scope,
-                &request,
+                request,
                 &mut fallback_plan,
             )
             .await
@@ -3599,9 +3516,9 @@ enabled = true
             .unwrap()
             .clone()
             .expect("agent.failover should be emitted");
-        assert_eq!(failover.original_provider.as_deref(), Some("anthropic"));
-        assert_eq!(failover.original_model.as_deref(), Some("claude-fable-5"));
-        assert_eq!(failover.attempt, Some(1));
+        assert_eq!(failover.original_provider, "anthropic");
+        assert_eq!(failover.original_model, "claude-fable-5");
+        assert_eq!(failover.attempt, 1);
         assert_eq!(failover.from_provider, "anthropic");
         assert_eq!(failover.from_model, "claude-fable-5");
         assert_eq!(failover.to_provider, "openai");

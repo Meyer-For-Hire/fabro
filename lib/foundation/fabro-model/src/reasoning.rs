@@ -46,16 +46,10 @@ impl ReasoningEffort {
     /// are equally distant, the higher effort wins.
     #[must_use]
     pub fn closest_supported(self, supported: &[Self]) -> Option<Self> {
-        let variants = Self::variants();
-        let requested_rank = variants.iter().position(|effort| *effort == self)?;
-
-        supported.iter().copied().min_by_key(|effort| {
-            let rank = variants
-                .iter()
-                .position(|candidate| candidate == effort)
-                .expect("supported reasoning effort must be an enum variant");
-            (requested_rank.abs_diff(rank), Reverse(rank))
-        })
+        supported
+            .iter()
+            .copied()
+            .min_by_key(|effort| ((self as u8).abs_diff(*effort as u8), Reverse(*effort)))
     }
 }
 

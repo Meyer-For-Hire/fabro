@@ -382,6 +382,7 @@ models/run-links.ts
 models/run-manifest.ts
 models/run-meta-branch-settings.ts
 models/run-mode.ts
+models/run-model-controls.ts
 models/run-model-settings.ts
 models/run-model.ts
 models/run-namespace.ts

@@ -1014,33 +1014,6 @@ mod tests {
     }
 
     #[test]
-    fn historical_failover_event_defaults_new_route_context() {
-        let line = json!({
-            "id": "evt_failover",
-            "ts": "2026-04-04T12:00:00.000Z",
-            "run_id": fixtures::RUN_1,
-            "event": "agent.failover",
-            "properties": {
-                "from_provider": "anthropic",
-                "from_model": "claude-fable-5",
-                "to_provider": "openai",
-                "to_model": "gpt-5.6-sol",
-                "error": "provider unavailable"
-            }
-        });
-
-        let parsed = RunEvent::from_value(line).unwrap();
-        let EventBody::Failover(props) = parsed.body else {
-            panic!("expected agent.failover");
-        };
-        assert_eq!(props.original_provider, None);
-        assert_eq!(props.original_model, None);
-        assert_eq!(props.attempt, None);
-        assert_eq!(props.requested_reasoning_effort, None);
-        assert_eq!(props.effective_reasoning_effort, None);
-    }
-
-    #[test]
     fn run_created_round_trip_preserves_manifest_blob() {
         let line = json!({
             "id": "evt_created_blob",

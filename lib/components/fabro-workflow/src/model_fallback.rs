@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use fabro_model::{Catalog, FallbackTarget, Model, ModelSelectionError, ProviderId};
+use fabro_model::{
+    Catalog, FallbackTarget, Model, ModelSelectionError, ProviderId, ReasoningEffort,
+};
 use fabro_types::settings::{ModelRef, ResolvedModelRef};
 use fabro_types::{RunNoticeCode, RunNoticeLevel};
 
@@ -16,6 +18,7 @@ pub struct ModelFallbackPolicy {
 }
 
 impl ModelFallbackPolicy {
+    #[cfg(test)]
     #[must_use]
     pub fn new(chains: BTreeMap<String, Vec<FallbackTarget>>) -> Self {
         Self { chains }
@@ -28,8 +31,13 @@ impl ModelFallbackPolicy {
         provider: &ProviderId,
         model: &str,
     ) -> Option<&'a [FallbackTarget]> {
-        let canonical = canonical_model_id(catalog, provider, model);
-        self.chains.get(&canonical).map(Vec::as_slice)
+        self.chain_for_canonical(&catalog.canonical_model_id(provider, model))
+    }
+
+    /// Look up a chain by an already-canonicalized requested model ID.
+    #[must_use]
+    pub fn chain_for_canonical(&self, canonical_model: &str) -> Option<&[FallbackTarget]> {
+        self.chains.get(canonical_model).map(Vec::as_slice)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&str, &[FallbackTarget])> {
@@ -39,20 +47,14 @@ impl ModelFallbackPolicy {
     }
 
     #[must_use]
+    pub fn len(&self) -> usize {
+        self.chains.len()
+    }
+
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.chains.is_empty()
     }
-}
-
-pub(crate) fn canonical_model_id(catalog: &Catalog, provider: &ProviderId, model: &str) -> String {
-    catalog.get_on_provider(provider, model).map_or_else(
-        || {
-            catalog
-                .select(model, None, &catalog.all_provider_ids())
-                .map_or_else(|_| model.to_string(), |offering| offering.id.to_string())
-        },
-        |offering| offering.id.to_string(),
-    )
 }
 
 /// Server-side result of canonicalizing and filtering configured fallback
@@ -91,6 +93,11 @@ pub enum ModelFallbackNotice {
         reference:       ModelRef,
         target:          FallbackTarget,
     },
+    NoNearbyReasoningLevel {
+        requested_model:  String,
+        target:           FallbackTarget,
+        requested_effort: ReasoningEffort,
+    },
     ChainEmpty {
         requested_model: String,
     },
@@ -105,7 +112,8 @@ impl ModelFallbackNotice {
             | Self::NoConfiguredOffering { .. }
             | Self::PrimaryNotInCatalog { .. }
             | Self::NoCompatibleModel { .. }
-            | Self::Duplicate { .. } => RunNoticeCode::ModelFallbackSkipped,
+            | Self::Duplicate { .. }
+            | Self::NoNearbyReasoningLevel { .. } => RunNoticeCode::ModelFallbackSkipped,
         }
     }
 
@@ -117,6 +125,7 @@ impl ModelFallbackNotice {
             | Self::NoConfiguredOffering { .. }
             | Self::PrimaryNotInCatalog { .. }
             | Self::NoCompatibleModel { .. }
+            | Self::NoNearbyReasoningLevel { .. }
             | Self::ChainEmpty { .. } => RunNoticeLevel::Warn,
         }
     }
@@ -166,6 +175,13 @@ impl ModelFallbackNotice {
             } => format!(
                 "Model fallback `{reference}` for requested model `{requested_model}` was skipped because target `{target}` already appears in that chain."
             ),
+            Self::NoNearbyReasoningLevel {
+                requested_model,
+                target,
+                requested_effort,
+            } => format!(
+                "Model fallback `{target}` for requested model `{requested_model}` was skipped because it has no reasoning level near `{requested_effort}`."
+            ),
             Self::ChainEmpty { requested_model } => format!(
                 "No usable model fallbacks remain for requested model `{requested_model}` after filtering its configured candidates."
             ),
@@ -180,15 +196,17 @@ impl ModelFallbackNotice {
 /// parses the raw table and cannot canonicalize model aliases.
 pub fn resolve_model_fallbacks(
     catalog: &Catalog,
-    eligible: &HashSet<ProviderId>,
+    configured_providers: &[ProviderId],
     configured: &BTreeMap<String, Vec<ModelRef>>,
 ) -> Result<ResolvedModelFallbacks, Error> {
+    let eligible = configured_providers.iter().cloned().collect::<HashSet<_>>();
     let mut resolved = ResolvedModelFallbacks::default();
     let mut raw_key_by_canonical = HashMap::<String, String>::new();
 
     for (raw_key, references) in configured {
+        require_bare_model_key(catalog, raw_key)?;
         let selected =
-            catalog.resolve_selection_with_catalog_fallback(Some(raw_key), None, eligible)?;
+            catalog.resolve_selection_with_catalog_fallback(Some(raw_key), None, &eligible)?;
         let requested_model = selected.model;
 
         if let Some(previous) =
@@ -209,7 +227,7 @@ pub fn resolve_model_fallbacks(
                 &requested_model,
                 &primary,
                 primary_model,
-                eligible,
+                &eligible,
                 model_ref,
             )? {
                 FallbackCandidate::Skipped(notice) => {
@@ -239,6 +257,30 @@ pub fn resolve_model_fallbacks(
     }
 
     Ok(resolved)
+}
+
+/// Reject chain keys that name a provider. Keys are requested-model selectors;
+/// a provider-qualified key can never match a dispatch-time canonical model
+/// ID, so it would be silently dead configuration.
+fn require_bare_model_key(catalog: &Catalog, raw_key: &str) -> Result<(), Error> {
+    let reference: ModelRef = raw_key
+        .parse()
+        .map_err(|error| Error::Precondition(format!("`run.model.fallbacks` key: {error}")))?;
+    match reference.resolve(catalog) {
+        Ok(ResolvedModelRef::Model { provider: None, .. }) => Ok(()),
+        Ok(ResolvedModelRef::Model {
+            provider: Some(_),
+            selector,
+        }) => Err(Error::Precondition(format!(
+            "`run.model.fallbacks` keys name a requested model; use `{selector}` instead of `{raw_key}`"
+        ))),
+        Ok(ResolvedModelRef::Provider(provider)) => Err(Error::Precondition(format!(
+            "`run.model.fallbacks` key `{raw_key}` names provider `{provider}`; keys must name a requested model"
+        ))),
+        Err(ambiguous) => Err(Error::Precondition(format!(
+            "`run.model.fallbacks` key: {ambiguous}"
+        ))),
+    }
 }
 
 enum FallbackCandidate {
@@ -332,7 +374,7 @@ fn resolve_fallback_candidate(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashSet};
+    use std::collections::BTreeMap;
 
     use fabro_model::{Catalog, FallbackTarget, ProviderId};
 
@@ -359,7 +401,7 @@ enabled = true
     #[test]
     fn canonicalizes_keys_and_keeps_each_chain_independent() {
         let catalog = openrouter_catalog();
-        let eligible = HashSet::from([ProviderId::new("openrouter")]);
+        let eligible = [ProviderId::new("openrouter")];
         let configured = BTreeMap::from([
             ("gpt-sol".to_string(), references(&["claude-opus"])),
             (
@@ -393,7 +435,7 @@ enabled = true
     #[test]
     fn rejects_aliases_that_define_the_same_requested_model_twice() {
         let catalog = openrouter_catalog();
-        let eligible = HashSet::from([ProviderId::new("openrouter")]);
+        let eligible = [ProviderId::new("openrouter")];
         let configured = BTreeMap::from([
             ("gpt-sol".to_string(), references(&["claude-opus"])),
             ("gpt-5.6-sol".to_string(), references(&["claude-fable"])),
@@ -410,9 +452,26 @@ enabled = true
     }
 
     #[test]
+    fn rejects_provider_qualified_keys() {
+        let catalog = openrouter_catalog();
+        let eligible = [ProviderId::new("openrouter")];
+        let configured = BTreeMap::from([(
+            "openrouter:gpt-sol".to_string(),
+            references(&["claude-opus"]),
+        )]);
+
+        let error = resolve_model_fallbacks(&catalog, &eligible, &configured).unwrap_err();
+
+        assert!(
+            error.to_string().contains("keys name a requested model"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn skips_unconfigured_candidates_per_requested_model() {
         let catalog = openrouter_catalog();
-        let eligible = HashSet::from([ProviderId::new("openrouter")]);
+        let eligible = [ProviderId::new("openrouter")];
         let configured = BTreeMap::from([(
             "kimi-k3".to_string(),
             references(&["kimi:kimi-k3", "openrouter:kimi-k3"]),
@@ -451,11 +510,11 @@ enabled = true
             .expect("catalog override should parse");
             Catalog::from_builtin_with_overrides(&overrides).expect("catalog should build")
         };
-        let eligible = HashSet::from([
+        let eligible = [
             ProviderId::new("modal"),
             ProviderId::new("kimi"),
             ProviderId::new("openrouter"),
-        ]);
+        ];
         let configured = BTreeMap::from([
             (
                 "kimi-k3".to_string(),

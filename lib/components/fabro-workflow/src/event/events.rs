@@ -584,16 +584,7 @@ pub enum Event {
     },
     Failover {
         stage: String,
-        original_provider: String,
-        original_model: String,
-        attempt: u32,
-        from_provider: String,
-        from_model: String,
-        to_provider: String,
-        to_model: String,
-        requested_reasoning_effort: Option<String>,
-        effective_reasoning_effort: Option<String>,
-        error: String,
+        props: fabro_types::FailoverProps,
     },
     CommandStarted {
         node_id:    String,
@@ -1398,31 +1389,19 @@ impl Event {
             Self::SshAccessReady { ssh_command } => {
                 info!(ssh_command, "SSH access ready");
             }
-            Self::Failover {
-                stage,
-                original_provider,
-                original_model,
-                attempt,
-                from_provider,
-                from_model,
-                to_provider,
-                to_model,
-                requested_reasoning_effort,
-                effective_reasoning_effort,
-                error,
-            } => {
+            Self::Failover { stage, props } => {
                 warn!(
                     stage,
-                    original_provider,
-                    original_model,
-                    attempt,
-                    from_provider,
-                    from_model,
-                    to_provider,
-                    to_model,
-                    requested_reasoning_effort,
-                    effective_reasoning_effort,
-                    error,
+                    original_provider = %props.original_provider,
+                    original_model = %props.original_model,
+                    attempt = props.attempt,
+                    from_provider = %props.from_provider,
+                    from_model = %props.from_model,
+                    to_provider = %props.to_provider,
+                    to_model = %props.to_model,
+                    requested_reasoning_effort = ?props.requested_reasoning_effort,
+                    effective_reasoning_effort = ?props.effective_reasoning_effort,
+                    error = %props.error,
                     "LLM provider failover"
                 );
             }

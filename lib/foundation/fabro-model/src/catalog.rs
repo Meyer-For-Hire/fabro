@@ -401,8 +401,8 @@ static GLOBAL_CATALOG: LazyLock<Catalog> = LazyLock::new(|| {
 /// A resolved fallback target: provider name + model ID.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FallbackTarget {
-    pub provider: String,
-    pub model:    String,
+    pub provider: ProviderId,
+    pub model:    ModelId,
 }
 
 impl FallbackTarget {
@@ -411,8 +411,8 @@ impl FallbackTarget {
     /// selectors all use one constructor.
     pub fn new(provider: impl std::fmt::Display, model: impl std::fmt::Display) -> Self {
         Self {
-            provider: provider.to_string(),
-            model:    model.to_string(),
+            provider: ProviderId::new(provider.to_string()),
+            model:    ModelId::new(model.to_string()),
         }
     }
 }
@@ -1049,6 +1049,23 @@ impl Catalog {
             .iter()
             .map(|provider| provider.id.clone())
             .collect()
+    }
+
+    /// Canonicalize a model selector to its catalog model ID, preferring the
+    /// given provider's offering. Unknown selectors pass through verbatim.
+    ///
+    /// Model-keyed fallback chains are written and read through this one
+    /// function so a configured chain key and a dispatch-time lookup cannot
+    /// silently disagree.
+    #[must_use]
+    pub fn canonical_model_id(&self, provider: &ProviderId, selector: &str) -> String {
+        self.get_on_provider(provider, selector).map_or_else(
+            || {
+                self.select(selector, None, &self.all_provider_ids())
+                    .map_or_else(|_| selector.to_string(), |offering| offering.id.to_string())
+            },
+            |offering| offering.id.to_string(),
+        )
     }
 
     /// Select the highest-priority default model on an eligible provider.

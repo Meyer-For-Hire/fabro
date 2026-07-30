@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -626,8 +626,7 @@ fn run_model_fallback_check(
         return true;
     }
 
-    let eligible = ready_providers.iter().cloned().collect::<HashSet<_>>();
-    let resolved = match resolve_model_fallbacks(catalog, &eligible, configured) {
+    let resolved = match resolve_model_fallbacks(catalog, ready_providers, configured) {
         Ok(resolved) => resolved,
         Err(error) => {
             checks.push(CheckResult {
@@ -676,10 +675,7 @@ fn run_model_fallback_check(
         } else {
             CheckStatus::Pass
         },
-        summary: format!(
-            "{} requested model chain(s)",
-            resolved.policy.iter().count()
-        ),
+        summary: format!("{} requested model chain(s)", resolved.policy.len()),
         details,
         remediation: None,
     });

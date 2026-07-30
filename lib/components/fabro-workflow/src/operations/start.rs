@@ -617,7 +617,7 @@ fn resolve_start_llm(
         settings.model.provider.as_deref(),
         false,
     )?;
-    let fallbacks = resolve_model_fallbacks(catalog, &eligible, &settings.model.fallbacks)?;
+    let fallbacks = resolve_model_fallbacks(catalog, configured, &settings.model.fallbacks)?;
 
     Ok(ResolvedStartLlm {
         model,
