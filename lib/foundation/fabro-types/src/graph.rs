@@ -149,6 +149,25 @@ impl Node {
         }
     }
 
+    /// Appends a class, ignoring blank names and ones already present.
+    ///
+    /// Classes accumulate from several sources — the `class` attribute,
+    /// enclosing subgraphs, and import placeholders — so every caller needs the
+    /// same de-duplicating append.
+    ///
+    /// The name is trimmed, and a name that is empty or only whitespace is
+    /// dropped. Stylesheet selectors match class names exactly, so a padded
+    /// name would never match any rule.
+    ///
+    /// Order is preserved because the first class is meaningful: it supplies
+    /// the fallback thread ID for fidelity threading.
+    pub fn add_class(&mut self, class: &str) {
+        let class = class.trim();
+        if !class.is_empty() && !self.classes.iter().any(|existing| existing == class) {
+            self.classes.push(class.to_string());
+        }
+    }
+
     fn str_attr(&self, key: &str) -> Option<&str> {
         self.attrs.get(key).and_then(AttrValue::as_str)
     }
@@ -271,11 +290,6 @@ impl Node {
     #[must_use]
     pub fn thread_id(&self) -> Option<&str> {
         self.str_attr("thread_id")
-    }
-
-    #[must_use]
-    pub fn class(&self) -> Option<&str> {
-        self.str_attr("class")
     }
 
     pub fn timeout(&self) -> Option<Duration> {
@@ -663,7 +677,7 @@ mod tests {
         assert_eq!(node.fallback_retry_target(), None);
         assert_eq!(node.fidelity(), None);
         assert_eq!(node.thread_id(), None);
-        assert_eq!(node.class(), None);
+        assert!(node.classes.is_empty());
         assert_eq!(node.timeout(), None);
         assert_eq!(node.model(), None);
         assert_eq!(node.provider(), None);
@@ -673,6 +687,18 @@ mod tests {
         assert_eq!(node.retry_policy(), None);
         assert_eq!(node.max_visits(), None);
         assert!(node.project_memory());
+    }
+
+    #[test]
+    fn add_class_trims_names_and_drops_blanks_and_duplicates() {
+        let mut node = Node::new("work");
+        node.add_class("coding");
+        node.add_class(" coding ");
+        node.add_class("");
+        node.add_class("   ");
+        node.add_class("\tcritical\n");
+
+        assert_eq!(node.classes, ["coding", "critical"]);
     }
 
     fn node_with(id: &str, attrs: &[(&str, &str)]) -> Node {

@@ -352,11 +352,9 @@ impl ImportTransform {
             Self::remap_retry_target(&mut merged_node.attrs, placeholder_id);
 
             for class_name in &placeholder.class_names {
-                Self::push_class(&mut merged_node.classes, class_name);
+                merged_node.add_class(class_name);
             }
-            if !placeholder.normalized_class.is_empty() {
-                Self::push_class(&mut merged_node.classes, &placeholder.normalized_class);
-            }
+            merged_node.add_class(&placeholder.normalized_class);
 
             graph.nodes.insert(prefixed_id, merged_node);
         }
@@ -413,24 +411,14 @@ impl ImportTransform {
             .get(placeholder_id)
             .ok_or_else(|| format!("missing import placeholder '{placeholder_id}'"))?;
         let mut default_attrs = HashMap::new();
-        let mut class_names = Vec::new();
 
         for (key, value) in &node.attrs {
             if key == "import" {
                 continue;
             }
 
+            // The parser already split `class` into `node.classes`.
             if key == "class" {
-                if let Some(class_attr) = value.as_str() {
-                    for class_name in class_attr.split(',') {
-                        let class_name = class_name.trim();
-                        if !class_name.is_empty()
-                            && !class_names.iter().any(|value| value == class_name)
-                        {
-                            class_names.push(class_name.to_string());
-                        }
-                    }
-                }
                 continue;
             }
 
@@ -446,7 +434,7 @@ impl ImportTransform {
 
         Ok(PlaceholderOptions {
             default_attrs,
-            class_names,
+            class_names: node.classes.clone(),
             normalized_class: Self::normalize_class_name(placeholder_id),
         })
     }
@@ -618,12 +606,6 @@ impl ImportTransform {
         ]
         .into_iter()
         .any(|key| edge.attrs.contains_key(key))
-    }
-
-    fn push_class(classes: &mut Vec<String>, class_name: &str) {
-        if !classes.iter().any(|value| value == class_name) {
-            classes.push(class_name.to_string());
-        }
     }
 
     fn normalize_class_name(label: &str) -> String {
@@ -1120,7 +1102,7 @@ mod tests {
         let graph = apply_import(
             r#"digraph Deploy {
                 start [shape=Mdiamond]
-                validate [import="./validate.fabro", model="haiku", backend="acp", acp.command="python fake_agent.py", class="fast, shared"]
+                validate [import="./validate.fabro", model="haiku", backend="acp", acp.command="python fake_agent.py", class="fast shared"]
                 exit [shape=Msquare]
                 start -> validate -> exit
             }"#,

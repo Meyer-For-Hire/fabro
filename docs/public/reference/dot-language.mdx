@@ -195,7 +195,7 @@ Other node types still need their shape, because their attributes don't identify
 | `label` | String | Display name in the graph visualization |
 | `shape` | Identifier | Graphviz shape — determines handler type (see table above) |
 | `type` | String | Explicit handler type (overrides shape) |
-| `class` | String | Comma-separated classes for [stylesheet](/workflows/stylesheets) targeting |
+| `class` | String | Classes for [stylesheet](/workflows/stylesheets) targeting. Separate multiple classes with spaces. Commas are also accepted for compatibility. |
 | `timeout` | Duration | Execution timeout (e.g. `900s`) |
 | `max_visits` | Integer | Max times this node can execute in a run. Overrides the graph-level `max_node_visits` for this node. |
 | `max_retries` | Integer | Override default retry count |

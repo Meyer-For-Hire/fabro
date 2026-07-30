@@ -47,6 +47,15 @@ fn convert_attrs(block: &AttrBlock) -> HashMap<String, AttrValue> {
         .collect()
 }
 
+/// Split a `class` attribute value into individual class names.
+///
+/// Classes are separated by whitespace. Commas are also accepted, because they
+/// were the only separator Fabro used to recognize. Splitting on commas first
+/// and then on whitespace drops empty entries without extra trimming.
+fn split_class_attr(class_attr: &str) -> impl Iterator<Item = &str> {
+    class_attr.split(',').flat_map(str::split_whitespace)
+}
+
 /// Derive a CSS class name from a subgraph label.
 fn derive_class_from_label(label: &str) -> String {
     label
@@ -97,13 +106,6 @@ impl SemanticState {
         })
     }
 
-    fn add_class_to_node(node: &mut Node, cls: &str) {
-        let cls_string = cls.to_string();
-        if !node.classes.contains(&cls_string) {
-            node.classes.push(cls_string);
-        }
-    }
-
     fn process_node(&mut self, node_stmt: &NodeStmt, subgraph_class: Option<&str>) {
         let node = self.ensure_node(&node_stmt.id);
         if let Some(attrs) = &node_stmt.attrs {
@@ -112,20 +114,18 @@ impl SemanticState {
             }
         }
         if let Some(cls) = subgraph_class {
-            Self::add_class_to_node(node, cls);
+            node.add_class(cls);
         }
-        // Parse explicit class attr into classes vec
-        let class_str = node
+        // Node defaults can also set `class`, so read the merged attrs. The
+        // clone releases the borrow on `node.attrs` before appending.
+        let class_attr = node
             .attrs
             .get("class")
             .and_then(AttrValue::as_str)
             .map(String::from);
-        if let Some(class_str) = class_str {
-            for cls in class_str.split(',') {
-                let cls = cls.trim().to_string();
-                if !cls.is_empty() && !node.classes.contains(&cls) {
-                    node.classes.push(cls);
-                }
+        if let Some(class_attr) = class_attr {
+            for cls in split_class_attr(&class_attr) {
+                node.add_class(cls);
             }
         }
     }
@@ -137,7 +137,7 @@ impl SemanticState {
             }
             let node = self.ensure_node(id);
             if let Some(cls) = subgraph_class {
-                Self::add_class_to_node(node, cls);
+                node.add_class(cls);
             }
         }
         let edge_attrs = edge_stmt
@@ -501,23 +501,36 @@ mod tests {
         assert_eq!(graph.edges[1].label(), Some("next"));
     }
 
-    #[test]
-    fn ast_to_graph_class_attr_parsed() {
+    fn classes_from_attr(class_attr: &str) -> Vec<String> {
         let dot = DotGraph {
             name:       "ClassTest".into(),
             statements: vec![Statement::Node(NodeStmt {
-                id:    "review".into(),
-                attrs: Some(vec![(
-                    "class".into(),
-                    AstValue::Str("code,critical".into()),
-                )]),
+                id:    "work".into(),
+                attrs: Some(vec![("class".into(), AstValue::Str(class_attr.into()))]),
             })],
         };
 
-        let graph = ast_to_graph(&dot).unwrap();
-        let review = &graph.nodes["review"];
-        assert!(review.classes.contains(&"code".to_string()));
-        assert!(review.classes.contains(&"critical".to_string()));
+        ast_to_graph(&dot).unwrap().nodes["work"].classes.clone()
+    }
+
+    #[test]
+    fn ast_to_graph_class_attr_splits_on_whitespace_and_commas() {
+        let expected = vec!["coding", "critical"];
+        for class_attr in [
+            "coding critical",
+            "coding,critical",
+            "coding, critical",
+            "coding  critical",
+            "  coding\tcritical\n",
+            "coding,,critical",
+            "coding critical coding",
+        ] {
+            assert_eq!(
+                classes_from_attr(class_attr),
+                expected,
+                "class attr {class_attr:?}"
+            );
+        }
     }
 
     #[test]

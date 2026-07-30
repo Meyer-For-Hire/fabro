@@ -1523,6 +1523,39 @@ fn stylesheet_comments_apply_via_parsed_graph() {
 }
 
 #[test]
+fn stylesheet_application_matches_space_separated_classes_from_dot() {
+    let input = r#"digraph StyleTest {
+        graph [
+            goal="Test class selectors",
+            model_stylesheet="
+                *           { model: default-model; provider: default-provider; }
+                .research   { reasoning_effort: high; }
+                .ensemble-a { model: ensemble-model; provider: openrouter; }
+            "
+        ]
+        start [shape=Mdiamond]
+        work  [shape=tab, class="research ensemble-a", prompt="Do work"]
+        exit  [shape=Msquare]
+        start -> work -> exit
+    }"#;
+
+    let graph = parse(input).expect("parse should succeed");
+    validate_or_raise(&graph, &[]).expect("validation should pass");
+
+    let transform = StylesheetApplicationTransform;
+    let graph = transform.apply(graph).unwrap();
+    let work = &graph.nodes["work"];
+
+    assert_eq!(work.classes, vec!["research", "ensemble-a"]);
+    assert_eq!(work.model(), Some("ensemble-model"));
+    assert_eq!(work.provider(), Some("openrouter"));
+    assert_eq!(
+        work.attrs.get("reasoning_effort"),
+        Some(&AttrValue::String("high".to_string()))
+    );
+}
+
+#[test]
 fn stylesheet_parse_and_apply_directly() {
     let stylesheet_text = "* { model: base; } .fast { model: turbo; }";
     let stylesheet = parse_stylesheet(stylesheet_text).expect("stylesheet parse should succeed");
