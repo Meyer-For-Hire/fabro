@@ -1,0 +1,10 @@
+digraph OfflineFallbacks {
+    graph [goal="Validate a future model fallback offline"]
+
+    start [shape=Mdiamond, label="Start"]
+    exit  [shape=Msquare, label="Exit"]
+
+    work [label="Work", prompt="Do work", model="future-primary"]
+
+    start -> work -> exit
+}

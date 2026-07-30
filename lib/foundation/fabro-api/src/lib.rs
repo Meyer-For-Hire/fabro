@@ -25,7 +25,7 @@ pub mod types {
         ReasoningEffortFeature, Speed as BillingSpeed, TokenCounts as CompletionUsage,
     };
     pub use fabro_types::run_event::AgentSessionActivatedProps;
-    pub use fabro_types::settings::run::McpHttpProtocol;
+    pub use fabro_types::settings::run::{McpHttpProtocol, RunModelControls, RunModelSettings};
     pub use fabro_types::settings::server::{
         GithubIntegrationSettings, GithubIntegrationStrategy, IntegrationWebhooksSettings,
         LogDestination, ObjectStoreSettings, ServerApiSettings, ServerArtifactsSettings,

@@ -1,6 +1,6 @@
 //! Model references for `run.model.fallbacks`.
 //!
-//! Each entry is one of:
+//! Each fallback-chain entry is one of:
 //!
 //! - a bare token such as `openai` or `gpt-5.4` — the parser cannot tell alone
 //!   whether the token is a provider name or a model alias

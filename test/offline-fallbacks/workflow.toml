@@ -1,0 +1,7 @@
+_version = 1
+
+[workflow]
+graph = "workflow.fabro"
+
+[run.model.fallbacks]
+"future-primary" = ["future-provider:future-model"]

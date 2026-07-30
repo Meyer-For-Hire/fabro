@@ -997,7 +997,7 @@ fn attach_json_errors_without_prompting_for_human_input() {
                   "reasoning_effort": null,
                   "speed": null
                 },
-                "fallbacks": [],
+                "fallbacks": {},
                 "name": "[DEFAULT_MODEL]",
                 "provider": "openai"
               },

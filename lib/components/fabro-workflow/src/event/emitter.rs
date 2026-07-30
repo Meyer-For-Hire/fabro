@@ -84,6 +84,24 @@ impl Emitter {
         });
     }
 
+    pub fn notice_scoped(
+        &self,
+        level: RunNoticeLevel,
+        code: RunNoticeCode,
+        message: impl Into<String>,
+        scope: &StageScope,
+    ) {
+        self.emit_scoped(
+            &Event::RunNotice {
+                level,
+                code: code.to_string(),
+                message: message.into(),
+                exec_output_tail: None,
+            },
+            scope,
+        );
+    }
+
     pub fn notice_with_tail(
         &self,
         level: RunNoticeLevel,

@@ -354,6 +354,7 @@ export * from './run-manifest';
 export * from './run-meta-branch-settings';
 export * from './run-mode';
 export * from './run-model';
+export * from './run-model-controls';
 export * from './run-model-settings';
 export * from './run-namespace';
 export * from './run-origin';

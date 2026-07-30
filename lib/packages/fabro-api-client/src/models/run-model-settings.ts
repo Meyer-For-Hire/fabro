@@ -13,9 +13,16 @@
  */
 
 
+// May contain unused imports in some cases
+// @ts-ignore
+import type { RunModelControls } from './run-model-controls';
 
 export interface RunModelSettings {
     'provider': string | null;
     'name': string | null;
-    'fallbacks': Array<string>;
+    /**
+     * Ordered fallback targets keyed by the originally requested model. Each chain is independent; selecting a fallback target does not activate that target model\'s own chain.
+     */
+    'fallbacks': { [key: string]: Array<string>; };
+    'controls'?: RunModelControls;
 }

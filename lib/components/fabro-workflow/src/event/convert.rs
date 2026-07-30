@@ -1146,20 +1146,7 @@ fn event_body_from_event(event: &Event) -> EventBody {
                 ssh_command: ssh_command.clone(),
             })
         }
-        Event::Failover {
-            from_provider,
-            from_model,
-            to_provider,
-            to_model,
-            error,
-            ..
-        } => EventBody::Failover(fabro_types::FailoverProps {
-            from_provider: from_provider.clone(),
-            from_model:    from_model.clone(),
-            to_provider:   to_provider.clone(),
-            to_model:      to_model.clone(),
-            error:         error.clone(),
-        }),
+        Event::Failover { props, .. } => EventBody::Failover(props.clone()),
         Event::CommandStarted {
             script,
             command,

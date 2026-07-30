@@ -245,6 +245,16 @@ fn main() {
             &[],
         ),
         (
+            "RunModelSettings",
+            "fabro_types::settings::run::RunModelSettings",
+            &[],
+        ),
+        (
+            "RunModelControls",
+            "fabro_types::settings::run::RunModelControls",
+            &[],
+        ),
+        (
             "ServerSandboxSettings",
             "fabro_types::settings::server::ServerSandboxSettings",
             &[],

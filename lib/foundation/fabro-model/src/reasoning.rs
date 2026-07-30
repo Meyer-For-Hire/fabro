@@ -4,6 +4,8 @@
 //! validation, OpenAPI replacement types, and the LLM client all share one
 //! enum so that adding a new effort value remains a Rust change.
 
+use std::cmp::Reverse;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(
@@ -36,6 +38,18 @@ impl ReasoningEffort {
     #[must_use]
     pub fn variants() -> &'static [Self] {
         <Self as strum::VariantArray>::VARIANTS
+    }
+
+    /// Select the supported effort nearest to this value.
+    ///
+    /// The enum declaration defines the ordered progression. When two values
+    /// are equally distant, the higher effort wins.
+    #[must_use]
+    pub fn closest_supported(self, supported: &[Self]) -> Option<Self> {
+        supported
+            .iter()
+            .copied()
+            .min_by_key(|effort| ((self as u8).abs_diff(*effort as u8), Reverse(*effort)))
     }
 }
 
@@ -89,6 +103,49 @@ mod tests {
         let v = ReasoningEffort::VARIANTS;
         assert_eq!(v[0], ReasoningEffort::Low);
         assert_eq!(v[v.len() - 1], ReasoningEffort::Max);
+    }
+
+    #[test]
+    fn closest_supported_uses_exact_match() {
+        assert_eq!(
+            ReasoningEffort::High.closest_supported(&[
+                ReasoningEffort::Low,
+                ReasoningEffort::High,
+                ReasoningEffort::Max,
+            ]),
+            Some(ReasoningEffort::High)
+        );
+    }
+
+    #[test]
+    fn closest_supported_rounds_equal_distance_up() {
+        let kimi = [
+            ReasoningEffort::Low,
+            ReasoningEffort::High,
+            ReasoningEffort::Max,
+        ];
+        assert_eq!(
+            ReasoningEffort::Medium.closest_supported(&kimi),
+            Some(ReasoningEffort::High)
+        );
+        assert_eq!(
+            ReasoningEffort::XHigh.closest_supported(&kimi),
+            Some(ReasoningEffort::Max)
+        );
+    }
+
+    #[test]
+    fn closest_supported_uses_nearest_lower_value_when_needed() {
+        assert_eq!(
+            ReasoningEffort::Max
+                .closest_supported(&[ReasoningEffort::High, ReasoningEffort::XHigh]),
+            Some(ReasoningEffort::XHigh)
+        );
+    }
+
+    #[test]
+    fn closest_supported_returns_none_for_unsupported_control() {
+        assert_eq!(ReasoningEffort::High.closest_supported(&[]), None);
     }
 
     #[test]

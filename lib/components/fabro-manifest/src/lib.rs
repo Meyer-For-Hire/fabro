@@ -76,7 +76,7 @@ pub fn build_run_overrides(input: RunOverrideInput<'_>) -> RunLayer {
     let model = (input.model.is_some() || input.provider.is_some()).then(|| RunModelLayer {
         provider:  input.provider.map(String::from),
         name:      input.model.map(String::from),
-        fallbacks: Vec::new(),
+        fallbacks: MergeMap::default(),
         controls:  None,
     });
     let environment = (input.environment.is_some()

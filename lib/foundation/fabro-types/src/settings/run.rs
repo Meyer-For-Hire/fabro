@@ -6,7 +6,7 @@
 //! notifications, interviews, agent knobs, hooks, SCM targeting, pull-request
 //! behavior, and artifact collection.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::time::Duration as StdDuration;
 
@@ -680,16 +680,109 @@ pub enum RunGoal {
     File(InterpString),
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct RunModelSettings {
     pub provider:  Option<String>,
     pub name:      Option<String>,
-    pub fallbacks: Vec<ModelRef>,
+    /// Ordered fallback references keyed by the originally requested model.
+    ///
+    /// Keys remain raw selectors during offline configuration resolution.
+    /// The server canonicalizes them against its model catalog before a run
+    /// starts.
+    pub fallbacks: BTreeMap<String, Vec<ModelRef>>,
     /// Run-level default values for typed model controls
     /// (`reasoning_effort`, `speed`). Node and style attributes still win
     /// over these defaults.
     #[serde(default)]
     pub controls:  RunModelControls,
+}
+
+/// Temporary compatibility deserializer: releases before model-keyed
+/// fallbacks serialized `fallbacks` as a flat array that applied to the run's
+/// requested model, and that shape persists inside stored `run.created`
+/// events. A legacy array is keyed under `name` when one is set; a legacy
+/// chain for the implicit default model cannot be keyed and is dropped.
+///
+/// Remove once run logs recorded by pre-model-keyed releases (< 0.311) are
+/// out of the support window; then restore `derive(Deserialize)`.
+impl<'de> serde::Deserialize<'de> for RunModelSettings {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Shadow {
+            provider:  Option<String>,
+            name:      Option<String>,
+            fallbacks: FallbacksCompat,
+            #[serde(default)]
+            controls:  RunModelControls,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum FallbacksCompat {
+            Keyed(BTreeMap<String, Vec<ModelRef>>),
+            Legacy(Vec<ModelRef>),
+        }
+
+        let shadow = Shadow::deserialize(deserializer)?;
+        let fallbacks = match shadow.fallbacks {
+            FallbacksCompat::Keyed(chains) => chains,
+            FallbacksCompat::Legacy(chain) => match (&shadow.name, chain) {
+                (Some(name), chain) if !chain.is_empty() => BTreeMap::from([(name.clone(), chain)]),
+                _ => BTreeMap::new(),
+            },
+        };
+        Ok(Self {
+            provider: shadow.provider,
+            name: shadow.name,
+            fallbacks,
+            controls: shadow.controls,
+        })
+    }
+}
+
+#[cfg(test)]
+mod run_model_settings_compat_tests {
+    use super::RunModelSettings;
+
+    #[test]
+    fn keyed_fallbacks_round_trip() {
+        let settings: RunModelSettings = serde_json::from_value(serde_json::json!({
+            "provider": "openrouter",
+            "name": "claude-fable",
+            "fallbacks": {"claude-fable": ["gpt-sol"]}
+        }))
+        .unwrap();
+        let chain = &settings.fallbacks["claude-fable"];
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].to_string(), "gpt-sol");
+    }
+
+    #[test]
+    fn legacy_array_fallbacks_key_under_the_requested_model() {
+        let settings: RunModelSettings = serde_json::from_value(serde_json::json!({
+            "provider": null,
+            "name": "claude-fable",
+            "fallbacks": ["gpt-sol", "openrouter:claude-opus"]
+        }))
+        .unwrap();
+        let chain = &settings.fallbacks["claude-fable"];
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[1].to_string(), "openrouter:claude-opus");
+    }
+
+    #[test]
+    fn legacy_array_without_a_requested_model_is_dropped() {
+        let settings: RunModelSettings = serde_json::from_value(serde_json::json!({
+            "provider": null,
+            "name": null,
+            "fallbacks": ["gpt-sol"]
+        }))
+        .unwrap();
+        assert!(settings.fallbacks.is_empty());
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

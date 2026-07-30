@@ -381,12 +381,14 @@ permissions = "read-write"
 [run.model]
 provider = "anthropic"
 name = "claude-sonnet-4-5"
-fallbacks = ["openrouter:kimi-k3", "gpt-terra"]
+
+[run.model.fallbacks]
+"claude-sonnet-4-5" = ["openrouter:kimi-k3", "gpt-terra"]
 ```
 
 | Key | Type / values | Default | Description |
 |---|---|---|---|
-| `fallbacks` | array<string> | [] | Ordered fallback references: bare providers, bare model IDs or aliases,<br />or provider-qualified `provider:selector` values. A qualified selector<br />may be a model ID, alias, or provider API ID. Legacy `provider/model`<br />values remain accepted. Supports the `...` splice marker at layering<br />time — see [`super::splice_array`]. |
+| `fallbacks` | table<string, array<string>> | {} | Model-keyed fallback chains. Each value is an ordered list of bare<br />providers, bare model IDs or aliases, or provider-qualified<br />`provider:selector` values. A qualified selector may be a model ID,<br />alias, or provider API ID. Legacy `provider/model` values remain<br />accepted. Each list supports the `...` splice marker at layering time.<br />Fabro selects one chain from the original requested model. A fallback<br />target never activates another model's chain.<br /><br />Model keys stay unresolved in this sparse layer because `fabro<br />validate` is offline and has no server model catalog. |
 | `name` | string | None | Model name for workflow runs. |
 | `provider` | string | None | Provider name for workflow model selection. |
 

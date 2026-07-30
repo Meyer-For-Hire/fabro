@@ -14315,9 +14315,29 @@ components:
         name:
           type: ["string", "null"]
         fallbacks:
-          type: array
-          items:
-            $ref: "#/components/schemas/ModelRef"
+          type: object
+          description: >
+            Ordered fallback targets keyed by the originally requested model.
+            Each chain is independent; selecting a fallback target does not
+            activate that target model's own chain.
+          additionalProperties:
+            type: array
+            items:
+              $ref: "#/components/schemas/ModelRef"
+        controls:
+          $ref: "#/components/schemas/RunModelControls"
+
+    RunModelControls:
+      type: object
+      description: >
+        Run-level default values for typed model controls. Node and style
+        attributes still win over these defaults.
+      required: [reasoning_effort, speed]
+      properties:
+        reasoning_effort:
+          type: ["string", "null"]
+        speed:
+          type: ["string", "null"]
 
     RunGitSettings:
       type: object

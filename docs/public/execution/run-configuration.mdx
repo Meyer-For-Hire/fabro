@@ -45,10 +45,12 @@ working_dir = "/tmp/workdir"
 
 [run.model]
 name = "claude-sonnet-4-5"
-fallbacks = ["openai", "gemini"]
 
 [run.model.controls]
 reasoning_effort = "high"
+
+[run.model.fallbacks]
+"claude-sonnet-4-5" = ["openai", "gemini"]
 
 [[run.prepare.steps]]
 script = "git clone https://github.com/fabro-sh/fabro repo"
@@ -140,25 +142,43 @@ name = "claude-sonnet-4-5"
 |---|---|
 | `name` | Canonical model slug or alias (e.g. `claude-sonnet-4-5`, `opus`, `gemini-pro`). See [Models](/core-concepts/models). |
 | `provider` | Optional provider pin. When omitted, Fabro selects among ready offerings by provider priority. When present, an unavailable provider is an error rather than permission to switch. |
-| `fallbacks` | Ordered list of model references to try when the primary is unavailable. Entries can be bare provider tokens (`"openai"`), bare model IDs or aliases, or qualified `"provider:selector"` references. |
+| `fallbacks` | Table of ordered fallback lists keyed by the originally requested model. |
 
 Provider values are catalog provider ID strings. Built-in IDs like `anthropic` and `openai` work, and settings-defined IDs like `proxy` work after they are added under `[llm.providers.<id>]`.
 
 For a qualified fallback, the selector may be that provider's canonical model ID, alias, or API ID. Fabro splits on the first `:` when the part before it names a known provider, so provider API IDs may contain `/` or additional colons:
 
 ```toml title="run.toml"
-[run.model]
-fallbacks = [
+[run.model.fallbacks]
+"kimi-k3" = [
+  "kimi:kimi-k3",
   "openrouter:kimi-k3",
-  "gpt-terra",
+  "claude-opus",
 ]
 ```
 
-The first entry could equivalently be written as `"openrouter:moonshotai/kimi-k3"` using OpenRouter's API ID; both forms resolve to its canonical `kimi-k3` offering. The unqualified `gpt-terra` alias uses normal ready-provider priority selection. Legacy `provider/model` fallback references remain accepted but are normalized to `provider:model`.
+This chain applies only when the original request resolves to `kimi-k3`. It tries direct Moonshot AI, then OpenRouter, then Claude Opus. The OpenRouter entry could equivalently be written as `"openrouter:moonshotai/kimi-k3"` using its API ID. Legacy `provider/model` fallback references remain accepted but are normalized to `provider:model`.
 
 A colon alone does not make a reference qualified. Many model IDs contain one — ollama `name:tag` values, Bedrock inference-profile IDs and ARNs — so Fabro treats the reference as qualified only when the text before the first `:` names a known provider. `"llama3:8b"` stays a single model ID, while `"ollama:llama3:8b"` pins the `ollama` provider and passes `llama3:8b` as the selector.
 
-At run creation, Fabro resolves the primary selector and every node selector against the ready-provider snapshot. It persists the selected canonical model slug and provider, so resuming the run does not choose a different provider just because credentials or priorities changed. The configured fallback chain remains available for failures that occur while the materialized run is executing.
+At run creation, Fabro resolves the primary selector, every node selector, and the fallback table against the server's ready-provider snapshot. It persists the selected canonical model slug and provider, so resuming the run does not choose a different provider just because credentials or priorities changed. `fabro validate` only checks the table's TOML shape because it is offline and has no server model catalog. Use `fabro preflight` for catalog and provider checks.
+
+Each original requested model selects one fixed chain. Fabro does not jump to the chain configured for a fallback target. When a target lacks the requested reasoning level, Fabro uses the nearest supported level. It rounds equal-distance choices up.
+
+For example, a server that selects Modal as the primary `kimi-k3` offering can define these independent chains:
+
+```toml title="settings.toml"
+[run.model.fallbacks]
+"kimi-k3" = ["kimi:kimi-k3", "openrouter:kimi-k3", "claude-opus"]
+"glm-5.2" = ["gpt-sol"]
+"gpt-sol" = ["claude-opus"]
+"claude-opus" = ["gpt-sol"]
+"gpt-terra" = ["claude-opus"]
+"gpt-luna" = ["claude-sonnet"]
+"claude-fable" = ["gpt-sol", "claude-opus"]
+```
+
+If `claude-fable` falls back to `gpt-sol`, Fabro continues with `claude-opus` from the Fable list. It does not restart from the separate `gpt-sol` list.
 
 Historical built-in provider API IDs are accepted for compatibility and normalize before this selection. For example, `name = "openai/gpt-5.6-sol"` is treated as the canonical `gpt-5.6-sol` selector; omit `provider` to use readiness and priority, or set `provider` separately to pin an offering.
 
@@ -181,14 +201,14 @@ speed = "fast"
 | `reasoning_effort` | Native reasoning-effort value to request when the selected model allows it, such as `"low"`, `"medium"`, `"high"`, `"xhigh"`, or `"max"`. |
 | `speed` | Native speed value to request when the selected model declares it, such as `"fast"`. The standard speed is implicit and does not need to be set. |
 
-#### Fallbacks with splice
+#### Fallback lists with splice
 
-Use the reserved `"..."` marker in `fallbacks` to splice in the inherited list from lower-precedence layers:
+Use the reserved `"..."` marker in one model's list to splice in that model's inherited list from lower-precedence layers:
 
 ```toml title="run.toml"
-[run.model]
-# Prepend "anthropic" to whatever fallbacks the project config already defines.
-fallbacks = ["anthropic", "..."]
+[run.model.fallbacks]
+# Prepend Anthropic to the inherited chain for gpt-5.6-sol.
+"gpt-5.6-sol" = ["anthropic", "..."]
 ```
 
 ### `[run.prepare]`

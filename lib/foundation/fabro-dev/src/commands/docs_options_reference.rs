@@ -109,7 +109,9 @@ permissions = "read-write""#,
             r#"[run.model]
 provider = "anthropic"
 name = "claude-sonnet-4-5"
-fallbacks = ["openrouter:kimi-k3", "gpt-terra"]"#,
+
+[run.model.fallbacks]
+"claude-sonnet-4-5" = ["openrouter:kimi-k3", "gpt-terra"]"#,
         ),
         Section::of::<fabro_config::CliLoggingLayer>(
             "[cli.logging]",

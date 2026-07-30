@@ -583,12 +583,8 @@ pub enum Event {
         ssh_command: String,
     },
     Failover {
-        stage:         String,
-        from_provider: String,
-        from_model:    String,
-        to_provider:   String,
-        to_model:      String,
-        error:         String,
+        stage: String,
+        props: fabro_types::FailoverProps,
     },
     CommandStarted {
         node_id:    String,
@@ -1393,21 +1389,19 @@ impl Event {
             Self::SshAccessReady { ssh_command } => {
                 info!(ssh_command, "SSH access ready");
             }
-            Self::Failover {
-                stage,
-                from_provider,
-                from_model,
-                to_provider,
-                to_model,
-                error,
-            } => {
+            Self::Failover { stage, props } => {
                 warn!(
                     stage,
-                    from_provider,
-                    from_model,
-                    to_provider,
-                    to_model,
-                    error,
+                    original_provider = ?props.original_provider,
+                    original_model = ?props.original_model,
+                    attempt = ?props.attempt,
+                    from_provider = %props.from_provider,
+                    from_model = %props.from_model,
+                    to_provider = %props.to_provider,
+                    to_model = %props.to_model,
+                    requested_reasoning_effort = ?props.requested_reasoning_effort,
+                    effective_reasoning_effort = ?props.effective_reasoning_effort,
+                    error = %props.error,
                     "LLM provider failover"
                 );
             }
