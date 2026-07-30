@@ -154,6 +154,9 @@ impl Node {
     /// Classes accumulate from several sources — the `class` attribute,
     /// enclosing subgraphs, and import placeholders — so every caller needs the
     /// same de-duplicating append.
+    ///
+    /// Order is preserved because the first class is meaningful: it supplies
+    /// the fallback thread ID for fidelity threading.
     pub fn add_class(&mut self, class: &str) {
         if !class.is_empty() && !self.classes.iter().any(|existing| existing == class) {
             self.classes.push(class.to_string());

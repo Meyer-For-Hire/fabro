@@ -514,25 +514,23 @@ mod tests {
     }
 
     #[test]
-    fn ast_to_graph_space_separated_class_attr_parsed() {
-        assert_eq!(classes_from_attr("coding critical"), vec![
-            "coding", "critical"
-        ]);
-    }
-
-    #[test]
-    fn ast_to_graph_comma_separated_class_attr_parsed() {
-        assert_eq!(classes_from_attr("coding,critical"), vec![
-            "coding", "critical"
-        ]);
-    }
-
-    #[test]
-    fn ast_to_graph_mixed_class_separators_ignore_empty_and_duplicate_classes() {
-        assert_eq!(
-            classes_from_attr(" coding, critical  coding,\t,review\ncritical "),
-            vec!["coding", "critical", "review"]
-        );
+    fn ast_to_graph_class_attr_splits_on_whitespace_and_commas() {
+        let expected = vec!["coding", "critical"];
+        for class_attr in [
+            "coding critical",
+            "coding,critical",
+            "coding, critical",
+            "coding  critical",
+            "  coding\tcritical\n",
+            "coding,,critical",
+            "coding critical coding",
+        ] {
+            assert_eq!(
+                classes_from_attr(class_attr),
+                expected,
+                "class attr {class_attr:?}"
+            );
+        }
     }
 
     #[test]
