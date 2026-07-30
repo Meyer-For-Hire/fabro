@@ -100,7 +100,11 @@ jobs:
         # runner yet; shipping binary is exercised via Docker smoke tests.
         # Re-enable after verifying the workspace passes on this target.
         if: matrix.target != 'aarch64-unknown-linux-musl' && matrix.target != 'x86_64-unknown-linux-musl'
-        run: cargo nextest run --locked --workspace --target ${{ matrix.target }} --release --status-level slow --profile ci
+        run: |
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            ulimit -n 4096
+          fi
+          cargo nextest run --locked --workspace --target ${{ matrix.target }} --release --status-level slow --profile ci
 
       - name: Build (musl via cargo-zigbuild)
         if: matrix.musl
