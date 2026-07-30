@@ -838,13 +838,17 @@ impl AgentApiBackend {
         let supervisor = SubAgentSupervisor::new(config.max_subagent_depth);
         let supervisor_for_session = supervisor.clone();
 
-        // Build factory that creates child sessions WITHOUT subagent tools
+        // Build factory that creates child sessions WITHOUT subagent tools.
+        // Child sessions inherit the parent's tool hooks: blocking
+        // pre_tool_use hooks are the only policy boundary workflow agents
+        // have, so a subagent's tool calls must pass through them too.
         let factory_client = client.clone();
         let factory_profile_builder = profile_builder;
         let factory_env = Arc::clone(sandbox);
         let factory_tool_env = tool_env.cloned();
         let factory_fabro_run_tools = fabro_run_tools.clone();
         let factory_permission_level = config.permission_level;
+        let factory_tool_hooks = config.tool_hooks.clone();
         let factory: SessionFactory = Arc::new(move || {
             let mut child_profile = factory_profile_builder.build();
             if let Some(services) = factory_fabro_run_tools.clone() {
@@ -858,6 +862,7 @@ impl AgentApiBackend {
                 SessionOptions {
                     reasoning_effort: controls.reasoning_effort,
                     speed: controls.speed,
+                    tool_hooks: factory_tool_hooks.clone(),
                     permission_level: factory_permission_level,
                     ..SessionOptions::default()
                 },
@@ -2704,6 +2709,133 @@ reasoning = false
         assert!(names.contains(&"send_input".to_string()));
         assert!(names.contains(&"wait".to_string()));
         assert!(names.contains(&"close_agent".to_string()));
+    }
+
+    /// Records every `pre_tool_use` call it sees and lets them all proceed.
+    struct RecordingHooks(Arc<Mutex<Vec<String>>>);
+
+    #[async_trait]
+    impl fabro_agent::ToolHookCallback for RecordingHooks {
+        async fn pre_tool_use(
+            &self,
+            tool_name: &str,
+            _tool_input: &serde_json::Value,
+        ) -> fabro_agent::ToolHookDecision {
+            self.0.lock().unwrap().push(tool_name.to_string());
+            fabro_agent::ToolHookDecision::Proceed
+        }
+
+        async fn post_tool_use(&self, _tool_name: &str, _tool_call_id: &str, _output: &str) {}
+
+        async fn post_tool_use_failure(&self, _tool_name: &str, _tool_call_id: &str, _error: &str) {
+        }
+    }
+
+    /// Blocking `pre_tool_use` hooks are the only policy boundary a workflow
+    /// agent has: workflow sessions run at `PermissionLevel::Full` with the
+    /// whole tool registry exposed. A child session created for `spawn_agent`
+    /// therefore has to run under the same `tool_hooks` as its parent —
+    /// otherwise any agent that can spawn a subagent gets an unguarded
+    /// read-write-shell escape from every hook-enforced policy.
+    #[tokio::test]
+    async fn subagent_tool_calls_pass_through_session_tool_hooks() {
+        let server = MockServer::start();
+        // Parent turn 1: spawn a subagent.
+        let parent_spawn = server.mock(|when, then| {
+            when.method(POST)
+                .path("/chat/completions")
+                .body_includes("PARENT_PROMPT_MARKER")
+                .body_excludes(r#""role":"tool""#);
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(chat_completion_tool_call_stream(
+                    "spawn_agent",
+                    "call_spawn_helper",
+                    r#"{"task":"CHILD_TASK_MARKER: read data.txt and report its contents"}"#,
+                ));
+        });
+        // Parent turn 2: the spawn result is back; finish the parent turn
+        // while the child keeps running in the background.
+        let parent_final = server.mock(|when, then| {
+            when.method(POST)
+                .path("/chat/completions")
+                .body_includes("call_spawn_helper");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(chat_completion_stream("parent done", 10, 1));
+        });
+        // Child turn 1: the child session uses a tool.
+        let child_read = server.mock(|when, then| {
+            when.method(POST)
+                .path("/chat/completions")
+                .body_includes("CHILD_TASK_MARKER")
+                .body_excludes("PARENT_PROMPT_MARKER")
+                .body_excludes(r#""role":"tool""#);
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(chat_completion_tool_call_stream(
+                    "read_file",
+                    "call_child_read",
+                    r#"{"file_path":"data.txt"}"#,
+                ));
+        });
+        // Child turn 2: the tool result is back; the child completes.
+        let child_final = server.mock(|when, then| {
+            when.method(POST)
+                .path("/chat/completions")
+                .body_includes("call_child_read");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(chat_completion_stream("child done", 10, 1));
+        });
+
+        let hook_calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let hooks: Arc<dyn fabro_agent::ToolHookCallback> =
+            Arc::new(RecordingHooks(Arc::clone(&hook_calls)));
+
+        let backend = mock_api_backend(&server);
+        let node = Node::new("researcher");
+        let workspace = tempfile::tempdir().unwrap();
+        tokio::fs::write(workspace.path().join("data.txt"), "hello\n")
+            .await
+            .unwrap();
+        let sandbox: Arc<dyn fabro_agent::Sandbox> =
+            Arc::new(LocalSandbox::new(workspace.path().to_path_buf()));
+
+        let mut session = backend
+            .create_session(&node, &sandbox, Some(hooks))
+            .await
+            .unwrap();
+        session
+            .process_input("PARENT_PROMPT_MARKER: spawn a helper subagent")
+            .await
+            .unwrap();
+
+        // The child runs on background tasks owned by the still-alive parent
+        // session; wait until its final turn has been served.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while child_final.calls() == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the spawned subagent never completed its turns against the mock provider"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        parent_spawn.assert_calls(1);
+        parent_final.assert_calls(1);
+        child_read.assert_calls(1);
+        child_final.assert_calls(1);
+
+        let recorded = hook_calls.lock().unwrap().clone();
+        assert!(
+            recorded.iter().any(|name| name == "spawn_agent"),
+            "the parent's own tool calls should reach the hooks; hooks saw: {recorded:?}"
+        );
+        assert!(
+            recorded.iter().any(|name| name == "read_file"),
+            "the child subagent's tool calls must pass through the same tool hooks as the \
+             parent's, but the hooks never saw the child's read_file; hooks saw: {recorded:?}"
+        );
     }
 
     #[test]

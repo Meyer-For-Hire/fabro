@@ -79,8 +79,9 @@ fn help_smoke_covers_high_cost_commands() {
           --debug             Enable DEBUG-level logging (default is INFO) [env: FABRO_DEBUG=]
           --node <NODE>       Filter to artifacts from a specific node
           --no-upgrade-check  Disable automatic upgrade check [env: FABRO_NO_UPGRADE_CHECK=true]
-          --retry <RETRY>     Filter to artifacts from a specific retry attempt
+          --stage <STAGE>     Filter to artifacts from a specific stage visit (node@visit)
           --quiet             Suppress non-essential output [env: FABRO_QUIET=]
+          --retry <RETRY>     Filter to artifacts from a specific retry attempt
           --verbose           Enable verbose output [env: FABRO_VERBOSE=]
       -h, --help              Print help
     ----- stderr -----
@@ -106,9 +107,10 @@ fn help_smoke_covers_high_cost_commands() {
           --debug             Enable DEBUG-level logging (default is INFO) [env: FABRO_DEBUG=]
           --node <NODE>       Filter to artifacts from a specific node
           --no-upgrade-check  Disable automatic upgrade check [env: FABRO_NO_UPGRADE_CHECK=true]
-          --retry <RETRY>     Filter to artifacts from a specific retry attempt
+          --stage <STAGE>     Filter to artifacts from a specific stage visit (node@visit)
           --quiet             Suppress non-essential output [env: FABRO_QUIET=]
-          --tree              Preserve {node_slug}/retry_{N}/ directory structure
+          --retry <RETRY>     Filter to artifacts from a specific retry attempt
+          --tree              Preserve node[/visit_{N}]/retry_{N}/ directory structure
           --verbose           Enable verbose output [env: FABRO_VERBOSE=]
       -h, --help              Print help
     ----- stderr -----
