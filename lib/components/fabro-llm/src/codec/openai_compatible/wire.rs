@@ -294,14 +294,18 @@ pub(super) struct ApiFunction {
 pub(super) struct ApiUsage {
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
-    /// Tolerant superset: aggregator dialects (OpenRouter) report in-band
-    /// USD cost and cache/reasoning token detail. Absent on plain providers.
+    /// Tolerant superset: compatible provider dialects report in-band USD cost
+    /// and cache/reasoning token detail. Absent on plain providers.
     #[serde(default)]
     pub cost: Option<f64>,
     #[serde(default)]
     pub prompt_tokens_details: Option<PromptTokensDetails>,
     #[serde(default)]
     pub completion_tokens_details: Option<CompletionTokensDetails>,
+    /// Modal reports reasoning tokens directly on `usage` instead of nesting
+    /// them under `completion_tokens_details`.
+    #[serde(default)]
+    pub reasoning_tokens: Option<i64>,
 }
 
 #[derive(serde::Deserialize)]
@@ -339,6 +343,7 @@ impl ApiUsage {
             .completion_tokens_details
             .as_ref()
             .and_then(|d| d.reasoning_tokens)
+            .or(self.reasoning_tokens)
             .unwrap_or(0);
         let (uncached_input, cached) =
             split_inclusive_token_total(self.prompt_tokens, cached_detail);
@@ -534,6 +539,72 @@ mod tests {
             input_tokens: 53,
             output_tokens: 0,
             reasoning_tokens: 59,
+            ..TokenCounts::default()
+        });
+    }
+
+    #[test]
+    fn non_streaming_usage_normalizes_modal_reasoning_tokens() {
+        let response: ApiResponse = serde_json::from_value(serde_json::json!({
+            "id": "chatcmpl-modal",
+            "model": "moonshotai/Kimi-K3",
+            "choices": [{
+                "message": {
+                    "content": "1275",
+                    "reasoning_content": "The arithmetic series sums to 1275."
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 116,
+                "completion_tokens": 66,
+                "prompt_tokens_details": {
+                    "cached_tokens": 64
+                },
+                "reasoning_tokens": 54,
+                "total_tokens": 182
+            }
+        }))
+        .unwrap();
+        let usage = response
+            .usage
+            .expect("Modal response should include token usage");
+
+        assert_eq!(usage.token_counts(), TokenCounts {
+            input_tokens: 52,
+            output_tokens: 12,
+            reasoning_tokens: 54,
+            cache_read_tokens: 64,
+            ..TokenCounts::default()
+        });
+    }
+
+    #[test]
+    fn streaming_usage_normalizes_modal_reasoning_tokens() {
+        let chunk: StreamChunk = serde_json::from_value(serde_json::json!({
+            "id": "chatcmpl-modal",
+            "model": "moonshotai/Kimi-K3",
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 116,
+                "completion_tokens": 66,
+                "prompt_tokens_details": {
+                    "cached_tokens": 64
+                },
+                "reasoning_tokens": 54,
+                "total_tokens": 182
+            }
+        }))
+        .unwrap();
+        let usage = chunk
+            .usage
+            .expect("Modal stream should include token usage");
+
+        assert_eq!(usage.token_counts(), TokenCounts {
+            input_tokens: 52,
+            output_tokens: 12,
+            reasoning_tokens: 54,
+            cache_read_tokens: 64,
             ..TokenCounts::default()
         });
     }
