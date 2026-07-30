@@ -121,10 +121,9 @@ impl SemanticState {
             .and_then(AttrValue::as_str)
             .map(String::from);
         if let Some(class_str) = class_str {
-            for cls in class_str.split(',') {
-                let cls = cls.trim().to_string();
-                if !cls.is_empty() && !node.classes.contains(&cls) {
-                    node.classes.push(cls);
+            for cls in class_str.split(|ch: char| ch == ',' || ch.is_whitespace()) {
+                if !cls.is_empty() {
+                    Self::add_class_to_node(node, cls);
                 }
             }
         }
@@ -501,23 +500,38 @@ mod tests {
         assert_eq!(graph.edges[1].label(), Some("next"));
     }
 
-    #[test]
-    fn ast_to_graph_class_attr_parsed() {
+    fn classes_from_attr(class_attr: &str) -> Vec<String> {
         let dot = DotGraph {
             name:       "ClassTest".into(),
             statements: vec![Statement::Node(NodeStmt {
-                id:    "review".into(),
-                attrs: Some(vec![(
-                    "class".into(),
-                    AstValue::Str("code,critical".into()),
-                )]),
+                id:    "work".into(),
+                attrs: Some(vec![("class".into(), AstValue::Str(class_attr.into()))]),
             })],
         };
 
-        let graph = ast_to_graph(&dot).unwrap();
-        let review = &graph.nodes["review"];
-        assert!(review.classes.contains(&"code".to_string()));
-        assert!(review.classes.contains(&"critical".to_string()));
+        ast_to_graph(&dot).unwrap().nodes["work"].classes.clone()
+    }
+
+    #[test]
+    fn ast_to_graph_space_separated_class_attr_parsed() {
+        assert_eq!(classes_from_attr("coding critical"), vec![
+            "coding", "critical"
+        ]);
+    }
+
+    #[test]
+    fn ast_to_graph_comma_separated_class_attr_parsed() {
+        assert_eq!(classes_from_attr("coding,critical"), vec![
+            "coding", "critical"
+        ]);
+    }
+
+    #[test]
+    fn ast_to_graph_mixed_class_separators_ignore_empty_and_duplicate_classes() {
+        assert_eq!(
+            classes_from_attr(" coding, critical  coding,\t,review\ncritical "),
+            vec!["coding", "critical", "review"]
+        );
     }
 
     #[test]

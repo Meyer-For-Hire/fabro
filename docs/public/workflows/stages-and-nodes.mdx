@@ -235,7 +235,7 @@ These attributes can be set on any node type:
 | Attribute | Description |
 |---|---|
 | `label` | Display name shown in the graph visualization |
-| `class` | CSS-like class for [model stylesheet](/workflows/stylesheets) targeting (space-separated for multiple) |
+| `class` | CSS-like class for [model stylesheet](/workflows/stylesheets) targeting. Separate multiple classes with spaces. Commas are also accepted for compatibility. |
 | `max_visits` | Max times this node can execute in a run. Overrides the graph-level `max_node_visits` for this node. |
 | `goal_gate` | When `true`, the workflow fails if this node doesn't succeed |
 | `max_retries` | Override default retry count for this node |
