@@ -14,6 +14,7 @@ use fabro_sandbox::{
     GitSetupIntent, SandboxEventCallback, SandboxSpec, reconnect_for_run_with_callback, shell_quote,
 };
 use fabro_static::EnvVars;
+use fabro_types::RunSandboxKind;
 use fabro_vault::Vault;
 use tokio::runtime::Handle;
 use tokio::sync::RwLock as AsyncRwLock;
@@ -301,13 +302,13 @@ pub async fn initialize(
         )))
     };
 
-    let attach_existing = checkpoint.is_some();
+    let is_resume = checkpoint.is_some();
     options.run_options.display_base_sha = options
         .run_options
         .pre_run_git
         .as_ref()
         .and_then(|git| git.sha.clone());
-    if !attach_existing
+    if !is_resume
         && !matches!(options.sandbox, SandboxSpec::Local { .. })
         && matches!(
             options
@@ -331,19 +332,36 @@ pub async fn initialize(
             emitter.emit(&Event::Sandbox { event });
         })
     };
-    let mut sandbox_initialized = true;
-    let sandbox: Arc<dyn Sandbox> = if attach_existing {
-        let run_state = options
+    let attach_instance = if is_resume {
+        let record = options
             .run_store
             .state()
             .await
-            .map_err(|err| Error::engine(err.to_string()))?;
-        let record = run_state.sandbox.ok_or_else(|| {
-            Error::Precondition("cannot resume run: run sandbox is missing".to_string())
-        })?;
-        let instance = record.instance().ok_or_else(|| {
-            Error::Precondition("cannot resume run: run sandbox was not initialized".to_string())
-        })?;
+            .map_err(|err| Error::engine(err.to_string()))?
+            .sandbox
+            .ok_or_else(|| {
+                Error::Precondition("cannot resume run: run sandbox is missing".to_string())
+            })?;
+        // A fork carries a checkpoint from its source run, but its first
+        // `run.created` event contains only a sandbox plan. Materialize that
+        // sandbox before resuming. Later fork resumes reconnect the ready
+        // instance.
+        let fork_needs_materialization = options.run_options.fork_source_ref.is_some()
+            && record.kind() == RunSandboxKind::Planned;
+        if fork_needs_materialization {
+            None
+        } else {
+            Some(record.into_instance().ok_or_else(|| {
+                Error::Precondition(
+                    "cannot resume run: run sandbox was not initialized".to_string(),
+                )
+            })?)
+        }
+    } else {
+        None
+    };
+    let attach_existing = attach_instance.is_some();
+    let sandbox: Arc<dyn Sandbox> = if let Some(instance) = attach_instance {
         let daytona_api_key = options
             .vault
             .read()
@@ -351,14 +369,13 @@ pub async fn initialize(
             .get(EnvVars::DAYTONA_API_KEY)
             .map(str::to_string);
         let sandbox = reconnect_for_run_with_callback(
-            instance,
+            &instance,
             daytona_api_key,
             Some(options.run_options.run_id),
             Some(Arc::clone(&sandbox_event_callback)),
         )
         .await
         .map_err(|err| Error::engine_with_anyhow("Failed to reconnect sandbox for resume", err))?;
-        sandbox_initialized = false;
         Arc::from(sandbox)
     } else {
         options
@@ -410,7 +427,7 @@ pub async fn initialize(
         return Err(Error::engine(msg));
     }
 
-    if sandbox_initialized {
+    if !attach_existing {
         let run_sandbox = options
             .sandbox
             .to_run_sandbox_instance(&*sandbox, options.run_options.run_id);
@@ -646,7 +663,7 @@ pub async fn initialize(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -657,7 +674,9 @@ mod tests {
     use fabro_sandbox::SandboxSpec;
     use fabro_store::Database;
     use fabro_types::settings::run::RunModelControls;
-    use fabro_types::{EventBody, RunEvent, RunId, WorkflowSettings, fixtures, test_support};
+    use fabro_types::{
+        EventBody, ForkSourceRef, RunEvent, RunId, WorkflowSettings, fixtures, test_support,
+    };
     use fabro_vault::{SecretType, Vault};
     use object_store::memory::InMemory;
     use tokio::fs::{create_dir_all, write};
@@ -666,9 +685,13 @@ mod tests {
     use super::*;
     use crate::context::{Context, keys};
     use crate::event::StoreProgressLogger;
+    use crate::pipeline::ResumeState;
     use crate::pipeline::types::InitOptions;
-    use crate::records::RunSpec;
+    use crate::records::{Checkpoint, CheckpointExt, RunSpec};
     use crate::run_options::RunOptions;
+    use crate::stage_execution::StageExecutionSeed;
+
+    const CHECKPOINT_SHA: &str = "abc123";
 
     fn test_run_id() -> RunId {
         fixtures::RUN_1
@@ -767,7 +790,63 @@ mod tests {
         }
     }
 
+    fn test_init_options(
+        run_store: crate::runtime_store::RunStoreHandle,
+        emitter: Arc<crate::event::Emitter>,
+        working_directory: std::path::PathBuf,
+        run_options: RunOptions,
+    ) -> InitOptions {
+        InitOptions {
+            run_store,
+            dry_run: false,
+            emitter: Arc::clone(&emitter),
+            sandbox: SandboxSpec::Local { working_directory },
+            llm: LlmSpec {
+                model:          "test-model".to_string(),
+                provider_id:    fabro_model::ProviderId::anthropic(),
+                fallbacks:      ModelFallbackPolicy::default(),
+                mcp_servers:    Vec::new(),
+                model_controls: RunModelControls::default(),
+                dry_run:        true,
+            },
+            interviewer: Arc::new(AutoApproveInterviewer::engine()),
+            steering_hub: Arc::new(crate::steering_hub::SteeringHub::new(emitter)),
+            catalog: test_catalog(),
+            lifecycle: crate::run_options::LifecycleOptions {
+                setup_commands:           vec![],
+                setup_command_timeout_ms: 1_000,
+            },
+            run_options,
+            workflow_path: None,
+            workflow_bundle: None,
+            hooks: fabro_hooks::HookSettings { hooks: vec![] },
+            sandbox_env: SandboxEnvSpec {
+                toml_env:           HashMap::new(),
+                github_permissions: None,
+                origin_url:         None,
+            },
+            vault: auth_test_support::empty_vault(),
+            git: None,
+            run_control: None,
+            registry_override: None,
+            artifact_sink: None,
+            resume: None,
+            seed_context: None,
+            fabro_run_tools: None,
+        }
+    }
+
     fn test_persisted(graph: Graph, source: String, run_dir: &std::path::Path) -> Persisted {
+        test_persisted_run(graph, source, run_dir, WorkflowSettings::default(), None)
+    }
+
+    fn test_persisted_run(
+        graph: Graph,
+        source: String,
+        run_dir: &std::path::Path,
+        settings: WorkflowSettings,
+        fork_source_ref: Option<ForkSourceRef>,
+    ) -> Persisted {
         Persisted::new(
             graph.clone(),
             source,
@@ -775,7 +854,7 @@ mod tests {
             run_dir.to_path_buf(),
             RunSpec {
                 run_id: test_run_id(),
-                settings: WorkflowSettings::default(),
+                settings,
                 graph,
                 graph_source: None,
                 workflow_slug: Some("test".to_string()),
@@ -792,7 +871,7 @@ mod tests {
                 provenance: test_support::test_run_provenance(),
                 manifest_blob: None,
                 definition_blob: None,
-                fork_source_ref: None,
+                fork_source_ref,
             },
         )
     }
@@ -818,49 +897,18 @@ mod tests {
             move |event| seen.lock().unwrap().push(event.clone())
         });
 
+        let run_store = memory_store().create_run(&test_run_id()).await.unwrap();
         let result = initialize(persisted, InitOptions {
-            run_store:         {
-                let store = memory_store();
-                let inner = store.create_run(&test_run_id()).await.unwrap();
-                inner.into()
-            },
-            dry_run:           false,
-            emitter:           emitter.clone(),
-            sandbox:           SandboxSpec::Local {
-                working_directory: std::env::current_dir().unwrap(),
-            },
-            llm:               LlmSpec {
-                model:          "test-model".to_string(),
-                provider_id:    fabro_model::ProviderId::anthropic(),
-                fallbacks:      ModelFallbackPolicy::default(),
-                mcp_servers:    Vec::new(),
-                model_controls: RunModelControls::default(),
-                dry_run:        true,
-            },
-            interviewer:       Arc::new(AutoApproveInterviewer::engine()),
-            steering_hub:      Arc::new(crate::steering_hub::SteeringHub::new(emitter.clone())),
-            catalog:           test_catalog(),
-            lifecycle:         crate::run_options::LifecycleOptions {
+            lifecycle: crate::run_options::LifecycleOptions {
                 setup_commands:           vec![setup],
                 setup_command_timeout_ms: 1_000,
             },
-            run_options:       test_settings(&run_dir),
-            workflow_path:     None,
-            workflow_bundle:   None,
-            hooks:             fabro_hooks::HookSettings { hooks: vec![] },
-            sandbox_env:       SandboxEnvSpec {
-                toml_env:           HashMap::new(),
-                github_permissions: None,
-                origin_url:         None,
-            },
-            vault:             auth_test_support::empty_vault(),
-            git:               None,
-            run_control:       None,
-            registry_override: None,
-            artifact_sink:     None,
-            resume:            None,
-            seed_context:      None,
-            fabro_run_tools:   None,
+            ..test_init_options(
+                run_store.into(),
+                emitter,
+                std::env::current_dir().unwrap(),
+                test_settings(&run_dir),
+            )
         })
         .await;
         let events = seen.lock().unwrap().clone();
@@ -899,49 +947,19 @@ mod tests {
         let persisted = test_persisted(graph, source.clone(), &run_dir);
         let emitter = Arc::new(crate::event::Emitter::new(test_run_id()));
 
+        let run_store = memory_store().create_run(&test_run_id()).await.unwrap();
         let initialized = initialize(persisted, InitOptions {
-            run_store:         {
-                let store = memory_store();
-                let inner = store.create_run(&test_run_id()).await.unwrap();
-                inner.into()
-            },
-            dry_run:           false,
-            emitter:           emitter.clone(),
-            sandbox:           SandboxSpec::Local {
-                working_directory: std::env::current_dir().unwrap(),
-            },
-            llm:               LlmSpec {
-                model:          "test-model".to_string(),
-                provider_id:    fabro_model::ProviderId::anthropic(),
-                fallbacks:      ModelFallbackPolicy::default(),
-                mcp_servers:    Vec::new(),
-                model_controls: RunModelControls::default(),
-                dry_run:        true,
-            },
-            interviewer:       Arc::new(AutoApproveInterviewer::engine()),
-            steering_hub:      Arc::new(crate::steering_hub::SteeringHub::new(emitter.clone())),
-            catalog:           test_catalog(),
-            lifecycle:         crate::run_options::LifecycleOptions {
-                setup_commands:           vec![],
-                setup_command_timeout_ms: 1_000,
-            },
-            run_options:       test_settings(&run_dir),
-            workflow_path:     None,
-            workflow_bundle:   None,
-            hooks:             fabro_hooks::HookSettings { hooks: vec![] },
-            sandbox_env:       SandboxEnvSpec {
+            sandbox_env: SandboxEnvSpec {
                 toml_env:           HashMap::from([("TEST_KEY".to_string(), "value".to_string())]),
                 github_permissions: None,
                 origin_url:         None,
             },
-            vault:             auth_test_support::empty_vault(),
-            git:               None,
-            run_control:       None,
-            registry_override: None,
-            artifact_sink:     None,
-            resume:            None,
-            seed_context:      None,
-            fabro_run_tools:   None,
+            ..test_init_options(
+                run_store.into(),
+                emitter,
+                std::env::current_dir().unwrap(),
+                test_settings(&run_dir),
+            )
         })
         .await
         .unwrap();
@@ -986,6 +1004,111 @@ mod tests {
                 .credentials
                 .is_empty()
         );
+    }
+
+    async fn initialize_resume_with_planned_sandbox(
+        temp: &tempfile::TempDir,
+        fork_source_ref: Option<ForkSourceRef>,
+    ) -> Result<Initialized, Error> {
+        let run_dir = temp.path().join("run");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        let (graph, source) = simple_graph();
+        let mut settings = WorkflowSettings::default();
+        settings.run.run_branch.enabled = false;
+        let persisted = test_persisted_run(
+            graph.clone(),
+            source,
+            &run_dir,
+            settings.clone(),
+            fork_source_ref.clone(),
+        );
+        let emitter = Arc::new(crate::event::Emitter::new(test_run_id()));
+        let store = memory_store();
+        let run_store = store.create_run(&test_run_id()).await.unwrap();
+        let mut checkpoint = Checkpoint::from_context(
+            &Context::new(),
+            "start",
+            vec!["start".to_string()],
+            HashMap::new(),
+            HashMap::new(),
+            Some("exit".to_string()),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        checkpoint.git_commit_sha = Some(CHECKPOINT_SHA.to_string());
+        let mut run_options = test_settings(&run_dir);
+        run_options.settings = settings;
+        run_options.fork_source_ref = fork_source_ref;
+        crate::event::append_event(&run_store, &test_run_id(), &Event::RunCreated {
+            run_id:           test_run_id(),
+            title:            None,
+            settings:         serde_json::to_value(&run_options.settings).unwrap(),
+            graph:            serde_json::to_value(&graph).unwrap(),
+            workflow_source:  None,
+            workflow_config:  None,
+            labels:           BTreeMap::new(),
+            run_dir:          run_dir.display().to_string(),
+            source_directory: Some(workspace.display().to_string()),
+            workflow_slug:    Some("test".to_string()),
+            automation:       None,
+            db_prefix:        None,
+            provenance:       test_support::test_run_provenance(),
+            manifest_blob:    None,
+            git:              None,
+            fork_source_ref:  run_options.fork_source_ref.clone(),
+            retried_from:     None,
+            parent_id:        None,
+            web_url:          None,
+        })
+        .await
+        .unwrap();
+
+        initialize(persisted, InitOptions {
+            resume: Some(ResumeState::for_test(
+                checkpoint,
+                StageExecutionSeed::default(),
+            )),
+            ..test_init_options(run_store.into(), emitter, workspace, run_options)
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn forked_run_resume_materializes_fresh_sandbox() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let fork_source_ref = ForkSourceRef {
+            source_run_id:  fixtures::RUN_64,
+            checkpoint_sha: CHECKPOINT_SHA.to_string(),
+        };
+
+        let initialized = initialize_resume_with_planned_sandbox(&temp, Some(fork_source_ref))
+            .await
+            .expect("a forked run should materialize a fresh sandbox before resuming");
+
+        assert_eq!(
+            initialized.engine.run.sandbox.working_directory(),
+            workspace.to_string_lossy().as_ref()
+        );
+    }
+
+    #[tokio::test]
+    async fn same_run_resume_does_not_recreate_uninitialized_sandbox() {
+        let temp = tempfile::tempdir().unwrap();
+
+        match initialize_resume_with_planned_sandbox(&temp, None).await {
+            Err(Error::Precondition(message)) => {
+                assert!(
+                    message.contains("was not initialized"),
+                    "unexpected precondition message: {message}"
+                );
+            }
+            Err(error) => panic!("expected sandbox precondition error, got {error}"),
+            Ok(_) => panic!("same-run resume should not recreate an uninitialized sandbox"),
+        }
     }
 
     #[tokio::test]
