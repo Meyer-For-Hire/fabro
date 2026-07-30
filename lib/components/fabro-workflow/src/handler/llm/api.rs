@@ -41,7 +41,8 @@ use super::routing::ProviderContext;
 use crate::context::WorkflowContext;
 use crate::context::keys::Fidelity;
 use crate::error::Error;
-use crate::event::{Emitter, Event, StageScope};
+use crate::event::{Emitter, Event, RunNoticeCode, RunNoticeLevel, StageScope};
+use crate::model_fallback::{ModelFallbackPolicy, canonical_model_id};
 use crate::outcome::billed_model_usage_from_llm;
 use crate::services::FabroRunToolServices;
 use crate::steering_hub::{ActiveControlHandle, SteeringHub};
@@ -633,8 +634,8 @@ fn spawn_event_forwarder(
 pub struct AgentApiBackend {
     model:              String,
     provider_id:        ProviderId,
-    fallback_chain:     Vec<FallbackTarget>,
-    sessions:           Mutex<HashMap<String, Session>>,
+    fallbacks:          ModelFallbackPolicy,
+    sessions:           Mutex<HashMap<String, CachedAgentSession>>,
     tool_env:           Option<Arc<dyn ToolEnvProvider>>,
     mcp_servers:        Vec<McpServerSettings>,
     tool_secrets:       ToolSecrets,
@@ -643,6 +644,45 @@ pub struct AgentApiBackend {
     steering_hub:       Arc<SteeringHub>,
     catalog:            Arc<Catalog>,
     fabro_run_tools:    Option<FabroRunToolServices>,
+}
+
+struct CachedAgentSession {
+    session:       Session,
+    fallback_plan: FallbackPlan,
+}
+
+#[derive(Clone, Debug)]
+struct LlmRoute {
+    target:   FallbackTarget,
+    controls: EffectiveRequestControls,
+}
+
+#[derive(Clone, Debug)]
+struct FallbackPlan {
+    original:           FallbackTarget,
+    requested_controls: EffectiveRequestControls,
+    current:            LlmRoute,
+    remaining:          Vec<LlmRoute>,
+    next_index:         usize,
+}
+
+struct FallbackPlanNotice {
+    code:    RunNoticeCode,
+    message: String,
+}
+
+impl FallbackPlan {
+    #[must_use]
+    fn has_next(&self) -> bool {
+        self.next_index < self.remaining.len()
+    }
+
+    fn advance(&mut self) -> Option<(LlmRoute, u32)> {
+        let route = self.remaining.get(self.next_index)?.clone();
+        self.next_index = self.next_index.saturating_add(1);
+        self.current = route.clone();
+        Some((route, u32::try_from(self.next_index).unwrap_or(u32::MAX)))
+    }
 }
 
 struct OneShotCompletion {
@@ -655,7 +695,7 @@ impl AgentApiBackend {
     pub fn new(
         model: String,
         provider_id: impl Into<ProviderId>,
-        fallback_chain: Vec<FallbackTarget>,
+        fallbacks: ModelFallbackPolicy,
         source: Arc<dyn CredentialSource>,
         steering_hub: Arc<SteeringHub>,
     ) -> Self {
@@ -663,7 +703,7 @@ impl AgentApiBackend {
         Self::new_with_catalog(
             model,
             provider_id.into(),
-            fallback_chain,
+            fallbacks,
             source,
             steering_hub,
             catalog,
@@ -674,7 +714,7 @@ impl AgentApiBackend {
     pub fn new_with_catalog(
         model: String,
         provider_id: ProviderId,
-        fallback_chain: Vec<FallbackTarget>,
+        fallbacks: ModelFallbackPolicy,
         source: Arc<dyn CredentialSource>,
         steering_hub: Arc<SteeringHub>,
         catalog: Arc<Catalog>,
@@ -682,7 +722,7 @@ impl AgentApiBackend {
         Self {
             model,
             provider_id,
-            fallback_chain,
+            fallbacks,
             sessions: Mutex::new(HashMap::new()),
             tool_env: None,
             mcp_servers: Vec::new(),
@@ -751,12 +791,155 @@ impl AgentApiBackend {
         )
     }
 
+    fn fallback_controls_for_target(
+        &self,
+        target: &FallbackTarget,
+        requested: EffectiveRequestControls,
+    ) -> Option<EffectiveRequestControls> {
+        let requested_effort = requested.reasoning_effort?;
+        let provider = ProviderId::new(&target.provider);
+        let offering = self.catalog.get_on_provider(&provider, &target.model)?;
+        let settings = self.catalog.settings_for(offering)?;
+        let effective_effort =
+            requested_effort.closest_supported(&settings.controls.reasoning_effort)?;
+        Some(EffectiveRequestControls {
+            reasoning_effort: Some(effective_effort),
+            speed:            requested.speed,
+        })
+    }
+
+    fn fallback_plan(
+        &self,
+        model: &str,
+        provider: &ProviderId,
+        requested_controls: EffectiveRequestControls,
+    ) -> (FallbackPlan, Vec<FallbackPlanNotice>) {
+        let primary_model = canonical_model_id(self.catalog.as_ref(), provider, model);
+        let original = FallbackTarget::new(provider, primary_model);
+        let current = LlmRoute {
+            target:   original.clone(),
+            controls: requested_controls,
+        };
+        let Some(configured) = self
+            .fallbacks
+            .chain_for(self.catalog.as_ref(), provider, model)
+        else {
+            return (
+                FallbackPlan {
+                    original,
+                    requested_controls,
+                    current,
+                    remaining: Vec::new(),
+                    next_index: 0,
+                },
+                Vec::new(),
+            );
+        };
+
+        let mut remaining = Vec::new();
+        let mut notices = Vec::new();
+        for target in configured {
+            if target == &original
+                || remaining
+                    .iter()
+                    .any(|route: &LlmRoute| route.target == *target)
+            {
+                continue;
+            }
+
+            let controls = match requested_controls.reasoning_effort {
+                None => requested_controls,
+                Some(requested_effort) => {
+                    match self.fallback_controls_for_target(target, requested_controls) {
+                        Some(controls) => controls,
+                        None if self
+                            .catalog
+                            .get_on_provider(&ProviderId::new(&target.provider), &target.model)
+                            .is_none() =>
+                        {
+                            // A catalog-unknown passthrough target has no
+                            // advertised controls. Preserve the request and let
+                            // the provider validate it.
+                            requested_controls
+                        }
+                        None => {
+                            notices.push(FallbackPlanNotice {
+                                code: RunNoticeCode::ModelFallbackSkipped,
+                                message: format!(
+                                    "Model fallback `{target}` for requested model `{}` was skipped because it has no reasoning level near `{requested_effort}`.",
+                                    original.model
+                                ),
+                            });
+                            continue;
+                        }
+                    }
+                }
+            };
+            remaining.push(LlmRoute {
+                target: target.clone(),
+                controls,
+            });
+        }
+
+        if !configured.is_empty() && remaining.is_empty() {
+            notices.push(FallbackPlanNotice {
+                code: RunNoticeCode::ModelFallbackChainEmpty,
+                message: format!(
+                    "No usable model fallbacks remain for requested model `{}` and primary target `{original}`.",
+                    original.model
+                ),
+            });
+        }
+
+        (
+            FallbackPlan {
+                original,
+                requested_controls,
+                current,
+                remaining,
+                next_index: 0,
+            },
+            notices,
+        )
+    }
+
+    fn emit_fallback_plan_notices(
+        notices: &[FallbackPlanNotice],
+        emitter: &Emitter,
+        stage_scope: &StageScope,
+    ) {
+        for notice in notices {
+            emitter.emit_scoped(
+                &Event::RunNotice {
+                    level:            RunNoticeLevel::Warn,
+                    code:             notice.code.to_string(),
+                    message:          notice.message.clone(),
+                    exec_output_tail: None,
+                },
+                stage_scope,
+            );
+        }
+    }
+
+    #[cfg(test)]
     async fn create_session(
         &self,
         node: &Node,
         sandbox: &Arc<dyn Sandbox>,
         tool_hooks: Option<Arc<dyn fabro_agent::ToolHookCallback>>,
     ) -> Result<Session, Error> {
+        let (cached, _) = self
+            .create_session_with_plan(node, sandbox, tool_hooks)
+            .await?;
+        Ok(cached.session)
+    }
+
+    async fn create_session_with_plan(
+        &self,
+        node: &Node,
+        sandbox: &Arc<dyn Sandbox>,
+        tool_hooks: Option<Arc<dyn fabro_agent::ToolHookCallback>>,
+    ) -> Result<(CachedAgentSession, Vec<FallbackPlanNotice>), Error> {
         let model = node.model().unwrap_or(&self.model);
         let provider = routing::resolve_node_provider_context(
             self.catalog.as_ref(),
@@ -764,38 +947,49 @@ impl AgentApiBackend {
             &self.model,
             node,
         )?;
-        Self::create_session_for(
-            model,
-            provider,
+        let controls = self.resolve_effective_request_controls(node)?;
+        let (fallback_plan, notices) = self.fallback_plan(model, &provider.provider_id, controls);
+        let route = &fallback_plan.current;
+        let route_provider =
+            self.resolve_provider_context(&route.target.model, Some(&route.target.provider))?;
+        let session = Self::create_session_for(
+            &route.target.model,
+            route_provider,
+            controls,
             node,
             sandbox,
             self.source.as_ref(),
             Arc::clone(&self.catalog),
-            &self.run_model_controls,
             self.tool_env.as_ref(),
             tool_hooks,
             self.mcp_servers.clone(),
             self.tool_secrets.clone(),
             self.fabro_run_tools.clone(),
         )
-        .await
+        .await?;
+        Ok((
+            CachedAgentSession {
+                session,
+                fallback_plan,
+            },
+            notices,
+        ))
     }
 
     async fn create_session_for(
         model: &str,
         provider: ProviderContext,
+        controls: EffectiveRequestControls,
         node: &Node,
         sandbox: &Arc<dyn Sandbox>,
         source: &dyn CredentialSource,
         catalog: Arc<Catalog>,
-        run_model_controls: &RunModelControls,
         tool_env: Option<&Arc<dyn ToolEnvProvider>>,
         tool_hooks: Option<Arc<dyn fabro_agent::ToolHookCallback>>,
         mcp_servers: Vec<McpServerSettings>,
         tool_secrets: ToolSecrets,
         fabro_run_tools: Option<FabroRunToolServices>,
     ) -> Result<Session, Error> {
-        let controls = effective_request_controls(run_model_controls, node)?;
         let client = Client::from_source(source, Arc::clone(&catalog))
             .await
             .map_err(|e| Error::handler_with_source("Failed to create LLM client", e))?;
@@ -931,15 +1125,188 @@ impl AgentApiBackend {
         Ok(lease)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "failover owns one agent invocation's live session, event bridge, accounting, and cancellation state"
+    )]
+    async fn failover_agent_session(
+        &self,
+        fallback_plan: &mut FallbackPlan,
+        initial_error: fabro_llm::Error,
+        node: &Node,
+        input: &str,
+        agent_tool_runtime: fabro_agent::AgentToolRuntime,
+        sandbox: &Arc<dyn Sandbox>,
+        tool_hooks: Option<Arc<dyn fabro_agent::ToolHookCallback>>,
+        cancel_token: &CancellationToken,
+        emitter: &Arc<Emitter>,
+        stage_scope: &StageScope,
+        stage_id: &StageId,
+        thread_id: Option<&str>,
+        file_tracking: &Arc<Mutex<FileTracking>>,
+        session: &mut Session,
+        bridge: &mut SessionCancelBridgeGuard,
+        lease: &mut Option<Arc<ActivationLease>>,
+        event_forwarder: &mut EventForwarder,
+        total_usage: &mut TokenCounts,
+        total_cost: &mut Option<UsdMicros>,
+        inference_duration: &mut Duration,
+        tool_duration: &mut Duration,
+    ) -> Result<(), Error> {
+        let mut error_message = initial_error.to_string();
+        let mut last_error = Error::Llm(initial_error);
+
+        bridge.abort();
+        discard_session(session, lease, event_forwarder, emitter).await;
+        event_forwarder.abort();
+
+        while fallback_plan.has_next() {
+            let from = fallback_plan.current.clone();
+            let Some((route, attempt)) = fallback_plan.advance() else {
+                break;
+            };
+            Self::emit_failover(
+                node,
+                emitter,
+                stage_scope,
+                fallback_plan,
+                &from,
+                &route,
+                attempt,
+                &error_message,
+            );
+
+            let target_provider = match self
+                .resolve_provider_context(&route.target.model, Some(&route.target.provider))
+            {
+                Ok(provider) => provider,
+                Err(error) => {
+                    error_message = error.to_string();
+                    last_error = error;
+                    continue;
+                }
+            };
+
+            if cancel_token.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            let new_session = Self::create_session_for(
+                &route.target.model,
+                target_provider,
+                route.controls,
+                node,
+                sandbox,
+                self.source.as_ref(),
+                Arc::clone(&self.catalog),
+                self.tool_env.as_ref(),
+                tool_hooks.clone(),
+                self.mcp_servers.clone(),
+                self.tool_secrets.clone(),
+                self.fabro_run_tools.clone(),
+            )
+            .await;
+            if cancel_token.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            *session = match new_session {
+                Ok(session) => session,
+                Err(error) => {
+                    error_message = error.to_string();
+                    last_error = error;
+                    continue;
+                }
+            };
+            bridge.replace(cancel_token.clone(), session);
+            *event_forwarder = spawn_event_forwarder(
+                session,
+                node.id.clone(),
+                stage_scope.clone(),
+                Arc::clone(emitter),
+                Arc::clone(file_tracking),
+            );
+
+            begin_session_lifecycle(session, emitter, None);
+            if let Err(error) = session.initialize().await {
+                match classify_agent_error(error, fallback_plan.has_next()) {
+                    AgentApiErrorDisposition::Cancelled => {
+                        bridge.abort();
+                        discard_session(session, lease, event_forwarder, emitter).await;
+                        return Err(Error::Cancelled);
+                    }
+                    AgentApiErrorDisposition::Terminal(error) => {
+                        bridge.abort();
+                        discard_session(session, lease, event_forwarder, emitter).await;
+                        return Err(error);
+                    }
+                    AgentApiErrorDisposition::FailoverEligible(error) => {
+                        error_message = error.to_string();
+                        last_error = Error::Llm(error);
+                        bridge.abort();
+                        discard_session(session, lease, event_forwarder, emitter).await;
+                        event_forwarder.abort();
+                        continue;
+                    }
+                }
+            }
+
+            match self.attach_session_to_hub(session, stage_id, thread_id, emitter) {
+                Ok(active_lease) => *lease = Some(active_lease),
+                Err(error) => {
+                    bridge.abort();
+                    discard_session(session, lease, event_forwarder, emitter).await;
+                    return Err(error);
+                }
+            }
+            emit_agent_tools_available(session, &node.id, stage_id, emitter);
+
+            let process_result = session
+                .process_input_with_runtime(input, agent_tool_runtime.clone())
+                .await;
+            let timing = session.last_input_timing();
+            *inference_duration = inference_duration.saturating_add(timing.inference);
+            *tool_duration = tool_duration.saturating_add(timing.tool);
+            match process_result {
+                Ok(()) => {
+                    event_forwarder.wait_for_processing_end().await;
+                    *total_usage += session.last_input_usage();
+                    UsdMicros::accumulate(total_cost, session.last_input_cost());
+                    return Ok(());
+                }
+                Err(error) => match classify_agent_error(error, fallback_plan.has_next()) {
+                    AgentApiErrorDisposition::Cancelled => {
+                        bridge.abort();
+                        discard_session(session, lease, event_forwarder, emitter).await;
+                        return Err(Error::Cancelled);
+                    }
+                    AgentApiErrorDisposition::Terminal(error) => {
+                        bridge.abort();
+                        discard_session(session, lease, event_forwarder, emitter).await;
+                        return Err(error);
+                    }
+                    AgentApiErrorDisposition::FailoverEligible(error) => {
+                        error_message = error.to_string();
+                        last_error = Error::Llm(error);
+                        bridge.abort();
+                        discard_session(session, lease, event_forwarder, emitter).await;
+                        event_forwarder.abort();
+                    }
+                },
+            }
+        }
+
+        Err(last_error)
+    }
+
     async fn shutdown_cached_sessions(&self, emitter: &Arc<Emitter>) {
-        let sessions: Vec<Session> = self
+        let sessions: Vec<CachedAgentSession> = self
             .sessions
             .lock()
             .expect("sessions mutex is never poisoned: no code panics while holding this lock")
             .drain()
             .map(|(_, s)| s)
             .collect();
-        for mut session in sessions {
+        for cached in sessions {
+            let mut session = cached.session;
             let session_id = session.id().to_string();
             if session.shutdown(SessionShutdownReason::Completed).await {
                 emitter.emit(&Event::AgentSessionEnded {
@@ -950,6 +1317,40 @@ impl AgentApiBackend {
         }
     }
 
+    fn emit_failover(
+        node: &Node,
+        emitter: &Emitter,
+        stage_scope: &StageScope,
+        plan: &FallbackPlan,
+        from: &LlmRoute,
+        to: &LlmRoute,
+        attempt: u32,
+        error: &str,
+    ) {
+        emitter.emit_scoped(
+            &Event::Failover {
+                stage: node.id.clone(),
+                original_provider: plan.original.provider.clone(),
+                original_model: plan.original.model.clone(),
+                attempt,
+                from_provider: from.target.provider.clone(),
+                from_model: from.target.model.clone(),
+                to_provider: to.target.provider.clone(),
+                to_model: to.target.model.clone(),
+                requested_reasoning_effort: plan
+                    .requested_controls
+                    .reasoning_effort
+                    .map(|effort| effort.to_string()),
+                effective_reasoning_effort: to
+                    .controls
+                    .reasoning_effort
+                    .map(|effort| effort.to_string()),
+                error: error.to_string(),
+            },
+            stage_scope,
+        );
+    }
+
     async fn complete_one_shot_request(
         &self,
         client: &Client,
@@ -957,90 +1358,57 @@ impl AgentApiBackend {
         emitter: &Arc<Emitter>,
         stage_scope: &StageScope,
         request: &Request,
-        controls: EffectiveRequestControls,
-        fallback_chain: &[FallbackTarget],
+        plan: &mut FallbackPlan,
     ) -> Result<OneShotCompletion, Error> {
-        let result = client.complete(request).await;
-        let default_provider = self.provider_id.to_string();
-
-        let (response, model) = match result {
-            Ok(resp) => (resp, ModelRef {
-                provider: ProviderId::from(
-                    request
-                        .provider
-                        .clone()
-                        .unwrap_or_else(|| default_provider.clone()),
-                ),
-                model_id: request.model.clone().into(),
-                speed:    controls.speed,
-            }),
-            Err(sdk_err) if sdk_err.failover_eligible() && !fallback_chain.is_empty() => {
-                let error_msg = sdk_err.to_string();
-                let from_provider = request
-                    .provider
-                    .clone()
-                    .unwrap_or_else(|| default_provider.clone());
-                let from_model = request.model.clone();
-
-                let mut last_err = sdk_err;
-                let mut found = None;
-
-                for target in fallback_chain {
-                    emitter.emit_scoped(
-                        &Event::Failover {
-                            stage:         node.id.clone(),
-                            from_provider: from_provider.clone(),
-                            from_model:    from_model.clone(),
-                            to_provider:   target.provider.clone(),
-                            to_model:      target.model.clone(),
-                            error:         error_msg.clone(),
+        let mut active_request = request.clone();
+        loop {
+            match client.complete(&active_request).await {
+                Ok(response) => {
+                    return Ok(OneShotCompletion {
+                        response,
+                        model: ModelRef {
+                            provider: ProviderId::from(plan.current.target.provider.clone()),
+                            model_id: plan.current.target.model.clone().into(),
+                            speed:    plan.current.controls.speed,
                         },
+                    });
+                }
+                Err(error) if error.failover_eligible() && plan.has_next() => {
+                    let error_message = error.to_string();
+                    let from = plan.current.clone();
+                    let Some((to, attempt)) = plan.advance() else {
+                        return Err(Error::Llm(error));
+                    };
+                    Self::emit_failover(
+                        node,
+                        emitter,
                         stage_scope,
+                        plan,
+                        &from,
+                        &to,
+                        attempt,
+                        &error_message,
                     );
-
                     let max_tokens = node.max_tokens().or_else(|| {
                         self.catalog
-                            .get_on_provider(&ProviderId::new(&target.provider), &target.model)
+                            .get_on_provider(
+                                &ProviderId::new(&to.target.provider),
+                                &to.target.model,
+                            )
                             .and_then(|model| model.limits.max_output)
                     });
-
-                    let fallback_request = Request {
-                        model: target.model.clone(),
-                        provider: Some(target.provider.clone()),
+                    active_request = Request {
+                        model: to.target.model,
+                        provider: Some(to.target.provider),
                         max_tokens,
-                        reasoning_effort: controls.reasoning_effort,
-                        speed: controls.speed,
-                        ..request.clone()
+                        reasoning_effort: to.controls.reasoning_effort,
+                        speed: to.controls.speed,
+                        ..active_request
                     };
-
-                    match client.complete(&fallback_request).await {
-                        Ok(resp) => {
-                            found = Some(OneShotCompletion {
-                                response: resp,
-                                model:    ModelRef {
-                                    provider: ProviderId::from(target.provider.clone()),
-                                    model_id: target.model.clone().into(),
-                                    speed:    controls.speed,
-                                },
-                            });
-                            break;
-                        }
-                        Err(err) if err.failover_eligible() => {
-                            last_err = err;
-                        }
-                        Err(err) => return Err(Error::Llm(err)),
-                    }
                 }
-
-                match found {
-                    Some(completion) => return Ok(completion),
-                    None => return Err(Error::Llm(last_err)),
-                }
+                Err(error) => return Err(Error::Llm(error)),
             }
-            Err(sdk_err) => return Err(Error::Llm(sdk_err)),
-        };
-
-        Ok(OneShotCompletion { response, model })
+        }
     }
 }
 
@@ -1067,28 +1435,16 @@ impl CodergenBackend for AgentApiBackend {
 
         let model = node.model().unwrap_or(&self.model);
         let provider = self.resolve_provider_context(model, node.provider())?;
-        let provider_id = provider.provider_id.to_string();
         let controls = self.resolve_effective_request_controls(node)?;
-
-        let max_tokens = node.max_tokens().or_else(|| {
-            self.catalog
-                .get_on_provider(&provider.provider_id, model)
-                .and_then(|model| model.limits.max_output)
-        });
+        let (mut fallback_plan, notices) =
+            self.fallback_plan(model, &provider.provider_id, controls);
+        Self::emit_fallback_plan_notices(&notices, emitter, stage_scope);
 
         let mut messages = Vec::new();
         if let Some(sys) = system_prompt {
             messages.push(Message::system(sys));
         }
         messages.push(Message::user(prompt));
-
-        // Build per-request fallback chain: if the node overrides the provider,
-        // no failover is available; otherwise use the backend's.
-        let fallback_chain: &[FallbackTarget] = if node.provider().is_some() {
-            &[]
-        } else {
-            &self.fallback_chain
-        };
 
         let output_schema = structured_output::parse_node_output_schema(node)?;
         let response_format = output_schema
@@ -1100,12 +1456,21 @@ impl CodergenBackend for AgentApiBackend {
         let mut inference_duration = Duration::ZERO;
 
         loop {
+            let route = &fallback_plan.current;
+            let max_tokens = node.max_tokens().or_else(|| {
+                self.catalog
+                    .get_on_provider(
+                        &ProviderId::new(&route.target.provider),
+                        &route.target.model,
+                    )
+                    .and_then(|model| model.limits.max_output)
+            });
             let request = Request {
-                model: model.to_string(),
+                model: route.target.model.clone(),
                 messages: messages.clone(),
-                provider: Some(provider_id.clone()),
-                reasoning_effort: controls.reasoning_effort,
-                speed: controls.speed,
+                provider: Some(route.target.provider.clone()),
+                reasoning_effort: route.controls.reasoning_effort,
+                speed: route.controls.speed,
                 tools: None,
                 tool_choice: None,
                 response_format: response_format.clone(),
@@ -1125,8 +1490,7 @@ impl CodergenBackend for AgentApiBackend {
                     emitter,
                     stage_scope,
                     &request,
-                    controls,
-                    fallback_chain,
+                    &mut fallback_plan,
                 )
                 .await;
             inference_duration = inference_duration.saturating_add(inference_start.elapsed());
@@ -1206,28 +1570,38 @@ impl CodergenBackend for AgentApiBackend {
         if cancel_token.is_cancelled() {
             return Err(Error::Cancelled);
         }
-        let (mut session, is_reused) = if let Some(ref key) = reuse_key {
+        let (cached, is_reused, fallback_notices) = if let Some(ref key) = reuse_key {
             let existing = self
                 .sessions
                 .lock()
                 .expect("sessions mutex is never poisoned: no code panics while holding this lock")
                 .remove(key);
-            if let Some(s) = existing {
-                (s, true)
+            if let Some(cached) = existing {
+                (cached, true, Vec::new())
             } else {
-                let created = self.create_session(node, sandbox, tool_hooks.clone()).await;
+                let created = self
+                    .create_session_with_plan(node, sandbox, tool_hooks.clone())
+                    .await;
                 if cancel_token.is_cancelled() {
                     return Err(Error::Cancelled);
                 }
-                (created?, false)
+                let (cached, notices) = created?;
+                (cached, false, notices)
             }
         } else {
-            let created = self.create_session(node, sandbox, tool_hooks.clone()).await;
+            let created = self
+                .create_session_with_plan(node, sandbox, tool_hooks.clone())
+                .await;
             if cancel_token.is_cancelled() {
                 return Err(Error::Cancelled);
             }
-            (created?, false)
+            let (cached, notices) = created?;
+            (cached, false, notices)
         };
+        let CachedAgentSession {
+            mut session,
+            mut fallback_plan,
+        } = cached;
         if cancel_token.is_cancelled() {
             return Err(Error::Cancelled);
         }
@@ -1247,6 +1621,7 @@ impl CodergenBackend for AgentApiBackend {
             last:    None,
         }));
         let stage_scope = StageScope::for_handler(context, &node.id);
+        Self::emit_fallback_plan_notices(&fallback_notices, emitter, &stage_scope);
 
         // Subscribe to session events: forward to pipeline emitter + track files.
         let mut event_forwarder = spawn_event_forwarder(
@@ -1269,7 +1644,7 @@ impl CodergenBackend for AgentApiBackend {
         let stage_id = stage_scope.stage_id();
         let mut lease: Option<Arc<ActivationLease>> = None;
 
-        let allow_failover_primary = !self.fallback_chain.is_empty();
+        let allow_failover_primary = fallback_plan.has_next();
         let init_result = if is_reused {
             Ok(())
         } else {
@@ -1332,7 +1707,8 @@ impl CodergenBackend for AgentApiBackend {
             Err(err) => Err(err),
         };
 
-        // On failover-eligible error, try fallback providers.
+        // On a provider-local failure, continue the fixed fallback plan that
+        // belongs to the originally requested model.
         let result: Result<(), Error> = match result {
             Ok(()) => Ok(()),
             Err(err) => match classify_agent_error(err, allow_failover_primary) {
@@ -1347,189 +1723,30 @@ impl CodergenBackend for AgentApiBackend {
                     return Err(err);
                 }
                 AgentApiErrorDisposition::FailoverEligible(sdk_err) => {
-                    let error_msg = sdk_err.to_string();
-                    let from_provider = self.provider_id.to_string();
-                    let from_model = self.model.clone();
-
-                    let mut last_err = Error::Llm(sdk_err);
-                    let mut succeeded = false;
-
-                    bridge.abort();
-                    discard_session(&mut session, &mut lease, &mut event_forwarder, emitter).await;
-                    event_forwarder.abort();
-
-                    for (index, target) in self.fallback_chain.iter().enumerate() {
-                        emitter.emit_scoped(
-                            &Event::Failover {
-                                stage:         node.id.clone(),
-                                from_provider: from_provider.clone(),
-                                from_model:    from_model.clone(),
-                                to_provider:   target.provider.clone(),
-                                to_model:      target.model.clone(),
-                                error:         error_msg.clone(),
-                            },
-                            &stage_scope,
-                        );
-
-                        let Ok(target_provider) =
-                            self.resolve_provider_context(&target.model, Some(&target.provider))
-                        else {
-                            continue;
-                        };
-
-                        if cancel_token.is_cancelled() {
-                            return Err(Error::Cancelled);
-                        }
-                        let new_session_result = Self::create_session_for(
-                            &target.model,
-                            target_provider,
-                            node,
-                            sandbox,
-                            self.source.as_ref(),
-                            Arc::clone(&self.catalog),
-                            &self.run_model_controls,
-                            self.tool_env.as_ref(),
-                            tool_hooks.clone(),
-                            self.mcp_servers.clone(),
-                            self.tool_secrets.clone(),
-                            self.fabro_run_tools.clone(),
-                        )
-                        .await;
-                        if cancel_token.is_cancelled() {
-                            return Err(Error::Cancelled);
-                        }
-                        let new_session = match new_session_result {
-                            Ok(s) => s,
-                            Err(e) => {
-                                last_err = e;
-                                continue;
-                            }
-                        };
-                        session = new_session;
-                        bridge.replace(cancel_token.clone(), &session);
-
-                        // Re-subscribe to forward events + track files from the new session
-                        event_forwarder = spawn_event_forwarder(
-                            &session,
-                            node.id.clone(),
-                            stage_scope.clone(),
-                            Arc::clone(emitter),
-                            Arc::clone(&file_tracking),
-                        );
-
-                        let allow_failover_next = index + 1 < self.fallback_chain.len();
-                        begin_session_lifecycle(&session, emitter, None);
-                        if let Err(err) = session.initialize().await {
-                            match classify_agent_error(err, allow_failover_next) {
-                                AgentApiErrorDisposition::Cancelled => {
-                                    bridge.abort();
-                                    discard_session(
-                                        &mut session,
-                                        &mut lease,
-                                        &mut event_forwarder,
-                                        emitter,
-                                    )
-                                    .await;
-                                    return Err(Error::Cancelled);
-                                }
-                                AgentApiErrorDisposition::Terminal(err) => {
-                                    bridge.abort();
-                                    discard_session(
-                                        &mut session,
-                                        &mut lease,
-                                        &mut event_forwarder,
-                                        emitter,
-                                    )
-                                    .await;
-                                    return Err(err);
-                                }
-                                AgentApiErrorDisposition::FailoverEligible(sdk_err) => {
-                                    last_err = Error::Llm(sdk_err);
-                                    bridge.abort();
-                                    discard_session(
-                                        &mut session,
-                                        &mut lease,
-                                        &mut event_forwarder,
-                                        emitter,
-                                    )
-                                    .await;
-                                    continue;
-                                }
-                            }
-                        }
-                        match self.attach_session_to_hub(
-                            &mut session,
-                            &stage_id,
-                            thread_id,
-                            emitter,
-                        ) {
-                            Ok(active_lease) => lease = Some(active_lease),
-                            Err(err) => {
-                                bridge.abort();
-                                discard_session(
-                                    &mut session,
-                                    &mut lease,
-                                    &mut event_forwarder,
-                                    emitter,
-                                )
-                                .await;
-                                return Err(err);
-                            }
-                        }
-                        emit_agent_tools_available(&session, &node.id, &stage_id, emitter);
-                        let process_result = session
-                            .process_input_with_runtime(prompt, agent_tool_runtime.clone())
-                            .await;
-                        let timing = session.last_input_timing();
-                        inference_duration = inference_duration.saturating_add(timing.inference);
-                        tool_duration = tool_duration.saturating_add(timing.tool);
-                        match process_result {
-                            Ok(()) => {
-                                event_forwarder.wait_for_processing_end().await;
-                                total_usage += session.last_input_usage();
-                                UsdMicros::accumulate(&mut total_cost, session.last_input_cost());
-                                succeeded = true;
-                                break;
-                            }
-                            Err(err) => match classify_agent_error(err, allow_failover_next) {
-                                AgentApiErrorDisposition::Cancelled => {
-                                    bridge.abort();
-                                    discard_session(
-                                        &mut session,
-                                        &mut lease,
-                                        &mut event_forwarder,
-                                        emitter,
-                                    )
-                                    .await;
-                                    return Err(Error::Cancelled);
-                                }
-                                AgentApiErrorDisposition::Terminal(err) => {
-                                    bridge.abort();
-                                    discard_session(
-                                        &mut session,
-                                        &mut lease,
-                                        &mut event_forwarder,
-                                        emitter,
-                                    )
-                                    .await;
-                                    return Err(err);
-                                }
-                                AgentApiErrorDisposition::FailoverEligible(sdk_err) => {
-                                    last_err = Error::Llm(sdk_err);
-                                    bridge.abort();
-                                    discard_session(
-                                        &mut session,
-                                        &mut lease,
-                                        &mut event_forwarder,
-                                        emitter,
-                                    )
-                                    .await;
-                                }
-                            },
-                        }
-                    }
-
-                    if succeeded { Ok(()) } else { Err(last_err) }
+                    self.failover_agent_session(
+                        &mut fallback_plan,
+                        sdk_err,
+                        node,
+                        prompt,
+                        agent_tool_runtime.clone(),
+                        sandbox,
+                        tool_hooks.clone(),
+                        &cancel_token,
+                        emitter,
+                        &stage_scope,
+                        &stage_id,
+                        thread_id,
+                        &file_tracking,
+                        &mut session,
+                        &mut bridge,
+                        &mut lease,
+                        &mut event_forwarder,
+                        &mut total_usage,
+                        &mut total_cost,
+                        &mut inference_duration,
+                        &mut tool_duration,
+                    )
+                    .await
                 }
             },
         };
@@ -1588,7 +1805,7 @@ impl CodergenBackend for AgentApiBackend {
                                 repair_attempts += 1;
                                 response = last_assistant_response(&session);
                             }
-                            Err(err) => match classify_agent_error(err, false) {
+                            Err(err) => match classify_agent_error(err, fallback_plan.has_next()) {
                                 AgentApiErrorDisposition::Cancelled => {
                                     bridge.abort();
                                     discard_session(
@@ -1612,15 +1829,31 @@ impl CodergenBackend for AgentApiBackend {
                                     return Err(err);
                                 }
                                 AgentApiErrorDisposition::FailoverEligible(sdk_err) => {
-                                    bridge.abort();
-                                    discard_session(
+                                    self.failover_agent_session(
+                                        &mut fallback_plan,
+                                        sdk_err,
+                                        node,
+                                        prompt,
+                                        agent_tool_runtime.clone(),
+                                        sandbox,
+                                        tool_hooks.clone(),
+                                        &cancel_token,
+                                        emitter,
+                                        &stage_scope,
+                                        &stage_id,
+                                        thread_id,
+                                        &file_tracking,
                                         &mut session,
+                                        &mut bridge,
                                         &mut lease,
                                         &mut event_forwarder,
-                                        emitter,
+                                        &mut total_usage,
+                                        &mut total_cost,
+                                        &mut inference_duration,
+                                        &mut tool_duration,
                                     )
-                                    .await;
-                                    return Err(Error::Llm(sdk_err));
+                                    .await?;
+                                    response = last_assistant_response(&session);
                                 }
                             },
                         }
@@ -1629,13 +1862,12 @@ impl CodergenBackend for AgentApiBackend {
             }
         }
 
-        let billing_controls = self.resolve_effective_request_controls(node)?;
         let stage_usage = billed_model_usage_from_llm(
             self.catalog.as_ref(),
             &ModelRef {
                 provider: session.provider_id(),
                 model_id: session.model().into(),
-                speed:    billing_controls.speed,
+                speed:    session.speed(),
             },
             &total_usage,
         )?
@@ -1653,7 +1885,10 @@ impl CodergenBackend for AgentApiBackend {
             self.sessions
                 .lock()
                 .expect("sessions mutex is never poisoned: no code panics while holding this lock")
-                .insert(key, session);
+                .insert(key, CachedAgentSession {
+                    session,
+                    fallback_plan,
+                });
         } else {
             bridge.abort();
             let session_id = session.id().to_string();
@@ -1894,6 +2129,20 @@ reasoning = false
         Arc::new(Catalog::from_builtin_with_overrides(&settings).unwrap())
     }
 
+    fn enabled_fallback_catalog() -> Arc<Catalog> {
+        let settings: LlmCatalogSettings = toml::from_str(
+            r"
+[providers.modal]
+enabled = true
+
+[providers.openrouter]
+enabled = true
+",
+        )
+        .expect("fallback catalog overrides should parse");
+        Arc::new(Catalog::from_builtin_with_overrides(&settings).unwrap())
+    }
+
     fn mock_api_backend(server: &MockServer) -> AgentApiBackend {
         let source = auth_test_support::env_credential_source(|name| {
             if name == "MOCK_API_KEY" {
@@ -1905,10 +2154,82 @@ reasoning = false
         AgentApiBackend::new_with_catalog(
             "mock-model".to_string(),
             ProviderId::from("mock"),
-            Vec::new(),
+            ModelFallbackPolicy::default(),
             source,
             SteeringHub::for_tests(),
             mock_llm_catalog(server),
+        )
+    }
+
+    fn fallback_api_backend(server: &MockServer) -> AgentApiBackend {
+        let settings: LlmCatalogSettings = toml::from_str(&format!(
+            r#"
+[providers.primary]
+adapter = "openai_compatible"
+agent_profile = "openai"
+base_url = "{}/primary"
+
+[providers.primary.auth]
+credentials = ["env:PRIMARY_API_KEY"]
+
+[providers.primary.models.test-model]
+display_name = "Primary Test Model"
+family = "test"
+default = true
+
+[providers.primary.models.test-model.limits]
+context_window = 8192
+max_output = 1024
+
+[providers.primary.models.test-model.features]
+tools = true
+vision = false
+reasoning = false
+
+[providers.fallback]
+adapter = "openai_compatible"
+agent_profile = "openai"
+base_url = "{}/fallback"
+
+[providers.fallback.auth]
+credentials = ["env:FALLBACK_API_KEY"]
+
+[providers.fallback.models.test-model]
+display_name = "Fallback Test Model"
+family = "test"
+default = true
+
+[providers.fallback.models.test-model.limits]
+context_window = 8192
+max_output = 1024
+
+[providers.fallback.models.test-model.features]
+tools = true
+vision = false
+reasoning = false
+"#,
+            server.base_url(),
+            server.base_url(),
+        ))
+        .expect("fallback catalog should parse");
+        let catalog = Arc::new(
+            Catalog::from_builtin_with_overrides(&settings).expect("catalog should build"),
+        );
+        let source = auth_test_support::env_credential_source(|name| match name {
+            "PRIMARY_API_KEY" | "FALLBACK_API_KEY" => Some("sk-test".to_string()),
+            _ => None,
+        });
+        let policy = ModelFallbackPolicy::new(std::collections::BTreeMap::from([(
+            "test-model".to_string(),
+            vec![FallbackTarget::new("fallback", "test-model")],
+        )]));
+        AgentApiBackend::new_with_catalog(
+            "test-model".to_string(),
+            ProviderId::new("primary"),
+            policy,
+            source,
+            SteeringHub::for_tests(),
+            catalog,
         )
     }
 
@@ -2007,7 +2328,7 @@ reasoning = false
         let backend = AgentApiBackend::new(
             "claude-opus-4-6".to_string(),
             ProviderId::openai(),
-            Vec::new(),
+            ModelFallbackPolicy::default(),
             auth_test_support::vault_only_credential_source(),
             SteeringHub::for_tests(),
         );
@@ -2020,7 +2341,7 @@ reasoning = false
         let backend = AgentApiBackend::new(
             "claude-opus-4-6".to_string(),
             ProviderId::anthropic(),
-            Vec::new(),
+            ModelFallbackPolicy::default(),
             auth_test_support::vault_only_credential_source(),
             SteeringHub::for_tests(),
         );
@@ -2850,7 +3171,7 @@ enabled = true
         let backend = AgentApiBackend::new_with_catalog(
             "gpt-5.4".to_string(),
             ProviderId::from("openrouter"),
-            Vec::new(),
+            ModelFallbackPolicy::default(),
             auth_test_support::vault_only_credential_source(),
             SteeringHub::for_tests(),
             Arc::new(Catalog::from_builtin_with_overrides(&settings).unwrap()),
@@ -2866,7 +3187,7 @@ enabled = true
         let backend = AgentApiBackend::new_with_catalog(
             "gpt-5.4".to_string(),
             ProviderId::from("openrouter"),
-            Vec::new(),
+            ModelFallbackPolicy::default(),
             auth_test_support::vault_only_credential_source(),
             SteeringHub::for_tests(),
             Arc::new(Catalog::from_builtin().unwrap()),
@@ -2913,7 +3234,7 @@ reasoning = false
         let backend = AgentApiBackend::new_with_catalog(
             "acme-llama".to_string(),
             ProviderId::from("acme"),
-            Vec::new(),
+            ModelFallbackPolicy::default(),
             auth_test_support::vault_only_credential_source(),
             SteeringHub::for_tests(),
             catalog,
@@ -2960,7 +3281,7 @@ reasoning = false
         let backend = AgentApiBackend::new_with_catalog(
             "acme-claude".to_string(),
             ProviderId::from("acme"),
-            Vec::new(),
+            ModelFallbackPolicy::default(),
             auth_test_support::vault_only_credential_source(),
             SteeringHub::for_tests(),
             catalog,
@@ -2977,7 +3298,7 @@ reasoning = false
         let backend = AgentApiBackend::new_with_catalog(
             "claude-sonnet-5".to_string(),
             ProviderId::anthropic(),
-            Vec::new(),
+            ModelFallbackPolicy::default(),
             auth_test_support::vault_only_credential_source(),
             SteeringHub::for_tests(),
             Arc::new(Catalog::from_builtin().unwrap()),
@@ -3004,7 +3325,7 @@ enabled = true
         let backend = AgentApiBackend::new_with_catalog(
             "openai/gpt-5.4".to_string(),
             ProviderId::from("openrouter"),
-            Vec::new(),
+            ModelFallbackPolicy::default(),
             auth_test_support::vault_only_credential_source(),
             SteeringHub::for_tests(),
             catalog,
@@ -3023,7 +3344,7 @@ enabled = true
         let backend = AgentApiBackend::new(
             "gpt-5.4".to_string(),
             ProviderId::openai(),
-            Vec::new(),
+            ModelFallbackPolicy::default(),
             auth_test_support::vault_only_credential_source(),
             SteeringHub::for_tests(),
         )
@@ -3044,7 +3365,7 @@ enabled = true
         let backend = AgentApiBackend::new(
             "gpt-5.4".to_string(),
             ProviderId::openai(),
-            Vec::new(),
+            ModelFallbackPolicy::default(),
             auth_test_support::vault_only_credential_source(),
             SteeringHub::for_tests(),
         )
@@ -3073,7 +3394,7 @@ enabled = true
         let backend = AgentApiBackend::new(
             "gpt-5.4".to_string(),
             ProviderId::openai(),
-            Vec::new(),
+            ModelFallbackPolicy::default(),
             auth_test_support::vault_only_credential_source(),
             SteeringHub::for_tests(),
         );
@@ -3082,6 +3403,86 @@ enabled = true
         let controls = backend.resolve_effective_request_controls(&node).unwrap();
 
         assert_eq!(controls.reasoning_effort, None);
+    }
+
+    #[test]
+    fn fallback_plan_maps_reasoning_to_each_target_and_rounds_ties_up() {
+        let policy = ModelFallbackPolicy::new(std::collections::BTreeMap::from([(
+            "kimi-k3".to_string(),
+            vec![
+                FallbackTarget::new("kimi", "kimi-k3"),
+                FallbackTarget::new("openrouter", "kimi-k3"),
+                FallbackTarget::new("anthropic", "claude-opus-5"),
+            ],
+        )]));
+        let backend = AgentApiBackend::new_with_catalog(
+            "kimi-k3".to_string(),
+            ProviderId::new("modal"),
+            policy,
+            auth_test_support::vault_only_credential_source(),
+            SteeringHub::for_tests(),
+            enabled_fallback_catalog(),
+        );
+
+        let (plan, notices) = backend.fallback_plan(
+            "kimi-k3",
+            &ProviderId::new("modal"),
+            EffectiveRequestControls {
+                reasoning_effort: Some(ReasoningEffort::Medium),
+                speed:            None,
+            },
+        );
+
+        assert!(notices.is_empty());
+        assert_eq!(
+            plan.remaining
+                .iter()
+                .map(|route| route.controls.reasoning_effort)
+                .collect::<Vec<_>>(),
+            vec![
+                Some(ReasoningEffort::High),
+                Some(ReasoningEffort::High),
+                Some(ReasoningEffort::Medium),
+            ]
+        );
+    }
+
+    #[test]
+    fn advancing_a_fallback_plan_never_activates_the_target_models_chain() {
+        let policy = ModelFallbackPolicy::new(std::collections::BTreeMap::from([
+            ("claude-fable-5".to_string(), vec![
+                FallbackTarget::new("openai", "gpt-5.6-sol"),
+                FallbackTarget::new("anthropic", "claude-opus-5"),
+            ]),
+            ("gpt-5.6-sol".to_string(), vec![FallbackTarget::new(
+                "anthropic",
+                "claude-sonnet-5",
+            )]),
+        ]));
+        let backend = AgentApiBackend::new_with_catalog(
+            "claude-fable-5".to_string(),
+            ProviderId::anthropic(),
+            policy,
+            auth_test_support::vault_only_credential_source(),
+            SteeringHub::for_tests(),
+            enabled_fallback_catalog(),
+        );
+        let (mut plan, notices) = backend.fallback_plan(
+            "claude-fable-5",
+            &ProviderId::anthropic(),
+            EffectiveRequestControls::default(),
+        );
+
+        assert!(notices.is_empty());
+        let (sol, first_attempt) = plan.advance().expect("Sol should be first");
+        let (opus, second_attempt) = plan.advance().expect("Opus should be second");
+        assert_eq!(sol.target, FallbackTarget::new("openai", "gpt-5.6-sol"));
+        assert_eq!(
+            opus.target,
+            FallbackTarget::new("anthropic", "claude-opus-5")
+        );
+        assert_eq!((first_attempt, second_attempt), (1, 2));
+        assert!(!plan.has_next());
     }
 
     #[tokio::test]
@@ -3099,7 +3500,7 @@ enabled = true
         let backend = AgentApiBackend::new(
             "claude-opus-4-6".to_string(),
             ProviderId::anthropic(),
-            Vec::new(),
+            ModelFallbackPolicy::default(),
             Arc::new(VaultCredentialSource::with_env_lookup(
                 Arc::new(AsyncRwLock::new(vault)),
                 |_| None,
@@ -3116,14 +3517,18 @@ enabled = true
 
     #[tokio::test]
     async fn one_shot_falls_back_after_refusal_error() {
-        let fallback_chain = vec![FallbackTarget {
+        let configured_targets = vec![FallbackTarget {
             provider: "openai".to_string(),
             model:    "gpt-5.5".to_string(),
         }];
+        let fallback_policy = ModelFallbackPolicy::new(std::collections::BTreeMap::from([(
+            "claude-fable-5".to_string(),
+            configured_targets,
+        )]));
         let backend = AgentApiBackend::new(
             "claude-fable-5".to_string(),
             ProviderId::anthropic(),
-            fallback_chain.clone(),
+            fallback_policy,
             auth_test_support::vault_only_credential_source(),
             SteeringHub::for_tests(),
         );
@@ -3144,6 +3549,13 @@ enabled = true
         let context = Context::new();
         let stage_scope = StageScope::for_handler(&context, &node.id);
         let emitter = Arc::new(Emitter::new(fabro_types::RunId::new()));
+        let emitted_failover = Arc::new(Mutex::new(None));
+        let emitted_failover_for_listener = Arc::clone(&emitted_failover);
+        emitter.on_event(move |event| {
+            if let fabro_types::EventBody::Failover(props) = &event.body {
+                *emitted_failover_for_listener.lock().unwrap() = Some(props.clone());
+            }
+        });
         let request = Request {
             model:            "claude-fable-5".to_string(),
             messages:         vec![Message::user("Hello")],
@@ -3160,6 +3572,12 @@ enabled = true
             metadata:         None,
             provider_options: None,
         };
+        let (mut fallback_plan, notices) = backend.fallback_plan(
+            "claude-fable-5",
+            &ProviderId::anthropic(),
+            EffectiveRequestControls::default(),
+        );
+        assert!(notices.is_empty());
 
         let completion = backend
             .complete_one_shot_request(
@@ -3168,8 +3586,7 @@ enabled = true
                 &emitter,
                 &stage_scope,
                 &request,
-                EffectiveRequestControls::default(),
-                &fallback_chain,
+                &mut fallback_plan,
             )
             .await
             .unwrap();
@@ -3177,6 +3594,91 @@ enabled = true
         assert_eq!(completion.response.text(), "fallback ok");
         assert_eq!(completion.model.provider, ProviderId::openai());
         assert_eq!(completion.model.model_id, "gpt-5.5");
+        let failover = emitted_failover
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("agent.failover should be emitted");
+        assert_eq!(failover.original_provider.as_deref(), Some("anthropic"));
+        assert_eq!(failover.original_model.as_deref(), Some("claude-fable-5"));
+        assert_eq!(failover.attempt, Some(1));
+        assert_eq!(failover.from_provider, "anthropic");
+        assert_eq!(failover.from_model, "claude-fable-5");
+        assert_eq!(failover.to_provider, "openai");
+        assert_eq!(failover.to_model, "gpt-5.5");
+        assert_eq!(failover.requested_reasoning_effort, None);
+        assert_eq!(failover.effective_reasoning_effort, None);
+        assert!(failover.error.contains("refused"));
+    }
+
+    #[tokio::test]
+    async fn explicit_provider_one_shot_stays_on_fallback_during_output_repair() {
+        let server = MockServer::start();
+        let primary_failure = server.mock(|when, then| {
+            when.method(POST).path("/primary/chat/completions");
+            then.status(401)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "error": {
+                        "message": "primary credential expired",
+                        "type": "authentication_error"
+                    }
+                }));
+        });
+        let fallback_response = server.mock(|when, then| {
+            when.method(POST)
+                .path("/fallback/chat/completions")
+                .body_excludes(r#""role":"assistant""#);
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(chat_completion_response("not json", 10, 1));
+        });
+        let fallback_repair = server.mock(|when, then| {
+            when.method(POST)
+                .path("/fallback/chat/completions")
+                .body_includes(r#""role":"assistant""#)
+                .body_includes("not json");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(chat_completion_response(r#"{"passed":true}"#, 11, 2));
+        });
+        let backend = fallback_api_backend(&server);
+        let mut node = Node::new("audit");
+        node.attrs.insert(
+            "provider".to_string(),
+            AttrValue::String("primary".to_string()),
+        );
+        node.attrs
+            .insert("output_schema".to_string(), custom_output_schema_attr());
+        node.attrs
+            .insert("output_retries".to_string(), AttrValue::Integer(1));
+        let context = Context::new();
+        let stage_scope = StageScope::for_handler(&context, &node.id);
+        let emitter = Arc::new(Emitter::new(fabro_types::RunId::new()));
+        let workspace = tempfile::tempdir().unwrap();
+        let sandbox: Arc<dyn fabro_agent::Sandbox> =
+            Arc::new(LocalSandbox::new(workspace.path().to_path_buf()));
+
+        let result = backend
+            .one_shot(OneShotRequest {
+                node:          &node,
+                prompt:        "Audit the result",
+                system_prompt: None,
+                emitter:       &emitter,
+                stage_scope:   &stage_scope,
+                sandbox:       &sandbox,
+                cancel_token:  CancellationToken::new(),
+            })
+            .await
+            .unwrap();
+
+        primary_failure.assert_calls(1);
+        fallback_response.assert_calls(1);
+        fallback_repair.assert_calls(1);
+        let CodergenResult::Text { text, .. } = result else {
+            panic!("one_shot should return text");
+        };
+        assert_eq!(text, r#"{"passed":true}"#);
     }
 
     #[tokio::test]
@@ -3310,6 +3812,77 @@ enabled = true
     }
 
     #[tokio::test]
+    async fn agent_output_repair_continues_on_the_original_models_fallback_plan() {
+        let server = MockServer::start();
+        let primary_response = server.mock(|when, then| {
+            when.method(POST)
+                .path("/primary/chat/completions")
+                .body_includes(r#""stream":true"#)
+                .body_excludes(r#""role":"assistant""#);
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(chat_completion_stream("not json", 20, 3));
+        });
+        let failed_repair = server.mock(|when, then| {
+            when.method(POST)
+                .path("/primary/chat/completions")
+                .body_includes(r#""role":"assistant""#)
+                .body_includes("not json");
+            then.status(401)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "error": {
+                        "message": "primary credential expired",
+                        "type": "authentication_error"
+                    }
+                }));
+        });
+        let fallback_response = server.mock(|when, then| {
+            when.method(POST)
+                .path("/fallback/chat/completions")
+                .body_includes(r#""stream":true"#)
+                .body_excludes(r#""role":"assistant""#);
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(chat_completion_stream(r#"{"passed":true}"#, 22, 4));
+        });
+        let backend = fallback_api_backend(&server);
+        let mut node = Node::new("audit");
+        node.attrs
+            .insert("output_schema".to_string(), custom_output_schema_attr());
+        node.attrs
+            .insert("output_retries".to_string(), AttrValue::Integer(1));
+        let context = Context::new();
+        let emitter = Arc::new(Emitter::new(fabro_types::RunId::new()));
+        let workspace = tempfile::tempdir().unwrap();
+        let sandbox: Arc<dyn fabro_agent::Sandbox> =
+            Arc::new(LocalSandbox::new(workspace.path().to_path_buf()));
+
+        let result = backend
+            .run(CodergenRunRequest {
+                node:               &node,
+                prompt:             "Audit the result",
+                context:            &context,
+                thread_id:          None,
+                emitter:            &emitter,
+                sandbox:            &sandbox,
+                tool_hooks:         None,
+                cancel_token:       CancellationToken::new(),
+                agent_tool_runtime: fabro_agent::AgentToolRuntime::default(),
+            })
+            .await
+            .unwrap();
+
+        primary_response.assert_calls(1);
+        failed_repair.assert_calls(1);
+        fallback_response.assert_calls(1);
+        let CodergenResult::Text { text, .. } = result else {
+            panic!("run should return text");
+        };
+        assert_eq!(text, r#"{"passed":true}"#);
+    }
+
+    #[tokio::test]
     async fn agent_run_web_search_uses_configured_brave_search_key() {
         let server = MockServer::start();
         let tool_call = server.mock(|when, then| {
@@ -3397,7 +3970,7 @@ enabled = true
         let backend = AgentApiBackend::new(
             "gpt-5.4".to_string(),
             ProviderId::openai(),
-            Vec::new(),
+            ModelFallbackPolicy::default(),
             auth_test_support::vault_only_credential_source(),
             SteeringHub::for_tests(),
         );
@@ -3426,12 +3999,21 @@ enabled = true
             SessionOptions::default(),
             None,
         );
+        let (fallback_plan, notices) = backend.fallback_plan(
+            "gpt-5.4",
+            &ProviderId::openai(),
+            EffectiveRequestControls::default(),
+        );
+        assert!(notices.is_empty());
         begin_session_lifecycle(&session, &emitter, None);
         backend
             .sessions
             .lock()
             .unwrap()
-            .insert("thread-1".to_string(), session);
+            .insert("thread-1".to_string(), CachedAgentSession {
+                session,
+                fallback_plan,
+            });
 
         backend.shutdown(&emitter).await;
         backend.shutdown(&emitter).await;
@@ -3515,7 +4097,7 @@ enabled = true
 
     fn non_failover_llm_error() -> LlmError {
         LlmError::Provider {
-            kind:   ProviderErrorKind::Authentication,
+            kind:   ProviderErrorKind::InvalidRequest,
             detail: Box::new(ProviderErrorDetail {
                 message:     "bad key".into(),
                 provider:    "openai".into(),

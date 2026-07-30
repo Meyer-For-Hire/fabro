@@ -88,6 +88,23 @@ fn server_owned_provider_is_not_rejected_by_offline_validation() {
 }
 
 #[test]
+fn model_fallback_table_is_not_catalog_checked_by_offline_validation() {
+    let cli = LightweightCli::new();
+    let mut cmd = cli.command();
+    cmd.env("FABRO_SERVER", "http://127.0.0.1:9")
+        .arg("validate")
+        .arg(fixture("offline-fallbacks/workflow.fabro"));
+
+    let output = cmd.output().expect("validate should execute");
+    assert!(
+        output.status.success(),
+        "offline validation should parse model fallback tables without a server catalog\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
 fn branching() {
     let context = test_context!();
     let mut cmd = context.validate();

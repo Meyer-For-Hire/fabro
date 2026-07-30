@@ -746,7 +746,7 @@ command = ["demo-mcp"]
                 model: Some(RunModelLayer {
                     provider:  Some("openai".to_string()),
                     name:      Some("gpt-5".to_string()),
-                    fallbacks: Vec::new(),
+                    fallbacks: crate::MergeMap::default(),
                     controls:  None,
                 }),
                 execution: Some(RunExecutionLayer {

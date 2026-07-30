@@ -148,14 +148,19 @@ pub struct RunModelLayer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[option(value_type = "string")]
     pub name:      Option<String>,
-    /// Ordered fallback references: bare providers, bare model IDs or aliases,
-    /// or provider-qualified `provider:selector` values. A qualified selector
-    /// may be a model ID, alias, or provider API ID. Legacy `provider/model`
-    /// values remain accepted. Supports the `...` splice marker at layering
-    /// time — see [`super::splice_array`].
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[option(default = "[]", value_type = "array<string>")]
-    pub fallbacks: Vec<ModelRefOrSplice>,
+    /// Model-keyed fallback chains. Each value is an ordered list of bare
+    /// providers, bare model IDs or aliases, or provider-qualified
+    /// `provider:selector` values. A qualified selector may be a model ID,
+    /// alias, or provider API ID. Legacy `provider/model` values remain
+    /// accepted. Each list supports the `...` splice marker at layering time.
+    /// Fabro selects one chain from the original requested model. A fallback
+    /// target never activates another model's chain.
+    ///
+    /// Model keys stay unresolved in this sparse layer because `fabro
+    /// validate` is offline and has no server model catalog.
+    #[serde(default, skip_serializing_if = "MergeMap::is_empty")]
+    #[option(default = "{}", value_type = "table<string, array<string>>")]
+    pub fallbacks: MergeMap<Vec<ModelRefOrSplice>>,
     /// Run-level default values for typed model controls. Node attributes
     /// and style-applied attributes still win over these defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]

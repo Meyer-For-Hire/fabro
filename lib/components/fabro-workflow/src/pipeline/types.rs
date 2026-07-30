@@ -5,7 +5,7 @@ use std::sync::Arc;
 use fabro_graphviz::graph::Graph;
 use fabro_interview::Interviewer;
 use fabro_mcp::config::McpServerSettings;
-use fabro_model::{Catalog, FallbackTarget, ProviderId};
+use fabro_model::{Catalog, ProviderId};
 use fabro_sandbox::SandboxSpec;
 use fabro_template::TemplateContext;
 use fabro_types::settings::run::{PullRequestSettings, RunModelControls};
@@ -20,6 +20,7 @@ use crate::error::Error;
 use crate::event::Emitter;
 use crate::file_resolver::FileResolver;
 use crate::handler::HandlerRegistry;
+use crate::model_fallback::ModelFallbackPolicy;
 use crate::outcome::Outcome;
 use crate::records::{Checkpoint, Conclusion, RunSpec};
 use crate::run_control::RunControlState;
@@ -236,7 +237,7 @@ impl Persisted {
 pub struct LlmSpec {
     pub model:          String,
     pub provider_id:    ProviderId,
-    pub fallback_chain: Vec<FallbackTarget>,
+    pub fallbacks:      ModelFallbackPolicy,
     pub mcp_servers:    Vec<McpServerSettings>,
     pub model_controls: RunModelControls,
     pub dry_run:        bool,

@@ -1482,36 +1482,6 @@ impl Catalog {
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
     }
-
-    /// Build an ordered fallback chain for a primary provider/model.
-    ///
-    /// For each fallback provider, finds the closest matching model. Providers
-    /// where no capability match exists (or the provider string doesn't
-    /// parse) are skipped.
-    #[must_use]
-    pub fn build_fallback_chain(
-        &self,
-        primary: &ProviderId,
-        model: &str,
-        fallbacks: &HashMap<String, Vec<String>>,
-    ) -> Vec<FallbackTarget> {
-        let Some(reference) = self.get_on_provider(primary, model) else {
-            return Vec::new();
-        };
-
-        let Some(fallback_providers) = fallbacks.get(primary.as_str()) else {
-            return Vec::new();
-        };
-
-        fallback_providers
-            .iter()
-            .filter_map(|provider_str| {
-                let provider = ProviderId::from(provider_str.clone());
-                self.closest(&provider, reference)
-                    .map(|m| FallbackTarget::new(provider_str, &m.id))
-            })
-            .collect()
-    }
 }
 
 type ModelIndexes = (
@@ -4198,71 +4168,6 @@ enabled = true
                 .closest(&ProviderId::openai(), haiku)
                 .is_none()
         );
-    }
-
-    #[test]
-    fn builtin_build_fallback_chain() {
-        let fallbacks = HashMap::from([("anthropic".to_string(), vec![
-            "gemini".to_string(),
-            "openai".to_string(),
-        ])]);
-        let chain = Catalog::builtin().build_fallback_chain(
-            &ProviderId::anthropic(),
-            "claude-opus-4-6",
-            &fallbacks,
-        );
-        assert_eq!(chain.len(), 2);
-        assert_eq!(chain[0].provider, "gemini");
-        assert_eq!(chain[0].model, "gemini-3.1-pro-preview");
-        assert_eq!(chain[1].provider, "openai");
-        assert_eq!(chain[1].model, "gpt-5.5");
-    }
-
-    #[test]
-    fn builtin_build_fallback_chain_unknown_model() {
-        let fallbacks = HashMap::from([("anthropic".to_string(), vec!["gemini".to_string()])]);
-        let chain = Catalog::builtin().build_fallback_chain(
-            &ProviderId::anthropic(),
-            "unknown-xyz",
-            &fallbacks,
-        );
-        assert!(chain.is_empty());
-    }
-
-    #[test]
-    fn builtin_build_fallback_chain_provider_not_in_map() {
-        let fallbacks = HashMap::from([("openai".to_string(), vec!["anthropic".to_string()])]);
-        let chain = Catalog::builtin().build_fallback_chain(
-            &ProviderId::anthropic(),
-            "claude-opus-4-6",
-            &fallbacks,
-        );
-        assert!(chain.is_empty());
-    }
-
-    #[test]
-    fn builtin_build_fallback_chain_skips_no_capability_match() {
-        let fallbacks = HashMap::from([("anthropic".to_string(), vec![
-            "openai".to_string(),
-            "kimi".to_string(),
-        ])]);
-        let chain = Catalog::builtin().build_fallback_chain(
-            &ProviderId::anthropic(),
-            "claude-haiku-4-5",
-            &fallbacks,
-        );
-        assert!(chain.is_empty());
-    }
-
-    #[test]
-    fn builtin_build_fallback_chain_empty_map() {
-        let fallbacks = HashMap::new();
-        let chain = Catalog::builtin().build_fallback_chain(
-            &ProviderId::anthropic(),
-            "claude-opus-4-6",
-            &fallbacks,
-        );
-        assert!(chain.is_empty());
     }
 
     #[test]

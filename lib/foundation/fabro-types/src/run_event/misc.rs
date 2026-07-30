@@ -187,11 +187,21 @@ pub struct SshAccessReadyProps {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FailoverProps {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
     pub from_provider: String,
-    pub from_model:    String,
-    pub to_provider:   String,
-    pub to_model:      String,
-    pub error:         String,
+    pub from_model: String,
+    pub to_provider: String,
+    pub to_model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_reasoning_effort: Option<String>,
+    pub error: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

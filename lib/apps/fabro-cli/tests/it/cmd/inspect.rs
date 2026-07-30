@@ -129,7 +129,7 @@ fn inspect_resolves_selector_via_server_endpoint() {
               "model": {
                 "provider": null,
                 "name": null,
-                "fallbacks": [],
+                "fallbacks": {},
                 "controls": {
                   "reasoning_effort": null,
                   "speed": null

@@ -25,6 +25,8 @@ use crate::git::GitAuthor;
 use crate::github_token_source::{AppIatMinter, GitHubTokenSource};
 use crate::handler::llm::{AgentAcpBackend, AgentApiBackend, BackendRouter, routing};
 use crate::handler::{HandlerRegistry, default_registry};
+#[cfg(test)]
+use crate::model_fallback::ModelFallbackPolicy;
 use crate::run_metadata::{RunMetadataRuntime, build_metadata_writer, metadata_branch_name};
 use crate::run_options::{GitCheckpointOptions, RunOptions};
 use crate::sandbox_git_runtime::SandboxGitRuntime;
@@ -166,7 +168,7 @@ async fn build_registry(
     let build_llm_registry = || {
         let model = spec.model.clone();
         let provider_id = spec.provider_id.clone();
-        let fallback_chain = spec.fallback_chain.clone();
+        let fallbacks = spec.fallbacks.clone();
         let mcp_servers = spec.mcp_servers.clone();
         let model_controls = spec.model_controls.clone();
         let tool_secrets_for_api = tool_secrets.clone();
@@ -180,7 +182,7 @@ async fn build_registry(
             let mut api = AgentApiBackend::new_with_catalog(
                 model.clone(),
                 provider_id.clone(),
-                fallback_chain.clone(),
+                fallbacks.clone(),
                 Arc::clone(&llm_source_for_api),
                 Arc::clone(&steering_hub_for_api),
                 Arc::clone(&catalog_for_api),
@@ -830,7 +832,7 @@ mod tests {
             llm:               LlmSpec {
                 model:          "test-model".to_string(),
                 provider_id:    fabro_model::ProviderId::anthropic(),
-                fallback_chain: Vec::new(),
+                fallbacks:      ModelFallbackPolicy::default(),
                 mcp_servers:    Vec::new(),
                 model_controls: RunModelControls::default(),
                 dry_run:        true,
@@ -911,7 +913,7 @@ mod tests {
             llm:               LlmSpec {
                 model:          "test-model".to_string(),
                 provider_id:    fabro_model::ProviderId::anthropic(),
-                fallback_chain: Vec::new(),
+                fallbacks:      ModelFallbackPolicy::default(),
                 mcp_servers:    Vec::new(),
                 model_controls: RunModelControls::default(),
                 dry_run:        true,
@@ -1010,7 +1012,7 @@ mod tests {
             &LlmSpec {
                 model:          "claude-opus-4-6".to_string(),
                 provider_id:    fabro_model::ProviderId::anthropic(),
-                fallback_chain: Vec::new(),
+                fallbacks:      ModelFallbackPolicy::default(),
                 mcp_servers:    Vec::new(),
                 model_controls: RunModelControls::default(),
                 dry_run:        false,
@@ -1132,7 +1134,7 @@ mod tests {
             llm: LlmSpec {
                 model:          "fake-acp".to_string(),
                 provider_id:    fabro_model::ProviderId::openai(),
-                fallback_chain: Vec::new(),
+                fallbacks:      ModelFallbackPolicy::default(),
                 mcp_servers:    Vec::new(),
                 model_controls: RunModelControls::default(),
                 dry_run:        false,
@@ -1227,7 +1229,7 @@ mod tests {
             llm:               LlmSpec {
                 model:          "test-model".to_string(),
                 provider_id:    fabro_model::ProviderId::anthropic(),
-                fallback_chain: Vec::new(),
+                fallbacks:      ModelFallbackPolicy::default(),
                 mcp_servers:    Vec::new(),
                 model_controls: RunModelControls::default(),
                 dry_run:        true,
@@ -1369,7 +1371,7 @@ mod tests {
             llm: LlmSpec {
                 model:          "test-model".to_string(),
                 provider_id:    fabro_model::ProviderId::anthropic(),
-                fallback_chain: Vec::new(),
+                fallbacks:      ModelFallbackPolicy::default(),
                 mcp_servers:    Vec::new(),
                 model_controls: RunModelControls::default(),
                 dry_run:        true,

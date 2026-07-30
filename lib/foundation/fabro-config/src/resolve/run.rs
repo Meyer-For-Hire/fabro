@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use fabro_types::settings::InterpString;
 use fabro_types::settings::run::{
@@ -123,11 +123,17 @@ fn resolve_model(model: Option<&RunModelLayer>) -> RunModelSettings {
         fallbacks: model
             .fallbacks
             .iter()
-            .filter_map(|entry| match entry {
-                ModelRefOrSplice::ModelRef(model_ref) => Some(model_ref.clone()),
-                ModelRefOrSplice::Splice => None,
+            .map(|(requested_model, chain)| {
+                let chain = chain
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        ModelRefOrSplice::ModelRef(model_ref) => Some(model_ref.clone()),
+                        ModelRefOrSplice::Splice => None,
+                    })
+                    .collect();
+                (requested_model.clone(), chain)
             })
-            .collect(),
+            .collect::<BTreeMap<_, _>>(),
         controls:  model
             .controls
             .as_ref()

@@ -210,8 +210,9 @@ impl Error {
     /// Whether this error is eligible for provider-level failover.
     ///
     /// Includes everything that is `retryable()` (transient errors good for
-    /// same-provider retry) plus `QuotaExceeded` — a different provider won't
-    /// share the same quota.
+    /// same-provider retry), provider-local availability failures, and
+    /// `QuotaExceeded`. A different provider has independent credentials,
+    /// access policy, model inventory, and quota.
     #[must_use]
     pub fn failover_eligible(&self) -> bool {
         if self.retryable() {
@@ -220,7 +221,10 @@ impl Error {
         matches!(
             self,
             Self::Provider {
-                kind: ProviderErrorKind::QuotaExceeded,
+                kind: ProviderErrorKind::Authentication
+                    | ProviderErrorKind::AccessDenied
+                    | ProviderErrorKind::NotFound
+                    | ProviderErrorKind::QuotaExceeded,
                 ..
             } | Self::RequestTimeout { .. }
         ) || self.refusal_content_filter()
@@ -888,6 +892,26 @@ mod tests {
     }
 
     #[test]
+    fn failover_eligible_provider_local_availability_errors() {
+        let detail = || Box::new(ProviderErrorDetail::new("error", "openai"));
+
+        for kind in [
+            ProviderErrorKind::Authentication,
+            ProviderErrorKind::AccessDenied,
+            ProviderErrorKind::NotFound,
+        ] {
+            assert!(
+                Error::Provider {
+                    kind,
+                    detail: detail(),
+                }
+                .failover_eligible(),
+                "{kind:?} should permit another provider"
+            );
+        }
+    }
+
+    #[test]
     fn failover_eligible_transient_non_provider_errors() {
         assert!(
             Error::RequestTimeout {
@@ -917,14 +941,6 @@ mod tests {
     #[test]
     fn failover_not_eligible_deterministic_errors() {
         let detail = || Box::new(ProviderErrorDetail::new("error", "openai"));
-
-        assert!(
-            !Error::Provider {
-                kind:   ProviderErrorKind::Authentication,
-                detail: detail(),
-            }
-            .failover_eligible()
-        );
 
         assert!(
             !Error::Provider {

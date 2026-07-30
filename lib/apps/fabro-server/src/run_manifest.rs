@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,15 +25,18 @@ use fabro_sandbox::from_environment::{
 use fabro_sandbox::redact::redact_auth_url;
 use fabro_sandbox::{DockerSandboxOptions, Sandbox, SandboxSpec};
 use fabro_static::EnvVars;
+use fabro_types::settings::ModelRef;
 use fabro_types::settings::cli::OutputVerbosity;
 use fabro_types::settings::interp::InterpString;
 use fabro_types::settings::run::{EnvironmentProvider, McpServerSettings, RunGoal, RunNamespace};
 use fabro_types::{
-    ManifestPath, RunId, RunProvenance, SandboxProviderKind, ServerSettings, WorkflowSettings,
+    ManifestPath, RunId, RunNoticeLevel, RunProvenance, SandboxProviderKind, ServerSettings,
+    WorkflowSettings,
 };
 use fabro_util::check_report::{CheckDetail, CheckReport, CheckResult, CheckSection, CheckStatus};
 use fabro_validate::Severity;
 use fabro_workflow::Error as WorkflowError;
+use fabro_workflow::model_fallback::resolve_model_fallbacks;
 use fabro_workflow::operations::{
     CreateRunInput, ValidateInput, WorkflowInput, validate, validate_with_catalog,
     validate_with_ready_providers,
@@ -544,6 +547,12 @@ async fn build_preflight_report(
         ));
     }
     run_environment_capability_check(&mut checks, &resolved_run);
+    let model_fallbacks_ok = run_model_fallback_check(
+        &mut checks,
+        catalog.as_ref(),
+        &ready_providers,
+        &resolved_run.model.fallbacks,
+    );
     let needs_github_credentials =
         sandbox_provider.is_clone_based() || resolved_run.integrations.github.is_token_requested();
     let github_app = if needs_github_credentials {
@@ -592,7 +601,8 @@ async fn build_preflight_report(
     let github_token_ok =
         run_github_token_check(&mut checks, prepared, &resolved_run, github_app).await;
 
-    let checks_ok = sandbox_ok && repository_access_ok && llm_ok && github_token_ok;
+    let checks_ok =
+        model_fallbacks_ok && sandbox_ok && repository_access_ok && llm_ok && github_token_ok;
 
     Ok((
         CheckReport {
@@ -604,6 +614,76 @@ async fn build_preflight_report(
         },
         checks_ok,
     ))
+}
+
+fn run_model_fallback_check(
+    checks: &mut Vec<CheckResult>,
+    catalog: &Catalog,
+    ready_providers: &[ProviderId],
+    configured: &BTreeMap<String, Vec<ModelRef>>,
+) -> bool {
+    if configured.is_empty() {
+        return true;
+    }
+
+    let eligible = ready_providers.iter().cloned().collect::<HashSet<_>>();
+    let resolved = match resolve_model_fallbacks(catalog, &eligible, configured) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            checks.push(CheckResult {
+                name:        "Model Fallbacks".into(),
+                status:      CheckStatus::Error,
+                summary:     "invalid".into(),
+                details:     configured
+                    .keys()
+                    .map(|model| CheckDetail::new(format!("Requested model: {model}")))
+                    .collect(),
+                remediation: Some(error.to_string()),
+            });
+            return false;
+        }
+    };
+
+    let has_warning = resolved
+        .notices
+        .iter()
+        .any(|notice| notice.level() != RunNoticeLevel::Info);
+    let mut details = resolved
+        .policy
+        .iter()
+        .map(|(model, targets)| {
+            let chain = if targets.is_empty() {
+                "(none)".to_string()
+            } else {
+                targets
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" -> ")
+            };
+            CheckDetail::new(format!("{model}: {chain}"))
+        })
+        .collect::<Vec<_>>();
+    details.extend(resolved.notices.iter().map(|notice| CheckDetail {
+        text: notice.message(),
+        warn: notice.level() != RunNoticeLevel::Info,
+    }));
+
+    checks.push(CheckResult {
+        name: "Model Fallbacks".into(),
+        status: if has_warning {
+            CheckStatus::Warning
+        } else {
+            CheckStatus::Pass
+        },
+        summary: format!(
+            "{} requested model chain(s)",
+            resolved.policy.iter().count()
+        ),
+        details,
+        remediation: None,
+    });
+    true
 }
 
 fn base_preflight_checks(prepared: &PreparedManifest, graph: &Graph) -> Vec<CheckResult> {
@@ -1493,6 +1573,106 @@ mod tests {
 
     fn test_catalog() -> Arc<Catalog> {
         Arc::new(Catalog::from_builtin().unwrap())
+    }
+
+    fn openrouter_catalog() -> Catalog {
+        let overrides = toml::from_str(
+            r"
+[providers.openrouter]
+enabled = true
+",
+        )
+        .expect("catalog override should parse");
+        Catalog::from_builtin_with_overrides(&overrides).expect("catalog should build")
+    }
+
+    fn model_refs(values: &[&str]) -> Vec<fabro_types::settings::ModelRef> {
+        values
+            .iter()
+            .map(|value| value.parse().expect("fallback reference should parse"))
+            .collect()
+    }
+
+    #[test]
+    fn model_fallback_preflight_resolves_each_requested_model_chain() {
+        let mut checks = Vec::new();
+        let configured = std::collections::BTreeMap::from([
+            ("gpt-sol".to_string(), model_refs(&["claude-opus"])),
+            (
+                "claude-fable".to_string(),
+                model_refs(&["gpt-sol", "claude-opus"]),
+            ),
+        ]);
+
+        assert!(run_model_fallback_check(
+            &mut checks,
+            &openrouter_catalog(),
+            &[ProviderId::new("openrouter")],
+            &configured,
+        ));
+
+        let check = checks.last().expect("fallback check should be present");
+        assert_eq!(check.status, CheckStatus::Pass);
+        assert!(
+            check
+                .details
+                .iter()
+                .any(|detail| detail.text == "gpt-5.6-sol: openrouter:claude-opus-5")
+        );
+        assert!(check.details.iter().any(|detail| {
+            detail.text == "claude-fable-5: openrouter:gpt-5.6-sol -> openrouter:claude-opus-5"
+        }));
+    }
+
+    #[test]
+    fn model_fallback_preflight_warns_when_a_provider_is_not_ready() {
+        let mut checks = Vec::new();
+        let configured = std::collections::BTreeMap::from([(
+            "kimi-k3".to_string(),
+            model_refs(&["kimi:kimi-k3", "openrouter:kimi-k3"]),
+        )]);
+
+        assert!(run_model_fallback_check(
+            &mut checks,
+            &openrouter_catalog(),
+            &[ProviderId::new("openrouter")],
+            &configured,
+        ));
+
+        let check = checks.last().expect("fallback check should be present");
+        assert_eq!(check.status, CheckStatus::Warning);
+        assert!(
+            check
+                .details
+                .iter()
+                .any(|detail| detail.warn
+                    && detail.text.contains("provider `kimi` is not configured"))
+        );
+    }
+
+    #[test]
+    fn model_fallback_preflight_rejects_duplicate_canonical_keys() {
+        let mut checks = Vec::new();
+        let configured = std::collections::BTreeMap::from([
+            ("gpt-sol".to_string(), model_refs(&["claude-opus"])),
+            ("gpt-5.6-sol".to_string(), model_refs(&["claude-fable"])),
+        ]);
+
+        assert!(!run_model_fallback_check(
+            &mut checks,
+            &openrouter_catalog(),
+            &[ProviderId::new("openrouter")],
+            &configured,
+        ));
+
+        let check = checks.last().expect("fallback check should be present");
+        assert_eq!(check.status, CheckStatus::Error);
+        assert!(
+            check
+                .remediation
+                .as_deref()
+                .is_some_and(|message| message.contains("both resolve to requested model"))
+        );
     }
 
     fn openai_compatible_completion(model: &str) -> serde_json::Value {

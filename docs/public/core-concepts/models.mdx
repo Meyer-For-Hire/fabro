@@ -285,7 +285,9 @@ goal = "Implement the feature"
 
 [run.model]
 name = "claude-sonnet-4-5"
-fallbacks = ["gemini", "openai"]
+
+[run.model.fallbacks]
+"claude-sonnet-4-5" = ["gemini", "openai"]
 ```
 
 Then launch with:
@@ -294,7 +296,9 @@ Then launch with:
 fabro run run.toml
 ```
 
-The `fallbacks` array is optional. Each entry may be a bare provider token (like `"gemini"`), a bare model ID or alias (like `"gpt-terra"`), or a qualified `"provider:selector"` reference. A qualified selector may be the provider's canonical model ID, alias, or API ID, including API IDs with slashes such as `"openrouter:moonshotai/kimi-k3"`. Fabro tries entries in order when the primary provider is unavailable, and qualified references remain provider pins. Legacy `provider/model` references remain accepted for compatibility.
+The `[run.model.fallbacks]` table is optional. Each key names the originally requested model. Its value is the ordered list to try after that model's active provider fails. An entry may be a bare provider token (like `"gemini"`), a bare model ID or alias (like `"gpt-terra"`), or a qualified `"provider:selector"` reference. A qualified selector may be the provider's canonical model ID, alias, or API ID, including API IDs with slashes such as `"openrouter:moonshotai/kimi-k3"`.
+
+Fabro selects one chain from the original request. It does not switch to the chain configured for a fallback target. When the requested reasoning level is unavailable on a fallback target, Fabro uses the nearest supported level. Equal-distance choices round up.
 
 <Note>
 The precedence order is: node-level stylesheet > run config TOML > CLI flags > server defaults. More specific settings always win.

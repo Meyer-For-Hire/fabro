@@ -6,7 +6,7 @@
 //! notifications, interviews, agent knobs, hooks, SCM targeting, pull-request
 //! behavior, and artifact collection.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::time::Duration as StdDuration;
 
@@ -684,7 +684,12 @@ pub enum RunGoal {
 pub struct RunModelSettings {
     pub provider:  Option<String>,
     pub name:      Option<String>,
-    pub fallbacks: Vec<ModelRef>,
+    /// Ordered fallback references keyed by the originally requested model.
+    ///
+    /// Keys remain raw selectors during offline configuration resolution.
+    /// The server canonicalizes them against its model catalog before a run
+    /// starts.
+    pub fallbacks: BTreeMap<String, Vec<ModelRef>>,
     /// Run-level default values for typed model controls
     /// (`reasoning_effort`, `speed`). Node and style attributes still win
     /// over these defaults.

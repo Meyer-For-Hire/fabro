@@ -100,21 +100,46 @@ script = "higher-1"
 fn run_model_fallbacks_splice_inserts_inherited() {
     let lower = parse(
         r#"
-[run.model]
-fallbacks = ["openrouter:moonshotai/kimi-k3", "gpt-terra"]
+[run.model.fallbacks]
+"kimi-k3" = ["openrouter:moonshotai/kimi-k3", "gpt-terra"]
+"gpt-sol" = ["claude-opus"]
 "#,
     );
     let higher = parse(
         r#"
-[run.model]
-fallbacks = ["anthropic", "..."]
+[run.model.fallbacks]
+"kimi-k3" = ["anthropic", "..."]
+"claude-fable" = ["gpt-sol", "claude-opus"]
 "#,
     );
     let merged = higher.combine(lower);
     let fallbacks = merged.run.unwrap().model.unwrap().fallbacks;
     assert_eq!(
-        serde_json::to_value(&fallbacks).unwrap(),
-        serde_json::json!(["anthropic", "openrouter:moonshotai/kimi-k3", "gpt-terra",])
+        serde_json::to_value(fallbacks.get("kimi-k3").unwrap()).unwrap(),
+        serde_json::json!(["anthropic", "openrouter:moonshotai/kimi-k3", "gpt-terra"])
+    );
+    assert_eq!(
+        serde_json::to_value(fallbacks.get("gpt-sol").unwrap()).unwrap(),
+        serde_json::json!(["claude-opus"])
+    );
+    assert_eq!(
+        serde_json::to_value(fallbacks.get("claude-fable").unwrap()).unwrap(),
+        serde_json::json!(["gpt-sol", "claude-opus"])
+    );
+}
+
+#[test]
+fn run_model_fallbacks_rejects_the_removed_array_shape() {
+    let error = r#"
+[run.model]
+fallbacks = ["anthropic"]
+"#
+    .parse::<SettingsLayer>()
+    .expect_err("the global fallback array must stay unsupported");
+
+    assert!(
+        error.to_string().contains("invalid type: sequence"),
+        "unexpected parse error: {error}"
     );
 }
 

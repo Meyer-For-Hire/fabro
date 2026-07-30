@@ -50,6 +50,7 @@ use fabro_workflow::handler::manager_loop::SubWorkflowHandler;
 use fabro_workflow::handler::start::StartHandler;
 use fabro_workflow::handler::wait::WaitHandler;
 use fabro_workflow::handler::{Handler, HandlerRegistry};
+use fabro_workflow::model_fallback::ModelFallbackPolicy;
 use fabro_workflow::outcome::{Outcome, OutcomeExt, StageOutcome};
 use fabro_workflow::records::{Checkpoint, CheckpointExt};
 use fabro_workflow::run_options::{GitCheckpointOptions, RunOptions};
@@ -2332,7 +2333,7 @@ reasoning = false
     let backend = AgentApiBackend::new_with_catalog(
         "compact-model".to_string(),
         ProviderId::from("compact"),
-        Vec::new(),
+        ModelFallbackPolicy::default(),
         source,
         Arc::new(SteeringHub::new(Arc::new(Emitter::default()))),
         catalog,
@@ -2487,7 +2488,7 @@ base_url = "{}"
     let backend = AgentApiBackend::new_with_catalog(
         "openai/gpt-5.4".to_string(),
         ProviderId::from("openrouter"),
-        Vec::new(),
+        ModelFallbackPolicy::default(),
         source,
         Arc::new(SteeringHub::new(Arc::new(Emitter::default()))),
         catalog,

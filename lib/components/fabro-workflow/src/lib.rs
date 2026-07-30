@@ -303,6 +303,7 @@ mod interview_runtime;
     reason = "The lifecycle module remains crate-visible for tests and pending integrations."
 )]
 pub(crate) mod lifecycle;
+pub mod model_fallback;
 pub(crate) mod node_handler;
 pub mod operations;
 pub mod outcome;

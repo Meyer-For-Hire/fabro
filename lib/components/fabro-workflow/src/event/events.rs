@@ -583,12 +583,17 @@ pub enum Event {
         ssh_command: String,
     },
     Failover {
-        stage:         String,
+        stage: String,
+        original_provider: String,
+        original_model: String,
+        attempt: u32,
         from_provider: String,
-        from_model:    String,
-        to_provider:   String,
-        to_model:      String,
-        error:         String,
+        from_model: String,
+        to_provider: String,
+        to_model: String,
+        requested_reasoning_effort: Option<String>,
+        effective_reasoning_effort: Option<String>,
+        error: String,
     },
     CommandStarted {
         node_id:    String,
@@ -1395,18 +1400,28 @@ impl Event {
             }
             Self::Failover {
                 stage,
+                original_provider,
+                original_model,
+                attempt,
                 from_provider,
                 from_model,
                 to_provider,
                 to_model,
+                requested_reasoning_effort,
+                effective_reasoning_effort,
                 error,
             } => {
                 warn!(
                     stage,
+                    original_provider,
+                    original_model,
+                    attempt,
                     from_provider,
                     from_model,
                     to_provider,
                     to_model,
+                    requested_reasoning_effort,
+                    effective_reasoning_effort,
                     error,
                     "LLM provider failover"
                 );

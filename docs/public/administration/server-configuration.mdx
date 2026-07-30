@@ -92,7 +92,9 @@ level = "info"
 [run.model]
 name = "claude-sonnet-4-5"
 provider = "anthropic"
-fallbacks = ["gemini", "openai"]
+
+[run.model.fallbacks]
+"claude-sonnet-4-5" = ["gemini", "openai"]
 
 [[run.prepare.steps]]
 script = "npm install"
