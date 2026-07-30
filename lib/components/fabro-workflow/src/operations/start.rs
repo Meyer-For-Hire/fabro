@@ -7,7 +7,7 @@ use fabro_auth::{CredentialSource, VaultCredentialSource};
 use fabro_interview::{AutoApproveInterviewer, Interviewer};
 use fabro_llm::client::Client as LlmClient;
 use fabro_mcp::config::McpServerSettings;
-use fabro_model::{Catalog, FallbackTarget, ModelSelectionError, ProviderId};
+use fabro_model::{Catalog, FallbackTarget, Model, ModelSelectionError, ProviderId};
 use fabro_sandbox::daytona::DaytonaConfig;
 use fabro_sandbox::from_environment::{
     daytona_config_from_environment, docker_config_from_environment_with_secrets,
@@ -15,12 +15,12 @@ use fabro_sandbox::from_environment::{
 };
 use fabro_sandbox::{DockerSandboxOptions, SandboxSpec};
 use fabro_static::EnvVars;
-use fabro_types::settings::ResolvedModelRef;
 use fabro_types::settings::run::{
     ApprovalMode, McpServerSettings as ResolvedMcpServerSettings, PullRequestSettings,
     ResolvedMcpEntry, RunMode, RunModelSettings as ResolvedRunModelSettings,
     RunNamespace as ResolvedRunSettings, RunPrepareSettings as ResolvedRunPrepareSettings,
 };
+use fabro_types::settings::{ModelRef, ResolvedModelRef};
 use fabro_types::{ManifestPath, RunId, RunRunnableSource, SandboxProviderKind};
 use fabro_vault::Vault;
 use tokio::runtime::Handle;
@@ -737,108 +737,31 @@ fn resolve_fallback_chain(
     }
 
     let primary = catalog.get_on_provider(provider, model);
-    let primary_target = FallbackTarget {
-        provider: provider.to_string(),
-        model:    model.to_string(),
-    };
+    let primary_target = FallbackTarget::new(provider, model);
     let mut resolution = ResolvedFallbackChain::default();
-    let mut seen = HashSet::new();
 
     for model_ref in &settings.fallbacks {
-        let reference = model_ref.to_string();
-        let target = match model_ref.resolve(catalog)? {
-            ResolvedModelRef::Provider(provider_name) => {
-                let provider_id = catalog_provider_id(catalog, &provider_name)?;
-                if !eligible.contains(&provider_id) {
-                    resolution
-                        .notices
-                        .push(ModelFallbackNotice::ProviderUnconfigured {
-                            reference,
-                            provider: provider_id,
-                        });
+        let target =
+            match resolve_fallback_candidate(catalog, provider, primary, eligible, model_ref)? {
+                FallbackCandidate::Skipped(notice) => {
+                    resolution.notices.push(notice);
                     continue;
                 }
-                let Some(model) =
-                    primary.and_then(|reference| catalog.closest(&provider_id, reference))
-                else {
-                    resolution
-                        .notices
-                        .push(ModelFallbackNotice::NoCompatibleModel {
-                            reference,
-                            provider: provider_id,
-                        });
-                    continue;
-                };
-                FallbackTarget {
-                    provider: provider_id.to_string(),
-                    model:    model.id.to_string(),
-                }
-            }
-            ResolvedModelRef::Model {
-                provider: fallback_provider,
-                selector,
-            } => {
-                if let Some(provider_name) = fallback_provider {
-                    let provider = catalog_provider_id(catalog, &provider_name)?;
-                    if !eligible.contains(&provider) {
-                        resolution
-                            .notices
-                            .push(ModelFallbackNotice::ProviderUnconfigured {
-                                reference,
-                                provider,
-                            });
-                        continue;
-                    }
-                    match catalog.resolve_on_provider(&provider, &selector) {
-                        Ok(info) => FallbackTarget {
-                            provider: info.provider.to_string(),
-                            model:    info.id.to_string(),
-                        },
-                        Err(ModelSelectionError::UnknownSelectorOnProvider { .. }) => {
-                            FallbackTarget {
-                                provider: provider.to_string(),
-                                model:    selector,
-                            }
-                        }
-                        Err(error) => return Err(error.into()),
-                    }
-                } else {
-                    match catalog.select(&selector, None, eligible) {
-                        Ok(info) => FallbackTarget {
-                            provider: info.provider.to_string(),
-                            model:    info.id.to_string(),
-                        },
-                        Err(ModelSelectionError::NoEligibleOffering { .. }) => {
-                            resolution
-                                .notices
-                                .push(ModelFallbackNotice::NoConfiguredOffering { reference });
-                            continue;
-                        }
-                        Err(ModelSelectionError::UnknownSelector { .. }) => FallbackTarget {
-                            provider: provider.to_string(),
-                            model:    selector,
-                        },
-                        Err(error) => return Err(error.into()),
-                    }
-                }
-            }
-        };
+                FallbackCandidate::Target(target) => target,
+            };
 
+        let reference = model_ref.to_string();
         if target == primary_target {
             resolution
                 .notices
                 .push(ModelFallbackNotice::MatchesPrimary { reference, target });
-            continue;
-        }
-
-        let target_key = (target.provider.clone(), target.model.clone());
-        if !seen.insert(target_key) {
+        } else if resolution.targets.contains(&target) {
             resolution
                 .notices
                 .push(ModelFallbackNotice::Duplicate { reference, target });
-            continue;
+        } else {
+            resolution.targets.push(target);
         }
-        resolution.targets.push(target);
     }
 
     if resolution.targets.is_empty() {
@@ -848,15 +771,85 @@ fn resolve_fallback_chain(
     Ok(resolution)
 }
 
-fn catalog_provider_id(
+/// The outcome of resolving one fallback candidate: either a dispatchable
+/// target or the reason the candidate cannot be used.
+enum FallbackCandidate {
+    Target(FallbackTarget),
+    Skipped(ModelFallbackNotice),
+}
+
+/// Resolve one fallback reference against the configured provider snapshot.
+///
+/// `primary` is the primary offering, used to pick the closest capability match
+/// when a candidate names a provider but no model. Unknown selectors pinned to
+/// a configured provider pass through verbatim so a model newer than the
+/// catalog still dispatches; candidates whose provider is unconfigured are
+/// skipped.
+fn resolve_fallback_candidate(
     catalog: &Catalog,
-    provider_name: &str,
-) -> Result<ProviderId, ModelSelectionError> {
-    let provider = ProviderId::from(provider_name);
-    catalog
-        .provider(&provider)
-        .map(|provider| provider.id.clone())
-        .ok_or(ModelSelectionError::UnknownProvider { provider })
+    primary_provider: &ProviderId,
+    primary: Option<&Model>,
+    eligible: &HashSet<ProviderId>,
+    model_ref: &ModelRef,
+) -> Result<FallbackCandidate, Error> {
+    let reference = model_ref.to_string();
+
+    Ok(match model_ref.resolve(catalog)? {
+        ResolvedModelRef::Provider(provider_name) => {
+            let provider = catalog.provider_id(&provider_name)?;
+            if !eligible.contains(&provider) {
+                return Ok(FallbackCandidate::Skipped(
+                    ModelFallbackNotice::ProviderUnconfigured {
+                        reference,
+                        provider,
+                    },
+                ));
+            }
+            match primary.and_then(|primary| catalog.closest(&provider, primary)) {
+                Some(model) => FallbackCandidate::Target(FallbackTarget::new(provider, &model.id)),
+                None => FallbackCandidate::Skipped(ModelFallbackNotice::NoCompatibleModel {
+                    reference,
+                    provider,
+                }),
+            }
+        }
+        ResolvedModelRef::Model {
+            provider: Some(provider_name),
+            selector,
+        } => {
+            let provider = catalog.provider_id(&provider_name)?;
+            if !eligible.contains(&provider) {
+                return Ok(FallbackCandidate::Skipped(
+                    ModelFallbackNotice::ProviderUnconfigured {
+                        reference,
+                        provider,
+                    },
+                ));
+            }
+            match catalog.resolve_on_provider(&provider, &selector) {
+                Ok(info) => {
+                    FallbackCandidate::Target(FallbackTarget::new(&info.provider, &info.id))
+                }
+                Err(ModelSelectionError::UnknownSelectorOnProvider { .. }) => {
+                    FallbackCandidate::Target(FallbackTarget::new(provider, selector))
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        ResolvedModelRef::Model {
+            provider: None,
+            selector,
+        } => match catalog.select(&selector, None, eligible) {
+            Ok(info) => FallbackCandidate::Target(FallbackTarget::new(&info.provider, &info.id)),
+            Err(ModelSelectionError::NoEligibleOffering { .. }) => {
+                FallbackCandidate::Skipped(ModelFallbackNotice::NoConfiguredOffering { reference })
+            }
+            Err(ModelSelectionError::UnknownSelector { .. }) => {
+                FallbackCandidate::Target(FallbackTarget::new(primary_provider, selector))
+            }
+            Err(error) => return Err(error.into()),
+        },
+    })
 }
 
 /// Build the launch-time MCP config from resolved settings. Secret tokens in
