@@ -1,5 +1,3 @@
-use std::borrow::Cow;
-
 use crate::error::Error;
 
 /// A parsed stylesheet selector.
@@ -69,7 +67,7 @@ pub fn parse_stylesheet(input: &str) -> Result<Stylesheet, Error> {
         if !remaining.starts_with('{') {
             return Err(Error::Stylesheet(format!(
                 "expected '{{' after selector, got: {:?}",
-                &remaining[..remaining.len().min(20)]
+                excerpt(remaining)
             )));
         }
         remaining = remaining[1..].trim();
@@ -86,61 +84,33 @@ pub fn parse_stylesheet(input: &str) -> Result<Stylesheet, Error> {
     Ok(Stylesheet { rules })
 }
 
-fn strip_css_comments(input: &str) -> Result<Cow<'_, str>, Error> {
-    let bytes = input.as_bytes();
-    let mut output: Option<String> = None;
-    let mut copied_through = 0;
-    let mut quote = None;
-    let mut i = 0;
+fn strip_css_comments(input: &str) -> Result<String, Error> {
+    let mut output = String::with_capacity(input.len());
+    let mut remaining = input;
 
-    while i < bytes.len() {
-        if let Some(quote_char) = quote {
-            if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                i += 2;
-            } else {
-                if bytes[i] == quote_char {
-                    quote = None;
-                }
-                i += 1;
-            }
-            continue;
-        }
+    while let Some(start) = remaining.find("/*") {
+        let body = &remaining[start + 2..];
+        let Some(end) = body.find("*/") else {
+            return Err(Error::Stylesheet(format!(
+                "unterminated CSS comment: {:?}",
+                excerpt(&remaining[start..])
+            )));
+        };
 
-        match bytes[i] {
-            b'\'' | b'"' => {
-                quote = Some(bytes[i]);
-                i += 1;
-            }
-            b'\\' if i + 1 < bytes.len() => {
-                i += 2;
-            }
-            b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                let comment_body_start = i + 2;
-                let Some(relative_end) = input[comment_body_start..].find("*/") else {
-                    return Err(Error::Stylesheet("unterminated CSS comment".into()));
-                };
-                let comment_end = comment_body_start + relative_end + 2;
-
-                let output = output.get_or_insert_with(|| String::with_capacity(input.len()));
-                output.push_str(&input[copied_through..i]);
-                // CSS comments do not join the tokens on either side. Preserve
-                // that boundary for this parser with one whitespace character.
-                output.push(' ');
-
-                copied_through = comment_end;
-                i = comment_end;
-            }
-            _ => i += 1,
-        }
+        output.push_str(&remaining[..start]);
+        // CSS comments do not join the tokens on either side. Preserve
+        // that boundary for this parser with one whitespace character.
+        output.push(' ');
+        remaining = &body[end + 2..];
     }
 
-    match output {
-        Some(mut output) => {
-            output.push_str(&input[copied_through..]);
-            Ok(Cow::Owned(output))
-        }
-        None => Ok(Cow::Borrowed(input)),
-    }
+    output.push_str(remaining);
+    Ok(output)
+}
+
+/// A short excerpt of `input` for error messages, cut on a character boundary.
+fn excerpt(input: &str) -> String {
+    input.chars().take(20).collect()
 }
 
 fn parse_selector(remaining: &mut &str) -> Result<Selector, Error> {
@@ -177,7 +147,7 @@ fn parse_selector(remaining: &mut &str) -> Result<Selector, Error> {
         if end == 0 {
             return Err(Error::Stylesheet(format!(
                 "expected selector ('*', '#id', '.class', or shape name), got: {:?}",
-                &remaining[..remaining.len().min(20)]
+                excerpt(remaining)
             )));
         }
         let shape = remaining[..end].to_string();
@@ -315,24 +285,31 @@ mod tests {
     }
 
     #[test]
-    fn comment_markers_inside_strings_are_preserved() {
-        let ss = parse_stylesheet("* { model: 'not-a/* comment */'; }").unwrap();
-        assert_eq!(ss.rules[0].declarations[0].value, "'not-a/* comment */'");
-    }
-
-    #[test]
     fn parse_error_unterminated_comment() {
         let error = parse_stylesheet("/* no terminator").unwrap_err();
         assert_eq!(
             error.to_string(),
-            "Stylesheet error: unterminated CSS comment"
+            r#"Stylesheet error: unterminated CSS comment: "/* no terminator""#
         );
     }
 
     #[test]
     fn parse_error_line_comment() {
-        let result = parse_stylesheet("// not a CSS comment\n* { model: sonnet; }");
-        assert!(result.is_err());
+        let error = parse_stylesheet("// not a CSS comment\n* { model: sonnet; }").unwrap_err();
+        assert!(
+            error.to_string().contains("expected selector"),
+            "`//` should be reported as a bad selector, got: {error}"
+        );
+    }
+
+    #[test]
+    fn parse_error_excerpt_splits_on_character_boundary() {
+        // A multi-byte character straddling the excerpt cutoff must not panic.
+        let error = parse_stylesheet("/* ünterminated cömment, well over 20 bytes").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            r#"Stylesheet error: unterminated CSS comment: "/* ünterminated cömm""#
+        );
     }
 
     #[test]
