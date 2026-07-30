@@ -7,11 +7,10 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, anyhow, bail};
 use fabro_api::types;
 use fabro_auth::auth_issue_message;
-use fabro_config::parse::{self, SettingsSource};
+use fabro_config::parse::SettingsSource;
 use fabro_config::{
-    CliLayer, CliOutputLayer, EnvironmentDockerfileLayer, EnvironmentImageLayer, EnvironmentLayer,
-    MergeMap, RunLayer, SettingsLayer, WorkflowSettingsBuilder, parse_input_overrides,
-    parse_labels, project,
+    CliLayer, CliOutputLayer, EnvironmentLayer, MergeMap, RunLayer, SettingsLayer,
+    WorkflowSettingsBuilder, parse_input_overrides, parse_labels, project,
 };
 use fabro_graphviz::graph::{Graph, is_llm_handler_type};
 use fabro_graphviz::render::apply_direction;
@@ -47,6 +46,7 @@ use futures_util::stream::{self, StreamExt};
 use tokio::process::Command;
 use tokio::time;
 
+use crate::run_compiler;
 use crate::server::AppState;
 use crate::server_secrets::LlmClientResult;
 
@@ -55,25 +55,8 @@ pub(crate) struct PreparedManifest {
     pub cwd:              PathBuf,
     pub git:              Option<types::GitContext>,
     pub root_source:      String,
-    #[allow(
-        dead_code,
-        reason = "create now resolves identity in the run compiler adapter"
-    )]
-    pub run_id:           Option<RunId>,
-    #[allow(
-        dead_code,
-        reason = "create now resolves lineage in the run compiler adapter"
-    )]
-    pub parent_id:        Option<RunId>,
-    #[allow(
-        dead_code,
-        reason = "create now normalizes titles in the run compiler adapter"
-    )]
-    pub title:            Option<String>,
     pub settings:         WorkflowSettings,
     pub target_path:      ManifestPath,
-    #[allow(dead_code, reason = "create now owns the bundle through run_compiler")]
-    pub workflow_bundle:  WorkflowBundle,
     pub workflow_input:   BundledWorkflow,
     pub source_directory: PathBuf,
 }
@@ -169,34 +152,36 @@ pub(crate) fn prepare_manifest_with_environment_defaults(
     {
         settings.run.goal = Some(RunGoal::Inline(InterpString::parse(&goal.text)));
     }
-    let title = manifest
+    // Validation-only parses: the create path resolves title and identity in
+    // its manifest adapter, but preflight/validate keep rejecting invalid
+    // values with the same messages.
+    manifest
         .title
         .as_ref()
         .map(|title| fabro_types::normalize_explicit_run_title(title.as_str()))
         .transpose()?;
+    manifest
+        .run_id
+        .as_deref()
+        .map(str::parse::<RunId>)
+        .transpose()
+        .context("invalid run ID")?;
+    manifest
+        .parent_id
+        .as_deref()
+        .map(str::parse::<RunId>)
+        .transpose()
+        .context("invalid parent run ID")?;
 
+    let source_directory = project::resolve_working_directory_from_run(&settings.run, &cwd);
     Ok(PreparedManifest {
-        cwd: cwd.clone(),
+        cwd,
         git: manifest.git.clone(),
         root_source,
-        run_id: manifest
-            .run_id
-            .as_deref()
-            .map(str::parse::<RunId>)
-            .transpose()
-            .context("invalid run ID")?,
-        parent_id: manifest
-            .parent_id
-            .as_deref()
-            .map(str::parse::<RunId>)
-            .transpose()
-            .context("invalid parent run ID")?,
-        title,
-        settings: settings.clone(),
+        settings,
         target_path,
-        workflow_bundle,
         workflow_input,
-        source_directory: project::resolve_working_directory_from_run(&settings.run, &cwd),
+        source_directory,
     })
 }
 
@@ -359,16 +344,13 @@ fn settings_layer_with_resolved_dockerfiles(
     files: &HashMap<ManifestPath, String>,
     settings_source: SettingsSource,
 ) -> Result<SettingsLayer> {
-    // Parse via `SettingsLayer` so unknown nested keys (like a stale
-    // `[server.integrations.github.permissions]` after the move to
-    // `[run.integrations.github.permissions]`) trip `deny_unknown_fields`.
-    let mut layer = source
-        .parse::<SettingsLayer>()
-        .context("Failed to parse run config TOML")?;
-    parse::validate_settings_source(&layer, settings_source)
-        .context("Failed to parse run config TOML")?;
-    resolve_manifest_dockerfiles(&mut layer, config_path, files)?;
-    Ok(layer)
+    run_compiler::settings_layer_with_resolved_dockerfiles(
+        source,
+        config_path,
+        files,
+        settings_source,
+    )
+    .map_err(anyhow::Error::new)
 }
 
 pub(crate) fn manifest_args_overrides(
@@ -406,50 +388,6 @@ pub(crate) fn manifest_args_overrides(
         cli,
         input_overrides: parse_input_overrides(&args.input)?,
     })
-}
-
-fn resolve_manifest_dockerfiles(
-    layer: &mut SettingsLayer,
-    config_path: &ManifestPath,
-    files: &HashMap<ManifestPath, String>,
-) -> Result<()> {
-    for environment in layer.environments.values_mut() {
-        if let Some(image) = environment.image.as_mut() {
-            resolve_manifest_dockerfile(image, config_path, files)?;
-        }
-    }
-    if let Some(image) = layer
-        .run
-        .as_mut()
-        .and_then(|run| run.environment.as_mut())
-        .and_then(|environment| environment.image.as_mut())
-    {
-        resolve_manifest_dockerfile(image, config_path, files)?;
-    }
-    Ok(())
-}
-
-fn resolve_manifest_dockerfile(
-    image: &mut EnvironmentImageLayer,
-    config_path: &ManifestPath,
-    files: &HashMap<ManifestPath, String>,
-) -> Result<()> {
-    let source = image.dockerfile.as_mut();
-    let Some(source) = source else {
-        return Ok(());
-    };
-    let EnvironmentDockerfileLayer::Path { path } = &*source else {
-        return Ok(());
-    };
-    let path_owned = path.clone();
-    let manifest_path = ManifestPath::from_reference(config_path.parent_or_dot(), &path_owned)
-        .ok_or_else(|| anyhow!("unsupported dockerfile reference: {path_owned}"))?;
-    let content = files
-        .get(&manifest_path)
-        .cloned()
-        .ok_or_else(|| anyhow!("missing bundled dockerfile: {manifest_path}"))?;
-    *source = EnvironmentDockerfileLayer::Inline(content);
-    Ok(())
 }
 
 pub(crate) fn manifest_project_config_path(

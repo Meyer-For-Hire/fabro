@@ -1,3 +1,29 @@
+//! The create-time run compiler: the single pipeline that turns an acquired
+//! workflow bundle into a complete, persistable run.
+//!
+//! The pipeline has four stages, each its own function with typed input and
+//! output:
+//!
+//! 1. [`normalize_source`] — resolve the bundle entrypoint and parse the
+//!    bundle-relative settings sources (workflow and project layers, with
+//!    dockerfile references inlined from bundled files).
+//! 2. [`layer_settings`] + [`apply_run_variables`] + graph compilation — layer
+//!    settings from every configured source, substitute the run-scoped variable
+//!    snapshot, then parse/transform/validate the graph through the
+//!    fabro-workflow pipeline.
+//! 3. Model pinning — materialize run-level model settings against the catalog
+//!    and the configured provider set. Stages 2's graph compilation and stage 3
+//!    share one blocking dispatch via [`compile_and_pin`].
+//! 4. [`assemble_run`] — purely assemble the complete persistence input; no
+//!    field is mutated after assembly.
+//!
+//! The input is deliberately source-neutral: it speaks in terms of an
+//! acquired [`WorkflowBundle`], not any wire request type, so non-HTTP
+//! callers and alternative workflow sources can drive the same pipeline.
+//! Callers own source acquisition, run-id resolution, variable snapshotting,
+//! and (for HTTP callers) all wire mapping — including turning
+//! [`RunCompilerError`] into HTTP responses.
+
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::path::PathBuf;
@@ -8,8 +34,7 @@ use fabro_config::{
     CliLayer, EnvironmentDockerfileLayer, EnvironmentImageLayer, EnvironmentLayer, MergeMap,
     RunLayer, SettingsLayer, WorkflowSettingsBuilder,
 };
-use fabro_model::{Catalog, ModelSelectionError, ProviderId};
-use fabro_types::settings::AmbiguousModelRef;
+use fabro_model::{Catalog, ProviderId};
 use fabro_types::settings::interp::{InterpString, ResolveError};
 use fabro_types::settings::run::{McpServerSettings, RunGoal};
 use fabro_types::{
@@ -26,7 +51,7 @@ use tokio::task;
 
 /// One project settings source already normalized into the manifest path
 /// namespace used by the workflow bundle.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct ProjectSettingsSource {
     pub(crate) path: ManifestPath,
     pub(crate) toml: String,
@@ -34,10 +59,11 @@ pub(crate) struct ProjectSettingsSource {
 
 /// Transport-neutral inputs for compiling one submitted run.
 ///
-/// IDs, title, git metadata, and provenance are resolved by the caller. This
-/// boundary owns only source normalization, settings resolution, workflow
-/// compilation, materialization, and persistence-input assembly.
-#[derive(Clone, Debug)]
+/// Identity (`run_id`), lineage, title, git metadata, and provenance are
+/// resolved by the caller. This boundary owns only source normalization,
+/// settings resolution, workflow compilation, model pinning, and
+/// persistence-input assembly.
+#[derive(Debug)]
 pub(crate) struct RawRunCompilerInput {
     pub(crate) workflow_bundle: WorkflowBundle,
     pub(crate) entrypoint: ManifestPath,
@@ -51,32 +77,16 @@ pub(crate) struct RawRunCompilerInput {
     pub(crate) cli_overrides: Option<CliLayer>,
     pub(crate) input_overrides: HashMap<String, toml::Value>,
     pub(crate) inline_goal_override: Option<String>,
-    pub(crate) vars: HashMap<String, String>,
-    pub(crate) run_id: Option<RunId>,
+    pub(crate) run_id: RunId,
     pub(crate) title: Option<String>,
     pub(crate) parent_id: Option<RunId>,
     pub(crate) git: Option<GitContext>,
     pub(crate) storage_root: PathBuf,
-    pub(crate) configured_providers: Vec<ProviderId>,
     pub(crate) workflow_slug: Option<String>,
     pub(crate) provenance: RunProvenance,
     pub(crate) web_url: Option<String>,
     pub(crate) submitted_manifest_bytes: Option<Vec<u8>>,
     pub(crate) automation: Option<AutomationRef>,
-}
-
-#[derive(Clone, Debug)]
-struct RunMetadata {
-    run_id: Option<RunId>,
-    title: Option<String>,
-    parent_id: Option<RunId>,
-    git: Option<GitContext>,
-    storage_root: PathBuf,
-    workflow_slug: Option<String>,
-    provenance: RunProvenance,
-    web_url: Option<String>,
-    submitted_manifest_bytes: Option<Vec<u8>>,
-    automation: Option<AutomationRef>,
 }
 
 /// Stage-one output: the selected bundled workflow and all client settings
@@ -96,176 +106,90 @@ pub(crate) struct NormalizedRun {
     cli_overrides: Option<CliLayer>,
     input_overrides: HashMap<String, toml::Value>,
     inline_goal_override: Option<String>,
-    vars: HashMap<String, String>,
-    configured_providers: Vec<ProviderId>,
-    metadata: RunMetadata,
+    metadata: CreateRunPersistenceMetadata,
 }
 
-/// Settings-layered output. Variable substitution is intentionally separate
-/// so callers can snapshot variables after source/settings preparation, as the
-/// create handler historically does.
+/// Settings-layered output. Variable substitution is a separate stage so
+/// callers can snapshot run variables after settings resolution and apply
+/// the snapshot through [`apply_run_variables`].
 pub(crate) struct LayeredRun {
-    workflow_bundle:      WorkflowBundle,
-    entrypoint:           ManifestPath,
-    workflow:             BundledWorkflow,
-    settings:             WorkflowSettings,
-    cwd:                  PathBuf,
-    vars:                 HashMap<String, String>,
-    configured_providers: Vec<ProviderId>,
-    metadata:             RunMetadata,
+    workflow_bundle: WorkflowBundle,
+    entrypoint:      ManifestPath,
+    workflow:        BundledWorkflow,
+    settings:        WorkflowSettings,
+    cwd:             PathBuf,
+    metadata:        CreateRunPersistenceMetadata,
 }
 
-impl LayeredRun {
-    pub(crate) fn with_vars(mut self, vars: HashMap<String, String>) -> Self {
-        self.vars = vars;
-        self
-    }
-}
-
-/// Settings-resolved stage output. Callers may inspect this before policy
-/// checks, then move it into [`compile_graph`] after those checks pass.
+/// Variable-substituted stage output. Callers may inspect the resolved
+/// settings before policy checks, then move it into [`compile_and_pin`].
 pub(crate) struct PreparedRun {
-    workflow_bundle:      WorkflowBundle,
-    entrypoint:           ManifestPath,
-    workflow:             BundledWorkflow,
-    settings:             WorkflowSettings,
-    cwd:                  PathBuf,
-    vars:                 HashMap<String, String>,
-    configured_providers: Vec<ProviderId>,
-    metadata:             RunMetadata,
+    layered: LayeredRun,
+    vars:    HashMap<String, String>,
 }
 
 impl PreparedRun {
-    pub(crate) fn resolve_run_id(mut self) -> (Self, RunId) {
-        let run_id = self.metadata.run_id.unwrap_or_default();
-        self.metadata.run_id = Some(run_id);
-        (self, run_id)
-    }
-
-    pub(crate) fn with_web_url(mut self, web_url: Option<String>) -> Self {
-        self.metadata.web_url = web_url;
-        self
-    }
-
-    pub(crate) fn with_configured_providers(
-        mut self,
-        configured_providers: Vec<ProviderId>,
-    ) -> Self {
-        self.configured_providers = configured_providers;
-        self
-    }
-
     pub(crate) fn settings(&self) -> &WorkflowSettings {
-        &self.settings
+        &self.layered.settings
     }
 
     pub(crate) fn parent_id(&self) -> Option<RunId> {
-        self.metadata.parent_id
+        self.layered.metadata.parent_id
     }
 }
 
 /// Graph-compiled stage output, retaining the metadata needed by later pure
 /// assembly.
-pub(crate) struct GraphCompiledRun {
-    compiled:   CompiledRun,
-    entrypoint: ManifestPath,
-    metadata:   RunMetadata,
+struct GraphCompiledRun {
+    compiled: CompiledRun,
+    metadata: CreateRunPersistenceMetadata,
 }
 
-impl GraphCompiledRun {
-    #[cfg(test)]
-    pub(crate) fn compiled(&self) -> &CompiledRun {
-        &self.compiled
-    }
-}
-
-/// Materialized stage output ready for pure persistence-input assembly.
-pub(crate) struct PersistenceReadyRun {
+/// Model-pinned stage output ready for pure persistence-input assembly.
+pub(crate) struct PinnedRun {
     materialized: MaterializedRun,
-    entrypoint:   ManifestPath,
-    metadata:     RunMetadata,
-}
-
-/// Complete output of this boundary.
-pub(crate) struct RunCompilerOutput {
-    persistence_input: CreateRunPersistenceInput,
-    entrypoint:        ManifestPath,
-}
-
-impl RunCompilerOutput {
-    #[cfg(test)]
-    pub(crate) fn persistence_input(&self) -> &CreateRunPersistenceInput {
-        &self.persistence_input
-    }
-
-    #[cfg(test)]
-    pub(crate) fn entrypoint(&self) -> &ManifestPath {
-        &self.entrypoint
-    }
-
-    pub(crate) fn into_parts(self) -> (CreateRunPersistenceInput, ManifestPath) {
-        (self.persistence_input, self.entrypoint)
-    }
+    metadata:     CreateRunPersistenceMetadata,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RunCompilerError {
-    #[error("invalid run source: {source}")]
-    InvalidSource {
-        #[source]
-        source: InvalidSourceError,
-    },
+    /// The acquired source bundle is invalid: missing entrypoint or broken
+    /// bundled-file references.
+    #[error(transparent)]
+    InvalidSource(#[from] InvalidSourceError),
 
-    #[error("invalid run settings: {source}")]
-    InvalidSettings {
-        #[source]
-        source: Box<InvalidSettingsError>,
-    },
+    /// A settings source failed to parse, or the layered settings failed to
+    /// resolve.
+    #[error(transparent)]
+    InvalidSettings(Box<InvalidSettingsError>),
 
-    #[error("run config variable interpolation failed: {source}")]
-    VariableInterpolation {
-        #[source]
-        source: VariableInterpolationError,
-    },
+    /// The run-variable snapshot could not be substituted into the resolved
+    /// run settings.
+    #[error("Run config variable interpolation failed: {0}")]
+    VariableInterpolation(#[from] VariableInterpolationError),
 
-    #[error("workflow validation or parse failed: {source}")]
-    ValidationOrParse {
-        #[source]
-        source: WorkflowError,
-    },
-
-    #[error("model selection failed: {source}")]
-    ModelSelection {
-        #[source]
-        source: ModelSelectionError,
-    },
-
-    #[error("model reference failed: {source}")]
-    ModelReference {
-        #[source]
-        source: AmbiguousModelRef,
-    },
-
-    #[error("{context}")]
-    Internal {
-        context: &'static str,
-        #[source]
-        source:  Box<dyn StdError + Send + Sync>,
-    },
+    /// Graph compilation or model pinning failed in the workflow engine. The
+    /// full [`WorkflowError`] is preserved so callers can distinguish
+    /// validation, parse, and model-selection failures.
+    #[error(transparent)]
+    Workflow(#[from] WorkflowError),
 }
 
+// The `Display` strings below are pinned to the pre-extraction wire
+// contract: both the create handler and the manifest preparation path render
+// them directly into HTTP 400 details.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum InvalidSourceError {
-    #[error("bundle entrypoint {entrypoint} is missing from the workflow bundle")]
+    #[error("manifest target path is missing from workflows map")]
     MissingEntrypoint { entrypoint: ManifestPath },
 
-    #[error("unsupported dockerfile reference {reference:?} in {config_path}")]
+    #[error("unsupported dockerfile reference: {reference}")]
     UnsupportedDockerfileReference {
         config_path: ManifestPath,
         reference:   String,
     },
 
-    #[error("bundled dockerfile {dockerfile_path} referenced by {config_path} is missing")]
+    #[error("missing bundled dockerfile: {dockerfile_path}")]
     MissingDockerfile {
         config_path:     ManifestPath,
         dockerfile_path: ManifestPath,
@@ -274,21 +198,17 @@ pub(crate) enum InvalidSourceError {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum InvalidSettingsError {
-    #[error("failed to parse {kind} settings at {path}")]
+    #[error("Failed to parse run config TOML")]
     Parse {
-        kind:   &'static str,
         path:   ManifestPath,
         #[source]
         source: Box<dyn StdError + Send + Sync>,
     },
 
-    #[error("failed to parse user settings: {source}")]
-    User {
-        #[source]
-        source: fabro_config::Error,
-    },
+    #[error(transparent)]
+    User(fabro_config::Error),
 
-    #[error("failed to resolve layered workflow settings: {source}")]
+    #[error("failed to resolve manifest settings")]
     Resolve {
         #[source]
         source: fabro_config::ResolveErrors,
@@ -310,8 +230,12 @@ pub(crate) enum VariableInterpolationError {
 
 pub(crate) type Result<T> = std::result::Result<T, RunCompilerError>;
 
+fn invalid_settings(source: InvalidSettingsError) -> RunCompilerError {
+    RunCompilerError::InvalidSettings(Box::new(source))
+}
+
 /// Normalize the bundle entrypoint and parse workflow/project settings while
-/// resolving Dockerfile references against the selected workflow's files.
+/// resolving dockerfile references against the selected workflow's files.
 pub(crate) fn normalize_source(input: RawRunCompilerInput) -> Result<NormalizedRun> {
     let RawRunCompilerInput {
         workflow_bundle,
@@ -326,13 +250,11 @@ pub(crate) fn normalize_source(input: RawRunCompilerInput) -> Result<NormalizedR
         cli_overrides,
         input_overrides,
         inline_goal_override,
-        vars,
         run_id,
         title,
         parent_id,
         git,
         storage_root,
-        configured_providers,
         workflow_slug,
         provenance,
         web_url,
@@ -342,10 +264,8 @@ pub(crate) fn normalize_source(input: RawRunCompilerInput) -> Result<NormalizedR
     let mut workflow = workflow_bundle
         .workflow(&entrypoint)
         .cloned()
-        .ok_or_else(|| RunCompilerError::InvalidSource {
-            source: InvalidSourceError::MissingEntrypoint {
-                entrypoint: entrypoint.clone(),
-            },
+        .ok_or_else(|| InvalidSourceError::MissingEntrypoint {
+            entrypoint: entrypoint.clone(),
         })?;
     workflow.path = entrypoint.clone();
 
@@ -353,24 +273,22 @@ pub(crate) fn normalize_source(input: RawRunCompilerInput) -> Result<NormalizedR
         .config
         .as_ref()
         .map(|config| {
-            parse_settings_layer(
+            settings_layer_with_resolved_dockerfiles(
                 &config.source,
                 &config.path,
                 &workflow.files,
                 SettingsSource::Workflow,
-                "workflow",
             )
         })
         .transpose()?;
     let project_layers = project_settings
         .into_iter()
         .map(|project| {
-            parse_settings_layer(
+            settings_layer_with_resolved_dockerfiles(
                 &project.toml,
                 &project.path,
                 &workflow.files,
                 SettingsSource::Project,
-                "project",
             )
         })
         .collect::<Result<Vec<_>>>()?;
@@ -390,24 +308,24 @@ pub(crate) fn normalize_source(input: RawRunCompilerInput) -> Result<NormalizedR
         cli_overrides,
         input_overrides,
         inline_goal_override,
-        vars,
-        configured_providers,
-        metadata: RunMetadata {
+        metadata: CreateRunPersistenceMetadata {
             run_id,
-            title,
-            parent_id,
-            git,
             storage_root,
             workflow_slug,
+            submitted_manifest_bytes,
+            title,
+            automation,
+            git,
+            fork_source_ref: None,
+            parent_id,
             provenance,
             web_url,
-            submitted_manifest_bytes,
-            automation,
         },
     })
 }
 
-/// Layer settings and apply the submitted input and goal overrides.
+/// Layer settings from every configured source and apply the submitted input
+/// and goal overrides.
 pub(crate) fn layer_settings(normalized: NormalizedRun) -> Result<LayeredRun> {
     let NormalizedRun {
         workflow_bundle,
@@ -424,8 +342,6 @@ pub(crate) fn layer_settings(normalized: NormalizedRun) -> Result<LayeredRun> {
         cli_overrides,
         input_overrides,
         inline_goal_override,
-        vars,
-        configured_providers,
         metadata,
     } = normalized;
     let mut builder = WorkflowSettingsBuilder::new()
@@ -444,18 +360,13 @@ pub(crate) fn layer_settings(normalized: NormalizedRun) -> Result<LayeredRun> {
         builder = builder.project_layer(layer);
     }
     for source in user_toml {
-        builder =
-            builder
-                .user_toml(&source)
-                .map_err(|source| RunCompilerError::InvalidSettings {
-                    source: Box::new(InvalidSettingsError::User { source }),
-                })?;
+        builder = builder
+            .user_toml(&source)
+            .map_err(|source| invalid_settings(InvalidSettingsError::User(source)))?;
     }
     let mut settings = builder
         .build()
-        .map_err(|source| RunCompilerError::InvalidSettings {
-            source: Box::new(InvalidSettingsError::Resolve { source }),
-        })?;
+        .map_err(|source| invalid_settings(InvalidSettingsError::Resolve { source }))?;
     settings.run.inputs.extend(input_overrides);
     if let Some(goal) = inline_goal_override {
         settings.run.goal = Some(RunGoal::Inline(InterpString::parse(&goal)));
@@ -467,187 +378,124 @@ pub(crate) fn layer_settings(normalized: NormalizedRun) -> Result<LayeredRun> {
         workflow,
         settings,
         cwd,
-        vars,
-        configured_providers,
         metadata,
     })
 }
 
-/// Apply a run-variable snapshot and validate the resulting artifact globs.
-pub(crate) fn apply_run_variables(mut layered: LayeredRun) -> Result<PreparedRun> {
-    substitute_variables(&layered.vars, &mut layered.settings)?;
-    Ok(PreparedRun {
-        workflow_bundle:      layered.workflow_bundle,
-        entrypoint:           layered.entrypoint,
-        workflow:             layered.workflow,
-        settings:             layered.settings,
-        cwd:                  layered.cwd,
-        vars:                 layered.vars,
-        configured_providers: layered.configured_providers,
-        metadata:             layered.metadata,
-    })
+/// Apply a run-variable snapshot to the layered settings and validate the
+/// resulting artifact globs. The snapshot is also retained for graph template
+/// rendering during compilation.
+pub(crate) fn apply_run_variables(
+    mut layered: LayeredRun,
+    vars: HashMap<String, String>,
+) -> Result<PreparedRun> {
+    substitute_run_variables(&vars, &mut layered.settings)?;
+    Ok(PreparedRun { layered, vars })
 }
 
-/// Run stage one and the settings/variables portion of stage two. This is the
-/// convenient boundary for callers that already own a variable snapshot.
-#[cfg(test)]
-pub(crate) fn prepare_run(input: RawRunCompilerInput) -> Result<PreparedRun> {
-    apply_run_variables(layer_settings(normalize_source(input)?)?)
-}
-
-/// Compile and validate the graph on Tokio's blocking pool.
-pub(crate) async fn compile_graph(
+/// Compile and validate the graph, then pin run-level model settings, in one
+/// dispatch on Tokio's blocking pool: graph compilation is CPU-heavy and may
+/// read a goal file, and pinning is pure CPU that belongs alongside it.
+pub(crate) async fn compile_and_pin(
     prepared: PreparedRun,
+    configured_providers: Vec<ProviderId>,
+    catalog: Arc<Catalog>,
+) -> Result<PinnedRun> {
+    task::spawn_blocking(move || {
+        let compiled = compile_graph(prepared, configured_providers, Arc::clone(&catalog))?;
+        pin_models(compiled, &catalog)
+    })
+    .await
+    .map_err(|source| {
+        RunCompilerError::Workflow(WorkflowError::engine_with_source(
+            "workflow create task failed",
+            source,
+        ))
+    })?
+}
+
+/// Stage two's graph compilation: parse, transform, and validate through the
+/// fabro-workflow pipeline, with undefined template variables promoted to
+/// hard errors.
+fn compile_graph(
+    prepared: PreparedRun,
+    configured_providers: Vec<ProviderId>,
     catalog: Arc<Catalog>,
 ) -> Result<GraphCompiledRun> {
     let PreparedRun {
-        workflow_bundle,
-        entrypoint,
-        workflow,
-        settings,
-        cwd,
+        layered:
+            LayeredRun {
+                workflow_bundle,
+                entrypoint,
+                workflow,
+                settings,
+                cwd,
+                metadata,
+            },
         vars,
-        configured_providers,
-        metadata,
     } = prepared;
-    let compile_input = CreateRunCompileInput {
-        workflow: WorkflowInput::Bundled(workflow),
-        settings,
-        vars,
-        cwd,
-        workflow_path: Some(entrypoint.clone()),
-        workflow_bundle: Some(workflow_bundle),
-        configured_providers,
-    };
-    let compiled =
-        task::spawn_blocking(move || operations::compile_create_run(compile_input, catalog))
-            .await
-            .map_err(|source| RunCompilerError::Internal {
-                context: "workflow compilation failed",
-                source:  Box::new(WorkflowError::engine_with_source(
-                    "workflow create task failed",
-                    source,
-                )),
-            })?
-            .map_err(classify_workflow_error)?;
-
-    Ok(GraphCompiledRun {
-        compiled,
-        entrypoint,
-        metadata,
-    })
-}
-
-/// Materialize run-level model settings on Tokio's blocking pool.
-pub(crate) async fn materialize_run(
-    compiled: GraphCompiledRun,
-    catalog: Arc<Catalog>,
-) -> Result<PersistenceReadyRun> {
-    let GraphCompiledRun {
-        compiled,
-        entrypoint,
-        metadata,
-    } = compiled;
-    let materialized = task::spawn_blocking(move || {
-        operations::materialize_create_run(compiled, catalog.as_ref())
-    })
-    .await
-    .map_err(|source| RunCompilerError::Internal {
-        context: "workflow compilation failed",
-        source:  Box::new(WorkflowError::engine_with_source(
-            "workflow create task failed",
-            source,
-        )),
-    })?
-    .map_err(classify_workflow_error)?;
-
-    Ok(PersistenceReadyRun {
-        materialized,
-        entrypoint,
-        metadata,
-    })
-}
-
-/// Purely assemble the complete workflow persistence input.
-pub(crate) fn assemble_run(ready: PersistenceReadyRun) -> RunCompilerOutput {
-    let PersistenceReadyRun {
-        materialized,
-        entrypoint,
-        metadata,
-    } = ready;
-    let RunMetadata {
-        run_id,
-        title,
-        parent_id,
-        git,
-        storage_root,
-        workflow_slug,
-        provenance,
-        web_url,
-        submitted_manifest_bytes,
-        automation,
-    } = metadata;
-    let persistence_input = operations::assemble_create_run_persistence_input(
-        materialized,
-        CreateRunPersistenceMetadata {
-            run_id: run_id.unwrap_or_default(),
-            storage_root,
-            workflow_slug,
-            submitted_manifest_bytes,
-            title,
-            automation,
-            git,
-            fork_source_ref: None,
-            parent_id,
-            provenance,
-            web_url,
+    let compiled = operations::compile_create_run(
+        CreateRunCompileInput {
+            workflow: WorkflowInput::Bundled(workflow),
+            settings,
+            vars,
+            cwd,
+            workflow_path: Some(entrypoint),
+            workflow_bundle: Some(workflow_bundle),
+            configured_providers,
         },
-    );
+        catalog,
+    )?;
 
-    RunCompilerOutput {
-        persistence_input,
-        entrypoint,
-    }
+    Ok(GraphCompiledRun { compiled, metadata })
 }
 
-/// Compile a raw run all the way to a complete persistence input.
-#[cfg(test)]
-pub(crate) async fn compile_run(
-    input: RawRunCompilerInput,
-    catalog: Arc<Catalog>,
-) -> Result<RunCompilerOutput> {
-    let prepared = prepare_run(input)?;
-    let compiled = compile_graph(prepared, Arc::clone(&catalog)).await?;
-    let materialized = materialize_run(compiled, catalog).await?;
-    Ok(assemble_run(materialized))
+/// Stage three: pin concrete model and provider selections against the
+/// catalog and the configured provider set.
+fn pin_models(compiled: GraphCompiledRun, catalog: &Catalog) -> Result<PinnedRun> {
+    let GraphCompiledRun { compiled, metadata } = compiled;
+    let materialized = operations::materialize_create_run(compiled, catalog)?;
+    Ok(PinnedRun {
+        materialized,
+        metadata,
+    })
 }
 
-fn parse_settings_layer(
+/// Stage four: purely assemble the complete persistence input. Every durable
+/// field — run id, submitted source bytes, automation reference — is set here
+/// once; nothing mutates the result afterwards.
+pub(crate) fn assemble_run(pinned: PinnedRun) -> CreateRunPersistenceInput {
+    let PinnedRun {
+        materialized,
+        metadata,
+    } = pinned;
+    operations::assemble_create_run_persistence_input(materialized, metadata)
+}
+
+/// Parse one bundle-relative settings source, rejecting keys that are not
+/// allowed for `settings_source` and inlining dockerfile references from the
+/// bundled files.
+///
+/// Parses via [`SettingsLayer`] so unknown nested keys (like a stale
+/// `[server.integrations.github.permissions]` after the move to
+/// `[run.integrations.github.permissions]`) trip `deny_unknown_fields`.
+pub(crate) fn settings_layer_with_resolved_dockerfiles(
     source: &str,
     config_path: &ManifestPath,
     files: &HashMap<ManifestPath, String>,
     settings_source: SettingsSource,
-    kind: &'static str,
 ) -> Result<SettingsLayer> {
-    let mut layer =
-        source
-            .parse::<SettingsLayer>()
-            .map_err(|source| RunCompilerError::InvalidSettings {
-                source: Box::new(InvalidSettingsError::Parse {
-                    kind,
-                    path: config_path.clone(),
-                    source: Box::new(source),
-                }),
-            })?;
-    parse::validate_settings_source(&layer, settings_source).map_err(|source| {
-        RunCompilerError::InvalidSettings {
-            source: Box::new(InvalidSettingsError::Parse {
-                kind,
-                path: config_path.clone(),
-                source: Box::new(source),
-            }),
-        }
-    })?;
+    let parse_error = |source: Box<dyn StdError + Send + Sync>| {
+        invalid_settings(InvalidSettingsError::Parse {
+            path: config_path.clone(),
+            source,
+        })
+    };
+    let mut layer = source
+        .parse::<SettingsLayer>()
+        .map_err(|source| parse_error(Box::new(source)))?;
+    parse::validate_settings_source(&layer, settings_source)
+        .map_err(|source| parse_error(Box::new(source)))?;
     resolve_dockerfiles(&mut layer, config_path, files)?;
     Ok(layer)
 }
@@ -683,65 +531,41 @@ fn resolve_dockerfile(
     };
     let reference = path.clone();
     let dockerfile_path = ManifestPath::from_reference(config_path.parent_or_dot(), &reference)
-        .ok_or_else(|| RunCompilerError::InvalidSource {
-            source: InvalidSourceError::UnsupportedDockerfileReference {
-                config_path: config_path.clone(),
-                reference:   reference.clone(),
-            },
+        .ok_or_else(|| InvalidSourceError::UnsupportedDockerfileReference {
+            config_path: config_path.clone(),
+            reference:   reference.clone(),
         })?;
-    let content =
-        files
-            .get(&dockerfile_path)
-            .cloned()
-            .ok_or_else(|| RunCompilerError::InvalidSource {
-                source: InvalidSourceError::MissingDockerfile {
-                    config_path:     config_path.clone(),
-                    dockerfile_path: dockerfile_path.clone(),
-                },
-            })?;
+    let content = files.get(&dockerfile_path).cloned().ok_or_else(|| {
+        InvalidSourceError::MissingDockerfile {
+            config_path:     config_path.clone(),
+            dockerfile_path: dockerfile_path.clone(),
+        }
+    })?;
     image.dockerfile = Some(EnvironmentDockerfileLayer::Inline(content));
     Ok(())
 }
 
-fn substitute_variables(
+/// Substitute run-scoped variables into the resolved run settings, then
+/// re-validate the artifact-include globs: a substituted variable can make a
+/// previously-safe glob unsafe.
+pub(crate) fn substitute_run_variables(
     variables: &HashMap<String, String>,
     settings: &mut WorkflowSettings,
-) -> Result<()> {
+) -> std::result::Result<(), VariableInterpolationError> {
     settings
         .run
-        .substitute_variables(|name| variables.get(name).cloned())
-        .map_err(|source| RunCompilerError::VariableInterpolation {
-            source: VariableInterpolationError::Interpolation(source),
-        })?;
+        .substitute_variables(|name| variables.get(name).cloned())?;
     for (index, pattern) in settings.run.artifacts.include.iter().enumerate() {
-        WorkspaceGlob::try_new(pattern).map_err(|source| {
-            RunCompilerError::VariableInterpolation {
-                source: VariableInterpolationError::ArtifactGlob { index, source },
-            }
-        })?;
+        WorkspaceGlob::try_new(pattern)
+            .map_err(|source| VariableInterpolationError::ArtifactGlob { index, source })?;
     }
     Ok(())
-}
-
-fn classify_workflow_error(error: WorkflowError) -> RunCompilerError {
-    match error {
-        WorkflowError::ModelSelection(source) => RunCompilerError::ModelSelection { source },
-        WorkflowError::ModelReference(source) => RunCompilerError::ModelReference { source },
-        source @ (WorkflowError::Parse(_) | WorkflowError::ValidationFailed { .. }) => {
-            RunCompilerError::ValidationOrParse { source }
-        }
-        source => RunCompilerError::Internal {
-            context: "workflow compilation failed",
-            source:  Box::new(source),
-        },
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
     use std::error::Error as _;
-    use std::sync::Arc;
 
     use fabro_config::EnvironmentDockerfileLayer;
     use fabro_graphviz::graph::AttrValue;
@@ -810,13 +634,11 @@ mod tests {
             cli_overrides: None,
             input_overrides: HashMap::new(),
             inline_goal_override: None,
-            vars: HashMap::new(),
-            run_id: Some(RunId::new()),
+            run_id: RunId::new(),
             title: None,
             parent_id: None,
             git: None,
             storage_root: PathBuf::from("/tmp/fabro-storage"),
-            configured_providers: Catalog::builtin().all_provider_ids().into_iter().collect(),
             workflow_slug: None,
             provenance: provenance(),
             web_url: None,
@@ -825,8 +647,19 @@ mod tests {
         }
     }
 
+    fn test_provider_ids() -> Vec<ProviderId> {
+        Catalog::builtin().all_provider_ids().into_iter().collect()
+    }
+
+    fn prepare_run(
+        input: RawRunCompilerInput,
+        vars: HashMap<String, String>,
+    ) -> Result<PreparedRun> {
+        apply_run_variables(layer_settings(normalize_source(input)?)?, vars)
+    }
+
     #[test]
-    fn stage_one_rejects_missing_entrypoint() {
+    fn normalize_source_rejects_missing_entrypoint() {
         let mut input = raw_input(None, HashMap::new());
         input.entrypoint = manifest_path("flows/missing.fabro");
 
@@ -834,26 +667,14 @@ mod tests {
             panic!("missing entrypoint should fail");
         };
 
-        assert!(matches!(error, RunCompilerError::InvalidSource {
-            source: InvalidSourceError::MissingEntrypoint { .. },
-        }));
+        assert!(matches!(
+            error,
+            RunCompilerError::InvalidSource(InvalidSourceError::MissingEntrypoint { .. })
+        ));
     }
 
     #[test]
-    fn unresolved_run_id_is_allocated_only_after_variables_are_applied() {
-        let mut input = raw_input(None, HashMap::new());
-        input.run_id = None;
-        let normalized = normalize_source(input).expect("source should normalize");
-        let layered = layer_settings(normalized).expect("settings should layer");
-        let prepared = apply_run_variables(layered).expect("variables should apply");
-
-        let (prepared, run_id) = prepared.resolve_run_id();
-
-        assert_eq!(prepared.metadata.run_id, Some(run_id));
-    }
-
-    #[test]
-    fn stage_one_rejects_missing_dockerfile_and_preserves_source_chain() {
+    fn normalize_source_rejects_missing_dockerfile_with_pinned_message() {
         let workflow_toml = r#"
 _version = 1
 
@@ -865,17 +686,38 @@ dockerfile = { path = "Dockerfile" }
             panic!("missing dockerfile should fail");
         };
 
-        assert!(matches!(error, RunCompilerError::InvalidSource {
-            source: InvalidSourceError::MissingDockerfile { .. },
-        }));
-        let source = error
-            .source()
-            .expect("top-level error should retain source");
-        assert!(source.to_string().contains("Dockerfile"));
+        assert!(matches!(
+            error,
+            RunCompilerError::InvalidSource(InvalidSourceError::MissingDockerfile { .. })
+        ));
+        assert_eq!(
+            error.to_string(),
+            "missing bundled dockerfile: flows/Dockerfile"
+        );
     }
 
     #[test]
-    fn stage_one_resolves_bundled_dockerfile() {
+    fn normalize_source_preserves_settings_parse_source_chain() {
+        let workflow_toml = r#"
+_version = 1
+
+[run.unknown-table]
+key = "value"
+"#;
+
+        let Err(error) = normalize_source(raw_input(Some(workflow_toml), HashMap::new())) else {
+            panic!("unknown settings key should fail");
+        };
+
+        assert_eq!(error.to_string(), "Failed to parse run config TOML");
+        let source = error
+            .source()
+            .expect("parse error should retain the TOML source");
+        assert!(source.to_string().contains("unknown"));
+    }
+
+    #[test]
+    fn normalize_source_resolves_bundled_dockerfile() {
         let workflow_toml = r#"
 _version = 1
 
@@ -960,11 +802,12 @@ owner = "{{ vars.owner }}"
             toml::Value::String("override".to_string()),
         );
         input.inline_goal_override = Some("Ship {{ vars.owner }}".to_string());
-        input
-            .vars
-            .insert("owner".to_string(), "payments".to_string());
 
-        let prepared = prepare_run(input).expect("settings should prepare");
+        let prepared = prepare_run(
+            input,
+            HashMap::from([("owner".to_string(), "payments".to_string())]),
+        )
+        .expect("settings should prepare");
         let settings = prepared.settings();
 
         assert_eq!(
@@ -999,47 +842,50 @@ _version = 1
 [run.artifacts]
 include = ["reports/{{ vars.path }}/*.json"]
 "#;
-        let mut input = raw_input(Some(workflow_toml), HashMap::new());
-        input
-            .vars
-            .insert("path".to_string(), "../secrets".to_string());
+        let input = raw_input(Some(workflow_toml), HashMap::new());
 
-        let Err(error) = prepare_run(input) else {
+        let Err(error) = prepare_run(
+            input,
+            HashMap::from([("path".to_string(), "../secrets".to_string())]),
+        ) else {
             panic!("unsafe artifact glob should fail");
         };
 
-        assert!(matches!(error, RunCompilerError::VariableInterpolation {
-            source: VariableInterpolationError::ArtifactGlob { .. },
-        }));
+        assert!(matches!(
+            error,
+            RunCompilerError::VariableInterpolation(VariableInterpolationError::ArtifactGlob {
+                index:  0,
+                source: WorkspaceGlobError::ParentTraversal { .. },
+            })
+        ));
     }
 
-    #[tokio::test]
-    async fn graph_vars_are_hard_errors_and_successfully_render_when_present() {
+    #[test]
+    fn graph_vars_are_hard_errors_and_successfully_render_when_present() {
         let catalog = Arc::new(Catalog::from_builtin().unwrap());
-        let missing = prepare_run(raw_input(None, HashMap::new()))
+        let missing = prepare_run(raw_input(None, HashMap::new()), HashMap::new())
             .expect("settings preparation should not compile graph vars");
-        let Err(error) = compile_graph(missing, Arc::clone(&catalog)).await else {
+        let Err(error) = compile_graph(missing, test_provider_ids(), Arc::clone(&catalog)) else {
             panic!("missing graph variable should be a hard error");
         };
-        assert!(matches!(error, RunCompilerError::ValidationOrParse {
-            source: WorkflowError::ValidationFailed { .. },
-        }));
+        assert!(matches!(
+            error,
+            RunCompilerError::Workflow(WorkflowError::ValidationFailed { .. })
+        ));
 
         let mut input = raw_input(None, HashMap::new());
-        input
-            .vars
-            .insert("owner".to_string(), "payments".to_string());
         input.input_overrides.insert(
             "target".to_string(),
             toml::Value::String("checkout".to_string()),
         );
-        let compiled = compile_graph(
-            prepare_run(input).expect("settings should prepare"),
-            catalog,
+        let prepared = prepare_run(
+            input,
+            HashMap::from([("owner".to_string(), "payments".to_string())]),
         )
-        .await
-        .expect("graph variables should render");
-        let work = &compiled.compiled().validated().graph().nodes["work"];
+        .expect("settings should prepare");
+        let compiled = compile_graph(prepared, test_provider_ids(), catalog)
+            .expect("graph variables should render");
+        let work = &compiled.compiled.validated().graph().nodes["work"];
 
         assert_eq!(
             work.attrs.get("prompt").and_then(AttrValue::as_str),
@@ -1051,8 +897,8 @@ include = ["reports/{{ vars.path }}/*.json"]
         );
     }
 
-    #[tokio::test]
-    async fn assembly_retains_entrypoint_and_run_metadata() {
+    #[test]
+    fn assembly_retains_entrypoint_and_run_metadata() {
         let run_id = RunId::new();
         let parent_id = RunId::new();
         let automation = AutomationRef {
@@ -1062,28 +908,30 @@ include = ["reports/{{ vars.path }}/*.json"]
         };
         let submitted = b"submitted manifest".to_vec();
         let mut input = raw_input(None, HashMap::new());
-        input.run_id = Some(run_id);
+        input.run_id = run_id;
         input.parent_id = Some(parent_id);
         input.title = Some("Compiler boundary".to_string());
         input.workflow_slug = Some("compiler-boundary".to_string());
         input.web_url = Some(format!("https://fabro.test/runs/{run_id}"));
         input.submitted_manifest_bytes = Some(submitted.clone());
         input.automation = Some(automation.clone());
-        input
-            .vars
-            .insert("owner".to_string(), "payments".to_string());
         input.input_overrides.insert(
             "target".to_string(),
             toml::Value::String("checkout".to_string()),
         );
         let expected_entrypoint = input.entrypoint.clone();
+        let catalog = Arc::new(Catalog::from_builtin().unwrap());
 
-        let output = compile_run(input, Arc::new(Catalog::from_builtin().unwrap()))
-            .await
-            .expect("run should compile");
-        let persistence = output.persistence_input();
+        let prepared = prepare_run(
+            input,
+            HashMap::from([("owner".to_string(), "payments".to_string())]),
+        )
+        .expect("settings should prepare");
+        let compiled = compile_graph(prepared, test_provider_ids(), Arc::clone(&catalog))
+            .expect("graph should compile");
+        let pinned = pin_models(compiled, &catalog).expect("models should pin");
+        let persistence = assemble_run(pinned);
 
-        assert_eq!(output.entrypoint(), &expected_entrypoint);
         assert_eq!(persistence.run_id(), run_id);
         assert_eq!(persistence.workflow_slug(), Some("compiler-boundary"));
         assert_eq!(

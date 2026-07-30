@@ -22,7 +22,6 @@ use tokio::task::spawn_blocking;
 use super::source::{ResolveWorkflowInput, WorkflowInput, resolve_workflow};
 use crate::error::Error;
 use crate::event::{Event, append_event, to_run_event_at};
-use crate::file_resolver::FileResolver;
 use crate::pipeline::types::PersistOptions;
 use crate::pipeline::{self, Persisted, TransformOptions, Validated};
 use crate::records::RunSpec;
@@ -57,8 +56,62 @@ pub struct CreateRunInput {
     pub web_url: Option<String>,
 }
 
+impl CreateRunInput {
+    /// Split into the compile-stage input and the persistence metadata for
+    /// `run_id`, the two halves of the create pipeline.
+    fn into_stages(
+        self,
+        run_id: RunId,
+        storage_root: PathBuf,
+    ) -> (CreateRunCompileInput, CreateRunPersistenceMetadata) {
+        let Self {
+            workflow,
+            settings,
+            vars,
+            cwd,
+            workflow_slug,
+            workflow_path,
+            workflow_bundle,
+            submitted_manifest_bytes,
+            run_id: _,
+            title,
+            automation,
+            git,
+            fork_source_ref,
+            parent_id,
+            provenance,
+            configured_providers,
+            web_url,
+        } = self;
+        (
+            CreateRunCompileInput {
+                workflow,
+                settings,
+                vars,
+                cwd,
+                workflow_path,
+                workflow_bundle,
+                configured_providers,
+            },
+            CreateRunPersistenceMetadata {
+                run_id,
+                storage_root,
+                workflow_slug,
+                submitted_manifest_bytes,
+                title,
+                automation,
+                git,
+                fork_source_ref,
+                parent_id,
+                provenance,
+                web_url,
+            },
+        )
+    }
+}
+
 /// Inputs needed to resolve and compile a workflow for run creation.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct CreateRunCompileInput {
     pub workflow:             WorkflowInput,
     pub settings:             WorkflowSettings,
@@ -72,7 +125,7 @@ pub struct CreateRunCompileInput {
 /// Durable metadata joined to a materialized workflow before persistence.
 /// `run_id` is already resolved, and `storage_root` is used to derive the
 /// run's scratch directory during pure input assembly.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct CreateRunPersistenceMetadata {
     pub run_id: RunId,
     pub storage_root: PathBuf,
@@ -105,8 +158,6 @@ pub struct CompiledRun {
     workflow_slug:        Option<String>,
     workflow_config:      Option<String>,
     dot_path:             Option<PathBuf>,
-    current_dir:          Option<PathBuf>,
-    file_resolver:        Option<Arc<dyn FileResolver>>,
     definition:           Option<RunDefinition>,
     source_directory:     String,
     labels:               HashMap<String, String>,
@@ -121,56 +172,23 @@ impl CompiledRun {
     pub fn settings(&self) -> &WorkflowSettings {
         &self.settings
     }
-
-    pub fn resolved_source(&self) -> &str {
-        &self.raw_source
-    }
-
-    pub fn workflow_slug(&self) -> Option<&str> {
-        self.workflow_slug.as_deref()
-    }
-
-    pub fn workflow_config(&self) -> Option<&str> {
-        self.workflow_config.as_deref()
-    }
-
-    pub fn dot_path(&self) -> Option<&Path> {
-        self.dot_path.as_deref()
-    }
-
-    pub fn current_dir(&self) -> Option<&Path> {
-        self.current_dir.as_deref()
-    }
-
-    pub fn file_resolver(&self) -> Option<Arc<dyn FileResolver>> {
-        self.file_resolver.clone()
-    }
-
-    pub fn definition(&self) -> Option<&RunDefinition> {
-        self.definition.as_ref()
-    }
-
-    pub fn source_directory(&self) -> &str {
-        &self.source_directory
-    }
-
-    pub fn labels(&self) -> &HashMap<String, String> {
-        &self.labels
-    }
 }
 
 /// Compiled workflow with its run-level model settings materialized against
 /// the same provider snapshot used during compilation.
 pub struct MaterializedRun {
-    compiled: CompiledRun,
-    settings: WorkflowSettings,
+    validated:        Validated,
+    settings:         WorkflowSettings,
+    raw_source:       String,
+    workflow_slug:    Option<String>,
+    workflow_config:  Option<String>,
+    dot_path:         Option<PathBuf>,
+    definition:       Option<RunDefinition>,
+    source_directory: String,
+    labels:           HashMap<String, String>,
 }
 
 impl MaterializedRun {
-    pub fn compiled(&self) -> &CompiledRun {
-        &self.compiled
-    }
-
     pub fn settings(&self) -> &WorkflowSettings {
         &self.settings
     }
@@ -219,7 +237,7 @@ impl CreateRunPersistenceInput {
     }
 
     pub fn definition(&self) -> Option<&RunDefinition> {
-        self.materialized.compiled.definition.as_ref()
+        self.materialized.definition.as_ref()
     }
 }
 
@@ -233,53 +251,12 @@ pub async fn create(
 ) -> Result<CreatedRun, Error> {
     let run_id = request.run_id.unwrap_or_default();
     let persistence_input = spawn_blocking(move || {
-        let CreateRunInput {
-            workflow,
-            settings,
-            vars,
-            cwd,
-            workflow_slug,
-            workflow_path,
-            workflow_bundle,
-            submitted_manifest_bytes,
-            run_id: _,
-            title,
-            automation,
-            git,
-            fork_source_ref,
-            parent_id,
-            provenance,
-            configured_providers,
-            web_url,
-        } = request;
-        let compiled = compile_create_run(
-            CreateRunCompileInput {
-                workflow,
-                settings,
-                vars,
-                cwd,
-                workflow_path,
-                workflow_bundle,
-                configured_providers,
-            },
-            Arc::clone(&catalog),
-        )?;
+        let (compile_input, metadata) = request.into_stages(run_id, storage_root);
+        let compiled = compile_create_run(compile_input, Arc::clone(&catalog))?;
         let materialized = materialize_create_run(compiled, catalog.as_ref())?;
         Ok::<_, Error>(assemble_create_run_persistence_input(
             materialized,
-            CreateRunPersistenceMetadata {
-                run_id,
-                storage_root,
-                workflow_slug,
-                submitted_manifest_bytes,
-                title,
-                automation,
-                git,
-                fork_source_ref,
-                parent_id,
-                provenance,
-                web_url,
-            },
+            metadata,
         ))
     })
     .await
@@ -374,8 +351,6 @@ pub fn compile_create_run(
         workflow_slug: resolved.workflow_slug,
         workflow_config,
         dot_path: resolved.dot_path,
-        current_dir: resolved.current_dir,
-        file_resolver: resolved.file_resolver,
         definition,
         source_directory: resolved.working_directory.to_string_lossy().to_string(),
         labels,
@@ -388,13 +363,35 @@ pub fn materialize_create_run(
     compiled: CompiledRun,
     catalog: &Catalog,
 ) -> Result<MaterializedRun, Error> {
+    let CompiledRun {
+        validated,
+        settings,
+        raw_source,
+        workflow_slug,
+        workflow_config,
+        dot_path,
+        definition,
+        source_directory,
+        labels,
+        configured_providers,
+    } = compiled;
     let settings = run_materialization::materialize_run(
-        compiled.settings.clone(),
-        compiled.validated.graph(),
+        settings,
+        validated.graph(),
         catalog,
-        &compiled.configured_providers,
+        &configured_providers,
     )?;
-    Ok(MaterializedRun { compiled, settings })
+    Ok(MaterializedRun {
+        validated,
+        settings,
+        raw_source,
+        workflow_slug,
+        workflow_config,
+        dot_path,
+        definition,
+        source_directory,
+        labels,
+    })
 }
 
 /// Assemble all inputs needed for persistence without I/O or recompilation.
@@ -419,7 +416,7 @@ pub fn assemble_create_run_persistence_input(
         .run_scratch(&run_id)
         .root()
         .to_path_buf();
-    let workflow_slug = workflow_slug.or_else(|| materialized.compiled.workflow_slug.clone());
+    let workflow_slug = workflow_slug.or_else(|| materialized.workflow_slug.clone());
 
     CreateRunPersistenceInput {
         materialized,
@@ -456,21 +453,17 @@ pub async fn persist_create_run(
         provenance,
         web_url,
     } = input;
-    let MaterializedRun { compiled, settings } = materialized;
-    let CompiledRun {
+    let MaterializedRun {
         validated,
-        settings: _,
+        settings,
         raw_source,
         workflow_slug: _,
         workflow_config,
         dot_path,
-        current_dir: _,
-        file_resolver: _,
         definition,
         source_directory,
         labels,
-        configured_providers: _,
-    } = compiled;
+    } = materialized;
     let persisted_run_dir = run_dir.clone();
     let persisted = spawn_blocking(move || {
         let run_spec = RunSpec {
@@ -785,15 +778,10 @@ reasoning = false
     }
 
     fn compile_input(request: &CreateRunInput) -> CreateRunCompileInput {
-        CreateRunCompileInput {
-            workflow:             request.workflow.clone(),
-            settings:             request.settings.clone(),
-            vars:                 request.vars.clone(),
-            cwd:                  request.cwd.clone(),
-            workflow_path:        request.workflow_path.clone(),
-            workflow_bundle:      request.workflow_bundle.clone(),
-            configured_providers: request.configured_providers.clone(),
-        }
+        let (compile_input, _) = request
+            .clone()
+            .into_stages(RunId::new(), PathBuf::from("/tmp/storage"));
+        compile_input
     }
 
     fn persistence_metadata(
@@ -801,19 +789,10 @@ reasoning = false
         run_id: RunId,
         storage_root: &Path,
     ) -> CreateRunPersistenceMetadata {
-        CreateRunPersistenceMetadata {
-            run_id,
-            storage_root: storage_root.to_path_buf(),
-            workflow_slug: request.workflow_slug.clone(),
-            submitted_manifest_bytes: request.submitted_manifest_bytes.clone(),
-            title: request.title.clone(),
-            automation: request.automation.clone(),
-            git: request.git.clone(),
-            fork_source_ref: request.fork_source_ref.clone(),
-            parent_id: request.parent_id,
-            provenance: request.provenance.clone(),
-            web_url: request.web_url.clone(),
-        }
+        let (_, metadata) = request
+            .clone()
+            .into_stages(run_id, storage_root.to_path_buf());
+        metadata
     }
 
     fn validate_dot(dot_source: &str, settings: WorkflowSettings) -> Validated {
@@ -1722,11 +1701,9 @@ reasoning = false
         )
         .unwrap();
 
-        assert_eq!(compiled.resolved_source(), MINIMAL_DOT);
-        assert_eq!(compiled.current_dir(), Some(Path::new("workflows")));
-        assert_eq!(compiled.dot_path(), Some(workflow_path.as_path()));
-        assert!(compiled.file_resolver().is_some());
-        assert_eq!(compiled.labels(), &compiled.settings().combined_labels());
+        assert_eq!(compiled.raw_source, MINIMAL_DOT);
+        assert_eq!(compiled.dot_path.as_deref(), Some(workflow_path.as_path()));
+        assert_eq!(compiled.labels, compiled.settings().combined_labels());
         let materialized = materialize_create_run(compiled, test_catalog().as_ref()).unwrap();
         let input =
             assemble_create_run_persistence_input(materialized, CreateRunPersistenceMetadata {
@@ -1788,7 +1765,7 @@ reasoning = false
         .unwrap();
         let compiled = compile_create_run(compile_input(&request), Arc::clone(&catalog)).unwrap();
         assert_eq!(
-            compiled.workflow_config(),
+            compiled.workflow_config.as_deref(),
             Some("_version = 1\n[workflow]\ngraph = \"workflow.fabro\"\n")
         );
 
