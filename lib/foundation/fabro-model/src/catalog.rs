@@ -3580,7 +3580,7 @@ enabled = true
         assert_eq!(provider.codec, CodecKind::OpenAiCompatible);
         assert_eq!(provider.agent_profile, AgentProfileKind::Kimi);
         assert_eq!(provider.billing_policy, BillingPolicy::OpenAi);
-        assert_eq!(provider.priority, 30);
+        assert_eq!(provider.priority, 75);
         assert!(provider.auth.is_none());
         assert_eq!(
             provider.extra_headers,
@@ -3695,7 +3695,7 @@ enabled = true
     }
 
     #[test]
-    fn builtin_kimi_k3_selection_prefers_direct_kimi_then_modal_over_openrouter() {
+    fn builtin_kimi_k3_selection_prefers_modal_then_direct_kimi_over_openrouter() {
         let kimi = ProviderId::new("kimi");
         let modal = ProviderId::new("modal");
         let openrouter = ProviderId::new("openrouter");
@@ -3716,7 +3716,16 @@ enabled = true
                 None,
                 &HashSet::from([kimi.clone(), modal.clone(), openrouter.clone()]),
             )
-            .expect("direct Kimi should win portable Kimi K3 selection");
+            .expect("Modal should win portable Kimi K3 selection");
+        assert_eq!(selected.provider, modal);
+
+        let selected = catalog
+            .select(
+                "kimi-k3",
+                None,
+                &HashSet::from([kimi.clone(), openrouter.clone()]),
+            )
+            .expect("direct Kimi should win when Modal is unavailable");
         assert_eq!(selected.provider, kimi);
 
         let selected = catalog

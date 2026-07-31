@@ -3,7 +3,7 @@ display_name = "Modal"
 adapter = "openai_compatible"
 agent_profile = "kimi"
 api_key_url = "https://modal.com/docs/guide/endpoints#proxy-tokens"
-priority = 30
+priority = 75
 enabled = false
 
 [providers.modal.extra_headers]
