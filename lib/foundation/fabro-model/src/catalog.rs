@@ -3029,6 +3029,148 @@ enabled = true
     }
 
     #[test]
+    fn builtin_deepseek_provider_routes_v4_models() {
+        let deepseek = ProviderId::new("deepseek");
+        let catalog = Catalog::builtin();
+        let provider = catalog
+            .provider(&deepseek)
+            .expect("DeepSeek provider should be active");
+
+        assert_eq!(provider.adapter, AdapterKind::OpenAiCompatible);
+        assert_eq!(provider.codec, CodecKind::OpenAiCompatible);
+        assert_eq!(provider.billing_policy, BillingPolicy::OpenAi);
+        assert_eq!(
+            provider.base_url.as_deref(),
+            Some("https://api.deepseek.com")
+        );
+        assert_eq!(provider.priority, 75);
+        assert_eq!(provider.auth.as_ref().unwrap().credentials, vec![
+            CredentialRef::Env("DEEPSEEK_API_KEY".to_string()),
+            CredentialRef::Vault("DEEPSEEK_API_KEY".to_string()),
+        ]);
+        assert_eq!(
+            catalog
+                .default_for_provider(&deepseek)
+                .map(|model| model.id.as_str()),
+            Some("deepseek-v4-flash")
+        );
+        assert_eq!(
+            catalog
+                .small_default_for_provider(&deepseek)
+                .map(|model| model.id.as_str()),
+            Some("deepseek-v4-flash")
+        );
+        assert_eq!(
+            catalog
+                .probe_for_provider(&deepseek)
+                .map(|model| model.id.as_str()),
+            Some("deepseek-v4-flash")
+        );
+
+        let expected = [
+            ("deepseek-v4-flash", 0.14, 0.28, 0.0028),
+            ("deepseek-v4-pro", 0.435, 0.87, 0.003_625),
+        ];
+        for (id, input, output, cache_read) in expected {
+            let model = catalog
+                .get_on_provider(&deepseek, id)
+                .unwrap_or_else(|| panic!("DeepSeek model '{id}' should be present"));
+            assert_eq!(model.family, "deepseek-v4", "{id}");
+            assert_eq!(model.limits.context_window, 1_048_576, "{id}");
+            assert_eq!(model.limits.max_output, Some(384_000), "{id}");
+            assert!(model.features.tools, "{id}");
+            assert!(!model.features.vision, "{id}");
+            assert!(model.features.reasoning, "{id}");
+            assert!(model.features.prompt_cache, "{id}");
+            assert!(!model.features.sampling_params, "{id}");
+            assert_eq!(model.costs.input_cost_per_mtok, Some(input), "{id}");
+            assert_eq!(model.costs.output_cost_per_mtok, Some(output), "{id}");
+            assert_eq!(
+                model.costs.cache_input_cost_per_mtok,
+                Some(cache_read),
+                "{id}"
+            );
+
+            let settings = catalog
+                .model_settings_on_provider(&deepseek, id)
+                .unwrap_or_else(|| panic!("DeepSeek settings for '{id}' should be present"));
+            assert_eq!(settings.api_id, id, "{id}");
+            assert!(settings.reasoning_by_default, "{id}");
+        }
+    }
+
+    #[test]
+    fn builtin_deepseek_reasoning_controls_match_provider_dialects() {
+        let catalog = Catalog::from_builtin_with_overrides(&minimal_settings(
+            r"
+[providers.fireworks]
+enabled = true
+
+[providers.openrouter]
+enabled = true
+",
+        ))
+        .expect("DeepSeek gateway providers should build when enabled");
+
+        let expected = [
+            (ProviderId::new("deepseek"), "deepseek-v4-flash", vec![
+                ReasoningEffort::Low,
+                ReasoningEffort::High,
+                ReasoningEffort::Max,
+            ]),
+            (ProviderId::new("deepseek"), "deepseek-v4-pro", vec![
+                ReasoningEffort::High,
+                ReasoningEffort::Max,
+            ]),
+            (ProviderId::new("fireworks"), "deepseek-v4-flash", vec![
+                ReasoningEffort::High,
+                ReasoningEffort::Max,
+            ]),
+            (ProviderId::new("fireworks"), "deepseek-v4-pro", vec![
+                ReasoningEffort::High,
+                ReasoningEffort::Max,
+            ]),
+            (ProviderId::new("openrouter"), "deepseek-v4-flash", vec![
+                ReasoningEffort::Low,
+                ReasoningEffort::High,
+                ReasoningEffort::Max,
+            ]),
+            (ProviderId::new("openrouter"), "deepseek-v4-pro", vec![
+                ReasoningEffort::High,
+                ReasoningEffort::XHigh,
+            ]),
+        ];
+
+        for (provider, id, efforts) in expected {
+            let model = catalog
+                .get_on_provider(&provider, id)
+                .unwrap_or_else(|| panic!("{provider}/{id} should be present"));
+            assert!(model.features.reasoning, "{provider}/{id}");
+            assert_eq!(
+                model.features.reasoning_effort,
+                ReasoningEffortFeature::Levels,
+                "{provider}/{id}"
+            );
+            assert_eq!(model.controls.reasoning_effort, efforts, "{provider}/{id}");
+            assert!(!model.features.sampling_params, "{provider}/{id}");
+
+            let settings = catalog
+                .model_settings_on_provider(&provider, id)
+                .unwrap_or_else(|| panic!("{provider}/{id} settings should be present"));
+            assert_eq!(
+                settings.agent_profile,
+                AgentProfileKind::OpenAi,
+                "{provider}/{id}"
+            );
+            assert!(settings.reasoning_by_default, "{provider}/{id}");
+            assert_eq!(
+                settings.controls.reasoning_effort, efforts,
+                "{provider}/{id}"
+            );
+        }
+    }
+
+    #[test]
     fn builtin_openrouter_provider_is_opt_in() {
         let openrouter = ProviderId::new("openrouter");
         let builtin = Catalog::builtin();
@@ -3070,6 +3212,27 @@ enabled = true
                 .unwrap()
                 .billing_policy,
             BillingPolicy::OpenAi
+        );
+        let deepseek = catalog
+            .get_on_provider(&openrouter, "deepseek-v4-flash")
+            .expect("DeepSeek V4 Flash should be present on OpenRouter");
+        assert_eq!(deepseek.limits.max_output, Some(384_000));
+        assert!(deepseek.features.prompt_cache);
+        assert_eq!(deepseek.costs.input_cost_per_mtok, Some(0.14));
+        assert_eq!(deepseek.costs.output_cost_per_mtok, Some(0.28));
+        assert_eq!(deepseek.costs.cache_input_cost_per_mtok, Some(0.0028));
+        assert_eq!(
+            catalog.settings_for(deepseek).unwrap().api_id,
+            "deepseek/deepseek-v4-flash-0731"
+        );
+        let deepseek_pro = catalog
+            .get_on_provider(&openrouter, "deepseek-v4-pro")
+            .expect("DeepSeek V4 Pro should be present on OpenRouter");
+        assert_eq!(deepseek_pro.limits.max_output, Some(384_000));
+        assert!(deepseek_pro.features.prompt_cache);
+        assert_eq!(
+            deepseek_pro.costs.cache_input_cost_per_mtok,
+            Some(0.003_625)
         );
         assert_eq!(
             catalog
@@ -3316,8 +3479,8 @@ enabled = true
 
         for (selector, canonical_id) in [
             ("deepseek-v4-pro", "deepseek-v4-pro"),
-            ("deepseek-v4", "deepseek-v4-pro"),
-            ("deepseek", "deepseek-v4-pro"),
+            ("deepseek-v4", "deepseek-v4-flash"),
+            ("deepseek", "deepseek-v4-flash"),
             ("deepseek-v4-flash", "deepseek-v4-flash"),
             ("deepseek-flash", "deepseek-v4-flash"),
         ] {
@@ -3877,9 +4040,9 @@ enabled = true
                 "accounts/fireworks/models/deepseek-v4-flash",
                 "deepseek-v4",
                 1_048_576,
-                16_384,
+                384_000,
                 false,
-                false,
+                true,
                 0.14,
                 0.28,
                 0.028,
@@ -3999,7 +4162,7 @@ enabled = true
     }
 
     #[test]
-    fn builtin_fireworks_shared_slugs_are_portable_with_openrouter() {
+    fn builtin_deepseek_shared_slugs_are_portable_across_providers() {
         let catalog = Catalog::from_builtin_with_overrides(&minimal_settings(
             r"
 [providers.fireworks]
@@ -4026,6 +4189,43 @@ enabled = true
                 assert_eq!(model.provider, provider, "{provider}/{id}");
             }
         }
+
+        for provider in [
+            ProviderId::new("deepseek"),
+            ProviderId::new("fireworks"),
+            ProviderId::new("openrouter"),
+        ] {
+            for id in ["deepseek-v4-pro", "deepseek-v4-flash"] {
+                let model = catalog
+                    .get_on_provider(&provider, id)
+                    .unwrap_or_else(|| panic!("'{id}' should resolve on provider '{provider}'"));
+                assert_eq!(model.id, id, "{provider}/{id}");
+                assert_eq!(model.provider, provider, "{provider}/{id}");
+                assert_eq!(model.limits.context_window, 1_048_576, "{provider}/{id}");
+            }
+            for alias in ["deepseek", "deepseek-v4", "deepseek-flash"] {
+                let model = catalog
+                    .resolve_on_provider(&provider, alias)
+                    .unwrap_or_else(|error| {
+                        panic!("'{alias}' should resolve on provider '{provider}': {error}")
+                    });
+                assert_eq!(model.id, "deepseek-v4-flash", "{provider}/{alias}");
+                assert_eq!(model.provider, provider, "{provider}/{alias}");
+            }
+        }
+
+        let selected = catalog
+            .select(
+                "deepseek",
+                None,
+                &HashSet::from([
+                    ProviderId::new("deepseek"),
+                    ProviderId::new("fireworks"),
+                    ProviderId::new("openrouter"),
+                ]),
+            )
+            .expect("direct DeepSeek should win portable DeepSeek selection");
+        assert_eq!(selected.provider, ProviderId::new("deepseek"));
     }
 
     #[test]
