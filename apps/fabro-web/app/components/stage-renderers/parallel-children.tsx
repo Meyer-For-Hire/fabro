@@ -5,7 +5,12 @@ import { StageState } from "@qltysh/fabro-api-client";
 import type { EventEnvelope } from "@qltysh/fabro-api-client";
 
 import type { Stage } from "../stage-sidebar";
-import { formatStageLabel, stageStatusLabel, stageStatusTone } from "../../lib/stage-sidebar";
+import {
+  ACTIVE_STAGE_STATES,
+  formatStageLabel,
+  stageStatusLabel,
+  stageStatusTone,
+} from "../../lib/stage-sidebar";
 import { formatDurationMs } from "../../lib/format";
 import { StageMetaBar } from "./meta-bar";
 import { parseParallelOverview } from "./helpers";
@@ -182,6 +187,13 @@ export function ParallelChildren({
     else if (row.status === StageState.FAILED) failureCount += 1;
   }
 
+  let duration = stage.duration === "--" ? "—" : stage.duration;
+  if (overview.durationMs != null) {
+    duration = formatDurationMs(overview.durationMs);
+  } else if (ACTIVE_STAGE_STATES.has(stage.status)) {
+    duration = "running";
+  }
+
   return (
     <div className="space-y-6 pl-3 pr-4 sm:pr-6 lg:pr-8">
       <StageMetaBar stage={stage} />
@@ -200,7 +212,7 @@ export function ParallelChildren({
         />
         <StatItem
           label="Duration"
-          value={overview.durationMs != null ? formatDurationMs(overview.durationMs) : overview.isComplete ? "—" : "running"}
+          value={duration}
         />
       </section>
 

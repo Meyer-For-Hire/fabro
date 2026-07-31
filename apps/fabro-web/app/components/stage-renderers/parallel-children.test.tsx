@@ -144,6 +144,20 @@ describe("ParallelChildren", () => {
     expect(statValue(renderer, "Failed")).toBe("0");
   });
 
+  test("uses the stage duration when cancellation interrupts the parallel summary", () => {
+    const renderer = renderParallel(
+      [startedEvent(2)],
+      [],
+      {
+        ...parallelStage,
+        status: StageState.CANCELLED,
+        duration: "53m 29s",
+      },
+    );
+
+    expect(statValue(renderer, "Duration")).toBe("53m 29s");
+  });
+
   test("keeps looped fork links scoped to the selected fork visit", () => {
     const renderer = renderParallel(
       [startedEvent(1)],
