@@ -7,10 +7,17 @@
 //! display_name = "Moonshot AI"
 //! adapter = "openai_compatible"
 //! base_url = "https://api.moonshot.ai/v1"
-//! auth = { credentials = ["env:KIMI_API_KEY", "vault:KIMI_API_KEY"] }
 //! priority = 60
 //! enabled = true
 //! aliases = ["moonshot-ai"]
+//!
+//! [llm.providers.moonshot.auth]
+//! credentials = [
+//!   "env:MOONSHOT_API_KEY",
+//!   "env:KIMI_API_KEY",
+//!   "vault:MOONSHOT_API_KEY",
+//!   "vault:KIMI_API_KEY",
+//! ]
 //!
 //! [llm.providers.moonshot.models."kimi-k2.5"]
 //! ...
@@ -499,7 +506,12 @@ enabled = true
 aliases = ["moonshot-ai"]
 
 [providers.moonshot.auth]
-credentials = ["env:KIMI_API_KEY", "vault:KIMI_API_KEY"]
+credentials = [
+  "env:MOONSHOT_API_KEY",
+  "env:KIMI_API_KEY",
+  "vault:MOONSHOT_API_KEY",
+  "vault:KIMI_API_KEY",
+]
 "#;
         let layer: LlmLayer = toml::from_str(toml).unwrap();
         let moonshot = layer.providers.get("moonshot").unwrap();
@@ -509,7 +521,9 @@ credentials = ["env:KIMI_API_KEY", "vault:KIMI_API_KEY"]
         let auth = moonshot.auth.as_ref().expect("expected api_key auth");
         assert_eq!(auth.header, ApiKeyHeaderPolicy::Bearer);
         assert_eq!(auth.credentials, vec![
+            CredentialRef::Env("MOONSHOT_API_KEY".to_string()),
             CredentialRef::Env("KIMI_API_KEY".to_string()),
+            CredentialRef::Vault("MOONSHOT_API_KEY".to_string()),
             CredentialRef::Vault("KIMI_API_KEY".to_string()),
         ]);
         assert_eq!(

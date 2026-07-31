@@ -3695,6 +3695,26 @@ enabled = true
     }
 
     #[test]
+    fn builtin_moonshot_provider_prefers_moonshot_api_key() {
+        let moonshot = ProviderId::new("moonshot");
+        let catalog = Catalog::builtin();
+        let provider = catalog
+            .provider(&moonshot)
+            .expect("Moonshot provider should be present");
+
+        assert_eq!(provider.auth.as_ref().unwrap().credentials, vec![
+            CredentialRef::Env("MOONSHOT_API_KEY".to_string()),
+            CredentialRef::Env("KIMI_API_KEY".to_string()),
+            CredentialRef::Vault("MOONSHOT_API_KEY".to_string()),
+            CredentialRef::Vault("KIMI_API_KEY".to_string()),
+        ]);
+        assert_eq!(
+            catalog.provider_vault_secret_name(&moonshot),
+            Some("MOONSHOT_API_KEY")
+        );
+    }
+
+    #[test]
     fn builtin_kimi_k3_selection_prefers_modal_then_moonshot_over_openrouter() {
         let moonshot = ProviderId::new("moonshot");
         let modal = ProviderId::new("modal");

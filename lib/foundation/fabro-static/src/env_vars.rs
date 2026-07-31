@@ -56,6 +56,7 @@ impl EnvVars {
     pub const INCEPTION_API_KEY: &'static str = "INCEPTION_API_KEY";
     pub const KIMI_API_KEY: &'static str = "KIMI_API_KEY";
     pub const MINIMAX_API_KEY: &'static str = "MINIMAX_API_KEY";
+    pub const MOONSHOT_API_KEY: &'static str = "MOONSHOT_API_KEY";
     pub const MODAL_TOKEN_ID: &'static str = "MODAL_TOKEN_ID";
     pub const MODAL_TOKEN_SECRET: &'static str = "MODAL_TOKEN_SECRET";
     pub const OPENAI_API_KEY: &'static str = "OPENAI_API_KEY";
@@ -206,6 +207,7 @@ mod tests {
             EnvVars::INCEPTION_API_KEY,
             EnvVars::KIMI_API_KEY,
             EnvVars::MINIMAX_API_KEY,
+            EnvVars::MOONSHOT_API_KEY,
             EnvVars::OPENAI_API_KEY,
             EnvVars::OPENAI_BASE_URL,
             EnvVars::OPENAI_ORGANIZATION,
