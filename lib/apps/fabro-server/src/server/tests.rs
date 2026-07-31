@@ -7,6 +7,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc as StdArc, Mutex as StdMutex};
 
+use async_zip::base::read::mem::ZipFileReader;
 use axum::body::Body;
 use axum::http::{Method, Request, header};
 use chrono::{Duration as ChronoDuration, Utc};
@@ -10590,6 +10591,173 @@ async fn stage_artifacts_keep_same_filename_per_retry() {
 }
 
 #[tokio::test]
+async fn run_artifacts_download_streams_latest_files_as_zip() {
+    let state = test_app_state();
+    let app = crate::test_support::build_test_router(Arc::clone(&state));
+    let run_id = create_run(&app, MINIMAL_DOT)
+        .await
+        .parse::<RunId>()
+        .unwrap();
+
+    let run_store = state.stores.runs.open_run(&run_id).await.unwrap();
+    for event in [
+        workflow_event::Event::RunRunnable {
+            source: fabro_types::RunRunnableSource::StartRequested,
+            actor:  None,
+        },
+        workflow_event::Event::RunStarting,
+        workflow_event::Event::RunRunning,
+    ] {
+        workflow_event::append_event(&run_store, &run_id, &event)
+            .await
+            .unwrap();
+    }
+    append_scoped_stage_event(
+        &state,
+        run_id,
+        "build",
+        1,
+        &stage_started_event("build", "command"),
+    )
+    .await;
+    append_scoped_stage_event(
+        &state,
+        run_id,
+        "verify",
+        1,
+        &stage_started_event("verify", "command"),
+    )
+    .await;
+
+    for (stage_id, retry, path, contents) in [
+        (
+            StageId::new("unknown", 1),
+            99,
+            "reports/result.txt",
+            &b"unknown stage"[..],
+        ),
+        (
+            StageId::new("build", 1),
+            1,
+            "reports/result.txt",
+            &b"build result"[..],
+        ),
+        (
+            StageId::new("verify", 1),
+            1,
+            "reports/result.txt",
+            &b"first verify"[..],
+        ),
+        (
+            StageId::new("verify", 1),
+            2,
+            "reports/result.txt",
+            &b"latest verify"[..],
+        ),
+        (
+            StageId::new("build", 1),
+            1,
+            "logs/run.txt",
+            &b"build log"[..],
+        ),
+        (
+            StageId::new("start", 1),
+            1,
+            "control-start.txt",
+            &b"excluded"[..],
+        ),
+        (
+            StageId::new("exit", 1),
+            1,
+            "control-exit.txt",
+            &b"excluded"[..],
+        ),
+    ] {
+        state
+            .artifact_store
+            .put(&run_id, &ArtifactKey::new(stage_id, retry, path), contents)
+            .await
+            .unwrap();
+    }
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(api(&format!("/runs/{run_id}/artifacts/download")))
+                .header(header::ACCEPT_ENCODING, "gzip")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/zip")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_DISPOSITION)
+            .and_then(|value| value.to_str().ok()),
+        Some(format!("attachment; filename=\"fabro-artifacts-{run_id}.zip\"").as_str())
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("private, no-store")
+    );
+    assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
+
+    let bytes = response_bytes!(response, StatusCode::OK).await;
+    let archive = ZipFileReader::new(bytes.clone())
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "ZIP parse failed for {} bytes (tail {:?}): {error}",
+                bytes.len(),
+                &bytes[bytes.len().saturating_sub(48)..]
+            )
+        });
+    let names = archive
+        .file()
+        .entries()
+        .iter()
+        .map(|entry| entry.filename().as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec!["logs/run.txt", "reports/result.txt"]);
+
+    let mut contents_by_name = HashMap::new();
+    for (index, name) in names.into_iter().enumerate() {
+        let mut entry = archive.reader_with_entry(index).await.unwrap();
+        let mut contents = Vec::new();
+        entry.read_to_end_checked(&mut contents).await.unwrap();
+        contents_by_name.insert(name, contents);
+    }
+    assert_eq!(contents_by_name["logs/run.txt"], b"build log");
+    assert_eq!(contents_by_name["reports/result.txt"], b"latest verify");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(api(&format!("/runs/{}/artifacts/download", RunId::new())))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_status!(response, StatusCode::NOT_FOUND).await;
+}
+
+#[tokio::test]
 async fn create_run_persists_run_spec() {
     let state = test_app_state();
     let app = crate::test_support::build_test_router(Arc::clone(&state));
@@ -11316,6 +11484,7 @@ async fn worker_token_is_rejected_on_user_only_routes() {
         (Method::GET, format!("/runs/{run_id}/graph/source")),
         (Method::GET, format!("/runs/{run_id}/stages")),
         (Method::GET, format!("/runs/{run_id}/artifacts")),
+        (Method::GET, format!("/runs/{run_id}/artifacts/download")),
         (Method::GET, format!("/runs/{run_id}/files")),
         (
             Method::GET,

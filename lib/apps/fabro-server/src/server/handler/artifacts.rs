@@ -1,4 +1,19 @@
+use std::io;
 use std::sync::Arc;
+
+use async_zip::base::write::ZipFileWriter;
+use async_zip::error::ZipError;
+use async_zip::{Compression, ZipEntryBuilder};
+use axum::http::HeaderValue;
+use fabro_store::{ArtifactStore, Error as StoreError, RunProjection};
+use futures_util::SinkExt as _;
+use futures_util::io::AsyncWriteExt as _;
+use tokio::io::AsyncWrite;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::io::{CopyToBytes, SinkWriter};
+use tokio_util::sync::PollSender;
+use tracing::warn;
 
 use super::super::{
     ApiError, AppState, ArtifactEntry, ArtifactKey, ArtifactListResponse, AsyncWriteExt, Body,
@@ -17,6 +32,7 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         .route("/runs/{id}/blobs", post(write_run_blob))
         .route("/runs/{id}/blobs/{blobId}", get(read_run_blob))
         .route("/runs/{id}/artifacts", get(list_run_artifacts))
+        .route("/runs/{id}/artifacts/download", get(download_run_artifacts))
         .route(
             "/runs/{id}/stages/{stageId}/artifacts",
             get(list_stage_artifacts)
@@ -145,6 +161,180 @@ async fn list_run_artifacts(
             ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
         }
     }
+}
+
+const ARCHIVE_STREAM_CHANNEL_CAPACITY: usize = 8;
+
+#[derive(Debug, thiserror::Error)]
+enum ArtifactArchiveError {
+    #[error("archive output failed: {0}")]
+    Io(#[from] io::Error),
+    #[error("artifact read failed: {0}")]
+    Store(#[from] StoreError),
+    #[error("artifact disappeared while the archive was being created")]
+    MissingArtifact,
+    #[error("ZIP write failed: {0}")]
+    Zip(#[from] ZipError),
+}
+
+fn validate_artifact_archive_path(path: &str) -> Result<(), StoreError> {
+    ArtifactStore::validate_relative_path(path)?;
+    let bytes = path.as_bytes();
+    let has_windows_drive_prefix =
+        bytes.first().is_some_and(u8::is_ascii_alphabetic) && bytes.get(1) == Some(&b':');
+    if path.contains('\0') || has_windows_drive_prefix {
+        return Err(StoreError::Other(
+            "artifact path is not safe for a ZIP archive".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn latest_run_artifacts(
+    entries: Vec<NodeArtifact>,
+    projection: &RunProjection,
+) -> Result<Vec<NodeArtifact>, StoreError> {
+    let stage_order = projection
+        .iter_stages()
+        .enumerate()
+        .map(|(order, (stage_id, _))| (stage_id.clone(), order))
+        .collect::<HashMap<_, _>>();
+    let mut latest_by_path: HashMap<String, (Option<usize>, NodeArtifact)> = HashMap::new();
+
+    for artifact in entries {
+        if matches!(artifact.node.node_id(), "start" | "exit") {
+            continue;
+        }
+        validate_artifact_archive_path(&artifact.filename)?;
+
+        let order = stage_order.get(&artifact.node).copied();
+        let replace =
+            latest_by_path
+                .get(&artifact.filename)
+                .is_none_or(|(existing_order, existing)| {
+                    (order, artifact.retry, &artifact.node)
+                        > (*existing_order, existing.retry, &existing.node)
+                });
+        if replace {
+            latest_by_path.insert(artifact.filename.clone(), (order, artifact));
+        }
+    }
+
+    let mut latest = latest_by_path
+        .into_values()
+        .map(|(_, artifact)| artifact)
+        .collect::<Vec<_>>();
+    latest.sort_by(|left, right| left.filename.cmp(&right.filename));
+    Ok(latest)
+}
+
+async fn write_artifact_archive<W>(
+    writer: W,
+    artifact_store: ArtifactStore,
+    run_id: RunId,
+    artifacts: Vec<NodeArtifact>,
+) -> Result<(), ArtifactArchiveError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut archive = ZipFileWriter::with_tokio(writer);
+    for artifact in artifacts {
+        let key = ArtifactKey::new(artifact.node, artifact.retry, artifact.filename.clone());
+        let Some(mut source) = artifact_store.get_stream(&run_id, &key).await? else {
+            return Err(ArtifactArchiveError::MissingArtifact);
+        };
+        let entry = ZipEntryBuilder::new(artifact.filename.into(), Compression::Stored);
+        let mut destination = archive.write_entry_stream(entry).await?;
+        while let Some(chunk) = source.next().await {
+            destination.write_all(&chunk?).await?;
+        }
+        destination.close().await?;
+    }
+    let mut writer = archive.close().await?.into_inner();
+    writer.shutdown().await?;
+    Ok(())
+}
+
+fn artifact_archive_body(
+    artifact_store: ArtifactStore,
+    run_id: RunId,
+    artifacts: Vec<NodeArtifact>,
+) -> Body {
+    let (sender, receiver) =
+        mpsc::channel::<Result<Bytes, io::Error>>(ARCHIVE_STREAM_CHANNEL_CAPACITY);
+    let error_sender = sender.clone();
+    let sink = PollSender::new(sender)
+        .sink_map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))
+        .with(|chunk: Bytes| {
+            std::future::ready(Ok::<Result<Bytes, io::Error>, io::Error>(Ok(chunk)))
+        });
+    let writer = SinkWriter::new(CopyToBytes::new(sink));
+
+    tokio::spawn(async move {
+        if let Err(error) = write_artifact_archive(writer, artifact_store, run_id, artifacts).await
+        {
+            let body_error = io::Error::other("artifact archive stream failed");
+            if error_sender.send(Err(body_error)).await.is_ok() {
+                warn!(%run_id, %error, "artifact archive stream failed");
+            }
+        }
+    });
+
+    Body::from_stream(ReceiverStream::new(receiver))
+}
+
+async fn download_run_artifacts(
+    _auth: RequiredUser,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    let id = match parse_run_id_path(&id) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    let cached = match state.cached_run(&id).await {
+        Ok(cached) => cached,
+        Err(error) => return error.into_response(),
+    };
+    let entries = match state.artifact_store.list_for_run(&id).await {
+        Ok(entries) => entries,
+        Err(error) => {
+            warn!(run_id = %id, %error, "failed to list artifacts for ZIP download");
+            return ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Artifact archive could not be prepared.",
+            )
+            .into_response();
+        }
+    };
+    let artifacts = match latest_run_artifacts(entries, &cached.projection) {
+        Ok(artifacts) => artifacts,
+        Err(error) => {
+            warn!(run_id = %id, %error, "failed to select artifacts for ZIP download");
+            return ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Artifact archive could not be prepared.",
+            )
+            .into_response();
+        }
+    };
+
+    let filename = format!("attachment; filename=\"fabro-artifacts-{id}.zip\"");
+    let body = artifact_archive_body(state.artifact_store.clone(), id, artifacts);
+    let mut response = body.into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/zip"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&filename).expect("run IDs produce valid attachment filenames"),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response
 }
 
 fn run_artifact_entry_from(entry: NodeArtifact) -> RunArtifactEntry {
@@ -645,5 +835,28 @@ async fn get_stage_artifact(
         Err(err) => {
             ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_artifact_archive_path;
+
+    #[test]
+    fn archive_paths_reject_cross_platform_absolute_forms() {
+        for path in [
+            "/escape.txt",
+            "../escape.txt",
+            r"..\escape.txt",
+            "C:/escape.txt",
+            "c:escape.txt",
+            "bad\0name",
+        ] {
+            assert!(
+                validate_artifact_archive_path(path).is_err(),
+                "accepted unsafe archive path: {path:?}"
+            );
+        }
+        assert!(validate_artifact_archive_path("nested/result.txt").is_ok());
     }
 }

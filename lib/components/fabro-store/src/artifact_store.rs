@@ -4,6 +4,7 @@ use bytes::Bytes;
 use chrono::Utc;
 use fabro_types::RunId;
 use futures::StreamExt;
+use futures::stream::BoxStream;
 use object_store::ObjectStore;
 use object_store::buffered::BufWriter;
 use object_store::path::Path as ObjectPath;
@@ -120,6 +121,28 @@ impl ArtifactStore {
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(err) => Err(err.into()),
         }
+    }
+
+    pub async fn get_stream(
+        &self,
+        run_id: &RunId,
+        key: &ArtifactKey,
+    ) -> Result<Option<BoxStream<'static, Result<Bytes>>>> {
+        let path = self.artifact_path(run_id, key)?;
+        match self.object_store.get(&path).await {
+            Ok(result) => Ok(Some(
+                result
+                    .into_stream()
+                    .map(|chunk| chunk.map_err(Error::from))
+                    .boxed(),
+            )),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    pub fn validate_relative_path(relative_path: &str) -> Result<()> {
+        validate_filename_segments(relative_path).map(drop)
     }
 
     pub async fn list_for_run(&self, run_id: &RunId) -> Result<Vec<NodeArtifact>> {
@@ -458,6 +481,22 @@ mod tests {
             store.get(&run_id, &key).await.unwrap(),
             Some(Bytes::from_static(b"hello world"))
         );
+    }
+
+    #[tokio::test]
+    async fn get_stream_round_trips_chunked_reads() {
+        let store = test_store();
+        let run_id = fixtures::RUN_1;
+        let key = ArtifactKey::new(StageId::new("build", 2), 1, "logs/output.txt");
+        store.put(&run_id, &key, b"hello world").await.unwrap();
+
+        let mut stream = store.get_stream(&run_id, &key).await.unwrap().unwrap();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            bytes.extend_from_slice(&chunk.unwrap());
+        }
+
+        assert_eq!(bytes, b"hello world");
     }
 
     #[tokio::test]

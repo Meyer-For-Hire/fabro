@@ -6,7 +6,10 @@ import type { RunArtifactEntry } from "@qltysh/fabro-api-client";
 
 import { EmptyState, ErrorState, LoadingState } from "../components/state";
 import { StageSidebar } from "../components/stage-sidebar";
-import { stageArtifactDownloadUrl } from "../lib/api-client";
+import {
+  runArtifactsDownloadUrl,
+  stageArtifactDownloadUrl,
+} from "../lib/api-client";
 import { formatBytes } from "../lib/format";
 import { plural } from "../lib/plural";
 import { useRunArtifacts, useRunStages } from "../lib/queries";
@@ -117,7 +120,7 @@ function ArtifactList({ runId, files }: { runId: string; files: readonly Artifac
 
   return (
     <div className="space-y-4">
-      <div className="flex flex-wrap items-baseline justify-between gap-4">
+      <div className="flex flex-wrap items-center justify-between gap-3">
         <h2 className="text-sm font-medium text-fg">
           {files.length} {plural(files.length, "file", "files")}
           {versioned && (
@@ -127,11 +130,22 @@ function ArtifactList({ runId, files }: { runId: string; files: readonly Artifac
             </span>
           )}
         </h2>
-        <span className="text-xs text-fg-muted tabular-nums">
-          {versioned
-            ? `${formatBytes(latestBytes)} latest · ${formatBytes(storedBytes)} stored`
-            : `${formatBytes(latestBytes)} total`}
-        </span>
+        <div className="ml-auto flex max-w-full flex-wrap items-center justify-end gap-3">
+          <span className="text-xs text-fg-muted tabular-nums">
+            {versioned
+              ? `${formatBytes(latestBytes)} latest · ${formatBytes(storedBytes)} stored`
+              : `${formatBytes(latestBytes)} total`}
+          </span>
+          <a
+            href={runArtifactsDownloadUrl(runId)}
+            download={`fabro-artifacts-${runId}.zip`}
+            aria-label={`Download the latest version of all ${files.length} ${plural(files.length, "artifact", "artifacts")} as a ZIP file`}
+            className="inline-flex min-h-11 shrink-0 items-center gap-1.5 rounded-md bg-overlay px-2.5 py-1 text-xs font-medium text-fg-2 outline-1 -outline-offset-1 outline-line-strong hover:bg-overlay-strong hover:text-fg focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 sm:min-h-8"
+          >
+            <ArrowDownTrayIcon className="size-3.5 shrink-0" aria-hidden="true" />
+            Download all
+          </a>
+        </div>
       </div>
 
       <section className="overflow-hidden rounded-md border border-line bg-panel-alt">

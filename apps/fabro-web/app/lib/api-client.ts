@@ -422,3 +422,9 @@ export function stageArtifactDownloadUrl(
     encodeURIComponent(id)
   }/stages/${encodeURIComponent(stageId)}/artifacts/download?${searchParams}`;
 }
+
+export function runArtifactsDownloadUrl(id: string): string {
+  return `${generatedApiConfiguration.basePath ?? ""}/api/v1/runs/${
+    encodeURIComponent(id)
+  }/artifacts/download`;
+}

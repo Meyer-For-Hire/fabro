@@ -116,6 +116,7 @@ pub(super) fn demo_routes() -> Router<Arc<AppState>> {
         .route("/runs/{id}/graph/source", get(demo::get_run_graph_source))
         .route("/runs/{id}/stages", get(demo::get_run_stages))
         .route("/runs/{id}/artifacts", get(demo::list_run_artifacts_stub))
+        .route("/runs/{id}/artifacts/download", get(not_implemented))
         .route("/runs/{id}/files", get(demo::list_run_files_stub))
         .route("/runs/{id}/commits", get(demo::list_run_commits_stub))
         .route(
