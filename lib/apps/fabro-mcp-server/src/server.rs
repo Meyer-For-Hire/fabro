@@ -4,15 +4,17 @@ use std::sync::Arc;
 use anyhow::Result;
 use fabro_tool::fabro_client::ClientBackend;
 use fabro_tool::{self as run_tools, FabroToolBackend};
+use fabro_util::version::FABRO_VERSION;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::transport::stdio;
 use rmcp::{ErrorData, ServerHandler, serve_server, tool, tool_handler, tool_router};
 use serde::Serialize;
 use tokio::sync::OnceCell;
 
 use crate::FabroMcpServerSettings;
+use crate::executable_monitor::ExecutableMonitor;
 use crate::manifest_builder::McpRunManifestBuilder;
 
 #[derive(Clone)]
@@ -23,17 +25,45 @@ pub(crate) struct FabroMcpServer {
     tool_router: ToolRouter<Self>,
 }
 
-pub async fn start(settings: FabroMcpServerSettings) -> Result<()> {
+/// The reason a running MCP stdio server returned to its caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpServerExit {
+    /// The MCP service stopped without an executable replacement.
+    ServiceStopped,
+    /// The executable on disk changed while the MCP service was running.
+    ExecutableReplaced,
+}
+
+pub async fn start(settings: FabroMcpServerSettings) -> Result<McpServerExit> {
+    let executable_monitor = ExecutableMonitor::current().await.ok();
     let server = FabroMcpServer::new(Arc::new(settings));
     let service = serve_server(server, stdio()).await?;
-    service.waiting().await?;
-    Ok(())
+    let exit = if let Some(executable_monitor) = executable_monitor {
+        let cancellation = service.cancellation_token();
+        let mut service_wait = Box::pin(service.waiting());
+        tokio::select! {
+            result = &mut service_wait => {
+                result?;
+                McpServerExit::ServiceStopped
+            }
+            () = executable_monitor.wait_until_replaced() => {
+                cancellation.cancel();
+                service_wait.await?;
+                McpServerExit::ExecutableReplaced
+            }
+        }
+    } else {
+        service.waiting().await?;
+        McpServerExit::ServiceStopped
+    };
+    Ok(exit)
 }
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for FabroMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("fabro", FABRO_VERSION).with_title("Fabro"))
             .with_instructions("Use these tools to create, inspect, control, wait for, and read events from Fabro workflow runs.")
     }
 }
@@ -250,6 +280,22 @@ mod tests {
 
     use super::*;
     use crate::FabroMcpServerSettings;
+
+    #[test]
+    fn server_info_reports_fabro_version() {
+        let settings = FabroMcpServerSettings {
+            cwd:            PathBuf::from("."),
+            config_path:    PathBuf::from("fabro.toml"),
+            client_factory: Arc::new(|| {
+                Box::pin(async { panic!("client should not be constructed while reading info") })
+            }),
+        };
+        let info = FabroMcpServer::new(Arc::new(settings)).get_info();
+
+        assert_eq!(info.server_info.name, "fabro");
+        assert_eq!(info.server_info.title.as_deref(), Some("Fabro"));
+        assert_eq!(info.server_info.version, FABRO_VERSION);
+    }
 
     #[test]
     fn fabro_run_pair_tool_is_registered_with_stage_based_schema() {

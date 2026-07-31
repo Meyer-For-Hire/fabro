@@ -1,4 +1,5 @@
 mod config;
+mod executable_monitor;
 mod manifest_builder;
 mod server;
 
@@ -10,7 +11,7 @@ use std::sync::Arc;
 use anyhow::Result;
 pub use config::{config_json, init_agent};
 use fabro_client::Client;
-pub use server::start;
+pub use server::{McpServerExit, start};
 
 pub type FabroClientFuture = Pin<Box<dyn Future<Output = Result<Client>> + Send>>;
 

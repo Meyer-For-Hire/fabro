@@ -8,16 +8,20 @@
 )]
 
 use std::collections::HashMap;
+#[cfg(unix)]
+use std::fs;
 use std::io::{BufRead as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use fabro_client::{AuthEntry, AuthStore, DevTokenEntry, OAuthEntry, StoredSubject};
 use fabro_mcp::client::McpClient;
 use fabro_mcp::config::{McpServerSettings, McpTransport};
 use fabro_test::{fabro_json_snapshot, fabro_snapshot, test_context};
-use fabro_types::RunId;
+use fabro_types::{Graph, RunId, WorkflowSettings, test_support};
 use httpmock::Method::{GET, POST};
 use httpmock::MockServer;
 
@@ -515,7 +519,7 @@ async fn stdio_server_initializes_and_lists_run_tools() {
 fn stdio_start_writes_only_json_rpc_to_stdout() {
     let context = test_context!();
     let fixture = mcp_stdio_fixture(&context, &[]);
-    let mut cmd = std::process::Command::new(&fixture.command[0]);
+    let mut cmd = Command::new(&fixture.command[0]);
     cmd.args(&fixture.command[1..])
         .env_clear()
         .envs(&fixture.env)
@@ -534,31 +538,96 @@ fn stdio_start_writes_only_json_rpc_to_stdout() {
 
     let stdout = child.stdout.take().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
+    thread::spawn(move || {
         let mut line = String::new();
         let result = std::io::BufReader::new(stdout).read_line(&mut line);
         let _ = tx.send(result.map(|_| line));
     });
 
     let line = rx
-        .recv_timeout(std::time::Duration::from_secs(5))
+        .recv_timeout(Duration::from_secs(5))
         .expect("initialize response should arrive")
         .expect("stdout should be readable");
     let value: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
     assert_eq!(value["jsonrpc"], "2.0");
+    assert_eq!(value["result"]["serverInfo"]["name"], "fabro");
+    assert_eq!(
+        value["result"]["serverInfo"]["version"],
+        env!("CARGO_PKG_VERSION")
+    );
 
     let _ = child.kill();
     let _ = child.wait();
 }
 
+#[cfg(unix)]
+#[test]
+fn stdio_server_exits_when_executable_is_replaced() {
+    let context = test_context!();
+    let fixture = mcp_stdio_fixture(&context, &[]);
+    let directory = tempfile::tempdir().expect("replacement directory should exist");
+    let executable = directory.path().join("fabro");
+    fs::copy(&fixture.command[0], &executable).expect("Fabro executable should be copied");
+    let mut cmd = Command::new(&executable);
+    cmd.args(&fixture.command[1..])
+        .env_clear()
+        .envs(&fixture.env)
+        .current_dir(&fixture.current_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().expect("MCP server should start");
+    let mut stdin = child.stdin.take().expect("MCP stdin should be available");
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2025-06-18","capabilities":{{}},"clientInfo":{{"name":"fabro-test","version":"0.0.0"}}}}}}"#
+    )
+    .expect("initialize request should be written");
+
+    let stdout = child.stdout.take().expect("MCP stdout should be available");
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let mut line = String::new();
+        let result = std::io::BufReader::new(stdout).read_line(&mut line);
+        let _ = tx.send(result.map(|_| line));
+    });
+    let response = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("initialize response should arrive")
+        .expect("MCP stdout should be readable");
+    let response: serde_json::Value = serde_json::from_str(response.trim()).unwrap();
+    assert_eq!(response["result"]["serverInfo"]["name"], "fabro");
+
+    // Keep stdin open so replacement, rather than EOF, stops the server.
+    let replacement = directory.path().join("fabro-replacement");
+    fs::write(&replacement, b"replacement").expect("replacement file should be written");
+    fs::rename(replacement, &executable).expect("Fabro executable should be replaced");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("MCP server should be polled") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("MCP server did not exit after its executable was replaced");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+
+    assert!(status.success(), "MCP server should exit successfully");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn stdio_startup_and_list_tools_is_fast() {
     let context = test_context!();
-    let start = std::time::Instant::now();
+    let start = Instant::now();
     let client = spawn_mcp_client(&context, &[]).await;
     let tools = client.list_tools().await.unwrap();
     assert_eq!(tools.len(), MCP_RUN_TOOL_NAMES.len());
-    assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    assert!(start.elapsed() < Duration::from_secs(2));
     client
         .shutdown()
         .await
@@ -1602,12 +1671,21 @@ async fn mcp_get_resolves_selector_and_returns_summary_projection_and_questions(
     let projection = server.mock(|when, then| {
         when.method(GET)
             .path(format!("/api/v1/runs/{run_id}/state"));
+        let mut body = run_projection_json(&run_id, &serde_json::json!({ "kind": "running" }));
+        body["spec"]["settings"]["run"]["model"] = serde_json::json!({
+            "provider": "openai",
+            "name": "gpt-5.6-sol",
+            "fallbacks": {
+                "gpt-5.6-sol": ["gpt-5.6-terra"]
+            },
+            "controls": {
+                "reasoning_effort": null,
+                "speed": null
+            }
+        });
         then.status(200)
             .header("Content-Type", "application/json")
-            .json_body(run_projection_json(
-                &run_id,
-                &serde_json::json!({ "kind": "running" }),
-            ));
+            .json_body(body);
     });
     let questions = server.mock(|when, then| {
         when.method(GET)
@@ -1644,6 +1722,10 @@ async fn mcp_get_resolves_selector_and_returns_summary_projection_and_questions(
     assert_eq!(get["summary"]["workflow_name"], "Simple");
     assert_eq!(get["summary"]["workflow_slug"], "simple");
     assert_eq!(get["projection"]["status"]["kind"], "running");
+    assert_eq!(
+        get["projection"]["spec"]["settings"]["run"]["model"]["fallbacks"]["gpt-5.6-sol"][0],
+        "gpt-5.6-terra"
+    );
     assert_eq!(get["questions"][0]["id"], "q-1");
     resolve.assert();
     retrieve.assert();
@@ -1995,6 +2077,82 @@ async fn mcp_events_filters_find_matches_beyond_first_page() {
     assert_eq!(filtered["events"][0]["truncated"], true);
     resolve.assert_calls(2);
     list_events.assert_calls(2);
+    client
+        .shutdown()
+        .await
+        .expect("MCP client should shut down");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_events_decodes_run_created_with_model_keyed_fallbacks() {
+    let context = test_context!();
+    let server = MockServer::start();
+    let target_url = format!("{}/api/v1", server.base_url());
+    let target: fabro_client::ServerTarget = target_url.parse().unwrap();
+    seed_dev_token_auth(&context.home_dir, &target, TEST_DEV_TOKEN);
+    let run_id = unique_run_id();
+    let resolve = mock_resolved_run(&server, "nightly", &run_id);
+    let mut settings = serde_json::to_value(WorkflowSettings::default())
+        .expect("workflow settings should serialize");
+    settings["run"]["model"] = serde_json::json!({
+        "provider": "openai",
+        "name": "gpt-5.6-sol",
+        "fallbacks": {
+            "gpt-5.6-sol": ["gpt-5.6-terra"]
+        },
+        "controls": {
+            "reasoning_effort": null,
+            "speed": null
+        }
+    });
+    let event = serde_json::json!({
+        "seq": 1,
+        "id": "evt-created",
+        "ts": "2026-04-05T12:00:00Z",
+        "run_id": run_id,
+        "event": "run.created",
+        "properties": {
+            "settings": settings,
+            "graph": Graph::new("Remote Workflow"),
+            "labels": {},
+            "run_dir": "/tmp/run",
+            "source_directory": "/srv/repo",
+            "provenance": test_support::test_run_provenance()
+        },
+        "actor": null
+    });
+    let events = server.mock(|when, then| {
+        when.method(GET)
+            .path(format!("/api/v1/runs/{run_id}/events"))
+            .query_param_missing("limit");
+        then.status(200)
+            .header("Content-Type", "application/json")
+            .json_body(serde_json::json!({
+                "data": [event],
+                "meta": { "has_more": false }
+            }));
+    });
+    let client = spawn_mcp_client(&context, &["--server", &target_url]).await;
+
+    let result = call_tool_json(
+        &client,
+        "fabro_run_events",
+        serde_json::json!({
+            "run_id": "nightly",
+            "action": "search",
+            "query": "gpt-5.6-terra",
+            "first": 1
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        result["events"][0]["event"]["properties"]["settings"]["run"]["model"]["fallbacks"]["gpt-5.6-sol"]
+            [0],
+        "gpt-5.6-terra"
+    );
+    resolve.assert();
+    events.assert();
     client
         .shutdown()
         .await

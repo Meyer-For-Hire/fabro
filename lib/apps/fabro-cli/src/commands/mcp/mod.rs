@@ -1,6 +1,8 @@
 use std::fmt::Write as _;
+use std::process;
 
 use anyhow::{Context as _, Result};
+use fabro_mcp_server::McpServerExit;
 
 use crate::args::{McpAgent, McpCommand, McpNamespace, ServerConnectionArgs};
 use crate::command_context::CommandContext;
@@ -9,7 +11,15 @@ use crate::server_client;
 pub(crate) async fn dispatch(ns: McpNamespace, base_ctx: &CommandContext) -> Result<()> {
     match ns.command {
         McpCommand::Start(args) => {
-            fabro_mcp_server::start(server_settings(base_ctx, &args.connection)?).await
+            let exit =
+                fabro_mcp_server::start(server_settings(base_ctx, &args.connection)?).await?;
+            if exit == McpServerExit::ExecutableReplaced {
+                // Tokio's stdin worker can remain blocked after the MCP service
+                // closes. Exit at the CLI boundary so the host can reconnect to
+                // the replacement executable.
+                process::exit(0);
+            }
+            Ok(())
         }
         McpCommand::Config(args) => {
             let json = fabro_mcp_server::config_json(&config_settings(&args.connection))?;
