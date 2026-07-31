@@ -151,7 +151,7 @@ For a qualified fallback, the selector may be that provider's canonical model ID
 ```toml title="run.toml"
 [run.model.fallbacks]
 "kimi-k3" = [
-  "kimi:kimi-k3",
+  "moonshot:kimi-k3",
   "openrouter:kimi-k3",
   "claude-opus",
 ]
@@ -169,7 +169,7 @@ For example, a server that selects Modal as the primary `kimi-k3` offering can d
 
 ```toml title="settings.toml"
 [run.model.fallbacks]
-"kimi-k3" = ["kimi:kimi-k3", "openrouter:kimi-k3", "claude-opus"]
+"kimi-k3" = ["moonshot:kimi-k3", "openrouter:kimi-k3", "claude-opus"]
 "glm-5.2" = ["gpt-sol"]
 "gpt-sol" = ["claude-opus"]
 "claude-opus" = ["gpt-sol"]

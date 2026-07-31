@@ -386,7 +386,7 @@ mod tests {
             ProviderId::anthropic(),
             ProviderId::openai(),
             ProviderId::gemini(),
-            ProviderId::new("kimi"),
+            ProviderId::new("moonshot"),
             ProviderId::new("zai"),
             ProviderId::new("minimax"),
             ProviderId::new("inception"),

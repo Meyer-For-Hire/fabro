@@ -474,7 +474,7 @@ enabled = true
         let eligible = [ProviderId::new("openrouter")];
         let configured = BTreeMap::from([(
             "kimi-k3".to_string(),
-            references(&["kimi:kimi-k3", "openrouter:kimi-k3"]),
+            references(&["moonshot:kimi-k3", "openrouter:kimi-k3"]),
         )]);
 
         let resolved = resolve_model_fallbacks(&catalog, &eligible, &configured).unwrap();
@@ -491,7 +491,7 @@ enabled = true
                 requested_model,
                 provider,
                 ..
-            }] if requested_model == "kimi-k3" && provider == &ProviderId::new("kimi")
+            }] if requested_model == "kimi-k3" && provider == &ProviderId::new("moonshot")
         ));
     }
 
@@ -512,13 +512,13 @@ enabled = true
         };
         let eligible = [
             ProviderId::new("modal"),
-            ProviderId::new("kimi"),
+            ProviderId::new("moonshot"),
             ProviderId::new("openrouter"),
         ];
         let configured = BTreeMap::from([
             (
                 "kimi-k3".to_string(),
-                references(&["kimi:kimi-k3", "openrouter:kimi-k3", "claude-opus"]),
+                references(&["moonshot:kimi-k3", "openrouter:kimi-k3", "claude-opus"]),
             ),
             ("glm-5.2".to_string(), references(&["gpt-sol"])),
             ("gpt-sol".to_string(), references(&["claude-opus"])),
@@ -541,7 +541,7 @@ enabled = true
                 .expect("requested model should have a chain")
         };
         assert_eq!(chain("kimi-k3"), [
-            FallbackTarget::new("kimi", "kimi-k3"),
+            FallbackTarget::new("moonshot", "kimi-k3"),
             FallbackTarget::new("openrouter", "kimi-k3"),
             FallbackTarget::new("openrouter", "claude-opus-5"),
         ]);

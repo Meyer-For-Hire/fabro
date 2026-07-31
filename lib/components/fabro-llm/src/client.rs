@@ -1529,13 +1529,16 @@ base_url = "{}/v1"
         let mut client = Client::new(HashMap::new(), None, vec![]);
         client.catalog = Some(Arc::clone(&catalog));
         client
-            .register_provider(Arc::new(MockProvider::new("kimi", "should not dispatch")))
+            .register_provider(Arc::new(MockProvider::new(
+                "moonshot",
+                "should not dispatch",
+            )))
             .await
             .unwrap();
 
         let mut request = test_request();
         request.model = "kimi-k2.5".to_string();
-        request.provider = Some("kimi".to_string());
+        request.provider = Some("moonshot".to_string());
         request.reasoning_effort = Some(ReasoningEffort::High);
 
         let err = client.complete(&request).await.unwrap_err();
@@ -1554,13 +1557,13 @@ base_url = "{}/v1"
         let mut client = Client::new(HashMap::new(), None, vec![]);
         client.catalog = Some(Arc::clone(&catalog));
         client
-            .register_provider(Arc::new(MockProvider::new("kimi", "accepted")))
+            .register_provider(Arc::new(MockProvider::new("moonshot", "accepted")))
             .await
             .unwrap();
 
         let mut request = test_request();
         request.model = "kimi-k3".to_string();
-        request.provider = Some("kimi".to_string());
+        request.provider = Some("moonshot".to_string());
         request.reasoning_effort = Some(ReasoningEffort::High);
 
         let response = client.complete(&request).await.unwrap();
@@ -1724,7 +1727,7 @@ base_url = "{}/v1"
         let catalog = catalog_with("");
         let client = Client::from_credentials(
             vec![ApiCredential {
-                provider:      ProviderId::new("kimi"),
+                provider:      ProviderId::new("moonshot"),
                 auth_header:   Some(ApiKeyHeader::Bearer("kimi-key".to_string())),
                 extra_headers: HashMap::new(),
                 base_url:      None,
@@ -1737,8 +1740,8 @@ base_url = "{}/v1"
         .await
         .unwrap();
 
-        assert_eq!(client.provider_names(), vec!["kimi"]);
-        assert_eq!(client.default_provider(), Some("kimi"));
+        assert_eq!(client.provider_names(), vec!["moonshot"]);
+        assert_eq!(client.default_provider(), Some("moonshot"));
     }
 
     #[tokio::test]

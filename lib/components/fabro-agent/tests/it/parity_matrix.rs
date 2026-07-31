@@ -31,7 +31,7 @@ struct OpenAiTwinOptions {
 
 fn summarizer_model_id(provider: &Provider) -> ModelHandle {
     match provider.as_str() {
-        ProviderId::OPENAI | "kimi" | "zai" | "minimax" | "inception" => ModelHandle::ByName {
+        ProviderId::OPENAI | "moonshot" | "zai" | "minimax" | "inception" => ModelHandle::ByName {
             provider: ProviderId::openai(),
             model:    "gpt-5.4-mini".to_string(),
         },
@@ -279,7 +279,7 @@ macro_rules! provider_tests {
         );
         provider_test!(
             $scenario,
-            ProviderId::new("kimi"),
+            ProviderId::new("moonshot"),
             "kimi-k2.5",
             kimi,
             keys = ["KIMI_API_KEY"]
@@ -413,7 +413,7 @@ provider_test!(
 );
 provider_test!(
     web_fetch,
-    ProviderId::new("kimi"),
+    ProviderId::new("moonshot"),
     "kimi-k2.5",
     kimi,
     keys = ["KIMI_API_KEY", "OPENAI_API_KEY"]
@@ -461,7 +461,7 @@ web_search_provider_test!(
     keys = ["GEMINI_API_KEY", "BRAVE_SEARCH_API_KEY"]
 );
 web_search_provider_test!(
-    ProviderId::new("kimi"),
+    ProviderId::new("moonshot"),
     "kimi-k2.5",
     kimi,
     keys = ["KIMI_API_KEY", "BRAVE_SEARCH_API_KEY"]
@@ -518,7 +518,7 @@ macro_rules! non_openai_provider_tests {
         );
         provider_test!(
             $scenario,
-            ProviderId::new("kimi"),
+            ProviderId::new("moonshot"),
             "kimi-k2.5",
             kimi,
             keys = ["KIMI_API_KEY"]
@@ -800,7 +800,7 @@ reasoning_effort_tests!(
     keys = ["GEMINI_API_KEY"]
 );
 reasoning_effort_tests!(
-    ProviderId::new("kimi"),
+    ProviderId::new("moonshot"),
     "kimi-k2.5",
     kimi_reasoning_effort,
     keys = ["KIMI_API_KEY"]
@@ -882,7 +882,7 @@ loop_detection_tests!(
     keys = ["GEMINI_API_KEY"]
 );
 loop_detection_tests!(
-    ProviderId::new("kimi"),
+    ProviderId::new("moonshot"),
     "kimi-k2.5",
     kimi_loop_detection,
     keys = ["KIMI_API_KEY"]

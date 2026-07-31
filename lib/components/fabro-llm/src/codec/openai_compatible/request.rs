@@ -110,7 +110,7 @@ fn apply_cache_breakpoints(messages: &mut [ChatMessage]) {
 /// Merge `provider_options.<provider_name>` fields into the serialized API
 /// request body.
 ///
-/// The provider name is configurable (e.g. "groq", "together", "kimi"),
+/// The provider name is configurable (e.g. "groq", "together", "moonshot"),
 /// allowing each instance to have its own namespace in `provider_options`.
 pub(super) fn merge_provider_options(
     body: &mut serde_json::Value,
@@ -221,7 +221,7 @@ mod tests {
         let mut request = minimal_request();
         request.reasoning_effort = Some(ReasoningEffort::High);
 
-        let body = encode_body(&request, "kimi", false);
+        let body = encode_body(&request, "moonshot", false);
 
         assert_eq!(body["reasoning_effort"], "high");
     }
@@ -229,7 +229,7 @@ mod tests {
     #[test]
     fn encode_omits_sampling_params_for_models_that_reject_them() {
         let model = Catalog::builtin()
-            .get_on_provider(&ProviderId::new("kimi"), "kimi-k3")
+            .get_on_provider(&ProviderId::new("moonshot"), "kimi-k3")
             .unwrap();
         let mut request = minimal_request();
         request.model = model.id.to_string();
@@ -238,7 +238,7 @@ mod tests {
         let params = CodecParams::default();
         let ctx = CodecCtx {
             request:       &request,
-            provider_name: "kimi",
+            provider_name: "moonshot",
             deployment_id: model.id.as_str(),
             model:         Some(model),
             params:        &params,
@@ -262,7 +262,7 @@ mod tests {
         let deployment_id = request.model.clone();
         let ctx = CodecCtx {
             request:       &request,
-            provider_name: "kimi",
+            provider_name: "moonshot",
             deployment_id: &deployment_id,
             model:         None,
             params:        &params,

@@ -3695,8 +3695,8 @@ enabled = true
     }
 
     #[test]
-    fn builtin_kimi_k3_selection_prefers_modal_then_direct_kimi_over_openrouter() {
-        let kimi = ProviderId::new("kimi");
+    fn builtin_kimi_k3_selection_prefers_modal_then_moonshot_over_openrouter() {
+        let moonshot = ProviderId::new("moonshot");
         let modal = ProviderId::new("modal");
         let openrouter = ProviderId::new("openrouter");
         let catalog = Catalog::from_builtin_with_overrides(&minimal_settings(
@@ -3714,7 +3714,7 @@ enabled = true
             .select(
                 "kimi-k3",
                 None,
-                &HashSet::from([kimi.clone(), modal.clone(), openrouter.clone()]),
+                &HashSet::from([moonshot.clone(), modal.clone(), openrouter.clone()]),
             )
             .expect("Modal should win portable Kimi K3 selection");
         assert_eq!(selected.provider, modal);
@@ -3723,10 +3723,10 @@ enabled = true
             .select(
                 "kimi-k3",
                 None,
-                &HashSet::from([kimi.clone(), openrouter.clone()]),
+                &HashSet::from([moonshot.clone(), openrouter.clone()]),
             )
-            .expect("direct Kimi should win when Modal is unavailable");
-        assert_eq!(selected.provider, kimi);
+            .expect("Moonshot should win when Modal is unavailable");
+        assert_eq!(selected.provider, moonshot);
 
         let selected = catalog
             .select("kimi-k3", None, &HashSet::from([modal.clone(), openrouter]))
@@ -4214,7 +4214,7 @@ enabled = true
         );
         assert_eq!(
             catalog
-                .provider(&ProviderId::new("kimi"))
+                .provider(&ProviderId::new("moonshot"))
                 .unwrap()
                 .base_url
                 .as_deref(),
@@ -4273,7 +4273,7 @@ enabled = true
             ("anthropic", CodecKind::AnthropicMessages),
             ("openai", CodecKind::OpenAiResponses),
             ("gemini", CodecKind::GeminiGenerate),
-            ("kimi", CodecKind::OpenAiCompatible),
+            ("moonshot", CodecKind::OpenAiCompatible),
         ] {
             let provider_id = ProviderId::new(provider);
             assert_eq!(catalog.provider(&provider_id).unwrap().codec, expected);
@@ -6729,7 +6729,7 @@ sampling_params = false
         insta::assert_debug_snapshot!(m, @r#"
         Model {
             id: "kimi-k2.5",
-            provider: kimi,
+            provider: moonshot,
             family: "kimi-k2",
             display_name: "Kimi K2.5",
             limits: ModelLimits {
@@ -6785,7 +6785,7 @@ sampling_params = false
         insta::assert_debug_snapshot!(m, @r#"
         Model {
             id: "kimi-k3",
-            provider: kimi,
+            provider: moonshot,
             family: "kimi-k3",
             display_name: "Kimi K3",
             limits: ModelLimits {
@@ -7136,11 +7136,11 @@ context_window = 1050000
     }
 
     #[test]
-    fn closest_model_haiku_to_kimi() {
+    fn closest_model_haiku_to_moonshot() {
         let haiku = Catalog::builtin().get("claude-haiku-4-5").unwrap();
         assert!(
             Catalog::builtin()
-                .closest(&ProviderId::new("kimi"), haiku)
+                .closest(&ProviderId::new("moonshot"), haiku)
                 .is_none()
         );
     }

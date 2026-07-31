@@ -548,7 +548,7 @@ mod tests {
         let options = native_tool_options(AgentProfileKind::OpenAi, has_web_search);
         let deps = ProfileDeps::standalone(options);
         OpenAiProfile::with_native_tools("kimi-k2.5", &deps).with_route(
-            ProviderId::new("kimi"),
+            ProviderId::new("moonshot"),
             Arc::new(Catalog::from_builtin().unwrap()),
         )
     }

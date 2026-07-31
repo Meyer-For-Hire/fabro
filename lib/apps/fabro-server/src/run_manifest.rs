@@ -1625,7 +1625,7 @@ enabled = true
         let mut checks = Vec::new();
         let configured = std::collections::BTreeMap::from([(
             "kimi-k3".to_string(),
-            model_refs(&["kimi:kimi-k3", "openrouter:kimi-k3"]),
+            model_refs(&["moonshot:kimi-k3", "openrouter:kimi-k3"]),
         )]);
 
         assert!(run_model_fallback_check(
@@ -1637,13 +1637,12 @@ enabled = true
 
         let check = checks.last().expect("fallback check should be present");
         assert_eq!(check.status, CheckStatus::Warning);
-        assert!(
-            check
-                .details
-                .iter()
-                .any(|detail| detail.warn
-                    && detail.text.contains("provider `kimi` is not configured"))
-        );
+        assert!(check.details.iter().any(|detail| {
+            detail.warn
+                && detail
+                    .text
+                    .contains("provider `moonshot` is not configured")
+        }));
     }
 
     #[test]
@@ -1686,15 +1685,15 @@ enabled = true
         })
     }
 
-    fn ready_kimi_and_openrouter_state(
+    fn ready_moonshot_and_openrouter_state(
         server: &httpmock::MockServer,
     ) -> Arc<crate::server::AppState> {
-        let kimi_url = server.url("/kimi/v1");
+        let moonshot_url = server.url("/moonshot/v1");
         let openrouter_url = server.url("/openrouter/v1");
         let llm_catalog_settings: LlmCatalogSettings = toml::from_str(&format!(
             r#"
-[providers.kimi]
-base_url = "{kimi_url}"
+[providers.moonshot]
+base_url = "{moonshot_url}"
 
 [providers.openrouter]
 base_url = "{openrouter_url}"
@@ -1706,7 +1705,7 @@ enabled = true
         crate::test_support::TestAppStateBuilder::new()
             .llm_catalog_settings(llm_catalog_settings)
             .vault_entries([
-                (EnvVars::KIMI_API_KEY, "test-kimi-key"),
+                (EnvVars::KIMI_API_KEY, "test-moonshot-key"),
                 (EnvVars::OPENROUTER_API_KEY, "test-openrouter-key"),
             ])
             .build()
@@ -1723,7 +1722,7 @@ enabled = true
             .unwrap_or_default();
         ready_providers.sort();
         assert_eq!(ready_providers, vec![
-            ProviderId::new("kimi"),
+            ProviderId::new("moonshot"),
             ProviderId::new("openrouter")
         ]);
 
@@ -2748,7 +2747,7 @@ digraph Demo {
                     .json_body(openai_compatible_completion("anthropic/claude-fable-5"));
             })
             .await;
-        let state = ready_kimi_and_openrouter_state(&server);
+        let state = ready_moonshot_and_openrouter_state(&server);
 
         let (response, _ok) = preflight_for_model(&state, "claude-fable").await;
 
@@ -2772,18 +2771,18 @@ digraph Demo {
     #[tokio::test]
     async fn preflight_uses_ready_providers_for_unknown_unqualified_model() {
         let server = httpmock::MockServer::start_async().await;
-        let kimi_probe = server
+        let moonshot_probe = server
             .mock_async(|when, then| {
                 when.method(httpmock::Method::POST)
-                    .path("/kimi/v1/chat/completions")
-                    .header("authorization", "Bearer test-kimi-key")
+                    .path("/moonshot/v1/chat/completions")
+                    .header("authorization", "Bearer test-moonshot-key")
                     .json_body_includes(r#"{"model":"provider-private-preview"}"#);
                 then.status(200)
                     .header("content-type", "application/json")
                     .json_body(openai_compatible_completion("provider-private-preview"));
             })
             .await;
-        let state = ready_kimi_and_openrouter_state(&server);
+        let state = ready_moonshot_and_openrouter_state(&server);
 
         let (response, _ok) = preflight_for_model(&state, "provider-private-preview").await;
 
@@ -2802,10 +2801,10 @@ digraph Demo {
                 .iter()
                 .map(|detail| detail.text.as_str())
                 .find(|detail| detail.starts_with("Provider: ")),
-            Some("Provider: kimi")
+            Some("Provider: moonshot")
         );
         assert_eq!(llm_check.status, types::PreflightCheckResultStatus::Pass);
-        kimi_probe.assert_async().await;
+        moonshot_probe.assert_async().await;
     }
 
     #[test]

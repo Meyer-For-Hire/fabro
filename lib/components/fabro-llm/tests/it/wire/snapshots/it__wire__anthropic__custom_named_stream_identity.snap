@@ -32,7 +32,7 @@ expression: rendered
     "response": {
       "id": "msg_kimi",
       "model": "kimi-test",
-      "provider": "kimi",
+      "provider": "moonshot",
       "message": {
         "role": "assistant",
         "content": [
