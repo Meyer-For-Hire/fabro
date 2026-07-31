@@ -3069,7 +3069,7 @@ enabled = true
 
         let expected = [
             ("deepseek-v4-flash", 0.14, 0.28, 0.0028),
-            ("deepseek-v4-pro", 0.435, 0.87, 0.003625),
+            ("deepseek-v4-pro", 0.435, 0.87, 0.003_625),
         ];
         for (id, input, output, cache_read) in expected {
             let model = catalog
@@ -3230,7 +3230,10 @@ enabled = true
             .expect("DeepSeek V4 Pro should be present on OpenRouter");
         assert_eq!(deepseek_pro.limits.max_output, Some(384_000));
         assert!(deepseek_pro.features.prompt_cache);
-        assert_eq!(deepseek_pro.costs.cache_input_cost_per_mtok, Some(0.003625));
+        assert_eq!(
+            deepseek_pro.costs.cache_input_cost_per_mtok,
+            Some(0.003_625)
+        );
         assert_eq!(
             catalog
                 .default_for_provider(&openrouter)
