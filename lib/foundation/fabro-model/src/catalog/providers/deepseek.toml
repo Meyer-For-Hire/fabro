@@ -18,6 +18,8 @@ credentials = ["env:DEEPSEEK_API_KEY", "vault:DEEPSEEK_API_KEY"]
 display_name = "DeepSeek V4 Flash"
 family = "deepseek-v4"
 aliases = ["deepseek-v4", "deepseek", "deepseek-flash"]
+# DeepSeek uses a general coding prompt and standard JSON function tools.
+agent_profile = "openai"
 default = true
 small_default = true
 probe = true
@@ -46,6 +48,7 @@ cache_input_cost_per_mtok = 0.0028
 [providers.deepseek.models."deepseek-v4-pro"]
 display_name = "DeepSeek V4 Pro"
 family = "deepseek-v4"
+agent_profile = "openai"
 
 [providers.deepseek.models."deepseek-v4-pro".limits]
 context_window = 1048576

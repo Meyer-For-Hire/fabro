@@ -3157,6 +3157,11 @@ enabled = true
             let settings = catalog
                 .model_settings_on_provider(&provider, id)
                 .unwrap_or_else(|| panic!("{provider}/{id} settings should be present"));
+            assert_eq!(
+                settings.agent_profile,
+                AgentProfileKind::OpenAi,
+                "{provider}/{id}"
+            );
             assert!(settings.reasoning_by_default, "{provider}/{id}");
             assert_eq!(
                 settings.controls.reasoning_effort, efforts,

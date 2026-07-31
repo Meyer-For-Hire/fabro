@@ -43,6 +43,12 @@ Fabro sends bearer-authenticated Chat Completions requests to `https://api.deeps
 
 Both models support text input, tool calling, native reasoning, streaming, JSON output, and automatic prompt caching. They do not support image input. Thinking mode is enabled by default.
 
+## Agent profile
+
+DeepSeek V4 uses Fabro's `openai` agent profile on every route. This profile is the closest match for DeepSeek's general coding behavior: it supplies project `AGENTS.md` instructions, standard JSON function tools, and a JSON-compatible file editor on Chat Completions routes. The setting is model-specific, so it remains the same through direct DeepSeek, Fireworks AI, and OpenRouter.
+
+Fabro does not use the `gpt56` profile for DeepSeek. That profile has a smaller Codex-specific tool set for GPT-5.6 models.
+
 ## Use DeepSeek models
 
 ```bash
