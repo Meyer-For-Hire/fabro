@@ -167,7 +167,7 @@ impl RunEventLogger {
                 match command {
                     RunEventCommand::Event(event) => {
                         if let Err(err) = sink.write_run_event(&event).await {
-                            tracing::warn!(error = %err, "Failed to write run event");
+                            tracing::error!(error = %err, "Failed to write run event");
                         }
                     }
                     RunEventCommand::Flush(tx) => {
