@@ -92,6 +92,7 @@ cache_input_cost_per_mtok = 0.145
 api_id = "accounts/fireworks/models/deepseek-v4-flash"
 display_name = "DeepSeek V4 Flash"
 family = "deepseek-v4"
+aliases = ["deepseek-v4", "deepseek", "deepseek-flash"]
 
 [providers.fireworks.models."deepseek-v4-flash".limits]
 context_window = 1048576

@@ -4025,6 +4025,16 @@ enabled = true
                 assert_eq!(model.id, id, "{provider}/{id}");
                 assert_eq!(model.provider, provider, "{provider}/{id}");
             }
+
+            for alias in ["deepseek", "deepseek-v4", "deepseek-flash"] {
+                let model = catalog
+                    .resolve_on_provider(&provider, alias)
+                    .unwrap_or_else(|error| {
+                        panic!("'{alias}' should resolve on provider '{provider}': {error}")
+                    });
+                assert_eq!(model.id, "deepseek-v4-flash", "{provider}/{alias}");
+                assert_eq!(model.provider, provider, "{provider}/{alias}");
+            }
         }
     }
 
