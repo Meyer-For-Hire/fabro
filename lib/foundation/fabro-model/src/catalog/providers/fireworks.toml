@@ -25,7 +25,7 @@ credentials = ["env:FIREWORKS_API_KEY", "vault:FIREWORKS_API_KEY"]
 # Prompt caching is automatic prefix caching (no cache_control breakpoints);
 # serverless responses report prompt_tokens_details.cached_tokens in the
 # usage body. Costs below are from docs.fireworks.ai/serverless/pricing
-# (standard tier), verified 2026-07-24.
+# (standard tier), verified 2026-07-31.
 
 [providers.fireworks.models."kimi-k2.7-code"]
 api_id = "accounts/fireworks/models/kimi-k2p7-code"
@@ -96,7 +96,7 @@ aliases = ["deepseek-v4", "deepseek", "deepseek-flash"]
 
 [providers.fireworks.models."deepseek-v4-flash".limits]
 context_window = 1048576
-max_output = 16384
+max_output = 384000
 
 [providers.fireworks.models."deepseek-v4-flash".features]
 tools = true

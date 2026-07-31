@@ -373,7 +373,7 @@ async fn openrouter_complete() {
         std::env::var(EnvVars::OPENROUTER_API_KEY).expect("OPENROUTER_API_KEY must be set");
     let adapter = OpenAiCompatibleAdapter::new(api_key, "https://openrouter.ai/api/v1")
         .with_name("openrouter");
-    let request = make_request("deepseek/deepseek-v4-flash");
+    let request = make_request("deepseek/deepseek-v4-flash-0731");
     let response = adapter.complete(&request).await.unwrap();
 
     assert!(

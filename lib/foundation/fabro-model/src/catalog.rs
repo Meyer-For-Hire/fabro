@@ -3071,6 +3071,18 @@ enabled = true
                 .billing_policy,
             BillingPolicy::OpenAi
         );
+        let deepseek = catalog
+            .get_on_provider(&openrouter, "deepseek-v4-flash")
+            .expect("DeepSeek V4 Flash should be present on OpenRouter");
+        assert_eq!(deepseek.limits.max_output, Some(384_000));
+        assert!(deepseek.features.prompt_cache);
+        assert_eq!(deepseek.costs.input_cost_per_mtok, Some(0.14));
+        assert_eq!(deepseek.costs.output_cost_per_mtok, Some(0.28));
+        assert_eq!(deepseek.costs.cache_input_cost_per_mtok, Some(0.0028));
+        assert_eq!(
+            catalog.settings_for(deepseek).unwrap().api_id,
+            "deepseek/deepseek-v4-flash-0731"
+        );
         assert_eq!(
             catalog
                 .default_for_provider(&openrouter)
@@ -3877,7 +3889,7 @@ enabled = true
                 "accounts/fireworks/models/deepseek-v4-flash",
                 "deepseek-v4",
                 1_048_576,
-                16_384,
+                384_000,
                 false,
                 false,
                 0.14,
