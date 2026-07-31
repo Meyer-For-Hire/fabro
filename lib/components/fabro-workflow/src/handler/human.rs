@@ -277,7 +277,7 @@ impl Handler for HumanHandler {
         let interview_guard = services
             .run
             .interview_blocker
-            .block(Arc::clone(&services.run.emitter));
+            .block(Arc::clone(&services.run.emitter), stage_scope.stage_id());
         let interview_start = Instant::now();
         let answer_submission = ask_with_timeout(self.interviewer.as_ref(), question).await;
         let answer_actor = answer_submission.actor.clone();
@@ -1264,6 +1264,8 @@ mod tests {
         let emitter = Arc::new(Emitter::new(fabro_types::fixtures::RUN_1));
         let event_names = Arc::new(Mutex::new(Vec::new()));
         let guards = Arc::new(Mutex::new(Vec::new()));
+        let block_state = blocker.subscribe();
+        let stage_id = fabro_types::StageId::new("gate", 1);
 
         emitter.on_event({
             let event_names = Arc::clone(&event_names);
@@ -1284,11 +1286,17 @@ mod tests {
                 let blocker = Arc::clone(&blocker);
                 let emitter = Arc::clone(&emitter);
                 let guards = Arc::clone(&guards);
+                let stage_id = stage_id.clone();
                 scope.spawn(move || {
-                    guards.lock().unwrap().push(blocker.block(emitter));
+                    guards
+                        .lock()
+                        .unwrap()
+                        .push(blocker.block(emitter, stage_id));
                 });
             }
         });
+        assert!(block_state.borrow().is_run_blocked());
+        assert!(block_state.borrow().is_stage_blocked(&stage_id));
 
         std::thread::scope(|scope| {
             for _ in 0..8 {
@@ -1304,5 +1312,7 @@ mod tests {
             "run.blocked",
             "run.unblocked"
         ],);
+        assert!(!block_state.borrow().is_run_blocked());
+        assert!(!block_state.borrow().is_stage_blocked(&stage_id));
     }
 }

@@ -28,9 +28,10 @@ use object_store::memory::InMemory;
 use super::*;
 use crate::context::{self, Context};
 use crate::error::Error;
-use crate::event::{Emitter, Event, StoreProgressLogger, append_event};
+use crate::event::{Emitter, Event, StageScope, StoreProgressLogger, append_event};
 use crate::handler::start::StartHandler;
 use crate::handler::{Handler as HandlerTrait, HandlerRegistry};
+use crate::interview_runtime::RunInterviewBlocker;
 use crate::model_fallback::ModelFallbackPolicy;
 use crate::outcome::{Outcome, OutcomeExt, StageOutcome};
 use crate::pipeline::initialize;
@@ -648,6 +649,59 @@ impl HandlerTrait for SlowHandler {
         tokio::time::sleep(Duration::from_millis(self.sleep_ms)).await;
         Ok(Outcome::success())
     }
+}
+
+struct InterviewWaitHandler {
+    wait_ms:   u64,
+    active_ms: u64,
+}
+
+#[async_trait]
+impl HandlerTrait for InterviewWaitHandler {
+    async fn execute(
+        &self,
+        node: &Node,
+        context: &Context,
+        _graph: &Graph,
+        _run_dir: &Path,
+        services: &crate::handler::EngineServices,
+    ) -> std::result::Result<Outcome, Error> {
+        let stage_id = StageScope::for_handler(context, &node.id).stage_id();
+        let guard = services
+            .run
+            .interview_blocker
+            .block(Arc::clone(&services.run.emitter), stage_id);
+        tokio::time::sleep(Duration::from_millis(self.wait_ms)).await;
+        guard.resolve();
+        tokio::time::sleep(Duration::from_millis(self.active_ms)).await;
+        Ok(Outcome::success())
+    }
+}
+
+fn interview_wait_graph(stall_timeout: Duration, node_timeout: Option<Duration>) -> Graph {
+    let mut graph = simple_graph();
+    graph.attrs.insert(
+        "stall_timeout".to_string(),
+        AttrValue::Duration(stall_timeout),
+    );
+    graph
+        .attrs
+        .insert("default_max_retries".to_string(), AttrValue::Integer(0));
+
+    let mut work = Node::new("work");
+    work.attrs.insert(
+        "type".to_string(),
+        AttrValue::String("interview_wait".to_string()),
+    );
+    if let Some(timeout) = node_timeout {
+        work.attrs
+            .insert("timeout".to_string(), AttrValue::Duration(timeout));
+    }
+    graph.nodes.insert("work".to_string(), work);
+    graph.edges.clear();
+    graph.edges.push(Edge::new("start", "work"));
+    graph.edges.push(Edge::new("work", "exit"));
+    graph
 }
 
 struct StopsSandboxHandler {
@@ -1369,6 +1423,90 @@ async fn stall_watchdog_triggers_on_hung_handler() {
     .await;
     let err = result.unwrap_err().to_string();
     assert!(err.contains("stall watchdog"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn stall_watchdog_starts_a_fresh_deadline_after_human_input() {
+    let emitter = Arc::new(Emitter::default());
+    let blocker = Arc::new(RunInterviewBlocker::new());
+    let stall_token = CancellationToken::new();
+    let shutdown = CancellationToken::new();
+    let watchdog = tokio::spawn(monitor_for_stall(
+        Duration::from_millis(50),
+        stall_token.clone(),
+        shutdown.clone(),
+        emitter.subscribe_activity(),
+        blocker.subscribe(),
+    ));
+    tokio::task::yield_now().await;
+
+    let guard = blocker.block(Arc::clone(&emitter), fabro_types::StageId::new("work", 1));
+    tokio::time::advance(Duration::from_millis(200)).await;
+    assert!(!stall_token.is_cancelled());
+
+    guard.resolve();
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(49)).await;
+    assert!(!stall_token.is_cancelled());
+
+    tokio::time::advance(Duration::from_millis(2)).await;
+    tokio::task::yield_now().await;
+    assert!(stall_token.is_cancelled());
+
+    shutdown.cancel();
+    watchdog.await.unwrap();
+}
+
+#[tokio::test]
+async fn stall_watchdog_suspends_while_run_waits_for_human_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let graph = interview_wait_graph(Duration::from_millis(50), None);
+    let mut registry = make_registry();
+    registry.register(
+        "interview_wait",
+        Box::new(InterviewWaitHandler {
+            wait_ms:   150,
+            active_ms: 10,
+        }),
+    );
+
+    let outcome = run_graph(
+        registry,
+        test_emitter_arc("test-run"),
+        local_env(),
+        &graph,
+        &test_run_options(dir.path(), "test-run"),
+    )
+    .await
+    .expect("human input wait should not trigger the stall watchdog");
+
+    assert_eq!(outcome.status, StageOutcome::Succeeded);
+}
+
+#[tokio::test]
+async fn node_timeout_excludes_human_input_wait() {
+    let dir = tempfile::tempdir().unwrap();
+    let graph = interview_wait_graph(Duration::ZERO, Some(Duration::from_millis(50)));
+    let mut registry = make_registry();
+    registry.register(
+        "interview_wait",
+        Box::new(InterviewWaitHandler {
+            wait_ms:   150,
+            active_ms: 20,
+        }),
+    );
+
+    let outcome = run_graph(
+        registry,
+        test_emitter_arc("test-run"),
+        local_env(),
+        &graph,
+        &test_run_options(dir.path(), "test-run"),
+    )
+    .await
+    .expect("human input wait should not consume the node timeout");
+
+    assert_eq!(outcome.status, StageOutcome::Succeeded);
 }
 
 #[tokio::test]

@@ -1,5 +1,5 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -7,31 +7,95 @@ use fabro_agent::{
     AgentQuestion, AgentQuestionAnswer, AgentQuestionAnswerStatus, AgentQuestionRuntime,
 };
 use fabro_interview::{Answer, AnswerSubmission, AnswerValue, Interviewer, Question};
-use fabro_types::{BlockedReason, InterviewOption, Principal, SystemActorKind};
+use fabro_types::{BlockedReason, InterviewOption, Principal, StageId, SystemActorKind};
 use futures::future;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
 use crate::event::{Emitter, Event, StageScope};
 use crate::millis_u64;
 
-/// Run-scoped refcount for unresolved human input. Emits `run.blocked` on the
+#[derive(Debug, Default)]
+pub(crate) struct InterviewBlockState {
+    unresolved_interviews: usize,
+    blocked_stages:        HashMap<StageId, usize>,
+}
+
+impl InterviewBlockState {
+    pub(crate) fn is_run_blocked(&self) -> bool {
+        self.unresolved_interviews > 0
+    }
+
+    pub(crate) fn is_stage_blocked(&self, stage_id: &StageId) -> bool {
+        self.blocked_stages.contains_key(stage_id)
+    }
+
+    fn block(&mut self, stage_id: StageId) {
+        self.unresolved_interviews = self
+            .unresolved_interviews
+            .checked_add(1)
+            .expect("unresolved interview count should not overflow");
+        let stage_count = self.blocked_stages.entry(stage_id).or_default();
+        *stage_count = stage_count
+            .checked_add(1)
+            .expect("stage interview count should not overflow");
+    }
+
+    fn resolve(&mut self, stage_id: &StageId) {
+        self.unresolved_interviews = self
+            .unresolved_interviews
+            .checked_sub(1)
+            .expect("an interview guard should resolve only once");
+        let stage_count = self
+            .blocked_stages
+            .get_mut(stage_id)
+            .expect("a guarded stage should remain registered until resolution");
+        *stage_count = stage_count
+            .checked_sub(1)
+            .expect("a stage interview guard should resolve only once");
+        if *stage_count == 0 {
+            self.blocked_stages.remove(stage_id);
+        }
+    }
+}
+
+/// Run-scoped state for unresolved human input. Emits `run.blocked` on the
 /// first unresolved human/agent interview and `run.unblocked` after the last
-/// one resolves.
+/// one resolves. Subscribers use the same state to suspend run and stage
+/// timeout budgets without deriving runtime control from persisted events.
 pub(crate) struct RunInterviewBlocker {
-    unresolved_interviews: AtomicUsize,
+    state:       watch::Sender<InterviewBlockState>,
+    transitions: Mutex<()>,
 }
 
 impl RunInterviewBlocker {
     #[must_use]
     pub(crate) fn new() -> Self {
+        let (state, _) = watch::channel(InterviewBlockState::default());
         Self {
-            unresolved_interviews: AtomicUsize::new(0),
+            state,
+            transitions: Mutex::new(()),
         }
     }
 
-    pub(crate) fn block(self: &Arc<Self>, emitter: Arc<Emitter>) -> RunInterviewGuard {
-        if self.unresolved_interviews.fetch_add(1, Ordering::AcqRel) == 0 {
+    pub(crate) fn subscribe(&self) -> watch::Receiver<InterviewBlockState> {
+        self.state.subscribe()
+    }
+
+    pub(crate) fn block(
+        self: &Arc<Self>,
+        emitter: Arc<Emitter>,
+        stage_id: StageId,
+    ) -> RunInterviewGuard {
+        let _transition = self
+            .transitions
+            .lock()
+            .expect("interview transition mutex should not be poisoned");
+        let should_emit_blocked = !self.state.borrow().is_run_blocked();
+        self.state
+            .send_modify(|state| state.block(stage_id.clone()));
+        if should_emit_blocked {
             emitter.emit(&Event::RunBlocked {
                 blocked_reason: BlockedReason::HumanInputRequired,
             });
@@ -39,37 +103,28 @@ impl RunInterviewBlocker {
         RunInterviewGuard {
             blocker: Arc::clone(self),
             emitter,
+            stage_id,
             resolved: false,
         }
     }
 
-    fn resolved(&self, emitter: &Emitter) {
-        let mut current = self.unresolved_interviews.load(Ordering::Acquire);
-        loop {
-            if current == 0 {
-                return;
-            }
-            match self.unresolved_interviews.compare_exchange_weak(
-                current,
-                current - 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    if current == 1 {
-                        emitter.emit(&Event::RunUnblocked);
-                    }
-                    return;
-                }
-                Err(observed) => current = observed,
-            }
+    fn resolved(&self, emitter: &Emitter, stage_id: &StageId) {
+        let _transition = self
+            .transitions
+            .lock()
+            .expect("interview transition mutex should not be poisoned");
+        let should_emit_unblocked = self.state.borrow().unresolved_interviews == 1;
+        if should_emit_unblocked {
+            emitter.emit(&Event::RunUnblocked);
         }
+        self.state.send_modify(|state| state.resolve(stage_id));
     }
 }
 
 pub(crate) struct RunInterviewGuard {
     blocker:  Arc<RunInterviewBlocker>,
     emitter:  Arc<Emitter>,
+    stage_id: StageId,
     resolved: bool,
 }
 
@@ -80,7 +135,7 @@ impl RunInterviewGuard {
 
     fn resolve_in_place(&mut self) {
         if !self.resolved {
-            self.blocker.resolved(self.emitter.as_ref());
+            self.blocker.resolved(self.emitter.as_ref(), &self.stage_id);
             self.resolved = true;
         }
     }
@@ -236,7 +291,8 @@ impl AgentQuestionRuntime for WorkflowAgentQuestionRuntime {
             self.stage_scope.clone(),
             self.stage_id.clone(),
             &prepared,
-            self.blocker.block(Arc::clone(&self.emitter)),
+            self.blocker
+                .block(Arc::clone(&self.emitter), self.stage_scope.stage_id()),
             interview_start,
         );
         let ask_all = future::join_all(
@@ -528,17 +584,21 @@ mod tests {
             let events = Arc::clone(&events);
             move |event| events.lock().unwrap().push(event.clone())
         });
+        let stage_scope = StageScope {
+            node_id:            "ask".to_string(),
+            visit:              1,
+            parallel_group_id:  None,
+            parallel_branch_id: None,
+        };
+        let stage_id = stage_scope.stage_id();
+        let blocker = Arc::new(RunInterviewBlocker::new());
+        let block_state = blocker.subscribe();
         let runtime = WorkflowAgentQuestionRuntime::new(
             interviewer.clone(),
             Arc::clone(&emitter),
-            StageScope {
-                node_id:            "ask".to_string(),
-                visit:              1,
-                parallel_group_id:  None,
-                parallel_branch_id: None,
-            },
+            stage_scope,
             "ask",
-            Arc::new(RunInterviewBlocker::new()),
+            blocker,
         );
         let option = InterviewOption {
             key:         "ship".to_string(),
@@ -578,6 +638,8 @@ mod tests {
         });
 
         tokio::task::yield_now().await;
+        assert!(block_state.borrow().is_run_blocked());
+        assert!(block_state.borrow().is_stage_blocked(&stage_id));
         let question_ids = {
             let events = events.lock().unwrap();
             assert!(matches!(events[0].body, EventBody::InterviewStarted(_)));
@@ -622,5 +684,60 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event.body, EventBody::RunUnblocked(_)))
         );
+        assert!(!block_state.borrow().is_run_blocked());
+        assert!(!block_state.borrow().is_stage_blocked(&stage_id));
+    }
+
+    #[tokio::test]
+    async fn cancelling_agent_question_unblocks_its_stage() {
+        let interviewer = Arc::new(ControlInterviewer::new());
+        let emitter = Arc::new(Emitter::new(RunId::new()));
+        let stage_scope = StageScope {
+            node_id:            "ask".to_string(),
+            visit:              1,
+            parallel_group_id:  None,
+            parallel_branch_id: None,
+        };
+        let stage_id = stage_scope.stage_id();
+        let blocker = Arc::new(RunInterviewBlocker::new());
+        let block_state = blocker.subscribe();
+        let runtime = WorkflowAgentQuestionRuntime::new(
+            interviewer,
+            emitter,
+            stage_scope,
+            "ask",
+            Arc::clone(&blocker),
+        );
+        let cancel_token = CancellationToken::new();
+        let ask_cancel_token = cancel_token.clone();
+        let ask = tokio::spawn(async move {
+            runtime
+                .ask_questions(
+                    "call_1",
+                    vec![AgentQuestion {
+                        original_id:       Some("q1".to_string()),
+                        original_question: "Continue?".to_string(),
+                        header:            None,
+                        text:              "Continue?".to_string(),
+                        question_type:     fabro_types::QuestionType::Freeform,
+                        options:           Vec::new(),
+                        allow_freeform:    true,
+                    }],
+                    ask_cancel_token,
+                )
+                .await
+                .unwrap()
+        });
+
+        tokio::task::yield_now().await;
+        assert!(block_state.borrow().is_run_blocked());
+        assert!(block_state.borrow().is_stage_blocked(&stage_id));
+
+        cancel_token.cancel();
+        let answers = ask.await.unwrap();
+
+        assert_eq!(answers[0].status, AgentQuestionAnswerStatus::Interrupted);
+        assert!(!block_state.borrow().is_run_blocked());
+        assert!(!block_state.borrow().is_stage_blocked(&stage_id));
     }
 }

@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use ::fabro_types::{ExecOutputTail, RunEvent, RunId, RunNoticeCode, RunNoticeLevel};
 use chrono::Utc;
+use tokio::sync::watch;
 
 use super::Event;
 use super::convert::to_run_event_at;
@@ -21,11 +22,12 @@ type EventListener = Arc<dyn Fn(&RunEvent) + Send + Sync>;
 
 /// Callback-based event emitter for workflow run events.
 pub struct Emitter {
-    run_id:        RunId,
-    listeners:     std::sync::Mutex<Vec<EventListener>>,
+    run_id:            RunId,
+    listeners:         std::sync::Mutex<Vec<EventListener>>,
     /// Epoch milliseconds of the last `emit()` or `touch()` call. 0 until first
     /// event.
-    last_event_at: AtomicI64,
+    last_event_at:     AtomicI64,
+    activity_revision: watch::Sender<u64>,
 }
 
 impl std::fmt::Debug for Emitter {
@@ -35,6 +37,7 @@ impl std::fmt::Debug for Emitter {
             .field("run_id", &self.run_id)
             .field("listener_count", &count)
             .field("last_event_at", &self.last_event_at.load(Ordering::Relaxed))
+            .field("activity_revision", &*self.activity_revision.borrow())
             .finish()
     }
 }
@@ -48,10 +51,12 @@ impl Default for Emitter {
 impl Emitter {
     #[must_use]
     pub fn new(run_id: RunId) -> Self {
+        let (activity_revision, _) = watch::channel(0);
         Self {
             run_id,
             listeners: std::sync::Mutex::new(Vec::new()),
             last_event_at: AtomicI64::new(0),
+            activity_revision,
         }
     }
 
@@ -118,7 +123,6 @@ impl Emitter {
     }
 
     fn emit_with_scope(&self, event: &Event, scope: Option<&StageScope>) {
-        self.last_event_at.store(epoch_millis(), Ordering::Relaxed);
         event.trace();
         if let Event::WorkflowRunStarted { run_id, .. } = event {
             debug_assert_eq!(
@@ -131,7 +135,7 @@ impl Emitter {
     }
 
     pub(crate) fn dispatch_run_event(&self, event: &RunEvent) {
-        self.last_event_at.store(epoch_millis(), Ordering::Relaxed);
+        self.record_activity();
         // Clone the listener list so we don't hold the lock during dispatch.
         // This prevents deadlocks if a listener calls emit() reentrantly.
         // Note: listeners added during this emit() won't receive the current event.
@@ -151,10 +155,20 @@ impl Emitter {
         self.last_event_at.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn subscribe_activity(&self) -> watch::Receiver<u64> {
+        self.activity_revision.subscribe()
+    }
+
     /// Manually update the last-event timestamp (e.g. to seed the watchdog at
     /// workflow run start).
     pub fn touch(&self) {
+        self.record_activity();
+    }
+
+    fn record_activity(&self) {
         self.last_event_at.store(epoch_millis(), Ordering::Relaxed);
+        self.activity_revision
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
 }
 

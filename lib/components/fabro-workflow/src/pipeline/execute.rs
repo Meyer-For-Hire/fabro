@@ -1,10 +1,11 @@
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use fabro_core::executor::ExecutorBuilder;
 use fabro_core::handler::NodeHandler;
 use fabro_core::state::ExecutionState;
-use tokio::time::sleep;
+use tokio::sync::watch;
+use tokio::time::{Instant as TokioInstant, sleep_until};
 use tokio_util::sync::CancellationToken;
 
 use super::types::{Executed, Initialized};
@@ -13,6 +14,7 @@ use crate::context::{self, Context};
 use crate::error::Error;
 use crate::event::Event;
 use crate::graph::WorkflowGraph;
+use crate::interview_runtime::InterviewBlockState;
 use crate::lifecycle::WorkflowLifecycle;
 use crate::node_handler::WorkflowNodeHandler;
 use crate::outcome::Outcome;
@@ -26,6 +28,60 @@ fn seed_context_from_checkpoint(checkpoint: Option<&Checkpoint>) -> Context {
         }
     }
     context
+}
+
+async fn monitor_for_stall(
+    stall_timeout: Duration,
+    stall_token: CancellationToken,
+    shutdown: CancellationToken,
+    mut activity: watch::Receiver<u64>,
+    mut interview_blocks: watch::Receiver<InterviewBlockState>,
+) {
+    let mut deadline = TokioInstant::now() + stall_timeout;
+
+    loop {
+        if interview_blocks.borrow_and_update().is_run_blocked() {
+            tokio::select! {
+                biased;
+                () = shutdown.cancelled() => return,
+                changed = interview_blocks.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    if !interview_blocks.borrow().is_run_blocked() {
+                        deadline = TokioInstant::now() + stall_timeout;
+                    }
+                }
+            }
+            continue;
+        }
+
+        let deadline_timer = sleep_until(deadline);
+        tokio::pin!(deadline_timer);
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => return,
+            changed = interview_blocks.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                deadline = TokioInstant::now() + stall_timeout;
+            }
+            changed = activity.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                deadline = TokioInstant::now() + stall_timeout;
+            }
+            () = &mut deadline_timer => {
+                if interview_blocks.borrow().is_run_blocked() {
+                    continue;
+                }
+                stall_token.cancel();
+                return;
+            }
+        }
+    }
 }
 
 /// EXECUTE phase: run the workflow graph.
@@ -187,43 +243,20 @@ pub async fn execute(init: Initialized) -> Executed {
 
     let stall_timeout_opt = graph.stall_timeout();
     let stall_token = stall_timeout_opt.map(|_| CancellationToken::new());
-    let stall_shutdown =
+    let stall_watchdog =
         if let (Some(stall_timeout), Some(ref token)) = (stall_timeout_opt, &stall_token) {
             let shutdown = CancellationToken::new();
             let emitter = Arc::clone(&engine.run.emitter);
-            let token_clone = token.clone();
-            let shutdown_clone = shutdown.clone();
+            let interview_blocks = engine.run.interview_blocker.subscribe();
             emitter.touch();
-            tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        () = sleep(stall_timeout) => {
-                            if shutdown_clone.is_cancelled() {
-                                return;
-                            }
-                            let last = emitter.last_event_at();
-                            let now = i64::try_from(
-                                std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_millis(),
-                            )
-                            .unwrap_or(i64::MAX);
-                            let idle_ms = now.saturating_sub(last);
-                            let stall_timeout_ms =
-                                i64::try_from(stall_timeout.as_millis()).unwrap_or(i64::MAX);
-                            if idle_ms >= stall_timeout_ms {
-                                token_clone.cancel();
-                                return;
-                            }
-                        }
-                        () = shutdown_clone.cancelled() => {
-                            return;
-                        }
-                    }
-                }
-            });
-            Some(shutdown)
+            let task = tokio::spawn(monitor_for_stall(
+                stall_timeout,
+                token.clone(),
+                shutdown.clone(),
+                emitter.subscribe_activity(),
+                interview_blocks,
+            ));
+            Some((shutdown, task))
         } else {
             None
         };
@@ -242,8 +275,11 @@ pub async fn execute(init: Initialized) -> Executed {
     let executor = builder.build();
     let result = executor.run(&wf_graph, state).await;
 
-    if let Some(shutdown) = stall_shutdown {
+    if let Some((shutdown, task)) = stall_watchdog {
         shutdown.cancel();
+        if let Err(error) = task.await {
+            tracing::error!(error = ?error, "stall watchdog task failed");
+        }
     }
 
     let (outcome, final_context) = match result {
