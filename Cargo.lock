@@ -2766,6 +2766,7 @@ dependencies = [
  "rand 0.9.4",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "strum 0.28.0",
  "thiserror 2.0.18",
  "tokio",
