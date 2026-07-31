@@ -176,9 +176,10 @@ impl Handler for CommandHandler {
                     structured_output::validate_response_text(schema, &finalized.output_text),
                 )
             });
-            let mut outcome = if let Some((_, Err(error))) = &validation {
+            let mut outcome = if let Some((schema, Err(error))) = &validation {
                 Outcome::fail_deterministic(schema_validation_failure_reason(
                     script,
+                    schema,
                     error,
                     &finalized.output_text,
                 ))
@@ -283,13 +284,14 @@ fn encode_stdin_value(value: serde_json::Value) -> serde_json::Result<Vec<u8>> {
 
 fn schema_validation_failure_reason(
     script: &str,
+    schema: &structured_output::OutputSchemaKind,
     error: &StructuredOutputError,
     output_text: &str,
 ) -> String {
     let mut reason = format!("Script output failed output_schema validation: {script}");
-    for message in error.messages() {
+    for message in error.rendered_messages(Some(schema)) {
         reason.push_str("\n- ");
-        reason.push_str(message);
+        reason.push_str(&message);
     }
     append_output_tail(&mut reason, output_text);
     reason
