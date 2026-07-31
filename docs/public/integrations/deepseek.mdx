@@ -1,0 +1,109 @@
+---
+title: "DeepSeek"
+description: "Run DeepSeek V4 Flash and Pro through DeepSeek's direct API or supported gateways"
+---
+
+[DeepSeek](https://www.deepseek.com/) provides an OpenAI-compatible API for DeepSeek V4. Fabro includes direct access to V4 Flash and V4 Pro. The same Fabro model IDs also work through the optional Fireworks AI and OpenRouter providers.
+
+## Prerequisites
+
+- A [DeepSeek Platform](https://platform.deepseek.com/) account
+- A DeepSeek API key from [platform.deepseek.com/api_keys](https://platform.deepseek.com/api_keys)
+- A running Fabro server
+
+## Configure direct access
+
+The direct `deepseek` provider is enabled in the built-in catalog. Store its key in the target Fabro server vault:
+
+```bash
+fabro provider login --provider deepseek
+
+# For a non-default remote server:
+fabro provider login --server https://your-fabro.example --provider deepseek
+
+# Or set the vault token directly:
+fabro secret set DEEPSEEK_API_KEY
+fabro secret --server https://your-fabro.example set DEEPSEEK_API_KEY
+```
+
+Standalone SDK usage outside a Fabro server can use an env-backed credential source explicitly:
+
+```bash
+export DEEPSEEK_API_KEY=<api-key>
+```
+
+Fabro sends bearer-authenticated Chat Completions requests to `https://api.deepseek.com`.
+
+## Included models
+
+| Fabro model ID | DeepSeek API model ID | Context | Max output | Role |
+|---|---|---:|---:|---|
+| `deepseek-v4-flash` | `deepseek-v4-flash` | 1,048,576 | 384,000 | Provider default, small default, and connectivity probe; aliases `deepseek`, `deepseek-v4`, `deepseek-flash` |
+| `deepseek-v4-pro` | `deepseek-v4-pro` | 1,048,576 | 384,000 | Higher-capability V4 model |
+
+Both models support text input, tool calling, native reasoning, streaming, JSON output, and automatic prompt caching. They do not support image input. Thinking mode is enabled by default.
+
+## Use DeepSeek models
+
+```bash
+fabro model list --provider deepseek
+fabro model test --provider deepseek --model deepseek-v4-flash --deep
+fabro run workflow.fabro --provider deepseek --model deepseek
+```
+
+In workflow stylesheets:
+
+```dot title="workflow.fabro"
+digraph Example {
+    graph [
+        model_stylesheet="
+            *          { model: deepseek-v4-flash; }
+            .difficult { model: deepseek-v4-pro; }
+        "
+    ]
+
+    start [shape=Mdiamond, label="Start"]
+    work  [label="Implement", prompt="Implement and verify the requested change."]
+    exit  [shape=Msquare, label="Exit"]
+
+    start -> work -> exit
+}
+```
+
+## Prompt caching and pricing
+
+DeepSeek applies prefix caching automatically. Fabro reads DeepSeek's `prompt_cache_hit_tokens` usage field and reports cache-read tokens separately from uncached input tokens.
+
+The built-in catalog uses DeepSeek's published prices per million tokens:
+
+| Model | Uncached input | Cache hit | Output |
+|---|---:|---:|---:|
+| `deepseek-v4-flash` | $0.14 | $0.0028 | $0.28 |
+| `deepseek-v4-pro` | $0.435 | $0.003625 | $0.87 |
+
+DeepSeek does not return an in-band dollar cost. Fabro calculates an estimated cost from these catalog rates and the reported token buckets.
+
+## Use a gateway
+
+The `deepseek-v4-flash`, `deepseek-v4-pro`, `deepseek`, `deepseek-v4`, and `deepseek-flash` selectors are portable across direct DeepSeek, Fireworks AI, and OpenRouter routes. Use `--provider` or a provider-qualified model selector when you need a specific route.
+
+See the [Fireworks AI integration](/integrations/fireworks) and [OpenRouter integration](/integrations/openrouter) for gateway setup and provider-specific pricing.
+
+## Troubleshooting
+
+**"No API key configured"** — Store `DEEPSEEK_API_KEY` on the target server with `fabro provider login --provider deepseek`. The server runtime resolves the key from its vault, not from process env.
+
+**Unknown model** — Use `deepseek-v4-flash` or `deepseek-v4-pro`. The retired `deepseek-chat` and `deepseek-reasoner` API IDs are not in the Fabro catalog.
+
+**A tool continuation returns HTTP 400** — Keep the assistant thinking content in conversation history. Fabro does this automatically when it replays tool-call turns.
+
+## Further reading
+
+<Columns cols={2}>
+  <Card title="DeepSeek API" icon="code" href="https://api-docs.deepseek.com/">
+    Official authentication, endpoints, and API reference.
+  </Card>
+  <Card title="Models and pricing" icon="money-bill" href="https://api-docs.deepseek.com/quick_start/pricing/">
+    Official limits, features, and token prices.
+  </Card>
+</Columns>

@@ -599,6 +599,28 @@ async fn fireworks_complete() {
     assert_eq!(response.provider, "fireworks");
 }
 
+#[fabro_macros::e2e_test(live("DEEPSEEK_API_KEY"))]
+async fn deepseek_complete() {
+    let api_key = std::env::var(EnvVars::DEEPSEEK_API_KEY).expect("DEEPSEEK_API_KEY must be set");
+    let adapter =
+        OpenAiCompatibleAdapter::new(api_key, "https://api.deepseek.com").with_name("deepseek");
+    let request = Request {
+        // Thinking mode is enabled by default and shares this budget with the
+        // visible answer.
+        max_tokens: Some(1024),
+        ..make_request("deepseek-v4-flash")
+    };
+    let response = adapter.complete(&request).await.unwrap();
+
+    assert!(
+        !response.text().is_empty(),
+        "response text should not be empty"
+    );
+    assert!(response.usage.input_tokens > 0);
+    assert!(response.usage.output_tokens > 0 || response.usage.reasoning_tokens > 0);
+    assert_eq!(response.provider, "deepseek");
+}
+
 #[fabro_macros::e2e_test(live("FIREWORKS_API_KEY"))]
 async fn fireworks_kimi_k2_7_code_deep_tool_round_trip() {
     let api_key = std::env::var(EnvVars::FIREWORKS_API_KEY).expect("FIREWORKS_API_KEY must be set");
