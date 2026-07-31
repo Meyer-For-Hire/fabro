@@ -689,6 +689,15 @@ impl RunProjectionReducer for RunProjection {
                     status:   SubAgentStatus::Running,
                 });
             }
+            EventBody::AgentSubTurnStarted(props) => {
+                let Some(stage) = stage_at_stored_or_visit(self, stored, props.visit, event.seq)
+                else {
+                    return Ok(());
+                };
+                if let Some(subagent) = subagent_mut(stage, &props.agent_id) {
+                    subagent.status = SubAgentStatus::Running;
+                }
+            }
             EventBody::AgentSubCompleted(props) => {
                 let Some(stage) = stage_at_stored_or_visit(self, stored, props.visit, event.seq)
                 else {
@@ -1611,9 +1620,10 @@ mod tests {
         AgentSessionDeactivatedProps, AgentSessionEndedProps, AgentSessionStartedProps,
         AgentSkillActivatedProps, AgentSkillActivationSource, AgentSkillSummary,
         AgentSkillsDiscoveredProps, AgentSteeringInjectedProps, AgentSubClosedProps,
-        AgentSubCompletedProps, AgentSubFailedProps, AgentSubSpawnedProps, AgentToolCategory,
-        AgentToolSource, AgentToolStartedProps, AgentToolSummary, AgentToolsAvailableProps,
-        CheckpointCompletedProps, InterviewCompletedProps, InterviewOption, InterviewStartedProps,
+        AgentSubCompletedProps, AgentSubFailedProps, AgentSubSpawnedProps,
+        AgentSubTurnStartedProps, AgentToolCategory, AgentToolSource, AgentToolStartedProps,
+        AgentToolSummary, AgentToolsAvailableProps, CheckpointCompletedProps,
+        InterviewCompletedProps, InterviewOption, InterviewStartedProps,
         ParallelBranchCompletedProps, ParallelBranchStartedProps, RunCompletedProps,
         RunControlEffectProps, StageCompletedProps, StageFailedProps, StagePromptProps,
         StageRetryingProps, StageStartedProps,
@@ -6434,10 +6444,11 @@ mod tests {
                 .apply_event(&test_stage_event(
                     1,
                     EventBody::AgentSubSpawned(AgentSubSpawnedProps {
-                        agent_id: "sub-1".to_string(),
-                        depth:    1,
-                        task:     "write tests".to_string(),
-                        visit:    1,
+                        agent_id:   "sub-1".to_string(),
+                        depth:      1,
+                        task:       "write tests".to_string(),
+                        generation: 1,
+                        visit:      1,
                     }),
                     stage_id.clone(),
                 ))
@@ -6455,6 +6466,7 @@ mod tests {
                     EventBody::AgentSubCompleted(AgentSubCompletedProps {
                         agent_id:   "sub-1".to_string(),
                         depth:      1,
+                        generation: 1,
                         success:    true,
                         turns_used: 3,
                         visit:      1,
@@ -6471,23 +6483,64 @@ mod tests {
             state
                 .apply_event(&test_stage_event(
                     3,
+                    EventBody::AgentSubTurnStarted(AgentSubTurnStartedProps {
+                        agent_id:   "sub-1".to_string(),
+                        depth:      1,
+                        task:       "fix the review findings".to_string(),
+                        generation: 2,
+                        visit:      1,
+                    }),
+                    stage_id.clone(),
+                ))
+                .unwrap();
+            let stage = state.stage(&stage_id).unwrap();
+            assert_eq!(stage.subagents.len(), 1);
+            assert_eq!(stage.subagents[0].task, "write tests");
+            assert_eq!(stage.subagents[0].status, SubAgentStatus::Running);
+
+            state
+                .apply_event(&test_stage_event(
+                    4,
+                    EventBody::AgentSubCompleted(AgentSubCompletedProps {
+                        agent_id:   "sub-1".to_string(),
+                        depth:      1,
+                        generation: 2,
+                        success:    true,
+                        turns_used: 5,
+                        visit:      1,
+                    }),
+                    stage_id.clone(),
+                ))
+                .unwrap();
+            let stage = state.stage(&stage_id).unwrap();
+            assert_eq!(stage.subagents.len(), 1);
+            assert_eq!(stage.subagents[0].status, SubAgentStatus::Completed {
+                success:    true,
+                turns_used: 5,
+            });
+
+            state
+                .apply_event(&test_stage_event(
+                    5,
                     EventBody::AgentSubSpawned(AgentSubSpawnedProps {
-                        agent_id: "sub-2".to_string(),
-                        depth:    2,
-                        task:     "debug failure".to_string(),
-                        visit:    1,
+                        agent_id:   "sub-2".to_string(),
+                        depth:      2,
+                        task:       "debug failure".to_string(),
+                        generation: 1,
+                        visit:      1,
                     }),
                     stage_id.clone(),
                 ))
                 .unwrap();
             state
                 .apply_event(&test_stage_event(
-                    4,
+                    6,
                     EventBody::AgentSubFailed(AgentSubFailedProps {
-                        agent_id: "sub-2".to_string(),
-                        depth:    2,
-                        error:    json!({ "message": "boom" }),
-                        visit:    1,
+                        agent_id:   "sub-2".to_string(),
+                        depth:      2,
+                        generation: 1,
+                        error:      json!({ "message": "boom" }),
+                        visit:      1,
                     }),
                     stage_id.clone(),
                 ))
@@ -6499,11 +6552,12 @@ mod tests {
 
             state
                 .apply_event(&test_stage_event(
-                    5,
+                    7,
                     EventBody::AgentSubClosed(AgentSubClosedProps {
-                        agent_id: "sub-2".to_string(),
-                        depth:    2,
-                        visit:    1,
+                        agent_id:   "sub-2".to_string(),
+                        depth:      2,
+                        generation: 1,
+                        visit:      1,
                     }),
                     stage_id.clone(),
                 ))

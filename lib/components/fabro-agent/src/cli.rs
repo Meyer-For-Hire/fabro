@@ -692,7 +692,7 @@ pub async fn run_with_args_and_client_and_catalog(
                             agent_id,
                             depth,
                             task,
-                            ..
+                            generation,
                         } => {
                             let task_preview = if task.len() > 60 {
                                 &task[..task.floor_char_boundary(60)]
@@ -702,40 +702,64 @@ pub async fn run_with_args_and_client_and_catalog(
                             eprintln!(
                                 "  {}",
                                 s.dim.apply_to(format!(
-                                    "{child_prefix}\u{25b6} subagent {agent_id} spawned (depth={depth}) task={task_preview:?}"
+                                    "{child_prefix}\u{25b6} subagent {agent_id} spawned (depth={depth}, generation={generation}) task={task_preview:?}"
+                                )),
+                            );
+                        }
+                        AgentEvent::SubAgentTurnStarted {
+                            agent_id,
+                            depth,
+                            task,
+                            generation,
+                        } => {
+                            let task_preview = if task.len() > 60 {
+                                &task[..task.floor_char_boundary(60)]
+                            } else {
+                                task
+                            };
+                            eprintln!(
+                                "  {}",
+                                s.dim.apply_to(format!(
+                                    "{child_prefix}\u{25b6} subagent {agent_id} turn started (depth={depth}, generation={generation}) task={task_preview:?}"
                                 )),
                             );
                         }
                         AgentEvent::SubAgentCompleted {
                             agent_id,
                             depth,
+                            generation,
                             success,
                             turns_used,
                         } => {
                             eprintln!(
                                 "  {}",
                                 s.dim.apply_to(format!(
-                                    "{child_prefix}\u{25a0} subagent {agent_id} completed (depth={depth}, success={success}, turns={turns_used})"
+                                    "{child_prefix}\u{25a0} subagent {agent_id} completed (depth={depth}, generation={generation}, success={success}, turns={turns_used})"
                                 )),
                             );
                         }
                         AgentEvent::SubAgentFailed {
                             agent_id,
                             depth,
+                            generation,
                             error,
                         } => {
                             eprintln!(
                                 "  {}",
                                 s.red.apply_to(format!(
-                                    "{child_prefix}\u{2717} subagent {agent_id} failed (depth={depth}): {error}"
+                                    "{child_prefix}\u{2717} subagent {agent_id} failed (depth={depth}, generation={generation}): {error}"
                                 )),
                             );
                         }
-                        AgentEvent::SubAgentClosed { agent_id, depth } => {
+                        AgentEvent::SubAgentClosed {
+                            agent_id,
+                            depth,
+                            generation,
+                        } => {
                             eprintln!(
                                 "  {}",
                                 s.dim.apply_to(format!(
-                                    "{child_prefix}\u{25a0} subagent {agent_id} closed (depth={depth})"
+                                    "{child_prefix}\u{25a0} subagent {agent_id} closed (depth={depth}, generation={generation})"
                                 )),
                             );
                         }

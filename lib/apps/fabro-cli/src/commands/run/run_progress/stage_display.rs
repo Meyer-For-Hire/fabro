@@ -655,6 +655,32 @@ impl StageDisplay {
         );
     }
 
+    pub(super) fn on_subagent_turn_started(
+        &mut self,
+        renderer: &ProgressRenderer,
+        stage_node_id: &str,
+        agent_id: &str,
+        task: &str,
+        generation: u64,
+    ) {
+        if !self.verbose {
+            return;
+        }
+
+        self.insert_subagent_line_for_stage(
+            renderer,
+            stage_node_id,
+            &renderer
+                .styles()
+                .dim
+                .apply_to(format!(
+                    "\u{21bb} subagent[{agent_id}] turn {generation} \"{}\"",
+                    styles::truncate(task, 50)
+                ))
+                .to_string(),
+        );
+    }
+
     fn finish_stage(
         &mut self,
         renderer: &ProgressRenderer,

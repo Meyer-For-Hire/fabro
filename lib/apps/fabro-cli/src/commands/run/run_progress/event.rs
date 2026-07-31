@@ -194,6 +194,12 @@ pub(super) enum ProgressEvent {
         agent_id:      String,
         task:          String,
     },
+    SubagentTurnStarted {
+        stage_node_id: String,
+        agent_id:      String,
+        task:          String,
+        generation:    u64,
+    },
     SubagentCompleted {
         stage_node_id: String,
         agent_id:      String,
@@ -430,6 +436,12 @@ pub(super) fn from_run_event(stored: &RunEvent) -> Option<ProgressEvent> {
             stage_node_id: node_id,
             agent_id:      props.agent_id.clone(),
             task:          props.task.clone(),
+        }),
+        EventBody::AgentSubTurnStarted(props) => Some(ProgressEvent::SubagentTurnStarted {
+            stage_node_id: node_id,
+            agent_id:      props.agent_id.clone(),
+            task:          props.task.clone(),
+            generation:    props.generation,
         }),
         EventBody::AgentSubCompleted(props) => Some(ProgressEvent::SubagentCompleted {
             stage_node_id: node_id,

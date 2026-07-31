@@ -3990,8 +3990,9 @@ enabled = true
 
         session.sub_agent_event_callback()(
             fabro_agent::subagent::SubAgentCallbackEvent::Lifecycle(AgentEvent::SubAgentClosed {
-                agent_id: "child-1".to_string(),
-                depth:    1,
+                agent_id:   "child-1".to_string(),
+                depth:      1,
+                generation: 1,
             }),
         );
         let session_id = session.id().to_string();

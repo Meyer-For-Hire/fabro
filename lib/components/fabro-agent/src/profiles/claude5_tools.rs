@@ -383,7 +383,7 @@ pub(crate) fn make_task_stop_tool(supervisor: SubAgentSupervisor) -> RegisteredT
     RegisteredTool {
         definition: definition(
             NativeTool::StopAgent,
-            "Stop a running background agent by task ID.",
+            "Stop a running or completed background agent by task ID.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -416,7 +416,7 @@ pub(crate) fn make_send_message_tool(supervisor: SubAgentSupervisor) -> Register
     RegisteredTool {
         definition: definition(
             NativeTool::MessageAgent,
-            "Send additional instructions to a running background agent by its task ID.",
+            "Send additional instructions to a background agent by its task ID. A running agent receives them at a safe turn boundary. A completed agent starts another turn in the same session with its existing history.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -590,11 +590,17 @@ mod tests {
         assert_schema(&make_task_stop_tool(supervisor.clone()), &["task_id"], &[
             "task_id",
         ]);
-        assert_schema(
-            &make_send_message_tool(supervisor),
-            &["message", "summary", "to"],
-            &["message", "to"],
+        let send_message = make_send_message_tool(supervisor);
+        assert_schema(&send_message, &["message", "summary", "to"], &[
+            "message", "to",
+        ]);
+        assert!(
+            send_message
+                .definition
+                .description
+                .contains("completed agent")
         );
+        assert!(send_message.definition.description.contains("same session"));
     }
 
     #[tokio::test]

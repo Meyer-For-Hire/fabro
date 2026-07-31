@@ -371,6 +371,20 @@ impl ProgressUI {
                 self.stage
                     .on_subagent_spawned(renderer, &stage_node_id, &agent_id, &task);
             }
+            ProgressEvent::SubagentTurnStarted {
+                stage_node_id,
+                agent_id,
+                task,
+                generation,
+            } => {
+                self.stage.on_subagent_turn_started(
+                    renderer,
+                    &stage_node_id,
+                    &agent_id,
+                    &task,
+                    generation,
+                );
+            }
             ProgressEvent::SubagentCompleted {
                 stage_node_id,
                 agent_id,
@@ -970,13 +984,15 @@ mod tests {
                 },
             }),
             agent_event("code", AgentEvent::SubAgentSpawned {
-                agent_id: "a1".into(),
-                depth:    1,
-                task:     "review recent changes".into(),
+                agent_id:   "a1".into(),
+                depth:      1,
+                task:       "review recent changes".into(),
+                generation: 1,
             }),
             agent_event("code", AgentEvent::SubAgentCompleted {
                 agent_id:   "a1".into(),
                 depth:      1,
+                generation: 1,
                 success:    true,
                 turns_used: 3,
             }),
@@ -1332,9 +1348,10 @@ mod tests {
         emit(
             &mut ui,
             agent_event("code", AgentEvent::SubAgentSpawned {
-                agent_id: "a1".into(),
-                depth:    1,
-                task:     "review recent changes".into(),
+                agent_id:   "a1".into(),
+                depth:      1,
+                task:       "review recent changes".into(),
+                generation: 1,
             }),
         );
         emit(
@@ -1342,8 +1359,28 @@ mod tests {
             agent_event("code", AgentEvent::SubAgentCompleted {
                 agent_id:   "a1".into(),
                 depth:      1,
+                generation: 1,
                 success:    true,
                 turns_used: 3,
+            }),
+        );
+        emit(
+            &mut ui,
+            agent_event("code", AgentEvent::SubAgentTurnStarted {
+                agent_id:   "a1".into(),
+                depth:      1,
+                task:       "fix the review findings".into(),
+                generation: 2,
+            }),
+        );
+        emit(
+            &mut ui,
+            agent_event("code", AgentEvent::SubAgentCompleted {
+                agent_id:   "a1".into(),
+                depth:      1,
+                generation: 2,
+                success:    true,
+                turns_used: 2,
             }),
         );
         emit(&mut ui, Event::SetupStarted { command_count: 1 });
@@ -1363,6 +1400,8 @@ mod tests {
           ⚠ retry: gpt-5-mini attempt 2 (busy, delay 1s)
             ▸ subagent[a1] "review recent changes"
             ✓ subagent[a1] (3 turns)
+            ↻ subagent[a1] turn 2 "fix the review findings"
+            ✓ subagent[a1] (2 turns)
           ✓ [1/1] bun install  2s
         Setup: 1 command (2s)
         ✓ Code  5s  (1 turns, 0 tools, 1.5k toks)

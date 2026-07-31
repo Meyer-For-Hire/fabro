@@ -242,6 +242,8 @@ pub enum EventBody {
     AgentLlmRetry(AgentLlmRetryProps),
     #[serde(rename = "agent.sub.spawned")]
     AgentSubSpawned(AgentSubSpawnedProps),
+    #[serde(rename = "agent.sub.turn.started")]
+    AgentSubTurnStarted(AgentSubTurnStartedProps),
     #[serde(rename = "agent.sub.completed")]
     AgentSubCompleted(AgentSubCompletedProps),
     #[serde(rename = "agent.sub.failed")]
@@ -510,6 +512,7 @@ impl EventBody {
             Self::AgentLlmFirstOutput(_) => "agent.llm.first_output",
             Self::AgentLlmRetry(_) => "agent.llm.retry",
             Self::AgentSubSpawned(_) => "agent.sub.spawned",
+            Self::AgentSubTurnStarted(_) => "agent.sub.turn.started",
             Self::AgentSubCompleted(_) => "agent.sub.completed",
             Self::AgentSubFailed(_) => "agent.sub.failed",
             Self::AgentSubClosed(_) => "agent.sub.closed",
@@ -682,6 +685,7 @@ fn is_known_event_name(event: &str) -> bool {
             | "agent.llm.first_output"
             | "agent.llm.retry"
             | "agent.sub.spawned"
+            | "agent.sub.turn.started"
             | "agent.sub.completed"
             | "agent.sub.failed"
             | "agent.sub.closed"
@@ -2495,6 +2499,37 @@ mod tests {
 
         let parsed: EventBody = serde_json::from_value(value).unwrap();
         assert_eq!(parsed, body);
+    }
+
+    #[test]
+    fn subagent_generations_are_typed_and_legacy_events_default_to_one() {
+        let started = EventBody::AgentSubTurnStarted(AgentSubTurnStartedProps {
+            agent_id:   "sub-1".to_string(),
+            depth:      1,
+            task:       "fix the review findings".to_string(),
+            generation: 2,
+            visit:      1,
+        });
+        let value = serde_json::to_value(&started).unwrap();
+        assert_eq!(value["event"], "agent.sub.turn.started");
+        assert_eq!(value["properties"]["generation"], 2);
+        assert_eq!(serde_json::from_value::<EventBody>(value).unwrap(), started);
+
+        let legacy: EventBody = serde_json::from_value(json!({
+            "event": "agent.sub.completed",
+            "properties": {
+                "agent_id": "sub-1",
+                "depth": 1,
+                "success": true,
+                "turns_used": 3,
+                "visit": 1
+            }
+        }))
+        .unwrap();
+        let EventBody::AgentSubCompleted(props) = legacy else {
+            panic!("expected subagent completion");
+        };
+        assert_eq!(props.generation, 1);
     }
 
     #[test]

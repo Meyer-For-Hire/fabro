@@ -86,6 +86,7 @@ pub fn event_name(event: &Event) -> &'static str {
             AgentEvent::CompactionCompleted { .. } => "agent.compaction.completed",
             AgentEvent::LlmRetry { .. } => "agent.llm.retry",
             AgentEvent::SubAgentSpawned { .. } => "agent.sub.spawned",
+            AgentEvent::SubAgentTurnStarted { .. } => "agent.sub.turn.started",
             AgentEvent::SubAgentCompleted { .. } => "agent.sub.completed",
             AgentEvent::SubAgentFailed { .. } => "agent.sub.failed",
             AgentEvent::SubAgentClosed { .. } => "agent.sub.closed",
@@ -184,15 +185,32 @@ mod tests {
                 stage:             "code".to_string(),
                 visit:             1,
                 event:             AgentEvent::SubAgentSpawned {
-                    agent_id: "a1".to_string(),
-                    depth:    1,
-                    task:     "do it".to_string(),
+                    agent_id:   "a1".to_string(),
+                    depth:      1,
+                    task:       "do it".to_string(),
+                    generation: 1,
                 },
                 session_id:        None,
                 parent_session_id: None,
                 tool_call_id:      None,
             }),
             "agent.sub.spawned"
+        );
+        assert_eq!(
+            event_name(&Event::Agent {
+                stage:             "code".to_string(),
+                visit:             1,
+                event:             AgentEvent::SubAgentTurnStarted {
+                    agent_id:   "a1".to_string(),
+                    depth:      1,
+                    task:       "fix it".to_string(),
+                    generation: 2,
+                },
+                session_id:        None,
+                parent_session_id: None,
+                tool_call_id:      None,
+            }),
+            "agent.sub.turn.started"
         );
         assert_eq!(
             event_name(&Event::Agent {

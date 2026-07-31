@@ -758,20 +758,36 @@ fn event_body_from_event(event: &Event) -> EventBody {
                 agent_id,
                 depth,
                 task,
+                generation,
             } => EventBody::AgentSubSpawned(fabro_types::AgentSubSpawnedProps {
-                agent_id: agent_id.clone(),
-                depth:    *depth,
-                task:     task.clone(),
-                visit:    *visit,
+                agent_id:  agent_id.clone(),
+                depth:     *depth,
+                task:      task.clone(),
+                generation: *generation,
+                visit:     *visit,
+            }),
+            AgentEvent::SubAgentTurnStarted {
+                agent_id,
+                depth,
+                task,
+                generation,
+            } => EventBody::AgentSubTurnStarted(fabro_types::AgentSubTurnStartedProps {
+                agent_id:  agent_id.clone(),
+                depth:     *depth,
+                task:      task.clone(),
+                generation: *generation,
+                visit:     *visit,
             }),
             AgentEvent::SubAgentCompleted {
                 agent_id,
                 depth,
+                generation,
                 success,
                 turns_used,
             } => EventBody::AgentSubCompleted(fabro_types::AgentSubCompletedProps {
                 agent_id:   agent_id.clone(),
                 depth:      *depth,
+                generation: *generation,
                 success:    *success,
                 turns_used: *turns_used,
                 visit:      *visit,
@@ -779,18 +795,25 @@ fn event_body_from_event(event: &Event) -> EventBody {
             AgentEvent::SubAgentFailed {
                 agent_id,
                 depth,
+                generation,
                 error,
             } => EventBody::AgentSubFailed(fabro_types::AgentSubFailedProps {
-                agent_id: agent_id.clone(),
-                depth:    *depth,
-                error:    serde_json::to_value(error).expect("agent Error derives Serialize with no custom logic that can fail"),
-                visit:    *visit,
+                agent_id:  agent_id.clone(),
+                depth:     *depth,
+                generation: *generation,
+                error:     serde_json::to_value(error).expect("agent Error derives Serialize with no custom logic that can fail"),
+                visit:     *visit,
             }),
-            AgentEvent::SubAgentClosed { agent_id, depth } => {
+            AgentEvent::SubAgentClosed {
+                agent_id,
+                depth,
+                generation,
+            } => {
                 EventBody::AgentSubClosed(fabro_types::AgentSubClosedProps {
-                    agent_id: agent_id.clone(),
-                    depth:    *depth,
-                    visit:    *visit,
+                    agent_id:  agent_id.clone(),
+                    depth:     *depth,
+                    generation: *generation,
+                    visit:     *visit,
                 })
             }
             AgentEvent::McpServerReady {
