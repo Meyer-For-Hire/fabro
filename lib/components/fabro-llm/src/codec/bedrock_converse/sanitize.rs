@@ -3,10 +3,9 @@
 //! Tool names must match `[a-zA-Z0-9_-]+`; tool-use IDs additionally allow
 //! `.` and `:`. Both are limited to 64 characters. These helpers rewrite only
 //! the Bedrock wire view: the canonical transcript retains provider output
-//! verbatim. Every encoded tool-use ID site must use the same helper so
-//! `toolUse` and `toolResult` blocks remain paired.
-
-use std::borrow::Cow;
+//! verbatim. The encoder routes every tool block through its
+//! `tool_use_block`/`tool_result_block` constructors so `toolUse` and
+//! `toolResult` blocks remain paired.
 
 use sha2::{Digest, Sha256};
 
@@ -14,40 +13,35 @@ const MAX_LENGTH: usize = 64;
 const HASH_HEX_LENGTH: usize = 16;
 const PREFIX_LENGTH: usize = MAX_LENGTH - 1 - HASH_HEX_LENGTH;
 
-pub(super) fn tool_name(name: &str) -> Cow<'_, str> {
+pub(super) fn tool_name(name: &str) -> String {
     sanitize(name, "unknown_tool", is_tool_name_char)
 }
 
-pub(super) fn tool_use_id(id: &str) -> Cow<'_, str> {
+pub(super) fn tool_use_id(id: &str) -> String {
     sanitize(id, "unknown_tool_use_id", is_tool_use_id_char)
 }
 
-fn sanitize<'a>(
-    value: &'a str,
-    empty_fallback: &'static str,
-    is_allowed: fn(char) -> bool,
-) -> Cow<'a, str> {
+fn sanitize(value: &str, empty_fallback: &'static str, is_allowed: fn(char) -> bool) -> String {
     if value.is_empty() {
-        return Cow::Borrowed(empty_fallback);
-    }
-    if value.len() <= MAX_LENGTH && value.chars().all(is_allowed) {
-        return Cow::Borrowed(value);
+        return empty_fallback.to_string();
     }
 
-    let mut sanitized = String::with_capacity(value.len());
-    for character in value.chars() {
-        sanitized.push(if is_allowed(character) {
-            character
-        } else {
-            '_'
-        });
-    }
+    let sanitized: String = value
+        .chars()
+        .map(|character| {
+            if is_allowed(character) {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
 
     if sanitized.len() <= MAX_LENGTH {
-        return Cow::Owned(sanitized);
+        sanitized
+    } else {
+        truncate_with_hash(&sanitized, value)
     }
-
-    Cow::Owned(truncate_with_hash(&sanitized, value))
 }
 
 fn is_tool_name_char(character: char) -> bool {
@@ -74,22 +68,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn valid_values_are_returned_borrowed() {
+    fn valid_values_pass_through_unchanged() {
         for name in ["search", "TaskList", "a-b_c9"] {
-            assert!(matches!(tool_name(name), Cow::Borrowed(value) if value == name));
+            assert_eq!(tool_name(name), name);
         }
 
         let max_length = "a".repeat(64);
-        assert!(matches!(
-            tool_name(&max_length),
-            Cow::Borrowed(value) if value == max_length
-        ));
+        assert_eq!(tool_name(&max_length), max_length);
 
         let id = "functions.read_file:4";
-        assert!(matches!(
-            tool_use_id(id),
-            Cow::Borrowed(value) if value == id
-        ));
+        assert_eq!(tool_use_id(id), id);
         assert_eq!(tool_name(id), "functions_read_file_4");
     }
 
@@ -118,7 +106,6 @@ mod tests {
         let boundary = "a".repeat(65);
         let first = tool_name(&boundary);
         let second = tool_name(&boundary);
-        assert!(matches!(&first, Cow::Owned(_)));
         assert_eq!(first, second);
         assert_eq!(first.len(), 64);
         assert!(
@@ -128,8 +115,8 @@ mod tests {
         );
 
         let shared_prefix = "x".repeat(99);
-        let left = tool_name(&format!("{shared_prefix}a")).into_owned();
-        let right = tool_name(&format!("{shared_prefix}b")).into_owned();
+        let left = tool_name(&format!("{shared_prefix}a"));
+        let right = tool_name(&format!("{shared_prefix}b"));
         assert_ne!(left, right);
     }
 }
