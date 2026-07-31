@@ -3661,6 +3661,348 @@ async fn create_run_from_manifest_helper_persists_automation_metadata() {
 }
 
 #[tokio::test]
+async fn create_run_from_manifest_pins_compiled_and_persisted_behavior() {
+    let state = TestAppStateBuilder::new()
+        .runtime_settings(
+            default_test_server_settings(),
+            manifest_run_defaults_from_toml(
+                r#"
+[run.metadata]
+server-label = "server"
+layer = "server"
+"#,
+            ),
+        )
+        .env_lookup(|_| None)
+        .vault_entries([(EnvVars::OPENAI_API_KEY, "test-openai-api-key")])
+        .build();
+    let run_id = RunId::new();
+    let dot = r#"digraph CompilePin {
+        graph [goal="Graph goal", target="{{ inputs.target }}"]
+        start [shape=Mdiamond]
+        work [prompt="Ship {{ inputs.target }}", model="gpt-5.4"]
+        exit [shape=Msquare]
+        start -> work -> exit
+    }"#;
+    let mut manifest_json = minimal_manifest_json(dot);
+    manifest_json["title"] = json!("  Pinned create  ");
+    manifest_json["goal"] = json!({
+        "type": "value",
+        "text": "Inline release goal"
+    });
+    manifest_json["args"] = json!({
+        "model": "gpt-5.4",
+        "input": ["target=payments"]
+    });
+    manifest_json["configs"] = json!([{
+        "type": "project",
+        "path": "/tmp/project/.fabro/project.toml",
+        "source": r#"
+_version = 1
+
+[project]
+name = "payments-project"
+
+[run.metadata]
+project-label = "project"
+layer = "project"
+"#
+    }]);
+    manifest_json["cwd"] = json!("/tmp/project");
+    manifest_json["git"] = json!({
+        "origin_url": "https://github.com/acme/payments.git",
+        "branch": "feature/compiler",
+        "sha": "0123456789abcdef",
+        "dirty": "clean",
+        "push_outcome": { "type": "not_attempted" }
+    });
+    let manifest: RunManifest = serde_json::from_value(manifest_json).unwrap();
+    let submitted_manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::USER_AGENT,
+        "fabro-cli/9.8.7".parse().expect("user agent should parse"),
+    );
+
+    let response = Box::pin(handler::runs::create_run_from_manifest(
+        Arc::clone(&state),
+        handler::runs::CreateRunFromManifestRequest {
+            manifest,
+            submitted_manifest_bytes: submitted_manifest_bytes.clone(),
+            explicit_run_id: Some(run_id),
+            explicit_title_supplied: true,
+            actor: Principal::System {
+                system_kind: SystemActorKind::Engine,
+            },
+            headers,
+            automation: None,
+        },
+    ))
+    .await;
+
+    let body = response_json!(response, StatusCode::CREATED).await;
+    assert_eq!(body["id"], run_id.to_string());
+    assert_eq!(body["title"], "Pinned create");
+    assert_eq!(body["lifecycle"]["status"]["kind"], "submitted");
+
+    let run_store = state.stores.runs.open_run_reader(&run_id).await.unwrap();
+    let events = run_store.list_events().await.unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .map(|envelope| envelope.event.event_name())
+            .collect::<Vec<_>>(),
+        vec!["run.created", "run.submitted"]
+    );
+    let run_state = run_store.state().await.unwrap();
+    let spec = &run_state.spec;
+    assert_eq!(spec.run_id, run_id);
+    assert_eq!(spec.graph.goal(), "Inline release goal");
+    assert_eq!(
+        spec.graph.attrs.get("target").and_then(AttrValue::as_str),
+        Some("{{ inputs.target }}")
+    );
+    assert_eq!(
+        spec.graph.nodes["work"]
+            .attrs
+            .get("prompt")
+            .and_then(AttrValue::as_str),
+        Some("Ship payments")
+    );
+    assert_eq!(
+        spec.graph.nodes["work"]
+            .attrs
+            .get("model")
+            .and_then(AttrValue::as_str),
+        Some("gpt-5.4")
+    );
+    assert_eq!(
+        spec.graph.nodes["work"]
+            .attrs
+            .get("provider")
+            .and_then(AttrValue::as_str),
+        Some("openai")
+    );
+    assert_eq!(spec.settings.run.model.name.as_deref(), Some("gpt-5.4"));
+    assert_eq!(spec.settings.run.model.provider.as_deref(), Some("openai"));
+    assert_eq!(
+        spec.settings.run.inputs.get("target"),
+        Some(&toml::Value::String("payments".to_string()))
+    );
+    assert_eq!(
+        spec.settings.project.name.as_deref(),
+        Some("payments-project")
+    );
+    assert_eq!(
+        spec.labels.get("project-label").map(String::as_str),
+        Some("project")
+    );
+    assert_eq!(
+        spec.labels.get("layer").map(String::as_str),
+        Some("project")
+    );
+    assert_eq!(
+        spec.git.as_ref().map(|git| git.origin_url.as_str()),
+        Some("https://github.com/acme/payments.git")
+    );
+
+    let created = events[0].event.to_value().unwrap();
+    assert_eq!(created["properties"]["title"], "Pinned create");
+    assert_eq!(created["properties"]["labels"]["project-label"], "project");
+    assert_eq!(
+        created["properties"]["provenance"]["client"]["user_agent"],
+        "fabro-cli/9.8.7"
+    );
+    assert_eq!(
+        created["properties"]["provenance"]["subject"]["kind"],
+        "system"
+    );
+    let manifest_blob = created["properties"]["manifest_blob"]
+        .as_str()
+        .expect("run.created should carry the submitted source blob")
+        .parse::<RunBlobId>()
+        .unwrap();
+    let persisted_manifest = run_store
+        .read_blob(&manifest_blob)
+        .await
+        .unwrap()
+        .expect("submitted source blob should exist");
+    assert_eq!(persisted_manifest.as_ref(), submitted_manifest_bytes);
+}
+
+#[tokio::test]
+async fn create_run_from_manifest_pins_compiler_http_error_mappings() {
+    let cases = [
+        (
+            {
+                let mut manifest = minimal_manifest_json(MINIMAL_DOT);
+                manifest["version"] = json!(2);
+                manifest
+            },
+            "unsupported manifest version 2",
+        ),
+        (
+            minimal_manifest_json(
+                r#"digraph Test {
+                    graph [goal="Test"]
+                    start [shape=Mdiamond]
+                    work [prompt="Use {{ vars.MISSING }}"]
+                    exit [shape=Msquare]
+                    start -> work -> exit
+                }"#,
+            ),
+            "Validation failed",
+        ),
+        (
+            {
+                let mut manifest = minimal_manifest_json(
+                    r#"digraph Test {
+                        graph [goal="Test"]
+                        start [shape=Mdiamond]
+                        work [prompt="Do work", model="gpt-5.4", provider="missing-provider"]
+                        exit [shape=Msquare]
+                        start -> work -> exit
+                    }"#,
+                );
+                manifest["args"] = json!({
+                    "model": "gpt-5.4",
+                    "provider": "missing-provider"
+                });
+                manifest
+            },
+            "Model selection failed: unknown model provider 'missing-provider'",
+        ),
+    ];
+
+    for (manifest_json, expected_detail) in cases {
+        let state = TestAppStateBuilder::new()
+            .env_lookup(|_| None)
+            .vault_entries([(EnvVars::OPENAI_API_KEY, "test-openai-api-key")])
+            .build();
+        let manifest: RunManifest = serde_json::from_value(manifest_json).unwrap();
+        let submitted_manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+
+        let response = Box::pin(handler::runs::create_run_from_manifest(
+            state,
+            handler::runs::CreateRunFromManifestRequest {
+                manifest,
+                submitted_manifest_bytes,
+                explicit_run_id: Some(RunId::new()),
+                explicit_title_supplied: true,
+                actor: Principal::System {
+                    system_kind: SystemActorKind::Engine,
+                },
+                headers: HeaderMap::new(),
+                automation: None,
+            },
+        ))
+        .await;
+
+        let body = response_json!(response, StatusCode::BAD_REQUEST).await;
+        assert_eq!(body["errors"][0]["detail"], expected_detail);
+    }
+}
+
+#[tokio::test]
+async fn create_run_from_manifest_preserves_competing_preparation_error_precedence() {
+    let mut workflow_before_title = minimal_manifest_json(MINIMAL_DOT);
+    workflow_before_title["workflows"]["workflow.fabro"]["config"] = json!({
+        "path": "workflow.toml",
+        "source": "_version = 1\n[run.unknown]\nvalue = true\n",
+    });
+    workflow_before_title["title"] = json!("   ");
+
+    let mut project_parse_before_later_path = minimal_manifest_json(MINIMAL_DOT);
+    project_parse_before_later_path["configs"] = json!([
+        {
+            "type": "project",
+            "path": "/tmp/.fabro/project.toml",
+            "source": "_version = 1\n[run.unknown]\nvalue = true\n",
+        },
+        {
+            "type": "project",
+            "source": "_version = 1\n",
+        },
+    ]);
+
+    for (manifest_json, expected_detail) in [
+        (workflow_before_title, "Failed to parse run config TOML"),
+        (
+            project_parse_before_later_path,
+            "Failed to parse run config TOML",
+        ),
+    ] {
+        let state = TestAppStateBuilder::new().build();
+        let manifest: RunManifest = serde_json::from_value(manifest_json).unwrap();
+        let submitted_manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+
+        let response = Box::pin(handler::runs::create_run_from_manifest(
+            state,
+            handler::runs::CreateRunFromManifestRequest {
+                manifest,
+                submitted_manifest_bytes,
+                explicit_run_id: None,
+                explicit_title_supplied: true,
+                actor: Principal::System {
+                    system_kind: SystemActorKind::Engine,
+                },
+                headers: HeaderMap::new(),
+                automation: None,
+            },
+        ))
+        .await;
+
+        let body = response_json!(response, StatusCode::BAD_REQUEST).await;
+        assert_eq!(body["errors"][0]["detail"], expected_detail);
+    }
+}
+
+#[tokio::test]
+async fn create_run_from_manifest_resolves_generated_id_after_variable_snapshot() {
+    let state = TestAppStateBuilder::new()
+        .env_lookup(|_| None)
+        .vault_entries([(EnvVars::OPENAI_API_KEY, "test-openai-api-key")])
+        .build();
+    let variable = state
+        .stores
+        .variables
+        .set("OWNER", "payments", None)
+        .await
+        .expect("test variable should persist");
+    let manifest: RunManifest = serde_json::from_value(minimal_manifest_json(
+        r#"digraph Test {
+            graph [goal="Test"]
+            start [shape=Mdiamond]
+            work [prompt="Ship {{ vars.OWNER }}"]
+            exit [shape=Msquare]
+            start -> work -> exit
+        }"#,
+    ))
+    .unwrap();
+    let submitted_manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+
+    let response = Box::pin(handler::runs::create_run_from_manifest(
+        state,
+        handler::runs::CreateRunFromManifestRequest {
+            manifest,
+            submitted_manifest_bytes,
+            explicit_run_id: None,
+            explicit_title_supplied: false,
+            actor: Principal::System {
+                system_kind: SystemActorKind::Engine,
+            },
+            headers: HeaderMap::new(),
+            automation: None,
+        },
+    ))
+    .await;
+
+    let body = response_json!(response, StatusCode::CREATED).await;
+    let run_id = body["id"].as_str().unwrap().parse::<RunId>().unwrap();
+    assert!(run_id.created_at() >= variable.updated_at);
+}
+
+#[tokio::test]
 async fn fake_automation_materializer_injection_captures_input_and_returns_manifest() {
     let materialized_manifest: RunManifest =
         serde_json::from_value(minimal_manifest_json(MINIMAL_DOT)).unwrap();
