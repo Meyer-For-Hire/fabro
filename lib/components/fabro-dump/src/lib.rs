@@ -723,40 +723,6 @@ mod tests {
     }
 
     #[test]
-    fn hydrate_referenced_blobs_resolves_stage_prompt_text_ref() {
-        let prompt = "assembled stage prompt";
-        let blob = serde_json::to_vec(prompt).unwrap();
-        let blob_id = fabro_types::RunBlobId::new(&blob);
-        let mut projection = RunProjection::new("Demo".to_string(), sample_run_spec(), Utc::now());
-        projection
-            .stage_entry("build", 1, first_event_seq(1))
-            .prompt = Some(fabro_types::format_blob_ref(&blob_id));
-        let mut dump = RunDump::from_projection(&projection).unwrap();
-
-        executor::block_on(async {
-            dump.hydrate_referenced_blobs_with_reader(|read_blob_id| {
-                let blob = blob.clone();
-                Box::pin(async move {
-                    assert_eq!(read_blob_id, blob_id);
-                    Ok(Some(bytes::Bytes::from(blob)))
-                })
-            })
-            .await
-        })
-        .unwrap();
-
-        let prompt_entry = dump
-            .entries()
-            .iter()
-            .find(|entry| entry.path == "stages/001-build@1/prompt.md")
-            .expect("prompt.md should be emitted");
-        let RunDumpContents::Text(text) = &prompt_entry.contents else {
-            panic!("prompt.md should be text");
-        };
-        assert_eq!(text, prompt);
-    }
-
-    #[test]
     fn hydrate_referenced_blobs_ignores_legacy_artifact_file_refs() {
         let blob = serde_json::to_vec("hydrated legacy text").unwrap();
         let blob_id = fabro_types::RunBlobId::new(&blob);

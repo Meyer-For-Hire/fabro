@@ -508,7 +508,7 @@ Emitted when a prompt is rendered for an LLM stage.
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `text` | string | Rendered prompt text, or a `blob://sha256/...` reference when the serialized text exceeds 100KB |
+| `text` | string | Rendered prompt text |
 
 ---
 

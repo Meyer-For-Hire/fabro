@@ -50,23 +50,6 @@ pub async fn offload_large_values(
     Ok(())
 }
 
-/// Offload a text value when its serialized JSON exceeds the blob threshold.
-///
-/// Returns the original text when it is small and a `blob://sha256/...`
-/// reference when it is offloaded.
-///
-/// # Errors
-///
-/// Returns an error if serialization or blob persistence fails.
-pub(crate) async fn offload_large_text(text: &str, run_store: &RunStoreHandle) -> Result<String> {
-    let mut value = Value::String(text.to_owned());
-    offload_value(&mut value, run_store).await?;
-    value
-        .as_str()
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| Error::engine("offloaded text was not a string"))
-}
-
 /// Offload large context-update values from typed parallel branch results
 /// before they are emitted through `parallel.completed` and stored in
 /// projections.
