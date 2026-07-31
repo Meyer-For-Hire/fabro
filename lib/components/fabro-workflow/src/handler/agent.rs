@@ -262,6 +262,11 @@ impl Handler for AgentHandler {
         } else {
             format!("{preamble}\n\n{raw_prompt}")
         };
+        let output_schema = structured_output::parse_node_output_schema(node)?;
+        let prompt = match output_schema.as_ref() {
+            Some(schema) => structured_output::agent_prompt_with_output_schema(&prompt, schema),
+            None => prompt,
+        };
 
         let stage_scope = emit_stage_prompt(
             services,
@@ -373,16 +378,16 @@ impl Handler for AgentHandler {
             serde_json::json!(&response_text),
         );
 
-        if let Some(schema) = structured_output::parse_node_output_schema(node)? {
+        if let Some(schema) = output_schema.as_ref() {
             if let Ok(validated) = validate_agent_output_sources(
-                &schema,
+                schema,
                 &response_text,
                 &services.run.sandbox,
                 last_file_touched.as_deref(),
             )
             .await
             {
-                structured_output::apply_validated_output(node, &schema, &validated, &mut outcome);
+                structured_output::apply_validated_output(node, schema, &validated, &mut outcome);
             } else {
                 let mut failed =
                     structured_output::exhausted_failure_outcome(node.output_retries());
@@ -990,12 +995,23 @@ All checks passed.
     }
 
     #[tokio::test]
-    async fn codergen_handler_custom_output_schema_updates_output_context_key() {
+    async fn codergen_handler_exposes_custom_output_schema_and_updates_output_context_key() {
         struct CustomOutputBackend;
 
         #[async_trait]
         impl CodergenBackend for CustomOutputBackend {
-            async fn run(&self, _request: CodergenRunRequest<'_>) -> Result<CodergenResult, Error> {
+            async fn run(&self, request: CodergenRunRequest<'_>) -> Result<CodergenResult, Error> {
+                assert!(request.prompt.starts_with("Audit the result\n\n"));
+                assert!(request.prompt.contains("Fabro final-output contract"));
+                assert!(request.prompt.contains(
+                    "It applies only to your final response, not to intermediate tool calls."
+                ));
+                assert!(request.prompt.contains(r#""required":["passed"]"#));
+                assert!(
+                    request
+                        .prompt
+                        .contains("Do not ask the user to provide or choose the output shape.")
+                );
                 Ok(CodergenResult::Text {
                     text:              r#"{"passed": true}"#.to_string(),
                     usage:             None,
@@ -1008,6 +1024,10 @@ All checks passed.
 
         let handler = AgentHandler::new(Some(Box::new(CustomOutputBackend)));
         let mut node = Node::new("audit");
+        node.attrs.insert(
+            "prompt".to_string(),
+            AttrValue::String("Audit the result".to_string()),
+        );
         node.attrs.insert(
             "output_schema".to_string(),
             AttrValue::String(

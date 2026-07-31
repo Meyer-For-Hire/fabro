@@ -3690,7 +3690,8 @@ enabled = true
                 .body_includes(r#""stream":true"#)
                 .body_includes(r#""role":"assistant""#)
                 .body_includes("not json")
-                .body_includes("output_schema");
+                .body_includes("output_schema")
+                .body_includes(r#"\"required\":[\"passed\"]"#);
             then.status(200)
                 .header("content-type", "text/event-stream")
                 .body(chat_completion_stream(r#"{"passed":true}"#, 21, 4));

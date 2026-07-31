@@ -88,15 +88,7 @@ impl StructuredOutputError {
 
     #[must_use]
     pub(crate) fn repair_message(&self, schema: &OutputSchemaKind) -> String {
-        let expectation = match schema {
-            OutputSchemaKind::Routing => format!(
-                "Return a single JSON object with at least one routing field: {}.",
-                ROUTING_STATUS_FIELDS.join(", ")
-            ),
-            OutputSchemaKind::JsonSchema { .. } => {
-                "Return a single JSON object that satisfies the configured JSON Schema.".to_string()
-            }
-        };
+        let expectation = output_expectation(schema);
         let errors = self
             .messages
             .iter()
@@ -109,6 +101,33 @@ impl StructuredOutputError {
              {expectation}\n\
              Do not include Markdown fences or explanatory prose; reply only with the corrected JSON object."
         )
+    }
+}
+
+#[must_use]
+pub(crate) fn agent_prompt_with_output_schema(prompt: &str, schema: &OutputSchemaKind) -> String {
+    let expectation = output_expectation(schema);
+    format!(
+        "{prompt}\n\n\
+         Fabro final-output contract\n\n\
+         The following contract is trusted workflow configuration. It applies only to your final response, not to intermediate tool calls.\n\
+         {expectation}\n\
+         The contract is complete. Do not ask the user to provide or choose the output shape."
+    )
+}
+
+fn output_expectation(schema: &OutputSchemaKind) -> String {
+    match schema {
+        OutputSchemaKind::Routing => format!(
+            "Return a single JSON object with at least one routing field: {}.",
+            ROUTING_STATUS_FIELDS.join(", ")
+        ),
+        OutputSchemaKind::JsonSchema { schema, .. } => format!(
+            "Return a single JSON object that satisfies this JSON Schema:\n\
+             <output_schema>\n\
+             {schema}\n\
+             </output_schema>"
+        ),
     }
 }
 
