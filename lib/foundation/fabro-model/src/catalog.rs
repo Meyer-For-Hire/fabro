@@ -3100,6 +3100,72 @@ enabled = true
     }
 
     #[test]
+    fn builtin_deepseek_reasoning_controls_match_provider_dialects() {
+        let catalog = Catalog::from_builtin_with_overrides(&minimal_settings(
+            r"
+[providers.fireworks]
+enabled = true
+
+[providers.openrouter]
+enabled = true
+",
+        ))
+        .expect("DeepSeek gateway providers should build when enabled");
+
+        let expected = [
+            (ProviderId::new("deepseek"), "deepseek-v4-flash", vec![
+                ReasoningEffort::Low,
+                ReasoningEffort::High,
+                ReasoningEffort::Max,
+            ]),
+            (ProviderId::new("deepseek"), "deepseek-v4-pro", vec![
+                ReasoningEffort::High,
+                ReasoningEffort::Max,
+            ]),
+            (ProviderId::new("fireworks"), "deepseek-v4-flash", vec![
+                ReasoningEffort::High,
+                ReasoningEffort::Max,
+            ]),
+            (ProviderId::new("fireworks"), "deepseek-v4-pro", vec![
+                ReasoningEffort::High,
+                ReasoningEffort::Max,
+            ]),
+            (ProviderId::new("openrouter"), "deepseek-v4-flash", vec![
+                ReasoningEffort::Low,
+                ReasoningEffort::High,
+                ReasoningEffort::Max,
+            ]),
+            (ProviderId::new("openrouter"), "deepseek-v4-pro", vec![
+                ReasoningEffort::High,
+                ReasoningEffort::XHigh,
+            ]),
+        ];
+
+        for (provider, id, efforts) in expected {
+            let model = catalog
+                .get_on_provider(&provider, id)
+                .unwrap_or_else(|| panic!("{provider}/{id} should be present"));
+            assert!(model.features.reasoning, "{provider}/{id}");
+            assert_eq!(
+                model.features.reasoning_effort,
+                ReasoningEffortFeature::Levels,
+                "{provider}/{id}"
+            );
+            assert_eq!(model.controls.reasoning_effort, efforts, "{provider}/{id}");
+            assert!(!model.features.sampling_params, "{provider}/{id}");
+
+            let settings = catalog
+                .model_settings_on_provider(&provider, id)
+                .unwrap_or_else(|| panic!("{provider}/{id} settings should be present"));
+            assert!(settings.reasoning_by_default, "{provider}/{id}");
+            assert_eq!(
+                settings.controls.reasoning_effort, efforts,
+                "{provider}/{id}"
+            );
+        }
+    }
+
+    #[test]
     fn builtin_openrouter_provider_is_opt_in() {
         let openrouter = ProviderId::new("openrouter");
         let builtin = Catalog::builtin();
@@ -3154,6 +3220,12 @@ enabled = true
             catalog.settings_for(deepseek).unwrap().api_id,
             "deepseek/deepseek-v4-flash-0731"
         );
+        let deepseek_pro = catalog
+            .get_on_provider(&openrouter, "deepseek-v4-pro")
+            .expect("DeepSeek V4 Pro should be present on OpenRouter");
+        assert_eq!(deepseek_pro.limits.max_output, Some(384_000));
+        assert!(deepseek_pro.features.prompt_cache);
+        assert_eq!(deepseek_pro.costs.cache_input_cost_per_mtok, Some(0.003625));
         assert_eq!(
             catalog
                 .default_for_provider(&openrouter)
@@ -3962,7 +4034,7 @@ enabled = true
                 1_048_576,
                 384_000,
                 false,
-                false,
+                true,
                 0.14,
                 0.28,
                 0.028,

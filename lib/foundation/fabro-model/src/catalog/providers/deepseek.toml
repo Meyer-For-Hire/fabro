@@ -30,9 +30,13 @@ max_output = 384000
 tools = true
 vision = false
 reasoning = true
+reasoning_effort = "levels"
 reasoning_by_default = true
 prompt_cache = true
 sampling_params = false
+
+[providers.deepseek.models."deepseek-v4-flash".controls]
+reasoning_effort = ["low", "high", "max"]
 
 [providers.deepseek.models."deepseek-v4-flash".costs]
 input_cost_per_mtok = 0.14
@@ -51,9 +55,15 @@ max_output = 384000
 tools = true
 vision = false
 reasoning = true
+reasoning_effort = "levels"
 reasoning_by_default = true
 prompt_cache = true
 sampling_params = false
+
+[providers.deepseek.models."deepseek-v4-pro".controls]
+# V4 Pro currently maps low to high. Keep only its distinct effort levels;
+# DeepSeek says it plans to change Pro's mapping in early August 2026.
+reasoning_effort = ["high", "max"]
 
 [providers.deepseek.models."deepseek-v4-pro".costs]
 input_cost_per_mtok = 0.435

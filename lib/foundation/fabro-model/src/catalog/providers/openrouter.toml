@@ -419,16 +419,25 @@ family = "deepseek-v4"
 
 [providers.openrouter.models."deepseek-v4-pro".limits]
 context_window = 1050000
-max_output = 16384
+max_output = 384000
 
 [providers.openrouter.models."deepseek-v4-pro".features]
 tools = true
 vision = false
 reasoning = true
+reasoning_effort = "levels"
+reasoning_by_default = true
+prompt_cache = true
+sampling_params = false
+
+[providers.openrouter.models."deepseek-v4-pro".controls]
+# OpenRouter names DeepSeek's max tier xhigh on this route.
+reasoning_effort = ["high", "xhigh"]
 
 [providers.openrouter.models."deepseek-v4-pro".costs]
 input_cost_per_mtok = 0.435
 output_cost_per_mtok = 0.87
+cache_input_cost_per_mtok = 0.003625
 
 [providers.openrouter.models."deepseek-v4-flash"]
 api_id = "deepseek/deepseek-v4-flash-0731"
@@ -443,8 +452,14 @@ max_output = 384000
 [providers.openrouter.models."deepseek-v4-flash".features]
 tools = true
 vision = false
-reasoning = false
+reasoning = true
+reasoning_effort = "levels"
+reasoning_by_default = true
 prompt_cache = true
+sampling_params = false
+
+[providers.openrouter.models."deepseek-v4-flash".controls]
+reasoning_effort = ["low", "high", "max"]
 
 [providers.openrouter.models."deepseek-v4-flash".costs]
 input_cost_per_mtok = 0.14

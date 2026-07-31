@@ -44,7 +44,7 @@ pub(super) struct ChatMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content:           Option<ChatContent>,
     /// Reasoning/thinking content echoed back for providers that require it
-    /// (Kimi).
+    /// during tool-call continuations (including Kimi and DeepSeek).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

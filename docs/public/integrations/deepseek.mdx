@@ -70,6 +70,34 @@ digraph Example {
 }
 ```
 
+## Thinking and reasoning effort
+
+DeepSeek enables thinking by default at `high` effort. Fabro advertises only effort values that produce a distinct model behavior on each route:
+
+| Route | V4 Flash | V4 Pro |
+|---|---|---|
+| Direct DeepSeek | `low`, `high`, `max` | `high`, `max` |
+| Fireworks AI | `high`, `max` | `high`, `max` |
+| OpenRouter | `low`, `high`, `max` | `high`, `xhigh` |
+
+DeepSeek currently maps a V4 Pro request for `low` to `high`; its documentation says this mapping will change in early August 2026. Fireworks maps `low` and `medium` to `high`, and maps `xhigh` to `max`. OpenRouter names the Pro maximum tier `xhigh`.
+
+Fabro omits `temperature` and `top_p` for these models because DeepSeek ignores sampling parameters while thinking is enabled.
+
+To disable thinking on the direct provider, omit typed `reasoning_effort` and pass DeepSeek's native toggle through provider options:
+
+```json
+{
+  "provider_options": {
+    "deepseek": {
+      "thinking": { "type": "disabled" }
+    }
+  }
+}
+```
+
+DeepSeek requires `reasoning_content` from an assistant tool call to appear in every later request in that tool-use turn. Fabro captures this content and replays it with the assistant message. This keeps multi-step tool calls valid and prevents DeepSeek's HTTP 400 response for missing reasoning history.
+
 ## Prompt caching and pricing
 
 DeepSeek applies prefix caching automatically. Fabro reads DeepSeek's `prompt_cache_hit_tokens` usage field and reports cache-read tokens separately from uncached input tokens.
@@ -99,11 +127,14 @@ See the [Fireworks AI integration](/integrations/fireworks) and [OpenRouter inte
 
 ## Further reading
 
-<Columns cols={2}>
+<Columns cols={3}>
   <Card title="DeepSeek API" icon="code" href="https://api-docs.deepseek.com/">
     Official authentication, endpoints, and API reference.
   </Card>
   <Card title="Models and pricing" icon="money-bill" href="https://api-docs.deepseek.com/quick_start/pricing/">
     Official limits, features, and token prices.
+  </Card>
+  <Card title="Thinking mode" icon="brain" href="https://api-docs.deepseek.com/guides/thinking_mode/">
+    Official thinking toggles, effort mappings, and tool-call replay rules.
   </Card>
 </Columns>
