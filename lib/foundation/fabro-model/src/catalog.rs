@@ -4198,6 +4198,7 @@ enabled = true
                     .unwrap_or_else(|| panic!("'{id}' should resolve on provider '{provider}'"));
                 assert_eq!(model.id, id, "{provider}/{id}");
                 assert_eq!(model.provider, provider, "{provider}/{id}");
+                assert_eq!(model.limits.context_window, 1_048_576, "{provider}/{id}");
             }
             for alias in ["deepseek", "deepseek-v4", "deepseek-flash"] {
                 let model = catalog

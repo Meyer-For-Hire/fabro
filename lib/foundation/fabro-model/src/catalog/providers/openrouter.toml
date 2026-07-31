@@ -419,7 +419,7 @@ family = "deepseek-v4"
 agent_profile = "openai"
 
 [providers.openrouter.models."deepseek-v4-pro".limits]
-context_window = 1050000
+context_window = 1048576
 max_output = 384000
 
 [providers.openrouter.models."deepseek-v4-pro".features]
@@ -448,7 +448,7 @@ aliases = ["deepseek-v4", "deepseek", "deepseek-flash"]
 agent_profile = "openai"
 
 [providers.openrouter.models."deepseek-v4-flash".limits]
-context_window = 1050000
+context_window = 1048576
 max_output = 384000
 
 [providers.openrouter.models."deepseek-v4-flash".features]
