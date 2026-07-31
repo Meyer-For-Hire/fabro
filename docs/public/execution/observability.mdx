@@ -69,9 +69,11 @@ Only `id`, `ts`, `run_id`, and `event` are always present. Optional fields are o
 For runtime `for_each` branches, `parallel.branch.started` and
 `parallel.branch.completed` include the zero-based `index` and an optional
 `item_label`. They do not include the raw item. The final prompt is recorded by
-the existing `stage.prompt` event, including the fenced item data, so event
-streams, run dumps, and retained logs are source-bearing data. Apply the same
-access controls and retention policy you use for workflow inputs.
+the existing `stage.prompt` event, including the fenced item data. When its
+serialized text exceeds 100KB, the event contains a managed blob reference
+instead of inline text, and `fabro dump` resolves that reference. Event streams,
+run dumps, and retained logs are source-bearing data. Apply the same access
+controls and retention policy you use for workflow inputs.
 
 ## Reading the event stream
 

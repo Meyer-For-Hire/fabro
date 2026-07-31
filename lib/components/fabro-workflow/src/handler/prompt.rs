@@ -111,7 +111,8 @@ impl Handler for PromptHandler {
             &prompt,
             StageModelUsage::MODE_PROMPT,
             self.backend.as_deref(),
-        )?;
+        )
+        .await?;
 
         // 3. Call LLM backend (one_shot)
         let (response_text, stage_usage, backend_files_touched, timing) =

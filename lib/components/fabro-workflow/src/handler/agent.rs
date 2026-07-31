@@ -13,6 +13,7 @@ use super::structured_output::{
     self, OutputSchemaKind, StructuredOutputError, ValidatedStructuredOutput,
 };
 use super::{EngineServices, Handler, NodeTimeoutPolicy};
+use crate::artifact;
 use crate::context::{Context, WorkflowContext, keys};
 use crate::error::Error;
 use crate::event::{Emitter, Event, StageScope};
@@ -70,7 +71,7 @@ pub struct OneShotRequest<'a> {
 /// `provider`/`model` overrides over run-level defaults, and the backend's
 /// `EffectiveRequestControls` (or `Default::default()` when no backend is
 /// attached) — live in one place.
-pub(crate) fn emit_stage_prompt(
+pub(crate) async fn emit_stage_prompt(
     services: &EngineServices,
     context: &Context,
     node: &Node,
@@ -91,11 +92,12 @@ pub(crate) fn emit_stage_prompt(
         .map(|b| b.effective_request_controls(node))
         .transpose()?
         .unwrap_or_default();
+    let stored_prompt = artifact::offload_large_text(prompt, &services.run.run_store).await?;
     services.run.emitter.emit_scoped(
         &Event::Prompt {
             stage:            node.id.clone(),
             visit:            stage_scope.visit,
-            text:             prompt.to_string(),
+            text:             stored_prompt,
             mode:             Some(mode.to_string()),
             provider:         prompt_provider,
             model:            prompt_model,
@@ -270,7 +272,8 @@ impl Handler for AgentHandler {
             &prompt,
             StageModelUsage::MODE_AGENT,
             self.backend.as_deref(),
-        )?;
+        )
+        .await?;
         let agent_tool_runtime = fabro_agent::AgentToolRuntime::with_question_runtime(Arc::new(
             WorkflowAgentQuestionRuntime::new(
                 Arc::clone(&services.interviewer),
@@ -1491,5 +1494,38 @@ Some text in between.
             prompt_content.contains("Summarize"),
             "prompt.md should contain original prompt"
         );
+    }
+
+    #[tokio::test]
+    async fn codergen_handler_offloads_large_stage_prompt() {
+        let handler = AgentHandler::new(None);
+        let prompt = "x".repeat(101 * 1024);
+        let mut node = Node::new("report");
+        node.attrs
+            .insert("prompt".to_string(), AttrValue::String(prompt.clone()));
+        let context = test_context();
+        let graph = Graph::new("test");
+        let tmp = TempDir::new().unwrap();
+        let (services, run_store, logger) = make_services_with_run_store().await;
+
+        handler
+            .execute(&node, &context, &graph, tmp.path(), &services)
+            .await
+            .unwrap();
+        logger.flush().await;
+
+        let state = run_store.state().await.unwrap();
+        let node_state = state.stage(&StageId::new("report", 1)).unwrap();
+        let prompt_ref = node_state.prompt.as_deref().unwrap();
+        let blob_id = fabro_types::parse_blob_ref(prompt_ref)
+            .expect("large stage prompt should be stored as a blob reference");
+        let blob = run_store
+            .read_blob(&blob_id)
+            .await
+            .unwrap()
+            .expect("stage prompt blob should exist");
+        let stored_prompt: String = serde_json::from_slice(&blob).unwrap();
+
+        assert_eq!(stored_prompt, prompt);
     }
 }

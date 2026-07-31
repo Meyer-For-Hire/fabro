@@ -424,7 +424,7 @@ Emitted when a workflow node finishes execution.
 | `failure_signature` | string? | Dedup key for repeated failures |
 | `context_updates` | object? | Context delta written by this stage |
 | `jump_to_node` | string? | Non-edge jump target |
-| `context_values` | object? | Full context snapshot after the stage |
+| `context_values` | object? | Durable context snapshot after the stage; runtime-only keys such as `current.preamble` are omitted |
 | `node_visits` | object? | Node visit counts after the stage |
 | `loop_failure_signatures` | object? | Loop failure signature counts |
 | `restart_failure_signatures` | object? | Restart failure signature counts |
@@ -508,7 +508,7 @@ Emitted when a prompt is rendered for an LLM stage.
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `text` | string | Rendered prompt text |
+| `text` | string | Rendered prompt text, or a `blob://sha256/...` reference when the serialized text exceeds 100KB |
 
 ---
 
