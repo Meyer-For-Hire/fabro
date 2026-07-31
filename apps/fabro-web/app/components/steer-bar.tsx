@@ -57,7 +57,9 @@ export function SteerBar({
   ref,
 }: SteerBarProps) {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [collapsePreferred, setCollapsePreferred] = useState(false);
+  // Steering is an occasional control, so the dock starts collapsed and
+  // stays out of the way until the operator opens it.
+  const [collapsePreferred, setCollapsePreferred] = useState(true);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const steer = useSteerRun(runId);
   const interrupt = useInterruptRun(runId);

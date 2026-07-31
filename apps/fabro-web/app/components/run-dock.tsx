@@ -99,7 +99,23 @@ export function RunDockShell({
         className,
       )}
     >
-      <div className="flex shrink-0 items-center gap-2.5 px-5 py-2 sm:px-6">
+      {/* While collapsed, the whole bar expands on click. Clicks that land on
+          a button (Interrupt, the chevron) keep their own behavior. The
+          chevron button stays the keyboard/assistive-tech toggle. */}
+      <div
+        className={classNames(
+          "flex shrink-0 items-center gap-2.5 px-5 py-2 sm:px-6",
+          collapsed && "cursor-pointer",
+        )}
+        onClick={
+          collapsed
+            ? (event) => {
+                if ((event.target as HTMLElement).closest("button")) return;
+                onCollapsedChange(false);
+              }
+            : undefined
+        }
+      >
         <StatusDot tone={tone} />
         {/* A live region: the dock changing to a state that needs the
             operator has to reach assistive tech, not only the eye. */}

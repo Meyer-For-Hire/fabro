@@ -9,7 +9,7 @@ import {
 import TestRenderer, { act } from "react-test-renderer";
 
 import { setupReactTestEnv } from "../lib/test-utils";
-import { DockComposer } from "./run-dock";
+import { DockComposer, RunDockShell } from "./run-dock";
 
 const mountedRenderers: TestRenderer.ReactTestRenderer[] = [];
 let teardownReactEnv: (() => void) | undefined;
@@ -24,6 +24,60 @@ afterEach(() => {
   }
   teardownReactEnv?.();
   teardownReactEnv = undefined;
+});
+
+describe("RunDockShell", () => {
+  function mountShell(
+    collapsed: boolean,
+    onCollapsedChange: (collapsed: boolean) => void,
+  ) {
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(
+        <RunDockShell
+          label="Steer running agent"
+          tone="idle"
+          status="Steering"
+          collapsed={collapsed}
+          onCollapsedChange={onCollapsedChange}
+          actions={<div />}
+        />,
+      );
+    });
+    mountedRenderers.push(renderer);
+    return renderer;
+  }
+
+  function clickableDivs(renderer: TestRenderer.ReactTestRenderer) {
+    return renderer.root.findAll(
+      (node) => node.type === "div" && node.props.onClick !== undefined,
+    );
+  }
+
+  test("the whole collapsed bar is a click target that expands it", () => {
+    const onCollapsedChange = mock((_collapsed: boolean) => undefined);
+    const renderer = mountShell(true, onCollapsedChange);
+
+    const [header] = clickableDivs(renderer);
+    expect(header).toBeDefined();
+    act(() => header.props.onClick({ target: { closest: () => null } }));
+    expect(onCollapsedChange).toHaveBeenCalledWith(false);
+  });
+
+  test("clicks on header buttons do not also expand the bar", () => {
+    const onCollapsedChange = mock((_collapsed: boolean) => undefined);
+    const renderer = mountShell(true, onCollapsedChange);
+
+    const [header] = clickableDivs(renderer);
+    act(() => header.props.onClick({ target: { closest: () => ({}) } }));
+    expect(onCollapsedChange).not.toHaveBeenCalled();
+  });
+
+  test("the expanded header is not a click target", () => {
+    const onCollapsedChange = mock((_collapsed: boolean) => undefined);
+    const renderer = mountShell(false, onCollapsedChange);
+    expect(clickableDivs(renderer)).toHaveLength(0);
+  });
 });
 
 describe("DockComposer", () => {
