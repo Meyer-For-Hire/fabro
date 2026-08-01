@@ -3546,6 +3546,23 @@ async fn post_run_manifest(app: &Router, manifest: serde_json::Value) -> serde_j
 }
 
 #[tokio::test]
+async fn post_runs_ignores_removed_run_id_input() {
+    let app = crate::test_support::build_test_router(test_app_state());
+    let submitted_run_id = RunId::new();
+    let mut manifest = minimal_manifest_json(MINIMAL_DOT);
+    manifest["run_id"] = json!(submitted_run_id.to_string());
+
+    let created = post_run_manifest(&app, manifest).await;
+    let allocated_run_id = created["id"]
+        .as_str()
+        .expect("create response should contain an id")
+        .parse::<RunId>()
+        .expect("create response id should be valid");
+
+    assert_ne!(allocated_run_id, submitted_run_id);
+}
+
+#[tokio::test]
 async fn post_runs_create_regression_keeps_api_behavior_without_automation_metadata() {
     let state = TestAppStateBuilder::new()
         .env_lookup(|_| None)

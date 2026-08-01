@@ -27,8 +27,6 @@ use httpmock::{Mock, MockServer};
 use serde_json::Value;
 use shlex::try_quote;
 
-use crate::support::unique_run_id;
-
 const LOCAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const CI_COMMAND_TIMEOUT: Duration = Duration::from_secs(90);
 static NEXT_SEEDED_EVENT_ID: AtomicU64 = AtomicU64::new(1);
@@ -953,10 +951,8 @@ async fn create_seeded_run(
     args: serde_json::Value,
     git: Option<serde_json::Value>,
 ) -> RunSetup {
-    let run_id = unique_run_id();
     let mut manifest = serde_json::json!({
         "version": 1,
-        "run_id": run_id.as_str(),
         "cwd": context.temp_dir.display().to_string(),
         "target": {
             "identifier": target_path,
@@ -993,11 +989,12 @@ async fn create_seeded_run(
         .json()
         .await
         .expect("seeded run create response should parse");
-    assert_eq!(
-        body["id"].as_str(),
-        Some(run_id.as_str()),
-        "seeded run should use requested run id"
-    );
+    let run_id = body["id"]
+        .as_str()
+        .expect("seeded run create response should contain an id")
+        .parse::<RunId>()
+        .expect("seeded run create response id should be valid")
+        .to_string();
 
     RunSetup {
         run_dir: context.find_run_dir(&run_id),

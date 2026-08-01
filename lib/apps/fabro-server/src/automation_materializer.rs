@@ -346,7 +346,6 @@ mod tests {
         })
         .expect("manifest should build from checkout");
 
-        assert_eq!(materialized.manifest.run_id, None);
         assert_eq!(materialized.manifest.cwd, checkout.display().to_string());
         assert_eq!(
             materialized.manifest.target.path,

@@ -251,7 +251,6 @@ pub fn build_run_manifest(input: ManifestBuildInput) -> Result<BuiltManifest> {
             git,
             goal,
             parent_id: None,
-            run_id: None,
             title: None,
             target: types::ManifestTarget {
                 identifier: input.workflow.display().to_string(),
