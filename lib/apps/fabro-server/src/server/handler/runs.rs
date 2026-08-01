@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use anyhow::Context as _;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -13,25 +15,25 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use fabro_api::types::{
-    BoardColumn, RunManifest, SubmitAnswerRequest, UpdateRunParentRequest, UpdateRunRequest,
+    BoardColumn, ManifestConfigType, ManifestGoalType, RunManifest, SubmitAnswerRequest,
+    UpdateRunParentRequest, UpdateRunRequest,
 };
-use fabro_config::Storage;
+use fabro_config::{CliLayer, RunLayer, Storage};
 use fabro_interview::AnswerSubmission;
 use fabro_llm::client::Client as LlmClient;
 use fabro_store::{
     RunSummaryListQuery, RunSummarySort, RunSummarySortDirection, RunSummaryVisibility,
 };
-use fabro_types::settings::ResolveError;
 use fabro_types::{
-    AutomationRef, Principal, Run, RunClientProvenance, RunId, RunProvenance, RunServerProvenance,
-    RunStatusKind, StageContextWindow, StageContextWindowStaleness,
+    AutomationRef, ManifestPath, Principal, Run, RunClientProvenance, RunId, RunProvenance,
+    RunServerProvenance, RunStatusKind, StageContextWindow, StageContextWindowStaleness,
     StageContextWindowUnavailableReason, StageHandler, StageModelUsage, StageProjection,
-    SystemActorKind, WorkflowSettings, parse_blob_ref,
+    SystemActorKind, parse_blob_ref,
 };
 use fabro_util::version::FABRO_VERSION;
-use fabro_util::workspace_glob::{WorkspaceGlob, WorkspaceGlobError};
 use fabro_workflow::command_log::{command_log_path, read_json_string_blob, read_log_slice};
 use fabro_workflow::run_status::RunStatus;
+use fabro_workflow::workflow_bundle::WorkflowBundle;
 use fabro_workflow::{Error as WorkflowError, operations};
 use strum::VariantArray as _;
 use tokio::fs;
@@ -47,6 +49,9 @@ use crate::error::ApiError;
 use crate::principal_middleware::{
     RequireCommandLog, RequireRunManagementTarget, RequireRunScoped, RequireRunStageScoped,
     RequiredRunManagementActor, RequiredUser,
+};
+use crate::run_compiler::{
+    self, ProjectSettingsPathError, ProjectSettingsSource, RawRunCompilerInput, RunCompilerError,
 };
 use crate::run_files::{list_run_commits, list_run_files};
 use crate::run_manifest;
@@ -552,6 +557,143 @@ pub(crate) struct CreateRunFromManifestRequest {
     pub(crate) automation:               Option<AutomationRef>,
 }
 
+struct ManifestRunCompilerAdapter {
+    workflow_bundle:      WorkflowBundle,
+    entrypoint:           ManifestPath,
+    cwd:                  PathBuf,
+    project_settings:     Vec<ProjectSettingsSource>,
+    user_toml:            Vec<String>,
+    run_overrides:        Option<RunLayer>,
+    cli_overrides:        Option<CliLayer>,
+    input_overrides:      HashMap<String, toml::Value>,
+    inline_goal_override: Option<String>,
+}
+
+fn adapt_manifest_source_for_run_compiler(
+    manifest: &RunManifest,
+) -> anyhow::Result<ManifestRunCompilerAdapter> {
+    if manifest.version != 1 {
+        anyhow::bail!("unsupported manifest version {}", manifest.version);
+    }
+    let cwd = PathBuf::from(&manifest.cwd);
+    let entrypoint = ManifestPath::from_wire(&manifest.target.path)
+        .ok_or_else(|| anyhow::anyhow!("invalid manifest target path: {}", manifest.target.path))?;
+    let workflow_bundle = run_manifest::workflow_bundle_from_manifest(&manifest.workflows)?;
+    if workflow_bundle.workflow(&entrypoint).is_none() {
+        anyhow::bail!("manifest target path is missing from workflows map");
+    }
+    let overrides = run_manifest::manifest_args_overrides(manifest.args.as_ref())
+        .context("failed to parse manifest args")?;
+    let project_settings = manifest
+        .configs
+        .iter()
+        .filter(|config| config.type_ == ManifestConfigType::Project)
+        .filter_map(|config| config.source.as_ref().map(|source| (config, source)))
+        .map(|(config, source)| ProjectSettingsSource {
+            path: normalize_project_settings_path(config.path.as_deref(), &cwd),
+            toml: source.clone(),
+        })
+        .collect();
+    let user_toml = manifest
+        .configs
+        .iter()
+        .filter(|config| config.type_ == ManifestConfigType::User)
+        .filter_map(|config| config.source.clone())
+        .collect();
+    let inline_goal_override = manifest
+        .goal
+        .as_ref()
+        .filter(|goal| goal.type_ != ManifestGoalType::Graph)
+        .map(|goal| goal.text.clone());
+
+    Ok(ManifestRunCompilerAdapter {
+        workflow_bundle,
+        entrypoint,
+        cwd,
+        project_settings,
+        user_toml,
+        run_overrides: overrides.run,
+        cli_overrides: overrides.cli,
+        input_overrides: overrides.input_overrides,
+        inline_goal_override,
+    })
+}
+
+fn normalize_project_settings_path(
+    path: Option<&str>,
+    cwd: &std::path::Path,
+) -> Result<ManifestPath, ProjectSettingsPathError> {
+    let path = path.ok_or(ProjectSettingsPathError::Missing)?;
+    let path_ref = std::path::Path::new(path);
+    let manifest_path = if path_ref.is_absolute() {
+        ManifestPath::from_absolute(path_ref, cwd)
+    } else {
+        ManifestPath::from_wire(path)
+    };
+    manifest_path.ok_or_else(|| ProjectSettingsPathError::Invalid {
+        path: path.to_string(),
+    })
+}
+
+struct ManifestRunIdentity {
+    run_id:    Option<RunId>,
+    parent_id: Option<RunId>,
+    title:     Option<String>,
+}
+
+fn manifest_run_identity(
+    manifest: &RunManifest,
+    explicit_run_id: Option<RunId>,
+) -> anyhow::Result<ManifestRunIdentity> {
+    let title = manifest
+        .title
+        .as_ref()
+        .map(|title| fabro_types::normalize_explicit_run_title(title.as_str()))
+        .transpose()?;
+    let manifest_run_id = manifest
+        .run_id
+        .as_deref()
+        .map(str::parse::<RunId>)
+        .transpose()
+        .context("invalid run ID")?;
+    let parent_id = manifest
+        .parent_id
+        .as_deref()
+        .map(str::parse::<RunId>)
+        .transpose()
+        .context("invalid parent run ID")?;
+    Ok(ManifestRunIdentity {
+        run_id: explicit_run_id.or(manifest_run_id),
+        parent_id,
+        title,
+    })
+}
+
+/// Map a [`RunCompilerError`] onto the create endpoint's pre-extraction wire
+/// contract. The 400 details for source, settings, and interpolation errors
+/// are the error types' own `Display` strings, which are pinned to the
+/// legacy messages.
+fn run_compiler_error_response(error: RunCompilerError) -> Response {
+    match error {
+        RunCompilerError::InvalidSource(_)
+        | RunCompilerError::InvalidSettings(_)
+        | RunCompilerError::VariableInterpolation(_) => {
+            ApiError::bad_request(error.to_string()).into_response()
+        }
+        RunCompilerError::Workflow(
+            WorkflowError::ValidationFailed { .. } | WorkflowError::Parse(_),
+        ) => ApiError::bad_request("Validation failed").into_response(),
+        RunCompilerError::Workflow(
+            err @ (WorkflowError::ModelSelection(_) | WorkflowError::ModelReference(_)),
+        ) => ApiError::bad_request(err.to_string()).into_response(),
+        RunCompilerError::Workflow(err) => ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to persist run state: {err}"),
+        )
+        .into_response(),
+    }
+}
+
 pub(crate) async fn create_run_from_manifest(
     state: Arc<AppState>,
     request: CreateRunFromManifestRequest,
@@ -568,14 +710,42 @@ pub(crate) async fn create_run_from_manifest(
     let manifest_run_defaults = state.manifest_run_defaults();
     let manifest_environment_defaults = state.environment_store().catalog_layer();
     let manifest_mcp_server_catalog = state.mcp_server_store().catalog_settings();
-    let mut prepared = match run_manifest::prepare_manifest_with_environment_defaults(
-        manifest_run_defaults.as_ref(),
-        manifest_environment_defaults.as_ref(),
-        &manifest_mcp_server_catalog,
-        &manifest,
-    ) {
-        Ok(prepared) => prepared,
+    let manifest_adapter = match adapt_manifest_source_for_run_compiler(&manifest) {
+        Ok(adapter) => adapter,
         Err(err) => return ApiError::bad_request(err.to_string()).into_response(),
+    };
+    let title_generation_target = manifest_adapter.entrypoint.clone();
+    let raw_compiler_input = RawRunCompilerInput {
+        workflow_bundle: manifest_adapter.workflow_bundle,
+        entrypoint: manifest_adapter.entrypoint,
+        cwd: manifest_adapter.cwd,
+        server_run_defaults: manifest_run_defaults.as_ref().clone(),
+        server_environment_defaults: manifest_environment_defaults.as_ref().clone(),
+        server_mcp_catalog: manifest_mcp_server_catalog,
+        project_settings: manifest_adapter.project_settings,
+        user_toml: manifest_adapter.user_toml,
+        run_overrides: manifest_adapter.run_overrides,
+        cli_overrides: manifest_adapter.cli_overrides,
+        input_overrides: manifest_adapter.input_overrides,
+        inline_goal_override: manifest_adapter.inline_goal_override,
+        run_id: None,
+        title: None,
+        parent_id: None,
+        git: manifest.git.clone(),
+        storage_root: state.server_storage_dir(),
+        workflow_slug: None,
+        provenance: run_provenance(&headers, &actor),
+        web_url: None,
+        submitted_manifest_bytes: Some(submitted_manifest_bytes),
+        automation,
+    };
+    let normalized = match run_compiler::normalize_source(raw_compiler_input) {
+        Ok(normalized) => normalized,
+        Err(err) => return run_compiler_error_response(err),
+    };
+    let layered = match run_compiler::layer_settings(normalized) {
+        Ok(layered) => layered,
+        Err(err) => return run_compiler_error_response(err),
     };
     let vars = match snapshot_run_variables(&state).await {
         Ok(vars) => vars,
@@ -584,20 +754,24 @@ pub(crate) async fn create_run_from_manifest(
                 .into_response();
         }
     };
-    if let Err(err) = substitute_run_variables(&vars, &mut prepared.settings) {
-        return ApiError::bad_request(format!("Run config variable interpolation failed: {err}"))
-            .into_response();
-    }
-    let run_id = explicit_run_id
-        .or(prepared.run_id)
-        .unwrap_or_else(RunId::new);
-    let provider = run_manifest::effective_sandbox_provider(&prepared.settings.run);
+    let prepared = match run_compiler::apply_run_variables(layered, vars) {
+        Ok(prepared) => prepared,
+        Err(err) => return run_compiler_error_response(err),
+    };
+    let identity = match manifest_run_identity(&manifest, explicit_run_id) {
+        Ok(identity) => identity,
+        Err(err) => return ApiError::bad_request(err.to_string()).into_response(),
+    };
+    let prepared = prepared.with_identity(identity.run_id, identity.parent_id, identity.title);
+    let (prepared, run_id) = prepared.resolve_run_id();
+    let prepared = prepared.with_web_url(state.run_web_url(&run_id));
+    let provider = run_manifest::effective_sandbox_provider(&prepared.settings().run);
     if let Some(error) =
         run_manifest::sandbox_provider_policy_error(&state.server_settings(), provider)
     {
         return ApiError::bad_request(error).into_response();
     }
-    if let Some(parent_id) = prepared.parent_id {
+    if let Some(parent_id) = prepared.parent_id() {
         if parent_id == run_id {
             return ApiError::bad_request("A run cannot be its own parent.").into_response();
         }
@@ -607,7 +781,6 @@ pub(crate) async fn create_run_from_manifest(
     }
     info!(run_id = %run_id, "Run created");
 
-    let web_url = state.run_web_url(&run_id);
     let catalog = state.catalog();
     // Resolve once: we need both the provider IDs (for the run create input
     // and ask-fabro-readiness) and the LLM client itself (for the spawned
@@ -628,34 +801,21 @@ pub(crate) async fn create_run_from_manifest(
             ready_provider_ids.clone()
         }
     };
-    let provenance = run_provenance(&headers, &actor);
-    let mut create_input = run_manifest::create_run_input(
-        prepared.clone(),
-        run_materialization_provider_ids,
-        provenance,
-        web_url.clone(),
-        vars,
-    );
-    create_input.run_id = Some(run_id);
-    create_input.submitted_manifest_bytes = Some(submitted_manifest_bytes);
-    create_input.automation = automation;
-
-    let storage_root = state.server_storage_dir();
-    let created = match Box::pin(operations::create(
+    let pinned =
+        match run_compiler::compile_and_pin(prepared, run_materialization_provider_ids, catalog)
+            .await
+        {
+            Ok(pinned) => pinned,
+            Err(err) => return run_compiler_error_response(err),
+        };
+    let persistence_input = run_compiler::assemble_run(pinned);
+    let created = match Box::pin(operations::persist_create_run(
         state.stores.runs.as_ref(),
-        create_input,
-        storage_root,
-        catalog,
+        persistence_input,
     ))
     .await
     {
         Ok(created) => created,
-        Err(WorkflowError::ValidationFailed { .. } | WorkflowError::Parse(_)) => {
-            return ApiError::bad_request("Validation failed").into_response();
-        }
-        Err(err @ (WorkflowError::ModelSelection(_) | WorkflowError::ModelReference(_))) => {
-            return ApiError::bad_request(err.to_string()).into_response();
-        }
         Err(err) => {
             return ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -699,7 +859,7 @@ pub(crate) async fn create_run_from_manifest(
             let run_spec = created.persisted.run_spec();
             let workflow = run_title_generation::workflow_summary(&run_spec.graph);
             let run_inputs = run_spec.settings.run.inputs.clone();
-            let workflow_target = prepared.target_path.to_string();
+            let workflow_target = title_generation_target.to_string();
             let title_catalog = state.catalog();
             let title_model = title_catalog.small_default_for_configured_ids(&ready_provider_ids);
             let title_model_id = title_model.id.clone();
@@ -844,7 +1004,7 @@ async fn run_preflight(
                 .into_response();
         }
     };
-    if let Err(err) = substitute_run_variables(&vars, &mut prepared.settings) {
+    if let Err(err) = run_compiler::substitute_run_variables(&vars, &mut prepared.settings) {
         return ApiError::bad_request(format!("Run config variable interpolation failed: {err}"))
             .into_response();
     }
@@ -897,7 +1057,7 @@ async fn validate_run_manifest(
                 .into_response();
         }
     };
-    if let Err(err) = substitute_run_variables(&vars, &mut prepared.settings) {
+    if let Err(err) = run_compiler::substitute_run_variables(&vars, &mut prepared.settings) {
         return ApiError::bad_request(format!("Run config variable interpolation failed: {err}"))
             .into_response();
     }
@@ -923,33 +1083,6 @@ async fn snapshot_run_variables(
     state: &AppState,
 ) -> Result<HashMap<String, String>, VariableError> {
     state.stores.variables.value_map().await
-}
-
-#[derive(Debug, thiserror::Error)]
-enum RunVariableSubstitutionError {
-    #[error(transparent)]
-    Interpolation(#[from] ResolveError),
-
-    #[error("run.artifacts.include[{index}]: {source}")]
-    ArtifactGlob {
-        index:  usize,
-        #[source]
-        source: WorkspaceGlobError,
-    },
-}
-
-fn substitute_run_variables(
-    variables: &HashMap<String, String>,
-    settings: &mut WorkflowSettings,
-) -> Result<(), RunVariableSubstitutionError> {
-    settings
-        .run
-        .substitute_variables(|name| variables.get(name).cloned())?;
-    for (index, pattern) in settings.run.artifacts.include.iter().enumerate() {
-        WorkspaceGlob::try_new(pattern)
-            .map_err(|source| RunVariableSubstitutionError::ArtifactGlob { index, source })?;
-    }
-    Ok(())
 }
 
 async fn get_run_status(
@@ -1253,27 +1386,4 @@ fn build_command_log_response(
         live_streaming,
     })
     .into_response()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rejects_artifact_glob_that_becomes_unsafe_after_interpolation() {
-        let variables = HashMap::from([("PATTERN".to_string(), "../outside/**".to_string())]);
-        let mut settings = WorkflowSettings::default();
-        settings.run.artifacts.include = vec!["{{ vars.PATTERN }}".to_string()];
-
-        let error = substitute_run_variables(&variables, &mut settings)
-            .expect_err("interpolated parent traversal should be rejected");
-
-        assert!(matches!(
-            error,
-            RunVariableSubstitutionError::ArtifactGlob {
-                index:  0,
-                source: WorkspaceGlobError::ParentTraversal { .. },
-            }
-        ));
-    }
 }

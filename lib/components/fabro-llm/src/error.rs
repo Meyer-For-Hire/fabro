@@ -316,6 +316,9 @@ pub fn error_from_status_code(
             };
         }
         413 => ProviderErrorKind::ContextLength,
+        429 if detail.error_code.as_deref() == Some("exceeded_current_quota_error") => {
+            ProviderErrorKind::QuotaExceeded
+        }
         429 => ProviderErrorKind::RateLimit,
         500..=599 => ProviderErrorKind::Server,
         // For ambiguous status codes (400, 422, etc.), use message-based classification
@@ -601,6 +604,22 @@ mod tests {
             ..
         }));
         assert!(err.retryable());
+    }
+
+    #[test]
+    fn exceeded_current_quota_error_is_non_retryable_quota_failure() {
+        let err = error_from_status_code(
+            429,
+            "Your account is suspended due to insufficient balance".into(),
+            "kimi".into(),
+            Some("exceeded_current_quota_error".into()),
+            None,
+            None,
+        );
+
+        assert_eq!(err.provider_kind(), Some(ProviderErrorKind::QuotaExceeded));
+        assert!(!err.retryable());
+        assert!(err.failover_eligible());
     }
 
     #[test]

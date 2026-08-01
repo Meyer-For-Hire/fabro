@@ -1,19 +1,24 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use fabro_tool::fabro_client::ClientBackend;
 use fabro_tool::{self as run_tools, FabroToolBackend};
+use fabro_util::version::FABRO_VERSION;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::transport::stdio;
 use rmcp::{ErrorData, ServerHandler, serve_server, tool, tool_handler, tool_router};
 use serde::Serialize;
 use tokio::sync::OnceCell;
+use tokio::time;
+use tracing::warn;
 
-use crate::FabroMcpServerSettings;
+use crate::executable_monitor::ExecutableMonitor;
 use crate::manifest_builder::McpRunManifestBuilder;
+use crate::{FabroMcpServerSettings, SERVER_NAME};
 
 #[derive(Clone)]
 pub(crate) struct FabroMcpServer {
@@ -23,10 +28,44 @@ pub(crate) struct FabroMcpServer {
     tool_router: ToolRouter<Self>,
 }
 
+/// How long to wait for the MCP service to stop after an upgrade is detected.
+/// The wait is bounded because the transport closes by writing to stdout, which
+/// blocks if the host has stopped reading.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub async fn start(settings: FabroMcpServerSettings) -> Result<()> {
-    let server = FabroMcpServer::new(Arc::new(settings));
-    let service = serve_server(server, stdio()).await?;
-    service.waiting().await?;
+    let monitor = match ExecutableMonitor::current() {
+        Ok(monitor) => Some(monitor),
+        Err(error) => {
+            warn!(
+                %error,
+                "Upgrade detection is unavailable; this MCP server will keep running after an \
+                 upgrade replaces it"
+            );
+            None
+        }
+    };
+    let service = serve_server(FabroMcpServer::new(Arc::new(settings)), stdio()).await?;
+    let Some(monitor) = monitor else {
+        service.waiting().await?;
+        return Ok(());
+    };
+
+    let cancellation = service.cancellation_token();
+    let mut service_wait = Box::pin(service.waiting());
+    tokio::select! {
+        result = &mut service_wait => {
+            result?;
+        }
+        () = monitor.wait_until_replaced() => {
+            // An upgrade replaced the executable, so stop serving and let the
+            // host reconnect to the new one. The CLI exits the process rather
+            // than returning, because Tokio's stdin worker stays blocked on a
+            // read that only the host can end.
+            cancellation.cancel();
+            let _ = time::timeout(SHUTDOWN_TIMEOUT, service_wait).await;
+        }
+    }
     Ok(())
 }
 
@@ -34,6 +73,7 @@ pub async fn start(settings: FabroMcpServerSettings) -> Result<()> {
 impl ServerHandler for FabroMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new(SERVER_NAME, FABRO_VERSION).with_title("Fabro"))
             .with_instructions("Use these tools to create, inspect, control, wait for, and read events from Fabro workflow runs.")
     }
 }
@@ -250,6 +290,22 @@ mod tests {
 
     use super::*;
     use crate::FabroMcpServerSettings;
+
+    #[test]
+    fn server_info_reports_fabro_version() {
+        let settings = FabroMcpServerSettings {
+            cwd:            PathBuf::from("."),
+            config_path:    PathBuf::from("fabro.toml"),
+            client_factory: Arc::new(|| {
+                Box::pin(async { panic!("client should not be constructed while reading info") })
+            }),
+        };
+        let info = FabroMcpServer::new(Arc::new(settings)).get_info();
+
+        assert_eq!(info.server_info.name, "fabro");
+        assert_eq!(info.server_info.title.as_deref(), Some("Fabro"));
+        assert_eq!(info.server_info.version, FABRO_VERSION);
+    }
 
     #[test]
     fn fabro_run_pair_tool_is_registered_with_stage_based_schema() {

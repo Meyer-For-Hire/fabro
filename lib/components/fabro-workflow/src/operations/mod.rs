@@ -14,7 +14,12 @@ pub use archive::{
     ArchiveOutcome, UnarchiveOutcome, archive, archived_rejection_message, ensure_not_archived,
     unarchive,
 };
-pub use create::{CreateRunInput, CreatedRun, create, make_run_dir};
+pub use create::{
+    CompiledRun, CreateRunCompileInput, CreateRunInput, CreateRunPersistenceInput,
+    CreateRunPersistenceMetadata, CreatedRun, MaterializedRun,
+    assemble_create_run_persistence_input, compile_create_run, create, make_run_dir,
+    materialize_create_run, persist_create_run,
+};
 pub use fork::{ForkOutcome, ForkRunInput, ResolvedForkTarget, fork_run};
 pub use resume::resume;
 pub use retry::{RetryOutcome, RetryRunInput, retry_run};

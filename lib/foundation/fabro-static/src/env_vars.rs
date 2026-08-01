@@ -48,6 +48,7 @@ impl EnvVars {
     pub const BEDROCK_API_KEY: &'static str = "BEDROCK_API_KEY";
     pub const BRAVE_SEARCH_API_KEY: &'static str = "BRAVE_SEARCH_API_KEY";
     pub const CHATGPT_ACCOUNT_ID: &'static str = "CHATGPT_ACCOUNT_ID";
+    pub const DEEPSEEK_API_KEY: &'static str = "DEEPSEEK_API_KEY";
     pub const FIREWORKS_API_KEY: &'static str = "FIREWORKS_API_KEY";
     pub const GEMINI_API_KEY: &'static str = "GEMINI_API_KEY";
     pub const GEMINI_BASE_URL: &'static str = "GEMINI_BASE_URL";
@@ -199,6 +200,7 @@ mod tests {
             EnvVars::BEDROCK_API_KEY,
             EnvVars::BRAVE_SEARCH_API_KEY,
             EnvVars::CHATGPT_ACCOUNT_ID,
+            EnvVars::DEEPSEEK_API_KEY,
             EnvVars::FIREWORKS_API_KEY,
             EnvVars::GEMINI_API_KEY,
             EnvVars::GEMINI_BASE_URL,

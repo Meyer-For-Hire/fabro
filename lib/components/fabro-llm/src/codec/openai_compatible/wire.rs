@@ -44,7 +44,7 @@ pub(super) struct ChatMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content:           Option<ChatContent>,
     /// Reasoning/thinking content echoed back for providers that require it
-    /// (Kimi).
+    /// during tool-call continuations (including Kimi and DeepSeek).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -300,6 +300,10 @@ pub(super) struct ApiUsage {
     pub cost: Option<f64>,
     #[serde(default)]
     pub prompt_tokens_details: Option<PromptTokensDetails>,
+    /// DeepSeek-specific top-level count of prompt tokens served from its
+    /// automatic context cache.
+    #[serde(default)]
+    pub prompt_cache_hit_tokens: Option<i64>,
     #[serde(default)]
     pub completion_tokens_details: Option<CompletionTokensDetails>,
 }
@@ -329,6 +333,7 @@ impl ApiUsage {
             .prompt_tokens_details
             .as_ref()
             .and_then(|d| d.cached_tokens)
+            .or(self.prompt_cache_hit_tokens)
             .unwrap_or(0);
         let cache_write_detail = self
             .prompt_tokens_details
@@ -534,6 +539,23 @@ mod tests {
             input_tokens: 53,
             output_tokens: 0,
             reasoning_tokens: 59,
+            ..TokenCounts::default()
+        });
+    }
+
+    #[test]
+    fn token_counts_accept_deepseek_cache_hit_field() {
+        let usage: ApiUsage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 53,
+            "completion_tokens": 11,
+            "prompt_cache_hit_tokens": 41
+        }))
+        .unwrap();
+
+        assert_eq!(usage.token_counts(), TokenCounts {
+            input_tokens: 12,
+            output_tokens: 11,
+            cache_read_tokens: 41,
             ..TokenCounts::default()
         });
     }

@@ -407,6 +407,22 @@ mod tests {
     }
 
     #[test]
+    fn streamed_tool_use_names_are_preserved_verbatim() {
+        let mut d = decoder();
+        feed(&mut d, "messageStart", r#"{"role":"assistant"}"#);
+        feed(
+            &mut d,
+            "contentBlockStart",
+            r#"{"start":{"toolUse":{"toolUseId":"tool-1","name":"search???"}},"contentBlockIndex":0}"#,
+        );
+        let stop = feed(&mut d, "contentBlockStop", r#"{"contentBlockIndex":0}"#);
+        let StreamEvent::ToolCallEnd { tool_call } = &stop[0] else {
+            panic!("expected ToolCallEnd");
+        };
+        assert_eq!(tool_call.name, "search???");
+    }
+
+    #[test]
     fn tool_use_accumulates_string_input_fragments() {
         let mut d = decoder();
         feed(&mut d, "messageStart", r#"{"role":"assistant"}"#);

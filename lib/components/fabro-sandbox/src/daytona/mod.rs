@@ -3305,7 +3305,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn check_daytona_api_key_with_accepts_full_scopes() {
+    async fn check_daytona_api_key_with_accepts_full_scopes_and_new_scopes() {
         let server = MockServer::start_async().await;
         let auth = mock_auth_probe(&server, 200).await;
         let current_key = mock_current_key(&server, vec![
@@ -3313,6 +3313,9 @@ mod tests {
             "delete:snapshots",
             "write:sandboxes",
             "delete:sandboxes",
+            "manage:secrets",
+            "read:limits",
+            "manage:sso",
         ])
         .await;
 

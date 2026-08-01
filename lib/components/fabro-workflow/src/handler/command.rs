@@ -289,7 +289,7 @@ fn schema_validation_failure_reason(
     let mut reason = format!("Script output failed output_schema validation: {script}");
     for message in error.messages() {
         reason.push_str("\n- ");
-        reason.push_str(message);
+        reason.push_str(&message);
     }
     append_output_tail(&mut reason, output_text);
     reason

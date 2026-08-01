@@ -58,7 +58,6 @@ pub fn run_tool_manifest_args(spec: &ValidatedCreateRunSpec) -> Option<types::Ma
 
     let payload = types::ManifestArgs {
         auto_approve: spec.auto_approve.filter(|value| *value),
-        docker_image: None,
         dry_run: spec.dry_run.filter(|value| *value),
         input,
         label,
@@ -77,7 +76,6 @@ pub fn run_tool_run_overrides(spec: &ValidatedCreateRunSpec) -> Option<RunLayer>
         model:            spec.model.as_deref(),
         provider:         spec.provider.as_deref(),
         environment:      spec.environment.as_deref(),
-        docker_image:     None,
         preserve_sandbox: spec.preserve_sandbox,
         dry_run:          spec.dry_run,
         auto_approve:     spec.auto_approve,
