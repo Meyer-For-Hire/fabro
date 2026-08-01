@@ -3,9 +3,8 @@ use std::sync::{Arc, LazyLock};
 
 use fabro_graphviz::graph::Node;
 use fabro_llm::types::{ResponseFormat, ResponseFormatType};
-use jsonschema::error::{TypeKind, ValidationErrorKind};
+use jsonschema::error::ValidationErrorKind;
 use jsonschema::paths::Location;
-use jsonschema::types::JsonType;
 use jsonschema::{ValidationError, Validator};
 use serde_json::Value;
 
@@ -51,32 +50,34 @@ pub(crate) enum StructuredOutputErrorKind {
 
 const MAX_SCHEMA_FRAGMENT_CHARS: usize = 320;
 
+/// `additionalProperties` errors carry one entry per unexpected key, and the
+/// keys come from model output. Cap them so a wide object can't turn the repair
+/// prompt into megabytes.
+const MAX_UNEXPECTED_PROPERTIES: usize = 10;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SchemaValidationIssue {
-    instance_path:   Location,
-    schema_path:     Location,
-    evaluation_path: Location,
-    keyword:         String,
-    detail:          SchemaValidationIssueDetail,
+    instance_path: Location,
+    schema_path:   Location,
+    detail:        SchemaValidationIssueDetail,
 }
 
+/// `Required` and `AdditionalProperties` get bespoke rendering because
+/// `jsonschema` names the offending property without ever locating it. Every
+/// other keyword already renders a message that names both the value and the
+/// constraint, so it goes through `Other` with the schema fragment attached.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SchemaValidationIssueDetail {
     Required {
         property: String,
     },
-    Type {
-        expected: Vec<String>,
-        actual:   String,
-    },
-    Enum {
-        options: String,
-    },
     AdditionalProperties {
         unexpected: Vec<String>,
+        total:      usize,
     },
     Other {
-        message: String,
+        message:         String,
+        schema_fragment: Option<String>,
     },
 }
 
@@ -93,72 +94,67 @@ pub(crate) struct StructuredOutputError {
 }
 
 impl SchemaValidationIssue {
-    fn from_error(error: &ValidationError<'_>) -> Self {
+    fn from_error(error: &ValidationError<'_>, schema: Option<&Value>) -> Self {
         let detail = match error.kind() {
             ValidationErrorKind::Required { property } => SchemaValidationIssueDetail::Required {
                 property: property
                     .as_str()
                     .map_or_else(|| property.to_string(), str::to_owned),
             },
-            ValidationErrorKind::Type { kind } => SchemaValidationIssueDetail::Type {
-                expected: expected_json_types(kind),
-                actual:   JsonType::from(error.instance().as_ref()).to_string(),
-            },
-            ValidationErrorKind::Enum { options } => SchemaValidationIssueDetail::Enum {
-                options: bounded_json(options),
-            },
             ValidationErrorKind::AdditionalProperties { unexpected } => {
                 SchemaValidationIssueDetail::AdditionalProperties {
-                    unexpected: unexpected.clone(),
+                    total:      unexpected.len(),
+                    unexpected: unexpected
+                        .iter()
+                        .take(MAX_UNEXPECTED_PROPERTIES)
+                        .cloned()
+                        .collect(),
                 }
             }
             _ => SchemaValidationIssueDetail::Other {
-                message: error.masked().to_string(),
+                message:         error.to_string(),
+                schema_fragment: schema
+                    .and_then(|schema| schema.pointer(error.schema_path().as_str()))
+                    .map(bounded_json),
             },
         };
         Self {
             instance_path: error.instance_path().clone(),
             schema_path: error.schema_path().clone(),
-            evaluation_path: error.evaluation_path().clone(),
-            keyword: error.kind().keyword().to_string(),
             detail,
         }
     }
 
-    fn render(&self, schema: Option<&Value>) -> String {
+    fn render(&self) -> String {
         let mut message = match &self.detail {
-            SchemaValidationIssueDetail::Required { property } => {
-                let target_path = self.instance_path.join(property);
-                format!(
-                    "Missing required property {} at JSON Pointer `{target_path}`. Add it to the object at {}.",
-                    Value::String(property.clone()),
-                    pointer_phrase(&self.instance_path),
-                )
-            }
-            SchemaValidationIssueDetail::Type { expected, actual } => format!(
-                "At {}, expected JSON type {}, but got {actual}.",
-                pointer_phrase(&self.instance_path),
-                format_expected_types(expected),
-            ),
-            SchemaValidationIssueDetail::Enum { options } => format!(
-                "At {}, the value is not one of the allowed enum values {options}.",
+            SchemaValidationIssueDetail::Required { property } => format!(
+                "Missing required property {} at JSON Pointer `{}`. Add it to the object at {}.",
+                Value::String(property.clone()),
+                self.instance_path.join(property),
                 pointer_phrase(&self.instance_path),
             ),
-            SchemaValidationIssueDetail::AdditionalProperties { unexpected } => {
-                let properties = unexpected
+            SchemaValidationIssueDetail::AdditionalProperties { unexpected, total } => {
+                let mut properties = unexpected
                     .iter()
                     .map(|property| {
-                        let property_path = self.instance_path.join(property);
-                        format!("{} at `{property_path}`", Value::String(property.clone()))
+                        format!(
+                            "{} at `{}`",
+                            Value::String(property.clone()),
+                            self.instance_path.join(property),
+                        )
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
+                let remaining = total - unexpected.len();
+                if remaining > 0 {
+                    let _ = write!(properties, ", and {remaining} more");
+                }
                 format!(
                     "Unexpected properties in the object at {}: {properties}.",
                     pointer_phrase(&self.instance_path),
                 )
             }
-            SchemaValidationIssueDetail::Other { message } => format!(
+            SchemaValidationIssueDetail::Other { message, .. } => format!(
                 "At {}: {}.",
                 pointer_phrase(&self.instance_path),
                 message.trim_end_matches('.'),
@@ -167,45 +163,19 @@ impl SchemaValidationIssue {
 
         let _ = write!(
             message,
-            " Schema rule {} (`{}` keyword)",
-            pointer_code(&self.schema_path),
-            self.keyword,
+            " Schema rule: {}",
+            pointer_phrase(&self.schema_path)
         );
-        if let Some(fragment) = schema
-            .and_then(|schema| schema.pointer(self.schema_path.as_str()))
-            .map(bounded_json)
+        if let SchemaValidationIssueDetail::Other {
+            schema_fragment: Some(fragment),
+            ..
+        } = &self.detail
         {
             message.push_str(": ");
-            message.push_str(&fragment);
+            message.push_str(fragment);
         }
         message.push('.');
-
-        if self.evaluation_path != self.schema_path {
-            let _ = write!(
-                message,
-                " Evaluation path: {}.",
-                pointer_code(&self.evaluation_path),
-            );
-        }
         message
-    }
-
-    fn same_problem_as(&self, other: &Self) -> bool {
-        if self.instance_path != other.instance_path
-            || self.schema_path != other.schema_path
-            || self.keyword != other.keyword
-        {
-            return false;
-        }
-        match (&self.detail, &other.detail) {
-            (
-                SchemaValidationIssueDetail::Required { property: left },
-                SchemaValidationIssueDetail::Required { property: right },
-            ) => left == right,
-            (SchemaValidationIssueDetail::Required { .. }, _)
-            | (_, SchemaValidationIssueDetail::Required { .. }) => false,
-            _ => true,
-        }
     }
 }
 
@@ -230,22 +200,12 @@ impl StructuredOutputError {
         self.kind
     }
 
-    #[cfg(test)]
     #[must_use]
     pub(crate) fn messages(&self) -> Vec<String> {
-        self.rendered_messages(None)
-    }
-
-    #[must_use]
-    pub(crate) fn rendered_messages(&self, schema: Option<&OutputSchemaKind>) -> Vec<String> {
         match &self.details {
             StructuredOutputErrorDetails::Message(message) => vec![message.clone()],
             StructuredOutputErrorDetails::SchemaValidation(issues) => {
-                let schema = schema.and_then(|schema| match schema {
-                    OutputSchemaKind::Routing => None,
-                    OutputSchemaKind::JsonSchema { schema, .. } => Some(schema),
-                });
-                issues.iter().map(|issue| issue.render(schema)).collect()
+                issues.iter().map(SchemaValidationIssue::render).collect()
             }
         }
     }
@@ -275,7 +235,7 @@ impl StructuredOutputError {
             }
         };
         let errors = self
-            .rendered_messages(Some(schema))
+            .messages()
             .iter()
             .map(|message| format!("- {message}"))
             .collect::<Vec<_>>()
@@ -284,8 +244,7 @@ impl StructuredOutputError {
             vec!["Your previous response did not satisfy the node's output_schema.".to_string()];
         if previous_error.is_some_and(|previous| self.shares_schema_issue_with(previous)) {
             sections.push(
-                "At least one validation problem below is unchanged from your previous repair. \
-                 Correct the exact JSON Pointer shown."
+                "At least one validation problem below is unchanged from your previous repair."
                     .to_string(),
             );
         }
@@ -312,28 +271,7 @@ impl StructuredOutputError {
         else {
             return false;
         };
-        current
-            .iter()
-            .any(|issue| previous.iter().any(|other| issue.same_problem_as(other)))
-    }
-}
-
-fn expected_json_types(kind: &TypeKind) -> Vec<String> {
-    match kind {
-        TypeKind::Single(json_type) => vec![json_type.to_string()],
-        TypeKind::Multiple(json_types) => json_types.iter().map(|kind| kind.to_string()).collect(),
-    }
-}
-
-fn format_expected_types(expected: &[String]) -> String {
-    let expected = expected
-        .iter()
-        .map(|kind| Value::String(kind.clone()).to_string())
-        .collect::<Vec<_>>();
-    match expected.as_slice() {
-        [] => "an allowed type".to_string(),
-        [expected] => expected.clone(),
-        _ => format!("one of {}", expected.join(", ")),
+        current.iter().any(|issue| previous.contains(issue))
     }
 }
 
@@ -345,27 +283,13 @@ fn pointer_phrase(path: &Location) -> String {
     }
 }
 
-fn pointer_code(path: &Location) -> String {
-    if path.as_str().is_empty() {
-        "`<document root>`".to_string()
-    } else {
-        format!("`{path}`")
-    }
-}
-
 fn bounded_json(value: &Value) -> String {
-    let rendered = value.to_string();
-    if rendered.chars().count() <= MAX_SCHEMA_FRAGMENT_CHARS {
-        rendered
-    } else {
-        format!(
-            "{}…",
-            rendered
-                .chars()
-                .take(MAX_SCHEMA_FRAGMENT_CHARS)
-                .collect::<String>()
-        )
+    let mut rendered = value.to_string();
+    if let Some((offset, _)) = rendered.char_indices().nth(MAX_SCHEMA_FRAGMENT_CHARS) {
+        rendered.truncate(offset);
+        rendered.push('…');
     }
+    rendered
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -458,8 +382,8 @@ pub(crate) fn validate_response_text(
 ) -> Result<ValidatedStructuredOutput, StructuredOutputError> {
     match schema {
         OutputSchemaKind::Routing => validate_routing_response_text(text),
-        OutputSchemaKind::JsonSchema { validator, .. } => {
-            validate_custom_response_text(validator, text)
+        OutputSchemaKind::JsonSchema { schema, validator } => {
+            validate_custom_response_text(validator, schema, text)
         }
     }
 }
@@ -580,7 +504,7 @@ fn validate_routing_response_text(
         if !contains_routing_field(obj) {
             continue;
         }
-        validate_value_against_validator(routing_validator(), &parsed)?;
+        validate_value_against_validator(routing_validator(), &parsed, None)?;
         return Ok(ValidatedStructuredOutput { value: parsed });
     }
 
@@ -595,6 +519,7 @@ fn validate_routing_response_text(
 
 fn validate_custom_response_text(
     validator: &Validator,
+    schema: &Value,
     text: &str,
 ) -> Result<ValidatedStructuredOutput, StructuredOutputError> {
     // Prose after the object can contain braces, so the last candidate is not
@@ -605,7 +530,7 @@ fn validate_custom_response_text(
     for candidate in candidates.iter().rev() {
         match serde_json::from_str::<Value>(candidate) {
             Ok(parsed) => {
-                validate_value_against_validator(validator, &parsed)?;
+                validate_value_against_validator(validator, &parsed, Some(schema))?;
                 return Ok(ValidatedStructuredOutput { value: parsed });
             }
             Err(err) if invalid_json.is_none() => invalid_json = Some(err.to_string()),
@@ -628,11 +553,12 @@ fn validate_custom_response_text(
 fn validate_value_against_validator(
     validator: &Validator,
     value: &Value,
+    schema: Option<&Value>,
 ) -> Result<(), StructuredOutputError> {
     let issues = validator
         .iter_errors(value)
         .take(5)
-        .map(|error| SchemaValidationIssue::from_error(&error))
+        .map(|error| SchemaValidationIssue::from_error(&error, schema))
         .collect::<Vec<_>>();
     if issues.is_empty() {
         Ok(())
@@ -959,10 +885,10 @@ mod tests {
 
         let error = validate_response_text(&schema, r#"{"findings":[{}]}"#).unwrap_err();
 
-        assert_eq!(error.rendered_messages(Some(&schema)), vec![
+        assert_eq!(error.messages(), vec![
             "Missing required property \"rationale\" at JSON Pointer `/findings/0/rationale`. \
-                 Add it to the object at JSON Pointer `/findings/0`. Schema rule \
-                 `/properties/findings/items/required` (`required` keyword): [\"rationale\"]."
+             Add it to the object at JSON Pointer `/findings/0`. Schema rule: JSON Pointer \
+             `/properties/findings/items/required`."
                 .to_string(),
         ],);
     }
@@ -980,13 +906,13 @@ mod tests {
         let error =
             validate_response_text(&schema, r#"{"line":"85","severity":"CRITICAL"}"#).unwrap_err();
 
-        assert_eq!(error.rendered_messages(Some(&schema)), vec![
-            "At JSON Pointer `/line`, expected JSON type \"integer\", but got string. \
-                 Schema rule `/properties/line/type` (`type` keyword): \"integer\"."
+        assert_eq!(error.messages(), vec![
+            "At JSON Pointer `/line`: \"85\" is not of type \"integer\". \
+             Schema rule: JSON Pointer `/properties/line/type`: \"integer\"."
                 .to_string(),
-            "At JSON Pointer `/severity`, the value is not one of the allowed enum values \
-                 [\"HIGH\",\"MEDIUM\",\"LOW\"]. Schema rule `/properties/severity/enum` \
-                 (`enum` keyword): [\"HIGH\",\"MEDIUM\",\"LOW\"]."
+            "At JSON Pointer `/severity`: \"CRITICAL\" is not one of \"HIGH\", \"MEDIUM\" or \
+             \"LOW\". Schema rule: JSON Pointer `/properties/severity/enum`: \
+             [\"HIGH\",\"MEDIUM\",\"LOW\"]."
                 .to_string(),
         ],);
     }
@@ -1004,10 +930,9 @@ mod tests {
         let error = validate_response_text(&schema, r#"{"findings":[],"rationale":"wrong level"}"#)
             .unwrap_err();
 
-        assert_eq!(error.rendered_messages(Some(&schema)), vec![
+        assert_eq!(error.messages(), vec![
             "Unexpected properties in the object at the document root: \"rationale\" at \
-                 `/rationale`. Schema rule `/additionalProperties` (`additionalProperties` \
-                 keyword): false."
+             `/rationale`. Schema rule: JSON Pointer `/additionalProperties`."
                 .to_string(),
         ],);
     }
@@ -1034,13 +959,32 @@ mod tests {
 
         assert!(
             repair.contains(
-                "At least one validation problem below is unchanged from your previous repair. \
-                 Correct the exact JSON Pointer shown."
+                "At least one validation problem below is unchanged from your previous repair."
             ),
             "unexpected repair message: {repair}",
         );
         assert!(
             repair.contains("JSON Pointer `/findings/0/rationale`"),
+            "unexpected repair message: {repair}",
+        );
+    }
+
+    #[test]
+    fn a_different_problem_at_the_same_location_is_not_called_unchanged() {
+        let schema = schema(serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "findings": { "type": "array" }
+            }
+        }));
+        let previous = validate_response_text(&schema, r#"{"stray":1}"#).unwrap_err();
+        let current = validate_response_text(&schema, r#"{"different":1}"#).unwrap_err();
+
+        let repair = current.repair_message(&schema, Some(&previous));
+
+        assert!(
+            !repair.contains("unchanged from your previous repair"),
             "unexpected repair message: {repair}",
         );
     }

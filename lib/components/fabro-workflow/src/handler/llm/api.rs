@@ -1741,7 +1741,6 @@ impl CodergenBackend for AgentApiBackend {
                         }
                         let repair_message =
                             error.repair_message(schema, previous_validation_error.as_ref());
-                        previous_validation_error = Some(error);
                         let repair_result = live
                             .session
                             .process_input_with_runtime(
@@ -1752,6 +1751,11 @@ impl CodergenBackend for AgentApiBackend {
                         live.record_input_timing();
                         match repair_result {
                             Ok(()) => {
+                                // Only once the model has actually seen the
+                                // repair can a later identical failure mean it
+                                // ignored the correction. Failover rebuilds the
+                                // session from the original prompt instead.
+                                previous_validation_error = Some(error);
                                 live.record_input_usage().await;
                                 repair_attempts += 1;
                                 response = last_assistant_response(&live.session);
