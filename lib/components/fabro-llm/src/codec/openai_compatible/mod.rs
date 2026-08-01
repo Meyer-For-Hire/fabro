@@ -1,6 +1,6 @@
 //! The OpenAI Chat Completions (`/chat/completions`) codec.
 //!
-//! Serves every "OpenAI-compatible" route (kimi, zai, minimax, venice,
+//! Serves every "OpenAI-compatible" route (moonshot, zai, minimax, venice,
 //! inception, ollama, litellm, …). Pure translation: no HTTP, auth, or base
 //! URL — the adapter shell owns those. Count-tokens and error mapping use the
 //! `Codec` trait defaults (this dialect has no count route and uses the shared

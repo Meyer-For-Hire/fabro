@@ -284,6 +284,52 @@ impl Error {
     }
 }
 
+/// Provider error code to error kind mapping, for the codes that say more
+/// than the transport-level status or stream event type does.
+///
+/// Returns `None` when the code adds nothing, so each caller keeps its own
+/// default: the stream decoders treat an unrecognized code as transient,
+/// while [`error_from_status_code`] falls back to the HTTP status.
+///
+/// Every dialect classifies through this one table so a code such as
+/// `insufficient_quota` means the same thing whether it arrives in an HTTP
+/// error body or in a mid-stream error event.
+#[must_use]
+pub(crate) fn kind_from_error_code(code: &str) -> Option<ProviderErrorKind> {
+    Some(match code {
+        // Out of credit, or over a billing cap. Distinct from RateLimit:
+        // backoff never clears it, but another provider has its own quota.
+        "insufficient_quota" | "billing_hard_limit_reached" | "exceeded_current_quota_error" => {
+            ProviderErrorKind::QuotaExceeded
+        }
+        "rate_limit_error" | "rate_limit_exceeded" | "too_many_requests" => {
+            ProviderErrorKind::RateLimit
+        }
+        "authentication_error" | "invalid_api_key" | "invalid_authentication" => {
+            ProviderErrorKind::Authentication
+        }
+        "access_denied" | "account_deactivated" | "permission_denied" | "permission_error" => {
+            ProviderErrorKind::AccessDenied
+        }
+        "content_filter" | "content_policy_violation" => ProviderErrorKind::ContentFilter,
+        // `request_too_large` is anthropic's oversized-input code, so it has
+        // to precede the `_too_large` suffix rule below.
+        "context_length_exceeded" | "request_too_large" => ProviderErrorKind::ContextLength,
+        "server_error" | "internal_error" | "service_unavailable" | "engine_overloaded" => {
+            ProviderErrorKind::Server
+        }
+        c if c == "not_found_error" || c.ends_with("_not_found") => ProviderErrorKind::NotFound,
+        c if c.starts_with("invalid_")
+            || c.starts_with("unsupported_")
+            || c.ends_with("_too_large")
+            || c.ends_with("_too_long") =>
+        {
+            ProviderErrorKind::InvalidRequest
+        }
+        _ => return None,
+    })
+}
+
 /// HTTP status code to error type mapping (Section 6.4).
 #[must_use]
 pub fn error_from_status_code(
@@ -303,6 +349,8 @@ pub fn error_from_status_code(
         raw,
     };
 
+    let code_kind = detail.error_code.as_deref().and_then(kind_from_error_code);
+
     // Check specific status codes first -- these always map to their designated
     // error types
     let kind = match status_code {
@@ -316,10 +364,16 @@ pub fn error_from_status_code(
             };
         }
         413 => ProviderErrorKind::ContextLength,
+        // A 429 means rate limited unless the body reports a spent quota,
+        // which retrying will never clear.
+        429 if code_kind == Some(ProviderErrorKind::QuotaExceeded) => {
+            ProviderErrorKind::QuotaExceeded
+        }
         429 => ProviderErrorKind::RateLimit,
         500..=599 => ProviderErrorKind::Server,
-        // For ambiguous status codes (400, 422, etc.), use message-based classification
-        _ => {
+        // For ambiguous status codes (400, 422, etc.), the provider's error
+        // code is the better signal; fall back to the message only without one
+        _ => code_kind.unwrap_or_else(|| {
             let lower_msg = detail.message.to_lowercase();
             if lower_msg.contains("not found") || lower_msg.contains("does not exist") {
                 ProviderErrorKind::NotFound
@@ -333,7 +387,7 @@ pub fn error_from_status_code(
             } else {
                 ProviderErrorKind::InvalidRequest
             }
-        }
+        }),
     };
 
     Error::Provider {
@@ -601,6 +655,105 @@ mod tests {
             ..
         }));
         assert!(err.retryable());
+    }
+
+    /// Every vendor spelling of "you are out of credit" arrives as a 429 and
+    /// has to classify as a spent quota, not as a rate limit.
+    #[test]
+    fn quota_codes_on_429_are_non_retryable_quota_failures() {
+        for (provider, code) in [
+            ("kimi", "exceeded_current_quota_error"),
+            ("openai", "insufficient_quota"),
+            ("openai", "billing_hard_limit_reached"),
+        ] {
+            let err = error_from_status_code(
+                429,
+                "Your account has insufficient balance".into(),
+                provider.into(),
+                Some(code.into()),
+                None,
+                None,
+            );
+
+            assert_eq!(
+                err.provider_kind(),
+                Some(ProviderErrorKind::QuotaExceeded),
+                "{code}"
+            );
+            assert!(!err.retryable(), "{code}");
+            assert!(err.failover_eligible(), "{code}");
+        }
+    }
+
+    /// A 429 that is a genuine rate limit stays retryable, whether the body
+    /// names it, names something unrecognized, or carries no code at all.
+    #[test]
+    fn non_quota_429_stays_a_retryable_rate_limit() {
+        for code in [
+            Some("rate_limit_error"),
+            Some("rate_limit_reached_error"),
+            Some("invalid_request_error"),
+            None,
+        ] {
+            let err = error_from_status_code(
+                429,
+                "slow down".into(),
+                "openai".into(),
+                code.map(String::from),
+                None,
+                None,
+            );
+
+            assert_eq!(
+                err.provider_kind(),
+                Some(ProviderErrorKind::RateLimit),
+                "{code:?}"
+            );
+            assert!(err.retryable(), "{code:?}");
+        }
+    }
+
+    /// For a status with no fixed meaning, the structured code beats guessing
+    /// from the message text.
+    #[test]
+    fn ambiguous_status_prefers_error_code_over_message() {
+        let err = error_from_status_code(
+            402,
+            "Payment required".into(),
+            "openai".into(),
+            Some("insufficient_quota".into()),
+            None,
+            None,
+        );
+        assert_eq!(err.provider_kind(), Some(ProviderErrorKind::QuotaExceeded));
+    }
+
+    #[test]
+    fn kind_from_error_code_covers_every_dialect() {
+        for (code, expected) in [
+            ("insufficient_quota", ProviderErrorKind::QuotaExceeded),
+            ("rate_limit_error", ProviderErrorKind::RateLimit),
+            ("authentication_error", ProviderErrorKind::Authentication),
+            ("permission_error", ProviderErrorKind::AccessDenied),
+            ("content_policy_violation", ProviderErrorKind::ContentFilter),
+            ("context_length_exceeded", ProviderErrorKind::ContextLength),
+            ("engine_overloaded", ProviderErrorKind::Server),
+            // anthropic's oversized-input code beats the `_too_large` rule
+            ("request_too_large", ProviderErrorKind::ContextLength),
+            ("prompt_too_long", ProviderErrorKind::InvalidRequest),
+            ("invalid_request_error", ProviderErrorKind::InvalidRequest),
+            ("unsupported_parameter", ProviderErrorKind::InvalidRequest),
+            // both the anthropic and openai not-found spellings
+            ("not_found_error", ProviderErrorKind::NotFound),
+            ("model_not_found", ProviderErrorKind::NotFound),
+        ] {
+            assert_eq!(kind_from_error_code(code), Some(expected), "{code}");
+        }
+
+        // No opinion, so the caller keeps its own default.
+        assert_eq!(kind_from_error_code("overloaded_error"), None);
+        assert_eq!(kind_from_error_code("api_error"), None);
+        assert_eq!(kind_from_error_code(""), None);
     }
 
     #[test]

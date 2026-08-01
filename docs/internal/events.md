@@ -424,7 +424,7 @@ Emitted when a workflow node finishes execution.
 | `failure_signature` | string? | Dedup key for repeated failures |
 | `context_updates` | object? | Context delta written by this stage |
 | `jump_to_node` | string? | Non-edge jump target |
-| `context_values` | object? | Full context snapshot after the stage |
+| `context_values` | object? | Context snapshot after the stage, minus runtime-only keys such as `current.preamble`. Artifact pointers are not normalized to blob refs — use `checkpoint.completed` for the durable projection |
 | `node_visits` | object? | Node visit counts after the stage |
 | `loop_failure_signatures` | object? | Loop failure signature counts |
 | `restart_failure_signatures` | object? | Restart failure signature counts |

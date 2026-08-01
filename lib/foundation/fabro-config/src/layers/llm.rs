@@ -3,16 +3,23 @@
 //! Holds the trusted, mergeable LLM provider/model catalog data:
 //!
 //! ```toml
-//! [llm.providers.kimi]
-//! display_name = "Kimi"
+//! [llm.providers.moonshot]
+//! display_name = "Moonshot AI"
 //! adapter = "openai_compatible"
 //! base_url = "https://api.moonshot.ai/v1"
-//! auth = { credentials = ["env:KIMI_API_KEY", "vault:KIMI_API_KEY"] }
 //! priority = 60
 //! enabled = true
-//! aliases = ["moonshot"]
+//! aliases = ["moonshot-ai"]
 //!
-//! [llm.providers.kimi.models."kimi-k2.5"]
+//! [llm.providers.moonshot.auth]
+//! credentials = [
+//!   "env:MOONSHOT_API_KEY",
+//!   "env:KIMI_API_KEY",
+//!   "vault:MOONSHOT_API_KEY",
+//!   "vault:KIMI_API_KEY",
+//! ]
+//!
+//! [llm.providers.moonshot.models."kimi-k2.5"]
 //! ...
 //! ```
 //!
@@ -489,33 +496,46 @@ agent_profile = "gemini"
     #[test]
     fn parses_minimal_provider_entry() {
         let toml = r#"
-[providers.kimi]
-display_name = "Kimi"
+[providers.moonshot]
+display_name = "Moonshot AI"
 adapter = "openai_compatible"
 agent_profile = "openai"
 base_url = "https://api.moonshot.ai/v1"
 priority = 60
 enabled = true
-aliases = ["moonshot"]
+aliases = ["moonshot-ai"]
 
-[providers.kimi.auth]
-credentials = ["env:KIMI_API_KEY", "vault:KIMI_API_KEY"]
+[providers.moonshot.auth]
+credentials = [
+  "env:MOONSHOT_API_KEY",
+  "env:KIMI_API_KEY",
+  "vault:MOONSHOT_API_KEY",
+  "vault:KIMI_API_KEY",
+]
 "#;
         let layer: LlmLayer = toml::from_str(toml).unwrap();
-        let kimi = layer.providers.get("kimi").unwrap();
-        assert_eq!(kimi.display_name.as_deref(), Some("Kimi"));
-        assert_eq!(kimi.adapter.as_deref(), Some("openai_compatible"));
-        assert_eq!(kimi.agent_profile, Some(AgentProfileKind::OpenAi));
-        let auth = kimi.auth.as_ref().expect("expected api_key auth");
+        let moonshot = layer.providers.get("moonshot").unwrap();
+        assert_eq!(moonshot.display_name.as_deref(), Some("Moonshot AI"));
+        assert_eq!(moonshot.adapter.as_deref(), Some("openai_compatible"));
+        assert_eq!(moonshot.agent_profile, Some(AgentProfileKind::OpenAi));
+        let auth = moonshot.auth.as_ref().expect("expected api_key auth");
         assert_eq!(auth.header, ApiKeyHeaderPolicy::Bearer);
         assert_eq!(auth.credentials, vec![
+            CredentialRef::Env("MOONSHOT_API_KEY".to_string()),
             CredentialRef::Env("KIMI_API_KEY".to_string()),
+            CredentialRef::Vault("MOONSHOT_API_KEY".to_string()),
             CredentialRef::Vault("KIMI_API_KEY".to_string()),
         ]);
-        assert_eq!(kimi.base_url.as_deref(), Some("https://api.moonshot.ai/v1"));
-        assert_eq!(kimi.priority, Some(60));
-        assert_eq!(kimi.enabled, Some(true));
-        assert_eq!(kimi.aliases.as_deref(), Some(&["moonshot".to_string()][..]));
+        assert_eq!(
+            moonshot.base_url.as_deref(),
+            Some("https://api.moonshot.ai/v1")
+        );
+        assert_eq!(moonshot.priority, Some(60));
+        assert_eq!(moonshot.enabled, Some(true));
+        assert_eq!(
+            moonshot.aliases.as_deref(),
+            Some(&["moonshot-ai".to_string()][..])
+        );
     }
 
     #[test]
@@ -584,7 +604,7 @@ x-portkey-api-key = "sk-portkey-literal"
     fn parses_full_model_entry() {
         let toml = r#"
 [models."kimi-k2.5"]
-provider = "kimi"
+provider = "moonshot"
 api_id = "kimi-k2.5"
 display_name = "Kimi K2.5"
 family = "kimi"
@@ -611,7 +631,7 @@ cache_input_cost_per_mtok = 0.15
 "#;
         let layer: LlmLayer = toml::from_str(toml).unwrap();
         let m = layer.models.get("kimi-k2.5").unwrap();
-        assert_eq!(m.provider.as_deref(), Some("kimi"));
+        assert_eq!(m.provider.as_deref(), Some("moonshot"));
         assert_eq!(m.api_id.as_deref(), Some("kimi-k2.5"));
         assert_eq!(m.display_name.as_deref(), Some("Kimi K2.5"));
         assert_eq!(m.family.as_deref(), Some("kimi"));
@@ -714,7 +734,7 @@ cache_input_cost_per_mtok = 9.0
     #[test]
     fn rejects_unknown_provider_field() {
         let toml = r#"
-[providers.kimi]
+[providers.moonshot]
 adapter = "openai_compatible"
 unknown_field = true
 "#;
@@ -725,7 +745,7 @@ unknown_field = true
     #[test]
     fn rejects_removed_provider_base_url_env_field() {
         let toml = r#"
-[providers.kimi]
+[providers.moonshot]
 adapter = "openai_compatible"
 base_url_env = "KIMI_BASE_URL"
 "#;
@@ -902,7 +922,7 @@ mystery = 1
     fn merge_map_field_merges_per_provider_id() {
         let mut high_map: std::collections::HashMap<String, ProviderSettings> =
             std::collections::HashMap::new();
-        high_map.insert("kimi".to_string(), ProviderSettings {
+        high_map.insert("moonshot".to_string(), ProviderSettings {
             base_url: Some("https://override".to_string()),
             ..ProviderSettings::default()
         });
@@ -910,7 +930,7 @@ mystery = 1
 
         let mut low_map: std::collections::HashMap<String, ProviderSettings> =
             std::collections::HashMap::new();
-        low_map.insert("kimi".to_string(), ProviderSettings {
+        low_map.insert("moonshot".to_string(), ProviderSettings {
             adapter: Some("openai_compatible".to_string()),
             base_url: Some("https://defaults".to_string()),
             ..ProviderSettings::default()
@@ -918,9 +938,9 @@ mystery = 1
         let low: MergeMap<ProviderSettings> = MergeMap::from(low_map);
 
         let merged = high.combine(low);
-        let kimi = merged.get("kimi").unwrap();
-        assert_eq!(kimi.adapter.as_deref(), Some("openai_compatible"));
-        assert_eq!(kimi.base_url.as_deref(), Some("https://override"));
+        let moonshot = merged.get("moonshot").unwrap();
+        assert_eq!(moonshot.adapter.as_deref(), Some("openai_compatible"));
+        assert_eq!(moonshot.base_url.as_deref(), Some("https://override"));
     }
 
     #[test]

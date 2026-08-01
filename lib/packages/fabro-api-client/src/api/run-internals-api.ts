@@ -147,6 +147,46 @@ export const RunInternalsApiAxiosParamCreator = function (configuration?: Config
             };
         },
         /**
+         * Streams a ZIP archive with the latest captured version of each artifact path. Stage order, retry number, and then stage ID determine the latest version, matching the artifacts page. Captures from the graph\'s boundary nodes are excluded, identified by their `start` and `exit` handler type rather than by node name.  The archive streams, so the response status is sent before the first artifact is read. A failure after that point aborts the transfer rather than returning `500`. The ZIP central directory is written last, so a truncated download does not open as a valid archive.
+         * @summary Download Run Artifacts
+         * @param {string} id Unique run identifier (ULID).
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        downloadRunArtifacts: async (id: string, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
+            // verify required parameter 'id' is not null or undefined
+            assertParamExists('downloadRunArtifacts', 'id', id)
+            const localVarPath = `/api/v1/runs/{id}/artifacts/download`
+                .replace(`{${"id"}}`, encodeURIComponent(String(id)));
+            // use dummy base URL string because the URL constructor only accepts absolute URLs.
+            const localVarUrlObj = new URL(localVarPath, DUMMY_BASE_URL);
+            let baseOptions;
+            if (configuration) {
+                baseOptions = configuration.baseOptions;
+            }
+
+            const localVarRequestOptions = { method: 'GET', ...baseOptions, ...options};
+            const localVarHeaderParameter = {} as any;
+            const localVarQueryParameter = {} as any;
+
+            // authentication SessionCookie required
+
+            // authentication BearerAuth required
+            // http bearer authentication required
+            await setBearerAuthToObject(localVarHeaderParameter, configuration)
+
+            localVarHeaderParameter['Accept'] = 'application/zip,application/json';
+
+            setSearchParams(localVarUrlObj, localVarQueryParameter);
+            let headersFromBaseOptions = baseOptions && baseOptions.headers ? baseOptions.headers : {};
+            localVarRequestOptions.headers = {...localVarHeaderParameter, ...headersFromBaseOptions, ...options.headers};
+
+            return {
+                url: toPathString(localVarUrlObj),
+                options: localVarRequestOptions,
+            };
+        },
+        /**
          * Returns one stored run event by source event sequence with content fields separated and truncated.
          * @summary Get Run Event Detail
          * @param {string} id Unique run identifier (ULID).
@@ -947,6 +987,19 @@ export const RunInternalsApiFp = function(configuration?: Configuration) {
             return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
         },
         /**
+         * Streams a ZIP archive with the latest captured version of each artifact path. Stage order, retry number, and then stage ID determine the latest version, matching the artifacts page. Captures from the graph\'s boundary nodes are excluded, identified by their `start` and `exit` handler type rather than by node name.  The archive streams, so the response status is sent before the first artifact is read. A failure after that point aborts the transfer rather than returning `500`. The ZIP central directory is written last, so a truncated download does not open as a valid archive.
+         * @summary Download Run Artifacts
+         * @param {string} id Unique run identifier (ULID).
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        async downloadRunArtifacts(id: string, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<File>> {
+            const localVarAxiosArgs = await localVarAxiosParamCreator.downloadRunArtifacts(id, options);
+            const localVarOperationServerIndex = configuration?.serverIndex ?? 0;
+            const localVarOperationServerBasePath = operationServerMap['RunInternalsApi.downloadRunArtifacts']?.[localVarOperationServerIndex]?.url;
+            return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
+        },
+        /**
          * Returns one stored run event by source event sequence with content fields separated and truncated.
          * @summary Get Run Event Detail
          * @param {string} id Unique run identifier (ULID).
@@ -1211,6 +1264,16 @@ export const RunInternalsApiFactory = function (configuration?: Configuration, b
             return localVarFp.attachRunEvents(id, sinceSeq, options).then((request) => request(axios, basePath));
         },
         /**
+         * Streams a ZIP archive with the latest captured version of each artifact path. Stage order, retry number, and then stage ID determine the latest version, matching the artifacts page. Captures from the graph\'s boundary nodes are excluded, identified by their `start` and `exit` handler type rather than by node name.  The archive streams, so the response status is sent before the first artifact is read. A failure after that point aborts the transfer rather than returning `500`. The ZIP central directory is written last, so a truncated download does not open as a valid archive.
+         * @summary Download Run Artifacts
+         * @param {string} id Unique run identifier (ULID).
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        downloadRunArtifacts(id: string, options?: RawAxiosRequestConfig): AxiosPromise<File> {
+            return localVarFp.downloadRunArtifacts(id, options).then((request) => request(axios, basePath));
+        },
+        /**
          * Returns one stored run event by source event sequence with content fields separated and truncated.
          * @summary Get Run Event Detail
          * @param {string} id Unique run identifier (ULID).
@@ -1424,6 +1487,17 @@ export class RunInternalsApi extends BaseAPI {
      */
     public attachRunEvents(id: string, sinceSeq?: number, options?: RawAxiosRequestConfig) {
         return RunInternalsApiFp(this.configuration).attachRunEvents(id, sinceSeq, options).then((request) => request(this.axios, this.basePath));
+    }
+
+    /**
+     * Streams a ZIP archive with the latest captured version of each artifact path. Stage order, retry number, and then stage ID determine the latest version, matching the artifacts page. Captures from the graph\'s boundary nodes are excluded, identified by their `start` and `exit` handler type rather than by node name.  The archive streams, so the response status is sent before the first artifact is read. A failure after that point aborts the transfer rather than returning `500`. The ZIP central directory is written last, so a truncated download does not open as a valid archive.
+     * @summary Download Run Artifacts
+     * @param {string} id Unique run identifier (ULID).
+     * @param {*} [options] Override http request option.
+     * @throws {RequiredError}
+     */
+    public downloadRunArtifacts(id: string, options?: RawAxiosRequestConfig) {
+        return RunInternalsApiFp(this.configuration).downloadRunArtifacts(id, options).then((request) => request(this.axios, this.basePath));
     }
 
     /**

@@ -73,7 +73,7 @@ pub(crate) struct CodecCtx<'a> {
     /// the stream model fallback uses `request.model`).
     pub request:       &'a Request,
     /// Identity stamped into `Response.provider`, and the `provider_options`
-    /// namespace key for the openai_compatible codec (kimi/zai/…).
+    /// namespace key for the openai_compatible codec (moonshot/zai/…).
     pub provider_name: &'a str,
     /// The model id to send on the wire — catalog `api_id`, resolved by the
     /// route (today `api_id == id` everywhere).

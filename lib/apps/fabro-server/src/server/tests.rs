@@ -7,6 +7,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc as StdArc, Mutex as StdMutex};
 
+use async_zip::base::read::mem::ZipFileReader;
 use axum::body::Body;
 use axum::http::{Method, Request, header};
 use chrono::{Duration as ChronoDuration, Utc};
@@ -3661,6 +3662,348 @@ async fn create_run_from_manifest_helper_persists_automation_metadata() {
 }
 
 #[tokio::test]
+async fn create_run_from_manifest_pins_compiled_and_persisted_behavior() {
+    let state = TestAppStateBuilder::new()
+        .runtime_settings(
+            default_test_server_settings(),
+            manifest_run_defaults_from_toml(
+                r#"
+[run.metadata]
+server-label = "server"
+layer = "server"
+"#,
+            ),
+        )
+        .env_lookup(|_| None)
+        .vault_entries([(EnvVars::OPENAI_API_KEY, "test-openai-api-key")])
+        .build();
+    let run_id = RunId::new();
+    let dot = r#"digraph CompilePin {
+        graph [goal="Graph goal", target="{{ inputs.target }}"]
+        start [shape=Mdiamond]
+        work [prompt="Ship {{ inputs.target }}", model="gpt-5.4"]
+        exit [shape=Msquare]
+        start -> work -> exit
+    }"#;
+    let mut manifest_json = minimal_manifest_json(dot);
+    manifest_json["title"] = json!("  Pinned create  ");
+    manifest_json["goal"] = json!({
+        "type": "value",
+        "text": "Inline release goal"
+    });
+    manifest_json["args"] = json!({
+        "model": "gpt-5.4",
+        "input": ["target=payments"]
+    });
+    manifest_json["configs"] = json!([{
+        "type": "project",
+        "path": "/tmp/project/.fabro/project.toml",
+        "source": r#"
+_version = 1
+
+[project]
+name = "payments-project"
+
+[run.metadata]
+project-label = "project"
+layer = "project"
+"#
+    }]);
+    manifest_json["cwd"] = json!("/tmp/project");
+    manifest_json["git"] = json!({
+        "origin_url": "https://github.com/acme/payments.git",
+        "branch": "feature/compiler",
+        "sha": "0123456789abcdef",
+        "dirty": "clean",
+        "push_outcome": { "type": "not_attempted" }
+    });
+    let manifest: RunManifest = serde_json::from_value(manifest_json).unwrap();
+    let submitted_manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::USER_AGENT,
+        "fabro-cli/9.8.7".parse().expect("user agent should parse"),
+    );
+
+    let response = Box::pin(handler::runs::create_run_from_manifest(
+        Arc::clone(&state),
+        handler::runs::CreateRunFromManifestRequest {
+            manifest,
+            submitted_manifest_bytes: submitted_manifest_bytes.clone(),
+            explicit_run_id: Some(run_id),
+            explicit_title_supplied: true,
+            actor: Principal::System {
+                system_kind: SystemActorKind::Engine,
+            },
+            headers,
+            automation: None,
+        },
+    ))
+    .await;
+
+    let body = response_json!(response, StatusCode::CREATED).await;
+    assert_eq!(body["id"], run_id.to_string());
+    assert_eq!(body["title"], "Pinned create");
+    assert_eq!(body["lifecycle"]["status"]["kind"], "submitted");
+
+    let run_store = state.stores.runs.open_run_reader(&run_id).await.unwrap();
+    let events = run_store.list_events().await.unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .map(|envelope| envelope.event.event_name())
+            .collect::<Vec<_>>(),
+        vec!["run.created", "run.submitted"]
+    );
+    let run_state = run_store.state().await.unwrap();
+    let spec = &run_state.spec;
+    assert_eq!(spec.run_id, run_id);
+    assert_eq!(spec.graph.goal(), "Inline release goal");
+    assert_eq!(
+        spec.graph.attrs.get("target").and_then(AttrValue::as_str),
+        Some("{{ inputs.target }}")
+    );
+    assert_eq!(
+        spec.graph.nodes["work"]
+            .attrs
+            .get("prompt")
+            .and_then(AttrValue::as_str),
+        Some("Ship payments")
+    );
+    assert_eq!(
+        spec.graph.nodes["work"]
+            .attrs
+            .get("model")
+            .and_then(AttrValue::as_str),
+        Some("gpt-5.4")
+    );
+    assert_eq!(
+        spec.graph.nodes["work"]
+            .attrs
+            .get("provider")
+            .and_then(AttrValue::as_str),
+        Some("openai")
+    );
+    assert_eq!(spec.settings.run.model.name.as_deref(), Some("gpt-5.4"));
+    assert_eq!(spec.settings.run.model.provider.as_deref(), Some("openai"));
+    assert_eq!(
+        spec.settings.run.inputs.get("target"),
+        Some(&toml::Value::String("payments".to_string()))
+    );
+    assert_eq!(
+        spec.settings.project.name.as_deref(),
+        Some("payments-project")
+    );
+    assert_eq!(
+        spec.labels.get("project-label").map(String::as_str),
+        Some("project")
+    );
+    assert_eq!(
+        spec.labels.get("layer").map(String::as_str),
+        Some("project")
+    );
+    assert_eq!(
+        spec.git.as_ref().map(|git| git.origin_url.as_str()),
+        Some("https://github.com/acme/payments.git")
+    );
+
+    let created = events[0].event.to_value().unwrap();
+    assert_eq!(created["properties"]["title"], "Pinned create");
+    assert_eq!(created["properties"]["labels"]["project-label"], "project");
+    assert_eq!(
+        created["properties"]["provenance"]["client"]["user_agent"],
+        "fabro-cli/9.8.7"
+    );
+    assert_eq!(
+        created["properties"]["provenance"]["subject"]["kind"],
+        "system"
+    );
+    let manifest_blob = created["properties"]["manifest_blob"]
+        .as_str()
+        .expect("run.created should carry the submitted source blob")
+        .parse::<RunBlobId>()
+        .unwrap();
+    let persisted_manifest = run_store
+        .read_blob(&manifest_blob)
+        .await
+        .unwrap()
+        .expect("submitted source blob should exist");
+    assert_eq!(persisted_manifest.as_ref(), submitted_manifest_bytes);
+}
+
+#[tokio::test]
+async fn create_run_from_manifest_pins_compiler_http_error_mappings() {
+    let cases = [
+        (
+            {
+                let mut manifest = minimal_manifest_json(MINIMAL_DOT);
+                manifest["version"] = json!(2);
+                manifest
+            },
+            "unsupported manifest version 2",
+        ),
+        (
+            minimal_manifest_json(
+                r#"digraph Test {
+                    graph [goal="Test"]
+                    start [shape=Mdiamond]
+                    work [prompt="Use {{ vars.MISSING }}"]
+                    exit [shape=Msquare]
+                    start -> work -> exit
+                }"#,
+            ),
+            "Validation failed",
+        ),
+        (
+            {
+                let mut manifest = minimal_manifest_json(
+                    r#"digraph Test {
+                        graph [goal="Test"]
+                        start [shape=Mdiamond]
+                        work [prompt="Do work", model="gpt-5.4", provider="missing-provider"]
+                        exit [shape=Msquare]
+                        start -> work -> exit
+                    }"#,
+                );
+                manifest["args"] = json!({
+                    "model": "gpt-5.4",
+                    "provider": "missing-provider"
+                });
+                manifest
+            },
+            "Model selection failed: unknown model provider 'missing-provider'",
+        ),
+    ];
+
+    for (manifest_json, expected_detail) in cases {
+        let state = TestAppStateBuilder::new()
+            .env_lookup(|_| None)
+            .vault_entries([(EnvVars::OPENAI_API_KEY, "test-openai-api-key")])
+            .build();
+        let manifest: RunManifest = serde_json::from_value(manifest_json).unwrap();
+        let submitted_manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+
+        let response = Box::pin(handler::runs::create_run_from_manifest(
+            state,
+            handler::runs::CreateRunFromManifestRequest {
+                manifest,
+                submitted_manifest_bytes,
+                explicit_run_id: Some(RunId::new()),
+                explicit_title_supplied: true,
+                actor: Principal::System {
+                    system_kind: SystemActorKind::Engine,
+                },
+                headers: HeaderMap::new(),
+                automation: None,
+            },
+        ))
+        .await;
+
+        let body = response_json!(response, StatusCode::BAD_REQUEST).await;
+        assert_eq!(body["errors"][0]["detail"], expected_detail);
+    }
+}
+
+#[tokio::test]
+async fn create_run_from_manifest_preserves_competing_preparation_error_precedence() {
+    let mut workflow_before_title = minimal_manifest_json(MINIMAL_DOT);
+    workflow_before_title["workflows"]["workflow.fabro"]["config"] = json!({
+        "path": "workflow.toml",
+        "source": "_version = 1\n[run.unknown]\nvalue = true\n",
+    });
+    workflow_before_title["title"] = json!("   ");
+
+    let mut project_parse_before_later_path = minimal_manifest_json(MINIMAL_DOT);
+    project_parse_before_later_path["configs"] = json!([
+        {
+            "type": "project",
+            "path": "/tmp/.fabro/project.toml",
+            "source": "_version = 1\n[run.unknown]\nvalue = true\n",
+        },
+        {
+            "type": "project",
+            "source": "_version = 1\n",
+        },
+    ]);
+
+    for (manifest_json, expected_detail) in [
+        (workflow_before_title, "Failed to parse run config TOML"),
+        (
+            project_parse_before_later_path,
+            "Failed to parse run config TOML",
+        ),
+    ] {
+        let state = TestAppStateBuilder::new().build();
+        let manifest: RunManifest = serde_json::from_value(manifest_json).unwrap();
+        let submitted_manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+
+        let response = Box::pin(handler::runs::create_run_from_manifest(
+            state,
+            handler::runs::CreateRunFromManifestRequest {
+                manifest,
+                submitted_manifest_bytes,
+                explicit_run_id: None,
+                explicit_title_supplied: true,
+                actor: Principal::System {
+                    system_kind: SystemActorKind::Engine,
+                },
+                headers: HeaderMap::new(),
+                automation: None,
+            },
+        ))
+        .await;
+
+        let body = response_json!(response, StatusCode::BAD_REQUEST).await;
+        assert_eq!(body["errors"][0]["detail"], expected_detail);
+    }
+}
+
+#[tokio::test]
+async fn create_run_from_manifest_resolves_generated_id_after_variable_snapshot() {
+    let state = TestAppStateBuilder::new()
+        .env_lookup(|_| None)
+        .vault_entries([(EnvVars::OPENAI_API_KEY, "test-openai-api-key")])
+        .build();
+    let variable = state
+        .stores
+        .variables
+        .set("OWNER", "payments", None)
+        .await
+        .expect("test variable should persist");
+    let manifest: RunManifest = serde_json::from_value(minimal_manifest_json(
+        r#"digraph Test {
+            graph [goal="Test"]
+            start [shape=Mdiamond]
+            work [prompt="Ship {{ vars.OWNER }}"]
+            exit [shape=Msquare]
+            start -> work -> exit
+        }"#,
+    ))
+    .unwrap();
+    let submitted_manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+
+    let response = Box::pin(handler::runs::create_run_from_manifest(
+        state,
+        handler::runs::CreateRunFromManifestRequest {
+            manifest,
+            submitted_manifest_bytes,
+            explicit_run_id: None,
+            explicit_title_supplied: false,
+            actor: Principal::System {
+                system_kind: SystemActorKind::Engine,
+            },
+            headers: HeaderMap::new(),
+            automation: None,
+        },
+    ))
+    .await;
+
+    let body = response_json!(response, StatusCode::CREATED).await;
+    let run_id = body["id"].as_str().unwrap().parse::<RunId>().unwrap();
+    assert!(run_id.created_at() >= variable.updated_at);
+}
+
+#[tokio::test]
 async fn fake_automation_materializer_injection_captures_input_and_returns_manifest() {
     let materialized_manifest: RunManifest =
         serde_json::from_value(minimal_manifest_json(MINIMAL_DOT)).unwrap();
@@ -6366,31 +6709,36 @@ async fn create_unreadable_durable_run(state: &Arc<AppState>, run_id: RunId) {
     workflow_event::append_event(&run_store, &run_id, &workflow_event::Event::RunRunning)
         .await
         .unwrap();
-    let payload = fabro_store::EventPayload::new(
-        json!({
-            "id": "evt-unreadable-run-completed",
-            "ts": "2026-05-05T20:46:33Z",
-            "run_id": run_id,
-            "event": "run.completed",
-            "properties": {
-                "timing": {
-                    "wall_time_ms": 1,
-                    "inference_time_ms": 0,
-                    "tool_time_ms": 0,
-                    "active_time_ms": 0
-                },
-                "artifact_count": 0,
-                "status": "legacy-status",
-                "reason": "completed",
-            },
-        }),
+    let seq = run_store.last_event_seq().await.unwrap().unwrap() + 1;
+    let completed = workflow_event::to_run_event_at(
         &run_id,
+        &workflow_event::Event::WorkflowRunCompleted {
+            timing:               fabro_types::RunTiming::wall_only(1),
+            artifact_count:       0,
+            status:               "legacy-status".to_string(),
+            reason:               SuccessReason::Completed,
+            total_usd_micros:     None,
+            final_git_commit_sha: None,
+            final_patch:          None,
+            diff_summary:         None,
+            billing:              None,
+        },
+        "2026-05-05T20:46:33Z".parse().unwrap(),
+        None,
+    );
+    let payload = workflow_event::build_redacted_event_payload(&completed, &run_id).unwrap();
+    fabro_store::test_support::put_unvalidated_run_event(
+        &state.stores.runs,
+        &run_id,
+        seq,
+        payload.as_value(),
     )
+    .await
     .unwrap();
     let err = run_store
-        .append_event(&payload)
+        .state()
         .await
-        .expect_err("invalid projection event should be persisted but rejected by projection");
+        .expect_err("poison event should make the run projection unreadable");
     assert!(
         err.to_string().contains("invalid completed stage status"),
         "unexpected projection error: {err}"
@@ -7098,7 +7446,7 @@ async fn list_models_exposes_reasoning_effort_controls() {
 
     let req = Request::builder()
         .method("GET")
-        .uri(api("/models?provider=kimi"))
+        .uri(api("/models?provider=moonshot"))
         .body(Body::empty())
         .unwrap();
 
@@ -10590,6 +10938,190 @@ async fn stage_artifacts_keep_same_filename_per_retry() {
 }
 
 #[tokio::test]
+async fn run_artifacts_download_streams_latest_files_as_zip() {
+    let state = test_app_state();
+    let app = crate::test_support::build_test_router(Arc::clone(&state));
+    let run_id = create_run(&app, MINIMAL_DOT)
+        .await
+        .parse::<RunId>()
+        .unwrap();
+
+    let run_store = state.stores.runs.open_run(&run_id).await.unwrap();
+    for event in [
+        workflow_event::Event::RunRunnable {
+            source: fabro_types::RunRunnableSource::StartRequested,
+            actor:  None,
+        },
+        workflow_event::Event::RunStarting,
+        workflow_event::Event::RunRunning,
+    ] {
+        workflow_event::append_event(&run_store, &run_id, &event)
+            .await
+            .unwrap();
+    }
+    append_scoped_stage_event(
+        &state,
+        run_id,
+        "build",
+        1,
+        &stage_started_event("build", "command"),
+    )
+    .await;
+    append_scoped_stage_event(
+        &state,
+        run_id,
+        "verify",
+        1,
+        &stage_started_event("verify", "command"),
+    )
+    .await;
+
+    for (stage_id, retry, path, contents) in [
+        (
+            StageId::new("unknown", 1),
+            99,
+            "reports/result.txt",
+            &b"unknown stage"[..],
+        ),
+        (
+            StageId::new("build", 1),
+            1,
+            "reports/result.txt",
+            &b"build result"[..],
+        ),
+        (
+            StageId::new("verify", 1),
+            1,
+            "reports/result.txt",
+            &b"first verify"[..],
+        ),
+        (
+            StageId::new("verify", 1),
+            2,
+            "reports/result.txt",
+            &b"latest verify"[..],
+        ),
+        (
+            StageId::new("build", 1),
+            1,
+            "logs/run.txt",
+            &b"build log"[..],
+        ),
+        (
+            StageId::new("start", 1),
+            1,
+            "control-start.txt",
+            &b"excluded"[..],
+        ),
+        (
+            StageId::new("exit", 1),
+            1,
+            "control-exit.txt",
+            &b"excluded"[..],
+        ),
+        // Neither stage reached the projection, so both rank equally on stage
+        // order and retry. The serialized stage ID breaks the tie the same way
+        // the artifacts page does: "unknown@2" sorts above "unknown@10".
+        (
+            StageId::new("unknown", 10),
+            1,
+            "orphan.txt",
+            &b"visit ten"[..],
+        ),
+        (
+            StageId::new("unknown", 2),
+            1,
+            "orphan.txt",
+            &b"visit two"[..],
+        ),
+    ] {
+        state
+            .artifact_store
+            .put(&run_id, &ArtifactKey::new(stage_id, retry, path), contents)
+            .await
+            .unwrap();
+    }
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(api(&format!("/runs/{run_id}/artifacts/download")))
+                .header(header::ACCEPT_ENCODING, "gzip")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/zip")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_DISPOSITION)
+            .and_then(|value| value.to_str().ok()),
+        Some(format!("attachment; filename=\"fabro-artifacts-{run_id}.zip\"").as_str())
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("private, no-store")
+    );
+    assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
+
+    let bytes = response_bytes!(response, StatusCode::OK).await;
+    let archive = ZipFileReader::new(bytes).await.unwrap();
+    let names = archive
+        .file()
+        .entries()
+        .iter()
+        .map(|entry| entry.filename().as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(names, vec![
+        "logs/run.txt",
+        "orphan.txt",
+        "reports/result.txt"
+    ]);
+
+    let mut contents_by_name = HashMap::new();
+    for (index, name) in names.into_iter().enumerate() {
+        let mut entry = archive.reader_with_entry(index).await.unwrap();
+        let mut contents = Vec::new();
+        entry.read_to_end_checked(&mut contents).await.unwrap();
+        contents_by_name.insert(name, contents);
+    }
+    assert_eq!(contents_by_name["logs/run.txt"], b"build log");
+    assert_eq!(contents_by_name["reports/result.txt"], b"latest verify");
+    assert_eq!(contents_by_name["orphan.txt"], b"visit two");
+}
+
+#[tokio::test]
+async fn run_artifacts_download_returns_not_found_for_unknown_run() {
+    let state = test_app_state();
+    let app = crate::test_support::build_test_router(Arc::clone(&state));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(api(&format!("/runs/{}/artifacts/download", RunId::new())))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_status!(response, StatusCode::NOT_FOUND).await;
+}
+
+#[tokio::test]
 async fn create_run_persists_run_spec() {
     let state = test_app_state();
     let app = crate::test_support::build_test_router(Arc::clone(&state));
@@ -11316,6 +11848,7 @@ async fn worker_token_is_rejected_on_user_only_routes() {
         (Method::GET, format!("/runs/{run_id}/graph/source")),
         (Method::GET, format!("/runs/{run_id}/stages")),
         (Method::GET, format!("/runs/{run_id}/artifacts")),
+        (Method::GET, format!("/runs/{run_id}/artifacts/download")),
         (Method::GET, format!("/runs/{run_id}/files")),
         (
             Method::GET,
@@ -15910,7 +16443,7 @@ async fn create_completion_unsupported_reasoning_efforts_return_bad_request() {
         then.status(500);
     });
     let state = TestAppStateBuilder::new()
-        .provider_base_url("kimi", upstream.url("/v1"))
+        .provider_base_url("moonshot", upstream.url("/v1"))
         .vault_entries([(EnvVars::KIMI_API_KEY, "test-kimi-api-key")])
         .build();
     let app = crate::test_support::build_test_router(state);
@@ -15923,7 +16456,7 @@ async fn create_completion_unsupported_reasoning_efforts_return_bad_request() {
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::json!({
-                        "provider": "kimi",
+                        "provider": "moonshot",
                         "model": "kimi-k3",
                         "reasoning_effort": effort,
                         "stream": stream,
@@ -15982,7 +16515,7 @@ async fn create_completion_returns_disjoint_usage_buckets() {
             }));
     });
     let state = TestAppStateBuilder::new()
-        .provider_base_url("kimi", upstream.base_url())
+        .provider_base_url("moonshot", upstream.base_url())
         .vault_entries([(EnvVars::KIMI_API_KEY, "test-kimi-api-key")])
         .build();
     let app = crate::test_support::build_test_router(state);
@@ -15993,7 +16526,7 @@ async fn create_completion_returns_disjoint_usage_buckets() {
         .header("content-type", "application/json")
         .body(Body::from(
             json!({
-                "provider": "kimi",
+                "provider": "moonshot",
                 "model": "kimi-k3",
                 "stream": false,
                 "messages": [{
@@ -16122,7 +16655,7 @@ async fn create_completion_structured_output_forwards_reasoning_effort() {
             }));
     });
     let state = TestAppStateBuilder::new()
-        .provider_base_url("kimi", upstream.base_url())
+        .provider_base_url("moonshot", upstream.base_url())
         .vault_entries([(EnvVars::KIMI_API_KEY, "test-kimi-api-key")])
         .build();
     let app = crate::test_support::build_test_router(state);
@@ -16133,7 +16666,7 @@ async fn create_completion_structured_output_forwards_reasoning_effort() {
         .header("content-type", "application/json")
         .body(Body::from(
             serde_json::json!({
-                "provider": "kimi",
+                "provider": "moonshot",
                 "model": "kimi-k3",
                 "reasoning_effort": "high",
                 "stream": false,

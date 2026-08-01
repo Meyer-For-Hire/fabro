@@ -4,6 +4,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde_json::{Map, Value, json};
 
+use super::sanitize;
 use crate::codec::{CodecCtx, EncodedRequest, extract_system_prompt, merge_named_provider_options};
 use crate::error::Error;
 use crate::types::{ContentPart, Message, Request, Role, ToolChoice};
@@ -127,12 +128,11 @@ fn encode_message(message: &Message) -> Option<Value> {
     if blocks.is_empty() && message.role == Role::Tool {
         if let Some(tool_call_id) = &message.tool_call_id {
             let text = message.text();
-            blocks.push(json!({
-                "toolResult": {
-                    "toolUseId": tool_call_id,
-                    "content": [{ "text": text }],
-                }
-            }));
+            blocks.push(tool_result_block(
+                tool_call_id,
+                json!([{ "text": text }]),
+                false,
+            ));
         }
     }
 
@@ -183,26 +183,18 @@ fn encode_content_part(part: &ContentPart) -> Option<Value> {
                 Value::Object(_) => tool_call.arguments.clone(),
                 _ => json!({}),
             };
-            Some(json!({
-                "toolUse": {
-                    "toolUseId": tool_call.id,
-                    "name": tool_call.name,
-                    "input": input,
-                }
-            }))
+            Some(tool_use_block(&tool_call.id, &tool_call.name, input))
         }
         ContentPart::ToolResult(result) => {
             let content = match &result.content {
                 Value::String(text) => json!([{ "text": text }]),
                 other => json!([{ "json": other }]),
             };
-            let mut block = Map::new();
-            block.insert("toolUseId".to_string(), json!(result.tool_call_id));
-            block.insert("content".to_string(), content);
-            if result.is_error {
-                block.insert("status".to_string(), json!("error"));
-            }
-            Some(json!({ "toolResult": Value::Object(block) }))
+            Some(tool_result_block(
+                &result.tool_call_id,
+                content,
+                result.is_error,
+            ))
         }
         ContentPart::Thinking(thinking) => {
             if thinking.redacted {
@@ -224,6 +216,28 @@ fn encode_content_part(part: &ContentPart) -> Option<Value> {
         // Audio input and opaque foreign parts have no Converse encoding.
         ContentPart::Audio(_) | ContentPart::Other { .. } => None,
     }
+}
+
+/// Build a `toolUse` block. All tool blocks must be constructed through
+/// [`tool_use_block`] and [`tool_result_block`] so identifier sanitization
+/// keeps `toolUse` and `toolResult` paired on the wire.
+fn tool_use_block(id: &str, name: &str, input: Value) -> Value {
+    let mut block = Map::new();
+    block.insert("toolUseId".to_string(), json!(sanitize::tool_use_id(id)));
+    block.insert("name".to_string(), json!(sanitize::tool_name(name)));
+    block.insert("input".to_string(), input);
+    json!({ "toolUse": Value::Object(block) })
+}
+
+/// Build a `toolResult` block; see [`tool_use_block`] for the pairing contract.
+fn tool_result_block(id: &str, content: Value, is_error: bool) -> Value {
+    let mut block = Map::new();
+    block.insert("toolUseId".to_string(), json!(sanitize::tool_use_id(id)));
+    block.insert("content".to_string(), content);
+    if is_error {
+        block.insert("status".to_string(), json!("error"));
+    }
+    json!({ "toolResult": Value::Object(block) })
 }
 
 /// Convert common MIME types into Bedrock's media `format` enum values.
@@ -520,6 +534,114 @@ mod tests {
         assert_eq!(tool_use["toolUseId"], "tool-1");
         assert_eq!(tool_use["name"], "TaskList");
         assert_eq!(tool_use["input"], json!({}));
+    }
+
+    #[test]
+    fn historical_tool_names_are_sanitized_on_the_wire() {
+        let mut request = base_request("claude");
+        request.messages = vec![Message {
+            role:         Role::Assistant,
+            content:      vec![ContentPart::ToolCall(ToolCall::new(
+                "tool-1",
+                "search???",
+                json!({}),
+            ))],
+            name:         None,
+            tool_call_id: None,
+        }];
+
+        let encoded = encode_with(&request);
+        let tool_use = &encoded.body["messages"][0]["content"][0]["toolUse"];
+        assert_eq!(tool_use["name"], sanitize::tool_name("search???"));
+    }
+
+    #[test]
+    fn sanitized_tool_use_ids_remain_paired() {
+        for id in ["bad id!".to_string(), "x".repeat(100)] {
+            let mut request = base_request("claude");
+            request.messages = vec![
+                Message {
+                    role:         Role::Assistant,
+                    content:      vec![ContentPart::ToolCall(ToolCall::new(
+                        &id,
+                        "search",
+                        json!({}),
+                    ))],
+                    name:         None,
+                    tool_call_id: None,
+                },
+                Message {
+                    role:         Role::Tool,
+                    content:      vec![ContentPart::ToolResult(ToolResult::success(
+                        &id,
+                        json!("done"),
+                    ))],
+                    name:         None,
+                    tool_call_id: Some(id.clone()),
+                },
+            ];
+
+            let encoded = encode_with(&request);
+            let tool_use_id = &encoded.body["messages"][0]["content"][0]["toolUse"]["toolUseId"];
+            let tool_result_id =
+                &encoded.body["messages"][1]["content"][0]["toolResult"]["toolUseId"];
+            assert_eq!(tool_use_id, tool_result_id);
+            assert!(tool_use_id.as_str().is_some_and(|value| value.len() <= 64));
+        }
+    }
+
+    #[test]
+    fn tool_role_fallback_sanitizes_the_tool_use_id() {
+        let mut request = base_request("claude");
+        request.messages = vec![Message {
+            role:         Role::Tool,
+            content:      vec![],
+            name:         None,
+            tool_call_id: Some("bad id!".to_string()),
+        }];
+
+        let encoded = encode_with(&request);
+        assert_eq!(
+            encoded.body["messages"][0]["content"][0]["toolResult"]["toolUseId"],
+            sanitize::tool_use_id("bad id!")
+        );
+    }
+
+    #[test]
+    fn overlength_tool_names_encode_within_the_bedrock_limit() {
+        let mut request = base_request("claude");
+        request.messages = vec![Message {
+            role:         Role::Assistant,
+            content:      vec![ContentPart::ToolCall(ToolCall::new(
+                "tool-1",
+                "x".repeat(100),
+                json!({}),
+            ))],
+            name:         None,
+            tool_call_id: None,
+        }];
+
+        let encoded = encode_with(&request);
+        let name = encoded.body["messages"][0]["content"][0]["toolUse"]["name"]
+            .as_str()
+            .unwrap();
+        assert_eq!(name.len(), 64);
+    }
+
+    #[test]
+    fn tool_definition_names_remain_unsanitized() {
+        let mut request = base_request("claude");
+        request.tools = Some(vec![ToolDefinition::function(
+            "weird.name",
+            "Deliberately invalid for Bedrock",
+            json!({"type": "object"}),
+        )]);
+
+        let encoded = encode_with(&request);
+        assert_eq!(
+            encoded.body["toolConfig"]["tools"][0]["toolSpec"]["name"],
+            "weird.name"
+        );
     }
 
     #[test]

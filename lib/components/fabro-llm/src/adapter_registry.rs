@@ -303,6 +303,8 @@ mod tests {
             ("claude-sonnet-4-5",                  "claude-sonnet-4-5",                   T::Anthropic,         C::AnthropicMessages, B::Anthropic, P::Anthropic),
             ("claude-sonnet-4-6",                  "claude-sonnet-4-6",                   T::Anthropic,         C::AnthropicMessages, B::Anthropic, P::Anthropic),
             ("claude-sonnet-5",                    "claude-sonnet-5",                     T::Anthropic,         C::AnthropicMessages, B::Anthropic, P::Claude5),
+            ("deepseek-v4-flash",                  "deepseek-v4-flash",                   T::OpenAiCompatible,  C::OpenAiCompatible,  B::OpenAi,    P::OpenAi),
+            ("deepseek-v4-pro",                    "deepseek-v4-pro",                     T::OpenAiCompatible,  C::OpenAiCompatible,  B::OpenAi,    P::OpenAi),
             ("gemini-3-flash-preview",             "gemini-3-flash-preview",              T::Gemini,            C::GeminiGenerate,    B::Gemini,    P::Gemini),
             ("gemini-3.1-flash-lite",              "gemini-3.1-flash-lite",               T::Gemini,            C::GeminiGenerate,    B::Gemini,    P::Gemini),
             ("gemini-3.1-pro-preview",             "gemini-3.1-pro-preview",              T::Gemini,            C::GeminiGenerate,    B::Gemini,    P::Gemini),
@@ -425,10 +427,10 @@ mod tests {
     fn openai_compatible_factory_uses_provider_id_for_name() {
         let config = AdapterConfig {
             base_url: Some("https://api.moonshot.ai/v1".to_string()),
-            ..AdapterConfig::new("kimi", ApiKeyHeader::Bearer("k".to_string()))
+            ..AdapterConfig::new("moonshot", ApiKeyHeader::Bearer("k".to_string()))
         };
         let adapter = factory_for(AdapterKind::OpenAiCompatible)(config).unwrap();
-        assert_eq!(adapter.name(), "kimi");
+        assert_eq!(adapter.name(), "moonshot");
     }
 
     #[test]
@@ -489,7 +491,7 @@ mod tests {
 
     #[test]
     fn openai_compatible_factory_errors_without_base_url() {
-        let config = AdapterConfig::new("kimi", ApiKeyHeader::Bearer("k".to_string()));
+        let config = AdapterConfig::new("moonshot", ApiKeyHeader::Bearer("k".to_string()));
         let Err(err) = factory_for(AdapterKind::OpenAiCompatible)(config) else {
             panic!("expected missing base_url error");
         };

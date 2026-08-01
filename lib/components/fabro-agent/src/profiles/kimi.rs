@@ -100,7 +100,7 @@ impl KimiProfile {
         Self {
             base: BaseProfile {
                 profile_kind: AgentProfileKind::Kimi,
-                provider_id: ProviderId::new("kimi"),
+                provider_id: ProviderId::new("moonshot"),
                 model: model.into(),
                 catalog: None,
                 registry,
@@ -178,8 +178,8 @@ mod tests {
     #[test]
     fn kimi_models_select_the_kimi_profile_on_every_provider() {
         for (catalog, provider, model) in [
-            (catalog(), "kimi", "kimi-k3"),
-            (catalog(), "kimi", "kimi-k2.5"),
+            (catalog(), "moonshot", "kimi-k3"),
+            (catalog(), "moonshot", "kimi-k2.5"),
             (catalog_with_openrouter(), "openrouter", "kimi-k3"),
             (catalog_with_openrouter(), "openrouter", "kimi-k2.6"),
         ] {

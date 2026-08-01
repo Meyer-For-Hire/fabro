@@ -185,8 +185,8 @@ async fn encode_tool_round_trip() {
     fabro_test::fabro_json_snapshot!(capture.body);
 }
 
-/// Assistant thinking parts echo back as `reasoning_content` (Kimi-motivated,
-/// applies to every compat assistant message).
+/// Assistant thinking parts echo back as `reasoning_content` (required by
+/// Kimi and DeepSeek during tool-call continuations).
 #[tokio::test]
 async fn encode_thinking_round_trip_as_reasoning_content() {
     let capture = encode_capture(&corpus_thinking_round_trip(MODEL)).await;
@@ -253,7 +253,7 @@ async fn encode_kimi_k3_uses_catalog_reasoning_and_sampling_controls() {
         ..base_request(MODEL)
     };
     let capture = encode_capture_with(&request, move |adapter| {
-        adapter.with_name("kimi").with_catalog(catalog)
+        adapter.with_name("moonshot").with_catalog(catalog)
     })
     .await;
 
@@ -398,9 +398,9 @@ async fn encode_openrouter_claude_auto_cache_opt_out() {
 async fn encode_provider_options_keyed_by_adapter_name() {
     let request = corpus_provider_options(
         MODEL,
-        serde_json::json!({"kimi": {"repetition_penalty": 1.2}}),
+        serde_json::json!({"moonshot": {"repetition_penalty": 1.2}}),
     );
-    let capture = encode_capture_with(&request, |adapter| adapter.with_name("kimi")).await;
+    let capture = encode_capture_with(&request, |adapter| adapter.with_name("moonshot")).await;
     fabro_test::fabro_json_snapshot!(capture.body);
 }
 
@@ -411,7 +411,7 @@ async fn encode_provider_options_other_namespace_ignored() {
         MODEL,
         serde_json::json!({"openai": {"repetition_penalty": 1.2}}),
     );
-    let capture = encode_capture_with(&request, |adapter| adapter.with_name("kimi")).await;
+    let capture = encode_capture_with(&request, |adapter| adapter.with_name("moonshot")).await;
     fabro_test::fabro_json_snapshot!(capture.body);
 }
 
@@ -904,11 +904,11 @@ async fn stream_without_done_or_content_synthesizes_nothing() {
 async fn custom_named_complete_identity() {
     let server = MockServer::start();
     let (mock, _slot) = mount_capture(&server, "/chat/completions", minimal_body());
-    let adapter = adapter(&server).with_name("kimi");
+    let adapter = adapter(&server).with_name("moonshot");
     let response = adapter
         .complete(&base_request(MODEL))
         .await
         .expect("complete should succeed");
     mock.assert();
-    assert_eq!(response.provider, "kimi");
+    assert_eq!(response.provider, "moonshot");
 }

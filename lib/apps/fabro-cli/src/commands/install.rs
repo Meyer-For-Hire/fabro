@@ -3515,12 +3515,13 @@ root = "{}"
         assert!(ids.contains(&ProviderId::anthropic()));
         assert!(ids.contains(&ProviderId::openai()));
         assert!(ids.contains(&ProviderId::gemini()));
-        assert!(ids.contains(&ProviderId::new("kimi")));
+        assert!(ids.contains(&ProviderId::new("moonshot")));
         assert!(ids.contains(&ProviderId::new("zai")));
         assert!(ids.contains(&ProviderId::new("minimax")));
         assert!(ids.contains(&ProviderId::new("inception")));
         assert!(ids.contains(&ProviderId::new("venice")));
         assert!(ids.contains(&ProviderId::new("poolside")));
+        assert!(ids.contains(&ProviderId::new("deepseek")));
         assert!(!ids.contains(&ProviderId::new("fireworks")));
         assert!(!ids.contains(&ProviderId::new("ollama")));
         assert!(!ids.contains(&ProviderId::new("litellm")));

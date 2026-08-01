@@ -48,6 +48,7 @@ impl EnvVars {
     pub const BEDROCK_API_KEY: &'static str = "BEDROCK_API_KEY";
     pub const BRAVE_SEARCH_API_KEY: &'static str = "BRAVE_SEARCH_API_KEY";
     pub const CHATGPT_ACCOUNT_ID: &'static str = "CHATGPT_ACCOUNT_ID";
+    pub const DEEPSEEK_API_KEY: &'static str = "DEEPSEEK_API_KEY";
     pub const FIREWORKS_API_KEY: &'static str = "FIREWORKS_API_KEY";
     pub const GEMINI_API_KEY: &'static str = "GEMINI_API_KEY";
     pub const GEMINI_BASE_URL: &'static str = "GEMINI_BASE_URL";
@@ -56,6 +57,7 @@ impl EnvVars {
     pub const INCEPTION_API_KEY: &'static str = "INCEPTION_API_KEY";
     pub const KIMI_API_KEY: &'static str = "KIMI_API_KEY";
     pub const MINIMAX_API_KEY: &'static str = "MINIMAX_API_KEY";
+    pub const MOONSHOT_API_KEY: &'static str = "MOONSHOT_API_KEY";
     pub const MODAL_TOKEN_ID: &'static str = "MODAL_TOKEN_ID";
     pub const MODAL_TOKEN_SECRET: &'static str = "MODAL_TOKEN_SECRET";
     pub const OPENAI_API_KEY: &'static str = "OPENAI_API_KEY";
@@ -198,6 +200,7 @@ mod tests {
             EnvVars::BEDROCK_API_KEY,
             EnvVars::BRAVE_SEARCH_API_KEY,
             EnvVars::CHATGPT_ACCOUNT_ID,
+            EnvVars::DEEPSEEK_API_KEY,
             EnvVars::FIREWORKS_API_KEY,
             EnvVars::GEMINI_API_KEY,
             EnvVars::GEMINI_BASE_URL,
@@ -206,6 +209,7 @@ mod tests {
             EnvVars::INCEPTION_API_KEY,
             EnvVars::KIMI_API_KEY,
             EnvVars::MINIMAX_API_KEY,
+            EnvVars::MOONSHOT_API_KEY,
             EnvVars::OPENAI_API_KEY,
             EnvVars::OPENAI_BASE_URL,
             EnvVars::OPENAI_ORGANIZATION,

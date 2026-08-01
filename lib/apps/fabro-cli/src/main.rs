@@ -120,8 +120,12 @@ async fn main() {
             "{:?}",
             miette::Report::new(CliDiagnostic::new(err, !json_mode))
         );
-        std::process::exit(exit_code);
     }
+
+    // Exit rather than returning. A command can leave a blocked worker thread
+    // behind — `mcp start` parks Tokio's stdin reader on a read only the MCP
+    // host can end — and dropping the runtime would wait on it forever.
+    std::process::exit(exit_code);
 }
 
 fn install_miette_hook() {

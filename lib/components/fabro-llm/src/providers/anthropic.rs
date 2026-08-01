@@ -169,7 +169,8 @@ impl Adapter {
 
     /// Collect a streaming response into a single [`Response`].
     ///
-    /// Used by non-Anthropic providers (e.g. Kimi) that require `stream=true`.
+    /// Used by non-Anthropic providers (e.g. Moonshot) that require
+    /// `stream=true`.
     async fn complete_via_stream(&self, request: &Request) -> Result<Response, Error> {
         use futures::StreamExt;
 
@@ -266,7 +267,7 @@ impl ProviderAdapter for Adapter {
         self.validate_request(request)?;
 
         let route = self.route_config();
-        // Non-Anthropic providers (e.g. Kimi) require stream=true even for
+        // Non-Anthropic providers (e.g. Moonshot) require stream=true even for
         // blocking calls. Collect the stream into a single Response.
         if route.force_streaming {
             return self.complete_via_stream(request).await;
@@ -367,8 +368,8 @@ mod tests {
 
     #[test]
     fn adapter_with_name() {
-        let adapter = Adapter::new("key").with_name("kimi");
-        assert_eq!(adapter.name(), "kimi");
+        let adapter = Adapter::new("key").with_name("moonshot");
+        assert_eq!(adapter.name(), "moonshot");
     }
 
     #[test]

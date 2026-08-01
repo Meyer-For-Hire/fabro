@@ -1190,7 +1190,6 @@ fn attach_json_errors_without_prompting_for_human_input() {
         "properties": {
           "attempt": 1,
           "context_values": {
-            "current.preamble": "Goal: Wait for approval/n",
             "current_node": "start",
             "graph.goal": "Wait for approval",
             "internal.fidelity": "compact",

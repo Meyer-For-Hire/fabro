@@ -98,11 +98,7 @@ describe("SteerBar", () => {
     });
     mountedRenderers.push(renderer);
 
-    act(() => {
-      renderer.root
-        .findByProps({ "aria-label": "Collapse Steer running agent" })
-        .props.onClick();
-    });
+    // The dock starts collapsed by default.
     expect(
       renderer.root.findByProps({
         "aria-label": "Expand Steer running agent",

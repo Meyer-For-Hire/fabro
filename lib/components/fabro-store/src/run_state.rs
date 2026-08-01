@@ -1363,20 +1363,11 @@ pub(crate) fn projected_billing(state: &RunProjection) -> BilledTokenCounts {
 
     let mut billing = BilledTokenCounts::default();
     for (stage_id, stage) in state.iter_stages() {
-        if !is_boundary_stage(state, stage_id.node_id()) {
+        if !state.is_boundary_stage(stage_id.node_id()) {
             billing.add_counts(&stage.usage);
         }
     }
     billing
-}
-
-fn is_boundary_stage(projection: &RunProjection, node_id: &str) -> bool {
-    projection
-        .spec()
-        .graph()
-        .nodes
-        .get(node_id)
-        .is_some_and(|node| matches!(node.handler_type(), Some("start" | "exit")))
 }
 
 fn run_models(state: &RunProjection) -> Vec<RunModel> {

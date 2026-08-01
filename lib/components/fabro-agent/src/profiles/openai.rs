@@ -229,19 +229,19 @@ mod tests {
     }
 
     #[test]
-    fn kimi_provider_prompt_uses_catalog_display_name() {
+    fn moonshot_provider_prompt_uses_catalog_display_name() {
         let profile =
-            OpenAiProfile::new("kimi-k2.5").with_route(ProviderId::new("kimi"), test_catalog());
+            OpenAiProfile::new("kimi-k2.5").with_route(ProviderId::new("moonshot"), test_catalog());
         let env = MockSandbox::linux();
         let prompt = profile.build_system_prompt(&env, &EnvContext::default(), &[], None, &[]);
-        assert!(prompt.contains("powered by Kimi"));
+        assert!(prompt.contains("powered by Moonshot AI"));
         assert!(!prompt.contains("powered by OpenAI"));
     }
 
     #[test]
     fn openai_compatible_profile_uses_json_schema_edit_tool() {
         let profile =
-            OpenAiProfile::new("kimi-k2.5").with_route(ProviderId::new("kimi"), test_catalog());
+            OpenAiProfile::new("kimi-k2.5").with_route(ProviderId::new("moonshot"), test_catalog());
 
         let names = profile.tool_registry().names();
         assert!(names.contains(&"edit_file".to_string()));

@@ -835,11 +835,11 @@ async fn stream_without_message_stop_emits_no_finish() {
 }
 
 // ---------------------------------------------------------------------------
-// Custom-named route (the Kimi-over-anthropic shape)
+// Custom-named route (the Moonshot Kimi-over-anthropic shape)
 // ---------------------------------------------------------------------------
 
-/// Shared setup for a custom-named anthropic-dialect (Kimi) stream route; the
-/// request and event halves are pinned by separate tests.
+/// Shared setup for a custom-named Moonshot Kimi stream route using the
+/// Anthropic dialect; separate tests pin the request and event halves.
 async fn custom_named_stream_capture() -> (WireCapture, Vec<serde_json::Value>) {
     let sse = support::sse_transcript(&[
         (
@@ -865,15 +865,15 @@ async fn custom_named_stream_capture() -> (WireCapture, Vec<serde_json::Value>) 
         ("message_stop", r#"{"type":"message_stop"}"#),
     ]);
     stream_capture(
-        adapter().with_name("kimi"),
+        adapter().with_name("moonshot"),
         &base_request("kimi-test"),
         &sse,
     )
     .await
 }
 
-/// A custom-named (Kimi) route authenticates with a bearer token and sends no
-/// `anthropic-version` header. This pins that route shape on the wire.
+/// A custom-named Moonshot route authenticates with a bearer token and sends
+/// no `anthropic-version` header. This pins that route shape on the wire.
 #[tokio::test]
 async fn custom_named_stream_route() {
     let (capture, _) = custom_named_stream_capture().await;
@@ -903,7 +903,7 @@ async fn custom_named_stream_error_identity() {
         ),
     ]);
     let (_capture, events) = stream_capture(
-        adapter().with_name("kimi"),
+        adapter().with_name("moonshot"),
         &base_request("kimi-test"),
         &sse,
     )

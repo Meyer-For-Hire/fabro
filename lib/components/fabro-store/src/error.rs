@@ -14,6 +14,11 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("Invalid event payload: {0}")]
     InvalidEvent(String),
+    #[error("event rejected by run projection: {source}")]
+    EventRejected {
+        #[source]
+        source: Box<Self>,
+    },
     #[error("Run not found: {0}")]
     RunNotFound(String),
     #[error("Run already exists: {0}")]
@@ -35,7 +40,7 @@ pub enum Error {
         run_id: String,
         field:  &'static str,
     },
-    #[error("invalid status transition: {0}")]
+    #[error(transparent)]
     InvalidTransition(#[from] fabro_types::InvalidTransition),
     #[error("{0}")]
     Other(String),

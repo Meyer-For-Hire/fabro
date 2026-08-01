@@ -631,6 +631,60 @@ base_url = "https://example--kimi-k3.modal.run/v1"
     }
 
     #[tokio::test]
+    async fn resolve_moonshot_api_request_prefers_moonshot_env_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::load(dir.path().join("secrets.json")).unwrap();
+        let resolver = test_resolver(
+            vault,
+            Arc::new(|name| match name {
+                EnvVars::MOONSHOT_API_KEY => Some("moonshot-key".to_string()),
+                EnvVars::KIMI_API_KEY => Some("kimi-key".to_string()),
+                _ => None,
+            }),
+        );
+
+        let resolved = resolver
+            .resolve(
+                ProviderId::new("moonshot"),
+                CredentialUsage::ApiRequest,
+                &default_catalog(),
+            )
+            .await
+            .unwrap();
+
+        let ResolvedCredential::Api(api) = resolved;
+        assert_eq!(
+            api.auth_header,
+            Some(ApiKeyHeader::Bearer("moonshot-key".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_moonshot_api_request_falls_back_to_kimi_env_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::load(dir.path().join("secrets.json")).unwrap();
+        let resolver = test_resolver(
+            vault,
+            Arc::new(|name| (name == EnvVars::KIMI_API_KEY).then(|| "kimi-key".to_string())),
+        );
+
+        let resolved = resolver
+            .resolve(
+                ProviderId::new("moonshot"),
+                CredentialUsage::ApiRequest,
+                &default_catalog(),
+            )
+            .await
+            .unwrap();
+
+        let ResolvedCredential::Api(api) = resolved;
+        assert_eq!(
+            api.auth_header,
+            Some(ApiKeyHeader::Bearer("kimi-key".to_string()))
+        );
+    }
+
+    #[tokio::test]
     async fn resolve_openai_api_request_falls_back_to_codex_oauth_credential() {
         let dir = tempfile::tempdir().unwrap();
         let mut vault = Vault::load(dir.path().join("secrets.json")).unwrap();

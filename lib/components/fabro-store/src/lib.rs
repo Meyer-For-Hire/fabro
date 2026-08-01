@@ -10,8 +10,8 @@ mod run_state;
 mod run_summary_store;
 mod serializable_projection;
 mod slate;
-#[cfg(test)]
-mod test_util;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 mod types;
 
 pub use artifact_store::{

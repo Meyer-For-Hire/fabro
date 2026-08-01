@@ -443,12 +443,12 @@ mod tests {
 
     #[test]
     fn summary_budget_for_always_reasoning_route_without_effort_adds_headroom() {
-        let kimi = ProviderId::new("kimi");
-        let model = catalog_model(&kimi, "kimi-k2.5");
+        let moonshot = ProviderId::new("moonshot");
+        let model = catalog_model(&moonshot, "kimi-k2.5");
         assert!(model.supports_reasoning());
         assert!(!model.supports_reasoning_effort());
         assert_eq!(
-            builtin_summary_max_tokens(&kimi, "kimi-k2.5"),
+            builtin_summary_max_tokens(&moonshot, "kimi-k2.5"),
             SUMMARY_MAX_TOKENS + REASONING_HEADROOM_TOKENS
         );
     }
