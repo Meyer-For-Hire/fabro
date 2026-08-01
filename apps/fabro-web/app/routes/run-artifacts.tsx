@@ -138,8 +138,7 @@ function ArtifactList({ runId, files }: { runId: string; files: readonly Artifac
           </span>
           <a
             href={runArtifactsDownloadUrl(runId)}
-            download={`fabro-artifacts-${runId}.zip`}
-            aria-label={`Download the latest version of all ${files.length} ${plural(files.length, "artifact", "artifacts")} as a ZIP file`}
+            aria-label={`Download all ${files.length} ${plural(files.length, "artifact", "artifacts")} as a ZIP file`}
             className="inline-flex min-h-11 shrink-0 items-center gap-1.5 rounded-md bg-overlay px-2.5 py-1 text-xs font-medium text-fg-2 outline-1 -outline-offset-1 outline-line-strong hover:bg-overlay-strong hover:text-fg focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 sm:min-h-8"
           >
             <ArrowDownTrayIcon className="size-3.5 shrink-0" aria-hidden="true" />

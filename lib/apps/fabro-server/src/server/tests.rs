@@ -10692,7 +10692,6 @@ async fn run_artifacts_download_streams_latest_files_as_zip() {
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response
             .headers()
@@ -10717,15 +10716,7 @@ async fn run_artifacts_download_streams_latest_files_as_zip() {
     assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
 
     let bytes = response_bytes!(response, StatusCode::OK).await;
-    let archive = ZipFileReader::new(bytes.clone())
-        .await
-        .unwrap_or_else(|error| {
-            panic!(
-                "ZIP parse failed for {} bytes (tail {:?}): {error}",
-                bytes.len(),
-                &bytes[bytes.len().saturating_sub(48)..]
-            )
-        });
+    let archive = ZipFileReader::new(bytes).await.unwrap();
     let names = archive
         .file()
         .entries()
@@ -10743,6 +10734,12 @@ async fn run_artifacts_download_streams_latest_files_as_zip() {
     }
     assert_eq!(contents_by_name["logs/run.txt"], b"build log");
     assert_eq!(contents_by_name["reports/result.txt"], b"latest verify");
+}
+
+#[tokio::test]
+async fn run_artifacts_download_returns_not_found_for_unknown_run() {
+    let state = test_app_state();
+    let app = crate::test_support::build_test_router(Arc::clone(&state));
 
     let response = app
         .oneshot(

@@ -962,6 +962,20 @@ impl RunProjection {
         &self.spec
     }
 
+    /// Whether a graph node is one of the `start`/`exit` boundaries.
+    ///
+    /// Boundary nodes run no work, so callers that report what a run *did* —
+    /// billing, stage listings, artifact downloads — leave them out. The test
+    /// is the node's handler type, not its name: a node may be named
+    /// `start` and still do real work.
+    pub fn is_boundary_stage(&self, node_id: &str) -> bool {
+        self.spec()
+            .graph()
+            .nodes
+            .get(node_id)
+            .is_some_and(|node| matches!(node.handler_type(), Some("start" | "exit")))
+    }
+
     pub fn status(&self) -> RunStatus {
         self.status
     }

@@ -3289,8 +3289,12 @@ paths:
       summary: Download Run Artifacts
       description: |
         Streams a ZIP archive with the latest captured version of each artifact path.
-        Stage order, retry number, and stage ID determine the latest version, matching the artifacts page.
+        Stage order and retry number determine the latest version, matching the artifacts page.
         Captures from the `start` and `exit` control nodes are excluded.
+
+        The archive streams, so the response status is sent before the first artifact is read.
+        A failure after that point aborts the transfer rather than returning `500`.
+        The ZIP central directory is written last, so a truncated download does not open as a valid archive.
       parameters:
         - $ref: "#/components/parameters/RunId"
       responses:

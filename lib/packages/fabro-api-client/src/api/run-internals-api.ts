@@ -147,7 +147,7 @@ export const RunInternalsApiAxiosParamCreator = function (configuration?: Config
             };
         },
         /**
-         * Streams a ZIP archive with the latest captured version of each artifact path. Stage order, retry number, and stage ID determine the latest version, matching the artifacts page. Captures from the `start` and `exit` control nodes are excluded.
+         * Streams a ZIP archive with the latest captured version of each artifact path. Stage order and retry number determine the latest version, matching the artifacts page. Captures from the `start` and `exit` control nodes are excluded.  The archive streams, so the response status is sent before the first artifact is read. A failure after that point aborts the transfer rather than returning `500`. The ZIP central directory is written last, so a truncated download does not open as a valid archive.
          * @summary Download Run Artifacts
          * @param {string} id Unique run identifier (ULID).
          * @param {*} [options] Override http request option.
@@ -987,7 +987,7 @@ export const RunInternalsApiFp = function(configuration?: Configuration) {
             return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
         },
         /**
-         * Streams a ZIP archive with the latest captured version of each artifact path. Stage order, retry number, and stage ID determine the latest version, matching the artifacts page. Captures from the `start` and `exit` control nodes are excluded.
+         * Streams a ZIP archive with the latest captured version of each artifact path. Stage order and retry number determine the latest version, matching the artifacts page. Captures from the `start` and `exit` control nodes are excluded.  The archive streams, so the response status is sent before the first artifact is read. A failure after that point aborts the transfer rather than returning `500`. The ZIP central directory is written last, so a truncated download does not open as a valid archive.
          * @summary Download Run Artifacts
          * @param {string} id Unique run identifier (ULID).
          * @param {*} [options] Override http request option.
@@ -1264,7 +1264,7 @@ export const RunInternalsApiFactory = function (configuration?: Configuration, b
             return localVarFp.attachRunEvents(id, sinceSeq, options).then((request) => request(axios, basePath));
         },
         /**
-         * Streams a ZIP archive with the latest captured version of each artifact path. Stage order, retry number, and stage ID determine the latest version, matching the artifacts page. Captures from the `start` and `exit` control nodes are excluded.
+         * Streams a ZIP archive with the latest captured version of each artifact path. Stage order and retry number determine the latest version, matching the artifacts page. Captures from the `start` and `exit` control nodes are excluded.  The archive streams, so the response status is sent before the first artifact is read. A failure after that point aborts the transfer rather than returning `500`. The ZIP central directory is written last, so a truncated download does not open as a valid archive.
          * @summary Download Run Artifacts
          * @param {string} id Unique run identifier (ULID).
          * @param {*} [options] Override http request option.
@@ -1490,7 +1490,7 @@ export class RunInternalsApi extends BaseAPI {
     }
 
     /**
-     * Streams a ZIP archive with the latest captured version of each artifact path. Stage order, retry number, and stage ID determine the latest version, matching the artifacts page. Captures from the `start` and `exit` control nodes are excluded.
+     * Streams a ZIP archive with the latest captured version of each artifact path. Stage order and retry number determine the latest version, matching the artifacts page. Captures from the `start` and `exit` control nodes are excluded.  The archive streams, so the response status is sent before the first artifact is read. A failure after that point aborts the transfer rather than returning `500`. The ZIP central directory is written last, so a truncated download does not open as a valid archive.
      * @summary Download Run Artifacts
      * @param {string} id Unique run identifier (ULID).
      * @param {*} [options] Override http request option.
