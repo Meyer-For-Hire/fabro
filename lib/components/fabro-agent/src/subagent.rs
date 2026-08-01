@@ -775,6 +775,14 @@ impl SubAgentSupervisor {
 
         if let Some((permit, generation)) = resumed {
             self.publish();
+            // This send cannot fail: `OwnedPermit::send` returns `()`, and the
+            // capacity it needs was reserved above while the state lock was
+            // held. Should a concurrent close drop the receiver first, the
+            // command is discarded and the agent still cannot hang, because
+            // every path that stops the runner -- `run_shutdown` and the two
+            // drop impls -- is reached only after `begin_shutdown` has set
+            // `Closing` under this same lock. A waiter then observes the close
+            // and stops instead of waiting on a turn that will never run.
             permit.send(StartTurn {
                 generation,
                 prompt: message.to_string(),
