@@ -105,6 +105,14 @@ pub(crate) fn output_stdout(output: &Output) -> String {
     stdout(output)
 }
 
+pub(crate) fn created_run_id(output: &Output) -> String {
+    stdout(output)
+        .trim()
+        .parse::<RunId>()
+        .expect("create command should print a run ID")
+        .to_string()
+}
+
 pub(crate) fn read_text(path: &Path) -> String {
     std::fs::read_to_string(path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()))
@@ -260,18 +268,10 @@ pub(crate) fn setup_seeded_created_dry_run(context: &TestContext) -> RunSetup {
 }
 
 fn run_completed_dry_run(context: &TestContext, workflow: &Path) -> RunSetup {
-    let run_id = unique_run_id();
     let mut cmd = context.run_cmd();
     cmd.current_dir(&context.temp_dir);
     cmd.timeout(command_timeout());
-    cmd.args([
-        "--run-id",
-        run_id.as_str(),
-        "--dry-run",
-        "--auto-approve",
-        "--environment",
-        "local",
-    ]);
+    cmd.args(["--dry-run", "--auto-approve", "--environment", "local"]);
     cmd.arg(workflow);
     let output = cmd.output().expect("command should execute");
     if !output.status.success() {
@@ -282,10 +282,7 @@ fn run_completed_dry_run(context: &TestContext, workflow: &Path) -> RunSetup {
             stderr(&output)
         );
     }
-    let run_setup = RunSetup {
-        run_dir: context.find_run_dir(&run_id),
-        run_id,
-    };
+    let run_setup = single_run_setup(context);
     wait_for_event_names(&run_setup.run_dir, &[
         "run.completed",
         "sandbox.stop.completed",
@@ -322,13 +319,10 @@ fn fast_simple_workflow(context: &TestContext) -> PathBuf {
 )]
 pub(crate) fn setup_detached_dry_run(context: &TestContext) -> RunSetup {
     let workflow = context.install_fixture("simple.fabro");
-    let run_id = unique_run_id();
     let mut cmd = context.run_cmd();
     cmd.current_dir(&context.temp_dir);
     cmd.timeout(command_timeout());
     cmd.args([
-        "--run-id",
-        run_id.as_str(),
         "--detach",
         "--dry-run",
         "--auto-approve",
@@ -345,7 +339,7 @@ pub(crate) fn setup_detached_dry_run(context: &TestContext) -> RunSetup {
             stderr(&output)
         );
     }
-    assert_eq!(stdout(&output).trim(), run_id);
+    let run_id = created_run_id(&output);
     let run = resolve_run(context, &run_id);
     let deadline = Instant::now() + command_timeout();
     while run_events(&run.run_dir).is_empty() {
@@ -427,14 +421,11 @@ id = "local"
 }
 
 fn run_local_workflow(context: &TestContext, workspace_dir: &Path, workflow: &str) -> RunSetup {
-    let run_id = unique_run_id();
     let mut cmd = context.run_cmd();
     cmd.current_dir(workspace_dir);
     cmd.timeout(command_timeout());
     cmd.env("OPENAI_API_KEY", "test");
     cmd.args([
-        "--run-id",
-        run_id.as_str(),
         "--auto-approve",
         "--environment",
         "local",
@@ -451,10 +442,7 @@ fn run_local_workflow(context: &TestContext, workspace_dir: &Path, workflow: &st
         );
     }
 
-    RunSetup {
-        run_dir: context.find_run_dir(&run_id),
-        run_id,
-    }
+    single_run_setup(context)
 }
 
 pub(crate) fn add_project_workflow(
@@ -650,6 +638,12 @@ fn infer_run_id(run_dir: &Path) -> String {
         .and_then(|name| name.rsplit('-').next().map(ToOwned::to_owned))
         .filter(|value| !value.is_empty())
         .expect("run directory name should contain run id suffix")
+}
+
+fn single_run_setup(context: &TestContext) -> RunSetup {
+    let run_dir = context.single_run_dir();
+    let run_id = infer_run_id(&run_dir);
+    RunSetup { run_id, run_dir }
 }
 
 fn block_on<T>(future: impl std::future::Future<Output = T>) -> T {

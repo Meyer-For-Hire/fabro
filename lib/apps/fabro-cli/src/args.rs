@@ -277,10 +277,6 @@ pub(crate) struct RunArgs {
     /// Run the workflow in the background and print the run ID
     #[arg(short = 'd', long)]
     pub(crate) detach: bool,
-
-    /// Pre-generated run ID (used internally by --detach)
-    #[arg(long, hide = true)]
-    pub(crate) run_id: Option<String>,
 }
 
 #[derive(Args)]

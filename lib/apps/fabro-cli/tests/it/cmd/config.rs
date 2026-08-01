@@ -9,8 +9,7 @@ use fabro_test::{fabro_snapshot, test_context};
 use httpmock::MockServer;
 use predicates::prelude::*;
 
-use super::support::run_state;
-use crate::support::unique_run_id;
+use super::support::{created_run_id, run_state};
 
 #[test]
 fn old_config_show_command_is_rejected() {
@@ -310,10 +309,9 @@ fn create_explicit_workflow_path_uses_project_config_relative_to_workflow() {
     context.ensure_home_server_auth_methods();
     let cwd = tempfile::tempdir().unwrap();
     let workflow = project.path().join("workflow.toml");
-    let run_id = unique_run_id();
 
     // Remove FABRO_STORAGE_DIR so the CLI uses storage_dir from settings.toml
-    context
+    let create = context
         .command()
         .env_remove("FABRO_STORAGE_DIR")
         .current_dir(cwd.path())
@@ -322,12 +320,11 @@ fn create_explicit_workflow_path_uses_project_config_relative_to_workflow() {
             "--dry-run",
             "--model",
             "gpt-5.4-pro",
-            "--run-id",
-            run_id.as_str(),
             workflow.to_str().unwrap(),
         ])
         .assert()
         .success();
+    let run_id = created_run_id(create.get_output());
 
     let runs_dir = storage_dir.join("scratch");
     let run_dir = std::fs::read_dir(&runs_dir)

@@ -23,7 +23,7 @@ use fabro_store::EventEnvelope;
 use fabro_test::{apply_test_isolation, expect_reqwest_json, isolated_storage_dir, test_context};
 use fabro_vault::{SecretType, Vault};
 
-use super::support::{find_run_dir, output_stderr, output_stdout};
+use super::support::{created_run_id, find_run_dir, output_stderr};
 use crate::support::{
     TEST_SESSION_SECRET, issue_test_github_jwt, issue_test_worker_jwt, parse_event_envelopes,
     unique_run_id,
@@ -299,14 +299,11 @@ async fn github_only_server_dispatched_worker_succeeds_without_worker_auth_store
 
     let workflow = context.temp_dir.join("worker-auth.fabro");
     write_probe_workflow(&workflow);
-    let run_id = unique_run_id();
     let output = context
         .run_cmd()
         .args([
             "--server",
             &target,
-            "--run-id",
-            &run_id,
             "--detach",
             "--dry-run",
             "--auto-approve",
@@ -323,7 +320,7 @@ async fn github_only_server_dispatched_worker_succeeds_without_worker_auth_store
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(output_stdout(&output).trim(), run_id);
+    let run_id = created_run_id(&output);
 
     let _run_dir = wait_for_run_dir(&server.storage_dir, &run_id);
     let events = wait_for_completed_events(&server.api_base_url, &run_id, &access_token).await;
@@ -356,14 +353,11 @@ fn runner_rejects_bogus_worker_token_against_github_only_server() {
 
         let workflow = context.temp_dir.join("worker-auth-negative.fabro");
         write_probe_workflow(&workflow);
-        let run_id = unique_run_id();
         let create_output = context
             .create_cmd()
             .args([
                 "--server",
                 &target,
-                "--run-id",
-                &run_id,
                 "--dry-run",
                 "--auto-approve",
                 "--environment",
@@ -379,7 +373,7 @@ fn runner_rejects_bogus_worker_token_against_github_only_server() {
             String::from_utf8_lossy(&create_output.stdout),
             String::from_utf8_lossy(&create_output.stderr)
         );
-        assert_eq!(output_stdout(&create_output).trim(), run_id);
+        let run_id = created_run_id(&create_output);
 
         let run_dir = wait_for_run_dir(&server.storage_dir, &run_id);
         let worker_root = tempfile::tempdir_in("/tmp").unwrap();

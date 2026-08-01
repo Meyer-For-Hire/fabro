@@ -15,9 +15,10 @@ use fabro_test::{
 use serde_json::Value;
 
 use super::support::{
-    output_stdout, resolve_run, server_endpoint, wait_for_status, write_gated_workflow,
+    created_run_id, output_stdout, resolve_run, server_endpoint, wait_for_status,
+    write_gated_workflow,
 };
-use crate::support::{run_output_filters, unique_run_id};
+use crate::support::run_output_filters;
 
 const SHARED_DAEMON_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -366,22 +367,20 @@ fn attach_reprompts_invalid_choice_then_accepts_valid_answer() {
 fn attach_replays_completed_detached_run() {
     let context = test_context!();
     context.ensure_home_server_auth_methods();
-    let run_id = unique_run_id();
     let workflow = context.install_fixture("simple.fabro");
 
-    context
+    let run = context
         .command()
         .args([
             "run",
             "--dry-run",
             "--auto-approve",
             "--detach",
-            "--run-id",
-            run_id.as_str(),
             workflow.to_str().unwrap(),
         ])
         .assert()
         .success();
+    let run_id = created_run_id(run.get_output());
 
     context
         .command()
