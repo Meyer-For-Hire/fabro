@@ -5,7 +5,7 @@ use rand::Rng;
 
 use crate::condition::evaluate_condition;
 use crate::context::Context;
-use crate::outcome::{Outcome, StageOutcome};
+use crate::outcome::Outcome;
 
 /// Result of edge selection: the chosen edge and the reason it was selected.
 pub(crate) struct SelectedGraphEdge<'a> {
@@ -99,14 +99,19 @@ pub(crate) fn check_goal_gates(
     graph: &GvGraph,
     node_outcomes: &HashMap<String, Outcome>,
 ) -> std::result::Result<(), String> {
-    for (node_id, outcome) in node_outcomes {
-        if let Some(node) = graph.nodes.get(node_id) {
-            if node.goal_gate()
-                && outcome.status != StageOutcome::Succeeded
-                && outcome.status != StageOutcome::PartiallySucceeded
-            {
-                return Err(node_id.clone());
-            }
+    let mut goal_gate_ids: Vec<&String> = graph
+        .nodes
+        .iter()
+        .filter_map(|(node_id, node)| node.goal_gate().then_some(node_id))
+        .collect();
+    goal_gate_ids.sort();
+
+    for node_id in goal_gate_ids {
+        if !node_outcomes
+            .get(node_id)
+            .is_some_and(|outcome| outcome.status.is_successful())
+        {
+            return Err(node_id.clone());
         }
     }
     Ok(())
@@ -630,6 +635,19 @@ mod tests {
         outcomes.insert("work".to_string(), Outcome::fail_classify("test"));
 
         assert_eq!(check_goal_gates(&g, &outcomes), Err("work".to_string()));
+    }
+
+    #[test]
+    fn goal_gates_unvisited_returns_node_id() {
+        let mut g = Graph::new("test");
+        let mut n = Node::new("verify");
+        n.attrs
+            .insert("goal_gate".to_string(), AttrValue::Boolean(true));
+        g.nodes.insert("verify".to_string(), n);
+
+        let outcomes = HashMap::new();
+
+        assert_eq!(check_goal_gates(&g, &outcomes), Err("verify".to_string()));
     }
 
     #[test]
