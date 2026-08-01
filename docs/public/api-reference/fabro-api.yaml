@@ -9184,9 +9184,6 @@ components:
         environment:
           type: string
           description: Named environment slug to select for the run.
-        docker_image:
-          type: string
-          description: Per-run environment image override.
         verbose:
           type: boolean
         dry_run:

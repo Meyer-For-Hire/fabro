@@ -361,7 +361,6 @@ pub(crate) fn manifest_args_overrides(
         model:            args.model.as_deref(),
         provider:         args.provider.as_deref(),
         environment:      args.environment.as_deref(),
-        docker_image:     args.docker_image.as_deref(),
         preserve_sandbox: args.preserve_sandbox,
         dry_run:          args.dry_run,
         auto_approve:     args.auto_approve,
@@ -2068,7 +2067,6 @@ root = "/srv/fabro"
             preserve_sandbox: None,
             provider:         None,
             environment:      None,
-            docker_image:     None,
             input:            Vec::new(),
             verbose:          None,
         });
@@ -2101,7 +2099,6 @@ override = "server"
             preserve_sandbox: None,
             provider:         None,
             environment:      None,
-            docker_image:     None,
             input:            vec!["override=cli".to_string()],
             verbose:          None,
         });
