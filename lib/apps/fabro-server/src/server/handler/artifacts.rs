@@ -10,7 +10,7 @@ use fabro_types::RunProjection;
 use fabro_util::error::collect_chain;
 use futures_util::SinkExt as _;
 use futures_util::io::AsyncWriteExt as _;
-use tokio::io::AsyncWrite;
+use tokio::io::{AsyncWrite, BufWriter};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::io::{CopyToBytes, SinkWriter};
@@ -167,14 +167,17 @@ async fn list_run_artifacts(
 
 const ARCHIVE_STREAM_CHANNEL_CAPACITY: usize = 8;
 
+/// Deflate flushes its output in 8 KiB blocks, and every write below becomes
+/// its own allocation, channel send, and HTTP body frame. Batching to 64 KiB
+/// cuts all three by eight without meaningfully delaying the stream.
+const ARCHIVE_WRITE_BUFFER_BYTES: usize = 64 * 1024;
+
 #[derive(Debug, thiserror::Error)]
 enum ArtifactArchiveError {
     #[error("archive output failed: {0}")]
     Io(#[from] io::Error),
     #[error("artifact read failed: {0}")]
     Store(#[from] StoreError),
-    #[error("artifact {0} disappeared while the archive was being created")]
-    MissingArtifact(String),
     #[error("ZIP write failed: {0}")]
     Zip(#[from] ZipError),
 }
@@ -242,7 +245,11 @@ where
     for artifact in artifacts {
         let key = ArtifactKey::new(artifact.node, artifact.retry, artifact.filename.clone());
         let Some(mut source) = artifact_store.get_stream(&run_id, &key).await? else {
-            return Err(ArtifactArchiveError::MissingArtifact(artifact.filename));
+            // Deleted between the listing and this read, which in practice means
+            // the run was pruned mid-download. Leave it out and keep going: an
+            // archive missing one file beats a truncated one missing the rest.
+            warn!(%run_id, path = %artifact.filename, "artifact vanished while archiving");
+            continue;
         };
         // Deflate, not Stored: artifacts are mostly logs and reports, and the
         // response is excluded from transfer compression precisely because the
@@ -281,7 +288,10 @@ fn artifact_archive_body(
         .with(|chunk: Bytes| {
             std::future::ready(Ok::<Result<Bytes, io::Error>, io::Error>(Ok(chunk)))
         });
-    let writer = SinkWriter::new(CopyToBytes::new(sink));
+    let writer = BufWriter::with_capacity(
+        ARCHIVE_WRITE_BUFFER_BYTES,
+        SinkWriter::new(CopyToBytes::new(sink)),
+    );
 
     tokio::spawn(async move {
         if let Err(error) = write_artifact_archive(writer, artifact_store, run_id, artifacts).await
