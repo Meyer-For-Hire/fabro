@@ -99,11 +99,17 @@ pub(crate) fn check_goal_gates(
     graph: &GvGraph,
     node_outcomes: &HashMap<String, Outcome>,
 ) -> std::result::Result<(), String> {
-    for (node_id, node) in &graph.nodes {
-        if node.goal_gate()
-            && !node_outcomes
-                .get(node_id)
-                .is_some_and(|outcome| outcome.status.is_successful())
+    let mut goal_gate_ids: Vec<&String> = graph
+        .nodes
+        .iter()
+        .filter_map(|(node_id, node)| node.goal_gate().then_some(node_id))
+        .collect();
+    goal_gate_ids.sort();
+
+    for node_id in goal_gate_ids {
+        if !node_outcomes
+            .get(node_id)
+            .is_some_and(|outcome| outcome.status.is_successful())
         {
             return Err(node_id.clone());
         }
