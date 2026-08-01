@@ -95,16 +95,10 @@ fn response_from_outcome(node_id: &str, outcome: &Outcome) -> Option<String> {
         .and_then(|value| value.as_str().map(ToOwned::to_owned))
 }
 
-/// Context values for `StageCompleted` events. Runtime-only keys are stripped,
-/// except for `CURRENT_PREAMBLE`, which stage events have historically
-/// included.
+/// Context values for `StageCompleted` events. Runtime-only keys are stripped.
 fn stage_context_values(workflow_context: &Context) -> Option<BTreeMap<String, serde_json::Value>> {
     let mut snapshot = workflow_context.snapshot();
-    let preamble = snapshot.get(context::keys::CURRENT_PREAMBLE).cloned();
     artifact::strip_transient_keys(&mut snapshot);
-    if let Some(preamble) = preamble {
-        snapshot.insert(context::keys::CURRENT_PREAMBLE.to_owned(), preamble);
-    }
     (!snapshot.is_empty()).then(|| snapshot.into_iter().collect())
 }
 
@@ -512,7 +506,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stage_context_values_drops_runtime_keys_but_keeps_current_preamble() {
+    fn stage_context_values_drops_runtime_keys_including_current_preamble() {
         let workflow_context = Context::new();
         workflow_context.set(
             context::keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES,
@@ -532,10 +526,7 @@ mod tests {
 
         assert!(!values.contains_key(context::keys::INTERNAL_PARALLEL_BRANCH_PREAMBLES));
         assert!(!values.contains_key(context::keys::INTERNAL_STAGE_EXECUTION_ORDINAL));
-        assert_eq!(
-            values.get(context::keys::CURRENT_PREAMBLE),
-            Some(&serde_json::json!("active preamble"))
-        );
+        assert!(!values.contains_key(context::keys::CURRENT_PREAMBLE));
         assert_eq!(
             values.get("response.work"),
             Some(&serde_json::json!("durable"))
