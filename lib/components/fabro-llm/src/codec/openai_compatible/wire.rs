@@ -294,8 +294,8 @@ pub(super) struct ApiFunction {
 pub(super) struct ApiUsage {
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
-    /// Tolerant superset: compatible provider dialects report in-band USD cost
-    /// and cache/reasoning token detail. Absent on plain providers.
+    /// Tolerant superset: aggregator dialects (OpenRouter) report in-band
+    /// USD cost and cache/reasoning token detail. Absent on plain providers.
     #[serde(default)]
     pub cost: Option<f64>,
     #[serde(default)]
@@ -332,6 +332,9 @@ impl ApiUsage {
     /// cache-write detail tokens are subtracted out of `input_tokens`, and
     /// reasoning tokens out of `output_tokens`, mirroring the
     /// `openai_responses` convention.
+    ///
+    /// Nested detail fields win over the flat `prompt_cache_hit_tokens` and
+    /// `reasoning_tokens` spellings that some providers send instead.
     pub(super) fn token_counts(&self) -> TokenCounts {
         let cached_detail = self
             .prompt_tokens_details
@@ -549,72 +552,6 @@ mod tests {
     }
 
     #[test]
-    fn non_streaming_usage_normalizes_modal_reasoning_tokens() {
-        let response: ApiResponse = serde_json::from_value(serde_json::json!({
-            "id": "chatcmpl-modal",
-            "model": "moonshotai/Kimi-K3",
-            "choices": [{
-                "message": {
-                    "content": "1275",
-                    "reasoning_content": "The arithmetic series sums to 1275."
-                },
-                "finish_reason": "stop"
-            }],
-            "usage": {
-                "prompt_tokens": 116,
-                "completion_tokens": 66,
-                "prompt_tokens_details": {
-                    "cached_tokens": 64
-                },
-                "reasoning_tokens": 54,
-                "total_tokens": 182
-            }
-        }))
-        .unwrap();
-        let usage = response
-            .usage
-            .expect("Modal response should include token usage");
-
-        assert_eq!(usage.token_counts(), TokenCounts {
-            input_tokens: 52,
-            output_tokens: 12,
-            reasoning_tokens: 54,
-            cache_read_tokens: 64,
-            ..TokenCounts::default()
-        });
-    }
-
-    #[test]
-    fn streaming_usage_normalizes_modal_reasoning_tokens() {
-        let chunk: StreamChunk = serde_json::from_value(serde_json::json!({
-            "id": "chatcmpl-modal",
-            "model": "moonshotai/Kimi-K3",
-            "choices": [],
-            "usage": {
-                "prompt_tokens": 116,
-                "completion_tokens": 66,
-                "prompt_tokens_details": {
-                    "cached_tokens": 64
-                },
-                "reasoning_tokens": 54,
-                "total_tokens": 182
-            }
-        }))
-        .unwrap();
-        let usage = chunk
-            .usage
-            .expect("Modal stream should include token usage");
-
-        assert_eq!(usage.token_counts(), TokenCounts {
-            input_tokens: 52,
-            output_tokens: 12,
-            reasoning_tokens: 54,
-            cache_read_tokens: 64,
-            ..TokenCounts::default()
-        });
-    }
-
-    #[test]
     fn token_counts_accept_deepseek_cache_hit_field() {
         let usage: ApiUsage = serde_json::from_value(serde_json::json!({
             "prompt_tokens": 53,
@@ -629,6 +566,44 @@ mod tests {
             cache_read_tokens: 41,
             ..TokenCounts::default()
         });
+    }
+
+    #[test]
+    fn token_counts_accept_modal_reasoning_tokens_field() {
+        let usage: ApiUsage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 116,
+            "completion_tokens": 66,
+            "reasoning_tokens": 54
+        }))
+        .unwrap();
+
+        assert_eq!(usage.token_counts(), TokenCounts {
+            input_tokens: 116,
+            output_tokens: 12,
+            reasoning_tokens: 54,
+            ..TokenCounts::default()
+        });
+    }
+
+    #[test]
+    fn token_counts_prefer_nested_reasoning_detail_over_top_level() {
+        let both_spellings: ApiUsage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 10,
+            "completion_tokens": 66,
+            "completion_tokens_details": {"reasoning_tokens": 20},
+            "reasoning_tokens": 54
+        }))
+        .unwrap();
+        assert_eq!(both_spellings.token_counts().reasoning_tokens, 20);
+
+        let empty_detail: ApiUsage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 10,
+            "completion_tokens": 66,
+            "completion_tokens_details": {},
+            "reasoning_tokens": 54
+        }))
+        .unwrap();
+        assert_eq!(empty_detail.token_counts().reasoning_tokens, 54);
     }
 
     #[test]
