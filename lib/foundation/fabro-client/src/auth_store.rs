@@ -109,7 +109,7 @@ pub enum LockError {
         source: std::io::Error,
     },
     #[cfg(unix)]
-    #[error("failed to wait for auth store lock at {path}: {source}")]
+    #[error("failed to wait for auth store refresh lock at {path}: {source}")]
     Task { path: PathBuf, source: JoinError },
 }
 
