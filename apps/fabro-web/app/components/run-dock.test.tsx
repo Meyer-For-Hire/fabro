@@ -73,6 +73,15 @@ describe("RunDockShell", () => {
     expect(onCollapsedChange).not.toHaveBeenCalled();
   });
 
+  test("clicks with a non-element target still expand the bar", () => {
+    const onCollapsedChange = mock((_collapsed: boolean) => undefined);
+    const renderer = mountShell(true, onCollapsedChange);
+
+    const [header] = clickableDivs(renderer);
+    act(() => header.props.onClick({ target: {} }));
+    expect(onCollapsedChange).toHaveBeenCalledWith(false);
+  });
+
   test("the expanded header is not a click target", () => {
     const onCollapsedChange = mock((_collapsed: boolean) => undefined);
     const renderer = mountShell(false, onCollapsedChange);

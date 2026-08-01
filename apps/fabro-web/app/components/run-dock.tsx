@@ -110,7 +110,9 @@ export function RunDockShell({
         onClick={
           collapsed
             ? (event) => {
-                if ((event.target as HTMLElement).closest("button")) return;
+                if ((event.target as HTMLElement | null)?.closest?.("button")) {
+                  return;
+                }
                 onCollapsedChange(false);
               }
             : undefined
