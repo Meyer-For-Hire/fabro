@@ -57,7 +57,7 @@ impl TryFrom<&EventPayload> for RunEvent {
     type Error = Error;
 
     fn try_from(value: &EventPayload) -> Result<Self> {
-        Self::from_ref(value.as_value())
+        Self::from_value(value.as_value().clone())
             .map_err(|err| Error::InvalidEvent(format!("invalid stored event: {err}")))
     }
 }

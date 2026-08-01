@@ -9,7 +9,7 @@ use futures::Stream;
 use slatedb::{Db, DbIterator, DbRead};
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::{error, warn};
+use tracing::warn;
 
 use super::blob_store::BlobStore;
 use super::projection_cache::{CachedRunProjection, RunProjectionCache};
@@ -192,6 +192,15 @@ impl RunDatabase {
     }
 
     async fn projected_state_locked(&self) -> Result<Arc<RunProjection>> {
+        self.projected_state_option_locked().await?.ok_or_else(|| {
+            Error::InvalidEvent(format!(
+                "run {} has no run.created event",
+                self.inner.run_id
+            ))
+        })
+    }
+
+    async fn projected_state_option_locked(&self) -> Result<Option<Arc<RunProjection>>> {
         let next_seq = {
             let cache = self.inner.projection_cache.lock().await;
             cache.last_seq.saturating_add(1)
@@ -202,55 +211,61 @@ impl RunDatabase {
             apply_cached_projection_event(&mut cache.state, event)?;
             cache.last_seq = event.seq;
         }
-        cache.state.clone().ok_or_else(|| {
-            Error::InvalidEvent(format!(
-                "run {} has no run.created event",
-                self.inner.run_id
-            ))
-        })
+        Ok(cache.state.clone())
     }
 
-    async fn cache_event(&self, event: &EventEnvelope) -> Result<()> {
+    /// Current projection for validating an append allocated at `seq`. In the
+    /// steady state the local cache already sits at `seq - 1` because
+    /// `state_lock` serializes appends, so this skips the storage scan that
+    /// `projected_state_option_locked` issues.
+    async fn projected_state_for_append_locked(
+        &self,
+        seq: u32,
+    ) -> Result<Option<Arc<RunProjection>>> {
         {
-            let mut projection_cache = self.inner.projection_cache.lock().await;
-            if projection_cache.state.is_none() && event.seq > 1 {
-                drop(projection_cache);
-                self.rebuild_local_projection_cache_through(event.seq)
-                    .await?;
-            } else {
-                apply_cached_projection_event(&mut projection_cache.state, event)?;
-                projection_cache.last_seq = event.seq;
+            let cache = self.inner.projection_cache.lock().await;
+            if cache.last_seq.saturating_add(1) == seq {
+                return Ok(cache.state.clone());
             }
         }
+        self.projected_state_option_locked().await
+    }
+
+    async fn install_in_memory_state_after_append(
+        &self,
+        event: &EventEnvelope,
+        cached: &CachedRunProjection,
+    ) {
+        {
+            let mut projection_cache = self.inner.projection_cache.lock().await;
+            projection_cache.state = Some(Arc::clone(&cached.projection));
+            projection_cache.last_seq = event.seq;
+        }
+        self.inner
+            .shared_projection_cache
+            .replace(cached.clone())
+            .await;
+
         let mut recent_events = self.inner.recent_events.lock().await;
         recent_events.push_back(event.clone());
         while recent_events.len() > self.inner.recent_event_limit {
             recent_events.pop_front();
         }
+        drop(recent_events);
         let _ = self.inner.event_tx.send(event.clone());
-        Ok(())
     }
 
-    async fn rebuild_local_projection_cache_through(&self, seq: u32) -> Result<()> {
-        let events = list_events_from(&self.inner.db, &self.inner.run_id, 1).await?;
-        let Some(last_seq) = events.last().map(|event| event.seq) else {
-            return Err(Error::InvalidEvent(format!(
-                "run {} has no events while rebuilding projection cache",
-                self.inner.run_id
-            )));
-        };
-        if last_seq < seq {
-            return Err(Error::InvalidEvent(format!(
-                "run {} projection cache rebuild stopped at seq {last_seq}, before appended seq {seq}",
-                self.inner.run_id
-            )));
+    async fn update_summary_after_committed_append(&self, cached: &CachedRunProjection) {
+        if let Some(store) = self.inner.run_summary_store.get() {
+            if let Err(err) = store.upsert_projection(cached).await {
+                warn!(
+                    run_id = %self.inner.run_id,
+                    source_last_seq = cached.last_seq,
+                    error = ?err,
+                    "failed to update SQLite run summary after committed append"
+                );
+            }
         }
-
-        let state = RunProjection::apply_events(&events)?;
-        let mut projection_cache = self.inner.projection_cache.lock().await;
-        projection_cache.state = Some(Arc::new(state));
-        projection_cache.last_seq = last_seq;
-        Ok(())
     }
 
     async fn cached_events_from(&self, start_seq: u32, limit: usize) -> Option<Vec<EventEnvelope>> {
@@ -270,12 +285,26 @@ impl RunDatabase {
 }
 
 impl RunDatabase {
+    /// Appends an event after validating it against the current run projection.
+    ///
+    /// A rejected event writes nothing. Every returned error means the event
+    /// was not committed and is safe to retry. Once the SlateDB write succeeds,
+    /// the append returns success even if a derived cache or SQLite summary
+    /// update fails; those failures are logged and repaired by later updates or
+    /// startup reconciliation.
     pub async fn append_event(&self, payload: &EventPayload) -> Result<u32> {
         Ok(self.append_event_envelope(payload).await?.seq)
     }
 
     /// Atomically appends `payload` when `predicate` matches the latest run
     /// projection.
+    ///
+    /// `Ok(None)` means the predicate rejected the append and nothing was
+    /// written. An invalid transition is also rejected before write, and every
+    /// returned error means the event was not committed and is safe to retry.
+    /// After the SlateDB write succeeds, derived cache and SQLite summary
+    /// updates are best-effort and cannot turn the committed append into an
+    /// error.
     pub async fn append_event_if(
         &self,
         payload: &EventPayload,
@@ -285,95 +314,76 @@ impl RunDatabase {
             return Err(Error::ReadOnly);
         }
         payload.validate(&self.inner.run_id)?;
-        let _state_guard = self.inner.state_lock.lock().await;
-        let projection = self.projected_state_locked().await?;
-        if !predicate(&projection) {
-            return Ok(None);
-        }
-        Ok(Some(self.append_event_envelope_locked(payload).await?.seq))
+        let (envelope, cached) = {
+            let _state_guard = self.inner.state_lock.lock().await;
+            let projection = self.projected_state_locked().await?;
+            if !predicate(&projection) {
+                return Ok(None);
+            }
+            let event = RunEvent::try_from(payload)?;
+            let event_bytes = serde_json::to_vec(payload)?;
+            self.append_event_envelope_locked(event, event_bytes)
+                .await?
+        };
+        self.update_summary_after_committed_append(&cached).await;
+        Ok(Some(envelope.seq))
     }
 
+    /// Appends and returns the stored event envelope after pre-write reduction.
+    ///
+    /// A rejected event writes nothing. Every returned error means the event
+    /// was not committed and is safe to retry. Once the SlateDB write succeeds,
+    /// derived cache and SQLite summary updates are best-effort: failures are
+    /// logged, and this method still returns the committed envelope.
     pub async fn append_event_envelope(&self, payload: &EventPayload) -> Result<EventEnvelope> {
         if self.read_only {
             return Err(Error::ReadOnly);
         }
         payload.validate(&self.inner.run_id)?;
-        let _state_guard = self.inner.state_lock.lock().await;
-        self.append_event_envelope_locked(payload).await
+        let event = RunEvent::try_from(payload)?;
+        let event_bytes = serde_json::to_vec(payload)?;
+        let (envelope, cached) = {
+            let _state_guard = self.inner.state_lock.lock().await;
+            self.append_event_envelope_locked(event, event_bytes)
+                .await?
+        };
+        self.update_summary_after_committed_append(&cached).await;
+        Ok(envelope)
     }
 
-    async fn append_event_envelope_locked(&self, payload: &EventPayload) -> Result<EventEnvelope> {
+    async fn append_event_envelope_locked(
+        &self,
+        event: RunEvent,
+        event_bytes: Vec<u8>,
+    ) -> Result<(EventEnvelope, CachedRunProjection)> {
         let event_seq = self.inner.event_seq.as_ref().ok_or(Error::ReadOnly)?;
-        let seq = allocate_event_seq(event_seq)?;
-        let event = EventEnvelope {
+        let seq = next_event_seq(event_seq)?;
+        let envelope = EventEnvelope { seq, event };
+        // Validation reduces through the exact code replay uses, so an event
+        // is written iff replay can reduce it. `Arc::make_mut` copy-on-writes,
+        // leaving the local projection cache untouched on rejection.
+        let mut next_state = self.projected_state_for_append_locked(seq).await?;
+        apply_cached_projection_event(&mut next_state, &envelope).map_err(event_rejected)?;
+        let next_projection =
+            next_state.expect("apply_cached_projection_event sets the state on success");
+        let cached = CachedRunProjection::from_projection(
+            self.inner.run_id,
+            Arc::unwrap_or_clone(next_projection),
             seq,
-            event: RunEvent::try_from(payload)?,
-        };
+        );
+        reserve_event_seq(event_seq, seq)?;
         self.inner
             .db
             .put(
                 keys::run_event_key(&self.inner.run_id, seq, Utc::now().timestamp_millis()),
-                serde_json::to_vec(payload)?,
+                event_bytes,
             )
             .await?;
-        self.cache_event(&event).await?;
-        // Box::pin keeps append_event_envelope's future small enough for the
-        // clippy::large_futures budget of its many callers.
-        Box::pin(self.update_summary_projection_after_append(&event)).await?;
-        Ok(event)
-    }
-
-    async fn update_summary_projection_after_append(&self, event: &EventEnvelope) -> Result<()> {
-        let cached = match self
-            .inner
-            .shared_projection_cache
-            .apply_event(&self.inner.run_id, event)
-            .await
-        {
-            Ok(entry) => entry,
-            Err(err) => {
-                match Self::build_cached_projection(&self.inner.db, &self.inner.run_id).await {
-                    Ok(Some(entry)) => {
-                        self.inner
-                            .shared_projection_cache
-                            .replace(entry.clone())
-                            .await;
-                        entry
-                    }
-                    rebuild => {
-                        self.inner
-                            .shared_projection_cache
-                            .remove(&self.inner.run_id)
-                            .await;
-                        if let Err(rebuild_err) = rebuild {
-                            warn!(
-                                run_id = %self.inner.run_id,
-                                error = %rebuild_err,
-                                "Failed to rebuild run projection cache after append"
-                            );
-                        }
-                        warn!(
-                            run_id = %self.inner.run_id,
-                            error = %err,
-                            "Failed to update run projection cache after append"
-                        );
-                        return Err(err);
-                    }
-                }
-            }
-        };
-        if let Some(store) = self.inner.run_summary_store.get() {
-            if let Err(err) = store.upsert_projection(&cached).await {
-                error!(
-                    run_id = %self.inner.run_id,
-                    source_last_seq = cached.last_seq,
-                    error = %err,
-                    "Failed to update SQLite run summary after append"
-                );
-                return Err(err);
-            }
-        }
-        Ok(())
+        // Box::pin keeps this future small enough for the
+        // clippy::large_futures budget of append_event_envelope's many
+        // callers.
+        Box::pin(self.install_in_memory_state_after_append(&envelope, &cached)).await;
+        Ok((envelope, cached))
     }
 
     pub async fn list_events(&self) -> Result<Vec<EventEnvelope>> {
@@ -589,14 +599,27 @@ impl RunDatabase {
     }
 }
 
-fn allocate_event_seq(event_seq: &AtomicU32) -> Result<u32> {
-    event_seq
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |seq| {
-            (seq <= keys::MAX_EVENT_SEQ).then_some(seq + 1)
-        })
-        .map_err(|_| Error::EventSequenceExhausted {
+fn event_rejected(error: Error) -> Error {
+    Error::EventRejected {
+        source: Box::new(error),
+    }
+}
+
+fn next_event_seq(event_seq: &AtomicU32) -> Result<u32> {
+    let seq = event_seq.load(Ordering::SeqCst);
+    if seq > keys::MAX_EVENT_SEQ {
+        return Err(Error::EventSequenceExhausted {
             max_seq: keys::MAX_EVENT_SEQ,
-        })
+        });
+    }
+    Ok(seq)
+}
+
+fn reserve_event_seq(event_seq: &AtomicU32, seq: u32) -> Result<()> {
+    event_seq
+        .compare_exchange(seq, seq + 1, Ordering::SeqCst, Ordering::SeqCst)
+        .map(|_| ())
+        .map_err(|_| Error::Other("event sequence changed while append lock was held".to_string()))
 }
 
 fn apply_cached_projection_event(
@@ -1289,6 +1312,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_event_does_not_consume_last_available_sequence() {
+        let run = fresh_run().await;
+        let run_id = run.run_id();
+        run.inner
+            .event_seq
+            .as_ref()
+            .unwrap()
+            .store(keys::MAX_EVENT_SEQ, Ordering::SeqCst);
+
+        let err = run
+            .append_event(&run_created_payload(&run_id))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::EventRejected { .. }));
+
+        let seq = run
+            .append_event(&stage_prompt_payload(&run_id, 1, Some("alpha")))
+            .await
+            .unwrap();
+        assert_eq!(seq, keys::MAX_EVENT_SEQ);
+    }
+
+    #[tokio::test]
     async fn append_event_rejects_sequences_beyond_key_order_limit() {
         let run = fresh_run().await;
         let run_id = run.run_id();
@@ -1304,6 +1350,7 @@ mod tests {
             .unwrap();
         assert_eq!(seq, keys::MAX_EVENT_SEQ);
 
+        let events_before_error = run.list_events().await.unwrap();
         let err = run
             .append_event(&stage_prompt_payload(&run_id, 2, Some("beta")))
             .await
@@ -1313,6 +1360,7 @@ mod tests {
             Error::EventSequenceExhausted { max_seq }
                 if max_seq == keys::MAX_EVENT_SEQ
         ));
+        assert_eq!(run.list_events().await.unwrap(), events_before_error);
         assert!(
             run.get_event(keys::MAX_EVENT_SEQ + 1)
                 .await

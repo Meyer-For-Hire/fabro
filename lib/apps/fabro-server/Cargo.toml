@@ -121,5 +121,6 @@ tokio-util.workspace = true
 tokio-tungstenite.workspace = true
 fabro-macros = { path = "../../foundation/fabro-macros" }
 fabro-sandbox = { path = "../../components/fabro-sandbox", features = ["test-support"] }
+fabro-store = { path = "../../components/fabro-store", features = ["test-support"] }
 fabro-test = { workspace = true }
 fabro-types = { path = "../../foundation/fabro-types", features = ["test-support"] }
