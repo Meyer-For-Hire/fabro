@@ -324,7 +324,6 @@ fn resolve_agent(
 
     RunAgentSettings {
         fabro_tools: agent.fabro_tools.unwrap_or(false),
-        permissions: agent.permissions,
         mcps:        resolve_mcp_entries(&agent.mcps, mcp_server_catalog, errors),
     }
 }

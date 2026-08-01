@@ -3,8 +3,8 @@
     reason = "sync test fixture setup; not on a Tokio path"
 )]
 
+use fabro_types::PermissionLevel;
 use fabro_types::settings::cli::{CliTargetSettings, OutputFormat, OutputVerbosity};
-use fabro_types::settings::run::AgentPermissions;
 use temp_env::with_var;
 
 use crate::{SettingsLayer, UserSettingsBuilder};
@@ -125,7 +125,7 @@ level = "debug"
     assert!(cli.exec.prevent_idle_sleep);
     assert_eq!(cli.exec.model.provider.as_deref(), Some("openai"));
     assert_eq!(cli.exec.model.name.as_deref(), Some("gpt-5"));
-    assert_eq!(cli.exec.agent.permissions, Some(AgentPermissions::ReadOnly));
+    assert_eq!(cli.exec.agent.permissions, Some(PermissionLevel::ReadOnly));
     assert_eq!(cli.exec.agent.mcps.as_ref().unwrap()["fs"].name, "fs");
     assert_eq!(cli.output.format, OutputFormat::Json);
     assert_eq!(cli.output.verbosity, OutputVerbosity::Verbose);

@@ -58,8 +58,8 @@ The new design must optimize for:
 - R21. `metadata` replaces Fabro-owned `labels` and exists on `project`, `workflow`, and `run` as flat string-to-string maps.
 - R22. `run.inputs` replaces `vars`. `run.inputs` must accept TOML scalar values. `metadata` remains string-to-string. `run.inputs` intentionally replaces the full inherited map rather than merging by key.
 - R23. `[run.model]` is the default model selection surface for LLM-backed workflow stages. `[run.agent]` is only for agent-specific settings.
-- R24. `[run.agent]` owns agent-only knobs such as `permissions` and `mcps`. `[run.sandbox]` owns the sandbox selection and execution-environment surface, including `provider`, shared sandbox knobs, `env`, and provider-specific nested tables.
-- R25. `run.agent.permissions` must remain a simple enum string, not an object.
+- R24. `[run.agent]` owns agent-only knobs such as `fabro_tools` and `mcps`. `[run.sandbox]` owns the sandbox selection and execution-environment surface, including `provider`, shared sandbox knobs, `env`, and provider-specific nested tables.
+- R25. Workspace tool permissions belong to `[cli.exec.agent]`.
 - R26. `[run.git]` and `[run.scm]` must remain separate concepts. `git` is local Git behavior such as commit author; `scm` is remote host/provider behavior.
 - R27. `[run.pull_request]` remains the provider-neutral run surface for PR behavior.
 - R28. `[run.prepare]` is the run preparation surface and replaces the old `setup` naming.
@@ -275,7 +275,7 @@ Config-executed actions are part of Fabro's trusted configuration model, not the
 
 - `script` and `command` in prepare steps, hooks, and launching MCP transports are executable configuration, not passive metadata.
 - These actions execute under the trust boundary of the consuming process.
-- They are not mediated by `run.agent.permissions` or `cli.exec.agent.permissions`.
+- They are not mediated by `cli.exec.agent.permissions`.
 - Users should treat `fabro.toml` and `workflow.toml` as executable project configuration, not as untrusted data blobs.
 
 ## Migration and Failure Behavior
@@ -385,9 +385,6 @@ working_dir = "/workspace"
 provider = "anthropic"
 name = "sonnet"
 fallbacks = ["openai", "gpt-5.4", "gemini/gemini-flash"]
-
-[run.agent]
-permissions = "read-write"
 
 [run.notifications.ops]
 enabled = true

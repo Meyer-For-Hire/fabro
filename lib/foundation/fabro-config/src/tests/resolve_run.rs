@@ -879,7 +879,7 @@ issues = "{{ env.GH_PERM_LEVEL }}"
     }
 }
 
-mod run_agent_fabro_tools {
+mod run_agent {
     use crate::SettingsLayer;
     use crate::layers::Combine;
 
@@ -896,6 +896,23 @@ mod run_agent_fabro_tools {
             .run;
 
         assert!(!settings.agent.fabro_tools);
+    }
+
+    #[test]
+    fn rejects_removed_permissions_setting() {
+        let err = r#"
+_version = 1
+
+[run.agent]
+permissions = "read-only"
+"#
+        .parse::<SettingsLayer>()
+        .expect_err("removed run.agent.permissions must be unknown");
+        let message = err.to_string();
+        assert!(
+            message.contains("unknown field `permissions`"),
+            "expected unknown-field error for run.agent.permissions, got: {message}"
+        );
     }
 
     #[test]

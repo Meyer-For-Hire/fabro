@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use fabro_types::settings::run::{
-    AgentPermissions, ApprovalMode, HookEvent, McpHttpProtocol, MergeStrategy, RunMode,
+    ApprovalMode, HookEvent, McpHttpProtocol, MergeStrategy, RunMode,
 };
 use fabro_types::settings::{Duration, InterpString, ModelRef};
 use serde::de::{self, Deserializer};
@@ -395,7 +395,7 @@ pub struct InterviewProviderLayer {
     pub channel: Option<InterpString>,
 }
 
-/// `[run.agent]` — agent knobs only (Fabro tools, permissions, MCPs).
+/// `[run.agent]` — agent knobs only (Fabro tools and MCPs).
 #[derive(
     Debug,
     Clone,
@@ -412,14 +412,6 @@ pub struct RunAgentLayer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[option(default = "false", value_type = "boolean")]
     pub fabro_tools: Option<bool>,
-
-    /// Default tool permission level for workflow agents.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[option(
-        default = "\"read-write\"",
-        value_type = "\"read-only\" | \"read-write\" | \"full\""
-    )]
-    pub permissions: Option<AgentPermissions>,
 
     /// Agent-scoped MCP server entries, keyed by name.
     #[serde(default, skip_serializing_if = "StickyMap::is_empty")]

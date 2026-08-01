@@ -1,7 +1,7 @@
 //! Sparse `[cli]` settings layer definitions.
 
+use fabro_types::PermissionLevel;
 use fabro_types::settings::cli::{CliAuthStrategy, OutputFormat, OutputVerbosity};
-use fabro_types::settings::run::AgentPermissions;
 use serde::{Deserialize, Serialize};
 
 use super::maps::StickyMap;
@@ -111,7 +111,7 @@ pub struct CliExecAgentLayer {
         default = "\"read-write\"",
         value_type = "\"read-only\" | \"read-write\" | \"full\""
     )]
-    pub permissions: Option<AgentPermissions>,
+    pub permissions: Option<PermissionLevel>,
     /// Agent-scoped MCP entries for `fabro exec`.
     #[serde(default, skip_serializing_if = "StickyMap::is_empty")]
     #[option(value_type = "table")]

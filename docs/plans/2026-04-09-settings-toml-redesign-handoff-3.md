@@ -242,7 +242,7 @@ pass. The file-name collisions to resolve are `project.rs`, `run.rs`,
 
 | Crate | Legacy types it still imports | Suggested destination |
 |---|---|---|
-| `fabro-agent` | `OutputFormat`, `PermissionLevel` from `settings::user` | Promote into `fabro-agent` itself — they're CLI/exec concerns. Or point at `settings::v2::cli::OutputFormat` / `v2::run::AgentPermissions` if shapes match. |
+| `fabro-agent` | `OutputFormat`, `PermissionLevel` from `settings::user` | Promote into `fabro-agent` itself — they're CLI/exec concerns. Or point at `settings::v2::cli::OutputFormat` / `fabro_types::PermissionLevel` if shapes match. |
 | `fabro-checkpoint` | `GitAuthorSettings` from `settings::server` | Promote into `fabro-checkpoint` or read directly from `v2::run::GitAuthorLayer` at the call site. |
 | `fabro-hooks` | `HookDefinition`, `HookEvent`, `HookSettings`, `HookType`, `TlsMode` | Promote all of them into `fabro-hooks`. They are runtime behavior types (has `resolved_hook_type()` / `runs_in_sandbox()` methods), not parse-tree types, so they belong in the consumer crate. |
 | `fabro-mcp` | `McpServerEntry`, `McpServerSettings`, `McpTransport`, `default_startup_timeout_secs`, `default_tool_timeout_secs` | Promote into `fabro-mcp`. Convert from v2 `run.agent.mcps.*` or `cli.exec.agent.mcps.*` at the call site. |

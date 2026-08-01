@@ -486,7 +486,7 @@ fabro_tools = true
 
 One workflow-agent exception is intentional: `fabro_run_create` always creates [child runs](/execution/child-runs) parented to the current run. If an agent supplies `parent_id`, it must match the current run ID.
 
-This setting is separate from normal agent `permissions` and from MCP server configuration. `permissions` controls workspace tool access, while `[run.agent.mcps]` configures external MCP servers available to the agent.
+This setting is independent of `[run.agent.mcps]`, which configures external MCP servers available to the agent.
 
 ### `[run.agent.mcps]`
 

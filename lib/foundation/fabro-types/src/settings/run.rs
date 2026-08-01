@@ -1350,7 +1350,6 @@ pub struct InterviewProviderSettings {
 pub struct RunAgentSettings {
     #[serde(default)]
     pub fabro_tools: bool,
-    pub permissions: Option<AgentPermissions>,
     pub mcps:        HashMap<String, ResolvedMcpEntry>,
 }
 
@@ -1444,7 +1443,6 @@ mod run_agent_settings_tests {
     #[test]
     fn deserializes_missing_fabro_tools_as_false() {
         let settings: RunAgentSettings = serde_json::from_value(serde_json::json!({
-            "permissions": null,
             "mcps": {}
         }))
         .expect("legacy run agent settings should deserialize");
@@ -1460,7 +1458,6 @@ mod run_agent_settings_tests {
     fn deserializes_old_format_bare_mcps_as_resolved_json() {
         let settings: RunAgentSettings = serde_json::from_value(serde_json::json!({
             "fabro_tools": true,
-            "permissions": null,
             "mcps": {
                 "filesystem": {
                     "name": "filesystem",
@@ -2373,14 +2370,6 @@ pub enum RunMode {
 pub enum ApprovalMode {
     Prompt,
     Auto,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum AgentPermissions {
-    ReadOnly,
-    ReadWrite,
-    Full,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, strum::Display)]

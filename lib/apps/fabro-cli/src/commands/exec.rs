@@ -301,19 +301,12 @@ fn run_mcp_servers_for_exec(
 }
 
 pub(crate) async fn execute(mut args: ExecArgs, ctx: &CommandContext) -> AnyResult<()> {
-    use fabro_agent::cli::PermissionLevel as AgentPermissionLevel;
-    use fabro_types::settings::run::AgentPermissions;
-
     let cli = &ctx.user_settings().cli;
     #[cfg(feature = "sleep_inhibitor")]
     let _sleep_guard = sleep_inhibitor::guard(cli.exec.prevent_idle_sleep);
     let provider_str = cli.exec.model.provider.as_deref();
     let model_str = cli.exec.model.name.as_deref();
-    let permissions = cli.exec.agent.permissions.map(|p| match p {
-        AgentPermissions::ReadOnly => AgentPermissionLevel::ReadOnly,
-        AgentPermissions::ReadWrite => AgentPermissionLevel::ReadWrite,
-        AgentPermissions::Full => AgentPermissionLevel::Full,
-    });
+    let permissions = cli.exec.agent.permissions;
     let output_format = Some(match cli.output.format {
         SettingsOutputFormat::Text => OutputFormat::Text,
         SettingsOutputFormat::Json => OutputFormat::Json,
