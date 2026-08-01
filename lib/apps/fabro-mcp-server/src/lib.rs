@@ -1,4 +1,5 @@
 mod config;
+mod executable_monitor;
 mod manifest_builder;
 mod server;
 
@@ -11,6 +12,10 @@ use anyhow::Result;
 pub use config::{config_json, init_agent};
 use fabro_client::Client;
 pub use server::start;
+
+/// The name this MCP server reports over the wire and registers under in agent
+/// config files.
+pub(crate) const SERVER_NAME: &str = "fabro";
 
 pub type FabroClientFuture = Pin<Box<dyn Future<Output = Result<Client>> + Send>>;
 

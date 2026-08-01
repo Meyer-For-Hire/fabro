@@ -322,6 +322,22 @@ impl Database {
         Ok(unreadable)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn put_unvalidated_run_event(
+        &self,
+        run_id: &RunId,
+        seq: u32,
+        payload: &serde_json::Value,
+    ) -> Result<()> {
+        let db = self.open_db().await?;
+        db.put(
+            keys::run_event_key(run_id, seq, 0),
+            serde_json::to_vec(payload)?,
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn get_cached_run(&self, run_id: &RunId) -> Result<Option<CachedRunProjection>> {
         self.warm_projection_cache().await?;
         Ok(self.projection_cache.get(run_id).await)
@@ -523,7 +539,7 @@ mod tests {
     use object_store::path::Path;
 
     use super::*;
-    use crate::{EventPayload, keys, test_util};
+    use crate::{EventPayload, keys, test_support as store_test_support};
 
     fn dt(value: &str) -> DateTime<Utc> {
         value.parse().unwrap()
@@ -572,7 +588,7 @@ mod tests {
     }
 
     async fn make_summary_store() -> (tempfile::TempDir, Arc<RunSummaryStore>) {
-        let (directory, store) = test_util::sqlite_summary_store().await;
+        let (directory, store) = store_test_support::sqlite_summary_store().await;
         (directory, Arc::new(store))
     }
 
@@ -682,6 +698,57 @@ mod tests {
         ))
         .await
         .unwrap();
+    }
+
+    async fn append_runnable(run: &RunDatabase, label: &str, created_at: DateTime<Utc>) {
+        append_created(run, label, created_at).await;
+        run.append_event(&event_payload(
+            label,
+            "2026-03-27T12:00:01Z",
+            "run.submitted",
+            &serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+        run.append_event(&event_payload(
+            label,
+            "2026-03-27T12:00:02Z",
+            "run.start_requested",
+            &serde_json::json!({ "resume": false }),
+        ))
+        .await
+        .unwrap();
+        run.append_event(&event_payload(
+            label,
+            "2026-03-27T12:00:03Z",
+            "run.runnable",
+            &serde_json::json!({ "source": "start_requested" }),
+        ))
+        .await
+        .unwrap();
+    }
+
+    fn workflow_failure_payload(label: &str) -> EventPayload {
+        event_payload(
+            label,
+            "2026-03-27T12:00:04Z",
+            "run.failed",
+            &serde_json::json!({
+                "failure": {
+                    "reason": "workflow_error",
+                    "detail": {
+                        "message": "workflow failed",
+                        "category": "deterministic"
+                    }
+                },
+                "timing": {
+                    "wall_time_ms": 1,
+                    "inference_time_ms": 0,
+                    "tool_time_ms": 0,
+                    "active_time_ms": 0
+                },
+            }),
+        )
     }
 
     async fn append_completed(run: &RunDatabase, label: &str, created_at: DateTime<Utc>) {
@@ -847,6 +914,160 @@ mod tests {
         assert_eq!(appended, None);
         assert_eq!(run.state().await.unwrap().title(), "User title");
         assert_eq!(run.list_events().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn rejected_transition_writes_nothing_and_preserves_projection_cache() {
+        let (_object_store, store) = make_store();
+        let run_id = test_run_id("run-1");
+        let run = store.create_run(&run_id).await.unwrap();
+        append_runnable(&run, "run-1", dt("2026-03-27T12:00:00Z")).await;
+        let events_before = run.list_events().await.unwrap();
+
+        let err = run
+            .append_event(&workflow_failure_payload("run-1"))
+            .await
+            .unwrap_err();
+
+        let Error::EventRejected { source } = err else {
+            panic!("expected event rejection");
+        };
+        assert!(matches!(
+            *source,
+            Error::InvalidTransition(fabro_types::InvalidTransition {
+                from: RunStatus::Runnable,
+                to:   RunStatus::Failed {
+                    reason: FailureReason::WorkflowError,
+                },
+            })
+        ));
+        assert_eq!(run.list_events().await.unwrap(), events_before);
+        assert_eq!(run.state().await.unwrap().status, RunStatus::Runnable);
+        let cached = store.get_cached_run(&run_id).await.unwrap().unwrap();
+        assert_eq!(cached.last_seq, 4);
+        assert_eq!(cached.projection.status, RunStatus::Runnable);
+    }
+
+    #[tokio::test]
+    async fn rejected_transition_leaves_reconciled_summary_present() {
+        let (_object_store, store) = make_store();
+        let (_directory, summaries) = make_summary_store().await;
+        store.attach_run_summary_store(Arc::clone(&summaries));
+        let run_id = test_run_id("run-1");
+        let run = store.create_run(&run_id).await.unwrap();
+        append_runnable(&run, "run-1", dt("2026-03-27T12:00:00Z")).await;
+
+        let err = run
+            .append_event(&workflow_failure_payload("run-1"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::EventRejected { .. }));
+
+        let entries = store
+            .list_cached_runs(&ListRunsQuery::default(), Utc::now())
+            .await
+            .unwrap();
+        summaries.reconcile(&entries).await.unwrap();
+        let summary = summaries.get(&run_id, Utc::now()).await.unwrap().unwrap();
+        assert_eq!(summary.lifecycle.status, RunStatus::Runnable);
+    }
+
+    #[tokio::test]
+    async fn committed_append_succeeds_when_summary_update_fails_and_is_repairable() {
+        let (object_store, store) = make_store();
+        let (directory, summaries) = make_summary_store().await;
+        store.attach_run_summary_store(Arc::clone(&summaries));
+        let run_id = test_run_id("run-1");
+        let run = store.create_run(&run_id).await.unwrap();
+        append_created(&run, "run-1", dt("2026-03-27T12:00:00Z")).await;
+        summaries.close_pool().await;
+
+        let result = run
+            .append_event_envelope(&event_payload(
+                "run-1",
+                "2026-03-27T12:00:01Z",
+                "run.title.updated",
+                &serde_json::json!({ "title": "Committed title" }),
+            ))
+            .await;
+
+        assert!(result.is_ok(), "committed append returned {result:?}");
+        assert_eq!(run.list_events().await.unwrap().len(), 2);
+        let cached = store.get_cached_run(&run_id).await.unwrap().unwrap();
+        assert_eq!(cached.last_seq, 2);
+        assert_eq!(cached.summary.title, "Committed title");
+        let stored = run.get_event(2).await.unwrap().unwrap();
+        assert_eq!(stored.event, result.unwrap().event);
+
+        let repaired_summaries =
+            Arc::new(store_test_support::sqlite_summary_store_at(directory.path()).await);
+        let stale = repaired_summaries
+            .get(&run_id, Utc::now())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(stale.title, "Committed title");
+
+        let reopened = Database::new(object_store, "runs/", Duration::from_millis(1), None);
+        reopened.attach_run_summary_store(Arc::clone(&repaired_summaries));
+        reopened.warm_projection_cache().await.unwrap();
+        let repaired = repaired_summaries
+            .get(&run_id, Utc::now())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(repaired.title, "Committed title");
+    }
+
+    #[tokio::test]
+    async fn first_event_is_validated_before_write() {
+        let (_object_store, store) = make_store();
+        let run_id = test_run_id("run-1");
+        let run = store.create_run(&run_id).await.unwrap();
+        let invalid_first = event_payload(
+            "run-1",
+            "2026-03-27T12:00:00Z",
+            "run.title.updated",
+            &serde_json::json!({ "title": "Too early" }),
+        );
+
+        let err = run.append_event(&invalid_first).await.unwrap_err();
+
+        assert!(matches!(err, Error::EventRejected { .. }));
+        assert!(run.list_events().await.unwrap().is_empty());
+
+        append_created(&run, "run-1", dt("2026-03-27T12:00:01Z")).await;
+        assert_eq!(run.list_events().await.unwrap().len(), 1);
+        assert!(run.state().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn malformed_optional_envelope_field_is_rejected_before_write() {
+        let (_object_store, store) = make_store();
+        let run_id = test_run_id("run-1");
+        let run = store.create_run(&run_id).await.unwrap();
+        let malformed = EventPayload::new(
+            serde_json::json!({
+                "id": "evt-created",
+                "ts": "2026-03-27T12:00:00Z",
+                "run_id": run_id.to_string(),
+                "event": "run.created",
+                "node_id": 42,
+                "properties": {
+                    "settings": WorkflowSettings::default(),
+                    "graph": Graph::new("test"),
+                    "run_dir": "/tmp/test",
+                    "provenance": test_support::test_run_provenance(),
+                },
+            }),
+            &run_id,
+        )
+        .unwrap();
+
+        let err = run.append_event(&malformed).await.unwrap_err();
+
+        assert!(matches!(err, Error::InvalidEvent(_)));
+        assert!(run.list_events().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1321,13 +1542,14 @@ mod tests {
             .add(&bad_run_id)
             .await
             .unwrap();
-        let db = store.open_db().await.unwrap();
-        db.put(
-            keys::run_event_key(&bad_run_id, 1, 0),
-            br#"{"not":"a valid run event"}"#,
-        )
-        .await
-        .unwrap();
+        store
+            .put_unvalidated_run_event(
+                &bad_run_id,
+                1,
+                &serde_json::json!({ "not": "a valid run event" }),
+            )
+            .await
+            .unwrap();
 
         let reopened = Database::new(object_store, "runs", Duration::from_millis(1), None);
         reopened.warm_projection_cache().await.unwrap();
@@ -1369,28 +1591,28 @@ mod tests {
             .and_then(serde_json::Value::as_object_mut)
             .unwrap();
         run_settings.remove("integrations");
-        let db = store.open_db().await.unwrap();
-        db.put(
-            keys::run_event_key(&bad_run_id, 1, 0),
-            serde_json::to_vec(&serde_json::json!({
-                "id": "evt-run-2-run.created",
-                "ts": "2026-03-27T12:00:10Z",
-                "run_id": bad_run_id,
-                "event": "run.created",
-                "properties": {
-                    "settings": run_spec["settings"],
-                    "graph": run_spec["graph"],
-                    "workflow_slug": run_spec["workflow_slug"],
-                    "source_directory": run_spec["source_directory"],
-                    "run_dir": "/tmp/run-2",
-                    "git": run_spec["git"],
-                    "labels": run_spec["labels"],
-                },
-            }))
-            .unwrap(),
-        )
-        .await
-        .unwrap();
+        store
+            .put_unvalidated_run_event(
+                &bad_run_id,
+                1,
+                &serde_json::json!({
+                    "id": "evt-run-2-run.created",
+                    "ts": "2026-03-27T12:00:10Z",
+                    "run_id": bad_run_id,
+                    "event": "run.created",
+                    "properties": {
+                        "settings": run_spec["settings"],
+                        "graph": run_spec["graph"],
+                        "workflow_slug": run_spec["workflow_slug"],
+                        "source_directory": run_spec["source_directory"],
+                        "run_dir": "/tmp/run-2",
+                        "git": run_spec["git"],
+                        "labels": run_spec["labels"],
+                    },
+                }),
+            )
+            .await
+            .unwrap();
 
         let reopened = Database::new(object_store, "runs", Duration::from_millis(1), None);
         let unreadable = reopened.list_unreadable_runs().await.unwrap();
@@ -1675,23 +1897,9 @@ mod tests {
         ))
         .await
         .unwrap();
-        run.append_event(&event_payload(
-            "run-1",
-            "2026-03-27T12:00:04Z",
-            "run.failed",
-            &serde_json::json!({
-                "failure": {
-                    "reason": "workflow_error",
-                    "detail": {
-                        "message": "workflow failed",
-                        "category": "deterministic"
-                    }
-                },
-                "timing": {"wall_time_ms": 1, "inference_time_ms": 0, "tool_time_ms": 0, "active_time_ms": 0},
-            }),
-        ))
-        .await
-        .unwrap();
+        run.append_event(&workflow_failure_payload("run-1"))
+            .await
+            .unwrap();
 
         let reopened = Database::new(
             Arc::clone(&object_store),

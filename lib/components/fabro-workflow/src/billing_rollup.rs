@@ -52,7 +52,7 @@ pub fn billing_rollup_from_projection(
     let mut billed_visit_count = 0_usize;
 
     for (stage_id, stage) in projection.iter_stages() {
-        if is_boundary_stage(projection, stage_id.node_id()) {
+        if projection.is_boundary_stage(stage_id.node_id()) {
             continue;
         }
         let usage = stage.billed_usage(catalog);
@@ -122,15 +122,6 @@ pub fn billing_rollup_from_projection(
         timing: run_timing,
         billed_visit_count,
     }
-}
-
-fn is_boundary_stage(projection: &RunProjection, node_id: &str) -> bool {
-    projection
-        .spec()
-        .graph()
-        .nodes
-        .get(node_id)
-        .is_some_and(|node| matches!(node.handler_type(), Some("start" | "exit")))
 }
 
 #[cfg(test)]

@@ -137,6 +137,7 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::{BroadcastStream, UnboundedReceiverStream};
 use tokio_util::sync::CancellationToken;
 use tower::{ServiceExt, service_fn};
+use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
 use tower_http::compression::{CompressionLayer, CompressionLevel};
 use tracing::{Instrument, debug, error, info, warn};
 use ulid::Ulid;
@@ -1922,12 +1923,14 @@ pub fn build_router_with_options(
 /// Response-compression layer shared by the main and install-mode routers.
 ///
 /// The default predicate skips streaming SSE (`text/event-stream`), gRPC,
-/// images, and tiny bodies. The quality is pinned because tower-http's
-/// default defers to each codec's own default, and brotli's is quality 11 —
-/// seconds of CPU on a multi-megabyte asset. Level 4 keeps both codecs fast
-/// at a near-optimal ratio.
-pub(crate) fn compression_layer() -> CompressionLayer {
-    CompressionLayer::new().quality(CompressionLevel::Precise(4))
+/// images, ZIP archives, and tiny bodies. The quality is pinned because
+/// tower-http's default defers to each codec's own default, and brotli's is
+/// quality 11 — seconds of CPU on a multi-megabyte asset. Level 4 keeps both
+/// codecs fast at a near-optimal ratio.
+pub(crate) fn compression_layer() -> CompressionLayer<impl Predicate> {
+    CompressionLayer::new()
+        .quality(CompressionLevel::Precise(4))
+        .compress_when(DefaultPredicate::new().and(NotForContentType::const_new("application/zip")))
 }
 
 async fn http_log_middleware(mut req: axum_extract::Request, next: Next) -> Response {

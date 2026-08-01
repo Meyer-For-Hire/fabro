@@ -154,6 +154,11 @@ impl RunSummaryStore {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) async fn close_pool(&self) {
+        self.pool.close().await;
+    }
+
     pub(crate) async fn reconcile(&self, entries: &[CachedRunProjection]) -> Result<()> {
         let mut transaction = self.pool.begin().await?;
         let stored_seqs: HashMap<String, i64> =
@@ -571,7 +576,7 @@ mod tests {
         RunSummaryVisibility,
     };
     use crate::slate::CachedRunProjection;
-    use crate::test_util;
+    use crate::test_support as store_test_support;
 
     fn dt(value: &str) -> DateTime<Utc> {
         value.parse().unwrap()
@@ -608,7 +613,7 @@ mod tests {
     }
 
     async fn store() -> (tempfile::TempDir, RunSummaryStore) {
-        test_util::sqlite_summary_store().await
+        store_test_support::sqlite_summary_store().await
     }
 
     fn sample_status(kind: RunStatusKind) -> RunStatus {

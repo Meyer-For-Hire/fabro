@@ -303,6 +303,8 @@ mod tests {
             ("claude-sonnet-4-5",                  "claude-sonnet-4-5",                   T::Anthropic,         C::AnthropicMessages, B::Anthropic, P::Anthropic),
             ("claude-sonnet-4-6",                  "claude-sonnet-4-6",                   T::Anthropic,         C::AnthropicMessages, B::Anthropic, P::Anthropic),
             ("claude-sonnet-5",                    "claude-sonnet-5",                     T::Anthropic,         C::AnthropicMessages, B::Anthropic, P::Claude5),
+            ("deepseek-v4-flash",                  "deepseek-v4-flash",                   T::OpenAiCompatible,  C::OpenAiCompatible,  B::OpenAi,    P::OpenAi),
+            ("deepseek-v4-pro",                    "deepseek-v4-pro",                     T::OpenAiCompatible,  C::OpenAiCompatible,  B::OpenAi,    P::OpenAi),
             ("gemini-3-flash-preview",             "gemini-3-flash-preview",              T::Gemini,            C::GeminiGenerate,    B::Gemini,    P::Gemini),
             ("gemini-3.1-flash-lite",              "gemini-3.1-flash-lite",               T::Gemini,            C::GeminiGenerate,    B::Gemini,    P::Gemini),
             ("gemini-3.1-pro-preview",             "gemini-3.1-pro-preview",              T::Gemini,            C::GeminiGenerate,    B::Gemini,    P::Gemini),

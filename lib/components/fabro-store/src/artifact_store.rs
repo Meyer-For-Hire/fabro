@@ -4,6 +4,7 @@ use bytes::Bytes;
 use chrono::Utc;
 use fabro_types::RunId;
 use futures::StreamExt;
+use futures::stream::BoxStream;
 use object_store::ObjectStore;
 use object_store::buffered::BufWriter;
 use object_store::path::Path as ObjectPath;
@@ -122,6 +123,33 @@ impl ArtifactStore {
         }
     }
 
+    pub async fn get_stream(
+        &self,
+        run_id: &RunId,
+        key: &ArtifactKey,
+    ) -> Result<Option<BoxStream<'static, Result<Bytes>>>> {
+        let path = self.artifact_path(run_id, key)?;
+        match self.object_store.get(&path).await {
+            Ok(result) => Ok(Some(
+                result
+                    .into_stream()
+                    .map(|chunk| chunk.map_err(Error::from))
+                    .boxed(),
+            )),
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// Check a path against the same rules `put` enforces, without writing.
+    ///
+    /// Readers that hand artifact paths back to a client — the ZIP download,
+    /// for one — use this to re-check paths that were stored before a rule
+    /// existed.
+    pub fn validate_relative_path(relative_path: &str) -> Result<()> {
+        validate_filename_segments(relative_path).map(drop)
+    }
+
     pub async fn list_for_run(&self, run_id: &RunId) -> Result<Vec<NodeArtifact>> {
         let prefix = self.run_prefix(run_id)?;
         let mut stream = self.object_store.list(Some(&prefix));
@@ -220,10 +248,25 @@ impl ArtifactStore {
     }
 }
 
+/// Artifact filenames end up as paths on someone else's disk — extracted from a
+/// ZIP, written by a worker — so they must stay relative and portable. The
+/// backslash, NUL, and drive-letter rules are what make the path safe on
+/// Windows as well as Unix.
 fn validate_filename_segments(filename: &str) -> Result<Vec<&str>> {
     if filename.contains('\\') {
         return Err(Error::Other(
             "artifact filename must not contain backslashes".to_string(),
+        ));
+    }
+    if filename.contains('\0') {
+        return Err(Error::Other(
+            "artifact filename must not contain NUL bytes".to_string(),
+        ));
+    }
+    let bytes = filename.as_bytes();
+    if bytes.first().is_some_and(u8::is_ascii_alphabetic) && bytes.get(1) == Some(&b':') {
+        return Err(Error::Other(
+            "artifact filename must not start with a drive letter".to_string(),
         ));
     }
     let segments = filename.split('/').collect::<Vec<_>>();
@@ -461,6 +504,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_stream_round_trips_chunked_reads() {
+        let store = test_store();
+        let run_id = fixtures::RUN_1;
+        let key = ArtifactKey::new(StageId::new("build", 2), 1, "logs/output.txt");
+        store.put(&run_id, &key, b"hello world").await.unwrap();
+
+        let mut stream = store.get_stream(&run_id, &key).await.unwrap().unwrap();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            bytes.extend_from_slice(&chunk.unwrap());
+        }
+
+        assert_eq!(bytes, b"hello world");
+    }
+
+    #[tokio::test]
     async fn rejects_invalid_relative_filenames() {
         let store = test_store();
         let run_id = fixtures::RUN_1;
@@ -468,15 +527,25 @@ mod tests {
 
         for filename in [
             "",
+            "/escape.txt",
             "../escape.txt",
             "logs//output.txt",
             "logs/./output.txt",
             r"logs\output.txt",
+            "C:/escape.txt",
+            "c:escape.txt",
+            "bad\0name.txt",
         ] {
             let key = ArtifactKey::new(node.clone(), 1, filename);
             let err = store.put(&run_id, &key, b"boom").await.unwrap_err();
-            assert!(err.to_string().contains("artifact filename"));
+            assert!(
+                err.to_string().contains("artifact filename"),
+                "accepted unsafe artifact filename: {filename:?}"
+            );
+            assert!(ArtifactStore::validate_relative_path(filename).is_err());
         }
+
+        assert!(ArtifactStore::validate_relative_path("nested/result.txt").is_ok());
     }
 
     #[tokio::test]

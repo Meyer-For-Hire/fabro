@@ -280,6 +280,21 @@ mod tests {
     }
 
     #[test]
+    fn tool_use_names_are_preserved_verbatim() {
+        let block = serde_json::json!({
+            "toolUse": {
+                "toolUseId": "tool-1",
+                "name": "search???",
+                "input": {}
+            }
+        });
+        let Some(ContentPart::ToolCall(tool_call)) = decode_content_block(&block) else {
+            panic!("expected tool call");
+        };
+        assert_eq!(tool_call.name, "search???");
+    }
+
+    #[test]
     fn reasoning_text_block_round_trips_signature() {
         let block = serde_json::json!({
             "reasoningContent": {
