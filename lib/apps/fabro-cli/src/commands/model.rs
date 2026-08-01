@@ -723,7 +723,7 @@ mod tests {
                     .body(
                         serde_json::json!({
                             "model_id": "kimi-k2.5",
-                            "provider": "kimi",
+                            "provider": "moonshot",
                             "status": "skip"
                         })
                         .to_string(),

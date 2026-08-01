@@ -427,10 +427,10 @@ mod tests {
     fn openai_compatible_factory_uses_provider_id_for_name() {
         let config = AdapterConfig {
             base_url: Some("https://api.moonshot.ai/v1".to_string()),
-            ..AdapterConfig::new("kimi", ApiKeyHeader::Bearer("k".to_string()))
+            ..AdapterConfig::new("moonshot", ApiKeyHeader::Bearer("k".to_string()))
         };
         let adapter = factory_for(AdapterKind::OpenAiCompatible)(config).unwrap();
-        assert_eq!(adapter.name(), "kimi");
+        assert_eq!(adapter.name(), "moonshot");
     }
 
     #[test]
@@ -491,7 +491,7 @@ mod tests {
 
     #[test]
     fn openai_compatible_factory_errors_without_base_url() {
-        let config = AdapterConfig::new("kimi", ApiKeyHeader::Bearer("k".to_string()));
+        let config = AdapterConfig::new("moonshot", ApiKeyHeader::Bearer("k".to_string()));
         let Err(err) = factory_for(AdapterKind::OpenAiCompatible)(config) else {
             panic!("expected missing base_url error");
         };

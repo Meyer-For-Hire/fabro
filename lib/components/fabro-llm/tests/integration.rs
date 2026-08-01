@@ -178,7 +178,7 @@ async fn openai_gpt_5_5_pro_complete() {
 async fn kimi_k3_reasoning_tool_round_trip() {
     let api_key = std::env::var(EnvVars::KIMI_API_KEY).expect("KIMI_API_KEY must be set");
     let adapter = OpenAiCompatibleAdapter::new(api_key, "https://api.moonshot.ai/v1")
-        .with_name("kimi")
+        .with_name("moonshot")
         .with_catalog(Arc::new(Catalog::from_builtin().unwrap()));
     let tool = ToolDefinition::function(
         "multiply",

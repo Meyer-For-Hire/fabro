@@ -7,7 +7,7 @@ expression: rendered
     "type": "stream_start"
   },
   {
-    "stream_item_error": "Server error from kimi: Overloaded",
+    "stream_item_error": "Server error from moonshot: Overloaded",
     "retryable": true,
     "failover_eligible": true
   }

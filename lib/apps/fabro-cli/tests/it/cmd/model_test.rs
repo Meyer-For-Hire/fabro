@@ -18,6 +18,7 @@ fn remove_provider_env(cmd: &mut Command) -> &mut Command {
         .env_remove("OPENAI_API_KEY")
         .env_remove("GEMINI_API_KEY")
         .env_remove("GOOGLE_API_KEY")
+        .env_remove("MOONSHOT_API_KEY")
         .env_remove("KIMI_API_KEY")
         .env_remove("ZAI_API_KEY")
         .env_remove("MINIMAX_API_KEY")

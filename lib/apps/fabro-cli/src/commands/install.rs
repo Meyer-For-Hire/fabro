@@ -3515,7 +3515,7 @@ root = "{}"
         assert!(ids.contains(&ProviderId::anthropic()));
         assert!(ids.contains(&ProviderId::openai()));
         assert!(ids.contains(&ProviderId::gemini()));
-        assert!(ids.contains(&ProviderId::new("kimi")));
+        assert!(ids.contains(&ProviderId::new("moonshot")));
         assert!(ids.contains(&ProviderId::new("zai")));
         assert!(ids.contains(&ProviderId::new("minimax")));
         assert!(ids.contains(&ProviderId::new("inception")));

@@ -3743,7 +3743,7 @@ enabled = true
         assert_eq!(provider.codec, CodecKind::OpenAiCompatible);
         assert_eq!(provider.agent_profile, AgentProfileKind::Kimi);
         assert_eq!(provider.billing_policy, BillingPolicy::OpenAi);
-        assert_eq!(provider.priority, 30);
+        assert_eq!(provider.priority, 75);
         assert!(provider.auth.is_none());
         assert_eq!(
             provider.extra_headers,
@@ -3858,8 +3858,28 @@ enabled = true
     }
 
     #[test]
-    fn builtin_kimi_k3_selection_prefers_direct_kimi_then_modal_over_openrouter() {
-        let kimi = ProviderId::new("kimi");
+    fn builtin_moonshot_provider_prefers_moonshot_api_key() {
+        let moonshot = ProviderId::new("moonshot");
+        let catalog = Catalog::builtin();
+        let provider = catalog
+            .provider(&moonshot)
+            .expect("Moonshot provider should be present");
+
+        assert_eq!(provider.auth.as_ref().unwrap().credentials, vec![
+            CredentialRef::Env("MOONSHOT_API_KEY".to_string()),
+            CredentialRef::Env("KIMI_API_KEY".to_string()),
+            CredentialRef::Vault("MOONSHOT_API_KEY".to_string()),
+            CredentialRef::Vault("KIMI_API_KEY".to_string()),
+        ]);
+        assert_eq!(
+            catalog.provider_vault_secret_name(&moonshot),
+            Some("MOONSHOT_API_KEY")
+        );
+    }
+
+    #[test]
+    fn builtin_kimi_k3_selection_prefers_modal_then_moonshot_over_openrouter() {
+        let moonshot = ProviderId::new("moonshot");
         let modal = ProviderId::new("modal");
         let openrouter = ProviderId::new("openrouter");
         let catalog = Catalog::from_builtin_with_overrides(&minimal_settings(
@@ -3877,10 +3897,19 @@ enabled = true
             .select(
                 "kimi-k3",
                 None,
-                &HashSet::from([kimi.clone(), modal.clone(), openrouter.clone()]),
+                &HashSet::from([moonshot.clone(), modal.clone(), openrouter.clone()]),
             )
-            .expect("direct Kimi should win portable Kimi K3 selection");
-        assert_eq!(selected.provider, kimi);
+            .expect("Modal should win portable Kimi K3 selection");
+        assert_eq!(selected.provider, modal);
+
+        let selected = catalog
+            .select(
+                "kimi-k3",
+                None,
+                &HashSet::from([moonshot.clone(), openrouter.clone()]),
+            )
+            .expect("Moonshot should win when Modal is unavailable");
+        assert_eq!(selected.provider, moonshot);
 
         let selected = catalog
             .select("kimi-k3", None, &HashSet::from([modal.clone(), openrouter]))
@@ -4405,7 +4434,7 @@ enabled = true
         );
         assert_eq!(
             catalog
-                .provider(&ProviderId::new("kimi"))
+                .provider(&ProviderId::new("moonshot"))
                 .unwrap()
                 .base_url
                 .as_deref(),
@@ -4464,7 +4493,7 @@ enabled = true
             ("anthropic", CodecKind::AnthropicMessages),
             ("openai", CodecKind::OpenAiResponses),
             ("gemini", CodecKind::GeminiGenerate),
-            ("kimi", CodecKind::OpenAiCompatible),
+            ("moonshot", CodecKind::OpenAiCompatible),
         ] {
             let provider_id = ProviderId::new(provider);
             assert_eq!(catalog.provider(&provider_id).unwrap().codec, expected);
@@ -6920,7 +6949,7 @@ sampling_params = false
         insta::assert_debug_snapshot!(m, @r#"
         Model {
             id: "kimi-k2.5",
-            provider: kimi,
+            provider: moonshot,
             family: "kimi-k2",
             display_name: "Kimi K2.5",
             limits: ModelLimits {
@@ -6976,7 +7005,7 @@ sampling_params = false
         insta::assert_debug_snapshot!(m, @r#"
         Model {
             id: "kimi-k3",
-            provider: kimi,
+            provider: moonshot,
             family: "kimi-k3",
             display_name: "Kimi K3",
             limits: ModelLimits {
@@ -7327,11 +7356,11 @@ context_window = 1050000
     }
 
     #[test]
-    fn closest_model_haiku_to_kimi() {
+    fn closest_model_haiku_to_moonshot() {
         let haiku = Catalog::builtin().get("claude-haiku-4-5").unwrap();
         assert!(
             Catalog::builtin()
-                .closest(&ProviderId::new("kimi"), haiku)
+                .closest(&ProviderId::new("moonshot"), haiku)
                 .is_none()
         );
     }

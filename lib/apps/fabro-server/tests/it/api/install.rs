@@ -143,7 +143,7 @@ async fn mock_anthropic_install_validation(server: &MockServer) -> httpmock::Moc
         .await
 }
 
-async fn mock_kimi_install_validation(server: &MockServer) -> httpmock::Mock<'_> {
+async fn mock_moonshot_install_validation(server: &MockServer) -> httpmock::Mock<'_> {
     server
         .mock_async(|when, then| {
             when.method("POST")
@@ -1355,11 +1355,13 @@ async fn token_install_finish_invokes_shutdown_callback_after_accepting() {
 #[tokio::test]
 async fn install_llm_accepts_catalog_openai_compatible_provider() {
     let llm_mock = MockServer::start_async().await;
-    mock_kimi_install_validation(&llm_mock).await;
+    mock_moonshot_install_validation(&llm_mock).await;
 
     let app = build_install_router(
-        InstallAppState::for_test("test-install-token")
-            .with_provider_base_url(ProviderId::new("kimi"), format!("{}/v1", llm_mock.url(""))),
+        InstallAppState::for_test("test-install-token").with_provider_base_url(
+            ProviderId::new("moonshot"),
+            format!("{}/v1", llm_mock.url("")),
+        ),
     );
 
     let test_response = app
@@ -1371,7 +1373,7 @@ async fn install_llm_accepts_catalog_openai_compatible_provider() {
                 .header("authorization", "Bearer test-install-token")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"provider":"kimi","api_key":"kimi-test-key"}"#,
+                    r#"{"provider":"moonshot","api_key":"kimi-test-key"}"#,
                 ))
                 .unwrap(),
         )
@@ -1388,7 +1390,7 @@ async fn install_llm_accepts_catalog_openai_compatible_provider() {
                 .header("authorization", "Bearer test-install-token")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"providers":[{"provider":"kimi","api_key":"kimi-test-key"}]}"#,
+                    r#"{"providers":[{"provider":"moonshot","api_key":"kimi-test-key"}]}"#,
                 ))
                 .unwrap(),
         )

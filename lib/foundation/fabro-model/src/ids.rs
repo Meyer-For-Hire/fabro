@@ -174,9 +174,9 @@ mod tests {
 
     #[test]
     fn provider_id_is_transparent_string_in_json() {
-        let id = ProviderId::new("kimi");
+        let id = ProviderId::new("moonshot");
         let json = serde_json::to_string(&id).unwrap();
-        assert_eq!(json, "\"kimi\"");
+        assert_eq!(json, "\"moonshot\"");
         let back: ProviderId = serde_json::from_str(&json).unwrap();
         assert_eq!(back, id);
     }

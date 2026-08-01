@@ -292,15 +292,15 @@ mod tests {
 
     #[test]
     fn accepts_new_llm_providers_subtree() {
-        let parsed = "[llm.providers.kimi]\nadapter = \"openai_compatible\"\n"
+        let parsed = "[llm.providers.moonshot]\nadapter = \"openai_compatible\"\n"
             .parse::<SettingsLayer>()
             .unwrap();
-        assert!(parsed.llm.unwrap().providers.contains_key("kimi"));
+        assert!(parsed.llm.unwrap().providers.contains_key("moonshot"));
     }
 
     #[test]
     fn accepts_new_llm_models_subtree() {
-        let parsed = "[llm.providers.kimi.models.\"foo\"]\n"
+        let parsed = "[llm.providers.moonshot.models.\"foo\"]\n"
             .parse::<SettingsLayer>()
             .unwrap();
         assert!(
@@ -308,7 +308,7 @@ mod tests {
                 .llm
                 .unwrap()
                 .providers
-                .get("kimi")
+                .get("moonshot")
                 .unwrap()
                 .models
                 .contains_key("foo")

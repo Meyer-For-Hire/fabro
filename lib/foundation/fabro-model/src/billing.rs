@@ -1414,9 +1414,10 @@ output_cost_per_mtok = 2.0
 
     #[test]
     fn old_provider_tagged_pricing_policy_is_rejected() {
-        let error =
-            serde_json::from_value::<ModelPricingPolicy>(openai_pricing_json("provider", "kimi"))
-                .unwrap_err();
+        let error = serde_json::from_value::<ModelPricingPolicy>(openai_pricing_json(
+            "provider", "moonshot",
+        ))
+        .unwrap_err();
         assert!(error.to_string().contains("algorithm"));
     }
 

@@ -3348,7 +3348,7 @@ enabled = true
         let policy = ModelFallbackPolicy::new(std::collections::BTreeMap::from([(
             "kimi-k3".to_string(),
             vec![
-                FallbackTarget::new("kimi", "kimi-k3"),
+                FallbackTarget::new("moonshot", "kimi-k3"),
                 FallbackTarget::new("openrouter", "kimi-k3"),
                 FallbackTarget::new("anthropic", "claude-opus-5"),
             ],

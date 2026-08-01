@@ -7446,7 +7446,7 @@ async fn list_models_exposes_reasoning_effort_controls() {
 
     let req = Request::builder()
         .method("GET")
-        .uri(api("/models?provider=kimi"))
+        .uri(api("/models?provider=moonshot"))
         .body(Body::empty())
         .unwrap();
 
@@ -16443,7 +16443,7 @@ async fn create_completion_unsupported_reasoning_efforts_return_bad_request() {
         then.status(500);
     });
     let state = TestAppStateBuilder::new()
-        .provider_base_url("kimi", upstream.url("/v1"))
+        .provider_base_url("moonshot", upstream.url("/v1"))
         .vault_entries([(EnvVars::KIMI_API_KEY, "test-kimi-api-key")])
         .build();
     let app = crate::test_support::build_test_router(state);
@@ -16456,7 +16456,7 @@ async fn create_completion_unsupported_reasoning_efforts_return_bad_request() {
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::json!({
-                        "provider": "kimi",
+                        "provider": "moonshot",
                         "model": "kimi-k3",
                         "reasoning_effort": effort,
                         "stream": stream,
@@ -16515,7 +16515,7 @@ async fn create_completion_returns_disjoint_usage_buckets() {
             }));
     });
     let state = TestAppStateBuilder::new()
-        .provider_base_url("kimi", upstream.base_url())
+        .provider_base_url("moonshot", upstream.base_url())
         .vault_entries([(EnvVars::KIMI_API_KEY, "test-kimi-api-key")])
         .build();
     let app = crate::test_support::build_test_router(state);
@@ -16526,7 +16526,7 @@ async fn create_completion_returns_disjoint_usage_buckets() {
         .header("content-type", "application/json")
         .body(Body::from(
             json!({
-                "provider": "kimi",
+                "provider": "moonshot",
                 "model": "kimi-k3",
                 "stream": false,
                 "messages": [{
@@ -16655,7 +16655,7 @@ async fn create_completion_structured_output_forwards_reasoning_effort() {
             }));
     });
     let state = TestAppStateBuilder::new()
-        .provider_base_url("kimi", upstream.base_url())
+        .provider_base_url("moonshot", upstream.base_url())
         .vault_entries([(EnvVars::KIMI_API_KEY, "test-kimi-api-key")])
         .build();
     let app = crate::test_support::build_test_router(state);
@@ -16666,7 +16666,7 @@ async fn create_completion_structured_output_forwards_reasoning_effort() {
         .header("content-type", "application/json")
         .body(Body::from(
             serde_json::json!({
-                "provider": "kimi",
+                "provider": "moonshot",
                 "model": "kimi-k3",
                 "reasoning_effort": "high",
                 "stream": false,
