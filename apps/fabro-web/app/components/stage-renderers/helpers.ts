@@ -172,35 +172,28 @@ export interface ParallelBranchSummary {
 
 export interface ParallelOverview {
   branchCount: number | null;
-  successCount: number | null;
-  failureCount: number | null;
-  durationMs: number | null;
   results: ParallelBranchSummary[];
-  isComplete: boolean;
 }
 
 /**
  * Roll up the `parallel.started` (announces branch count) and
- * `parallel.completed` (carries the rolled-up results) events for a parallel
+ * `parallel.completed` (carries the per-branch results) events for a parallel
  * stage. Pre-completion, only the announce data is available.
+ *
+ * Only branch identity is parsed. The event's own `success_count`,
+ * `failure_count` and `duration_ms` rollups are deliberately ignored: the
+ * renderer counts the branch rows it actually draws, and duration comes from
+ * the stage record via `StageMetaBar`.
  */
 export function parseParallelOverview(events: EventEnvelope[]): ParallelOverview {
   let branchCount: number | null = null;
-  let successCount: number | null = null;
-  let failureCount: number | null = null;
-  let durationMs: number | null = null;
   let results: ParallelBranchSummary[] = [];
-  let isComplete = false;
 
   for (const event of events) {
     const props: UnknownRecord = event.properties ?? {};
     if (event.event === "parallel.started") {
       branchCount = getNumber(props, "branch_count") ?? branchCount;
     } else if (event.event === "parallel.completed") {
-      isComplete = true;
-      successCount = getNumber(props, "success_count") ?? successCount;
-      failureCount = getNumber(props, "failure_count") ?? failureCount;
-      durationMs = getNumber(props, "duration_ms") ?? durationMs;
       const rawResults = getArray(props, "results") ?? [];
       results = rawResults
         .map((entry) => {
@@ -218,14 +211,7 @@ export function parseParallelOverview(events: EventEnvelope[]): ParallelOverview
     }
   }
 
-  return {
-    branchCount,
-    successCount,
-    failureCount,
-    durationMs,
-    results,
-    isComplete,
-  };
+  return { branchCount, results };
 }
 
 export interface ReducerTranscript {

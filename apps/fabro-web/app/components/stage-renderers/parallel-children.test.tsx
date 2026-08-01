@@ -144,18 +144,23 @@ describe("ParallelChildren", () => {
     expect(statValue(renderer, "Failed")).toBe("0");
   });
 
-  test("uses the stage duration when cancellation interrupts the parallel summary", () => {
+  test("shows the recorded stage duration when cancellation interrupts the fan-out", () => {
     const renderer = renderParallel(
       [startedEvent(2)],
       [],
-      {
-        ...parallelStage,
+      makeStage({
+        id: "fork@1",
+        name: "fork",
+        nodeId: "fork",
+        handler: "parallel",
         status: StageState.CANCELLED,
         duration: "53m 29s",
-      },
+      }),
     );
 
-    expect(statValue(renderer, "Duration")).toBe("53m 29s");
+    // No `parallel.completed` event is emitted for an interrupted fan-out, so
+    // the stage record is the only duration there is.
+    expect(textContent(renderer.root)).toContain("53m 29s");
   });
 
   test("keeps looped fork links scoped to the selected fork visit", () => {

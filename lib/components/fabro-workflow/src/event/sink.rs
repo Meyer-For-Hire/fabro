@@ -163,14 +163,45 @@ impl RunEventLogger {
         let (tx, mut rx) = mpsc::unbounded_channel();
 
         tokio::spawn(async move {
+            // A dropped run event is unrecoverable history loss, so the first
+            // one is an ERROR worth investigating. A broken sink fails for
+            // every event that follows, so report the rest as a count at flush
+            // instead of one ERROR per event. Flush runs per stage and per
+            // agent turn, so only losses since the last summary are reported.
+            let mut write_failures: u64 = 0;
+            let mut summarized_failures: u64 = 0;
             while let Some(command) = rx.recv().await {
                 match command {
                     RunEventCommand::Event(event) => {
                         if let Err(err) = sink.write_run_event(&event).await {
-                            tracing::error!(error = %err, "Failed to write run event");
+                            write_failures += 1;
+                            if write_failures == 1 {
+                                tracing::error!(
+                                    run_id = %event.run_id,
+                                    event = %event.body.event_name(),
+                                    error = %err,
+                                    "Failed to write run event",
+                                );
+                            } else {
+                                tracing::debug!(
+                                    run_id = %event.run_id,
+                                    event = %event.body.event_name(),
+                                    failures = write_failures,
+                                    error = %err,
+                                    "Failed to write run event",
+                                );
+                            }
                         }
                     }
                     RunEventCommand::Flush(tx) => {
+                        if write_failures > summarized_failures {
+                            tracing::error!(
+                                lost = write_failures - summarized_failures,
+                                total = write_failures,
+                                "Run events were lost to write failures",
+                            );
+                            summarized_failures = write_failures;
+                        }
                         let _ = tx.send(());
                     }
                 }
