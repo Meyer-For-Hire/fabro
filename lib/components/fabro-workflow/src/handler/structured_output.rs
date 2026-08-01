@@ -102,13 +102,17 @@ impl SchemaValidationIssue {
                     .map_or_else(|| property.to_string(), str::to_owned),
             },
             ValidationErrorKind::AdditionalProperties { unexpected } => {
+                // `unexpected` arrives in the order the model emitted the keys,
+                // so sort before truncating. That keeps the retained subset and
+                // the rendered message stable, and lets two attempts that left
+                // the same keys in place compare equal whatever order they used.
+                let total = unexpected.len();
+                let mut sorted = unexpected.clone();
+                sorted.sort_unstable();
+                sorted.truncate(MAX_UNEXPECTED_PROPERTIES);
                 SchemaValidationIssueDetail::AdditionalProperties {
-                    total:      unexpected.len(),
-                    unexpected: unexpected
-                        .iter()
-                        .take(MAX_UNEXPECTED_PROPERTIES)
-                        .cloned()
-                        .collect(),
+                    unexpected: sorted,
+                    total,
                 }
             }
             _ => SchemaValidationIssueDetail::Other {
@@ -965,6 +969,26 @@ mod tests {
         );
         assert!(
             repair.contains("JSON Pointer `/findings/0/rationale`"),
+            "unexpected repair message: {repair}",
+        );
+    }
+
+    #[test]
+    fn the_same_unexpected_properties_in_a_new_order_are_still_unchanged() {
+        let schema = schema(serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "findings": { "type": "array" }
+            }
+        }));
+        let previous = validate_response_text(&schema, r#"{"beta":1,"alpha":1}"#).unwrap_err();
+        let current = validate_response_text(&schema, r#"{"alpha":1,"beta":1}"#).unwrap_err();
+
+        let repair = current.repair_message(&schema, Some(&previous));
+
+        assert!(
+            repair.contains("unchanged from your previous repair"),
             "unexpected repair message: {repair}",
         );
     }
