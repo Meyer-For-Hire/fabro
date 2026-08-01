@@ -1435,7 +1435,7 @@ async fn stall_watchdog_starts_a_fresh_deadline_after_human_input() {
         Duration::from_millis(50),
         stall_token.clone(),
         shutdown.clone(),
-        emitter.subscribe_activity(),
+        Arc::clone(&emitter),
         blocker.subscribe(),
     ));
     tokio::task::yield_now().await;

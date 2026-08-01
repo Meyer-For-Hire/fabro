@@ -1,33 +1,28 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use ::fabro_types::{ExecOutputTail, RunEvent, RunId, RunNoticeCode, RunNoticeLevel};
 use chrono::Utc;
-use tokio::sync::watch;
+use tokio::time::Instant;
 
 use super::Event;
 use super::convert::to_run_event_at;
+use crate::millis_u64;
 use crate::stage_scope::StageScope;
-
-fn epoch_millis() -> i64 {
-    let millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    i64::try_from(millis).unwrap_or(i64::MAX)
-}
 
 /// Listener callback type for workflow run events.
 type EventListener = Arc<dyn Fn(&RunEvent) + Send + Sync>;
 
 /// Callback-based event emitter for workflow run events.
 pub struct Emitter {
-    run_id:            RunId,
-    listeners:         std::sync::Mutex<Vec<EventListener>>,
-    /// Epoch milliseconds of the last `emit()` or `touch()` call. 0 until first
-    /// event.
-    last_event_at:     AtomicI64,
-    activity_revision: watch::Sender<u64>,
+    run_id:           RunId,
+    listeners:        std::sync::Mutex<Vec<EventListener>>,
+    /// Monotonic origin that `last_activity_ms` is measured from.
+    activity_origin:  Instant,
+    /// Milliseconds after `activity_origin` of the last `emit()` or `touch()`.
+    /// 0 until the first event.
+    last_activity_ms: AtomicU64,
 }
 
 impl std::fmt::Debug for Emitter {
@@ -36,9 +31,11 @@ impl std::fmt::Debug for Emitter {
         f.debug_struct("Emitter")
             .field("run_id", &self.run_id)
             .field("listener_count", &count)
-            .field("last_event_at", &self.last_event_at.load(Ordering::Relaxed))
-            .field("activity_revision", &*self.activity_revision.borrow())
-            .finish()
+            .field(
+                "last_activity_ms",
+                &self.last_activity_ms.load(Ordering::Relaxed),
+            )
+            .finish_non_exhaustive()
     }
 }
 
@@ -51,12 +48,11 @@ impl Default for Emitter {
 impl Emitter {
     #[must_use]
     pub fn new(run_id: RunId) -> Self {
-        let (activity_revision, _) = watch::channel(0);
         Self {
             run_id,
             listeners: std::sync::Mutex::new(Vec::new()),
-            last_event_at: AtomicI64::new(0),
-            activity_revision,
+            activity_origin: Instant::now(),
+            last_activity_ms: AtomicU64::new(0),
         }
     }
 
@@ -149,26 +145,26 @@ impl Emitter {
         }
     }
 
-    /// Returns the epoch milliseconds of the last `emit()` or `touch()` call.
-    /// Returns 0 if neither has been called.
-    pub fn last_event_at(&self) -> i64 {
-        self.last_event_at.load(Ordering::Relaxed)
+    /// Returns the monotonic instant of the last `emit()` or `touch()` call,
+    /// or the emitter's creation instant if neither has been called.
+    pub(crate) fn last_activity(&self) -> Instant {
+        self.activity_origin + Duration::from_millis(self.last_activity_ms.load(Ordering::Relaxed))
     }
 
-    pub(crate) fn subscribe_activity(&self) -> watch::Receiver<u64> {
-        self.activity_revision.subscribe()
-    }
-
-    /// Manually update the last-event timestamp (e.g. to seed the watchdog at
-    /// workflow run start).
+    /// Manually record activity (e.g. to seed the watchdog at workflow run
+    /// start, or for agent stream deltas that are not emitted as run events).
     pub fn touch(&self) {
         self.record_activity();
     }
 
+    /// Called for every event, including agent streaming deltas. Keep this to a
+    /// single clock read and a relaxed store — the stall watchdog samples it at
+    /// its own deadline rather than being woken here.
     fn record_activity(&self) {
-        self.last_event_at.store(epoch_millis(), Ordering::Relaxed);
-        self.activity_revision
-            .send_modify(|revision| *revision = revision.wrapping_add(1));
+        self.last_activity_ms.store(
+            millis_u64(self.activity_origin.elapsed()),
+            Ordering::Relaxed,
+        );
     }
 }
 

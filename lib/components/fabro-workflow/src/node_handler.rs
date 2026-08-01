@@ -13,7 +13,7 @@ use fabro_graphviz::graph::types::{Graph as GvGraph, Node as GvNode};
 use fabro_types::{StageId, SystemActorKind};
 use futures::FutureExt;
 use tokio::sync::watch;
-use tokio::time::{Instant, sleep};
+use tokio::time::{Instant, sleep, timeout};
 
 use crate::artifact;
 use crate::context::Context;
@@ -25,6 +25,11 @@ use crate::interview_runtime::InterviewBlockState;
 use crate::outcome::{FailureDetail, Outcome, StageOutcome};
 use crate::retry::build_retry_policy;
 
+/// Runs `future` under a `duration` budget that only counts time when this
+/// stage is not waiting on human input. A sibling stage's interview does not
+/// pause this budget — the wait is keyed by `stage_id`.
+///
+/// Returns `None` if the budget runs out first.
 async fn timeout_excluding_interview_wait<F>(
     duration: Duration,
     stage_id: &StageId,
@@ -38,31 +43,24 @@ where
     let mut remaining = duration;
 
     loop {
-        if interview_blocks
+        let blocked = interview_blocks
             .borrow_and_update()
-            .is_stage_blocked(stage_id)
-        {
-            tokio::select! {
-                biased;
-                output = &mut future => return Some(output),
-                changed = interview_blocks.changed() => {
-                    changed.expect("run services should own interview state for the handler lifetime");
-                }
-            }
-            continue;
-        }
-
+            .is_stage_blocked(stage_id);
         let active_started = Instant::now();
-        let deadline = sleep(remaining);
-        tokio::pin!(deadline);
         tokio::select! {
             biased;
             output = &mut future => return Some(output),
             changed = interview_blocks.changed() => {
-                changed.expect("run services should own interview state for the handler lifetime");
-                remaining = remaining.saturating_sub(active_started.elapsed());
+                if changed.is_err() {
+                    // The blocker outlives every handler. If it ever goes away,
+                    // fall back to a plain deadline rather than spinning.
+                    return timeout(remaining, future).await.ok();
+                }
+                if !blocked {
+                    remaining = remaining.saturating_sub(active_started.elapsed());
+                }
             }
-            () = &mut deadline => return None,
+            () = sleep(remaining), if !blocked => return None,
         }
     }
 }
@@ -113,10 +111,10 @@ pub(crate) async fn execute_single_attempt(
         NodeTimeoutPolicy::HandlerManaged => None,
     };
 
-    let stage_id = StageScope::for_handler(&wf_context, &node.id).stage_id();
     let future = dispatch_handler(handler, node, &wf_context, graph, run_dir, services);
     let panic_safe = AssertUnwindSafe(future).catch_unwind();
     let timed_result = if let Some(duration) = node_timeout {
+        let stage_id = StageScope::for_handler(&wf_context, &node.id).stage_id();
         let Some(inner) = timeout_excluding_interview_wait(
             duration,
             &stage_id,

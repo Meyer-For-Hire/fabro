@@ -12,7 +12,7 @@ use super::types::{Executed, Initialized};
 use crate::artifact;
 use crate::context::{self, Context};
 use crate::error::Error;
-use crate::event::Event;
+use crate::event::{Emitter, Event};
 use crate::graph::WorkflowGraph;
 use crate::interview_runtime::InterviewBlockState;
 use crate::lifecycle::WorkflowLifecycle;
@@ -30,34 +30,24 @@ fn seed_context_from_checkpoint(checkpoint: Option<&Checkpoint>) -> Context {
     context
 }
 
+/// Cancels `stall_token` once the run goes `stall_timeout` without emitting an
+/// event. Waiting on human input suspends the timer, and the first unblock
+/// starts a fresh full deadline.
+///
+/// Ordinary activity does not wake this task — a busy run emits an event per
+/// agent stream delta. The deadline instead re-reads `Emitter::last_activity()`
+/// when it fires and re-arms if the run was active in the meantime.
 async fn monitor_for_stall(
     stall_timeout: Duration,
     stall_token: CancellationToken,
     shutdown: CancellationToken,
-    mut activity: watch::Receiver<u64>,
+    emitter: Arc<Emitter>,
     mut interview_blocks: watch::Receiver<InterviewBlockState>,
 ) {
-    let mut deadline = TokioInstant::now() + stall_timeout;
+    let mut deadline = emitter.last_activity() + stall_timeout;
 
     loop {
-        if interview_blocks.borrow_and_update().is_run_blocked() {
-            tokio::select! {
-                biased;
-                () = shutdown.cancelled() => return,
-                changed = interview_blocks.changed() => {
-                    if changed.is_err() {
-                        return;
-                    }
-                    if !interview_blocks.borrow().is_run_blocked() {
-                        deadline = TokioInstant::now() + stall_timeout;
-                    }
-                }
-            }
-            continue;
-        }
-
-        let deadline_timer = sleep_until(deadline);
-        tokio::pin!(deadline_timer);
+        let blocked = interview_blocks.borrow_and_update().is_run_blocked();
         tokio::select! {
             biased;
             () = shutdown.cancelled() => return,
@@ -65,16 +55,13 @@ async fn monitor_for_stall(
                 if changed.is_err() {
                     return;
                 }
+                // Blocking parks the timer; unblocking restarts the full budget.
                 deadline = TokioInstant::now() + stall_timeout;
             }
-            changed = activity.changed() => {
-                if changed.is_err() {
-                    return;
-                }
-                deadline = TokioInstant::now() + stall_timeout;
-            }
-            () = &mut deadline_timer => {
-                if interview_blocks.borrow().is_run_blocked() {
+            () = sleep_until(deadline), if !blocked => {
+                let extended = emitter.last_activity() + stall_timeout;
+                if extended > deadline {
+                    deadline = extended;
                     continue;
                 }
                 stall_token.cancel();
@@ -253,7 +240,7 @@ pub async fn execute(init: Initialized) -> Executed {
                 stall_timeout,
                 token.clone(),
                 shutdown.clone(),
-                emitter.subscribe_activity(),
+                emitter,
                 interview_blocks,
             ));
             Some((shutdown, task))

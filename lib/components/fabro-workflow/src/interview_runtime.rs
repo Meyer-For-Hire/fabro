@@ -16,15 +16,16 @@ use ulid::Ulid;
 use crate::event::{Emitter, Event, StageScope};
 use crate::millis_u64;
 
+/// Unresolved interviews per stage. A stage is present only while it has at
+/// least one, so the run is blocked exactly when the map is non-empty.
 #[derive(Debug, Default)]
 pub(crate) struct InterviewBlockState {
-    unresolved_interviews: usize,
-    blocked_stages:        HashMap<StageId, usize>,
+    blocked_stages: HashMap<StageId, usize>,
 }
 
 impl InterviewBlockState {
     pub(crate) fn is_run_blocked(&self) -> bool {
-        self.unresolved_interviews > 0
+        !self.blocked_stages.is_empty()
     }
 
     pub(crate) fn is_stage_blocked(&self, stage_id: &StageId) -> bool {
@@ -32,29 +33,18 @@ impl InterviewBlockState {
     }
 
     fn block(&mut self, stage_id: StageId) {
-        self.unresolved_interviews = self
-            .unresolved_interviews
-            .checked_add(1)
-            .expect("unresolved interview count should not overflow");
-        let stage_count = self.blocked_stages.entry(stage_id).or_default();
-        *stage_count = stage_count
-            .checked_add(1)
-            .expect("stage interview count should not overflow");
+        *self.blocked_stages.entry(stage_id).or_default() += 1;
     }
 
+    /// `RunInterviewGuard` resolves at most once, so an unknown stage here
+    /// means the state is already clear. Runs from `Drop`, so it must not
+    /// panic.
     fn resolve(&mut self, stage_id: &StageId) {
-        self.unresolved_interviews = self
-            .unresolved_interviews
-            .checked_sub(1)
-            .expect("an interview guard should resolve only once");
-        let stage_count = self
-            .blocked_stages
-            .get_mut(stage_id)
-            .expect("a guarded stage should remain registered until resolution");
-        *stage_count = stage_count
-            .checked_sub(1)
-            .expect("a stage interview guard should resolve only once");
-        if *stage_count == 0 {
+        let Some(count) = self.blocked_stages.get_mut(stage_id) else {
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
             self.blocked_stages.remove(stage_id);
         }
     }
@@ -64,8 +54,14 @@ impl InterviewBlockState {
 /// first unresolved human/agent interview and `run.unblocked` after the last
 /// one resolves. Subscribers use the same state to suspend run and stage
 /// timeout budgets without deriving runtime control from persisted events.
+///
+/// Both transitions publish the new state before emitting the event, so a
+/// listener that reads `subscribe()` from an event callback always sees state
+/// that agrees with the event it just received.
 pub(crate) struct RunInterviewBlocker {
     state:       watch::Sender<InterviewBlockState>,
+    /// Serializes state change plus event emission so concurrent guards cannot
+    /// interleave into an out-of-order `run.blocked` / `run.unblocked` pair.
     transitions: Mutex<()>,
 }
 
@@ -92,10 +88,12 @@ impl RunInterviewBlocker {
             .transitions
             .lock()
             .expect("interview transition mutex should not be poisoned");
-        let should_emit_blocked = !self.state.borrow().is_run_blocked();
-        self.state
-            .send_modify(|state| state.block(stage_id.clone()));
-        if should_emit_blocked {
+        let mut newly_blocked = false;
+        self.state.send_modify(|state| {
+            newly_blocked = !state.is_run_blocked();
+            state.block(stage_id.clone());
+        });
+        if newly_blocked {
             emitter.emit(&Event::RunBlocked {
                 blocked_reason: BlockedReason::HumanInputRequired,
             });
@@ -113,11 +111,14 @@ impl RunInterviewBlocker {
             .transitions
             .lock()
             .expect("interview transition mutex should not be poisoned");
-        let should_emit_unblocked = self.state.borrow().unresolved_interviews == 1;
-        if should_emit_unblocked {
+        let mut fully_unblocked = false;
+        self.state.send_modify(|state| {
+            state.resolve(stage_id);
+            fully_unblocked = !state.is_run_blocked();
+        });
+        if fully_unblocked {
             emitter.emit(&Event::RunUnblocked);
         }
-        self.state.send_modify(|state| state.resolve(stage_id));
     }
 }
 
