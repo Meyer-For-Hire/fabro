@@ -24,10 +24,6 @@ export interface ManifestArgs {
      * Named environment slug to select for the run.
      */
     'environment'?: string;
-    /**
-     * Per-run environment image override.
-     */
-    'docker_image'?: string;
     'verbose'?: boolean;
     'dry_run'?: boolean;
     'auto_approve'?: boolean;
