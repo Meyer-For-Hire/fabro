@@ -23,15 +23,14 @@ pub(crate) async fn execute(
     let cli_args_config = preflight_args_overrides(&args)?;
 
     let manifest = build_run_manifest(ManifestBuildInput {
-        workflow: args.workflow.clone(),
-        cwd: ctx.cwd().to_path_buf(),
-        run_overrides: cli_args_config.run,
-        cli_overrides: cli_args_config.cli,
-        input_overrides: cli_args_config.input_overrides,
-        args: preflight_manifest_args(&args),
+        workflow:             args.workflow.clone(),
+        cwd:                  ctx.cwd().to_path_buf(),
+        run_overrides:        cli_args_config.run,
+        cli_overrides:        cli_args_config.cli,
+        input_overrides:      cli_args_config.input_overrides,
+        args:                 preflight_manifest_args(&args),
         environment_defaults: fabro_environment::seeded_catalog_layer(),
-        user_settings_path: Some(active_settings_path(None)),
-        ..Default::default()
+        user_settings_path:   Some(active_settings_path(None)),
     })?;
 
     let spinner = (!ctx.json_output()).then(|| cyan_spinner("Running checks..."));

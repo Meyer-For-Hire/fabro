@@ -24,9 +24,7 @@ use fabro_template::{
 };
 use fabro_types::settings::interp::InterpString;
 use fabro_types::settings::run::{ApprovalMode, ResolvedGoalSource, ResolvedRunGoal, RunMode};
-use fabro_types::{
-    DirtyStatus, GitContext, ManifestPath, PreRunPushOutcome, RunId, WorkflowSettings,
-};
+use fabro_types::{DirtyStatus, GitContext, ManifestPath, PreRunPushOutcome, WorkflowSettings};
 use fabro_workflow::git::{
     GitSyncStatus, branch_needs_push, head_sha, push_branch_noninteractive, sync_status,
 };
@@ -42,7 +40,6 @@ pub struct ManifestBuildInput {
     pub cli_overrides:        Option<CliLayer>,
     pub input_overrides:      HashMap<String, toml::Value>,
     pub args:                 Option<types::ManifestArgs>,
-    pub run_id:               Option<RunId>,
     pub environment_defaults: MergeMap<EnvironmentLayer>,
     /// Path to the user settings file (for inclusion in
     /// `RunManifest.configs`). `None` skips the user config entry.
@@ -254,7 +251,7 @@ pub fn build_run_manifest(input: ManifestBuildInput) -> Result<BuiltManifest> {
             git,
             goal,
             parent_id: None,
-            run_id: input.run_id.map(|run_id| run_id.to_string()),
+            run_id: None,
             title: None,
             target: types::ManifestTarget {
                 identifier: input.workflow.display().to_string(),
