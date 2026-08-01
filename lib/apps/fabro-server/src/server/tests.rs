@@ -10672,6 +10672,21 @@ async fn run_artifacts_download_streams_latest_files_as_zip() {
             "control-exit.txt",
             &b"excluded"[..],
         ),
+        // Neither stage reached the projection, so both rank equally on stage
+        // order and retry. The serialized stage ID breaks the tie the same way
+        // the artifacts page does: "unknown@2" sorts above "unknown@10".
+        (
+            StageId::new("unknown", 10),
+            1,
+            "orphan.txt",
+            &b"visit ten"[..],
+        ),
+        (
+            StageId::new("unknown", 2),
+            1,
+            "orphan.txt",
+            &b"visit two"[..],
+        ),
     ] {
         state
             .artifact_store
@@ -10723,7 +10738,11 @@ async fn run_artifacts_download_streams_latest_files_as_zip() {
         .iter()
         .map(|entry| entry.filename().as_str().unwrap().to_string())
         .collect::<Vec<_>>();
-    assert_eq!(names, vec!["logs/run.txt", "reports/result.txt"]);
+    assert_eq!(names, vec![
+        "logs/run.txt",
+        "orphan.txt",
+        "reports/result.txt"
+    ]);
 
     let mut contents_by_name = HashMap::new();
     for (index, name) in names.into_iter().enumerate() {
@@ -10734,6 +10753,7 @@ async fn run_artifacts_download_streams_latest_files_as_zip() {
     }
     assert_eq!(contents_by_name["logs/run.txt"], b"build log");
     assert_eq!(contents_by_name["reports/result.txt"], b"latest verify");
+    assert_eq!(contents_by_name["orphan.txt"], b"visit two");
 }
 
 #[tokio::test]

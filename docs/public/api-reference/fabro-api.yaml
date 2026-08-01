@@ -3289,8 +3289,8 @@ paths:
       summary: Download Run Artifacts
       description: |
         Streams a ZIP archive with the latest captured version of each artifact path.
-        Stage order and retry number determine the latest version, matching the artifacts page.
-        Captures from the `start` and `exit` control nodes are excluded.
+        Stage order, retry number, and then stage ID determine the latest version, matching the artifacts page.
+        Captures from the graph's boundary nodes are excluded, identified by their `start` and `exit` handler type rather than by node name.
 
         The archive streams, so the response status is sent before the first artifact is read.
         A failure after that point aborts the transfer rather than returning `500`.

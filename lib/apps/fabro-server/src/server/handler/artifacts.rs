@@ -184,9 +184,12 @@ enum ArtifactArchiveError {
 
 /// One entry per artifact path, holding the newest capture of that path.
 ///
-/// Newest means latest stage, then latest retry. Stages the projection does not
-/// know about sort oldest (`None` < `Some`), which is what the artifacts page
-/// does too. Boundary stages are dropped: they run no work, so anything they
+/// Newest means latest stage, then latest retry, then highest stage ID. That
+/// last tiebreaker only decides between two stages the projection does not know
+/// about, which both sort oldest (`None` < `Some`); it is here so the winner
+/// does not depend on the order the store happens to list objects in. All three
+/// keys mirror the artifacts page, which sorts on the same triple and takes the
+/// last entry. Boundary stages are dropped: they run no work, so anything they
 /// captured was already in the workspace.
 ///
 /// Paths are re-checked here rather than trusted: a path stored before a
@@ -202,8 +205,16 @@ fn latest_run_artifacts(
         .enumerate()
         .map(|(order, (stage_id, _))| (stage_id.clone(), order))
         .collect::<HashMap<_, _>>();
-    let capture_rank =
-        |artifact: &NodeArtifact| (stage_order.get(&artifact.node).copied(), artifact.retry);
+    // The stage ID compares as its serialized `node@visit` form, matching the
+    // string the artifacts page sorts on rather than `StageId`'s own ordering,
+    // which compares the visit numerically and would disagree.
+    let capture_rank = |artifact: &NodeArtifact| {
+        (
+            stage_order.get(&artifact.node).copied(),
+            artifact.retry,
+            artifact.node.to_string(),
+        )
+    };
     let mut latest_by_path: HashMap<String, NodeArtifact> = HashMap::new();
 
     for artifact in entries {
