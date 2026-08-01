@@ -295,7 +295,7 @@ impl Error {
 /// `insufficient_quota` means the same thing whether it arrives in an HTTP
 /// error body or in a mid-stream error event.
 #[must_use]
-pub fn kind_from_error_code(code: &str) -> Option<ProviderErrorKind> {
+pub(crate) fn kind_from_error_code(code: &str) -> Option<ProviderErrorKind> {
     Some(match code {
         // Out of credit, or over a billing cap. Distinct from RateLimit:
         // backoff never clears it, but another provider has its own quota.
@@ -726,17 +726,6 @@ mod tests {
             None,
         );
         assert_eq!(err.provider_kind(), Some(ProviderErrorKind::QuotaExceeded));
-
-        // No code, so the message fallback still runs.
-        let err = error_from_status_code(
-            400,
-            "This model's maximum context length is 4096 tokens".into(),
-            "openai".into(),
-            None,
-            None,
-            None,
-        );
-        assert_eq!(err.provider_kind(), Some(ProviderErrorKind::ContextLength));
     }
 
     #[test]

@@ -11,7 +11,7 @@ use serde::Deserialize;
 use super::decode::{map_finish_reason, token_counts_from_api_usage, tool_call_from_item};
 use super::wire::ApiUsage;
 use crate::codec::{CodecCtx, RawEvent, StreamDecoder};
-use crate::error::{Error, ProviderErrorDetail, ProviderErrorKind, kind_from_error_code};
+use crate::error::{self, Error, ProviderErrorDetail, ProviderErrorKind};
 use crate::types::{
     ContentPart, FinishReason, Message, RateLimitInfo, Response, Role, StreamEvent, TokenCounts,
     ToolCall,
@@ -38,7 +38,7 @@ fn provider_error_from_openai_error_json(error: &serde_json::Value, provider: &s
 
     // Unrecognized and absent codes are treated as transient.
     let kind = classifier
-        .and_then(kind_from_error_code)
+        .and_then(error::kind_from_error_code)
         .unwrap_or(ProviderErrorKind::Server);
 
     Error::Provider {
