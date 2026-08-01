@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -519,40 +519,14 @@ async fn stdio_server_initializes_and_lists_run_tools() {
 fn stdio_start_writes_only_json_rpc_to_stdout() {
     let context = test_context!();
     let fixture = mcp_stdio_fixture(&context, &[]);
-    let mut cmd = Command::new(&fixture.command[0]);
-    cmd.args(&fixture.command[1..])
-        .env_clear()
-        .envs(&fixture.env)
-        .current_dir(&fixture.current_dir)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
 
-    let mut child = cmd.spawn().unwrap();
-    let mut stdin = child.stdin.take().unwrap();
-    writeln!(
-        stdin,
-        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2025-06-18","capabilities":{{}},"clientInfo":{{"name":"fabro-test","version":"0.0.0"}}}}}}"#
-    )
-    .unwrap();
+    let (mut child, _stdin, response) =
+        spawn_stdio_server(&fixture, Path::new(&fixture.command[0]));
 
-    let stdout = child.stdout.take().unwrap();
-    let (tx, rx) = std::sync::mpsc::channel();
-    thread::spawn(move || {
-        let mut line = String::new();
-        let result = std::io::BufReader::new(stdout).read_line(&mut line);
-        let _ = tx.send(result.map(|_| line));
-    });
-
-    let line = rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("initialize response should arrive")
-        .expect("stdout should be readable");
-    let value: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
-    assert_eq!(value["jsonrpc"], "2.0");
-    assert_eq!(value["result"]["serverInfo"]["name"], "fabro");
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["result"]["serverInfo"]["name"], "fabro");
     assert_eq!(
-        value["result"]["serverInfo"]["version"],
+        response["result"]["serverInfo"]["version"],
         env!("CARGO_PKG_VERSION")
     );
 
@@ -566,40 +540,17 @@ fn stdio_server_exits_when_executable_is_replaced() {
     let context = test_context!();
     let fixture = mcp_stdio_fixture(&context, &[]);
     let directory = tempfile::tempdir().expect("replacement directory should exist");
+    // A symlink stands in for a Homebrew install: the server follows it to the
+    // real binary, so replacing the link changes the identity it watches without
+    // copying a multi-hundred-megabyte executable.
     let executable = directory.path().join("fabro");
-    fs::copy(&fixture.command[0], &executable).expect("Fabro executable should be copied");
-    let mut cmd = Command::new(&executable);
-    cmd.args(&fixture.command[1..])
-        .env_clear()
-        .envs(&fixture.env)
-        .current_dir(&fixture.current_dir)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    std::os::unix::fs::symlink(&fixture.command[0], &executable)
+        .expect("Fabro executable should be linked");
 
-    let mut child = cmd.spawn().expect("MCP server should start");
-    let mut stdin = child.stdin.take().expect("MCP stdin should be available");
-    writeln!(
-        stdin,
-        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2025-06-18","capabilities":{{}},"clientInfo":{{"name":"fabro-test","version":"0.0.0"}}}}}}"#
-    )
-    .expect("initialize request should be written");
-
-    let stdout = child.stdout.take().expect("MCP stdout should be available");
-    let (tx, rx) = std::sync::mpsc::channel();
-    thread::spawn(move || {
-        let mut line = String::new();
-        let result = std::io::BufReader::new(stdout).read_line(&mut line);
-        let _ = tx.send(result.map(|_| line));
-    });
-    let response = rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("initialize response should arrive")
-        .expect("MCP stdout should be readable");
-    let response: serde_json::Value = serde_json::from_str(response.trim()).unwrap();
+    // `_stdin` holds the pipe open so replacement, not EOF, stops the server.
+    let (mut child, _stdin, response) = spawn_stdio_server(&fixture, &executable);
     assert_eq!(response["result"]["serverInfo"]["name"], "fabro");
 
-    // Keep stdin open so replacement, rather than EOF, stops the server.
     let replacement = directory.path().join("fabro-replacement");
     fs::write(&replacement, b"replacement").expect("replacement file should be written");
     fs::rename(replacement, &executable).expect("Fabro executable should be replaced");
@@ -2535,6 +2486,45 @@ fn mcp_stdio_fixture(context: &fabro_test::TestContext, extra_args: &[&str]) -> 
         env,
         current_dir: context.temp_dir.clone(),
     }
+}
+
+const MCP_INITIALIZE_REQUEST: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"fabro-test","version":"0.0.0"}}}"#;
+
+/// Starts `fabro mcp start` as a raw child process, sends `initialize`, and
+/// returns the decoded response. Unlike `spawn_mcp_client`, the caller keeps
+/// the `Child` and its stdin, so it can observe how and when the server exits.
+fn spawn_stdio_server(
+    fixture: &McpStdioFixture,
+    program: &Path,
+) -> (Child, ChildStdin, serde_json::Value) {
+    let mut child = Command::new(program)
+        .args(&fixture.command[1..])
+        .env_clear()
+        .envs(&fixture.env)
+        .current_dir(&fixture.current_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("MCP server should start");
+
+    let mut stdin = child.stdin.take().expect("MCP stdin should be available");
+    writeln!(stdin, "{MCP_INITIALIZE_REQUEST}").expect("initialize request should be written");
+
+    let stdout = child.stdout.take().expect("MCP stdout should be available");
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let mut line = String::new();
+        let result = std::io::BufReader::new(stdout).read_line(&mut line);
+        let _ = tx.send(result.map(|_| line));
+    });
+    let line = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("initialize response should arrive")
+        .expect("MCP stdout should be readable");
+
+    let response = serde_json::from_str(line.trim()).expect("response should be JSON");
+    (child, stdin, response)
 }
 
 fn write_mcp_server_settings(

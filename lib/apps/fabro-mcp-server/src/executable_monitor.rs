@@ -5,143 +5,100 @@
 //! process keeps its old API response decoder after the `fabro` file on disk is
 //! upgraded.
 
-use std::path::PathBuf;
-use std::time::{Duration, SystemTime};
-use std::{env, io};
+use std::fs::Metadata;
+use std::path::{self, PathBuf};
+use std::time::Duration;
+use std::{env, fs, io};
 
-use fabro_static::EnvVars;
-use tokio::time::Instant;
-use tokio::{fs, time};
+use tokio::time::{self, Instant, MissedTickBehavior};
 
 const CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 pub(crate) struct ExecutableMonitor {
     path:     PathBuf,
-    identity: ExecutableIdentity,
+    identity: Identity,
 }
 
 impl ExecutableMonitor {
-    pub(crate) async fn current() -> io::Result<Self> {
-        let path = invoked_executable_path().await?;
-        Self::new(path).await
+    pub(crate) fn current() -> io::Result<Self> {
+        Self::new(invoked_executable_path()?)
     }
 
-    async fn new(path: PathBuf) -> io::Result<Self> {
-        let identity = ExecutableIdentity::from_metadata(&fs::metadata(&path).await?);
+    fn new(path: PathBuf) -> io::Result<Self> {
+        let identity = identity(&fs::metadata(&path)?);
         Ok(Self { path, identity })
     }
 
     pub(crate) async fn wait_until_replaced(self) {
         let mut interval = time::interval_at(Instant::now() + CHECK_INTERVAL, CHECK_INTERVAL);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            if self.was_replaced().await {
+            if self.was_replaced() {
                 return;
             }
         }
     }
 
-    async fn was_replaced(&self) -> bool {
-        fs::metadata(&self.path).await.map_or(true, |metadata| {
-            ExecutableIdentity::from_metadata(&metadata) != self.identity
-        })
+    /// Reads the identity synchronously. This is a `stat` of a page-cached
+    /// inode once per second, so handing it to Tokio's blocking pool would
+    /// cost more than the call itself and would keep a pool thread resident
+    /// for the life of the server.
+    fn was_replaced(&self) -> bool {
+        !fs::metadata(&self.path).is_ok_and(|metadata| identity(&metadata) == self.identity)
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ExecutableIdentity {
-    len:      u64,
-    modified: Option<SystemTime>,
-    #[cfg(unix)]
-    device:   u64,
-    #[cfg(unix)]
-    inode:    u64,
+/// Identifies the file behind an executable path. Upgrades always swap a new
+/// file into place — `fabro upgrade` renames over the old one and Homebrew
+/// repoints a symlink — so the identity changes even though the path does not.
+#[cfg(unix)]
+type Identity = (u64, u64);
+
+#[cfg(unix)]
+fn identity(metadata: &Metadata) -> Identity {
+    use std::os::unix::fs::MetadataExt as _;
+
+    (metadata.dev(), metadata.ino())
 }
 
-impl ExecutableIdentity {
-    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
-        #[cfg(unix)]
-        use std::os::unix::fs::MetadataExt as _;
+#[cfg(not(unix))]
+type Identity = (u64, Option<std::time::SystemTime>);
 
-        Self {
-            len:                 metadata.len(),
-            modified:            metadata.modified().ok(),
-            #[cfg(unix)]
-            device:              metadata.dev(),
-            #[cfg(unix)]
-            inode:               metadata.ino(),
-        }
-    }
+#[cfg(not(unix))]
+fn identity(metadata: &Metadata) -> Identity {
+    (metadata.len(), metadata.modified().ok())
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "MCP startup resolves its invoked executable through the process PATH so it can detect Homebrew symlink updates"
-)]
-async fn invoked_executable_path() -> io::Result<PathBuf> {
-    let invoked = env::args_os()
-        .next()
-        .map(PathBuf::from)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "process argv[0] is unavailable"))?;
-
-    if invoked.components().count() > 1 {
-        return absolute_path(invoked);
-    }
-
-    if let Some(path) = env::var_os(EnvVars::PATH) {
-        for directory in env::split_paths(&path) {
-            let candidate = absolute_path(directory.join(&invoked))?;
-            if fs::metadata(&candidate)
-                .await
-                .is_ok_and(|metadata| is_executable_file(&metadata))
-            {
-                return Ok(candidate);
-            }
-        }
-    }
-
-    env::current_exe()
-}
-
-fn absolute_path(path: PathBuf) -> io::Result<PathBuf> {
-    if path.is_absolute() {
-        Ok(path)
-    } else {
-        env::current_dir().map(|cwd| cwd.join(path))
-    }
-}
-
-fn is_executable_file(metadata: &std::fs::Metadata) -> bool {
-    if !metadata.is_file() {
-        return false;
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
+/// Resolves the executable path to watch.
+///
+/// `argv[0]` wins when it carries a directory, because it names the path the
+/// host actually launched, symlink included. MCP hosts normally launch a bare
+/// `fabro` found on `PATH`, which leaves `current_exe`: it reports the symlink
+/// on macOS, and the Homebrew symlink's own target on Linux.
+fn invoked_executable_path() -> io::Result<PathBuf> {
+    match env::args_os().next().map(PathBuf::from) {
+        Some(invoked) if invoked.components().count() > 1 => path::absolute(invoked),
+        _ => env::current_exe(),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use tokio::fs as async_fs;
+
     use super::*;
 
     #[tokio::test]
     async fn unchanged_executable_is_current() {
         let directory = tempfile::tempdir().expect("temp directory should exist");
         let executable = directory.path().join("fabro");
-        fs::write(&executable, b"current")
+        async_fs::write(&executable, b"current")
             .await
             .expect("fixture executable should be written");
-        let monitor = ExecutableMonitor::new(executable).await.unwrap();
+        let monitor = ExecutableMonitor::new(executable).unwrap();
 
-        assert!(!monitor.was_replaced().await);
+        assert!(!monitor.was_replaced());
     }
 
     #[tokio::test]
@@ -149,42 +106,34 @@ mod tests {
         let directory = tempfile::tempdir().expect("temp directory should exist");
         let executable = directory.path().join("fabro");
         let replacement = directory.path().join("fabro-new");
-        fs::write(&executable, b"old")
+        async_fs::write(&executable, b"old")
             .await
             .expect("old fixture executable should be written");
-        fs::write(&replacement, b"new executable")
+        async_fs::write(&replacement, b"new executable")
             .await
             .expect("new fixture executable should be written");
-        let monitor = ExecutableMonitor::new(executable.clone()).await.unwrap();
+        let monitor = ExecutableMonitor::new(executable.clone()).unwrap();
 
-        fs::rename(&replacement, &executable)
+        async_fs::rename(&replacement, &executable)
             .await
             .expect("fixture executable should be replaced");
 
-        assert!(monitor.was_replaced().await);
+        assert!(monitor.was_replaced());
     }
 
     #[tokio::test]
     async fn removed_executable_is_detected() {
         let directory = tempfile::tempdir().expect("temp directory should exist");
         let executable = directory.path().join("fabro");
-        fs::write(&executable, b"current")
+        async_fs::write(&executable, b"current")
             .await
             .expect("fixture executable should be written");
-        let monitor = ExecutableMonitor::new(executable.clone()).await.unwrap();
+        let monitor = ExecutableMonitor::new(executable.clone()).unwrap();
 
-        fs::remove_file(executable)
+        async_fs::remove_file(executable)
             .await
             .expect("fixture executable should be removed");
 
-        assert!(monitor.was_replaced().await);
-    }
-
-    #[test]
-    fn executable_check_rejects_directories() {
-        let directory = tempfile::tempdir().expect("temp directory should exist");
-        let metadata = std::fs::metadata(directory.path()).unwrap();
-
-        assert!(!is_executable_file(&metadata));
+        assert!(monitor.was_replaced());
     }
 }

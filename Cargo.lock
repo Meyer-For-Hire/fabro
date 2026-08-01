@@ -2838,7 +2838,6 @@ dependencies = [
  "fabro-manifest",
  "fabro-model",
  "fabro-server",
- "fabro-static",
  "fabro-tool",
  "fabro-types",
  "fabro-util",
@@ -2852,6 +2851,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml 0.8.23",
+ "tracing",
 ]
 
 [[package]]

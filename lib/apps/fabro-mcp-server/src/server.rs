@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use fabro_tool::fabro_client::ClientBackend;
@@ -12,10 +13,12 @@ use rmcp::transport::stdio;
 use rmcp::{ErrorData, ServerHandler, serve_server, tool, tool_handler, tool_router};
 use serde::Serialize;
 use tokio::sync::OnceCell;
+use tokio::time;
+use tracing::warn;
 
-use crate::FabroMcpServerSettings;
 use crate::executable_monitor::ExecutableMonitor;
 use crate::manifest_builder::McpRunManifestBuilder;
+use crate::{FabroMcpServerSettings, SERVER_NAME};
 
 #[derive(Clone)]
 pub(crate) struct FabroMcpServer {
@@ -25,45 +28,52 @@ pub(crate) struct FabroMcpServer {
     tool_router: ToolRouter<Self>,
 }
 
-/// The reason a running MCP stdio server returned to its caller.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum McpServerExit {
-    /// The MCP service stopped without an executable replacement.
-    ServiceStopped,
-    /// The executable on disk changed while the MCP service was running.
-    ExecutableReplaced,
-}
+/// How long to wait for the MCP service to stop after an upgrade is detected.
+/// Bounded because the transport closes by writing to a stdout the host may
+/// already have stopped reading.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub async fn start(settings: FabroMcpServerSettings) -> Result<McpServerExit> {
-    let executable_monitor = ExecutableMonitor::current().await.ok();
-    let server = FabroMcpServer::new(Arc::new(settings));
-    let service = serve_server(server, stdio()).await?;
-    let exit = if let Some(executable_monitor) = executable_monitor {
-        let cancellation = service.cancellation_token();
-        let mut service_wait = Box::pin(service.waiting());
-        tokio::select! {
-            result = &mut service_wait => {
-                result?;
-                McpServerExit::ServiceStopped
-            }
-            () = executable_monitor.wait_until_replaced() => {
-                cancellation.cancel();
-                service_wait.await?;
-                McpServerExit::ExecutableReplaced
-            }
+pub async fn start(settings: FabroMcpServerSettings) -> Result<()> {
+    let monitor = match ExecutableMonitor::current() {
+        Ok(monitor) => Some(monitor),
+        Err(error) => {
+            warn!(
+                %error,
+                "Upgrade detection is unavailable; this MCP server will keep running after an \
+                 upgrade replaces it"
+            );
+            None
         }
-    } else {
-        service.waiting().await?;
-        McpServerExit::ServiceStopped
     };
-    Ok(exit)
+    let service = serve_server(FabroMcpServer::new(Arc::new(settings)), stdio()).await?;
+    let Some(monitor) = monitor else {
+        service.waiting().await?;
+        return Ok(());
+    };
+
+    let cancellation = service.cancellation_token();
+    let mut service_wait = Box::pin(service.waiting());
+    tokio::select! {
+        result = &mut service_wait => {
+            result?;
+        }
+        () = monitor.wait_until_replaced() => {
+            // An upgrade replaced the executable, so stop serving and let the
+            // host reconnect to the new one. The CLI exits the process rather
+            // than returning, because Tokio's stdin worker stays blocked on a
+            // read that only the host can end.
+            cancellation.cancel();
+            let _ = time::timeout(SHUTDOWN_TIMEOUT, service_wait).await;
+        }
+    }
+    Ok(())
 }
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for FabroMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("fabro", FABRO_VERSION).with_title("Fabro"))
+            .with_server_info(Implementation::new(SERVER_NAME, FABRO_VERSION).with_title("Fabro"))
             .with_instructions("Use these tools to create, inspect, control, wait for, and read events from Fabro workflow runs.")
     }
 }

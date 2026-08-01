@@ -21,7 +21,6 @@ fabro-manifest = { path = "../../components/fabro-manifest" }
 fabro-config = { path = "../../foundation/fabro-config" }
 fabro-model = { path = "../../foundation/fabro-model" }
 fabro-server = { path = "../fabro-server" }
-fabro-static = { path = "../../foundation/fabro-static" }
 fabro-tool = { path = "../../components/fabro-tool" }
 fabro-types = { path = "../../foundation/fabro-types" }
 fabro-util = { path = "../../foundation/fabro-util" }
@@ -33,6 +32,7 @@ serde_json.workspace = true
 strum.workspace = true
 tokio.workspace = true
 toml.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 httpmock = "0.8"
