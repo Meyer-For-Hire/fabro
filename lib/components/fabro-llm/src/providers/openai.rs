@@ -521,6 +521,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn complete_classifies_insufficient_quota_as_quota_exceeded() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/responses");
+            then.status(429)
+                .header("content-type", "application/json")
+                .json_body(serde_json::json!({
+                    "error": {
+                        "message": "You exceeded your current quota.",
+                        "type": "insufficient_quota"
+                    }
+                }));
+        });
+        let adapter = Adapter::new("sk-test").with_base_url(server.base_url());
+
+        let err = adapter
+            .complete(&minimal_request())
+            .await
+            .expect_err("spent quota should fail the completion");
+
+        mock.assert();
+        assert_eq!(err.provider_kind(), Some(ProviderErrorKind::QuotaExceeded));
+        assert_eq!(err.status_code(), Some(429));
+        assert!(!err.retryable());
+        assert!(err.failover_eligible());
+        match err {
+            Error::Provider { detail, .. } => {
+                assert_eq!(detail.error_code.as_deref(), Some("insufficient_quota"));
+            }
+            other => panic!("expected provider error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn codex_complete_via_stream_propagates_stream_errors() {
         let server = MockServer::start();
         let sse_body = r#"event: error
