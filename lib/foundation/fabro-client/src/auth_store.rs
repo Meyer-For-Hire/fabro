@@ -118,10 +118,18 @@ pub struct AuthStore {
     path: PathBuf,
 }
 
+/// Holds the cross-process refresh lock until dropped.
 #[cfg(unix)]
 pub(crate) struct RefreshLockGuard {
     _file: std::fs::File,
 }
+
+#[allow(
+    dead_code,
+    reason = "Non-Unix targets never acquire the lock, so this is never constructed."
+)]
+#[cfg(not(unix))]
+pub(crate) struct RefreshLockGuard;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct AuthFile {
@@ -218,7 +226,7 @@ impl AuthStore {
     }
 
     #[cfg(not(unix))]
-    pub(crate) async fn acquire_refresh_lock(&self) -> Result<(), AuthStoreError> {
+    pub(crate) async fn acquire_refresh_lock(&self) -> Result<RefreshLockGuard, AuthStoreError> {
         Err(AuthStoreError::UnsupportedPlatform)
     }
 
@@ -254,16 +262,7 @@ impl AuthStore {
         &self,
         f: impl FnOnce() -> Result<T, AuthStoreError>,
     ) -> Result<T, AuthStoreError> {
-        let lock_file = self.open_lock_file()?;
-        match FileExt::try_lock_shared(&lock_file) {
-            Ok(()) => {}
-            Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
-                lock_file
-                    .lock_shared()
-                    .map_err(|source| self.lock_error(source))?;
-            }
-            Err(source) => return Err(self.lock_error(source)),
-        }
+        let _lock = open_locked_file(self.lock_path(), LockMode::Shared)?;
         f()
     }
 
@@ -280,29 +279,8 @@ impl AuthStore {
         &self,
         f: impl FnOnce() -> Result<T, AuthStoreError>,
     ) -> Result<T, AuthStoreError> {
-        let lock_file = self.open_lock_file()?;
-        match FileExt::try_lock_exclusive(&lock_file) {
-            Ok(()) => {}
-            Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
-                lock_file
-                    .lock_exclusive()
-                    .map_err(|source| self.lock_error(source))?;
-            }
-            Err(source) => return Err(self.lock_error(source)),
-        }
+        let _lock = open_locked_file(self.lock_path(), LockMode::Exclusive)?;
         f()
-    }
-
-    #[cfg(unix)]
-    fn open_lock_file(&self) -> Result<std::fs::File, AuthStoreError> {
-        let path = self.lock_path();
-        std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|source| LockError::Io { path, source }.into())
     }
 
     fn lock_path(&self) -> PathBuf {
@@ -317,32 +295,9 @@ impl AuthStore {
     #[cfg(unix)]
     fn acquire_refresh_lock_blocking(&self) -> Result<RefreshLockGuard, AuthStoreError> {
         self.ensure_parent_dir()?;
-        let path = self.refresh_lock_path();
-        let lock_file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|source| LockError::Io {
-                path: path.clone(),
-                source,
-            })?;
-        match FileExt::try_lock_exclusive(&lock_file) {
-            Ok(()) => {}
-            Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
-                lock_file
-                    .lock_exclusive()
-                    .map_err(|source| classify_lock_error(path, source))?;
-            }
-            Err(source) => return Err(classify_lock_error(path, source).into()),
-        }
-        Ok(RefreshLockGuard { _file: lock_file })
-    }
-
-    #[cfg(unix)]
-    fn lock_error(&self, source: std::io::Error) -> AuthStoreError {
-        classify_lock_error(self.lock_path(), source).into()
+        Ok(RefreshLockGuard {
+            _file: open_locked_file(self.refresh_lock_path(), LockMode::Exclusive)?,
+        })
     }
 
     #[cfg(unix)]
@@ -418,6 +373,62 @@ fn write_private_file(path: &Path, contents: &str) -> Result<(), AuthStoreError>
         source,
     })?;
     Ok(())
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum LockMode {
+    Shared,
+    Exclusive,
+}
+
+#[cfg(unix)]
+impl LockMode {
+    // Qualify these as `FileExt` calls. `std::fs::File` has inherent locking
+    // methods with different return types, and inherent methods take
+    // precedence over trait methods.
+    fn try_lock(self, file: &std::fs::File) -> std::io::Result<()> {
+        match self {
+            Self::Shared => FileExt::try_lock_shared(file),
+            Self::Exclusive => FileExt::try_lock_exclusive(file),
+        }
+    }
+
+    fn lock(self, file: &std::fs::File) -> std::io::Result<()> {
+        match self {
+            Self::Shared => FileExt::lock_shared(file),
+            Self::Exclusive => FileExt::lock_exclusive(file),
+        }
+    }
+}
+
+/// Opens `path`, creating it if absent, and takes an advisory lock on the
+/// returned handle. Dropping the handle releases the lock.
+///
+/// The non-blocking attempt comes first so that a filesystem which cannot lock
+/// at all reports `EOPNOTSUPP`/`ENOLCK` right away. Only plain contention
+/// reports `WouldBlock`, and that is the one case worth waiting on.
+#[cfg(unix)]
+fn open_locked_file(path: PathBuf, mode: LockMode) -> Result<std::fs::File, AuthStoreError> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|source| LockError::Io {
+            path: path.clone(),
+            source,
+        })?;
+    match mode.try_lock(&file) {
+        Ok(()) => {}
+        Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
+            mode.lock(&file)
+                .map_err(|source| classify_lock_error(path, source))?;
+        }
+        Err(source) => return Err(classify_lock_error(path, source).into()),
+    }
+    Ok(file)
 }
 
 #[cfg(unix)]
