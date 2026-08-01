@@ -29,8 +29,8 @@ pub(crate) struct FabroMcpServer {
 }
 
 /// How long to wait for the MCP service to stop after an upgrade is detected.
-/// Bounded because the transport closes by writing to a stdout the host may
-/// already have stopped reading.
+/// The wait is bounded because the transport closes by writing to stdout, which
+/// blocks if the host has stopped reading.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub async fn start(settings: FabroMcpServerSettings) -> Result<()> {

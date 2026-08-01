@@ -555,7 +555,10 @@ fn stdio_server_exits_when_executable_is_replaced() {
     fs::write(&replacement, b"replacement").expect("replacement file should be written");
     fs::rename(replacement, &executable).expect("Fabro executable should be replaced");
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // The server takes up to 1s to notice the replacement and then bounds its
+    // own shutdown at 5s, so 6s is the worst case. Allow more so a loaded runner
+    // cannot fail a healthy server; a passing run exits in about a second.
+    let deadline = Instant::now() + Duration::from_secs(20);
     let status = loop {
         if let Some(status) = child.try_wait().expect("MCP server should be polled") {
             break status;
