@@ -170,7 +170,7 @@ fn live_billing_rows(projection: &RunProjection, now: DateTime<Utc>) -> Vec<Live
 
     for (stage_id, stage) in projection.iter_stages() {
         let node_id = stage_id.node_id();
-        if is_boundary_stage(projection, node_id) || !stage_has_billing_row(stage) {
+        if projection.is_boundary_stage(node_id) || !stage_has_billing_row(stage) {
             continue;
         }
 
@@ -204,13 +204,4 @@ fn stage_has_billing_row(stage: &StageProjection) -> bool {
         || stage.timing.is_some()
         || !stage.usage.is_zero()
         || stage.started_at.is_some()
-}
-
-fn is_boundary_stage(projection: &RunProjection, node_id: &str) -> bool {
-    projection
-        .spec()
-        .graph()
-        .nodes
-        .get(node_id)
-        .is_some_and(|node| matches!(node.handler_type(), Some("start" | "exit")))
 }

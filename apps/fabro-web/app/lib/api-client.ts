@@ -408,6 +408,13 @@ export function requestSignalOptions(request?: Request): RawAxiosRequestConfig {
   return request?.signal ? { signal: request.signal } : {};
 }
 
+/** Absolute href for a path under a run, for links the browser follows itself. */
+function runApiPath(id: string, suffix: string): string {
+  return `${generatedApiConfiguration.basePath ?? ""}/api/v1/runs/${
+    encodeURIComponent(id)
+  }${suffix}`;
+}
+
 export function stageArtifactDownloadUrl(
   id: string,
   stageId: string,
@@ -418,7 +425,12 @@ export function stageArtifactDownloadUrl(
     filename,
     retry: String(retry),
   });
-  return `${generatedApiConfiguration.basePath ?? ""}/api/v1/runs/${
-    encodeURIComponent(id)
-  }/stages/${encodeURIComponent(stageId)}/artifacts/download?${searchParams}`;
+  return runApiPath(
+    id,
+    `/stages/${encodeURIComponent(stageId)}/artifacts/download?${searchParams}`,
+  );
+}
+
+export function runArtifactsDownloadUrl(id: string): string {
+  return runApiPath(id, "/artifacts/download");
 }
