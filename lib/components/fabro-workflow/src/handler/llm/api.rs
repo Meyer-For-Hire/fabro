@@ -1480,6 +1480,7 @@ impl CodergenBackend for AgentApiBackend {
             .as_ref()
             .map(structured_output::prompt_response_format);
         let mut repair_attempts = 0_i64;
+        let mut previous_validation_error = None;
         let mut total_usage = TokenCounts::default();
         let mut total_cost = None;
         let mut inference_duration = Duration::ZERO;
@@ -1527,8 +1528,11 @@ impl CodergenBackend for AgentApiBackend {
                         structured_output::exhausted_failure_reason(node.output_retries()),
                     ));
                 }
+                let repair_message =
+                    error.repair_message(schema, previous_validation_error.as_ref());
+                previous_validation_error = Some(error);
                 messages.push(Message::assistant(response_text));
-                messages.push(Message::user(error.repair_message(schema)));
+                messages.push(Message::user(repair_message));
                 repair_attempts += 1;
                 continue;
             }
@@ -1716,6 +1720,7 @@ impl CodergenBackend for AgentApiBackend {
         let mut response = last_assistant_response(&live.session);
         if let Some(schema) = &output_schema {
             let mut repair_attempts = 0_i64;
+            let mut previous_validation_error = None;
             loop {
                 let last_file_touched = last_touched_file(&live.file_tracking);
                 match validate_agent_output_sources(
@@ -1734,7 +1739,8 @@ impl CodergenBackend for AgentApiBackend {
                                 structured_output::exhausted_failure_reason(node.output_retries()),
                             ));
                         }
-                        let repair_message = error.repair_message(schema);
+                        let repair_message =
+                            error.repair_message(schema, previous_validation_error.as_ref());
                         let repair_result = live
                             .session
                             .process_input_with_runtime(
@@ -1745,6 +1751,11 @@ impl CodergenBackend for AgentApiBackend {
                         live.record_input_timing();
                         match repair_result {
                             Ok(()) => {
+                                // Only once the model has actually seen the
+                                // repair can a later identical failure mean it
+                                // ignored the correction. Failover rebuilds the
+                                // session from the original prompt instead.
+                                previous_validation_error = Some(error);
                                 live.record_input_usage().await;
                                 repair_attempts += 1;
                                 response = last_assistant_response(&live.session);
@@ -2237,6 +2248,13 @@ reasoning = false
     fn custom_output_schema_attr() -> AttrValue {
         AttrValue::String(
             r#"{"type":"object","required":["passed"],"properties":{"passed":{"type":"boolean"}}}"#
+                .to_string(),
+        )
+    }
+
+    fn nested_output_schema_attr() -> AttrValue {
+        AttrValue::String(
+            r#"{"type":"object","required":["findings"],"properties":{"findings":{"type":"array","items":{"type":"object","required":["rationale"],"properties":{"rationale":{"type":"string"}}}}}}"#
                 .to_string(),
         )
     }
@@ -3731,6 +3749,76 @@ enabled = true
         let usage = usage.expect("usage should be aggregated");
         assert_eq!(usage.tokens().input_tokens, 41);
         assert_eq!(usage.tokens().output_tokens, 7);
+    }
+
+    #[tokio::test]
+    async fn agent_run_identifies_a_schema_error_repeated_during_repair() {
+        let server = MockServer::start();
+        let first = server.mock(|when, then| {
+            when.method(POST)
+                .path("/chat/completions")
+                .body_includes(r#""stream":true"#)
+                .body_excludes(r#""role":"assistant""#);
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(chat_completion_stream(r#"{"findings":[{}]}"#, 20, 3));
+        });
+        let first_repair = server.mock(|when, then| {
+            when.method(POST)
+                .path("/chat/completions")
+                .body_includes("JSON Pointer `/findings/0/rationale`")
+                .body_excludes("unchanged from your previous repair");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(chat_completion_stream(r#"{"findings":[{}]}"#, 21, 4));
+        });
+        let second_repair = server.mock(|when, then| {
+            when.method(POST)
+                .path("/chat/completions")
+                .body_includes("JSON Pointer `/findings/0/rationale`")
+                .body_includes("unchanged from your previous repair");
+            then.status(200)
+                .header("content-type", "text/event-stream")
+                .body(chat_completion_stream(
+                    r#"{"findings":[{"rationale":"done"}]}"#,
+                    22,
+                    5,
+                ));
+        });
+        let backend = mock_api_backend(&server);
+        let mut node = Node::new("audit");
+        node.attrs
+            .insert("output_schema".to_string(), nested_output_schema_attr());
+        node.attrs
+            .insert("output_retries".to_string(), AttrValue::Integer(2));
+        let context = Context::new();
+        let emitter = Arc::new(Emitter::new(fabro_types::RunId::new()));
+        let workspace = tempfile::tempdir().unwrap();
+        let sandbox: Arc<dyn fabro_agent::Sandbox> =
+            Arc::new(LocalSandbox::new(workspace.path().to_path_buf()));
+
+        let result = backend
+            .run(CodergenRunRequest {
+                node:               &node,
+                prompt:             "Audit the result",
+                context:            &context,
+                thread_id:          None,
+                emitter:            &emitter,
+                sandbox:            &sandbox,
+                tool_hooks:         None,
+                cancel_token:       CancellationToken::new(),
+                agent_tool_runtime: fabro_agent::AgentToolRuntime::default(),
+            })
+            .await
+            .unwrap();
+
+        first.assert_calls(1);
+        first_repair.assert_calls(1);
+        second_repair.assert_calls(1);
+        let CodergenResult::Text { text, .. } = result else {
+            panic!("run should return text");
+        };
+        assert_eq!(text, r#"{"findings":[{"rationale":"done"}]}"#);
     }
 
     #[tokio::test]

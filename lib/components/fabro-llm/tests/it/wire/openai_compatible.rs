@@ -185,8 +185,8 @@ async fn encode_tool_round_trip() {
     fabro_test::fabro_json_snapshot!(capture.body);
 }
 
-/// Assistant thinking parts echo back as `reasoning_content` (Kimi-motivated,
-/// applies to every compat assistant message).
+/// Assistant thinking parts echo back as `reasoning_content` (required by
+/// Kimi and DeepSeek during tool-call continuations).
 #[tokio::test]
 async fn encode_thinking_round_trip_as_reasoning_content() {
     let capture = encode_capture(&corpus_thinking_round_trip(MODEL)).await;

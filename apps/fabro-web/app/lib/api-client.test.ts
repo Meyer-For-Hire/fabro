@@ -6,6 +6,7 @@ import {
   extractRequestId,
   fetchAllPages,
   generatedAxios,
+  runArtifactsDownloadUrl,
   stageArtifactDownloadUrl,
 } from "./api-client";
 
@@ -142,6 +143,14 @@ describe("stageArtifactDownloadUrl", () => {
       stageArtifactDownloadUrl("run 1", "stage@1", "logs/output.txt", 2),
     ).toBe(
       "/api/v1/runs/run%201/stages/stage%401/artifacts/download?filename=logs%2Foutput.txt&retry=2",
+    );
+  });
+});
+
+describe("runArtifactsDownloadUrl", () => {
+  test("builds the escaped ZIP download href", () => {
+    expect(runArtifactsDownloadUrl("run 1")).toBe(
+      "/api/v1/runs/run%201/artifacts/download",
     );
   });
 });

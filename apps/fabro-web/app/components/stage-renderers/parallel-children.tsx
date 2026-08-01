@@ -6,7 +6,6 @@ import type { EventEnvelope } from "@qltysh/fabro-api-client";
 
 import type { Stage } from "../stage-sidebar";
 import { formatStageLabel, stageStatusLabel, stageStatusTone } from "../../lib/stage-sidebar";
-import { formatDurationMs } from "../../lib/format";
 import { StageMetaBar } from "./meta-bar";
 import { parseParallelOverview } from "./helpers";
 import type { ParallelBranchSummary } from "./helpers";
@@ -184,9 +183,11 @@ export function ParallelChildren({
 
   return (
     <div className="space-y-6 pl-3 pr-4 sm:pr-6 lg:pr-8">
+      {/* The meta bar owns duration for every stage renderer, including the
+          live clock while running, so the tiles below stay outcome-only. */}
       <StageMetaBar stage={stage} />
 
-      <section className="grid grid-cols-2 gap-x-6 gap-y-4 rounded-lg bg-panel p-5 outline-1 -outline-offset-1 outline-line sm:grid-cols-4">
+      <section className="grid grid-cols-2 gap-x-6 gap-y-4 rounded-lg bg-panel p-5 outline-1 -outline-offset-1 outline-line sm:grid-cols-3">
         <StatItem label="Branches" value={branchCount || "—"} />
         <StatItem
           label="Succeeded"
@@ -197,10 +198,6 @@ export function ParallelChildren({
           label="Failed"
           value={failureCount}
           tone={failureCount > 0 ? "danger" : "default"}
-        />
-        <StatItem
-          label="Duration"
-          value={overview.durationMs != null ? formatDurationMs(overview.durationMs) : overview.isComplete ? "—" : "running"}
         />
       </section>
 

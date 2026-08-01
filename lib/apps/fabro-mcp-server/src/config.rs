@@ -9,9 +9,7 @@ use anyhow::{Context as _, Result, anyhow};
 use serde_json::map::Entry;
 use serde_json::{Map, Value, json};
 
-use crate::{McpAgent, McpConfigSettings, McpInitSettings};
-
-const SERVER_NAME: &str = "fabro";
+use crate::{McpAgent, McpConfigSettings, McpInitSettings, SERVER_NAME};
 
 pub fn config_json(settings: &McpConfigSettings) -> Result<String> {
     serde_json::to_string_pretty(&generic_config(settings))

@@ -61,7 +61,6 @@ pub struct RunOverrideInput<'a> {
     pub model:            Option<&'a str>,
     pub provider:         Option<&'a str>,
     pub environment:      Option<&'a str>,
-    pub docker_image:     Option<&'a str>,
     pub preserve_sandbox: Option<bool>,
     pub dry_run:          Option<bool>,
     pub auto_approve:     Option<bool>,
@@ -79,23 +78,19 @@ pub fn build_run_overrides(input: RunOverrideInput<'_>) -> RunLayer {
         fallbacks: MergeMap::default(),
         controls:  None,
     });
-    let environment = (input.environment.is_some()
-        || input.docker_image.is_some()
-        || input.preserve_sandbox.is_some())
-    .then(|| RunEnvironmentLayer {
-        id: input.environment.map(ToOwned::to_owned),
-        image: input.docker_image.map(|image| EnvironmentImageLayer {
-            docker: Some(image.to_string()),
-            ..EnvironmentImageLayer::default()
-        }),
-        lifecycle: input
-            .preserve_sandbox
-            .map(|preserve| EnvironmentLifecycleLayer {
-                preserve: Some(preserve),
-                ..EnvironmentLifecycleLayer::default()
-            }),
-        ..RunEnvironmentLayer::default()
-    });
+    let environment =
+        (input.environment.is_some() || input.preserve_sandbox.is_some()).then(|| {
+            RunEnvironmentLayer {
+                id: input.environment.map(ToOwned::to_owned),
+                lifecycle: input
+                    .preserve_sandbox
+                    .map(|preserve| EnvironmentLifecycleLayer {
+                        preserve: Some(preserve),
+                        ..EnvironmentLifecycleLayer::default()
+                    }),
+                ..RunEnvironmentLayer::default()
+            }
+        });
     let execution =
         (input.dry_run.is_some() || input.auto_approve.is_some()).then(|| RunExecutionLayer {
             mode:     input.dry_run.map(|dry_run| {
@@ -894,7 +889,6 @@ pub fn manifest_args_is_empty(args: &types::ManifestArgs) -> bool {
         && args.preserve_sandbox.is_none()
         && args.provider.is_none()
         && args.environment.is_none()
-        && args.docker_image.is_none()
         && args.input.is_empty()
         && args.verbose.is_none()
 }
@@ -966,7 +960,6 @@ mod tests {
             model:            Some("gpt-5.4-mini"),
             provider:         Some("openai"),
             environment:      Some("local"),
-            docker_image:     None,
             preserve_sandbox: Some(true),
             dry_run:          Some(true),
             auto_approve:     Some(false),
@@ -1026,6 +1019,40 @@ mod tests {
             overrides.metadata.0.get("source").map(String::as_str),
             Some("mcp")
         );
+    }
+
+    #[test]
+    fn sparse_run_overrides_preserve_only_has_no_image() {
+        let overrides = build_sparse_run_overrides(RunOverrideInput {
+            preserve_sandbox: Some(true),
+            ..RunOverrideInput::default()
+        })
+        .expect("preserve override");
+        let environment = overrides.environment.expect("environment override");
+
+        assert!(environment.image.is_none());
+        assert_eq!(
+            environment.lifecycle.expect("lifecycle override").preserve,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn sparse_run_overrides_environment_only_has_no_image() {
+        let overrides = build_sparse_run_overrides(RunOverrideInput {
+            environment: Some("local"),
+            ..RunOverrideInput::default()
+        })
+        .expect("environment override");
+        let environment = overrides.environment.expect("environment override");
+
+        assert_eq!(environment.id.as_deref(), Some("local"));
+        assert!(environment.image.is_none());
+    }
+
+    #[test]
+    fn sparse_run_overrides_default_is_empty() {
+        assert!(build_sparse_run_overrides(RunOverrideInput::default()).is_none());
     }
 
     // Regression coverage for https://github.com/fabro-sh/fabro/issues/476.

@@ -195,15 +195,11 @@ describe("parseParallelOverview", () => {
     const overview = parseParallelOverview(events);
     expect(overview).toEqual({
       branchCount: 3,
-      successCount: 2,
-      failureCount: 1,
-      durationMs: 12000,
       results: [
         { id: "branch-a", index: null, itemLabel: null, status: "succeeded" },
         { id: "branch-b", index: null, itemLabel: null, status: "succeeded" },
         { id: "branch-c", index: null, itemLabel: null, status: "failed" },
       ],
-      isComplete: true,
     });
   });
 
@@ -249,7 +245,6 @@ describe("parseParallelOverview", () => {
       }),
     ];
     const overview = parseParallelOverview(events);
-    expect(overview.isComplete).toBe(false);
     expect(overview.branchCount).toBe(4);
     expect(overview.results).toEqual([]);
   });

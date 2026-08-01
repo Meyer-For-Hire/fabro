@@ -237,7 +237,9 @@ pub(super) fn translate_response_format(format: &ResponseFormat) -> serde_json::
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{AudioData, ContentPart, DocumentData, Message, Role, ToolCall};
+    use crate::types::{
+        AudioData, ContentPart, DocumentData, Message, Role, ThinkingData, ToolCall,
+    };
 
     #[test]
     fn translate_assistant_message_with_tool_calls_only() {
@@ -289,6 +291,37 @@ mod tests {
         let tool_calls = translated[0].tool_calls.as_ref().unwrap();
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].function.name, "get_weather");
+    }
+
+    #[test]
+    fn translate_assistant_tool_call_replays_reasoning_content() {
+        let msg = Message {
+            role:         Role::Assistant,
+            content:      vec![
+                ContentPart::Thinking(ThinkingData {
+                    text:      "I need the weather tool.".to_string(),
+                    signature: None,
+                    redacted:  false,
+                }),
+                ContentPart::ToolCall(ToolCall::new(
+                    "call_2",
+                    "get_weather",
+                    serde_json::json!({"city": "NYC"}),
+                )),
+            ],
+            name:         None,
+            tool_call_id: None,
+        };
+
+        let translated = translate_messages(&[msg]);
+
+        assert_eq!(
+            translated[0].reasoning_content.as_deref(),
+            Some("I need the weather tool.")
+        );
+        assert_eq!(translated[0].tool_calls.as_ref().unwrap().len(), 1);
+        let json = serde_json::to_value(&translated[0]).unwrap();
+        assert_eq!(json["reasoning_content"], "I need the weather tool.");
     }
 
     #[test]

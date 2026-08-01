@@ -34,6 +34,7 @@ pub mod manifest_validation;
 mod migrations;
 mod principal_middleware;
 mod request_id;
+mod run_compiler;
 mod run_files;
 mod run_files_security;
 mod run_manifest;

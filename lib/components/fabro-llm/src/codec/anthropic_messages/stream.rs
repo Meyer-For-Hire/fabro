@@ -8,7 +8,7 @@
 use super::SYNTHETIC_TOOL_NAME;
 use super::decode::{convert_synthetic_tool_to_text, map_finish_reason, refusal_error};
 use crate::codec::{RawEvent, StreamDecoder, parse_tool_arguments_or_empty};
-use crate::error::{Error, ProviderErrorDetail, ProviderErrorKind};
+use crate::error::{self, Error, ProviderErrorDetail, ProviderErrorKind};
 use crate::types::{
     ContentPart, FinishReason, Message, RateLimitInfo, Response, Role, StreamEvent, ThinkingData,
     TokenCounts, ToolCall,
@@ -355,16 +355,11 @@ fn stream_error_event_to_provider_error(data: &serde_json::Value, provider_name:
         .and_then(serde_json::Value::as_str)
         .map(String::from);
 
-    let kind = match error_code.as_deref() {
-        Some("rate_limit_error") => ProviderErrorKind::RateLimit,
-        Some("authentication_error") => ProviderErrorKind::Authentication,
-        Some("permission_error") => ProviderErrorKind::AccessDenied,
-        Some("not_found_error") => ProviderErrorKind::NotFound,
-        Some("invalid_request_error") => ProviderErrorKind::InvalidRequest,
-        Some("request_too_large") => ProviderErrorKind::ContextLength,
-        // overloaded_error, api_error, and unknown stream errors are transient.
-        _ => ProviderErrorKind::Server,
-    };
+    // overloaded_error, api_error, and unknown stream errors are transient.
+    let kind = error_code
+        .as_deref()
+        .and_then(error::kind_from_error_code)
+        .unwrap_or(ProviderErrorKind::Server);
 
     Error::Provider {
         kind,

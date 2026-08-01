@@ -1,4 +1,21 @@
+use std::io;
 use std::sync::Arc;
+
+use async_zip::base::write::ZipFileWriter;
+use async_zip::error::ZipError;
+use async_zip::{Compression, ZipEntryBuilder};
+use axum::http::HeaderValue;
+use fabro_store::{ArtifactStore, Error as StoreError};
+use fabro_types::RunProjection;
+use fabro_util::error::collect_chain;
+use futures_util::SinkExt as _;
+use futures_util::io::AsyncWriteExt as _;
+use tokio::io::{AsyncWrite, BufWriter};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::io::{CopyToBytes, SinkWriter};
+use tokio_util::sync::PollSender;
+use tracing::warn;
 
 use super::super::{
     ApiError, AppState, ArtifactEntry, ArtifactKey, ArtifactListResponse, AsyncWriteExt, Body,
@@ -17,6 +34,7 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         .route("/runs/{id}/blobs", post(write_run_blob))
         .route("/runs/{id}/blobs/{blobId}", get(read_run_blob))
         .route("/runs/{id}/artifacts", get(list_run_artifacts))
+        .route("/runs/{id}/artifacts/download", get(download_run_artifacts))
         .route(
             "/runs/{id}/stages/{stageId}/artifacts",
             get(list_stage_artifacts)
@@ -145,6 +163,210 @@ async fn list_run_artifacts(
             ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
         }
     }
+}
+
+const ARCHIVE_STREAM_CHANNEL_CAPACITY: usize = 8;
+
+/// Deflate flushes its output in 8 KiB blocks, and every write below becomes
+/// its own allocation, channel send, and HTTP body frame. Batching to 64 KiB
+/// cuts all three by eight without meaningfully delaying the stream.
+const ARCHIVE_WRITE_BUFFER_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, thiserror::Error)]
+enum ArtifactArchiveError {
+    #[error("archive output failed: {0}")]
+    Io(#[from] io::Error),
+    #[error("artifact read failed: {0}")]
+    Store(#[from] StoreError),
+    #[error("ZIP write failed: {0}")]
+    Zip(#[from] ZipError),
+}
+
+/// One entry per artifact path, holding the newest capture of that path.
+///
+/// Newest means latest stage, then latest retry, then highest stage ID. That
+/// last tiebreaker only decides between two stages the projection does not know
+/// about, which both sort oldest (`None` < `Some`); it is here so the winner
+/// does not depend on the order the store happens to list objects in. All three
+/// keys mirror the artifacts page, which sorts on the same triple and takes the
+/// last entry. Boundary stages are dropped: they run no work, so anything they
+/// captured was already in the workspace.
+///
+/// Paths are re-checked here rather than trusted: a path stored before a
+/// validation rule existed would otherwise be written straight into a ZIP that
+/// somebody extracts. An unsafe path is skipped, not fatal — one bad path must
+/// not cost the caller every other artifact.
+fn latest_run_artifacts(
+    entries: Vec<NodeArtifact>,
+    projection: &RunProjection,
+) -> Vec<NodeArtifact> {
+    let stage_order = projection
+        .iter_stages()
+        .enumerate()
+        .map(|(order, (stage_id, _))| (stage_id.clone(), order))
+        .collect::<HashMap<_, _>>();
+    // The stage ID compares as its serialized `node@visit` form, matching the
+    // string the artifacts page sorts on rather than `StageId`'s own ordering,
+    // which compares the visit numerically and would disagree.
+    let capture_rank = |artifact: &NodeArtifact| {
+        (
+            stage_order.get(&artifact.node).copied(),
+            artifact.retry,
+            artifact.node.to_string(),
+        )
+    };
+    let mut latest_by_path: HashMap<String, NodeArtifact> = HashMap::new();
+
+    for artifact in entries {
+        if projection.is_boundary_stage(artifact.node.node_id()) {
+            continue;
+        }
+        if let Err(error) = ArtifactStore::validate_relative_path(&artifact.filename) {
+            warn!(
+                path = %artifact.filename,
+                %error,
+                "skipping artifact with an unsafe path"
+            );
+            continue;
+        }
+
+        match latest_by_path.get(&artifact.filename) {
+            Some(existing) if capture_rank(existing) >= capture_rank(&artifact) => {}
+            _ => {
+                latest_by_path.insert(artifact.filename.clone(), artifact);
+            }
+        }
+    }
+
+    let mut latest = latest_by_path.into_values().collect::<Vec<_>>();
+    latest.sort_by(|left, right| left.filename.cmp(&right.filename));
+    latest
+}
+
+async fn write_artifact_archive<W>(
+    writer: W,
+    artifact_store: ArtifactStore,
+    run_id: RunId,
+    artifacts: Vec<NodeArtifact>,
+) -> Result<(), ArtifactArchiveError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut archive = ZipFileWriter::with_tokio(writer);
+    for artifact in artifacts {
+        let key = ArtifactKey::new(artifact.node, artifact.retry, artifact.filename.clone());
+        let Some(mut source) = artifact_store.get_stream(&run_id, &key).await? else {
+            // Deleted between the listing and this read, which in practice means
+            // the run was pruned mid-download. Leave it out and keep going: an
+            // archive missing one file beats a truncated one missing the rest.
+            warn!(%run_id, path = %artifact.filename, "artifact vanished while archiving");
+            continue;
+        };
+        // Deflate, not Stored: artifacts are mostly logs and reports, and the
+        // response is excluded from transfer compression precisely because the
+        // archive already carries its own.
+        let entry = ZipEntryBuilder::new(artifact.filename.into(), Compression::Deflate);
+        // `destination` is a futures-io writer from async_zip, while `writer` at
+        // the end of this function is a tokio one, so both `AsyncWriteExt`
+        // traits are in scope and each call resolves to a different one.
+        let mut destination = archive.write_entry_stream(entry).await?;
+        while let Some(chunk) = source.next().await {
+            destination.write_all(&chunk?).await?;
+        }
+        destination.close().await?;
+    }
+    let mut writer = archive.close().await?.into_inner();
+    writer.shutdown().await?;
+    Ok(())
+}
+
+fn artifact_archive_body(
+    artifact_store: ArtifactStore,
+    run_id: RunId,
+    artifacts: Vec<NodeArtifact>,
+) -> Body {
+    // A channel of `Result`, rather than `tokio::io::duplex`, so a failure
+    // partway through can poison the body. Dropping a duplex writer ends the
+    // response with a clean EOF, which would hand the caller a truncated ZIP
+    // that looks like a complete download. Sending an `Err` aborts the chunked
+    // body instead, so the caller sees a transfer error. Do not "simplify" this
+    // to a duplex without replacing that signal.
+    let (sender, receiver) =
+        mpsc::channel::<Result<Bytes, io::Error>>(ARCHIVE_STREAM_CHANNEL_CAPACITY);
+    let error_sender = sender.clone();
+    let sink = PollSender::new(sender)
+        .sink_map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))
+        .with(|chunk: Bytes| {
+            std::future::ready(Ok::<Result<Bytes, io::Error>, io::Error>(Ok(chunk)))
+        });
+    let writer = BufWriter::with_capacity(
+        ARCHIVE_WRITE_BUFFER_BYTES,
+        SinkWriter::new(CopyToBytes::new(sink)),
+    );
+
+    tokio::spawn(async move {
+        if let Err(error) = write_artifact_archive(writer, artifact_store, run_id, artifacts).await
+        {
+            // Log before signalling: the send fails when the caller has already
+            // gone away, and that is exactly when this log is the only record
+            // that the archive failed. The 200 went out long ago.
+            warn!(
+                %run_id,
+                error = %collect_chain(&error).join(": "),
+                "artifact archive stream failed"
+            );
+            let _ = error_sender
+                .send(Err(io::Error::other("artifact archive stream failed")))
+                .await;
+        }
+    });
+
+    Body::from_stream(ReceiverStream::new(receiver))
+}
+
+async fn download_run_artifacts(
+    _auth: RequiredUser,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Response {
+    let id = match parse_run_id_path(&id) {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    let cached = match state.cached_run(&id).await {
+        Ok(cached) => cached,
+        Err(error) => return error.into_response(),
+    };
+    let entries = match state.artifact_store.list_for_run(&id).await {
+        Ok(entries) => entries,
+        Err(error) => {
+            warn!(run_id = %id, %error, "failed to list artifacts for ZIP download");
+            return ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Artifact archive could not be prepared.",
+            )
+            .into_response();
+        }
+    };
+    let artifacts = latest_run_artifacts(entries, &cached.projection);
+
+    let content_disposition = format!("attachment; filename=\"fabro-artifacts-{id}.zip\"");
+    let body = artifact_archive_body(state.artifact_store.clone(), id, artifacts);
+    let mut response = body.into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/zip"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&content_disposition)
+            .expect("run IDs produce valid attachment filenames"),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response
 }
 
 fn run_artifact_entry_from(entry: NodeArtifact) -> RunArtifactEntry {

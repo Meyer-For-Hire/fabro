@@ -12,6 +12,7 @@
 
 mod decode;
 mod encode;
+mod sanitize;
 mod stream;
 
 use crate::codec::{Codec, CodecCtx, EncodedRequest, StreamDecoder};
