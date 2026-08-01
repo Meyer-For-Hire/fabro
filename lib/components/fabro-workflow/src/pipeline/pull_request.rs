@@ -472,6 +472,47 @@ pub struct CreatedPullRequest {
     pub head_branch: String,
 }
 
+fn recovered_pull_request(
+    existing: fabro_github::ExistingPullRequest,
+    owner: String,
+    repo: String,
+    base_branch: &str,
+    head_branch: &str,
+) -> CreatedPullRequest {
+    CreatedPullRequest {
+        link:        PullRequestLink {
+            owner,
+            repo,
+            number: existing.number,
+        },
+        title:       existing.title,
+        base_branch: base_branch.to_string(),
+        head_branch: head_branch.to_string(),
+    }
+}
+
+async fn enable_auto_merge_if_requested(
+    github: &github_app::GitHubContext<'_>,
+    owner: &str,
+    repo: &str,
+    node_id: &str,
+    number: u64,
+    options: Option<&AutoMergeOptions>,
+) {
+    let Some(options) = options else {
+        return;
+    };
+    match github_app::enable_auto_merge(github, owner, repo, node_id, options.merge_strategy).await
+    {
+        Ok(()) => info!(pr_number = number, "Auto-merge enabled"),
+        Err(err) => warn!(
+            pr_number = number,
+            error = %err,
+            "Failed to enable auto-merge (repo may not have auto-merge enabled in settings)"
+        ),
+    }
+}
+
 /// How many times to read the remote branch head before giving up.
 ///
 /// `GET /repos/{owner}/{repo}/branches/{branch}` is replica-served, so shortly
@@ -535,6 +576,36 @@ pub async fn open_pull_request(
     // branch would otherwise cost a full LLM call before failing.
     verify_remote_head(&req, &owner, &repo).await?;
 
+    if let Some(existing) = github_app::find_open_pull_request(
+        &req.github,
+        &owner,
+        &repo,
+        req.base_branch,
+        req.head_branch,
+        req.expected_head_sha,
+    )
+    .await
+    .map_err(|err| format!("failed to reconcile an existing pull request: {err:#}"))?
+    {
+        info!(pr_url = %existing.html_url, pr_number = existing.number, "Existing pull request reconciled");
+        enable_auto_merge_if_requested(
+            &req.github,
+            &owner,
+            &repo,
+            &existing.node_id,
+            existing.number,
+            req.auto_merge.as_ref(),
+        )
+        .await;
+        return Ok(recovered_pull_request(
+            existing,
+            owner,
+            repo,
+            req.base_branch,
+            req.head_branch,
+        ));
+    }
+
     let content = build_pr_content(
         req.diff,
         req.goal,
@@ -550,7 +621,7 @@ pub async fn open_pull_request(
     let body = truncate_pr_body(&content.body);
     let title = content.title;
 
-    let created = github_app::create_pull_request(
+    let created = match github_app::create_pull_request(
         &req.github,
         &owner,
         &repo,
@@ -561,32 +632,58 @@ pub async fn open_pull_request(
         req.draft,
     )
     .await
-    .map_err(|err| format!("{err:#}"))?;
-
-    info!(pr_url = %created.html_url, created.number, "Pull request created");
-
-    if let Some(am_cfg) = req.auto_merge {
-        match github_app::enable_auto_merge(
-            &req.github,
-            &owner,
-            &repo,
-            &created.node_id,
-            am_cfg.merge_strategy,
-        )
-        .await
-        {
-            Ok(()) => {
-                info!(pr_number = created.number, "Auto-merge enabled");
-            }
-            Err(e) => {
-                tracing::warn!(
-                    pr_number = created.number,
-                    error = %e,
-                    "Failed to enable auto-merge (repo may not have auto-merge enabled in settings)"
-                );
+    {
+        Ok(created) => created,
+        Err(create_err) => {
+            match github_app::find_open_pull_request(
+                &req.github,
+                &owner,
+                &repo,
+                req.base_branch,
+                req.head_branch,
+                req.expected_head_sha,
+            )
+            .await
+            {
+                Ok(Some(existing)) => {
+                    info!(pr_url = %existing.html_url, pr_number = existing.number, "Pull request reconciled after create response failed");
+                    enable_auto_merge_if_requested(
+                        &req.github,
+                        &owner,
+                        &repo,
+                        &existing.node_id,
+                        existing.number,
+                        req.auto_merge.as_ref(),
+                    )
+                    .await;
+                    return Ok(recovered_pull_request(
+                        existing,
+                        owner,
+                        repo,
+                        req.base_branch,
+                        req.head_branch,
+                    ));
+                }
+                Ok(None) => return Err(format!("{create_err:#}")),
+                Err(reconcile_err) => {
+                    return Err(format!(
+                        "{create_err:#}; failed to reconcile the pull request after creation: {reconcile_err:#}"
+                    ));
+                }
             }
         }
-    }
+    };
+
+    info!(pr_url = %created.html_url, created.number, "Pull request created");
+    enable_auto_merge_if_requested(
+        &req.github,
+        &owner,
+        &repo,
+        &created.node_id,
+        created.number,
+        req.auto_merge.as_ref(),
+    )
+    .await;
 
     let link = PullRequestLink {
         owner,
@@ -1609,19 +1706,20 @@ mod tests {
     /// client from the credential source, so the in-process MockProvider
     /// cannot intercept — we mock the OpenAI HTTP endpoint instead.
     struct FallbackHarness {
-        _vault_dir:     tempfile::TempDir,
+        _vault_dir:        tempfile::TempDir,
         // Held to keep the mock listener alive for the duration of the test;
         // the test interacts with it via `Client::from_source` (which goes
         // out via HTTP to the mock URL stored in `llm_source`).
-        openai_server:  MockServer,
-        github_server:  MockServer,
-        openai_mock_id: usize,
-        branch_mock_id: usize,
-        github_mock_id: usize,
-        llm_source:     Arc<dyn CredentialSource>,
-        catalog:        Arc<Catalog>,
-        creds:          fabro_github::GitHubCredentials,
-        run_store:      RunStoreHandle,
+        openai_server:     MockServer,
+        github_server:     MockServer,
+        openai_mock_id:    usize,
+        branch_mock_id:    usize,
+        reconcile_mock_id: usize,
+        github_mock_id:    usize,
+        llm_source:        Arc<dyn CredentialSource>,
+        catalog:           Arc<Catalog>,
+        creds:             fabro_github::GitHubCredentials,
+        run_store:         RunStoreHandle,
     }
 
     impl FallbackHarness {
@@ -1630,6 +1728,9 @@ mod tests {
                 .assert_async()
                 .await;
             httpmock::Mock::new(self.branch_mock_id, &self.github_server)
+                .assert_async()
+                .await;
+            httpmock::Mock::new(self.reconcile_mock_id, &self.github_server)
                 .assert_async()
                 .await;
             httpmock::Mock::new(self.github_mock_id, &self.github_server)
@@ -1688,6 +1789,19 @@ mod tests {
                         "html_url": "https://example.test/owner/repo/pull/1",
                         "node_id": "PR_kwTest1",
                     }));
+            })
+            .await;
+        let reconcile_mock = github_server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/repos/owner/repo/pulls")
+                    .query_param("state", "open")
+                    .query_param("base", "main")
+                    .query_param("head", "owner:fabro/run/123")
+                    .header("authorization", "Bearer test-token");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(serde_json::json!([]));
             })
             .await;
 
@@ -1780,6 +1894,7 @@ mod tests {
 
         let openai_mock_id = openai_mock.id;
         let branch_mock_id = branch_mock.id;
+        let reconcile_mock_id = reconcile_mock.id;
         let github_mock_id = github_mock.id;
 
         FallbackHarness {
@@ -1788,6 +1903,7 @@ mod tests {
             github_server,
             openai_mock_id,
             branch_mock_id,
+            reconcile_mock_id,
             github_mock_id,
             llm_source,
             catalog,

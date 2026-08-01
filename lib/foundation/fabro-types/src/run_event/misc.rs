@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 
 use super::ExecOutputTail;
 use crate::{
-    CommandTermination, ParallelBranchResult, PullRequestLink, ReviewTarget, StageId, StageOutcome,
+    CommandTermination, ParallelBranchResult, PullRequestCreationId, PullRequestLink, ReviewTarget,
+    StageId, StageOutcome,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -259,6 +260,13 @@ pub struct AgentAcpTimedOutProps {
     pub stdout:      String,
     pub stderr:      String,
     pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PullRequestCreationRequestedProps {
+    pub creation_id: PullRequestCreationId,
+    pub model:       String,
+    pub force:       bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

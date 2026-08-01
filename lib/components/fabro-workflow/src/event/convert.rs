@@ -1320,6 +1320,17 @@ fn event_body_from_event(event: &Event) -> EventBody {
             stderr:      stderr.clone(),
             duration_ms: *duration_ms,
         }),
+        Event::PullRequestCreationRequested {
+            creation_id,
+            model,
+            force,
+        } => EventBody::PullRequestCreationRequested(
+            fabro_types::PullRequestCreationRequestedProps {
+                creation_id: *creation_id,
+                model:       model.clone(),
+                force:       *force,
+            },
+        ),
         Event::PullRequestCreated {
             pr_url,
             pr_number,

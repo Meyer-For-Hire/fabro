@@ -352,6 +352,8 @@ pub enum EventBody {
     AgentAcpCancelled(AgentAcpCancelledProps),
     #[serde(rename = "agent.acp.timed_out")]
     AgentAcpTimedOut(AgentAcpTimedOutProps),
+    #[serde(rename = "pull_request.creation_requested")]
+    PullRequestCreationRequested(PullRequestCreationRequestedProps),
     #[serde(rename = "pull_request.created")]
     PullRequestCreated(PullRequestCreatedProps),
     #[serde(rename = "pull_request.linked")]
@@ -567,6 +569,7 @@ impl EventBody {
             Self::AgentAcpCompleted(_) => "agent.acp.completed",
             Self::AgentAcpCancelled(_) => "agent.acp.cancelled",
             Self::AgentAcpTimedOut(_) => "agent.acp.timed_out",
+            Self::PullRequestCreationRequested(_) => "pull_request.creation_requested",
             Self::PullRequestCreated(_) => "pull_request.created",
             Self::PullRequestLinked(_) => "pull_request.linked",
             Self::PullRequestUnlinked(_) => "pull_request.unlinked",

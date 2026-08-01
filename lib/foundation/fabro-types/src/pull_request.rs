@@ -1,6 +1,45 @@
+use chrono::{DateTime, Utc};
 use serde::de::Error as DeError;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+use crate::id::ulid_id;
+
+ulid_id!(PullRequestCreationId);
+
+/// Durable status for an explicitly requested pull request creation.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::Display, strum::EnumString,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum PullRequestCreationStatus {
+    Pending,
+    Succeeded,
+    Failed,
+}
+
+/// Latest explicit pull request creation requested for a run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestCreation {
+    pub id:           PullRequestCreationId,
+    pub status:       PullRequestCreationStatus,
+    pub model:        String,
+    pub force:        bool,
+    pub requested_at: DateTime<Utc>,
+    pub updated_at:   DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<PullRequestLink>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error:        Option<String>,
+}
+
+impl PullRequestCreation {
+    #[must_use]
+    pub fn is_pending(&self) -> bool {
+        self.status == PullRequestCreationStatus::Pending
+    }
+}
 
 /// Minimal GitHub pull request reference stored on a workflow run.
 #[derive(Debug, Clone, PartialEq, Eq)]

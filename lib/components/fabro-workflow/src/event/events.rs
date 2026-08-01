@@ -4,9 +4,9 @@ use ::fabro_types::{
     AutomationRef, BilledTokenCounts, BlockedReason, CommandTermination, DiffSummary,
     FailureReason, ForkSourceRef, GitContext, PairId, PairMessageId, PairSystemMessageKind,
     PairTarget, ParallelBranchId, ParallelBranchResult, PendingReason, PermissionLevel, Principal,
-    PullRequestLink, ReviewTarget, RunBlobId, RunFailure, RunId, RunNoticeLevel,
-    RunPairEndedReason, RunPairFailedReason, RunProvenance, RunRunnableSource, RunTiming,
-    SandboxProviderKind, StageId, StageOutcome, StageTiming, SuccessReason,
+    PullRequestCreationId, PullRequestLink, ReviewTarget, RunBlobId, RunFailure, RunId,
+    RunNoticeLevel, RunPairEndedReason, RunPairFailedReason, RunProvenance, RunRunnableSource,
+    RunTiming, SandboxProviderKind, StageId, StageOutcome, StageTiming, SuccessReason,
     run_event as fabro_types,
 };
 use fabro_agent::{AgentEvent, SandboxEvent};
@@ -725,6 +725,11 @@ pub enum Event {
         stdout:      String,
         stderr:      String,
         duration_ms: u64,
+    },
+    PullRequestCreationRequested {
+        creation_id: PullRequestCreationId,
+        model:       String,
+        force:       bool,
     },
     PullRequestCreated {
         pr_url:      String,
@@ -1533,6 +1538,13 @@ impl Event {
                 ..
             } => {
                 debug!(node_id, duration_ms, "Agent ACP timed out");
+            }
+            Self::PullRequestCreationRequested {
+                creation_id,
+                model,
+                force,
+            } => {
+                info!(creation_id = %creation_id, model, force, "Pull request creation requested");
             }
             Self::PullRequestCreated {
                 pr_url,

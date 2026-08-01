@@ -2,7 +2,10 @@ use std::any::{TypeId, type_name};
 
 use fabro_api::types::MergeRunPullRequestRequest;
 use fabro_types::settings::run::MergeStrategy;
-use fabro_types::{PullRequest, PullRequestLink, PullRequestResponse};
+use fabro_types::{
+    PullRequest, PullRequestCreation, PullRequestCreationId, PullRequestCreationStatus,
+    PullRequestLink, PullRequestResponse,
+};
 use serde_json::json;
 
 #[test]
@@ -26,6 +29,42 @@ fn pull_request_response_reuses_domain_types() {
 
     assert_same_type_as_pull_request(&response.data);
     assert_same_type_as_pull_request_link(&response.data.link);
+}
+
+#[test]
+fn pull_request_creation_reuses_domain_type() {
+    let fixture = json!({
+        "id": "01KYYK70WTZT2E551P3H5P0059",
+        "status": "pending",
+        "model": "kimi-k3",
+        "force": true,
+        "requested_at": "2026-08-01T12:00:00Z",
+        "updated_at": "2026-08-01T12:00:00Z"
+    });
+    let creation: fabro_api::types::PullRequestCreation =
+        serde_json::from_value(fixture.clone()).expect("creation should deserialize");
+
+    assert_eq!(
+        TypeId::of::<fabro_api::types::PullRequestCreation>(),
+        TypeId::of::<PullRequestCreation>()
+    );
+    assert_eq!(
+        TypeId::of::<fabro_api::types::PullRequestCreationId>(),
+        TypeId::of::<PullRequestCreationId>()
+    );
+    assert_eq!(
+        TypeId::of::<fabro_api::types::PullRequestCreationStatus>(),
+        TypeId::of::<PullRequestCreationStatus>()
+    );
+    assert_eq!(serde_json::to_value(creation).unwrap(), fixture);
+    assert_eq!(
+        serde_json::to_value(PullRequestCreationStatus::Succeeded).unwrap(),
+        "succeeded"
+    );
+    assert_eq!(
+        serde_json::to_value(PullRequestCreationStatus::Failed).unwrap(),
+        "failed"
+    );
 }
 
 #[test]

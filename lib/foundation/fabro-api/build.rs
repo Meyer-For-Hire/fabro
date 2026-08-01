@@ -545,6 +545,21 @@ fn main() {
         ("EventEnvelope", "fabro_types::EventEnvelope", &[]),
         ("PullRequest", "fabro_types::PullRequest", &[]),
         ("PullRequestLink", "fabro_types::PullRequestLink", &[]),
+        (
+            "PullRequestCreationId",
+            "fabro_types::PullRequestCreationId",
+            &[],
+        ),
+        (
+            "PullRequestCreationStatus",
+            "fabro_types::PullRequestCreationStatus",
+            &[],
+        ),
+        (
+            "PullRequestCreation",
+            "fabro_types::PullRequestCreation",
+            &[],
+        ),
         ("PullRequestDetails", "fabro_types::PullRequestDetails", &[]),
         ("PullRequestMeta", "fabro_types::PullRequestMeta", &[]),
         (

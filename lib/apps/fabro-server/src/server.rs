@@ -186,6 +186,7 @@ pub(crate) use handler::graph::render_graph_bytes;
 pub(in crate::server) use handler::graph::{
     RenderSubprocessError, render_dot_subprocess, render_graph_bytes_with_exe_override,
 };
+pub(crate) use handler::pull_requests::spawn_pull_request_creation_supervisor;
 #[cfg(test)]
 pub(in crate::server) use handler::system::validate_github_slug;
 use session_runtime::SessionRuntimeManager;
@@ -1120,6 +1121,7 @@ pub struct AppState {
     pub(crate) worker_runtime: Arc<dyn WorkerRuntime>,
     scheduler_notify: Notify,
     automation_scheduler_notify: Notify,
+    pull_request_scheduler_notify: Notify,
     global_event_tx: broadcast::Sender<EventEnvelope>,
     /// Per-run coalescing registry for `GET /runs/{id}/files`. Concurrent
     /// callers for the same run share one materialization; different runs
@@ -1206,6 +1208,16 @@ impl AppState {
         &self,
     ) -> impl std::future::Future<Output = ()> + '_ {
         self.automation_scheduler_notify.notified()
+    }
+
+    pub(crate) fn notify_pull_request_scheduler(&self) {
+        self.pull_request_scheduler_notify.notify_one();
+    }
+
+    pub(crate) fn pull_request_scheduler_notified(
+        &self,
+    ) -> impl std::future::Future<Output = ()> + '_ {
+        self.pull_request_scheduler_notify.notified()
     }
 }
 
@@ -1621,6 +1633,7 @@ impl AppState {
         self.shutting_down.store(true, Ordering::Relaxed);
         self.scheduler_notify.notify_waiters();
         self.automation_scheduler_notify.notify_waiters();
+        self.pull_request_scheduler_notify.notify_waiters();
     }
 
     pub(crate) fn shutdown_token(&self) -> CancellationToken {
@@ -2559,6 +2572,7 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         worker_runtime,
         scheduler_notify: Notify::new(),
         automation_scheduler_notify: Notify::new(),
+        pull_request_scheduler_notify: Notify::new(),
         global_event_tx,
         files_in_flight: new_files_in_flight(),
         pull_request_create_locks: Arc::new(Mutex::new(HashMap::new())),

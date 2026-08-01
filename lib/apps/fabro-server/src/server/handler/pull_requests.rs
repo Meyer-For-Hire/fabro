@@ -1,4 +1,12 @@
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
+
+use axum::http::{HeaderValue, header};
+use fabro_store::ListRunsQuery;
+use tokio::task::{JoinHandle, JoinSet};
+use tokio::time;
+use tracing::Instrument as _;
 
 use super::super::{
     ApiError, AppState, CloseRunPullRequestResponse, CreateRunPullRequestRequest, IntoResponse,
@@ -21,10 +29,18 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
             post(merge_run_pull_request),
         )
         .route(
+            "/runs/{id}/pull_request/creation",
+            get(get_run_pull_request_creation),
+        )
+        .route(
             "/runs/{id}/pull_request/close",
             post(close_run_pull_request),
         )
 }
+
+const PULL_REQUEST_CREATION_TIMEOUT: Duration = Duration::from_mins(10);
+const PULL_REQUEST_CREATION_SCAN_INTERVAL: Duration = Duration::from_secs(5);
+const MAX_CONCURRENT_PULL_REQUEST_CREATIONS: usize = 4;
 
 #[expect(
     clippy::disallowed_types,
@@ -306,18 +322,23 @@ async fn create_run_pull_request(
         Err(err) => return err.into_response(),
     };
     let run_state = cached.projection.as_ref();
-    let inputs = match RunPrInputs::extract(run_state, body.force) {
-        Ok(inputs) => inputs,
-        Err(err) => return err.into_response(),
-    };
+    if let Some(creation) = run_state
+        .pull_request_creation
+        .as_ref()
+        .filter(|creation| creation.is_pending())
+    {
+        return accepted_pull_request_creation_response(&id, creation.clone());
+    }
+    if let Err(err) = RunPrInputs::extract(run_state, body.force) {
+        return err.into_response();
+    }
     let creds = match load_server_github_credentials(state.as_ref()).await {
         Ok(creds) => creds,
         Err(err) => return err.into_response(),
     };
-    let github = match server_github_context(state.as_ref(), &creds) {
-        Ok(ctx) => ctx,
-        Err(err) => return err.into_response(),
-    };
+    if let Err(err) = server_github_context(state.as_ref(), &creds) {
+        return err.into_response();
+    }
     let model = if let Some(model) = body.model {
         model
     } else {
@@ -328,8 +349,174 @@ async fn create_run_pull_request(
             .id
             .to_string()
     };
-    let catalog = state.catalog();
+    let creation_id = fabro_types::PullRequestCreationId::new();
+    let event = workflow_event::Event::PullRequestCreationRequested {
+        creation_id,
+        model,
+        force: body.force,
+    };
+    let appended = match workflow_event::append_event_if(&run_store, &id, &event, |projection| {
+        projection.pull_request.is_none()
+            && !projection
+                .pull_request_creation
+                .as_ref()
+                .is_some_and(fabro_types::PullRequestCreation::is_pending)
+    })
+    .await
+    {
+        Ok(appended) => appended,
+        Err(err) => {
+            return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+                .into_response();
+        }
+    };
 
+    let cached = match state.cached_run(&id).await {
+        Ok(cached) => cached,
+        Err(err) => return err.into_response(),
+    };
+    if !appended {
+        if let Some(creation) = cached
+            .projection
+            .pull_request_creation
+            .as_ref()
+            .filter(|creation| creation.is_pending())
+        {
+            return accepted_pull_request_creation_response(&id, creation.clone());
+        }
+        if let Some(record) = cached.projection.pull_request.as_ref() {
+            return ApiError::with_code(
+                StatusCode::CONFLICT,
+                format!("Pull request already exists at {}", record.html_url()),
+                "pull_request_exists",
+            )
+            .into_response();
+        }
+        return ApiError::new(
+            StatusCode::CONFLICT,
+            "Pull request creation state changed. Retry the request.",
+        )
+        .into_response();
+    }
+
+    let Some(creation) = cached.projection.pull_request_creation.clone() else {
+        return ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Pull request creation was accepted but its status is unavailable.",
+        )
+        .into_response();
+    };
+    state.notify_pull_request_scheduler();
+    accepted_pull_request_creation_response(&id, creation)
+}
+
+fn accepted_pull_request_creation_response(
+    run_id: &RunId,
+    creation: fabro_types::PullRequestCreation,
+) -> Response {
+    let mut response = (StatusCode::ACCEPTED, Json(creation)).into_response();
+    let location = format!("/api/v1/runs/{run_id}/pull_request/creation");
+    if let Ok(location) = HeaderValue::from_str(&location) {
+        response.headers_mut().insert(header::LOCATION, location);
+    }
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    response
+}
+
+async fn get_run_pull_request_creation(
+    RequireRunScoped(id): RequireRunScoped,
+    State(state): State<Arc<AppState>>,
+) -> Response {
+    let cached = match state.cached_run(&id).await {
+        Ok(cached) => cached,
+        Err(err) => return err.into_response(),
+    };
+    match cached.projection.pull_request_creation.clone() {
+        Some(creation) => Json(creation).into_response(),
+        None => ApiError::with_code(
+            StatusCode::NOT_FOUND,
+            "No explicit pull request creation was requested for this run.",
+            "no_pull_request_creation",
+        )
+        .into_response(),
+    }
+}
+
+async fn append_pull_request_creation_failure(
+    run_store: &fabro_store::RunDatabase,
+    run_id: &RunId,
+    creation_id: fabro_types::PullRequestCreationId,
+    error: String,
+) -> anyhow::Result<()> {
+    let event = workflow_event::Event::PullRequestFailed { error };
+    workflow_event::append_event_if(run_store, run_id, &event, |projection| {
+        projection
+            .pull_request_creation
+            .as_ref()
+            .is_some_and(|creation| creation.id == creation_id && creation.is_pending())
+    })
+    .await?;
+    Ok(())
+}
+
+pub(crate) async fn process_pull_request_creation(
+    state: Arc<AppState>,
+    run_id: RunId,
+) -> anyhow::Result<()> {
+    let _create_guard = lock_pull_request_create(&state.pull_request_create_locks, &run_id).await;
+    let run_store = state.stores.runs.open_run(&run_id).await?;
+    let run_state = run_store.state().await?;
+    let Some(creation) = run_state
+        .pull_request_creation
+        .as_ref()
+        .filter(|creation| creation.is_pending())
+        .cloned()
+    else {
+        return Ok(());
+    };
+    if run_state.pull_request.is_some() {
+        return Ok(());
+    }
+
+    let inputs = match RunPrInputs::extract(&run_state, creation.force) {
+        Ok(inputs) => inputs,
+        Err(err) => {
+            return append_pull_request_creation_failure(
+                &run_store,
+                &run_id,
+                creation.id,
+                err.detail().to_string(),
+            )
+            .await;
+        }
+    };
+    let creds = match load_server_github_credentials(state.as_ref()).await {
+        Ok(creds) => creds,
+        Err(err) => {
+            return append_pull_request_creation_failure(
+                &run_store,
+                &run_id,
+                creation.id,
+                err.detail().to_string(),
+            )
+            .await;
+        }
+    };
+    let github = match server_github_context(state.as_ref(), &creds) {
+        Ok(github) => github,
+        Err(err) => {
+            return append_pull_request_creation_failure(
+                &run_store,
+                &run_id,
+                creation.id,
+                err.detail().to_string(),
+            )
+            .await;
+        }
+    };
+    let catalog = state.catalog();
     let run_store_handle = run_store.clone().into();
     let request = pull_request::OpenPullRequestRequest {
         github,
@@ -339,18 +526,35 @@ async fn create_run_pull_request(
         expected_head_sha: inputs.final_git_sha,
         goal: inputs.goal,
         diff: inputs.diff,
-        model: &model,
+        model: &creation.model,
         draft: true,
         auto_merge: None,
         run_store: &run_store_handle,
         llm_source: state.llm_source.as_ref(),
         catalog,
         conclusion: Some(inputs.conclusion),
-        run_state: Some(run_state),
+        run_state: Some(&run_state),
     };
-    let created_pull_request = match pull_request::open_pull_request(request).await {
-        Ok(created) => created,
-        Err(err) => return ApiError::new(StatusCode::BAD_GATEWAY, err).into_response(),
+    let shutdown = state.shutdown_token();
+    let result = tokio::select! {
+        () = shutdown.cancelled() => return Ok(()),
+        result = time::timeout(PULL_REQUEST_CREATION_TIMEOUT, pull_request::open_pull_request(request)) => result,
+    };
+    let created_pull_request = match result {
+        Ok(Ok(created)) => created,
+        Ok(Err(err)) => {
+            return append_pull_request_creation_failure(&run_store, &run_id, creation.id, err)
+                .await;
+        }
+        Err(_) => {
+            return append_pull_request_creation_failure(
+                &run_store,
+                &run_id,
+                creation.id,
+                "Pull request creation timed out after 10 minutes.".to_string(),
+            )
+            .await;
+        }
     };
 
     let event = workflow_event::Event::pull_request_created(
@@ -361,11 +565,132 @@ async fn create_run_pull_request(
         &created_pull_request.title,
         true,
     );
-    if let Err(err) = workflow_event::append_event(&run_store, &id, &event).await {
-        return ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
+    workflow_event::append_event_if(&run_store, &run_id, &event, |projection| {
+        projection.pull_request.is_none()
+            && projection
+                .pull_request_creation
+                .as_ref()
+                .is_some_and(|current| current.id == creation.id && current.is_pending())
+    })
+    .await?;
+    Ok(())
+}
+
+async fn pending_pull_request_creation_run_ids(state: &AppState) -> anyhow::Result<Vec<RunId>> {
+    let mut pending = state
+        .stores
+        .runs
+        .list_cached_runs(&ListRunsQuery::default(), chrono::Utc::now())
+        .await?
+        .into_iter()
+        .filter_map(|cached| {
+            let creation = cached.projection.pull_request_creation.as_ref()?;
+            (cached.projection.pull_request.is_none() && creation.is_pending())
+                .then_some((cached.run_id, creation.requested_at))
+        })
+        .collect::<Vec<_>>();
+    pending.sort_by_key(|(run_id, requested_at)| (*requested_at, *run_id));
+    Ok(pending.into_iter().map(|(run_id, _)| run_id).collect())
+}
+
+pub(crate) fn spawn_pull_request_creation_supervisor(state: Arc<AppState>) -> JoinHandle<()> {
+    tokio::spawn(
+        run_pull_request_creation_supervisor(state)
+            .instrument(tracing::info_span!("pull_request_creation_supervisor")),
+    )
+}
+
+async fn run_pull_request_creation_supervisor(state: Arc<AppState>) {
+    let shutdown = state.shutdown_token();
+    let mut workers = JoinSet::new();
+    let mut active = HashSet::new();
+    let mut task_run_ids = std::collections::HashMap::new();
+    let mut scan_requested = true;
+    let mut scan_interval = time::interval(PULL_REQUEST_CREATION_SCAN_INTERVAL);
+    scan_interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+
+    loop {
+        if scan_requested {
+            match pending_pull_request_creation_run_ids(state.as_ref()).await {
+                Ok(pending) => {
+                    let available =
+                        MAX_CONCURRENT_PULL_REQUEST_CREATIONS.saturating_sub(active.len());
+                    let ready = pending
+                        .into_iter()
+                        .filter(|run_id| !active.contains(run_id))
+                        .take(available)
+                        .collect::<Vec<_>>();
+                    for run_id in ready {
+                        active.insert(run_id);
+                        let task_state = Arc::clone(&state);
+                        let handle = workers.spawn(
+                            async move {
+                                let result =
+                                    process_pull_request_creation(task_state, run_id).await;
+                                (run_id, result)
+                            }
+                            .instrument(
+                                tracing::info_span!("pull_request_creation", run_id = %run_id),
+                            ),
+                        );
+                        task_run_ids.insert(handle.id(), run_id);
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "Failed to scan queued pull request creations");
+                }
+            }
+            scan_requested = false;
+        }
+
+        if shutdown.is_cancelled() {
+            break;
+        }
+
+        if workers.is_empty() {
+            tokio::select! {
+                () = shutdown.cancelled() => break,
+                () = state.pull_request_scheduler_notified() => scan_requested = true,
+                _ = scan_interval.tick() => scan_requested = true,
+            }
+            continue;
+        }
+
+        tokio::select! {
+            () = shutdown.cancelled() => break,
+            () = state.pull_request_scheduler_notified() => scan_requested = true,
+            _ = scan_interval.tick() => scan_requested = true,
+            joined = workers.join_next_with_id() => {
+                match joined {
+                    Some(Ok((task_id, (run_id, Ok(()))))) => {
+                        task_run_ids.remove(&task_id);
+                        active.remove(&run_id);
+                        scan_requested = true;
+                    }
+                    Some(Ok((task_id, (run_id, Err(err))))) => {
+                        task_run_ids.remove(&task_id);
+                        active.remove(&run_id);
+                        tracing::warn!(run_id = %run_id, error = %err, "Pull request creation worker failed");
+                    }
+                    Some(Err(err)) => {
+                        if let Some(run_id) = task_run_ids.remove(&err.id()) {
+                            active.remove(&run_id);
+                            tracing::warn!(run_id = %run_id, error = %err, "Pull request creation worker stopped unexpectedly");
+                        } else {
+                            tracing::warn!(error = %err, "Pull request creation worker stopped unexpectedly");
+                        }
+                    }
+                    None => {}
+                }
+            }
+        }
     }
 
-    Json(created_pull_request.link).into_response()
+    while let Some(joined) = workers.join_next().await {
+        if let Err(err) = joined {
+            tracing::warn!(error = %err, "Pull request creation worker stopped during shutdown");
+        }
+    }
 }
 
 async fn link_run_pull_request(
@@ -373,6 +698,7 @@ async fn link_run_pull_request(
     State(state): State<Arc<AppState>>,
     Json(body): Json<LinkRunPullRequestRequest>,
 ) -> Response {
+    let _create_guard = lock_pull_request_create(&state.pull_request_create_locks, &id).await;
     let pull_request = match pull_request_record_from_link_request(&body) {
         Ok(record) => record,
         Err(err) => return err.into_response(),

@@ -10,39 +10,41 @@ use crate::run_event::{AgentSessionActivatedProps, StagePromptProps};
 use crate::{
     AgentBackend, AgentMcpToolSummary, AgentSkillActivationSource, AgentSkillSummary,
     AgentToolSummary, BilledTokenCounts, Checkpoint, Conclusion, InterviewQuestionRecord,
-    InvalidTransition, LlmOutputKind, ModelRef, ParallelBranchId, PermissionLevel, PullRequestLink,
-    RunApproval, RunControlAction, RunDiff, RunId, RunSandbox, RunSpec, RunStatus, RunTiming,
-    StageCompletion, StageHandler, StageId, StageState, StageTiming, StartRecord,
-    TodoListProjection, timing,
+    InvalidTransition, LlmOutputKind, ModelRef, ParallelBranchId, PermissionLevel,
+    PullRequestCreation, PullRequestLink, RunApproval, RunControlAction, RunDiff, RunId,
+    RunSandbox, RunSpec, RunStatus, RunTiming, StageCompletion, StageHandler, StageId, StageState,
+    StageTiming, StartRecord, TodoListProjection, timing,
 };
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RunProjection {
     #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub title:              String,
+    pub title:                 String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_id:          Option<RunId>,
-    pub spec:               RunSpec,
+    pub parent_id:             Option<RunId>,
+    pub spec:                  RunSpec,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub web_url:            Option<String>,
-    pub start:              Option<StartRecord>,
-    pub status:             RunStatus,
+    pub web_url:               Option<String>,
+    pub start:                 Option<StartRecord>,
+    pub status:                RunStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub approval:           Option<RunApproval>,
+    pub approval:              Option<RunApproval>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub archived_at:        Option<DateTime<Utc>>,
-    pub status_updated_at:  DateTime<Utc>,
-    pub last_event_at:      DateTime<Utc>,
-    pub pending_control:    Option<RunControlAction>,
-    pub checkpoints:        Vec<CheckpointRecord>,
-    pub conclusion:         Option<Conclusion>,
-    pub sandbox:            Option<RunSandbox>,
-    pub pull_request:       Option<PullRequestLink>,
-    pub superseded_by:      Option<RunId>,
+    pub archived_at:           Option<DateTime<Utc>>,
+    pub status_updated_at:     DateTime<Utc>,
+    pub last_event_at:         DateTime<Utc>,
+    pub pending_control:       Option<RunControlAction>,
+    pub checkpoints:           Vec<CheckpointRecord>,
+    pub conclusion:            Option<Conclusion>,
+    pub sandbox:               Option<RunSandbox>,
+    pub pull_request:          Option<PullRequestLink>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub retried_from:       Option<RunId>,
-    pub pending_interviews: BTreeMap<String, PendingInterviewRecord>,
-    stages:                 HashMap<StageId, StageProjection>,
+    pub pull_request_creation: Option<PullRequestCreation>,
+    pub superseded_by:         Option<RunId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retried_from:          Option<RunId>,
+    pub pending_interviews:    BTreeMap<String, PendingInterviewRecord>,
+    stages:                    HashMap<StageId, StageProjection>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -873,6 +875,7 @@ impl RunProjection {
             conclusion: None,
             sandbox: None,
             pull_request: None,
+            pull_request_creation: None,
             superseded_by: None,
             retried_from: None,
             pending_interviews: BTreeMap::new(),
