@@ -1460,12 +1460,14 @@ async fn stall_watchdog_starts_a_fresh_deadline_after_human_input() {
 #[tokio::test]
 async fn stall_watchdog_suspends_while_run_waits_for_human_input() {
     let dir = tempfile::tempdir().unwrap();
-    let graph = interview_wait_graph(Duration::from_millis(50), None);
+    // The blocked wait outruns the stall timeout, so this only passes if the
+    // watchdog stays suspended and then restarts on a fresh deadline.
+    let graph = interview_wait_graph(Duration::from_millis(300), None);
     let mut registry = make_registry();
     registry.register(
         "interview_wait",
         Box::new(InterviewWaitHandler {
-            wait_ms:   150,
+            wait_ms:   500,
             active_ms: 10,
         }),
     );
@@ -1486,12 +1488,14 @@ async fn stall_watchdog_suspends_while_run_waits_for_human_input() {
 #[tokio::test]
 async fn node_timeout_excludes_human_input_wait() {
     let dir = tempfile::tempdir().unwrap();
-    let graph = interview_wait_graph(Duration::ZERO, Some(Duration::from_millis(50)));
+    // The blocked wait outruns the node timeout, but the active work is well
+    // inside it, so this only fails if the interview wait is being charged.
+    let graph = interview_wait_graph(Duration::ZERO, Some(Duration::from_millis(300)));
     let mut registry = make_registry();
     registry.register(
         "interview_wait",
         Box::new(InterviewWaitHandler {
-            wait_ms:   150,
+            wait_ms:   500,
             active_ms: 20,
         }),
     );

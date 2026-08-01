@@ -5,6 +5,7 @@ use fabro_core::executor::ExecutorBuilder;
 use fabro_core::handler::NodeHandler;
 use fabro_core::state::ExecutionState;
 use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use tokio::time::{Instant as TokioInstant, sleep_until};
 use tokio_util::sync::CancellationToken;
 
@@ -28,6 +29,50 @@ fn seed_context_from_checkpoint(checkpoint: Option<&Checkpoint>) -> Context {
         }
     }
     context
+}
+
+/// Background watchdog that cancels a run which stops emitting events.
+struct StallWatchdog {
+    /// Cancelled by the monitor once the run stalls. Handed to the executor.
+    stall_token: CancellationToken,
+    /// Cancelled by us to stop the monitor once the run finishes.
+    shutdown:    CancellationToken,
+    task:        JoinHandle<()>,
+}
+
+impl StallWatchdog {
+    fn spawn(
+        stall_timeout: Duration,
+        emitter: Arc<Emitter>,
+        interview_blocks: watch::Receiver<InterviewBlockState>,
+    ) -> Self {
+        let stall_token = CancellationToken::new();
+        let shutdown = CancellationToken::new();
+        emitter.touch();
+        let task = tokio::spawn(monitor_for_stall(
+            stall_timeout,
+            stall_token.clone(),
+            shutdown.clone(),
+            emitter,
+            interview_blocks,
+        ));
+        Self {
+            stall_token,
+            shutdown,
+            task,
+        }
+    }
+
+    fn stall_token(&self) -> CancellationToken {
+        self.stall_token.clone()
+    }
+
+    async fn stop(self) {
+        self.shutdown.cancel();
+        if let Err(error) = self.task.await {
+            tracing::error!(error = ?error, "stall watchdog task failed");
+        }
+    }
 }
 
 /// Cancels `stall_token` once the run goes `stall_timeout` without emitting an
@@ -228,31 +273,19 @@ pub async fn execute(init: Initialized) -> Executed {
         None
     };
 
-    let stall_timeout_opt = graph.stall_timeout();
-    let stall_token = stall_timeout_opt.map(|_| CancellationToken::new());
-    let stall_watchdog =
-        if let (Some(stall_timeout), Some(ref token)) = (stall_timeout_opt, &stall_token) {
-            let shutdown = CancellationToken::new();
-            let emitter = Arc::clone(&engine.run.emitter);
-            let interview_blocks = engine.run.interview_blocker.subscribe();
-            emitter.touch();
-            let task = tokio::spawn(monitor_for_stall(
-                stall_timeout,
-                token.clone(),
-                shutdown.clone(),
-                emitter,
-                interview_blocks,
-            ));
-            Some((shutdown, task))
-        } else {
-            None
-        };
+    let stall_watchdog = graph.stall_timeout().map(|stall_timeout| {
+        StallWatchdog::spawn(
+            stall_timeout,
+            Arc::clone(&engine.run.emitter),
+            engine.run.interview_blocker.subscribe(),
+        )
+    });
 
     let mut builder = ExecutorBuilder::new(handler as Arc<dyn NodeHandler<WorkflowGraph>>)
         .lifecycle(Box::new(lifecycle));
 
     builder = builder.cancel_token(run_options.cancel_token.clone());
-    if let Some(token) = stall_token.clone() {
+    if let Some(token) = stall_watchdog.as_ref().map(StallWatchdog::stall_token) {
         builder = builder.stall_token(token);
     }
     if let Some(limit) = max_node_visits {
@@ -262,11 +295,8 @@ pub async fn execute(init: Initialized) -> Executed {
     let executor = builder.build();
     let result = executor.run(&wf_graph, state).await;
 
-    if let Some((shutdown, task)) = stall_watchdog {
-        shutdown.cancel();
-        if let Err(error) = task.await {
-            tracing::error!(error = ?error, "stall watchdog task failed");
-        }
+    if let Some(watchdog) = stall_watchdog {
+        watchdog.stop().await;
     }
 
     let (outcome, final_context) = match result {

@@ -152,7 +152,10 @@ pub(crate) struct WorkflowAgentQuestionRuntime {
     interviewer: Arc<dyn Interviewer>,
     emitter:     Arc<Emitter>,
     stage_scope: StageScope,
-    stage_id:    String,
+    /// Graph node id, reported as the `stage` on interview events. Distinct
+    /// from `stage_scope.stage_id()`, which is the visit-qualified `StageId`
+    /// used to key block state.
+    node_id:     String,
     blocker:     Arc<RunInterviewBlocker>,
 }
 
@@ -162,14 +165,14 @@ impl WorkflowAgentQuestionRuntime {
         interviewer: Arc<dyn Interviewer>,
         emitter: Arc<Emitter>,
         stage_scope: StageScope,
-        stage_id: impl Into<String>,
+        node_id: impl Into<String>,
         blocker: Arc<RunInterviewBlocker>,
     ) -> Self {
         Self {
             interviewer,
             emitter,
             stage_scope,
-            stage_id: stage_id.into(),
+            node_id: node_id.into(),
             blocker,
         }
     }
@@ -183,7 +186,7 @@ struct PreparedQuestion {
 struct PendingAgentQuestionBatch {
     emitter:     Arc<Emitter>,
     stage_scope: StageScope,
-    stage_id:    String,
+    node_id:     String,
     questions:   Vec<(String, String)>,
     started_at:  Instant,
     guard:       Option<RunInterviewGuard>,
@@ -193,7 +196,7 @@ impl PendingAgentQuestionBatch {
     fn new(
         emitter: Arc<Emitter>,
         stage_scope: StageScope,
-        stage_id: String,
+        node_id: String,
         prepared: &[PreparedQuestion],
         guard: RunInterviewGuard,
         started_at: Instant,
@@ -201,7 +204,7 @@ impl PendingAgentQuestionBatch {
         Self {
             emitter,
             stage_scope,
-            stage_id,
+            node_id,
             questions: prepared
                 .iter()
                 .map(|prepared_question| {
@@ -237,7 +240,7 @@ impl Drop for PendingAgentQuestionBatch {
                     }),
                     question_id: question_id.clone(),
                     question: question.clone(),
-                    stage: self.stage_id.clone(),
+                    stage: self.node_id.clone(),
                     reason: "interrupted".to_string(),
                     duration_ms,
                 },
@@ -274,7 +277,7 @@ impl AgentQuestionRuntime for WorkflowAgentQuestionRuntime {
                 &Event::InterviewStarted {
                     question_id:     question.id.clone(),
                     question:        question.text.clone(),
-                    stage:           self.stage_id.clone(),
+                    stage:           self.node_id.clone(),
                     question_type:   question.question_type.to_string(),
                     options:         question.options.clone(),
                     allow_freeform:  question.allow_freeform,
@@ -290,7 +293,7 @@ impl AgentQuestionRuntime for WorkflowAgentQuestionRuntime {
         let cleanup = PendingAgentQuestionBatch::new(
             Arc::clone(&self.emitter),
             self.stage_scope.clone(),
-            self.stage_id.clone(),
+            self.node_id.clone(),
             &prepared,
             self.blocker
                 .block(Arc::clone(&self.emitter), self.stage_scope.stage_id()),
@@ -361,7 +364,7 @@ impl WorkflowAgentQuestionRuntime {
         question.id = internal_question_id(&self.stage_scope, tool_call_id, index);
         question.options.clone_from(&agent_question.options);
         question.allow_freeform = agent_question.allow_freeform;
-        question.stage.clone_from(&self.stage_id);
+        question.stage.clone_from(&self.node_id);
         question.metadata.insert(
             "agent.tool_call_id".to_string(),
             serde_json::json!(tool_call_id),
@@ -401,7 +404,7 @@ impl WorkflowAgentQuestionRuntime {
                     }),
                     question_id: prepared.question.id.clone(),
                     question: prepared.question.text.clone(),
-                    stage: self.stage_id.clone(),
+                    stage: self.node_id.clone(),
                     duration_ms,
                 },
                 &self.stage_scope,
@@ -444,7 +447,7 @@ impl WorkflowAgentQuestionRuntime {
                 actor,
                 question_id: prepared.question.id.clone(),
                 question: prepared.question.text.clone(),
-                stage: self.stage_id.clone(),
+                stage: self.node_id.clone(),
                 reason: reason.to_string(),
                 duration_ms,
             },
