@@ -12,7 +12,7 @@ use serde_json::Value;
 use super::support::{
     created_run_id, output_stderr, remote_run_summary_json, run_state, wait_for_event_names,
 };
-use crate::support::{run_output_filters, run_projection_json, unique_run_id};
+use crate::support::{LightweightCli, run_output_filters, run_projection_json, unique_run_id};
 
 fn run_status_response(run_id: &str, status: &str) -> serde_json::Value {
     let status = match status {
@@ -986,20 +986,17 @@ fn dry_run_persists_event_history_in_store() {
 
 #[test]
 fn run_rejects_removed_run_id_flag() {
-    let context = test_context!();
-    context.ensure_home_server_auth_methods();
-    let run_id = unique_run_id();
-    let workflow = context.install_fixture("simple.fabro");
+    let cli = LightweightCli::new();
 
-    let output = context
+    let output = cli
         .command()
         .args([
             "run",
             "--dry-run",
             "--auto-approve",
             "--run-id",
-            run_id.as_str(),
-            workflow.to_str().unwrap(),
+            "01KRBZW5C00000000000000001",
+            "workflow.fabro",
         ])
         .assert()
         .failure();
