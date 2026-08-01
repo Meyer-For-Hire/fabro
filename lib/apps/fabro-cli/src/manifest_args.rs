@@ -11,7 +11,6 @@ pub(crate) fn run_manifest_args(args: &RunArgs) -> Option<types::ManifestArgs> {
         preserve_sandbox: args.preserve_sandbox.then_some(true),
         provider:         args.provider.clone(),
         environment:      args.environment.clone(),
-        docker_image:     None,
         input:            args.inputs.values.clone(),
         verbose:          args.verbose.then_some(true),
     };
@@ -27,7 +26,6 @@ pub(crate) fn preflight_manifest_args(args: &PreflightArgs) -> Option<types::Man
         preserve_sandbox: None,
         provider:         args.provider.clone(),
         environment:      args.environment.clone(),
-        docker_image:     None,
         input:            args.inputs.values.clone(),
         verbose:          args.verbose.then_some(true),
     };
