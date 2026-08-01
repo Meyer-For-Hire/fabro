@@ -146,22 +146,6 @@ impl Database {
     pub async fn create_run(&self, run_id: &RunId) -> Result<RunDatabase> {
         self.warm_projection_cache().await?;
         let db = self.open_db().await?;
-        // Keep the active-writer miss and insert atomic. Otherwise concurrent
-        // callers can create independent writers with the same recovered seq.
-        let mut active_runs = self.active_runs.lock().await;
-
-        if let Some(active) = active_run_from(&active_runs, run_id) {
-            if !active.matches_run(run_id) {
-                return Err(Error::RunAlreadyExists(run_id.to_string()));
-            }
-            self.catalog_index().await?.add(run_id).await?;
-            return Ok(active);
-        }
-
-        let run_exists = RunDatabase::has_any_events(&db, run_id).await?;
-        if run_exists {
-            return Err(Error::RunAlreadyExists(run_id.to_string()));
-        }
 
         self.catalog_index().await?.add(run_id).await?;
         let run_store = RunDatabase::open_writer(
@@ -171,6 +155,7 @@ impl Database {
             Arc::clone(&self.run_summary_store),
         )
         .await?;
+        let mut active_runs = self.active_runs.lock().await;
         Self::cache_active_run(&mut active_runs, &run_store);
         Ok(run_store)
     }
