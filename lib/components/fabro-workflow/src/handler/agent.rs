@@ -262,6 +262,11 @@ impl Handler for AgentHandler {
         } else {
             format!("{preamble}\n\n{raw_prompt}")
         };
+        let output_schema = structured_output::parse_node_output_schema(node)?;
+        let prompt = match output_schema.as_ref() {
+            Some(schema) => schema.agent_prompt(&prompt),
+            None => prompt,
+        };
 
         let stage_scope = emit_stage_prompt(
             services,
@@ -373,16 +378,16 @@ impl Handler for AgentHandler {
             serde_json::json!(&response_text),
         );
 
-        if let Some(schema) = structured_output::parse_node_output_schema(node)? {
+        if let Some(schema) = output_schema.as_ref() {
             if let Ok(validated) = validate_agent_output_sources(
-                &schema,
+                schema,
                 &response_text,
                 &services.run.sandbox,
                 last_file_touched.as_deref(),
             )
             .await
             {
-                structured_output::apply_validated_output(node, &schema, &validated, &mut outcome);
+                structured_output::apply_validated_output(node, schema, &validated, &mut outcome);
             } else {
                 let mut failed =
                     structured_output::exhausted_failure_outcome(node.output_retries());
@@ -1027,6 +1032,79 @@ All checks passed.
         assert_eq!(
             outcome.context_updates.get("output.audit"),
             Some(&serde_json::json!({"passed": true})),
+        );
+    }
+
+    #[tokio::test]
+    async fn codergen_handler_appends_output_schema_contract_to_prompt() {
+        use std::sync::{Arc, Mutex};
+
+        struct PromptCapturingBackend {
+            captured_prompt: Arc<Mutex<Option<String>>>,
+        }
+
+        #[async_trait]
+        impl CodergenBackend for PromptCapturingBackend {
+            async fn run(&self, request: CodergenRunRequest<'_>) -> Result<CodergenResult, Error> {
+                *self.captured_prompt.lock().unwrap() = Some(request.prompt.to_string());
+                Ok(CodergenResult::Text {
+                    text:              r#"{"passed": true}"#.to_string(),
+                    usage:             None,
+                    files_touched:     Vec::new(),
+                    last_file_touched: None,
+                    timing:            StageTiming::default(),
+                })
+            }
+        }
+
+        let captured = Arc::new(Mutex::new(None));
+        let handler = AgentHandler::new(Some(Box::new(PromptCapturingBackend {
+            captured_prompt: captured.clone(),
+        })));
+
+        let mut node = Node::new("audit");
+        node.attrs.insert(
+            "prompt".to_string(),
+            AttrValue::String("Audit the result".to_string()),
+        );
+        node.attrs.insert(
+            "output_schema".to_string(),
+            AttrValue::String(
+                r#"{"type":"object","required":["passed"],"properties":{"passed":{"type":"boolean"}}}"#
+                    .to_string(),
+            ),
+        );
+        let context = test_context();
+        let graph = Graph::new("test");
+        let tmp = TempDir::new().unwrap();
+
+        handler
+            .execute(&node, &context, &graph, tmp.path(), &make_services())
+            .await
+            .unwrap();
+
+        let prompt = captured.lock().unwrap().clone().unwrap();
+        assert!(
+            prompt.starts_with("Audit the result\n\n"),
+            "task prompt should come first, got: {prompt}"
+        );
+        assert!(
+            prompt.contains("Fabro final-output contract"),
+            "contract heading missing, got: {prompt}"
+        );
+        assert!(
+            prompt.contains(
+                "It applies only to your final response, not to intermediate tool calls."
+            ),
+            "contract should scope itself to the final response, got: {prompt}"
+        );
+        assert!(
+            prompt.contains(r#""required":["passed"]"#),
+            "contract should embed the resolved schema, got: {prompt}"
+        );
+        assert!(
+            prompt.ends_with("Do not ask the user to provide or choose the output shape."),
+            "contract should close the prompt, got: {prompt}"
         );
     }
 

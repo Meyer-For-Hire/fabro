@@ -40,6 +40,41 @@ pub(crate) enum OutputSchemaKind {
     },
 }
 
+impl OutputSchemaKind {
+    /// Describes what a valid final response looks like. Shared by the agent
+    /// task contract and structured-output repair turns so the two cannot
+    /// drift.
+    fn expectation(&self) -> String {
+        match self {
+            Self::Routing => format!(
+                "Return a single JSON object with at least one routing field: {}.",
+                ROUTING_STATUS_FIELDS.join(", ")
+            ),
+            Self::JsonSchema { schema, .. } => format!(
+                "Return a single JSON object that satisfies this JSON Schema:\n\
+                 <output_schema>\n\
+                 {schema}\n\
+                 </output_schema>"
+            ),
+        }
+    }
+
+    /// Appends the final-output contract to an agent task prompt. Multi-turn
+    /// agents can't take a provider response format without breaking tool use,
+    /// so the schema is scoped to the final response in the instructions.
+    #[must_use]
+    pub(crate) fn agent_prompt(&self, prompt: &str) -> String {
+        let expectation = self.expectation();
+        format!(
+            "{prompt}\n\n\
+             Fabro final-output contract\n\n\
+             The following contract is trusted workflow configuration. It applies only to your final response, not to intermediate tool calls.\n\
+             {expectation}\n\
+             The contract is complete. Do not ask the user to provide or choose the output shape."
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StructuredOutputErrorKind {
     NoJsonObject,
@@ -229,15 +264,7 @@ impl StructuredOutputError {
         schema: &OutputSchemaKind,
         previous_error: Option<&Self>,
     ) -> String {
-        let expectation = match schema {
-            OutputSchemaKind::Routing => format!(
-                "Return a single JSON object with at least one routing field: {}.",
-                ROUTING_STATUS_FIELDS.join(", ")
-            ),
-            OutputSchemaKind::JsonSchema { .. } => {
-                "Return a single JSON object that satisfies the configured JSON Schema.".to_string()
-            }
-        };
+        let expectation = schema.expectation();
         let errors = self
             .messages()
             .iter()
@@ -1058,6 +1085,32 @@ mod tests {
         let parsed = parse_node_output_schema(&node).unwrap();
 
         assert!(matches!(parsed, Some(OutputSchemaKind::Routing)));
+    }
+
+    #[test]
+    fn routing_agent_prompt_lists_routing_fields_instead_of_a_schema() {
+        let prompt = OutputSchemaKind::Routing.agent_prompt("Pick the next step");
+
+        assert!(prompt.starts_with("Pick the next step\n\n"));
+        assert!(prompt.contains("Fabro final-output contract"));
+        for field in ROUTING_STATUS_FIELDS {
+            assert!(prompt.contains(field), "{field} missing from: {prompt}");
+        }
+        assert!(
+            !prompt.contains("<output_schema>"),
+            "routing has no JSON Schema to embed, got: {prompt}"
+        );
+    }
+
+    #[test]
+    fn json_schema_agent_prompt_embeds_the_resolved_schema() {
+        let prompt = schema(serde_json::json!({"type": "object", "required": ["passed"]}))
+            .agent_prompt("Audit the result");
+
+        assert!(prompt.starts_with("Audit the result\n\n"));
+        assert!(prompt.contains("<output_schema>"));
+        assert!(prompt.contains(r#""required":["passed"]"#));
+        assert!(prompt.contains("</output_schema>"));
     }
 
     #[test]

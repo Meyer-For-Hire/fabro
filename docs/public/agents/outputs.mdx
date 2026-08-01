@@ -136,6 +136,8 @@ audit [
 
 `output_schema="@path/to/schema.json"` uses the same workflow file-reference rules as prompt files: the schema is loaded relative to the workflow file and inlined before execution. The final JSON object in the LLM response, or in a successful command's merged stdout and stderr, is validated with `jsonschema`.
 
+For API-backed agent nodes, Fabro adds the resolved output contract to the task instructions. The contract applies only to the final response. It does not restrict intermediate tool calls or progress messages.
+
 Custom schema validation only reads response or command output text. It does not fall back to `status.json` or the last file touched by the agent.
 
 When custom schema validation succeeds, Fabro stores the parsed JSON value in context at:
