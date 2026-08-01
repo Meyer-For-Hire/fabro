@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
@@ -6,7 +7,7 @@ use fabro_llm::types::ToolDefinition;
 use fabro_types::INITIAL_SUBAGENT_GENERATION;
 use fabro_util::error as util_error;
 use futures::future;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::{Instant, timeout_at};
 use tokio_util::sync::CancellationToken;
@@ -48,9 +49,14 @@ fn format_parent_notification_batch(notifications: &[SubAgentParentNotification]
         .iter()
         .map(|notification| {
             let (status, result) = match &notification.result {
-                Ok(result) if result.success => ("completed", result.output.clone()),
-                Ok(result) => ("failed", result.output.clone()),
-                Err(error) => ("failed", util_error::collect_chain(error).join(": ")),
+                Ok(result) if result.success => {
+                    ("completed", Cow::Borrowed(result.output.as_str()))
+                }
+                Ok(result) => ("failed", Cow::Borrowed(result.output.as_str())),
+                Err(error) => (
+                    "failed",
+                    Cow::Owned(util_error::collect_chain(error).join(": ")),
+                ),
             };
             format!(
                 "<task-notification>\n  <task-id>{}</task-id>\n  <status>{status}</status>\n  \
@@ -621,7 +627,15 @@ impl SubAgentSupervisor {
             let mut rx = session.subscribe();
             let callback = Arc::clone(&self.event_callback);
             Some(tokio::spawn(async move {
-                while let Ok(event) = rx.recv().await {
+                loop {
+                    let event = match rx.recv().await {
+                        Ok(event) => event,
+                        // A lagged receiver stays usable, and a reused child
+                        // forwards for the whole parent session. Giving up here
+                        // would silence the child for the rest of its life.
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    };
                     // Skip streaming / noise events
                     if event.event.is_streaming_noise()
                         || matches!(
