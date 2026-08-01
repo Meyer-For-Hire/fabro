@@ -19,8 +19,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 #[cfg(unix)]
-use tokio::task;
-use tokio::task::JoinError;
+use tokio::task::{self, JoinError};
 
 use crate::target::ServerTarget;
 
@@ -109,6 +108,7 @@ pub enum LockError {
         path:   PathBuf,
         source: std::io::Error,
     },
+    #[cfg(unix)]
     #[error("failed to wait for auth store lock at {path}: {source}")]
     Task { path: PathBuf, source: JoinError },
 }
@@ -124,10 +124,6 @@ pub(crate) struct RefreshLockGuard {
     _file: std::fs::File,
 }
 
-#[allow(
-    dead_code,
-    reason = "Non-Unix targets never acquire the lock, so this is never constructed."
-)]
 #[cfg(not(unix))]
 pub(crate) struct RefreshLockGuard;
 
@@ -225,9 +221,12 @@ impl AuthStore {
             })?
     }
 
+    // Matches the other lock helpers, which are no-op passthroughs off Unix.
+    // Failing here instead would break re-installing a stored dev token, which
+    // needs no lock because it never writes.
     #[cfg(not(unix))]
     pub(crate) async fn acquire_refresh_lock(&self) -> Result<RefreshLockGuard, AuthStoreError> {
-        Err(AuthStoreError::UnsupportedPlatform)
+        Ok(RefreshLockGuard)
     }
 
     fn read_auth_file(&self) -> Result<AuthFile, AuthStoreError> {
