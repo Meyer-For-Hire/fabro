@@ -522,14 +522,10 @@ async fn persist_created_run(
     web_url: Option<String>,
 ) -> Result<(), Error> {
     let record = persisted.run_spec();
-    let run_store = match store.create_run(&record.run_id).await {
-        Ok(run_store) => run_store,
-        Err(err) => store
-            .open_run(&record.run_id)
-            .await
-            .map_err(|open_err| Error::engine(open_err.to_string()))
-            .map_err(|_| Error::engine(err.to_string()))?,
-    };
+    let run_store = store
+        .create_run(&record.run_id)
+        .await
+        .map_err(|err| Error::engine_with_source("failed to create run store", err))?;
     let manifest_blob = match submitted_manifest_bytes {
         Some(bytes) => Some(run_store.write_blob(bytes).await.map_err(store_error)?),
         None => None,
