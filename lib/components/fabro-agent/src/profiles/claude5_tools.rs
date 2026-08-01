@@ -333,7 +333,7 @@ pub(crate) fn make_task_output_tool(supervisor: SubAgentSupervisor) -> Registere
                 }
 
                 match supervisor.status(task_id) {
-                    Some(SubAgentStatus::Finished(result)) => {
+                    Some(SubAgentStatus::Finished { result, .. }) => {
                         return finished_output(&supervisor, task_id, result);
                     }
                     Some(SubAgentStatus::Running) if !block => {

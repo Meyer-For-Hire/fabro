@@ -363,21 +363,13 @@ impl ProgressUI {
             ProgressEvent::LlmRequestFinished { stage_node_id } => {
                 self.stage.on_llm_request_finished(&stage_node_id);
             }
-            ProgressEvent::SubagentSpawned {
-                stage_node_id,
-                agent_id,
-                task,
-            } => {
-                self.stage
-                    .on_subagent_spawned(renderer, &stage_node_id, &agent_id, &task);
-            }
-            ProgressEvent::SubagentTurnStarted {
+            ProgressEvent::SubagentStarted {
                 stage_node_id,
                 agent_id,
                 task,
                 generation,
             } => {
-                self.stage.on_subagent_turn_started(
+                self.stage.on_subagent_started(
                     renderer,
                     &stage_node_id,
                     &agent_id,

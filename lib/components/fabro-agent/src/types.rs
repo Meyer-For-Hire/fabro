@@ -224,10 +224,6 @@ pub struct McpToolSummary {
     pub original_name: String,
 }
 
-const fn initial_subagent_generation() -> u64 {
-    1
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AgentEvent {
     SessionStarted {
@@ -359,7 +355,7 @@ pub enum AgentEvent {
         agent_id:   String,
         depth:      usize,
         task:       String,
-        #[serde(default = "initial_subagent_generation")]
+        #[serde(default = "fabro_types::initial_subagent_generation")]
         generation: u64,
     },
     SubAgentTurnStarted {
@@ -371,7 +367,7 @@ pub enum AgentEvent {
     SubAgentCompleted {
         agent_id:   String,
         depth:      usize,
-        #[serde(default = "initial_subagent_generation")]
+        #[serde(default = "fabro_types::initial_subagent_generation")]
         generation: u64,
         success:    bool,
         turns_used: usize,
@@ -379,14 +375,14 @@ pub enum AgentEvent {
     SubAgentFailed {
         agent_id:   String,
         depth:      usize,
-        #[serde(default = "initial_subagent_generation")]
+        #[serde(default = "fabro_types::initial_subagent_generation")]
         generation: u64,
         error:      Error,
     },
     SubAgentClosed {
         agent_id:   String,
         depth:      usize,
-        #[serde(default = "initial_subagent_generation")]
+        #[serde(default = "fabro_types::initial_subagent_generation")]
         generation: u64,
     },
     McpServerReady {

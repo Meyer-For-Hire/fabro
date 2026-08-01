@@ -425,8 +425,15 @@ pub struct AgentSubClosedProps {
     pub visit:      u32,
 }
 
-const fn initial_subagent_generation() -> u64 {
-    1
+/// The generation of a subagent's first turn. Events stored before subagent
+/// session reuse existed carry no generation, so they read back as this.
+pub const INITIAL_SUBAGENT_GENERATION: u64 = 1;
+
+/// Serde default for the generation of a stored subagent event. Public so
+/// crates with their own subagent event types share this one definition.
+#[must_use]
+pub const fn initial_subagent_generation() -> u64 {
+    INITIAL_SUBAGENT_GENERATION
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

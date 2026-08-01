@@ -689,46 +689,54 @@ impl RunProjectionReducer for RunProjection {
                     status:   SubAgentStatus::Running,
                 });
             }
+            // A reused subagent stays one projected row: the spawn task and
+            // generation 1 identify it, and every later generation only moves
+            // its status. The per-turn task and generation stay in the event
+            // log for consumers that need each turn.
             EventBody::AgentSubTurnStarted(props) => {
-                let Some(stage) = stage_at_stored_or_visit(self, stored, props.visit, event.seq)
-                else {
-                    return Ok(());
-                };
-                if let Some(subagent) = subagent_mut(stage, &props.agent_id) {
-                    subagent.status = SubAgentStatus::Running;
-                }
+                set_subagent_status(
+                    self,
+                    stored,
+                    props.visit,
+                    event.seq,
+                    &props.agent_id,
+                    SubAgentStatus::Running,
+                );
             }
             EventBody::AgentSubCompleted(props) => {
-                let Some(stage) = stage_at_stored_or_visit(self, stored, props.visit, event.seq)
-                else {
-                    return Ok(());
-                };
-                if let Some(subagent) = subagent_mut(stage, &props.agent_id) {
-                    subagent.status = SubAgentStatus::Completed {
+                set_subagent_status(
+                    self,
+                    stored,
+                    props.visit,
+                    event.seq,
+                    &props.agent_id,
+                    SubAgentStatus::Completed {
                         success:    props.success,
                         turns_used: props.turns_used,
-                    };
-                }
+                    },
+                );
             }
             EventBody::AgentSubFailed(props) => {
-                let Some(stage) = stage_at_stored_or_visit(self, stored, props.visit, event.seq)
-                else {
-                    return Ok(());
-                };
-                if let Some(subagent) = subagent_mut(stage, &props.agent_id) {
-                    subagent.status = SubAgentStatus::Failed {
+                set_subagent_status(
+                    self,
+                    stored,
+                    props.visit,
+                    event.seq,
+                    &props.agent_id,
+                    SubAgentStatus::Failed {
                         error: props.error.clone(),
-                    };
-                }
+                    },
+                );
             }
             EventBody::AgentSubClosed(props) => {
-                let Some(stage) = stage_at_stored_or_visit(self, stored, props.visit, event.seq)
-                else {
-                    return Ok(());
-                };
-                if let Some(subagent) = subagent_mut(stage, &props.agent_id) {
-                    subagent.status = SubAgentStatus::Closed;
-                }
+                set_subagent_status(
+                    self,
+                    stored,
+                    props.visit,
+                    event.seq,
+                    &props.agent_id,
+                    SubAgentStatus::Closed,
+                );
             }
             EventBody::AgentSkillsDiscovered(props) => {
                 let Some(stage) = stage_at_stored_or_visit(self, stored, props.visit, event.seq)
@@ -895,6 +903,25 @@ fn apply_todo_deleted(stage: &mut StageProjection, props: &TodoDeletedProps) {
     list.remove(&props.todo_id);
     if list.items.is_empty() {
         stage.root_agent_todos = None;
+    }
+}
+
+/// Move an already-projected subagent to a new lifecycle status. Every
+/// subagent event after the spawn updates the same row, so reuse shows one
+/// agent returning to running rather than a second agent appearing.
+fn set_subagent_status(
+    state: &mut RunProjection,
+    stored: &RunEvent,
+    visit: u32,
+    seq: u32,
+    agent_id: &str,
+    status: SubAgentStatus,
+) {
+    let Some(stage) = stage_at_stored_or_visit(state, stored, visit, seq) else {
+        return;
+    };
+    if let Some(subagent) = subagent_mut(stage, agent_id) {
+        subagent.status = status;
     }
 }
 

@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 
 use fabro_llm::types::ToolDefinition;
+use fabro_types::INITIAL_SUBAGENT_GENERATION;
 use fabro_util::error as util_error;
 use futures::future;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -81,18 +82,29 @@ fn escape_notification_xml(value: &str) -> String {
 #[derive(Debug, Clone)]
 pub enum SubAgentStatus {
     Running,
-    Finished(Result<SubAgentResult, Error>),
+    /// The turn ended. `reusable` reports whether the child session survived it
+    /// and can start another turn, so a finished-but-spent agent and a
+    /// finished-and-ready one cannot be confused.
+    Finished {
+        result:   Result<SubAgentResult, Error>,
+        reusable: bool,
+    },
     Closing,
     Closed,
 }
 
 const SUBAGENT_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
-const INITIAL_SUBAGENT_GENERATION: u64 = 1;
+/// One idle child accepts one next turn. `send_input` reserves this single slot
+/// before it makes the agent running, so an agent can never be running with no
+/// turn on its way; input for a running agent goes to the follow-up queue
+/// instead.
 const SUBAGENT_COMMAND_CAPACITY: usize = 1;
 
+/// Start the next turn of an existing child session.
 #[derive(Debug)]
-enum SubAgentCommand {
-    Start { generation: u64, prompt: String },
+struct StartTurn {
+    generation: u64,
+    prompt:     String,
 }
 
 struct ParentNotificationState {
@@ -104,11 +116,9 @@ struct SubAgent {
     status:              watch::Sender<SubAgentStatus>,
     generation:          u64,
     results:             HashMap<u64, Result<SubAgentResult, Error>>,
-    reusable:            bool,
-    command_tx:          mpsc::Sender<SubAgentCommand>,
+    command_tx:          mpsc::Sender<StartTurn>,
     runner_stop:         CancellationToken,
     cleanup_done:        watch::Sender<bool>,
-    cleanup_started:     bool,
     monitor_task:        Option<JoinHandle<()>>,
     event_forwarder:     Option<JoinHandle<()>>,
     cleanup_task:        Option<JoinHandle<()>>,
@@ -154,9 +164,32 @@ struct SupervisorState {
     lifecycle_draining: bool,
 }
 
+impl SupervisorState {
+    fn agent(&self, agent_id: &str) -> Result<&SubAgent, Error> {
+        self.agents
+            .get(agent_id)
+            .ok_or_else(|| unknown_agent(agent_id))
+    }
+
+    fn agent_mut(&mut self, agent_id: &str) -> Result<&mut SubAgent, Error> {
+        self.agents
+            .get_mut(agent_id)
+            .ok_or_else(|| unknown_agent(agent_id))
+    }
+
+    fn queue_lifecycle_event(&mut self, event: AgentEvent) {
+        self.lifecycle_events.push_back(event);
+    }
+}
+
+fn unknown_agent(agent_id: &str) -> Error {
+    Error::InvalidState(format!(
+        "No agent found with id: {agent_id} (it was never spawned)"
+    ))
+}
+
 struct ShutdownWork {
-    agent_id:            String,
-    depth:               usize,
+    handle:              SubAgentHandle,
     generation:          u64,
     close_running_agent: bool,
     status:              watch::Sender<SubAgentStatus>,
@@ -166,7 +199,6 @@ struct ShutdownWork {
     child_abort_handle:  AbortHandle,
     cancel_token:        CancellationToken,
     runner_stop:         CancellationToken,
-    state:               Weak<Mutex<SupervisorState>>,
 }
 
 impl Drop for ShutdownWork {
@@ -206,30 +238,44 @@ fn signal_notifications(changed: &watch::Sender<u64>) {
     });
 }
 
-fn queue_lifecycle_event(state: &mut SupervisorState, event: AgentEvent) {
-    state.lifecycle_events.push_back(event);
+/// Clear the draining flag however the drain ends, so one panicking callback
+/// cannot silence every later lifecycle event.
+struct DrainingGuard<'a>(&'a Arc<Mutex<SupervisorState>>);
+
+impl Drop for DrainingGuard<'_> {
+    fn drop(&mut self) {
+        self.0
+            .lock()
+            .expect("subagent state lock poisoned")
+            .lifecycle_draining = false;
+    }
 }
 
-/// Deliver lifecycle callbacks in the same order as the state transitions
-/// that queued them. Callbacks run without the supervisor lock held and may
-/// safely call back into the supervisor.
+/// Deliver lifecycle callbacks in the same order as the state transitions that
+/// queued them.
+///
+/// The queue exists for cross-thread ordering: a runner thread that releases
+/// the lock after committing one generation would otherwise race a `send_input`
+/// thread emitting the next generation's start, and consumers would see the
+/// turns out of order. Callbacks run with no lock held, so one may also call
+/// back into the supervisor without deadlocking.
 fn drain_lifecycle_events(
     state: &Arc<Mutex<SupervisorState>>,
     event_callback: &Arc<RwLock<Option<SubAgentEventCallback>>>,
 ) {
     {
-        let mut state = state.lock().expect("subagent state lock poisoned");
-        if state.lifecycle_draining {
+        let mut locked = state.lock().expect("subagent state lock poisoned");
+        if locked.lifecycle_draining {
             return;
         }
-        state.lifecycle_draining = true;
+        locked.lifecycle_draining = true;
     }
+    let _draining = DrainingGuard(state);
 
     loop {
         let event = {
-            let mut state = state.lock().expect("subagent state lock poisoned");
-            let Some(event) = state.lifecycle_events.pop_front() else {
-                state.lifecycle_draining = false;
+            let mut locked = state.lock().expect("subagent state lock poisoned");
+            let Some(event) = locked.lifecycle_events.pop_front() else {
                 return;
             };
             event
@@ -273,67 +319,109 @@ fn completion_event(
     }
 }
 
-/// Commit one generation result or claim a follow-up that raced its final
-/// boundary. The supervisor state lock is acquired before the follow-up queue
-/// lock, which is also the ordering used by `send_input`.
-fn commit_turn_result(
-    state: &Arc<Mutex<SupervisorState>>,
-    event_callback: &Arc<RwLock<Option<SubAgentEventCallback>>>,
-    notifications_changed: &watch::Sender<u64>,
-    agent_id: &str,
-    depth: usize,
-    generation: u64,
-    result: &Result<SubAgentResult, Error>,
-    reusable: bool,
-) -> TurnCommit {
-    let outcome = {
-        let mut state = state.lock().expect("subagent state lock poisoned");
-        let Some(agent) = state.agents.get_mut(agent_id) else {
+/// One child's view of its supervisor: the shared state plus the identity every
+/// lifecycle transition needs.
+///
+/// The state reference is weak because a child task reaches its supervisor
+/// through this handle, and a strong reference would close the cycle
+/// state -> `SubAgent` -> runner task -> handle.
+#[derive(Clone)]
+struct SubAgentHandle {
+    state:                 Weak<Mutex<SupervisorState>>,
+    event_callback:        Arc<RwLock<Option<SubAgentEventCallback>>>,
+    notifications_changed: Arc<watch::Sender<u64>>,
+    agent_id:              String,
+    depth:                 usize,
+}
+
+impl SubAgentHandle {
+    /// Commit one generation result, or claim a follow-up that raced its final
+    /// boundary. The supervisor state lock is acquired before the follow-up
+    /// queue lock, which is also the ordering used by `send_input`.
+    fn commit_turn_result(
+        &self,
+        generation: u64,
+        result: &Result<SubAgentResult, Error>,
+        reusable: bool,
+    ) -> TurnCommit {
+        let Some(state) = self.state.upgrade() else {
             return TurnCommit::Stopping;
         };
-        if agent.generation != generation
-            || !matches!(*agent.status.borrow(), SubAgentStatus::Running)
-        {
-            return TurnCommit::Stopping;
-        }
-
-        if reusable {
-            let next_prompt = agent
-                .followup_queue
-                .lock()
-                .expect("followup queue lock poisoned")
-                .pop_front();
-            if let Some(next_prompt) = next_prompt {
-                return TurnCommit::Continue(next_prompt);
+        let outcome = {
+            let mut locked = state.lock().expect("subagent state lock poisoned");
+            let Ok(agent) = locked.agent_mut(&self.agent_id) else {
+                return TurnCommit::Stopping;
+            };
+            if agent.generation != generation
+                || !matches!(*agent.status.borrow(), SubAgentStatus::Running)
+            {
+                return TurnCommit::Stopping;
             }
-        }
 
-        agent.results.insert(generation, result.clone());
-        agent.reusable = reusable;
-        agent
-            .status
-            .send_replace(SubAgentStatus::Finished(result.clone()));
-        queue_lifecycle_event(
-            &mut state,
-            completion_event(agent_id, depth, generation, result),
-        );
-        TurnCommit::Finished
-    };
+            if reusable {
+                let next_prompt = agent
+                    .followup_queue
+                    .lock()
+                    .expect("followup queue lock poisoned")
+                    .pop_front();
+                if let Some(next_prompt) = next_prompt {
+                    return TurnCommit::Continue(next_prompt);
+                }
+            }
 
-    signal_notifications(notifications_changed);
-    drain_lifecycle_events(state, event_callback);
-    outcome
+            agent.results.insert(generation, result.clone());
+            agent.status.send_replace(SubAgentStatus::Finished {
+                result: result.clone(),
+                reusable,
+            });
+            locked.queue_lifecycle_event(completion_event(
+                &self.agent_id,
+                self.depth,
+                generation,
+                result,
+            ));
+            TurnCommit::Finished
+        };
+
+        self.publish(&state);
+        outcome
+    }
+
+    /// The generation this agent is on now, or `None` once the supervisor or
+    /// the agent itself is gone.
+    fn current_generation(&self) -> Option<u64> {
+        let state = self.state.upgrade()?;
+        let locked = state.lock().expect("subagent state lock poisoned");
+        locked
+            .agent(&self.agent_id)
+            .ok()
+            .map(|agent| agent.generation)
+    }
+
+    fn queue_and_publish(&self, event: AgentEvent) {
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        state
+            .lock()
+            .expect("subagent state lock poisoned")
+            .queue_lifecycle_event(event);
+        self.publish(&state);
+    }
+
+    /// Wake notification waiters and deliver queued lifecycle callbacks. Always
+    /// called with no supervisor lock held.
+    fn publish(&self, state: &Arc<Mutex<SupervisorState>>) {
+        signal_notifications(&self.notifications_changed);
+        drain_lifecycle_events(state, &self.event_callback);
+    }
 }
 
 async fn run_subagent_session(
     mut session: Session,
-    state: Weak<Mutex<SupervisorState>>,
-    event_callback: Arc<RwLock<Option<SubAgentEventCallback>>>,
-    notifications_changed: Arc<watch::Sender<u64>>,
-    agent_id: String,
-    depth: usize,
+    handle: SubAgentHandle,
     initial_prompt: String,
-    mut command_rx: mpsc::Receiver<SubAgentCommand>,
+    mut command_rx: mpsc::Receiver<StartTurn>,
     runner_stop: CancellationToken,
     start_rx: oneshot::Receiver<()>,
 ) {
@@ -342,35 +430,20 @@ async fn run_subagent_session(
     }
 
     if let Err(error) = session.initialize().await {
-        if let Some(state) = state.upgrade() {
-            let result = Err(error);
-            commit_turn_result(
-                &state,
-                &event_callback,
-                &notifications_changed,
-                &agent_id,
-                depth,
-                INITIAL_SUBAGENT_GENERATION,
-                &result,
-                false,
-            );
-        }
-        runner_stop.cancelled().await;
-        let reason = if session.cancel_token().is_cancelled() {
-            SessionShutdownReason::Cancelled
-        } else {
-            SessionShutdownReason::Error
-        };
-        session.shutdown(reason).await;
+        handle.commit_turn_result(INITIAL_SUBAGENT_GENERATION, &Err(error), false);
+        // A session that never initialized has no history worth reusing, so
+        // release it and its sandbox now rather than holding both until the
+        // parent closes the agent.
+        session.shutdown(shutdown_reason(&session, true)).await;
         return;
     }
 
-    let mut command = SubAgentCommand::Start {
+    let mut command = StartTurn {
         generation: INITIAL_SUBAGENT_GENERATION,
         prompt:     initial_prompt,
     };
     'commands: loop {
-        let SubAgentCommand::Start {
+        let StartTurn {
             generation,
             mut prompt,
         } = command;
@@ -398,19 +471,7 @@ async fn run_subagent_session(
                 });
             let reusable =
                 session.state() == SessionState::Idle && !session.cancel_token().is_cancelled();
-            let Some(state) = state.upgrade() else {
-                break 'commands;
-            };
-            match commit_turn_result(
-                &state,
-                &event_callback,
-                &notifications_changed,
-                &agent_id,
-                depth,
-                generation,
-                &result,
-                reusable,
-            ) {
+            match handle.commit_turn_result(generation, &result, reusable) {
                 TurnCommit::Continue(next_prompt) => prompt = next_prompt,
                 TurnCommit::Finished => break,
                 TurnCommit::Stopping => break 'commands,
@@ -429,49 +490,35 @@ async fn run_subagent_session(
         };
     }
 
-    let reason = if session.cancel_token().is_cancelled() {
-        SessionShutdownReason::Cancelled
-    } else {
-        SessionShutdownReason::Completed
-    };
-    session.shutdown(reason).await;
+    session.shutdown(shutdown_reason(&session, false)).await;
 }
 
-fn spawn_runner_monitor(
-    runner_task: JoinHandle<()>,
-    state: Weak<Mutex<SupervisorState>>,
-    event_callback: Arc<RwLock<Option<SubAgentEventCallback>>>,
-    notifications_changed: Arc<watch::Sender<u64>>,
-    agent_id: String,
-    depth: usize,
-) -> JoinHandle<()> {
+/// Cancellation always wins as the reported reason; otherwise a session that
+/// failed to start reports an error and one that ran reports completion.
+fn shutdown_reason(session: &Session, failed_to_start: bool) -> SessionShutdownReason {
+    if session.cancel_token().is_cancelled() {
+        SessionShutdownReason::Cancelled
+    } else if failed_to_start {
+        SessionShutdownReason::Error
+    } else {
+        SessionShutdownReason::Completed
+    }
+}
+
+/// Report a runner that died without committing its own result, so the agent
+/// never sits in `Running` with nothing left to run.
+fn spawn_runner_monitor(runner_task: JoinHandle<()>, handle: SubAgentHandle) -> JoinHandle<()> {
     tokio::spawn(async move {
         let Err(error) = runner_task.await else {
             return;
         };
-        let Some(state) = state.upgrade() else {
+        let Some(generation) = handle.current_generation() else {
             return;
         };
         let task_result = Err(Error::InvalidState(format!(
             "Agent task failed to join: {error}"
         )));
-        let generation = {
-            let state = state.lock().expect("subagent state lock poisoned");
-            let Some(agent) = state.agents.get(&agent_id) else {
-                return;
-            };
-            agent.generation
-        };
-        commit_turn_result(
-            &state,
-            &event_callback,
-            &notifications_changed,
-            &agent_id,
-            depth,
-            generation,
-            &task_result,
-            false,
-        );
+        handle.commit_turn_result(generation, &task_result, false);
     })
 }
 
@@ -499,23 +546,29 @@ impl SubAgentSupervisor {
         }
     }
 
+    /// A child's view of this supervisor, for the tasks that run that child.
+    fn handle(&self, agent_id: String, depth: usize) -> SubAgentHandle {
+        SubAgentHandle {
+            state: Arc::downgrade(&self.state),
+            event_callback: Arc::clone(&self.event_callback),
+            notifications_changed: Arc::clone(&self.notifications_changed),
+            agent_id,
+            depth,
+        }
+    }
+
+    /// Wake notification waiters and deliver queued lifecycle callbacks, after
+    /// the state lock has been released.
+    fn publish(&self) {
+        signal_notifications(&self.notifications_changed);
+        drain_lifecycle_events(&self.state, &self.event_callback);
+    }
+
     pub fn set_event_callback(&self, cb: SubAgentEventCallback) {
         *self
             .event_callback
             .write()
             .expect("subagent callback lock poisoned") = Some(cb);
-    }
-
-    #[cfg(test)]
-    fn emit_event(&self, event: AgentEvent) {
-        let callback = self
-            .event_callback
-            .read()
-            .expect("subagent callback lock poisoned")
-            .clone();
-        if let Some(cb) = callback {
-            cb(SubAgentCallbackEvent::Lifecycle(event));
-        }
     }
 
     pub fn spawn(
@@ -597,27 +650,17 @@ impl SubAgentSupervisor {
         let (command_tx, command_rx) = mpsc::channel(SUBAGENT_COMMAND_CAPACITY);
         let runner_stop = CancellationToken::new();
         let child_depth = depth + 1;
+        let handle = self.handle(agent_id.clone(), child_depth);
         let runner_task = tokio::spawn(run_subagent_session(
             session,
-            Arc::downgrade(&self.state),
-            Arc::clone(&self.event_callback),
-            Arc::clone(&self.notifications_changed),
-            agent_id.clone(),
-            child_depth,
+            handle.clone(),
             task_prompt.clone(),
             command_rx,
             runner_stop.clone(),
             start_rx,
         ));
         let child_abort_handle = runner_task.abort_handle();
-        let monitor_task = spawn_runner_monitor(
-            runner_task,
-            Arc::downgrade(&self.state),
-            Arc::clone(&self.event_callback),
-            Arc::clone(&self.notifications_changed),
-            agent_id.clone(),
-            child_depth,
-        );
+        let monitor_task = spawn_runner_monitor(runner_task, handle);
         let (status, _) = watch::channel(SubAgentStatus::Running);
         let (cleanup_done, _) = watch::channel(false);
 
@@ -634,11 +677,9 @@ impl SubAgentSupervisor {
                 status,
                 generation: INITIAL_SUBAGENT_GENERATION,
                 results: HashMap::new(),
-                reusable: false,
                 command_tx,
                 runner_stop,
                 cleanup_done,
-                cleanup_started: false,
                 monitor_task: Some(monitor_task),
                 event_forwarder,
                 cleanup_task: None,
@@ -649,15 +690,14 @@ impl SubAgentSupervisor {
                 parent_notification,
                 spawn_seq,
             });
-            queue_lifecycle_event(&mut state, AgentEvent::SubAgentSpawned {
+            state.queue_lifecycle_event(AgentEvent::SubAgentSpawned {
                 agent_id:   agent_id.clone(),
                 depth:      child_depth,
                 task:       task_prompt,
                 generation: INITIAL_SUBAGENT_GENERATION,
             });
         }
-        signal_notifications(&self.notifications_changed);
-        drain_lifecycle_events(&self.state, &self.event_callback);
+        self.publish();
         let _ = start_tx.send(());
 
         Ok(agent_id)
@@ -666,11 +706,7 @@ impl SubAgentSupervisor {
     pub fn send_input(&self, agent_id: &str, message: &str) -> Result<(), Error> {
         let resumed = {
             let mut state = self.state.lock().expect("subagent state lock poisoned");
-            let agent = state.agents.get_mut(agent_id).ok_or_else(|| {
-                Error::InvalidState(format!(
-                    "No agent found with id: {agent_id} (it was never spawned)"
-                ))
-            })?;
+            let agent = state.agent_mut(agent_id)?;
             let status = agent.status.borrow().clone();
             match status {
                 SubAgentStatus::Running => {
@@ -681,8 +717,8 @@ impl SubAgentSupervisor {
                         .push_back(message.to_string());
                     None
                 }
-                SubAgentStatus::Finished(_) => {
-                    if !agent.reusable {
+                SubAgentStatus::Finished { reusable, .. } => {
+                    if !reusable {
                         return Err(Error::InvalidState(format!(
                             "Agent {agent_id} cannot accept more input because its session ended"
                         )));
@@ -702,13 +738,12 @@ impl SubAgentSupervisor {
                         ))
                     })?;
                     agent.generation = generation;
-                    agent.reusable = false;
                     agent.status.send_replace(SubAgentStatus::Running);
                     if let Some(notification) = &mut agent.parent_notification {
                         notification.pending_generations.push_back(generation);
                     }
                     let depth = agent.depth;
-                    queue_lifecycle_event(&mut state, AgentEvent::SubAgentTurnStarted {
+                    state.queue_lifecycle_event(AgentEvent::SubAgentTurnStarted {
                         agent_id: agent_id.to_string(),
                         depth,
                         task: message.to_string(),
@@ -725,9 +760,8 @@ impl SubAgentSupervisor {
         };
 
         if let Some((permit, generation)) = resumed {
-            signal_notifications(&self.notifications_changed);
-            drain_lifecycle_events(&self.state, &self.event_callback);
-            permit.send(SubAgentCommand::Start {
+            self.publish();
+            permit.send(StartTurn {
                 generation,
                 prompt: message.to_string(),
             });
@@ -743,22 +777,14 @@ impl SubAgentSupervisor {
     ) -> Result<SubAgentResult, Error> {
         let (generation, mut status) = {
             let state = self.state.lock().expect("subagent state lock poisoned");
-            let agent = state.agents.get(agent_id).ok_or_else(|| {
-                Error::InvalidState(format!(
-                    "No agent found with id: {agent_id} (it was never spawned)"
-                ))
-            })?;
+            let agent = state.agent(agent_id)?;
             (agent.generation, agent.status.subscribe())
         };
 
         loop {
             let current = {
                 let state = self.state.lock().expect("subagent state lock poisoned");
-                let agent = state.agents.get(agent_id).ok_or_else(|| {
-                    Error::InvalidState(format!(
-                        "No agent found with id: {agent_id} (it was never spawned)"
-                    ))
-                })?;
+                let agent = state.agent(agent_id)?;
                 if let Some(result) = agent.results.get(&generation) {
                     return result.clone();
                 }
@@ -771,7 +797,7 @@ impl SubAgentSupervisor {
                         "Agent {agent_id} has been closed"
                     )));
                 }
-                SubAgentStatus::Running | SubAgentStatus::Finished(_) => {}
+                SubAgentStatus::Running | SubAgentStatus::Finished { .. } => {}
             }
 
             tokio::select! {
@@ -916,15 +942,11 @@ impl SubAgentSupervisor {
 
     fn begin_shutdown(&self, agent_id: &str, strict: bool) -> Result<ShutdownDisposition, Error> {
         let mut state = self.state.lock().expect("subagent state lock poisoned");
-        let agent = state.agents.get_mut(agent_id).ok_or_else(|| {
-            Error::InvalidState(format!(
-                "No agent found with id: {agent_id} (it was never spawned)"
-            ))
-        })?;
+        let agent = state.agent_mut(agent_id)?;
 
         let close_running_agent = match agent.status.borrow().clone() {
             SubAgentStatus::Running => true,
-            SubAgentStatus::Finished(_) => false,
+            SubAgentStatus::Finished { .. } => false,
             SubAgentStatus::Closing | SubAgentStatus::Closed if strict => {
                 return Err(Error::InvalidState(format!(
                     "Agent {agent_id} is already closed"
@@ -935,25 +957,18 @@ impl SubAgentSupervisor {
             }
             SubAgentStatus::Closed => return Ok(ShutdownDisposition::Done),
         };
+        // Reaching here means the status was Running or Finished, so this call
+        // is the one that commits shutdown: the arms above return for a status
+        // already Closing or Closed, and the only write out of Closing is
+        // `run_shutdown`'s move to Closed.
+        debug_assert!(agent.cleanup_task.is_none());
         agent.status.send_replace(SubAgentStatus::Closing);
 
         // Shutdown is committed, so no pending result will reach the parent.
         agent.parent_notification = None;
 
-        if agent.cleanup_started {
-            return if strict {
-                Err(Error::InvalidState(format!(
-                    "Agent {agent_id} is already closed"
-                )))
-            } else {
-                Ok(ShutdownDisposition::Follow(agent.cleanup_done.subscribe()))
-            };
-        }
-        agent.cleanup_started = true;
-
         Ok(ShutdownDisposition::Lead(ShutdownWork {
-            agent_id: agent_id.to_string(),
-            depth: agent.depth,
+            handle: self.handle(agent_id.to_string(), agent.depth),
             generation: agent.generation,
             close_running_agent,
             status: agent.status.clone(),
@@ -963,14 +978,10 @@ impl SubAgentSupervisor {
             child_abort_handle: agent.child_abort_handle.clone(),
             cancel_token: agent.cancel_token.clone(),
             runner_stop: agent.runner_stop.clone(),
-            state: Arc::downgrade(&self.state),
         }))
     }
 
-    async fn run_shutdown(
-        mut work: ShutdownWork,
-        event_callback: Arc<RwLock<Option<SubAgentEventCallback>>>,
-    ) {
+    async fn run_shutdown(mut work: ShutdownWork) {
         let _cleanup_done = CleanupDoneGuard(work.cleanup_done.clone());
         let deadline = Instant::now() + SUBAGENT_SHUTDOWN_GRACE;
         work.runner_stop.cancel();
@@ -1001,25 +1012,18 @@ impl SubAgentSupervisor {
             }
         });
         if emit_closed {
-            if let Some(state) = work.state.upgrade() {
-                {
-                    let mut state = state.lock().expect("subagent state lock poisoned");
-                    queue_lifecycle_event(&mut state, AgentEvent::SubAgentClosed {
-                        agent_id:   work.agent_id.clone(),
-                        depth:      work.depth,
-                        generation: work.generation,
-                    });
-                }
-                drain_lifecycle_events(&state, &event_callback);
-            }
+            work.handle.queue_and_publish(AgentEvent::SubAgentClosed {
+                agent_id:   work.handle.agent_id.clone(),
+                depth:      work.handle.depth,
+                generation: work.generation,
+            });
         }
     }
 
     fn spawn_shutdown(&self, work: ShutdownWork) -> watch::Receiver<bool> {
         let cleanup_done = work.cleanup_done.subscribe();
-        let agent_id = work.agent_id.clone();
-        let event_callback = Arc::clone(&self.event_callback);
-        let cleanup_task = tokio::spawn(Self::run_shutdown(work, event_callback));
+        let agent_id = work.handle.agent_id.clone();
+        let cleanup_task = tokio::spawn(Self::run_shutdown(work));
         let mut state = self.state.lock().expect("subagent state lock poisoned");
         let agent = state
             .agents
@@ -1135,10 +1139,7 @@ impl SubAgentSupervisor {
         let runner_stop = CancellationToken::new();
         let depth = 1;
         let (monitor_start_tx, monitor_start_rx) = oneshot::channel();
-        let state = Arc::downgrade(&self.state);
-        let event_callback = Arc::clone(&self.event_callback);
-        let notifications_changed = Arc::clone(&self.notifications_changed);
-        let monitored_agent_id = agent_id.clone();
+        let handle = self.handle(agent_id.clone(), depth);
         let monitor_task = tokio::spawn(async move {
             let _ = monitor_start_rx.await;
             let task_result = match child_task.await {
@@ -1147,19 +1148,7 @@ impl SubAgentSupervisor {
                     "Agent task failed to join: {error}"
                 ))),
             };
-            let Some(state) = state.upgrade() else {
-                return;
-            };
-            commit_turn_result(
-                &state,
-                &event_callback,
-                &notifications_changed,
-                &monitored_agent_id,
-                depth,
-                INITIAL_SUBAGENT_GENERATION,
-                &task_result,
-                false,
-            );
+            handle.commit_turn_result(INITIAL_SUBAGENT_GENERATION, &task_result, false);
         });
         {
             let mut state = self.state.lock().expect("subagent state lock poisoned");
@@ -1167,11 +1156,9 @@ impl SubAgentSupervisor {
                 status,
                 generation: INITIAL_SUBAGENT_GENERATION,
                 results: HashMap::new(),
-                reusable: false,
                 command_tx,
                 runner_stop,
                 cleanup_done,
-                cleanup_started: false,
                 monitor_task: Some(monitor_task),
                 event_forwarder,
                 cleanup_task: None,
@@ -1718,7 +1705,7 @@ mod tests {
         assert!(agent_result.turns_used > 0);
         assert!(matches!(
             manager.status(&agent_id),
-            Some(SubAgentStatus::Finished(Ok(_)))
+            Some(SubAgentStatus::Finished { result: Ok(_), .. })
         ));
     }
 
@@ -1948,17 +1935,6 @@ mod tests {
         assert_eq!(grandchild.parent_session_id.as_deref(), Some("child"));
     }
 
-    #[test]
-    fn no_callback_does_not_panic() {
-        // Manager without callback should not panic on emit
-        let manager = SubAgentSupervisor::new(3);
-        manager.emit_event(AgentEvent::SubAgentClosed {
-            agent_id:   "x".into(),
-            depth:      0,
-            generation: 1,
-        });
-    }
-
     #[tokio::test]
     async fn close_all_closes_all_agents() {
         let manager = SubAgentSupervisor::new(3);
@@ -1995,7 +1971,7 @@ mod tests {
         assert_eq!(result2.output, "cached output");
         assert!(matches!(
             manager.status(&agent_id),
-            Some(SubAgentStatus::Finished(Ok(_)))
+            Some(SubAgentStatus::Finished { result: Ok(_), .. })
         ));
     }
 
@@ -2155,7 +2131,7 @@ mod tests {
         let _ = manager.wait(&agent_id).await.unwrap();
         assert!(matches!(
             manager.status(&agent_id),
-            Some(SubAgentStatus::Finished(Ok(_)))
+            Some(SubAgentStatus::Finished { result: Ok(_), .. })
         ));
 
         manager.close_agent(&agent_id).await.unwrap();
@@ -2199,7 +2175,7 @@ mod tests {
         time::timeout(Duration::from_secs(1), async {
             while !matches!(
                 supervisor.status(&agent_id),
-                Some(SubAgentStatus::Finished(Ok(_)))
+                Some(SubAgentStatus::Finished { result: Ok(_), .. })
             ) {
                 yield_now().await;
             }
@@ -2255,19 +2231,16 @@ mod tests {
     #[tokio::test]
     async fn wait_returns_its_target_generation_after_a_later_turn_starts() {
         let supervisor = SubAgentSupervisor::new(3);
-        let child_cancel = CancellationToken::new();
-        let task_cancel = child_cancel.clone();
-        let child = tokio::spawn(async move {
-            task_cancel.cancelled().await;
-            Ok(SubAgentResult {
-                output:     "unused".to_string(),
-                success:    true,
-                turns_used: 1,
-            })
-        });
-        let agent_id = "generation-aware-wait".to_string();
-        supervisor.supervise_test_task(agent_id.clone(), child, child_cancel, None);
+        let child = make_session(vec![
+            text_response("generation one"),
+            text_response("generation two"),
+        ])
+        .await;
+        let agent_id = supervisor.spawn(child, "implement".to_string(), 0).unwrap();
 
+        // Registering the wait pins it to generation one. It stays unpolled
+        // from here, so generation one's completion and generation two's start
+        // reach it as a single coalesced watch update.
         let wait_cancel = CancellationToken::new();
         let mut wait = Box::pin(supervisor.wait_with_cancel(&agent_id, &wait_cancel));
         assert!(
@@ -2275,26 +2248,15 @@ mod tests {
             "generation one should still be running"
         );
 
-        {
-            let mut state = supervisor
-                .state
-                .lock()
-                .expect("subagent state lock poisoned");
-            let agent = state.agents.get_mut(&agent_id).unwrap();
-            let first_result = Ok(SubAgentResult {
-                output:     "generation one".to_string(),
-                success:    true,
-                turns_used: 1,
-            });
-            agent
-                .results
-                .insert(INITIAL_SUBAGENT_GENERATION, first_result.clone());
-            agent
-                .status
-                .send_replace(SubAgentStatus::Finished(first_result));
-            agent.generation = INITIAL_SUBAGENT_GENERATION + 1;
-            agent.status.send_replace(SubAgentStatus::Running);
+        while !matches!(
+            supervisor.status(&agent_id),
+            Some(SubAgentStatus::Finished { .. })
+        ) {
+            yield_now().await;
         }
+        supervisor
+            .send_input(&agent_id, "Fix the review findings")
+            .unwrap();
 
         let result = time::timeout(Duration::from_secs(1), wait)
             .await

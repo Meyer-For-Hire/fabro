@@ -693,25 +693,19 @@ pub async fn run_with_args_and_client_and_catalog(
                             depth,
                             task,
                             generation,
-                        } => {
-                            let task_preview = if task.len() > 60 {
-                                &task[..task.floor_char_boundary(60)]
-                            } else {
-                                task
-                            };
-                            eprintln!(
-                                "  {}",
-                                s.dim.apply_to(format!(
-                                    "{child_prefix}\u{25b6} subagent {agent_id} spawned (depth={depth}, generation={generation}) task={task_preview:?}"
-                                )),
-                            );
                         }
-                        AgentEvent::SubAgentTurnStarted {
+                        | AgentEvent::SubAgentTurnStarted {
                             agent_id,
                             depth,
                             task,
                             generation,
                         } => {
+                            let started =
+                                if matches!(event.event, AgentEvent::SubAgentSpawned { .. }) {
+                                    "spawned"
+                                } else {
+                                    "turn started"
+                                };
                             let task_preview = if task.len() > 60 {
                                 &task[..task.floor_char_boundary(60)]
                             } else {
@@ -720,7 +714,7 @@ pub async fn run_with_args_and_client_and_catalog(
                             eprintln!(
                                 "  {}",
                                 s.dim.apply_to(format!(
-                                    "{child_prefix}\u{25b6} subagent {agent_id} turn started (depth={depth}, generation={generation}) task={task_preview:?}"
+                                    "{child_prefix}\u{25b6} subagent {agent_id} {started} (depth={depth}, generation={generation}) task={task_preview:?}"
                                 )),
                             );
                         }
