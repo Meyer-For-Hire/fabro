@@ -889,9 +889,8 @@ fn dry_run_persists_event_history_in_store() {
     let workflow = context.install_fixture("simple.fabro");
 
     context
-        .command()
+        .run_cmd()
         .args([
-            "run",
             "--dry-run",
             "--auto-approve",
             "--environment",
