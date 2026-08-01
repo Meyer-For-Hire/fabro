@@ -52,7 +52,7 @@ Key attributes:
 | `max_tokens` | Maximum tokens for LLM responses |
 | `fidelity` | How much prior context is passed to this node (see [Context](/execution/context#fidelity-controlling-agent-context)) |
 | `thread_id` | Groups nodes into a shared conversation thread (advanced — see below) |
-| `timeout` | Execution timeout (e.g. `"900s"`) |
+| `timeout` | Execution timeout (e.g. `"900s"`). Time spent waiting for an answer to an agent question does not count. |
 
 **Fidelity levels:**
 

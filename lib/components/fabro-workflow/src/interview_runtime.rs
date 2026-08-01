@@ -1,5 +1,5 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -7,31 +7,93 @@ use fabro_agent::{
     AgentQuestion, AgentQuestionAnswer, AgentQuestionAnswerStatus, AgentQuestionRuntime,
 };
 use fabro_interview::{Answer, AnswerSubmission, AnswerValue, Interviewer, Question};
-use fabro_types::{BlockedReason, InterviewOption, Principal, SystemActorKind};
+use fabro_types::{BlockedReason, InterviewOption, Principal, StageId, SystemActorKind};
 use futures::future;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
 use crate::event::{Emitter, Event, StageScope};
 use crate::millis_u64;
 
-/// Run-scoped refcount for unresolved human input. Emits `run.blocked` on the
+/// Unresolved interviews per stage. A stage is present only while it has at
+/// least one, so the run is blocked exactly when the map is non-empty.
+#[derive(Debug, Default)]
+pub(crate) struct InterviewBlockState {
+    blocked_stages: HashMap<StageId, usize>,
+}
+
+impl InterviewBlockState {
+    pub(crate) fn is_run_blocked(&self) -> bool {
+        !self.blocked_stages.is_empty()
+    }
+
+    pub(crate) fn is_stage_blocked(&self, stage_id: &StageId) -> bool {
+        self.blocked_stages.contains_key(stage_id)
+    }
+
+    fn block(&mut self, stage_id: StageId) {
+        *self.blocked_stages.entry(stage_id).or_default() += 1;
+    }
+
+    /// `RunInterviewGuard` resolves at most once, so an unknown stage here
+    /// means the state is already clear. Runs from `Drop`, so it must not
+    /// panic.
+    fn resolve(&mut self, stage_id: &StageId) {
+        let Some(count) = self.blocked_stages.get_mut(stage_id) else {
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            self.blocked_stages.remove(stage_id);
+        }
+    }
+}
+
+/// Run-scoped state for unresolved human input. Emits `run.blocked` on the
 /// first unresolved human/agent interview and `run.unblocked` after the last
-/// one resolves.
+/// one resolves. Subscribers use the same state to suspend run and stage
+/// timeout budgets without deriving runtime control from persisted events.
+///
+/// Both transitions publish the new state before emitting the event, so a
+/// listener that reads `subscribe()` from an event callback always sees state
+/// that agrees with the event it just received.
 pub(crate) struct RunInterviewBlocker {
-    unresolved_interviews: AtomicUsize,
+    state:       watch::Sender<InterviewBlockState>,
+    /// Serializes state change plus event emission so concurrent guards cannot
+    /// interleave into an out-of-order `run.blocked` / `run.unblocked` pair.
+    transitions: Mutex<()>,
 }
 
 impl RunInterviewBlocker {
     #[must_use]
     pub(crate) fn new() -> Self {
+        let (state, _) = watch::channel(InterviewBlockState::default());
         Self {
-            unresolved_interviews: AtomicUsize::new(0),
+            state,
+            transitions: Mutex::new(()),
         }
     }
 
-    pub(crate) fn block(self: &Arc<Self>, emitter: Arc<Emitter>) -> RunInterviewGuard {
-        if self.unresolved_interviews.fetch_add(1, Ordering::AcqRel) == 0 {
+    pub(crate) fn subscribe(&self) -> watch::Receiver<InterviewBlockState> {
+        self.state.subscribe()
+    }
+
+    pub(crate) fn block(
+        self: &Arc<Self>,
+        emitter: Arc<Emitter>,
+        stage_id: StageId,
+    ) -> RunInterviewGuard {
+        let _transition = self
+            .transitions
+            .lock()
+            .expect("interview transition mutex should not be poisoned");
+        let mut newly_blocked = false;
+        self.state.send_modify(|state| {
+            newly_blocked = !state.is_run_blocked();
+            state.block(stage_id.clone());
+        });
+        if newly_blocked {
             emitter.emit(&Event::RunBlocked {
                 blocked_reason: BlockedReason::HumanInputRequired,
             });
@@ -39,30 +101,23 @@ impl RunInterviewBlocker {
         RunInterviewGuard {
             blocker: Arc::clone(self),
             emitter,
+            stage_id,
             resolved: false,
         }
     }
 
-    fn resolved(&self, emitter: &Emitter) {
-        let mut current = self.unresolved_interviews.load(Ordering::Acquire);
-        loop {
-            if current == 0 {
-                return;
-            }
-            match self.unresolved_interviews.compare_exchange_weak(
-                current,
-                current - 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    if current == 1 {
-                        emitter.emit(&Event::RunUnblocked);
-                    }
-                    return;
-                }
-                Err(observed) => current = observed,
-            }
+    fn resolved(&self, emitter: &Emitter, stage_id: &StageId) {
+        let _transition = self
+            .transitions
+            .lock()
+            .expect("interview transition mutex should not be poisoned");
+        let mut fully_unblocked = false;
+        self.state.send_modify(|state| {
+            state.resolve(stage_id);
+            fully_unblocked = !state.is_run_blocked();
+        });
+        if fully_unblocked {
+            emitter.emit(&Event::RunUnblocked);
         }
     }
 }
@@ -70,6 +125,7 @@ impl RunInterviewBlocker {
 pub(crate) struct RunInterviewGuard {
     blocker:  Arc<RunInterviewBlocker>,
     emitter:  Arc<Emitter>,
+    stage_id: StageId,
     resolved: bool,
 }
 
@@ -80,7 +136,7 @@ impl RunInterviewGuard {
 
     fn resolve_in_place(&mut self) {
         if !self.resolved {
-            self.blocker.resolved(self.emitter.as_ref());
+            self.blocker.resolved(self.emitter.as_ref(), &self.stage_id);
             self.resolved = true;
         }
     }
@@ -96,7 +152,10 @@ pub(crate) struct WorkflowAgentQuestionRuntime {
     interviewer: Arc<dyn Interviewer>,
     emitter:     Arc<Emitter>,
     stage_scope: StageScope,
-    stage_id:    String,
+    /// Graph node id, reported as the `stage` on interview events. Distinct
+    /// from `stage_scope.stage_id()`, which is the visit-qualified `StageId`
+    /// used to key block state.
+    node_id:     String,
     blocker:     Arc<RunInterviewBlocker>,
 }
 
@@ -106,14 +165,14 @@ impl WorkflowAgentQuestionRuntime {
         interviewer: Arc<dyn Interviewer>,
         emitter: Arc<Emitter>,
         stage_scope: StageScope,
-        stage_id: impl Into<String>,
+        node_id: impl Into<String>,
         blocker: Arc<RunInterviewBlocker>,
     ) -> Self {
         Self {
             interviewer,
             emitter,
             stage_scope,
-            stage_id: stage_id.into(),
+            node_id: node_id.into(),
             blocker,
         }
     }
@@ -127,7 +186,7 @@ struct PreparedQuestion {
 struct PendingAgentQuestionBatch {
     emitter:     Arc<Emitter>,
     stage_scope: StageScope,
-    stage_id:    String,
+    node_id:     String,
     questions:   Vec<(String, String)>,
     started_at:  Instant,
     guard:       Option<RunInterviewGuard>,
@@ -137,7 +196,7 @@ impl PendingAgentQuestionBatch {
     fn new(
         emitter: Arc<Emitter>,
         stage_scope: StageScope,
-        stage_id: String,
+        node_id: String,
         prepared: &[PreparedQuestion],
         guard: RunInterviewGuard,
         started_at: Instant,
@@ -145,7 +204,7 @@ impl PendingAgentQuestionBatch {
         Self {
             emitter,
             stage_scope,
-            stage_id,
+            node_id,
             questions: prepared
                 .iter()
                 .map(|prepared_question| {
@@ -181,7 +240,7 @@ impl Drop for PendingAgentQuestionBatch {
                     }),
                     question_id: question_id.clone(),
                     question: question.clone(),
-                    stage: self.stage_id.clone(),
+                    stage: self.node_id.clone(),
                     reason: "interrupted".to_string(),
                     duration_ms,
                 },
@@ -218,7 +277,7 @@ impl AgentQuestionRuntime for WorkflowAgentQuestionRuntime {
                 &Event::InterviewStarted {
                     question_id:     question.id.clone(),
                     question:        question.text.clone(),
-                    stage:           self.stage_id.clone(),
+                    stage:           self.node_id.clone(),
                     question_type:   question.question_type.to_string(),
                     options:         question.options.clone(),
                     allow_freeform:  question.allow_freeform,
@@ -234,9 +293,10 @@ impl AgentQuestionRuntime for WorkflowAgentQuestionRuntime {
         let cleanup = PendingAgentQuestionBatch::new(
             Arc::clone(&self.emitter),
             self.stage_scope.clone(),
-            self.stage_id.clone(),
+            self.node_id.clone(),
             &prepared,
-            self.blocker.block(Arc::clone(&self.emitter)),
+            self.blocker
+                .block(Arc::clone(&self.emitter), self.stage_scope.stage_id()),
             interview_start,
         );
         let ask_all = future::join_all(
@@ -304,7 +364,7 @@ impl WorkflowAgentQuestionRuntime {
         question.id = internal_question_id(&self.stage_scope, tool_call_id, index);
         question.options.clone_from(&agent_question.options);
         question.allow_freeform = agent_question.allow_freeform;
-        question.stage.clone_from(&self.stage_id);
+        question.stage.clone_from(&self.node_id);
         question.metadata.insert(
             "agent.tool_call_id".to_string(),
             serde_json::json!(tool_call_id),
@@ -344,7 +404,7 @@ impl WorkflowAgentQuestionRuntime {
                     }),
                     question_id: prepared.question.id.clone(),
                     question: prepared.question.text.clone(),
-                    stage: self.stage_id.clone(),
+                    stage: self.node_id.clone(),
                     duration_ms,
                 },
                 &self.stage_scope,
@@ -387,7 +447,7 @@ impl WorkflowAgentQuestionRuntime {
                 actor,
                 question_id: prepared.question.id.clone(),
                 question: prepared.question.text.clone(),
-                stage: self.stage_id.clone(),
+                stage: self.node_id.clone(),
                 reason: reason.to_string(),
                 duration_ms,
             },
@@ -528,17 +588,21 @@ mod tests {
             let events = Arc::clone(&events);
             move |event| events.lock().unwrap().push(event.clone())
         });
+        let stage_scope = StageScope {
+            node_id:            "ask".to_string(),
+            visit:              1,
+            parallel_group_id:  None,
+            parallel_branch_id: None,
+        };
+        let stage_id = stage_scope.stage_id();
+        let blocker = Arc::new(RunInterviewBlocker::new());
+        let block_state = blocker.subscribe();
         let runtime = WorkflowAgentQuestionRuntime::new(
             interviewer.clone(),
             Arc::clone(&emitter),
-            StageScope {
-                node_id:            "ask".to_string(),
-                visit:              1,
-                parallel_group_id:  None,
-                parallel_branch_id: None,
-            },
+            stage_scope,
             "ask",
-            Arc::new(RunInterviewBlocker::new()),
+            blocker,
         );
         let option = InterviewOption {
             key:         "ship".to_string(),
@@ -578,6 +642,8 @@ mod tests {
         });
 
         tokio::task::yield_now().await;
+        assert!(block_state.borrow().is_run_blocked());
+        assert!(block_state.borrow().is_stage_blocked(&stage_id));
         let question_ids = {
             let events = events.lock().unwrap();
             assert!(matches!(events[0].body, EventBody::InterviewStarted(_)));
@@ -622,5 +688,60 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event.body, EventBody::RunUnblocked(_)))
         );
+        assert!(!block_state.borrow().is_run_blocked());
+        assert!(!block_state.borrow().is_stage_blocked(&stage_id));
+    }
+
+    #[tokio::test]
+    async fn cancelling_agent_question_unblocks_its_stage() {
+        let interviewer = Arc::new(ControlInterviewer::new());
+        let emitter = Arc::new(Emitter::new(RunId::new()));
+        let stage_scope = StageScope {
+            node_id:            "ask".to_string(),
+            visit:              1,
+            parallel_group_id:  None,
+            parallel_branch_id: None,
+        };
+        let stage_id = stage_scope.stage_id();
+        let blocker = Arc::new(RunInterviewBlocker::new());
+        let block_state = blocker.subscribe();
+        let runtime = WorkflowAgentQuestionRuntime::new(
+            interviewer,
+            emitter,
+            stage_scope,
+            "ask",
+            Arc::clone(&blocker),
+        );
+        let cancel_token = CancellationToken::new();
+        let ask_cancel_token = cancel_token.clone();
+        let ask = tokio::spawn(async move {
+            runtime
+                .ask_questions(
+                    "call_1",
+                    vec![AgentQuestion {
+                        original_id:       Some("q1".to_string()),
+                        original_question: "Continue?".to_string(),
+                        header:            None,
+                        text:              "Continue?".to_string(),
+                        question_type:     fabro_types::QuestionType::Freeform,
+                        options:           Vec::new(),
+                        allow_freeform:    true,
+                    }],
+                    ask_cancel_token,
+                )
+                .await
+                .unwrap()
+        });
+
+        tokio::task::yield_now().await;
+        assert!(block_state.borrow().is_run_blocked());
+        assert!(block_state.borrow().is_stage_blocked(&stage_id));
+
+        cancel_token.cancel();
+        let answers = ask.await.unwrap();
+
+        assert_eq!(answers[0].status, AgentQuestionAnswerStatus::Interrupted);
+        assert!(!block_state.borrow().is_run_blocked());
+        assert!(!block_state.borrow().is_stage_blocked(&stage_id));
     }
 }

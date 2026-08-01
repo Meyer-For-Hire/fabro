@@ -196,7 +196,7 @@ Other node types still need their shape, because their attributes don't identify
 | `shape` | Identifier | Graphviz shape — determines handler type (see table above) |
 | `type` | String | Explicit handler type (overrides shape) |
 | `class` | String | Classes for [stylesheet](/workflows/stylesheets) targeting. Separate multiple classes with spaces. Commas are also accepted for compatibility. |
-| `timeout` | Duration | Execution timeout (e.g. `900s`) |
+| `timeout` | Duration | Execution timeout (e.g. `900s`). An agent's wait for human input does not consume this budget. On a human node, this is the response deadline. |
 | `max_visits` | Integer | Max times this node can execute in a run. Overrides the graph-level `max_node_visits` for this node. |
 | `max_retries` | Integer | Override default retry count |
 | `retry_policy` | String | Named preset: `none`, `standard`, `aggressive`, `linear`, `patient` |
