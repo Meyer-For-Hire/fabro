@@ -3,7 +3,7 @@ use std::convert::TryFrom;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use fabro_types::LlmOutputKind;
+use fabro_types::{INITIAL_SUBAGENT_GENERATION, LlmOutputKind};
 use fabro_workflow::outcome::{StageOutcome, format_cost};
 use indicatif::ProgressBar;
 
@@ -606,17 +606,26 @@ impl StageDisplay {
         );
     }
 
-    pub(super) fn on_subagent_spawned(
+    /// Show a subagent starting work. Generation 1 is the spawn; a later
+    /// generation is another turn in the same child session, so it reads as a
+    /// return to work rather than a new agent.
+    pub(super) fn on_subagent_started(
         &mut self,
         renderer: &ProgressRenderer,
         stage_node_id: &str,
         agent_id: &str,
         task: &str,
+        generation: u64,
     ) {
         if !self.verbose {
             return;
         }
 
+        let (glyph, turn) = if generation > INITIAL_SUBAGENT_GENERATION {
+            ("\u{21bb}", format!("turn {generation} "))
+        } else {
+            ("\u{25b8}", String::new())
+        };
         self.insert_subagent_line_for_stage(
             renderer,
             stage_node_id,
@@ -624,7 +633,7 @@ impl StageDisplay {
                 .styles()
                 .dim
                 .apply_to(format!(
-                    "\u{25b8} subagent[{agent_id}] \"{}\"",
+                    "{glyph} subagent[{agent_id}] {turn}\"{}\"",
                     styles::truncate(task, 50)
                 ))
                 .to_string(),

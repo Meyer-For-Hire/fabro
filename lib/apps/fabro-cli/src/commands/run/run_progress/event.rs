@@ -189,10 +189,13 @@ pub(super) enum ProgressEvent {
     LlmRequestFinished {
         stage_node_id: String,
     },
-    SubagentSpawned {
+    /// A subagent started work. Generation 1 is the spawn; later generations
+    /// are further turns in the same child session.
+    SubagentStarted {
         stage_node_id: String,
         agent_id:      String,
         task:          String,
+        generation:    u64,
     },
     SubagentCompleted {
         stage_node_id: String,
@@ -426,10 +429,17 @@ pub(super) fn from_run_event(stored: &RunEvent) -> Option<ProgressEvent> {
                 stage_node_id: node_id,
             })
         }
-        EventBody::AgentSubSpawned(props) => Some(ProgressEvent::SubagentSpawned {
+        EventBody::AgentSubSpawned(props) => Some(ProgressEvent::SubagentStarted {
             stage_node_id: node_id,
             agent_id:      props.agent_id.clone(),
             task:          props.task.clone(),
+            generation:    props.generation,
+        }),
+        EventBody::AgentSubTurnStarted(props) => Some(ProgressEvent::SubagentStarted {
+            stage_node_id: node_id,
+            agent_id:      props.agent_id.clone(),
+            task:          props.task.clone(),
+            generation:    props.generation,
         }),
         EventBody::AgentSubCompleted(props) => Some(ProgressEvent::SubagentCompleted {
             stage_node_id: node_id,

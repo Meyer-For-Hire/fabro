@@ -378,16 +378,29 @@ pub struct AgentLlmFirstOutputProps {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentSubSpawnedProps {
-    pub agent_id: String,
-    pub depth:    usize,
-    pub task:     String,
-    pub visit:    u32,
+    pub agent_id:   String,
+    pub depth:      usize,
+    pub task:       String,
+    #[serde(default = "initial_subagent_generation")]
+    pub generation: u64,
+    pub visit:      u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentSubTurnStartedProps {
+    pub agent_id:   String,
+    pub depth:      usize,
+    pub task:       String,
+    pub generation: u64,
+    pub visit:      u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentSubCompletedProps {
     pub agent_id:   String,
     pub depth:      usize,
+    #[serde(default = "initial_subagent_generation")]
+    pub generation: u64,
     pub success:    bool,
     pub turns_used: usize,
     pub visit:      u32,
@@ -395,17 +408,32 @@ pub struct AgentSubCompletedProps {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentSubFailedProps {
-    pub agent_id: String,
-    pub depth:    usize,
-    pub error:    Value,
-    pub visit:    u32,
+    pub agent_id:   String,
+    pub depth:      usize,
+    #[serde(default = "initial_subagent_generation")]
+    pub generation: u64,
+    pub error:      Value,
+    pub visit:      u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentSubClosedProps {
-    pub agent_id: String,
-    pub depth:    usize,
-    pub visit:    u32,
+    pub agent_id:   String,
+    pub depth:      usize,
+    #[serde(default = "initial_subagent_generation")]
+    pub generation: u64,
+    pub visit:      u32,
+}
+
+/// The generation of a subagent's first turn. Events stored before subagent
+/// session reuse existed carry no generation, so they read back as this.
+pub const INITIAL_SUBAGENT_GENERATION: u64 = 1;
+
+/// Serde default for the generation of a stored subagent event. Public so
+/// crates with their own subagent event types share this one definition.
+#[must_use]
+pub const fn initial_subagent_generation() -> u64 {
+    INITIAL_SUBAGENT_GENERATION
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
