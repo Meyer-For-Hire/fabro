@@ -98,7 +98,7 @@ cargo nextest run -p fabro-cli --test it runner
 
 - [ ] Add `fabro_tools = true` to the `[run.agent]` generated sample.
 - [ ] Document that the setting defaults to `false`.
-- [ ] Document that the setting controls built-in Fabro run-management tools and is separate from ordinary agent `permissions` and `[run.agent.mcps]`.
+- [ ] Document that the setting controls built-in Fabro run-management tools and is separate from `[run.agent.mcps]`.
 - [ ] Run:
 
 ```bash

@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use super::run::McpServerSettings;
+use crate::session::PermissionLevel;
 
 /// A structurally resolved `[cli]` view for consumers.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -49,17 +50,9 @@ pub struct CliExecModelSettings {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CliExecAgentSettings {
-    pub permissions: Option<AgentPermissions>,
+    pub permissions: Option<PermissionLevel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcps:        Option<HashMap<String, McpServerSettings>>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum AgentPermissions {
-    ReadOnly,
-    ReadWrite,
-    Full,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

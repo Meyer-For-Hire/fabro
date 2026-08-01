@@ -1,9 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use fabro_model::{AgentProfileKind, BillingPolicy, CodecKind, ProviderAuthConfig};
-use fabro_types::settings::cli::{
-    AgentPermissions, CliAuthStrategy, OutputFormat, OutputVerbosity,
-};
+use fabro_types::PermissionLevel;
+use fabro_types::settings::cli::{CliAuthStrategy, OutputFormat, OutputVerbosity};
 use fabro_types::settings::run::{
     ApprovalMode, EnvironmentNetworkMode, EnvironmentProvider, MergeStrategy, RunMode,
 };
@@ -74,7 +73,7 @@ impl_combine_or_option!(
     CliAuthStrategy,
     OutputFormat,
     OutputVerbosity,
-    AgentPermissions,
+    PermissionLevel,
     ApprovalMode,
     HookAgentMarker,
     HookTlsMode,
@@ -309,7 +308,7 @@ mod tests {
         assert_option_leaf(CliAuthStrategy::None, CliAuthStrategy::Jwt);
         assert_option_leaf(OutputFormat::Json, OutputFormat::Text);
         assert_option_leaf(OutputVerbosity::Quiet, OutputVerbosity::Verbose);
-        assert_option_leaf(AgentPermissions::ReadOnly, AgentPermissions::Full);
+        assert_option_leaf(PermissionLevel::ReadOnly, PermissionLevel::Full);
         assert_option_leaf(ApprovalMode::Auto, ApprovalMode::Prompt);
         assert_option_leaf(HookAgentMarker::Enabled, HookAgentMarker::Enabled);
         assert_option_leaf(HookTlsMode::NoVerify, HookTlsMode::Verify);
