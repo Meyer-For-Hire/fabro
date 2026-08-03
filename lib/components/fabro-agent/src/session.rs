@@ -1532,10 +1532,13 @@ impl Session {
                 compaction_failed = self.compact_if_needed().await;
             }
 
-            self.inject_task_reminder_if_needed();
+            // Keep generated directives local to the round until its assistant
+            // response commits. An interrupted round must not leave a system
+            // message behind for later steering to follow.
+            let pending_task_reminder = self.task_reminder_if_needed();
 
             // Build request
-            let built_request = self.build_request();
+            let built_request = self.build_request(pending_task_reminder.as_deref());
             let local_context_window = built_request.context_window.clone();
             let request = built_request.request;
 
@@ -1887,6 +1890,12 @@ impl Session {
             *usage_accumulator += usage.clone();
             UsdMicros::accumulate(cost_accumulator, response.cost_usd.map(UsdMicros::from_usd));
 
+            if let Some(reminder) = pending_task_reminder {
+                self.history.push(Message::System {
+                    content:   reminder,
+                    timestamp: SystemTime::now(),
+                });
+            }
             self.history.push(Message::Assistant {
                 content: text.clone(),
                 tool_calls: tool_calls.clone(),
@@ -2123,12 +2132,15 @@ impl Session {
         }
     }
 
-    fn build_request(&self) -> BuiltRequest {
+    fn build_request(&self, pending_task_reminder: Option<&str>) -> BuiltRequest {
         let mut messages = Vec::new();
         if !self.system_prompt.trim().is_empty() {
             messages.push(LlmMessage::system(self.system_prompt.clone()));
         }
         messages.extend(self.history.convert_to_messages());
+        if let Some(reminder) = pending_task_reminder {
+            messages.push(LlmMessage::system(reminder));
+        }
 
         let tools_with_source = self.effective_tools();
         let tools: Vec<_> = tools_with_source
@@ -2180,19 +2192,14 @@ impl Session {
         }
     }
 
-    fn inject_task_reminder_if_needed(&mut self) {
+    fn task_reminder_if_needed(&self) -> Option<String> {
         let tools: Vec<_> = self
             .effective_tools()
             .into_iter()
             .map(|tool| tool.definition)
             .collect();
         let tool_names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
-        if let Some(reminder) = task_reminder::maybe_reminder(&self.history, &tool_names) {
-            self.history.push(Message::System {
-                content:   reminder,
-                timestamp: SystemTime::now(),
-            });
-        }
+        task_reminder::maybe_reminder(&self.history, &tool_names)
     }
 }
 
@@ -2538,6 +2545,56 @@ mod tests {
             if self.call_index.fetch_add(1, Ordering::SeqCst) == 0 {
                 self.first_started.notify_one();
                 return std::future::pending().await;
+            }
+            Ok(response_to_stream(self.response.clone()))
+        }
+    }
+
+    struct BlockingAfterFirstOutputProvider {
+        requests:   Mutex<Vec<Request>>,
+        response:   Response,
+        call_index: AtomicUsize,
+    }
+
+    impl BlockingAfterFirstOutputProvider {
+        fn new(response: Response) -> Self {
+            Self {
+                requests: Mutex::new(Vec::new()),
+                response,
+                call_index: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ProviderAdapter for BlockingAfterFirstOutputProvider {
+        fn name(&self) -> &'static str {
+            "mock"
+        }
+
+        async fn complete(&self, _request: &Request) -> Result<Response, LlmError> {
+            Err(LlmError::Configuration {
+                message: "BlockingAfterFirstOutputProvider does not implement complete()".into(),
+                source:  None,
+            })
+        }
+
+        async fn stream(&self, request: &Request) -> Result<StreamEventStream, LlmError> {
+            self.requests
+                .lock()
+                .expect("request capture lock poisoned")
+                .push(request.clone());
+            if self.call_index.fetch_add(1, Ordering::SeqCst) == 0 {
+                let first_output = StreamEvent::ToolCallStart {
+                    tool_call: ToolCall::new(
+                        "call_1",
+                        "TaskUpdate",
+                        serde_json::json!({"taskId": "1", "status": "completed"}),
+                    ),
+                };
+                return Ok(Box::pin(
+                    stream::iter([Ok(first_output)]).chain(stream::pending()),
+                ));
             }
             Ok(response_to_stream(self.response.clone()))
         }
@@ -2920,6 +2977,90 @@ mod tests {
         assert!(settled < steered);
         assert_eq!(provider.call_index.load(Ordering::SeqCst), 2);
         assert!(!control.is_waiting_for_steer());
+    }
+
+    #[tokio::test]
+    async fn interrupt_after_task_reminder_keeps_resumed_request_order_valid() {
+        let provider = Arc::new(BlockingAfterFirstOutputProvider::new(text_response(
+            "resumed",
+        )));
+        let client = make_client(provider.clone()).await;
+        let mut registry = ToolRegistry::new();
+        registry.register(make_named_noop_tool("TaskCreate"));
+        registry.register(make_named_noop_tool("TaskUpdate"));
+        let profile = Arc::new(TestProfile::with_tools(registry));
+        let env = Arc::new(MockSandbox::default());
+        let mut session = Session::new(client, profile, env, SessionOptions::default(), None);
+        for index in 0..10 {
+            session.history.push(Message::User {
+                content:   format!("turn {index}"),
+                timestamp: SystemTime::now(),
+            });
+            session.history.push(Message::Assistant {
+                content:        "done".into(),
+                tool_calls:     Vec::new(),
+                provider_parts: Vec::new(),
+                usage:          Box::<TokenCounts>::default(),
+                response_id:    format!("response_{index}"),
+                timestamp:      SystemTime::now(),
+            });
+        }
+
+        let control = session.control_handle();
+        let mut events = session.subscribe();
+        let control_for_controller = control.clone();
+        let controller = tokio::spawn(async move {
+            wait_for_agent_event(&mut events, |event| {
+                matches!(event, AgentEvent::LlmFirstOutput {
+                    kind: LlmOutputKind::ToolCall,
+                })
+            })
+            .await;
+            control_for_controller.interrupt(None);
+            wait_for_agent_event(&mut events, |event| {
+                matches!(event, AgentEvent::RoundInterrupted { generation: 1 })
+            })
+            .await;
+            control_for_controller.steer("wrap up now".into(), None);
+        });
+
+        timeout(Duration::from_secs(1), session.process_input("continue"))
+            .await
+            .expect("interrupted session should resume after steering")
+            .unwrap();
+        controller.await.unwrap();
+
+        let requests = provider
+            .requests
+            .lock()
+            .expect("request capture lock poisoned");
+        let interrupted = requests
+            .first()
+            .expect("the interrupted request should be captured");
+        assert!(
+            matches!(interrupted.messages.last(), Some(message)
+                if message.role == Role::System
+                    && message.text().contains("<system-reminder>")),
+            "the interrupted request should include the staged task reminder"
+        );
+        let resumed = requests
+            .get(1)
+            .expect("steering should trigger a second provider request");
+        assert!(
+            matches!(resumed.messages.as_slice(), [.., steering, reminder]
+                if steering.role == Role::User
+                    && steering.text() == "wrap up now"
+                    && reminder.role == Role::System
+                    && reminder.text().contains("<system-reminder>")),
+            "the resumed request should place steering before a newly staged reminder"
+        );
+        drop(requests);
+
+        assert!(
+            matches!(session.history.turns(), [.., Message::System { content: reminder, .. }, Message::Assistant { content, .. }]
+                if reminder.contains("<system-reminder>") && content == "resumed"),
+            "the reminder should commit with the successful assistant turn"
+        );
     }
 
     #[tokio::test]
