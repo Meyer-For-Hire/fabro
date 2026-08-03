@@ -3721,6 +3721,82 @@ enabled = true
     }
 
     #[test]
+    fn builtin_openrouter_includes_qwen3_8_max_when_enabled() {
+        let catalog = Catalog::from_builtin_with_overrides(&minimal_settings(
+            r"
+[providers.openrouter]
+enabled = true
+",
+        ))
+        .expect("enabled OpenRouter override should build from the built-in provider settings");
+
+        let model = catalog
+            .get_on_provider(&ProviderId::new("openrouter"), "qwen3.8-max")
+            .expect("OpenRouter Qwen3.8 Max should be present");
+        insta::assert_debug_snapshot!(model, @r#"
+        Model {
+            id: "qwen3.8-max",
+            provider: openrouter,
+            family: "qwen3",
+            display_name: "Qwen3.8 Max",
+            limits: ModelLimits {
+                context_window: 1000000,
+                max_output: Some(
+                    131072,
+                ),
+            },
+            training: None,
+            knowledge_cutoff: None,
+            features: ModelFeatures {
+                tools: true,
+                vision: true,
+                reasoning: true,
+                reasoning_effort: Levels,
+                prompt_cache: true,
+                cache_control_breakpoints: false,
+                sampling_params: true,
+            },
+            controls: ModelControls {
+                reasoning_effort: [
+                    Low,
+                    Medium,
+                    High,
+                    XHigh,
+                ],
+            },
+            costs: ModelCosts {
+                input_cost_per_mtok: Some(
+                    2.0,
+                ),
+                output_cost_per_mtok: Some(
+                    6.0,
+                ),
+                cache_input_cost_per_mtok: Some(
+                    0.25,
+                ),
+            },
+            estimated_output_tps: None,
+            aliases: [],
+            default: false,
+            small_default: false,
+            configured: false,
+        }
+        "#);
+
+        let settings = catalog
+            .model_settings_on_provider(&ProviderId::new("openrouter"), "qwen3.8-max")
+            .expect("OpenRouter Qwen3.8 Max settings should be present");
+        assert_eq!(settings.api_id, "qwen/qwen3.8-max");
+        assert!(settings.reasoning_by_default);
+        assert_eq!(settings.controls.reasoning_effort, vec![
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::XHigh,
+        ]);
+    }
+
+    #[test]
     fn builtin_modal_provider_is_opt_in() {
         let modal = ProviderId::new("modal");
         let builtin = Catalog::builtin();
