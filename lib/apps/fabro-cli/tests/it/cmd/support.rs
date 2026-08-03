@@ -845,11 +845,6 @@ async fn seed_git_backed_changed_run(context: &TestContext) -> SeededGitRunSetup
             "branch": "main",
             "sha": base_sha,
             "dirty": "clean",
-            "push_outcome": {
-                "type": "succeeded",
-                "remote": "origin",
-                "branch": "main",
-            },
         })),
     )
     .await;
@@ -889,11 +884,6 @@ async fn seed_git_backed_noop_run(context: &TestContext) -> RunSetup {
             "branch": "main",
             "sha": base_sha,
             "dirty": "clean",
-            "push_outcome": {
-                "type": "succeeded",
-                "remote": "origin",
-                "branch": "main",
-            },
         })),
     )
     .await;

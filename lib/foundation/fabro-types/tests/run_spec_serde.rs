@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use fabro_types::graph::Graph;
-use fabro_types::run::{DirtyStatus, ForkSourceRef, GitContext, PreRunPushOutcome, RunSpec};
+use fabro_types::run::{DirtyStatus, ForkSourceRef, GitContext, RunSpec};
 use fabro_types::settings::InterpString;
 use fabro_types::settings::run::RunGoal;
 use fabro_types::test_support::test_run_provenance;
@@ -32,14 +32,10 @@ fn run_spec_round_trips_templated_settings() {
         manifest_blob:    None,
         definition_blob:  None,
         git:              Some(GitContext {
-            origin_url:   "https://github.com/fabro-sh/fabro.git".to_string(),
-            branch:       "main".to_string(),
-            sha:          Some("abc123".to_string()),
-            dirty:        DirtyStatus::Clean,
-            push_outcome: PreRunPushOutcome::Succeeded {
-                remote: "origin".to_string(),
-                branch: "main".to_string(),
-            },
+            origin_url: "https://github.com/fabro-sh/fabro.git".to_string(),
+            branch:     "main".to_string(),
+            sha:        Some("abc123".to_string()),
+            dirty:      DirtyStatus::Clean,
         }),
         fork_source_ref:  Some(ForkSourceRef {
             source_run_id:  fixtures::RUN_2,
@@ -58,7 +54,7 @@ fn run_spec_round_trips_templated_settings() {
     assert_eq!(json["git"]["branch"], "main");
     assert_eq!(json["git"]["sha"], "abc123");
     assert_eq!(json["git"]["dirty"], "clean");
-    assert_eq!(json["git"]["push_outcome"]["type"], "succeeded");
+    assert!(json["git"].get("push_outcome").is_none());
     assert_eq!(json["fork_source_ref"]["checkpoint_sha"], "def456");
     assert_eq!(json["automation"]["id"], "nightly");
     assert_eq!(json["automation"]["trigger_id"], "schedule_1");

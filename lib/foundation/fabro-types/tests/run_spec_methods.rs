@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use fabro_types::graph::Graph;
-use fabro_types::run::{DirtyStatus, GitContext, PreRunPushOutcome, RunSpec};
+use fabro_types::run::{DirtyStatus, GitContext, RunSpec};
 use fabro_types::settings::{ProjectNamespace, WorkflowNamespace};
 use fabro_types::test_support::test_run_provenance;
 use fabro_types::{WorkflowSettings, fixtures};
@@ -32,14 +32,10 @@ fn sample_run_spec() -> RunSpec {
         manifest_blob: None,
         definition_blob: None,
         git: Some(GitContext {
-            origin_url:   "https://github.com/fabro-sh/fabro.git".to_string(),
-            branch:       "main".to_string(),
-            sha:          Some("abc123".to_string()),
-            dirty:        DirtyStatus::Dirty,
-            push_outcome: PreRunPushOutcome::SkippedRemoteMismatch {
-                remote:          "https://github.com/user/fork.git".to_string(),
-                repo_origin_url: "https://github.com/fabro-sh/fabro.git".to_string(),
-            },
+            origin_url: "https://github.com/fabro-sh/fabro.git".to_string(),
+            branch:     "main".to_string(),
+            sha:        Some("abc123".to_string()),
+            dirty:      DirtyStatus::Dirty,
         }),
         fork_source_ref: None,
     }
