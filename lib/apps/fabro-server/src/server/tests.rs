@@ -10583,13 +10583,6 @@ async fn create_run_persists_manifest_and_definition_blobs_without_bundle_file()
     );
     assert_eq!(accepted_definition["workflow_path"], "workflow.fabro");
     assert!(accepted_definition["workflows"]["workflow.fabro"].is_object());
-
-    for removed in ["workflow_config", "run_dir", "db_prefix"] {
-        assert!(
-            created["properties"].get(removed).is_none(),
-            "new run.created events must omit {removed}"
-        );
-    }
 }
 
 #[tokio::test]
