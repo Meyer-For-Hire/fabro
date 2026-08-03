@@ -25,10 +25,9 @@ describe("buildRunManifest", () => {
   test("welcome draft → minimal manifest with inline DOT + TOML", () => {
     const manifest = buildRunManifest(createInitialDraft());
     expect(manifest.version).toBe(1);
-    expect(manifest.target.identifier).toBe("playground_workflow");
-    expect(manifest.target.path).toBe(
-      ".fabro/workflows/playground_workflow/workflow.fabro",
-    );
+    expect(manifest.target).toEqual({
+      path: ".fabro/workflows/playground_workflow/workflow.fabro",
+    });
     const workflow =
       manifest.workflows[".fabro/workflows/playground_workflow/workflow.fabro"];
     expect(workflow).toBeDefined();
@@ -38,17 +37,16 @@ describe("buildRunManifest", () => {
     expect(workflow!.config?.source).toContain("[run.sandbox]");
   });
 
-  test("named draft → title and identifier use the snake_case name", () => {
+  test("named draft → title and target path use the snake_case name", () => {
     const draft = {
       ...createInitialDraft(),
       name: "release_notes",
       goal: "Generate release notes.",
     };
     const manifest = buildRunManifest(draft);
-    expect(manifest.target.identifier).toBe("release_notes");
-    expect(manifest.target.path).toBe(
-      ".fabro/workflows/release_notes/workflow.fabro",
-    );
+    expect(manifest.target).toEqual({
+      path: ".fabro/workflows/release_notes/workflow.fabro",
+    });
     expect(manifest.title).toBe("Generate release notes.");
     expect(manifest.cwd).toBe("/tmp/fabro-playground");
   });
