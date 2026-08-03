@@ -1,7 +1,9 @@
-#![expect(
-    clippy::disallowed_methods,
-    reason = "sync workflow creation path: reads workflow.toml during workflow load and persists \
-              .fabro scaffolding outside the Tokio execution hot path"
+#![cfg_attr(
+    test,
+    expect(
+        clippy::disallowed_methods,
+        reason = "tests write workflow fixture files synchronously before exercising async creation"
+    )
 )]
 
 use std::collections::{BTreeMap, HashMap};
@@ -156,7 +158,6 @@ pub struct CompiledRun {
     settings:             WorkflowSettings,
     raw_source:           String,
     workflow_slug:        Option<String>,
-    workflow_config:      Option<String>,
     dot_path:             Option<PathBuf>,
     definition:           Option<RunDefinition>,
     source_directory:     String,
@@ -181,7 +182,6 @@ pub struct MaterializedRun {
     settings:         WorkflowSettings,
     raw_source:       String,
     workflow_slug:    Option<String>,
-    workflow_config:  Option<String>,
     dot_path:         Option<PathBuf>,
     definition:       Option<RunDefinition>,
     source_directory: String,
@@ -290,10 +290,6 @@ pub fn compile_create_run(
     .map_err(|err| Error::Parse(err.to_string()))?;
     let settings = resolved.settings;
     let labels = settings.combined_labels();
-    let workflow_config = resolved
-        .workflow_toml_path
-        .as_deref()
-        .and_then(|path| std::fs::read_to_string(path).ok());
     let source_name = resolved
         .dot_path
         .as_ref()
@@ -349,7 +345,6 @@ pub fn compile_create_run(
         settings,
         raw_source: resolved.raw_source,
         workflow_slug: resolved.workflow_slug,
-        workflow_config,
         dot_path: resolved.dot_path,
         definition,
         source_directory: resolved.working_directory.to_string_lossy().to_string(),
@@ -368,7 +363,6 @@ pub fn materialize_create_run(
         settings,
         raw_source,
         workflow_slug,
-        workflow_config,
         dot_path,
         definition,
         source_directory,
@@ -386,7 +380,6 @@ pub fn materialize_create_run(
         settings,
         raw_source,
         workflow_slug,
-        workflow_config,
         dot_path,
         definition,
         source_directory,
@@ -458,7 +451,6 @@ pub async fn persist_create_run(
         settings,
         raw_source,
         workflow_slug: _,
-        workflow_config,
         dot_path,
         definition,
         source_directory,
@@ -493,7 +485,6 @@ pub async fn persist_create_run(
         store,
         &persisted,
         &raw_source,
-        workflow_config,
         submitted_manifest_bytes.as_deref(),
         definition.as_ref(),
         title,
@@ -514,7 +505,6 @@ async fn persist_created_run(
     store: &Database,
     persisted: &Persisted,
     workflow_source: &str,
-    workflow_config: Option<String>,
     submitted_manifest_bytes: Option<&[u8]>,
     accepted_definition: Option<&RunDefinition>,
     explicit_title: Option<String>,
@@ -554,17 +544,14 @@ async fn persist_created_run(
                     .map_err(|err| Error::engine(err.to_string()))?,
             ),
             workflow_source: (!workflow_source.is_empty()).then(|| workflow_source.to_string()),
-            workflow_config,
             labels: record
                 .labels
                 .clone()
                 .into_iter()
                 .collect::<BTreeMap<_, _>>(),
-            run_dir: persisted.run_dir().display().to_string(),
             source_directory: record.source_directory.clone(),
             workflow_slug: record.workflow_slug.clone(),
             automation: record.automation.clone(),
-            db_prefix: None,
             provenance: record.provenance.clone(),
             manifest_blob,
             git: record.git.clone(),
@@ -1753,20 +1740,9 @@ reasoning = false
             web_url: None,
         };
         let catalog = test_catalog();
-        let workflow_config_path = dir.path().join("workflow.toml");
-        std::fs::write(
-            &workflow_config_path,
-            "_version = 1\n[workflow]\ngraph = \"workflow.fabro\"\n",
-        )
-        .unwrap();
         let compiled = compile_create_run(compile_input(&request), Arc::clone(&catalog)).unwrap();
-        assert_eq!(
-            compiled.workflow_config.as_deref(),
-            Some("_version = 1\n[workflow]\ngraph = \"workflow.fabro\"\n")
-        );
 
         std::fs::write(&dot_path, "this is no longer a graph").unwrap();
-        std::fs::write(&workflow_config_path, "changed after compilation").unwrap();
 
         let materialized = materialize_create_run(compiled, catalog.as_ref()).unwrap();
         let metadata = persistence_metadata(&request, fixtures::RUN_2, &storage_root);
@@ -1797,10 +1773,6 @@ reasoning = false
         assert_eq!(
             created.workflow_source.as_deref(),
             Some(compiled_source.as_str())
-        );
-        assert_eq!(
-            created.workflow_config.as_deref(),
-            Some("_version = 1\n[workflow]\ngraph = \"workflow.fabro\"\n")
         );
         let manifest_blob = created
             .manifest_blob

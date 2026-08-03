@@ -987,7 +987,6 @@ mod tests {
                 "properties": {
                     "settings": WorkflowSettings::default(),
                     "graph": Graph::new("test"),
-                    "run_dir": "/tmp/test",
                     "provenance": test_support::test_run_provenance(),
                 },
             }),

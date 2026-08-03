@@ -115,11 +115,6 @@ fn events_completed_run_reads_store_without_progress_jsonl() {
         r#""id":"[0-9a-f-]+""#.to_string(),
         r#""id":"[EVENT_ID]""#.to_string(),
     ));
-    filters.push((
-        r#""run_dir":"(?:\[DRY_RUN_DIR\]|\[STORAGE_DIR\]/scratch/REDACTED)""#.to_string(),
-        r#""run_dir":"[RUN_DIR]""#.to_string(),
-    ));
-
     let mut cmd = context.command();
     cmd.args(["events", "--tail", "2", &run.run_id]);
 
@@ -145,10 +140,6 @@ fn events_tail_limits_output() {
     filters.push((
         r#""id":"[0-9a-f-]+""#.to_string(),
         r#""id":"[EVENT_ID]""#.to_string(),
-    ));
-    filters.push((
-        r#""run_dir":"(?:\[DRY_RUN_DIR\]|\[STORAGE_DIR\]/scratch/REDACTED)""#.to_string(),
-        r#""run_dir":"[RUN_DIR]""#.to_string(),
     ));
     let mut cmd = context.command();
     cmd.args(["events", "--tail", "2", &run.run_id]);

@@ -2069,7 +2069,6 @@ async fn mcp_events_decodes_run_created_with_model_keyed_fallbacks() {
             "settings": settings,
             "graph": Graph::new("Remote Workflow"),
             "labels": {},
-            "run_dir": "/tmp/run",
             "source_directory": "/srv/repo",
             "provenance": test_support::test_run_provenance()
         },

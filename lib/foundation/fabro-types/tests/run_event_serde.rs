@@ -22,9 +22,7 @@ fn run_created_props_round_trip_templated_settings() {
         settings:         templated_settings(),
         graph:            Graph::new("ship"),
         workflow_source:  Some("digraph Ship { start -> exit }".to_string()),
-        workflow_config:  Some("[run]\ngoal = \"Ship {{ env.TASK }}\"".to_string()),
         labels:           BTreeMap::from([("team".to_string(), "platform".to_string())]),
-        run_dir:          "/tmp/run".to_string(),
         source_directory: Some("/Users/client/project".to_string()),
         workflow_slug:    Some("demo".to_string()),
         automation:       Some(AutomationRef {
@@ -32,7 +30,6 @@ fn run_created_props_round_trip_templated_settings() {
             name:       Some("Nightly".to_string()),
             trigger_id: Some("schedule_1".to_string()),
         }),
-        db_prefix:        Some("run_".to_string()),
         provenance:       test_run_provenance(),
         manifest_blob:    None,
         git:              Some(GitContext {
@@ -91,13 +88,10 @@ fn run_created_props_omits_web_url_when_absent() {
         settings:         WorkflowSettings::default(),
         graph:            Graph::new("ship"),
         workflow_source:  None,
-        workflow_config:  None,
         labels:           BTreeMap::new(),
-        run_dir:          "/tmp/run".to_string(),
         source_directory: None,
         workflow_slug:    None,
         automation:       None,
-        db_prefix:        None,
         provenance:       test_run_provenance(),
         manifest_blob:    None,
         git:              None,
@@ -135,7 +129,6 @@ fn run_created_props_defaults_additive_fields_for_legacy_events() {
         "settings": WorkflowSettings::default(),
         "graph": Graph::new("ship"),
         "labels": {},
-        "run_dir": "/tmp/run",
         "provenance": test_run_provenance()
     });
 

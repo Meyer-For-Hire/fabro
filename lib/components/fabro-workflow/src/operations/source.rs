@@ -35,15 +35,14 @@ pub(crate) struct ResolveWorkflowInput {
 
 #[derive(Clone)]
 pub(crate) struct ResolvedWorkflow {
-    pub raw_source:         String,
-    pub settings:           WorkflowSettings,
-    pub workflow_slug:      Option<String>,
-    pub workflow_toml_path: Option<PathBuf>,
-    pub dot_path:           Option<PathBuf>,
-    pub current_dir:        Option<PathBuf>,
-    pub file_resolver:      Option<Arc<dyn FileResolver>>,
-    pub goal_override:      Option<String>,
-    pub working_directory:  PathBuf,
+    pub raw_source:        String,
+    pub settings:          WorkflowSettings,
+    pub workflow_slug:     Option<String>,
+    pub dot_path:          Option<PathBuf>,
+    pub current_dir:       Option<PathBuf>,
+    pub file_resolver:     Option<Arc<dyn FileResolver>>,
+    pub goal_override:     Option<String>,
+    pub working_directory: PathBuf,
 }
 
 pub(crate) fn resolve_workflow(request: ResolveWorkflowInput) -> anyhow::Result<ResolvedWorkflow> {
@@ -60,7 +59,6 @@ pub(crate) fn resolve_workflow(request: ResolveWorkflowInput) -> anyhow::Result<
                 raw_source,
                 settings,
                 workflow_slug: location.slug,
-                workflow_toml_path: location.toml,
                 dot_path: Some(location.graph),
                 current_dir: Some(location.dir),
                 file_resolver: Some(Arc::new(FilesystemFileResolver::new(Some(
@@ -79,7 +77,6 @@ pub(crate) fn resolve_workflow(request: ResolveWorkflowInput) -> anyhow::Result<
                 raw_source: source,
                 settings,
                 workflow_slug: None,
-                workflow_toml_path: None,
                 dot_path: None,
                 current_dir: base_dir,
                 file_resolver: has_base_dir.then(|| {
@@ -100,7 +97,6 @@ pub(crate) fn resolve_workflow(request: ResolveWorkflowInput) -> anyhow::Result<
                 raw_source: workflow.source.clone(),
                 settings,
                 workflow_slug: workflow_slug_from_path(workflow.path.as_path()),
-                workflow_toml_path: None,
                 dot_path: Some(workflow.path.as_path().to_path_buf()),
                 current_dir: Some(workflow.current_dir()),
                 file_resolver: Some(workflow.file_resolver()),
