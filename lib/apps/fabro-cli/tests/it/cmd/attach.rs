@@ -916,7 +916,6 @@ fn attach_json_errors_without_prompting_for_human_input() {
               "login": "dev"
             }
           },
-          "run_dir": "[RUN_DIR]",
           "settings": {
             "project": {
               "description": null,

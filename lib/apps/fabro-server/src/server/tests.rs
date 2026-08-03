@@ -4569,13 +4569,10 @@ async fn append_default_run_created(run_store: &fabro_store::RunDatabase, run_id
         settings: serde_json::to_value(WorkflowSettings::default()).unwrap(),
         graph: serde_json::to_value(Graph::new("test")).unwrap(),
         workflow_source: None,
-        workflow_config: None,
         labels: std::collections::BTreeMap::default(),
-        run_dir: "/tmp".to_string(),
         source_directory: None,
         workflow_slug: None,
         automation: None,
-        db_prefix: None,
         provenance: test_support::test_run_provenance(),
         manifest_blob: None,
         git: None,
@@ -4623,13 +4620,10 @@ async fn create_slack_notification_run(
         settings: serde_json::to_value(settings).unwrap(),
         graph: serde_json::to_value(Graph::new(graph_name)).unwrap(),
         workflow_source: None,
-        workflow_config: None,
         labels: std::collections::BTreeMap::default(),
-        run_dir: "/tmp".to_string(),
         source_directory: None,
         workflow_slug: workflow_slug.map(str::to_string),
         automation: None,
-        db_prefix: None,
         provenance: test_support::test_run_provenance(),
         manifest_blob: None,
         git: None,
@@ -5699,13 +5693,10 @@ async fn list_run_stages_distinguishes_visits() {
             settings: serde_json::to_value(fabro_types::WorkflowSettings::default()).unwrap(),
             graph: serde_json::to_value(&graph).unwrap(),
             workflow_source: None,
-            workflow_config: None,
             labels: std::collections::BTreeMap::default(),
-            run_dir: String::new(),
             source_directory: None,
             workflow_slug: Some("test".to_string()),
             automation: None,
-            db_prefix: None,
             provenance: test_support::test_run_provenance(),
             manifest_blob: None,
             git: None,
@@ -5838,13 +5829,10 @@ async fn list_run_stages_exposes_execution_identity_for_resumed_stage() {
             settings: serde_json::to_value(fabro_types::WorkflowSettings::default()).unwrap(),
             graph: serde_json::to_value(&graph).unwrap(),
             workflow_source: None,
-            workflow_config: None,
             labels: std::collections::BTreeMap::default(),
-            run_dir: String::new(),
             source_directory: None,
             workflow_slug: Some("test".to_string()),
             automation: None,
-            db_prefix: None,
             provenance: test_support::test_run_provenance(),
             manifest_blob: None,
             git: None,
@@ -7045,13 +7033,10 @@ async fn create_completed_run_ready_for_pull_request(
             settings: serde_json::to_value(&run_spec.settings).unwrap(),
             graph: serde_json::to_value(&run_spec.graph).unwrap(),
             workflow_source: None,
-            workflow_config: None,
             labels: run_spec.labels.clone().into_iter().collect(),
-            run_dir: run_spec.source_directory.clone().unwrap_or_default(),
             source_directory: run_spec.source_directory.clone(),
             workflow_slug: run_spec.workflow_slug.clone(),
             automation: None,
-            db_prefix: None,
             provenance: run_spec.provenance.clone(),
             manifest_blob: None,
             git,
@@ -10599,9 +10584,12 @@ async fn create_run_persists_manifest_and_definition_blobs_without_bundle_file()
     assert_eq!(accepted_definition["workflow_path"], "workflow.fabro");
     assert!(accepted_definition["workflows"]["workflow.fabro"].is_object());
 
-    created["properties"]["run_dir"]
-        .as_str()
-        .expect("run.created should include run_dir");
+    for removed in ["workflow_config", "run_dir", "db_prefix"] {
+        assert!(
+            created["properties"].get(removed).is_none(),
+            "new run.created events must omit {removed}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -13869,13 +13857,10 @@ async fn create_preserved_local_sandbox_run(state: &Arc<AppState>, run_id: RunId
             settings: serde_json::to_value(settings).unwrap(),
             graph: serde_json::to_value(graph).unwrap(),
             workflow_source: None,
-            workflow_config: None,
             labels: std::collections::BTreeMap::default(),
-            run_dir: "/tmp/fabro-run".to_string(),
             source_directory: Some("/tmp/fabro-run".to_string()),
             workflow_slug: Some("test".to_string()),
             automation: None,
-            db_prefix: None,
             provenance: test_support::test_run_provenance(),
             manifest_blob: None,
             git: None,
@@ -14621,13 +14606,10 @@ async fn delete_run_retry_after_missing_provider_resource_removes_metadata() {
             settings: serde_json::to_value(fabro_types::WorkflowSettings::default()).unwrap(),
             graph: serde_json::to_value(graph).unwrap(),
             workflow_source: None,
-            workflow_config: None,
             labels: std::collections::BTreeMap::default(),
-            run_dir: "/tmp/fabro-run".to_string(),
             source_directory: Some("/tmp/fabro-run".to_string()),
             workflow_slug: Some("test".to_string()),
             automation: None,
-            db_prefix: None,
             provenance: test_support::test_run_provenance(),
             manifest_blob: None,
             git: None,

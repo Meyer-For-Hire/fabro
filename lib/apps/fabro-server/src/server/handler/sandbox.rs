@@ -1365,7 +1365,6 @@ mod retrieve_sandbox_tests {
                 "properties": {
                     "settings": WorkflowSettings::default(),
                     "graph": Graph::new("test"),
-                    "run_dir": "/tmp/test",
                     "provenance": test_support::test_run_provenance(),
                 },
             }),
