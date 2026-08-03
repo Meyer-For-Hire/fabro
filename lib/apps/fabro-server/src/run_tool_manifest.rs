@@ -25,7 +25,6 @@ pub fn build_run_tool_manifest(
         cli_overrides:        Some(CliLayer::default()),
         input_overrides:      spec.inputs.clone(),
         args:                 run_tool_manifest_args(spec),
-        run_id:               spec.run_id,
         environment_defaults: fabro_environment::seeded_catalog_layer(),
         user_settings_path:   Some(user_settings_path.to_path_buf()),
     })
@@ -106,7 +105,6 @@ mod tests {
     fn create_run_spec(workflow: &str) -> ValidatedCreateRunSpec {
         ValidatedCreateRunSpec::try_from(CreateRunSpec {
             workflow:         workflow.to_string(),
-            run_id:           None,
             parent_id:        None,
             cwd:              None,
             goal:             None,
@@ -164,7 +162,6 @@ mod tests {
     fn manifest_args_preserve_input_provenance() {
         let spec = ValidatedCreateRunSpec::try_from(CreateRunSpec {
             workflow:         "simple".to_string(),
-            run_id:           None,
             parent_id:        None,
             cwd:              None,
             goal:             None,
@@ -196,7 +193,6 @@ mod tests {
     fn run_overrides_preserve_goal_file_as_file_goal() {
         let spec = ValidatedCreateRunSpec::try_from(CreateRunSpec {
             workflow:         "implement-plan".to_string(),
-            run_id:           None,
             parent_id:        None,
             cwd:              None,
             goal:             None,

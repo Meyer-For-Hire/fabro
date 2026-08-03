@@ -9052,10 +9052,6 @@ components:
           type: integer
           description: Manifest schema version.
           example: 1
-        run_id:
-          type: ["string", "null"]
-          description: Optional pre-generated run ID to use instead of allocating a new ULID.
-          example: "01HV6D7S5YF4Z4B2M7K4N0Q6T9"
         parent_id:
           type: ["string", "null"]
           description: Optional orchestration parent run ID. Fork and rewind lineage use separate fields and should not set this value.

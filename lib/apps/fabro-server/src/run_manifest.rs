@@ -157,12 +157,6 @@ pub(crate) fn prepare_manifest_with_environment_defaults(
         .map(|title| fabro_types::normalize_explicit_run_title(title.as_str()))
         .transpose()?;
     manifest
-        .run_id
-        .as_deref()
-        .map(str::parse::<RunId>)
-        .transpose()
-        .context("invalid run ID")?;
-    manifest
         .parent_id
         .as_deref()
         .map(str::parse::<RunId>)
@@ -1404,7 +1398,6 @@ mod tests {
             git:       None,
             goal:      None,
             parent_id: None,
-            run_id:    None,
             title:     None,
             target:    types::ManifestTarget {
                 identifier: "workflow.fabro".to_string(),

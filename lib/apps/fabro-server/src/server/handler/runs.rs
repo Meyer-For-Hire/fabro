@@ -550,6 +550,8 @@ async fn create_run(
 pub(crate) struct CreateRunFromManifestRequest {
     pub(crate) manifest:                 RunManifest,
     pub(crate) submitted_manifest_bytes: Vec<u8>,
+    /// Run ID preallocated by server-side automation code, never supplied by
+    /// an HTTP create body.
     pub(crate) explicit_run_id:          Option<RunId>,
     pub(crate) explicit_title_supplied:  bool,
     pub(crate) actor:                    Principal,
@@ -650,12 +652,6 @@ fn manifest_run_identity(
         .as_ref()
         .map(|title| fabro_types::normalize_explicit_run_title(title.as_str()))
         .transpose()?;
-    let manifest_run_id = manifest
-        .run_id
-        .as_deref()
-        .map(str::parse::<RunId>)
-        .transpose()
-        .context("invalid run ID")?;
     let parent_id = manifest
         .parent_id
         .as_deref()
@@ -663,7 +659,7 @@ fn manifest_run_identity(
         .transpose()
         .context("invalid parent run ID")?;
     Ok(ManifestRunIdentity {
-        run_id: explicit_run_id.or(manifest_run_id),
+        run_id: explicit_run_id,
         parent_id,
         title,
     })

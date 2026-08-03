@@ -20,8 +20,9 @@ use fabro_types::{EventBody, FailureReason, RunEvent, StageId};
 use httpmock::MockServer;
 
 use super::support::{
-    command_log_text, find_run_dir, local_dev_token, output_stderr, run_events, run_state,
-    server_endpoint, server_target, wait_for_event_names, wait_for_status, write_gated_workflow,
+    command_log_text, created_run_id, find_run_dir, local_dev_token, output_stderr, run_events,
+    run_state, server_endpoint, server_target, wait_for_event_names, wait_for_status,
+    write_gated_workflow,
 };
 use crate::support::{issue_test_worker_jwt, seed_dev_token_auth, unique_run_id};
 
@@ -243,7 +244,6 @@ fn worker_requires_fabro_worker_token_env() {
 #[test]
 fn runner_uses_cached_graph_after_source_deleted() {
     let context = auth_context();
-    let run_id = unique_run_id();
     let workflow_path = context.temp_dir.join("workflow.fabro");
 
     context.write_temp(
@@ -257,18 +257,17 @@ digraph CachedGraph {
 ",
     );
 
-    context
+    let create = context
         .command()
         .args([
             "create",
             "--dry-run",
             "--auto-approve",
-            "--run-id",
-            run_id.as_str(),
             workflow_path.to_str().unwrap(),
         ])
         .assert()
         .success();
+    let run_id = created_run_id(create.get_output());
 
     let run_dir = context.find_run_dir(&run_id);
     let server = server_target(&context.storage_dir);
@@ -298,7 +297,6 @@ digraph CachedGraph {
 #[test]
 fn runner_local_dry_runs_ignore_github_app_configuration() {
     let context = auth_context();
-    let run_id = unique_run_id();
     let workflow_path = context.temp_dir.join("workflow.fabro");
 
     context.write_home(
@@ -324,18 +322,17 @@ digraph GitHubApp {
 ",
     );
 
-    context
+    let create = context
         .command()
         .args([
             "create",
             "--dry-run",
             "--auto-approve",
-            "--run-id",
-            run_id.as_str(),
             workflow_path.to_str().unwrap(),
         ])
         .assert()
         .success();
+    let run_id = created_run_id(create.get_output());
 
     let run_dir = context.find_run_dir(&run_id);
     context.write_home(".fabro/settings.toml", "_version = 1\n");
@@ -361,7 +358,6 @@ digraph GitHubApp {
 #[test]
 fn runner_runs_without_run_json_when_run_id_is_explicit() {
     let context = auth_context();
-    let run_id = unique_run_id();
     let workflow_path = context.temp_dir.join("workflow.fabro");
 
     context.write_temp(
@@ -375,18 +371,17 @@ digraph DetachedStoreOnly {
 ",
     );
 
-    context
+    let create = context
         .command()
         .args([
             "create",
             "--dry-run",
             "--auto-approve",
-            "--run-id",
-            run_id.as_str(),
             workflow_path.to_str().unwrap(),
         ])
         .assert()
         .success();
+    let run_id = created_run_id(create.get_output());
 
     let run_dir = context.find_run_dir(&run_id);
     let server = server_target(&context.storage_dir);
@@ -469,7 +464,6 @@ methods = ["dev-token"]
     )
     .expect("writing leak-probe workflow");
 
-    let run_id = unique_run_id();
     let dev_token = local_dev_token(&storage_dir).expect("managed server should have a dev token");
     let target = ServerTarget::unix_socket_path(&socket_path).expect("socket path should parse");
     seed_dev_token_auth(&context.home_dir, &target, &dev_token);
@@ -478,8 +472,6 @@ methods = ["dev-token"]
         .args([
             "--server",
             socket_path.to_str().expect("socket path should be UTF-8"),
-            "--run-id",
-            run_id.as_str(),
             "--detach",
             "--auto-approve",
             "--environment",
@@ -496,6 +488,7 @@ methods = ["dev-token"]
         String::from_utf8_lossy(&run_output.stdout),
         String::from_utf8_lossy(&run_output.stderr)
     );
+    let run_id = created_run_id(&run_output);
 
     let run_dir = find_run_dir(&storage_dir, &run_id).expect("leak-probe run dir should exist");
     wait_for_status(&run_dir, &["succeeded"]);
@@ -704,7 +697,6 @@ fn runner_reports_malformed_run_state_without_prefetching_events() {
 #[test]
 fn detached_run_answers_pending_question_without_interview_scratch_files() {
     let context = auth_context();
-    let run_id = unique_run_id();
     let workflow_path = context.temp_dir.join("human-gate.fabro");
 
     context.write_temp(
@@ -731,8 +723,6 @@ fn detached_run_answers_pending_question_without_interview_scratch_files() {
         .args([
             "run",
             "--detach",
-            "--run-id",
-            run_id.as_str(),
             "--environment",
             "local",
             workflow_path.to_str().unwrap(),
@@ -746,6 +736,7 @@ fn detached_run_answers_pending_question_without_interview_scratch_files() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    let run_id = created_run_id(&output);
 
     let run_dir = context.find_run_dir(&run_id);
     let runtime = tokio::runtime::Runtime::new().expect("test runtime should build");
@@ -796,7 +787,6 @@ fn detached_run_answers_pending_question_without_interview_scratch_files() {
 #[test]
 fn detached_run_cancel_reaches_worker_over_control_websocket() {
     let context = auth_context();
-    let run_id = unique_run_id();
     let workflow_path = context.temp_dir.join("cancel-over-control-websocket.fabro");
     let _gate = write_gated_workflow(
         &workflow_path,
@@ -809,8 +799,6 @@ fn detached_run_cancel_reaches_worker_over_control_websocket() {
         .args([
             "run",
             "--detach",
-            "--run-id",
-            run_id.as_str(),
             "--environment",
             "local",
             workflow_path.to_str().unwrap(),
@@ -824,6 +812,7 @@ fn detached_run_cancel_reaches_worker_over_control_websocket() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    let run_id = created_run_id(&output);
 
     let run_dir = context.find_run_dir(&run_id);
     wait_for_event_names(&run_dir, &["run.running"]);
@@ -857,23 +846,21 @@ fn detached_run_cancel_reaches_worker_over_control_websocket() {
 #[test]
 fn worker_exits_after_sigterm_cancel_even_when_stdin_stays_open() {
     let context = auth_context();
-    let run_id = unique_run_id();
     let workflow_path = context.temp_dir.join("cancel-gated.fabro");
     let _gate = write_gated_workflow(&workflow_path, "cancel_gated", "Wait for cancellation");
 
-    context
+    let create = context
         .command()
         .args([
             "create",
             "--auto-approve",
             "--environment",
             "local",
-            "--run-id",
-            run_id.as_str(),
             workflow_path.to_str().unwrap(),
         ])
         .assert()
         .success();
+    let run_id = created_run_id(create.get_output());
 
     let run_dir = context.find_run_dir(&run_id);
     let server = server_target(&context.storage_dir);

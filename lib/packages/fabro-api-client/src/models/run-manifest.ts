@@ -41,10 +41,6 @@ export interface RunManifest {
      */
     'version': number;
     /**
-     * Optional pre-generated run ID to use instead of allocating a new ULID.
-     */
-    'run_id'?: string | null;
-    /**
      * Optional orchestration parent run ID. Fork and rewind lineage use separate fields and should not set this value.
      */
     'parent_id'?: string | null;
