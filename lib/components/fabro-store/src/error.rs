@@ -21,8 +21,6 @@ pub enum Error {
     },
     #[error("Run not found: {0}")]
     RunNotFound(String),
-    #[error("Run already exists: {0}")]
-    RunAlreadyExists(String),
     #[error("Session not found: {0}")]
     SessionNotFound(String),
     #[error("Session already exists: {0}")]
