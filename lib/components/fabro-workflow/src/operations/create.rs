@@ -1,7 +1,9 @@
-#![expect(
-    clippy::disallowed_methods,
-    reason = "sync workflow creation path: reads workflow.toml during workflow load and persists \
-              .fabro scaffolding outside the Tokio execution hot path"
+#![cfg_attr(
+    test,
+    expect(
+        clippy::disallowed_methods,
+        reason = "tests write workflow fixture files synchronously before exercising async creation"
+    )
 )]
 
 use std::collections::{BTreeMap, HashMap};
