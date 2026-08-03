@@ -22,9 +22,7 @@ fn run_created_props_round_trip_templated_settings() {
         settings:         templated_settings(),
         graph:            Graph::new("ship"),
         workflow_source:  Some("digraph Ship { start -> exit }".to_string()),
-        workflow_config:  Some("[run]\ngoal = \"Ship {{ env.TASK }}\"".to_string()),
         labels:           BTreeMap::from([("team".to_string(), "platform".to_string())]),
-        run_dir:          "/tmp/run".to_string(),
         source_directory: Some("/Users/client/project".to_string()),
         workflow_slug:    Some("demo".to_string()),
         automation:       Some(AutomationRef {
@@ -32,7 +30,6 @@ fn run_created_props_round_trip_templated_settings() {
             name:       Some("Nightly".to_string()),
             trigger_id: Some("schedule_1".to_string()),
         }),
-        db_prefix:        Some("run_".to_string()),
         provenance:       test_run_provenance(),
         manifest_blob:    None,
         git:              Some(GitContext {
@@ -91,13 +88,10 @@ fn run_created_props_omits_web_url_when_absent() {
         settings:         WorkflowSettings::default(),
         graph:            Graph::new("ship"),
         workflow_source:  None,
-        workflow_config:  None,
         labels:           BTreeMap::new(),
-        run_dir:          "/tmp/run".to_string(),
         source_directory: None,
         workflow_slug:    None,
         automation:       None,
-        db_prefix:        None,
         provenance:       test_run_provenance(),
         manifest_blob:    None,
         git:              None,
@@ -143,6 +137,47 @@ fn run_created_props_defaults_additive_fields_for_legacy_events() {
         serde_json::from_value(json).expect("legacy props should deserialize");
     assert_eq!(props.retried_from, None);
     assert_eq!(props.automation, None);
+}
+
+#[test]
+fn run_created_props_accepts_removed_fields_without_reserializing_them() {
+    let historical = serde_json::json!({
+        "title": "Ship task",
+        "settings": templated_settings(),
+        "graph": Graph::new("ship"),
+        "workflow_source": "digraph Ship { start -> exit }",
+        "workflow_config": "[run]\ngoal = \"Ship {{ env.TASK }}\"",
+        "labels": {"team": "platform"},
+        "run_dir": "/tmp/run",
+        "source_directory": "/Users/client/project",
+        "db_prefix": "run_",
+        "provenance": test_run_provenance()
+    });
+
+    let props: RunCreatedProps =
+        serde_json::from_value(historical).expect("historical props should deserialize");
+    let canonical = serde_json::to_value(props).expect("props should serialize canonically");
+
+    assert_eq!(canonical["title"], "Ship task");
+    assert_eq!(canonical["graph"]["name"], "ship");
+    assert_eq!(
+        canonical["workflow_source"],
+        "digraph Ship { start -> exit }"
+    );
+    assert_eq!(canonical["labels"]["team"], "platform");
+    assert_eq!(canonical["source_directory"], "/Users/client/project");
+    assert_eq!(canonical["settings"]["run"]["goal"]["type"], "inline");
+    assert_eq!(
+        canonical["settings"]["run"]["goal"]["value"],
+        "Ship {{ env.TASK }}"
+    );
+    assert!(canonical.get("provenance").is_some());
+    for removed in ["workflow_config", "run_dir", "db_prefix"] {
+        assert!(
+            canonical.get(removed).is_none(),
+            "removed field {removed} must not be reserialized: {canonical}"
+        );
+    }
 }
 
 #[test]

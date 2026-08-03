@@ -30,18 +30,13 @@ pub enum Event {
         graph:            serde_json::Value,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workflow_source:  Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        workflow_config:  Option<String>,
         labels:           BTreeMap<String, String>,
-        run_dir:          String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source_directory: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         workflow_slug:    Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         automation:       Option<AutomationRef>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        db_prefix:        Option<String>,
         provenance:       RunProvenance,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         manifest_blob:    Option<RunBlobId>,
@@ -795,10 +790,8 @@ impl Event {
     pub fn trace(&self) {
         use tracing::{debug, error, info, warn};
         match self {
-            Self::RunCreated {
-                run_id, run_dir, ..
-            } => {
-                info!(run_id = %run_id, run_dir, "Run created");
+            Self::RunCreated { run_id, .. } => {
+                info!(run_id = %run_id, "Run created");
             }
             Self::WorkflowRunStarted { name, run_id, .. } => {
                 info!(workflow = name.as_str(), run_id = %run_id, "Workflow run started");
