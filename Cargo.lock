@@ -2819,6 +2819,7 @@ dependencies = [
  "fabro-types",
  "fabro-workflow",
  "git2",
+ "serde_json",
  "temp-env",
  "tempfile",
  "toml 0.8.23",

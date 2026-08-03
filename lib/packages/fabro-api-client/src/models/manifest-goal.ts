@@ -15,7 +15,7 @@
 
 
 /**
- * Resolved goal with provenance.
+ * Resolved goal kind and content.
  */
 export interface ManifestGoal {
     'type': ManifestGoalTypeEnum;
@@ -23,10 +23,6 @@ export interface ManifestGoal {
      * Resolved goal content.
      */
     'text': string;
-    /**
-     * Original goal file path when the goal came from a file.
-     */
-    'path'?: string | null;
 }
 
 export const ManifestGoalTypeEnum = {

@@ -252,10 +252,7 @@ pub fn build_run_manifest(input: ManifestBuildInput) -> Result<BuiltManifest> {
             goal,
             parent_id: None,
             title: None,
-            target: types::ManifestTarget {
-                identifier: input.workflow.display().to_string(),
-                path:       target_key,
-            },
+            target: types::ManifestTarget { path: target_key },
             version: 1,
             workflows: context.workflows,
         },
@@ -709,7 +706,6 @@ fn resolve_manifest_goal(
         )
         .ok_or_else(|| anyhow!("unsupported manifest goal reference: {reference}"))?;
         return Ok(Some(types::ManifestGoal {
-            path:  Some(reference.to_string()),
             text:  std::fs::read_to_string(&goal_path)
                 .with_context(|| format!("Failed to read {}", goal_path.display()))?,
             type_: types::ManifestGoalType::Graph,
@@ -717,24 +713,21 @@ fn resolve_manifest_goal(
     }
 
     Ok(Some(types::ManifestGoal {
-        path:  None,
         text:  goal.to_string(),
         type_: types::ManifestGoalType::Graph,
     }))
 }
 
 /// Translate a [`ResolvedRunGoal`] into the wire-level `ManifestGoal`
-/// shape. Inline goals get `type = Value`; file-sourced goals keep their
-/// absolute path as the `path` field and use `type = File`.
+/// shape. Inline goals get `type = Value`; file-sourced goals carry their
+/// already-resolved contents with `type = File`.
 fn resolved_goal_to_manifest(resolved: ResolvedRunGoal) -> types::ManifestGoal {
     match resolved.source {
         ResolvedGoalSource::Inline => types::ManifestGoal {
-            path:  None,
             text:  resolved.text,
             type_: types::ManifestGoalType::Value,
         },
-        ResolvedGoalSource::File { path } => types::ManifestGoal {
-            path:  Some(path.to_string_lossy().into_owned()),
+        ResolvedGoalSource::File { .. } => types::ManifestGoal {
             text:  resolved.text,
             type_: types::ManifestGoalType::File,
         },
@@ -1118,8 +1111,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            built.manifest.target.path,
-            ".fabro/workflows/demo/workflow.fabro"
+            serde_json::to_value(&built.manifest.target).unwrap(),
+            serde_json::json!({ "path": ".fabro/workflows/demo/workflow.fabro" })
         );
         assert_eq!(built.manifest.workflows.len(), 2);
         let root = &built.manifest.workflows[".fabro/workflows/demo/workflow.fabro"];
@@ -1139,7 +1132,10 @@ mod tests {
             root.files
                 .contains_key(".fabro/workflows/demo/prompts/lint.md")
         );
-        assert_eq!(built.manifest.goal.unwrap().text, "ship it");
+        assert_eq!(
+            serde_json::to_value(built.manifest.goal.as_ref().unwrap()).unwrap(),
+            serde_json::json!({ "type": "graph", "text": "ship it" })
+        );
         assert!(
             built
                 .manifest
@@ -1573,11 +1569,10 @@ file = "prompts/goal.md"
         .unwrap();
 
         let goal = built.manifest.goal.expect("manifest goal should be set");
-        assert_eq!(goal.text, "ship from project root");
-        assert_eq!(goal.type_, types::ManifestGoalType::File);
-        let resolved = goal.path.expect("file goal must carry a path");
-        let expected = project.join(".fabro").join("prompts").join("goal.md");
-        assert_eq!(PathBuf::from(resolved), expected);
+        assert_eq!(
+            serde_json::to_value(&goal).unwrap(),
+            serde_json::json!({ "type": "file", "text": "ship from project root" })
+        );
     }
 
     /// A relative `[run.goal] file = "..."` declared in `workflow.toml`
@@ -1623,11 +1618,35 @@ file = "prompts/goal.md"
         .unwrap();
 
         let goal = built.manifest.goal.expect("manifest goal should be set");
-        assert_eq!(goal.text, "ship from workflow dir");
-        assert_eq!(goal.type_, types::ManifestGoalType::File);
-        let resolved = goal.path.expect("file goal must carry a path");
-        let expected = workflow_dir.join("prompts").join("goal.md");
-        assert_eq!(PathBuf::from(resolved), expected);
+        assert_eq!(
+            serde_json::to_value(&goal).unwrap(),
+            serde_json::json!({ "type": "file", "text": "ship from workflow dir" })
+        );
+    }
+
+    /// The wire-level goal carries only the resolved kind and content:
+    /// inline and file-sourced goals serialize to exactly `type` + `text`.
+    #[test]
+    fn resolved_goals_serialize_type_and_text_only() {
+        let inline = resolved_goal_to_manifest(ResolvedRunGoal {
+            text:   "inline goal".to_string(),
+            source: ResolvedGoalSource::Inline,
+        });
+        assert_eq!(
+            serde_json::to_value(&inline).unwrap(),
+            serde_json::json!({ "type": "value", "text": "inline goal" })
+        );
+
+        let file = resolved_goal_to_manifest(ResolvedRunGoal {
+            text:   "goal from file".to_string(),
+            source: ResolvedGoalSource::File {
+                path: PathBuf::from("/tmp/project/goal.md"),
+            },
+        });
+        assert_eq!(
+            serde_json::to_value(&file).unwrap(),
+            serde_json::json!({ "type": "file", "text": "goal from file" })
+        );
     }
 
     /// When `[run] working_dir` points to a nested git repo, the manifest's

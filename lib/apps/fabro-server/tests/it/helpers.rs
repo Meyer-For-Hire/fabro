@@ -250,7 +250,6 @@ pub(crate) fn minimal_manifest_json(dot_source: &str) -> serde_json::Value {
         "version": 1,
         "cwd": "/tmp",
         "target": {
-            "identifier": "workflow.fabro",
             "path": "workflow.fabro"
         },
         "workflows": {

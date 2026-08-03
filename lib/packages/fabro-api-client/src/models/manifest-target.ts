@@ -16,10 +16,6 @@
 
 export interface ManifestTarget {
     /**
-     * What the user typed.
-     */
-    'identifier': string;
-    /**
      * Resolved path that keys into the workflows map.
      */
     'path': string;

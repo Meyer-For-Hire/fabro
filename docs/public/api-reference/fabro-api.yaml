@@ -9197,7 +9197,7 @@ components:
           type: string
 
     ManifestGoal:
-      description: Resolved goal with provenance.
+      description: Resolved goal kind and content.
       type: object
       required:
         - type
@@ -9212,9 +9212,6 @@ components:
         text:
           type: string
           description: Resolved goal content.
-        path:
-          type: ["string", "null"]
-          description: Original goal file path when the goal came from a file.
 
     ManifestArgs:
       description: Sparse command-local args that affect run settings.
@@ -9248,13 +9245,8 @@ components:
     ManifestTarget:
       type: object
       required:
-        - identifier
         - path
       properties:
-        identifier:
-          type: string
-          description: What the user typed.
-          example: smoke
         path:
           type: string
           description: Resolved path that keys into the workflows map.
