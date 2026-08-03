@@ -13,6 +13,7 @@ pub mod event_envelope;
 pub mod failure_signature;
 pub mod graph;
 mod id;
+mod input_scalar;
 pub mod interview;
 pub mod llm_backend;
 pub mod manifest_path;
@@ -75,6 +76,7 @@ pub use graph::{
     AttrValue, ContextKeyAttr, Edge, Graph, KNOWN_HANDLER_TYPES, Node, is_known_handler_type,
     is_llm_handler_type, shape_to_handler_type,
 };
+pub use input_scalar::{JsonScalarToTomlError, json_scalar_to_toml_value};
 pub use interview::{
     InterviewQuestionRecord, QuestionType, ReviewTarget, ReviewTargetError, ReviewTargetKind,
 };
