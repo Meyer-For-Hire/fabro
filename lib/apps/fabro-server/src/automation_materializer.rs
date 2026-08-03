@@ -4,10 +4,10 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use async_trait::async_trait;
 use fabro_api::types::RunManifest;
-use fabro_automation::{AutomationId, AutomationTarget, GitHubRepositorySlug};
+use fabro_automation::{AutomationId, AutomationTarget};
 use fabro_config::{EnvironmentLayer, MergeMap};
 use fabro_manifest::ManifestBuildInput;
-use fabro_types::{DirtyStatus, GitContext, PreRunPushOutcome, RunId};
+use fabro_types::{DirtyStatus, GitContext, GitHubRepositorySlug, PreRunPushOutcome, RunId};
 use fabro_util::error::collect_chain;
 use tokio::{fs, task};
 

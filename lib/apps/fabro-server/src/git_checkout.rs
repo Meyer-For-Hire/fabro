@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use fabro_automation::GitHubRepositorySlug;
 use fabro_store::KeyedMutex;
+use fabro_types::GitHubRepositorySlug;
 use tokio::process::Command;
 use tokio::{fs, time};
 
@@ -465,7 +465,7 @@ mod tests {
     use super::*;
 
     fn repository_slug(value: &str) -> GitHubRepositorySlug {
-        fabro_automation::parse_github_repository_slug(value).expect("slug should parse")
+        GitHubRepositorySlug::try_new(value).expect("slug should parse")
     }
 
     #[test]
