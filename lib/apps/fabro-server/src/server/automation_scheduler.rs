@@ -401,7 +401,6 @@ mod tests {
             "version": 1,
             "cwd": "/tmp",
             "target": {
-                "identifier": "workflow.fabro",
                 "path": "workflow.fabro",
             },
             "workflows": {

@@ -955,7 +955,6 @@ async fn create_seeded_run(
         "version": 1,
         "cwd": context.temp_dir.display().to_string(),
         "target": {
-            "identifier": target_path,
             "path": target_path,
         },
         "args": args,

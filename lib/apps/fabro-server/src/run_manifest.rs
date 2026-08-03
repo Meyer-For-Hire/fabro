@@ -1400,8 +1400,7 @@ mod tests {
             parent_id: None,
             title:     None,
             target:    types::ManifestTarget {
-                identifier: "workflow.fabro".to_string(),
-                path:       "workflow.fabro".to_string(),
+                path: "workflow.fabro".to_string(),
             },
             version:   1,
             workflows: HashMap::from([("workflow.fabro".to_string(), types::ManifestWorkflow {
@@ -2229,7 +2228,6 @@ id = "local"
     #[test]
     fn prepare_manifest_keeps_missing_metadata_names_absent() {
         let mut manifest = minimal_manifest();
-        manifest.target.identifier = "release-flow".to_string();
         manifest.workflows.get_mut("workflow.fabro").unwrap().source = r"
 digraph GraphName {
     start [shape=Mdiamond]

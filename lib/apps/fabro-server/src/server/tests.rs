@@ -3190,7 +3190,6 @@ fn manifest_json(target_path: &str, dot_source: &str) -> serde_json::Value {
         "version": 1,
         "cwd": "/tmp",
         "target": {
-            "identifier": target_path,
             "path": target_path,
         },
         "workflows": {
@@ -3560,6 +3559,60 @@ async fn post_runs_ignores_removed_run_id_input() {
         .expect("create response id should be valid");
 
     assert_ne!(allocated_run_id, submitted_run_id);
+}
+
+/// Old clients may still send the removed `target.identifier` and
+/// `goal.path` manifest properties. The server must keep accepting such
+/// bodies as unknown fields: the workflow is selected by `target.path`
+/// and the goal comes from the resolved `goal.text`.
+#[tokio::test]
+async fn post_runs_accepts_legacy_manifest_metadata_properties() {
+    let state = test_app_state();
+    let app = crate::test_support::build_test_router(Arc::clone(&state));
+    let picked_dot = r"digraph PickedFlow {
+        start [shape=Mdiamond]
+        exit [shape=Msquare]
+        start -> exit
+    }";
+    let decoy_dot = r"digraph DecoyFlow {
+        start [shape=Mdiamond]
+        exit [shape=Msquare]
+        start -> exit
+    }";
+    let manifest = serde_json::json!({
+        "version": 1,
+        "cwd": "/tmp",
+        "target": {
+            // Legacy display metadata: deliberately names the decoy entry
+            // to prove selection never reads it.
+            "identifier": "decoy.fabro",
+            "path": "picked.fabro",
+        },
+        "goal": {
+            "type": "file",
+            "text": "Goal text from the legacy body",
+            "path": "/tmp/original/goal.md",
+        },
+        "workflows": {
+            "picked.fabro": { "source": picked_dot, "files": {} },
+            "decoy.fabro": { "source": decoy_dot, "files": {} },
+        },
+    });
+
+    let created = post_run_manifest(&app, manifest).await;
+    let run_id = created["id"]
+        .as_str()
+        .expect("create response should contain an id")
+        .parse::<RunId>()
+        .expect("create response id should be valid");
+
+    let run_store = state.stores.runs.open_run_reader(&run_id).await.unwrap();
+    let run_state = run_store.state().await.unwrap();
+    assert_eq!(run_state.spec.graph.name, "PickedFlow");
+    assert_eq!(
+        run_state.spec.graph.goal(),
+        "Goal text from the legacy body"
+    );
 }
 
 #[tokio::test]
@@ -4225,7 +4278,6 @@ async fn validate_endpoint_returns_template_source_coordinates() {
         "version": 1,
         "cwd": "/tmp",
         "target": {
-            "identifier": "workflow.fabro",
             "path": "workflow.fabro",
         },
         "workflows": {
@@ -11169,7 +11221,6 @@ async fn create_run_keeps_missing_project_and_workflow_names_absent() {
         "version": 1,
         "cwd": "/tmp/project",
         "target": {
-            "identifier": "workflow.fabro",
             "path": "workflow.fabro",
         },
         "configs": [
@@ -13366,7 +13417,6 @@ async fn get_graph_returns_svg() {
                 "version": 1,
                 "cwd": "/tmp",
                 "target": {
-                    "identifier": "workflow.fabro",
                     "path": "workflow.fabro",
                 },
                 "workflows": {
@@ -13426,7 +13476,6 @@ async fn get_graph_source_returns_dot() {
                 "version": 1,
                 "cwd": "/tmp",
                 "target": {
-                    "identifier": "workflow.fabro",
                     "path": "workflow.fabro",
                 },
                 "workflows": {
@@ -13480,7 +13529,6 @@ async fn render_graph_from_manifest_returns_svg() {
                     "version": 1,
                     "cwd": "/tmp",
                     "target": {
-                        "identifier": "workflow.fabro",
                         "path": "workflow.fabro",
                     },
                     "workflows": {
@@ -13538,7 +13586,6 @@ async fn render_graph_from_manifest_accepts_fabro_dotted_attributes() {
                     "version": 1,
                     "cwd": "/tmp",
                     "target": {
-                        "identifier": "workflow.fabro",
                         "path": "workflow.fabro",
                     },
                     "workflows": {
