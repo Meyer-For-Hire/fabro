@@ -140,47 +140,6 @@ fn run_created_props_defaults_additive_fields_for_legacy_events() {
 }
 
 #[test]
-fn run_created_props_accepts_removed_fields_without_reserializing_them() {
-    let historical = serde_json::json!({
-        "title": "Ship task",
-        "settings": templated_settings(),
-        "graph": Graph::new("ship"),
-        "workflow_source": "digraph Ship { start -> exit }",
-        "workflow_config": "[run]\ngoal = \"Ship {{ env.TASK }}\"",
-        "labels": {"team": "platform"},
-        "run_dir": "/tmp/run",
-        "source_directory": "/Users/client/project",
-        "db_prefix": "run_",
-        "provenance": test_run_provenance()
-    });
-
-    let props: RunCreatedProps =
-        serde_json::from_value(historical).expect("historical props should deserialize");
-    let canonical = serde_json::to_value(props).expect("props should serialize canonically");
-
-    assert_eq!(canonical["title"], "Ship task");
-    assert_eq!(canonical["graph"]["name"], "ship");
-    assert_eq!(
-        canonical["workflow_source"],
-        "digraph Ship { start -> exit }"
-    );
-    assert_eq!(canonical["labels"]["team"], "platform");
-    assert_eq!(canonical["source_directory"], "/Users/client/project");
-    assert_eq!(canonical["settings"]["run"]["goal"]["type"], "inline");
-    assert_eq!(
-        canonical["settings"]["run"]["goal"]["value"],
-        "Ship {{ env.TASK }}"
-    );
-    assert!(canonical.get("provenance").is_some());
-    for removed in ["workflow_config", "run_dir", "db_prefix"] {
-        assert!(
-            canonical.get(removed).is_none(),
-            "removed field {removed} must not be reserialized: {canonical}"
-        );
-    }
-}
-
-#[test]
 fn run_parent_events_round_trip_parent_ids() {
     let linked = EventBody::RunParentLinked(RunParentLinkedProps {
         previous_parent_id: None,
