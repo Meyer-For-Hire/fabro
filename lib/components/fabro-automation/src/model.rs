@@ -4,6 +4,7 @@ use std::sync::LazyLock;
 use croner::Cron;
 use croner::errors::CronError;
 use croner::parser::{CronParser, Seconds, Year};
+use fabro_types::{GitHubRepositorySlug, repository};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -156,24 +157,6 @@ pub struct AutomationTarget {
     #[serde(rename = "ref")]
     pub ref_selector: String,
     pub workflow:     String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GitHubRepositorySlug {
-    owner: String,
-    repo:  String,
-}
-
-impl GitHubRepositorySlug {
-    #[must_use]
-    pub fn owner(&self) -> &str {
-        &self.owner
-    }
-
-    #[must_use]
-    pub fn repo(&self) -> &str {
-        &self.repo
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -367,19 +350,10 @@ fn normalize_replace(
 pub fn parse_github_repository_slug(
     value: &str,
 ) -> Result<GitHubRepositorySlug, AutomationValidationError> {
-    let Some((owner, repo)) = value.split_once('/') else {
-        return Err(AutomationValidationError::InvalidRepositorySlug {
+    GitHubRepositorySlug::try_new(value).ok_or_else(|| {
+        AutomationValidationError::InvalidRepositorySlug {
             value: value.to_string(),
-        });
-    };
-    if repo.contains('/') || !valid_github_owner(owner) || !valid_github_repo(repo) {
-        return Err(AutomationValidationError::InvalidRepositorySlug {
-            value: value.to_string(),
-        });
-    }
-    Ok(GitHubRepositorySlug {
-        owner: owner.to_string(),
-        repo:  repo.to_string(),
+        }
     })
 }
 
@@ -387,47 +361,8 @@ fn validate_repository_slug(value: &str) -> Result<(), AutomationValidationError
     parse_github_repository_slug(value).map(|_| ())
 }
 
-fn valid_github_owner(value: &str) -> bool {
-    if value.is_empty() || value.len() > 39 {
-        return false;
-    }
-    let bytes = value.as_bytes();
-    let first = bytes[0];
-    let last = bytes[bytes.len() - 1];
-    (first.is_ascii_alphanumeric() && last.is_ascii_alphanumeric())
-        && bytes
-            .iter()
-            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
-}
-
-fn valid_github_repo(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 100
-        && value != "."
-        && value != ".."
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-}
-
 fn validate_git_ref_selector(value: &str) -> Result<(), AutomationValidationError> {
-    let valid = !value.is_empty()
-        && value.len() <= 255
-        && value.trim() == value
-        && !value.starts_with(['/', '-', '.'])
-        && !value.ends_with(['/', '.'])
-        && !has_lock_suffix(value)
-        && value != "@"
-        && !value.contains("..")
-        && !value.contains("//")
-        && !value.contains("@{")
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
-        && value
-            .split('/')
-            .all(|part| !part.is_empty() && !part.starts_with('.') && !has_lock_suffix(part));
-    if valid {
+    if repository::is_valid_github_ref_selector(value) {
         Ok(())
     } else {
         Err(AutomationValidationError::InvalidGitRefSelector {
@@ -456,12 +391,6 @@ fn validate_workflow_selector(value: &str) -> Result<(), AutomationValidationErr
             value: value.to_string(),
         })
     }
-}
-
-fn has_lock_suffix(value: &str) -> bool {
-    value
-        .rsplit_once('.')
-        .is_some_and(|(_, extension)| extension == "lock")
 }
 
 fn validate_triggers(triggers: &[AutomationTrigger]) -> Result<(), AutomationValidationError> {
@@ -505,7 +434,7 @@ fn validate_triggers(triggers: &[AutomationTrigger]) -> Result<(), AutomationVal
 mod tests {
     use crate::{
         ApiTrigger, Automation, AutomationId, AutomationReplace, AutomationTarget,
-        AutomationTrigger, AutomationTriggerId, ScheduleTrigger,
+        AutomationTrigger, AutomationTriggerId, AutomationValidationError, ScheduleTrigger,
     };
 
     fn target() -> AutomationTarget {
@@ -616,12 +545,41 @@ enabled = true
     }
 
     #[test]
-    fn repository_slug_parser_returns_validated_parts() {
-        let slug = crate::parse_github_repository_slug("owner/.github").unwrap();
+    fn repository_slug_parser_returns_the_shared_type() {
+        let slug: fabro_types::GitHubRepositorySlug =
+            crate::parse_github_repository_slug("owner/.github").unwrap();
 
         assert_eq!(slug.owner(), "owner");
         assert_eq!(slug.repo(), ".github");
-        assert!(crate::parse_github_repository_slug("not/github/slug").is_err());
+    }
+
+    #[test]
+    fn invalid_repository_slug_preserves_the_automation_error() {
+        let error = crate::parse_github_repository_slug("not/github/slug").unwrap_err();
+
+        assert!(matches!(
+            &error,
+            AutomationValidationError::InvalidRepositorySlug { value }
+                if value == "not/github/slug"
+        ));
+        assert_eq!(
+            error.to_string(),
+            "repository slug \"not/github/slug\" must be a GitHub owner/repo slug"
+        );
+    }
+
+    #[test]
+    fn invalid_git_ref_selector_preserves_the_automation_error() {
+        let error = super::validate_git_ref_selector("main;rm").unwrap_err();
+
+        assert!(matches!(
+            &error,
+            AutomationValidationError::InvalidGitRefSelector { value } if value == "main;rm"
+        ));
+        assert_eq!(
+            error.to_string(),
+            "git ref selector \"main;rm\" is not safe"
+        );
     }
 
     #[test]

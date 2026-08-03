@@ -105,7 +105,7 @@ pub use pull_request::{
     PullRequestRef, PullRequestResponse, PullRequestTimestamps, PullRequestUser,
 };
 pub use reasoning::ReasoningOutput;
-pub use repository::{RepositoryProvider, RepositoryRef};
+pub use repository::{GitHubRepositorySlug, RepositoryProvider, RepositoryRef};
 pub use run::{
     DirtyStatus, ForkSourceRef, GitContext, PreRunPushOutcome, RunClientProvenance, RunProvenance,
     RunServerProvenance, RunSpec,
