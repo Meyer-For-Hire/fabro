@@ -129,7 +129,6 @@ fn run_created_props_defaults_additive_fields_for_legacy_events() {
         "settings": WorkflowSettings::default(),
         "graph": Graph::new("ship"),
         "labels": {},
-        "run_dir": "/tmp/run",
         "provenance": test_run_provenance()
     });
 

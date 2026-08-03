@@ -2351,7 +2351,7 @@ mod tests {
     }
 
     #[test]
-    fn historical_run_created_with_removed_fields_replays_into_projection() {
+    fn run_created_replay_ignores_unknown_properties() {
         let provenance = test_support::test_run_provenance();
         let event = test_raw_event(
             1,
@@ -2361,12 +2361,12 @@ mod tests {
                 "settings": WorkflowSettings::default(),
                 "graph": Graph::new("historical"),
                 "workflow_source": "digraph historical { start -> exit }",
-                "workflow_config": "[workflow]\ngraph = \"workflow.fabro\"",
                 "labels": {"team": "platform"},
-                "run_dir": "/tmp/historical-run",
                 "source_directory": "/workspace/project",
                 "workflow_slug": "historical",
-                "db_prefix": "run_",
+                "unknown_future_property": {
+                    "nested": ["value", 42, true]
+                },
                 "provenance": provenance
             }),
             None,
