@@ -1314,6 +1314,17 @@ fn event_body_from_event(event: &Event) -> EventBody {
             stderr:      stderr.clone(),
             duration_ms: *duration_ms,
         }),
+        Event::PullRequestCreationRequested {
+            creation_id,
+            model,
+            force,
+        } => EventBody::PullRequestCreationRequested(
+            fabro_types::PullRequestCreationRequestedProps {
+                creation_id: *creation_id,
+                model:       model.clone(),
+                force:       *force,
+            },
+        ),
         Event::PullRequestCreated {
             pr_url,
             pr_number,
@@ -1345,9 +1356,10 @@ fn event_body_from_event(event: &Event) -> EventBody {
                 pull_request: pull_request.clone(),
             })
         }
-        Event::PullRequestFailed { error } => {
+        Event::PullRequestFailed { creation_id, error } => {
             EventBody::PullRequestFailed(fabro_types::PullRequestFailedProps {
-                error: error.clone(),
+                creation_id: *creation_id,
+                error:       error.clone(),
             })
         }
     }

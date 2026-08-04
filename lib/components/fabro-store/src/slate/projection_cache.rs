@@ -189,6 +189,27 @@ impl RunProjectionCache {
             .map(|entry| (Arc::clone(&entry.projection), entry.last_seq))
     }
 
+    /// Run ids whose latest explicit pull request creation is still pending,
+    /// oldest request first. Clones only ids and timestamps, so callers can
+    /// poll on an interval without materializing run summaries.
+    pub(crate) async fn pending_pull_request_creations(&self) -> Vec<RunId> {
+        let mut pending = self
+            .state
+            .lock()
+            .await
+            .entries
+            .values()
+            .filter_map(|entry| {
+                let creation = entry.projection.pull_request_creation.as_ref()?;
+                creation
+                    .is_pending()
+                    .then_some((creation.requested_at, entry.run_id))
+            })
+            .collect::<Vec<_>>();
+        pending.sort_unstable();
+        pending.into_iter().map(|(_, run_id)| run_id).collect()
+    }
+
     pub(crate) async fn get_summary(&self, run_id: &RunId, now: DateTime<Utc>) -> Option<Run> {
         let mut entry = {
             let state = self.state.lock().await;

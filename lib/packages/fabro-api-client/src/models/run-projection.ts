@@ -24,6 +24,9 @@ import type { Conclusion } from './conclusion';
 import type { PendingInterviewRecord } from './pending-interview-record';
 // May contain unused imports in some cases
 // @ts-ignore
+import type { PullRequestCreation } from './pull-request-creation';
+// May contain unused imports in some cases
+// @ts-ignore
 import type { PullRequestLink } from './pull-request-link';
 // May contain unused imports in some cases
 // @ts-ignore
@@ -74,6 +77,7 @@ export interface RunProjection {
     'conclusion'?: Conclusion | null;
     'sandbox'?: RunSandbox | null;
     'pull_request'?: PullRequestLink | null;
+    'pull_request_creation'?: PullRequestCreation | null;
     'superseded_by'?: string | null;
     /**
      * Source run ID when this run was created by manual retry.

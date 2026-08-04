@@ -70,13 +70,35 @@ fn pr_create_uses_server_endpoint_and_prints_url() {
             .json_body(serde_json::json!({
                 "force": false
             }));
+        then.status(202)
+            .header("Content-Type", "application/json")
+            .json_body(serde_json::json!({
+                "id": "01KYYK70WTZT2E551P3H5P0059",
+                "status": "pending",
+                "model": "kimi-k3",
+                "force": false,
+                "requested_at": "2026-08-01T12:00:00Z",
+                "updated_at": "2026-08-01T12:00:00Z"
+            }));
+    });
+    let status_mock = server.mock(|when, then| {
+        when.method("GET")
+            .path(format!("/api/v1/runs/{run_id}/pull_request/creation"));
         then.status(200)
             .header("Content-Type", "application/json")
             .json_body(serde_json::json!({
-                "owner": "fabro-sh",
-                "repo": "fabro",
-                "number": 123,
-                "html_url": "https://github.com/fabro-sh/fabro/pull/123"
+                "id": "01KYYK70WTZT2E551P3H5P0059",
+                "status": "succeeded",
+                "model": "kimi-k3",
+                "force": false,
+                "requested_at": "2026-08-01T12:00:00Z",
+                "updated_at": "2026-08-01T12:00:15Z",
+                "pull_request": {
+                    "owner": "fabro-sh",
+                    "repo": "fabro",
+                    "number": 123,
+                    "html_url": "https://github.com/fabro-sh/fabro/pull/123"
+                }
             }));
     });
 
@@ -99,6 +121,7 @@ fn pr_create_uses_server_endpoint_and_prints_url() {
 
     resolve_mock.assert();
     create_mock.assert();
+    status_mock.assert();
 }
 
 #[test]
@@ -116,13 +139,35 @@ fn pr_create_passes_force_and_model_to_server() {
                 "force": true,
                 "model": "gpt-5.2"
             }));
+        then.status(202)
+            .header("Content-Type", "application/json")
+            .json_body(serde_json::json!({
+                "id": "01KYYK70WTZT2E551P3H5P0059",
+                "status": "pending",
+                "model": "gpt-5.2",
+                "force": true,
+                "requested_at": "2026-08-01T12:00:00Z",
+                "updated_at": "2026-08-01T12:00:00Z"
+            }));
+    });
+    let status_mock = server.mock(|when, then| {
+        when.method("GET")
+            .path(format!("/api/v1/runs/{run_id}/pull_request/creation"));
         then.status(200)
             .header("Content-Type", "application/json")
             .json_body(serde_json::json!({
-                "owner": "fabro-sh",
-                "repo": "fabro",
-                "number": 123,
-                "html_url": "https://github.com/fabro-sh/fabro/pull/123"
+                "id": "01KYYK70WTZT2E551P3H5P0059",
+                "status": "succeeded",
+                "model": "gpt-5.2",
+                "force": true,
+                "requested_at": "2026-08-01T12:00:00Z",
+                "updated_at": "2026-08-01T12:00:15Z",
+                "pull_request": {
+                    "owner": "fabro-sh",
+                    "repo": "fabro",
+                    "number": 123,
+                    "html_url": "https://github.com/fabro-sh/fabro/pull/123"
+                }
             }));
     });
 
@@ -154,4 +199,5 @@ fn pr_create_passes_force_and_model_to_server() {
 
     resolve_mock.assert();
     create_mock.assert();
+    status_mock.assert();
 }

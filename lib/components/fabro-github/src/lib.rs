@@ -635,11 +635,105 @@ pub async fn create_installation_access_token_for_pr(
     .await
 }
 
-/// Result of a successful pull request creation.
+/// Pull request created on, or reconciled from, GitHub.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreatedPullRequest {
     pub html_url: String,
     pub number:   u64,
     pub node_id:  String,
+    pub title:    String,
+}
+
+/// Find an open pull request that already carries the expected head commit.
+///
+/// This supports recovery when GitHub created a pull request but the caller
+/// stopped before it could persist the result locally.
+pub async fn find_open_pull_request(
+    ctx: &GitHubContext<'_>,
+    owner: &str,
+    repo: &str,
+    base: &str,
+    head: &str,
+    expected_head_sha: &str,
+) -> anyhow::Result<Option<CreatedPullRequest>> {
+    let client = ctx.http_client()?;
+    find_open_pull_request_with_client(&client, ctx, owner, repo, base, head, expected_head_sha)
+        .await
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Pull request reconciliation needs explicit repo, branch, and commit coordinates."
+)]
+pub async fn find_open_pull_request_with_client(
+    client: &impl HttpClient,
+    ctx: &GitHubContext<'_>,
+    owner: &str,
+    repo: &str,
+    base: &str,
+    head: &str,
+    expected_head_sha: &str,
+) -> anyhow::Result<Option<CreatedPullRequest>> {
+    #[derive(Deserialize)]
+    struct PullRequestHead {
+        sha: String,
+    }
+
+    #[derive(Deserialize)]
+    struct PullRequestListItem {
+        html_url: String,
+        number:   u64,
+        node_id:  String,
+        title:    String,
+        head:     PullRequestHead,
+    }
+
+    let token = ctx
+        .creds
+        .resolve_bearer_token(
+            client,
+            owner,
+            repo,
+            ctx.base_url,
+            serde_json::json!({ "contents": "write", "pull_requests": "write" }),
+        )
+        .await?;
+    let mut url = DisplaySafeUrl::parse(&format!("{}/repos/{owner}/{repo}/pulls", ctx.base_url))
+        .context("Failed to build pull request reconciliation URL")?;
+    url.query_pairs_mut()
+        .append_pair("state", "open")
+        .append_pair("base", base)
+        .append_pair("head", &format!("{owner}:{head}"));
+    let auth = format!("Bearer {token}");
+    let resp = client
+        .request(
+            HttpMethod::Get,
+            &url.raw_string(),
+            &github_headers(&auth),
+            None,
+        )
+        .await
+        .context("Failed to find an existing pull request")?;
+    if resp.status != 200 {
+        bail!(
+            "Unexpected status {} finding an existing pull request: {}",
+            resp.status,
+            resp.text()
+        );
+    }
+
+    let pull_requests = resp
+        .json::<Vec<PullRequestListItem>>()
+        .context("Failed to parse existing pull request response")?;
+    Ok(pull_requests
+        .into_iter()
+        .find(|pull_request| pull_request.head.sha == expected_head_sha)
+        .map(|pull_request| CreatedPullRequest {
+            html_url: pull_request.html_url,
+            number:   pull_request.number,
+            node_id:  pull_request.node_id,
+            title:    pull_request.title,
+        }))
 }
 
 /// Create a pull request on GitHub.
@@ -747,6 +841,7 @@ pub async fn create_pull_request_with_client(
         html_url: pr.html_url,
         number:   pr.number,
         node_id:  pr.node_id,
+        title:    title.to_string(),
     })
 }
 
@@ -1905,6 +2000,52 @@ mod tests {
             .to_string();
         assert!(err.contains("does not have access"), "got: {err}");
         assert!(err.contains("repo"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn find_open_pull_request_matches_the_expected_head_commit() {
+        let mock = MockHttpClient::new()
+            .on(
+                HttpMethod::Get,
+                "/repos/owner/repo/pulls?state=open&base=main&head=owner%3Afabro%2Frun%2F1",
+                200,
+                r#"[
+                    {
+                        "html_url": "https://github.com/owner/repo/pull/40",
+                        "number": 40,
+                        "node_id": "PR_wrong",
+                        "title": "Old head",
+                        "head": {"sha": "old-sha"}
+                    },
+                    {
+                        "html_url": "https://github.com/owner/repo/pull/42",
+                        "number": 42,
+                        "node_id": "PR_expected",
+                        "title": "Expected head",
+                        "head": {"sha": "final-sha"}
+                    }
+                ]"#,
+            )
+            .with_req_header("Authorization", "Bearer ghu_test");
+        let creds = GitHubCredentials::Pat("ghu_test".to_string());
+        let ctx = GitHubContext::new(&creds, "https://api.test");
+
+        let found = find_open_pull_request_with_client(
+            &mock,
+            &ctx,
+            "owner",
+            "repo",
+            "main",
+            "fabro/run/1",
+            "final-sha",
+        )
+        .await
+        .unwrap()
+        .expect("matching pull request should be found");
+
+        assert_eq!(found.number, 42);
+        assert_eq!(found.node_id, "PR_expected");
+        assert_eq!(found.title, "Expected head");
     }
 
     #[tokio::test]

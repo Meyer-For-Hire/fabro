@@ -1422,7 +1422,8 @@ mod tests {
             draft:       true,
         });
         emit(&mut ui, Event::PullRequestFailed {
-            error: "auth token expired".into(),
+            creation_id: None,
+            error:       "auth token expired".into(),
         });
 
         insta::assert_snapshot!(rendered(&buffer), @r"

@@ -151,6 +151,7 @@ pub fn event_name(event: &Event) -> &'static str {
         Event::AgentAcpCompleted { .. } => "agent.acp.completed",
         Event::AgentAcpCancelled { .. } => "agent.acp.cancelled",
         Event::AgentAcpTimedOut { .. } => "agent.acp.timed_out",
+        Event::PullRequestCreationRequested { .. } => "pull_request.creation_requested",
         Event::PullRequestCreated { .. } => "pull_request.created",
         Event::PullRequestLinked { .. } => "pull_request.linked",
         Event::PullRequestUnlinked { .. } => "pull_request.unlinked",

@@ -472,6 +472,71 @@ pub struct CreatedPullRequest {
     pub head_branch: String,
 }
 
+/// Adopt an open pull request that already exists for the head branch at the
+/// expected commit, e.g. when GitHub created the pull request but the caller
+/// stopped before persisting the result.
+async fn reconcile_existing_pull_request(
+    req: &OpenPullRequestRequest<'_>,
+    owner: &str,
+    repo: &str,
+    context: &'static str,
+) -> anyhow::Result<Option<CreatedPullRequest>> {
+    let Some(existing) = github_app::find_open_pull_request(
+        &req.github,
+        owner,
+        repo,
+        req.base_branch,
+        req.head_branch,
+        req.expected_head_sha,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    info!(pr_url = %existing.html_url, pr_number = existing.number, context, "Existing pull request reconciled");
+    enable_auto_merge_if_requested(
+        &req.github,
+        owner,
+        repo,
+        &existing.node_id,
+        existing.number,
+        req.auto_merge.as_ref(),
+    )
+    .await;
+    Ok(Some(CreatedPullRequest {
+        link:        PullRequestLink {
+            owner:  owner.to_string(),
+            repo:   repo.to_string(),
+            number: existing.number,
+        },
+        title:       existing.title,
+        base_branch: req.base_branch.to_string(),
+        head_branch: req.head_branch.to_string(),
+    }))
+}
+
+async fn enable_auto_merge_if_requested(
+    github: &github_app::GitHubContext<'_>,
+    owner: &str,
+    repo: &str,
+    node_id: &str,
+    number: u64,
+    options: Option<&AutoMergeOptions>,
+) {
+    let Some(options) = options else {
+        return;
+    };
+    match github_app::enable_auto_merge(github, owner, repo, node_id, options.merge_strategy).await
+    {
+        Ok(()) => info!(pr_number = number, "Auto-merge enabled"),
+        Err(err) => warn!(
+            pr_number = number,
+            error = %err,
+            "Failed to enable auto-merge (repo may not have auto-merge enabled in settings)"
+        ),
+    }
+}
+
 /// How many times to read the remote branch head before giving up.
 ///
 /// `GET /repos/{owner}/{repo}/branches/{branch}` is replica-served, so shortly
@@ -535,6 +600,13 @@ pub async fn open_pull_request(
     // branch would otherwise cost a full LLM call before failing.
     verify_remote_head(&req, &owner, &repo).await?;
 
+    if let Some(existing) = reconcile_existing_pull_request(&req, &owner, &repo, "before creation")
+        .await
+        .map_err(|err| format!("failed to reconcile an existing pull request: {err:#}"))?
+    {
+        return Ok(existing);
+    }
+
     let content = build_pr_content(
         req.diff,
         req.goal,
@@ -550,7 +622,7 @@ pub async fn open_pull_request(
     let body = truncate_pr_body(&content.body);
     let title = content.title;
 
-    let created = github_app::create_pull_request(
+    let created = match github_app::create_pull_request(
         &req.github,
         &owner,
         &repo,
@@ -561,32 +633,33 @@ pub async fn open_pull_request(
         req.draft,
     )
     .await
-    .map_err(|err| format!("{err:#}"))?;
-
-    info!(pr_url = %created.html_url, created.number, "Pull request created");
-
-    if let Some(am_cfg) = req.auto_merge {
-        match github_app::enable_auto_merge(
-            &req.github,
-            &owner,
-            &repo,
-            &created.node_id,
-            am_cfg.merge_strategy,
-        )
-        .await
-        {
-            Ok(()) => {
-                info!(pr_number = created.number, "Auto-merge enabled");
-            }
-            Err(e) => {
-                tracing::warn!(
-                    pr_number = created.number,
-                    error = %e,
-                    "Failed to enable auto-merge (repo may not have auto-merge enabled in settings)"
-                );
+    {
+        Ok(created) => created,
+        Err(create_err) => {
+            match reconcile_existing_pull_request(&req, &owner, &repo, "after a failed create")
+                .await
+            {
+                Ok(Some(existing)) => return Ok(existing),
+                Ok(None) => return Err(format!("{create_err:#}")),
+                Err(reconcile_err) => {
+                    return Err(format!(
+                        "{create_err:#}; failed to reconcile the pull request after creation: {reconcile_err:#}"
+                    ));
+                }
             }
         }
-    }
+    };
+
+    info!(pr_url = %created.html_url, created.number, "Pull request created");
+    enable_auto_merge_if_requested(
+        &req.github,
+        &owner,
+        &repo,
+        &created.node_id,
+        created.number,
+        req.auto_merge.as_ref(),
+    )
+    .await;
 
     let link = PullRequestLink {
         owner,
@@ -1598,19 +1671,20 @@ mod tests {
     /// client from the credential source, so the in-process MockProvider
     /// cannot intercept — we mock the OpenAI HTTP endpoint instead.
     struct FallbackHarness {
-        _vault_dir:     tempfile::TempDir,
+        _vault_dir:        tempfile::TempDir,
         // Held to keep the mock listener alive for the duration of the test;
         // the test interacts with it via `Client::from_source` (which goes
         // out via HTTP to the mock URL stored in `llm_source`).
-        openai_server:  MockServer,
-        github_server:  MockServer,
-        openai_mock_id: usize,
-        branch_mock_id: usize,
-        github_mock_id: usize,
-        llm_source:     Arc<dyn CredentialSource>,
-        catalog:        Arc<Catalog>,
-        creds:          fabro_github::GitHubCredentials,
-        run_store:      RunStoreHandle,
+        openai_server:     MockServer,
+        github_server:     MockServer,
+        openai_mock_id:    usize,
+        branch_mock_id:    usize,
+        reconcile_mock_id: usize,
+        github_mock_id:    usize,
+        llm_source:        Arc<dyn CredentialSource>,
+        catalog:           Arc<Catalog>,
+        creds:             fabro_github::GitHubCredentials,
+        run_store:         RunStoreHandle,
     }
 
     impl FallbackHarness {
@@ -1619,6 +1693,9 @@ mod tests {
                 .assert_async()
                 .await;
             httpmock::Mock::new(self.branch_mock_id, &self.github_server)
+                .assert_async()
+                .await;
+            httpmock::Mock::new(self.reconcile_mock_id, &self.github_server)
                 .assert_async()
                 .await;
             httpmock::Mock::new(self.github_mock_id, &self.github_server)
@@ -1638,6 +1715,15 @@ mod tests {
     async fn setup_fallback_test_harness_with_branch_sha(
         openai_payload_text: &str,
         branch_sha: &str,
+    ) -> FallbackHarness {
+        setup_fallback_test_harness_with(openai_payload_text, branch_sha, serde_json::json!([]))
+            .await
+    }
+
+    async fn setup_fallback_test_harness_with(
+        openai_payload_text: &str,
+        branch_sha: &str,
+        reconcile_response: serde_json::Value,
     ) -> FallbackHarness {
         let openai_server = MockServer::start_async().await;
         let openai_mock = openai_server
@@ -1677,6 +1763,19 @@ mod tests {
                         "html_url": "https://example.test/owner/repo/pull/1",
                         "node_id": "PR_kwTest1",
                     }));
+            })
+            .await;
+        let reconcile_mock = github_server
+            .mock_async(move |when, then| {
+                when.method(GET)
+                    .path("/repos/owner/repo/pulls")
+                    .query_param("state", "open")
+                    .query_param("base", "main")
+                    .query_param("head", "owner:fabro/run/123")
+                    .header("authorization", "Bearer test-token");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(reconcile_response);
             })
             .await;
 
@@ -1766,6 +1865,7 @@ mod tests {
 
         let openai_mock_id = openai_mock.id;
         let branch_mock_id = branch_mock.id;
+        let reconcile_mock_id = reconcile_mock.id;
         let github_mock_id = github_mock.id;
 
         FallbackHarness {
@@ -1774,12 +1874,73 @@ mod tests {
             github_server,
             openai_mock_id,
             branch_mock_id,
+            reconcile_mock_id,
             github_mock_id,
             llm_source,
             catalog,
             creds,
             run_store: run_store.into(),
         }
+    }
+
+    /// An open pull request already exists for the head branch at the
+    /// expected commit — for example after a crash between GitHub creating
+    /// the pull request and the caller persisting it. `open_pull_request`
+    /// adopts it without an LLM call and without a create request.
+    #[tokio::test]
+    async fn open_pull_request_adopts_an_existing_pull_request_without_creating() {
+        let payload = pr_content_json("Unused", "Unused.");
+        let harness = setup_fallback_test_harness_with(
+            &payload,
+            "final-sha",
+            serde_json::json!([{
+                "html_url": "https://github.com/owner/repo/pull/7",
+                "number": 7,
+                "node_id": "PR_existing",
+                "title": "Reconciled title",
+                "head": {"sha": "final-sha"}
+            }]),
+        )
+        .await;
+
+        let github_base_url = harness.github_server.url("");
+        let github = github_app::GitHubContext::new(&harness.creds, &github_base_url);
+
+        let result = open_pull_request(OpenPullRequestRequest {
+            github,
+            origin_url: "https://github.com/owner/repo.git",
+            base_branch: "main",
+            head_branch: "fabro/run/123",
+            expected_head_sha: "final-sha",
+            goal: "Fix telemetry leak",
+            diff: "diff --git a/src/lib.rs b/src/lib.rs\n+fn x() {}\n",
+            model: "gpt-5.4",
+            draft: false,
+            auto_merge: None,
+            run_store: &harness.run_store,
+            llm_source: harness.llm_source.as_ref(),
+            catalog: harness.catalog.clone(),
+            conclusion: None,
+            run_state: None,
+        })
+        .await
+        .expect("reconciliation should adopt the existing pull request");
+
+        assert_eq!(result.link.number, 7);
+        assert_eq!(result.title, "Reconciled title");
+        // Adoption must not cost an LLM call or a create request.
+        assert_eq!(
+            httpmock::Mock::new(harness.openai_mock_id, &harness.openai_server)
+                .calls_async()
+                .await,
+            0
+        );
+        assert_eq!(
+            httpmock::Mock::new(harness.github_mock_id, &harness.github_server)
+                .calls_async()
+                .await,
+            0
+        );
     }
 
     /// LLM returns a usable body but an empty title; the content builder

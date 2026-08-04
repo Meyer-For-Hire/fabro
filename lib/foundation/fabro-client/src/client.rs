@@ -38,6 +38,13 @@ use crate::{AuthEntry, OAuthEntry, StoredSubject, sse};
 const DEFAULT_CONTROL_PLANE_REQUEST_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(30);
 const DEFAULT_HEALTH_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+/// Matches the `Retry-After` the server sends on the 202
+/// (`PULL_REQUEST_CREATION_RETRY_AFTER` in `fabro-server`).
+const PULL_REQUEST_CREATION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// Overall polling deadline. The server abandons a creation attempt after 10
+/// minutes, but a creation can also sit pending behind the server's worker
+/// pool (or a dead server), so the client needs its own bound.
+const PULL_REQUEST_CREATION_POLL_DEADLINE: std::time::Duration = std::time::Duration::from_mins(15);
 
 type TransportFuture = BoxFuture<'static, Result<(fabro_http::HttpClient, String)>>;
 
@@ -1435,6 +1442,57 @@ impl Client {
         force: bool,
         model: Option<String>,
     ) -> Result<fabro_types::PullRequestLink> {
+        let mut creation = self
+            .request_run_pull_request_creation(run_id, force, model)
+            .await?;
+        let creation_id = creation.id;
+        let deadline = std::time::Instant::now() + PULL_REQUEST_CREATION_POLL_DEADLINE;
+        loop {
+            match creation.status {
+                fabro_types::PullRequestCreationStatus::Pending => {
+                    if std::time::Instant::now() >= deadline {
+                        bail!(
+                            "Pull request creation {creation_id} is still pending after {} \
+                             minutes. Check its status with: fabro pr create {run_id}",
+                            PULL_REQUEST_CREATION_POLL_DEADLINE.as_secs() / 60
+                        );
+                    }
+                    time::sleep(PULL_REQUEST_CREATION_POLL_INTERVAL).await;
+                    creation = self.get_run_pull_request_creation(run_id).await?;
+                    if creation.id != creation_id {
+                        bail!(
+                            "Pull request creation {creation_id} was superseded by {}",
+                            creation.id
+                        );
+                    }
+                }
+                fabro_types::PullRequestCreationStatus::Succeeded => {
+                    return creation.pull_request.ok_or_else(|| {
+                        anyhow!(
+                            "Pull request creation {} succeeded without a pull request record",
+                            creation.id
+                        )
+                    });
+                }
+                fabro_types::PullRequestCreationStatus::Failed => {
+                    bail!(
+                        "Pull request creation failed: {}",
+                        creation
+                            .error
+                            .as_deref()
+                            .unwrap_or("the server did not provide an error")
+                    );
+                }
+            }
+        }
+    }
+
+    pub async fn request_run_pull_request_creation(
+        &self,
+        run_id: &RunId,
+        force: bool,
+        model: Option<String>,
+    ) -> Result<fabro_types::PullRequestCreation> {
         let body = types::CreateRunPullRequestRequest { force, model };
         let response = self
             .send_api(|client| async move {
@@ -1447,7 +1505,24 @@ impl Client {
             })
             .await
             .map_err(add_pr_upgrade_hint)?;
-        convert_type(response.into_inner())
+        Ok(response.into_inner())
+    }
+
+    pub async fn get_run_pull_request_creation(
+        &self,
+        run_id: &RunId,
+    ) -> Result<fabro_types::PullRequestCreation> {
+        let response = self
+            .send_api(|client| async move {
+                client
+                    .get_run_pull_request_creation()
+                    .id(run_id.to_string())
+                    .send()
+                    .await
+            })
+            .await
+            .map_err(add_pr_upgrade_hint)?;
+        Ok(response.into_inner())
     }
 
     pub async fn get_run_pull_request(

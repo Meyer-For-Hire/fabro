@@ -20,7 +20,7 @@ mod mcp_servers;
 mod models;
 mod pair;
 mod playground;
-mod pull_requests;
+pub(in crate::server) mod pull_requests;
 pub(in crate::server) mod runs;
 mod sandbox;
 mod sandboxes;

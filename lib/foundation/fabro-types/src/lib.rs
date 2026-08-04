@@ -102,7 +102,8 @@ pub use pair::{
 pub use parallel::ParallelBranchResult;
 pub use principal::{AuthMethod, Principal, SystemActorKind, UserPrincipal};
 pub use pull_request::{
-    CheckRun, CheckRunStatus, PullRequest, PullRequestDetails, PullRequestDetailsStatus,
+    CheckRun, CheckRunStatus, PullRequest, PullRequestCreation, PullRequestCreationId,
+    PullRequestCreationStatus, PullRequestDetails, PullRequestDetailsStatus,
     PullRequestDetailsUnavailableReason, PullRequestGithubDetail, PullRequestLink, PullRequestMeta,
     PullRequestRef, PullRequestResponse, PullRequestTimestamps, PullRequestUser,
 };

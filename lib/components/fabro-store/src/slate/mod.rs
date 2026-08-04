@@ -349,6 +349,13 @@ impl Database {
         Ok(self.projection_cache.get_summary(run_id, now).await)
     }
 
+    /// Run ids whose latest explicit pull request creation is still pending,
+    /// oldest request first.
+    pub async fn pending_pull_request_creation_run_ids(&self) -> Result<Vec<RunId>> {
+        self.warm_projection_cache().await?;
+        Ok(self.projection_cache.pending_pull_request_creations().await)
+    }
+
     pub async fn put_session_run_index(
         &self,
         session_id: &SessionId,

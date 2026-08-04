@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 
 use super::ExecOutputTail;
 use crate::{
-    CommandTermination, ParallelBranchResult, PullRequestLink, ReviewTarget, StageId, StageOutcome,
+    CommandTermination, ParallelBranchResult, PullRequestCreationId, PullRequestLink, ReviewTarget,
+    StageId, StageOutcome,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -262,6 +263,13 @@ pub struct AgentAcpTimedOutProps {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PullRequestCreationRequestedProps {
+    pub creation_id: PullRequestCreationId,
+    pub model:       String,
+    pub force:       bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PullRequestCreatedProps {
     pub pr_url:      String,
     pub pr_number:   u64,
@@ -287,5 +295,9 @@ pub struct PullRequestUnlinkedProps {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PullRequestFailedProps {
-    pub error: String,
+    /// Set when the failure resolves an explicitly requested creation; absent
+    /// for pull request failures in the workflow publish stage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creation_id: Option<PullRequestCreationId>,
+    pub error:       String,
 }

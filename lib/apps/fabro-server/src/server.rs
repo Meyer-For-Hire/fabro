@@ -86,7 +86,7 @@ use fabro_slack::{blocks as slack_blocks, connection as slack_connection};
 use fabro_static::EnvVars;
 use fabro_store::{
     ArtifactKey, ArtifactStore, CachedRunProjection, Database, EventEnvelope, EventPayload,
-    NodeArtifact, PendingInterviewRecord, RunSummaryStore, StageArtifactEntry, StageId,
+    KeyedMutex, NodeArtifact, PendingInterviewRecord, RunSummaryStore, StageArtifactEntry, StageId,
 };
 #[cfg(test)]
 use fabro_types::BlockedReason;
@@ -128,8 +128,7 @@ use tokio::process::Command;
 use tokio::runtime::Builder as TokioRuntimeBuilder;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{
-    Mutex as AsyncMutex, Notify, OwnedMutexGuard, RwLock as AsyncRwLock, Semaphore, broadcast,
-    mpsc, oneshot,
+    Mutex as AsyncMutex, Notify, RwLock as AsyncRwLock, Semaphore, broadcast, mpsc, oneshot,
 };
 use tokio::task::spawn_blocking;
 use tokio::time::{sleep, timeout};
@@ -174,6 +173,7 @@ use crate::{
 
 mod automation_scheduler;
 mod handler;
+mod pull_request_supervisor;
 mod resource_sampler;
 mod session_runtime;
 
@@ -188,6 +188,7 @@ pub(in crate::server) use handler::graph::{
 };
 #[cfg(test)]
 pub(in crate::server) use handler::system::validate_github_slug;
+pub(crate) use pull_request_supervisor::spawn_pull_request_creation_supervisor;
 use session_runtime::SessionRuntimeManager;
 
 pub(crate) type EnvLookup = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
@@ -1120,12 +1121,13 @@ pub struct AppState {
     pub(crate) worker_runtime: Arc<dyn WorkerRuntime>,
     scheduler_notify: Notify,
     automation_scheduler_notify: Notify,
+    pull_request_scheduler_notify: Notify,
     global_event_tx: broadcast::Sender<EventEnvelope>,
     /// Per-run coalescing registry for `GET /runs/{id}/files`. Concurrent
     /// callers for the same run share one materialization; different runs
     /// proceed in parallel. See `crate::run_files` for semantics.
     pub(crate) files_in_flight: FilesInFlight,
-    pull_request_create_locks: PullRequestCreateLocks,
+    pull_request_create_locks: KeyedMutex<RunId>,
     parent_link_lock: AsyncMutex<()>,
 
     pub(super) server_secrets: ServerSecrets,
@@ -1157,8 +1159,6 @@ pub(crate) struct AppStores {
     pub(crate) vault:         Arc<SecretStore>,
     pub(crate) variables:     Arc<VariableStore>,
 }
-
-type PullRequestCreateLocks = Arc<Mutex<HashMap<RunId, Arc<AsyncMutex<()>>>>>;
 
 impl AppState {
     pub(crate) fn automation_store(&self) -> &AutomationStore {
@@ -1207,6 +1207,16 @@ impl AppState {
     ) -> impl std::future::Future<Output = ()> + '_ {
         self.automation_scheduler_notify.notified()
     }
+
+    pub(crate) fn notify_pull_request_scheduler(&self) {
+        self.pull_request_scheduler_notify.notify_one();
+    }
+
+    pub(crate) fn pull_request_scheduler_notified(
+        &self,
+    ) -> impl std::future::Future<Output = ()> + '_ {
+        self.pull_request_scheduler_notify.notified()
+    }
 }
 
 pub(crate) struct AskFabroReadiness {
@@ -1240,50 +1250,6 @@ impl AskFabroReadiness {
             unavailable_reason,
             default_model: self.default_model.clone(),
         }
-    }
-}
-
-struct PullRequestCreateGuard {
-    locks:  PullRequestCreateLocks,
-    run_id: RunId,
-    mutex:  Arc<AsyncMutex<()>>,
-    guard:  Option<OwnedMutexGuard<()>>,
-}
-
-impl Drop for PullRequestCreateGuard {
-    fn drop(&mut self) {
-        self.guard.take();
-
-        let mut locks = self
-            .locks
-            .lock()
-            .expect("pull request create locks poisoned");
-        if locks.get(&self.run_id).is_some_and(|mutex| {
-            Arc::ptr_eq(mutex, &self.mutex) && Arc::strong_count(&self.mutex) == 2
-        }) {
-            locks.remove(&self.run_id);
-        }
-    }
-}
-
-async fn lock_pull_request_create(
-    locks: &PullRequestCreateLocks,
-    run_id: &RunId,
-) -> PullRequestCreateGuard {
-    let mutex = {
-        let mut locks = locks.lock().expect("pull request create locks poisoned");
-        Arc::clone(
-            locks
-                .entry(*run_id)
-                .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
-        )
-    };
-    let guard = mutex.clone().lock_owned().await;
-    PullRequestCreateGuard {
-        locks: Arc::clone(locks),
-        run_id: *run_id,
-        mutex,
-        guard: Some(guard),
     }
 }
 
@@ -1519,6 +1485,20 @@ impl AppState {
             .ok_or_else(|| ApiError::not_found("Run not found."))
     }
 
+    /// Like [`Self::cached_run`], but returns only the shared projection —
+    /// no run summary clone or children count under the cache mutex.
+    pub(crate) async fn cached_run_projection(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Arc<fabro_store::RunProjection>, ApiError> {
+        self.stores
+            .runs
+            .get_cached_projection(run_id)
+            .await
+            .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+            .ok_or_else(|| ApiError::not_found("Run not found."))
+    }
+
     pub(crate) fn session_runtimes(&self) -> &SessionRuntimeManager {
         &self.session_runtimes
     }
@@ -1621,6 +1601,7 @@ impl AppState {
         self.shutting_down.store(true, Ordering::Relaxed);
         self.scheduler_notify.notify_waiters();
         self.automation_scheduler_notify.notify_waiters();
+        self.pull_request_scheduler_notify.notify_waiters();
     }
 
     pub(crate) fn shutdown_token(&self) -> CancellationToken {
@@ -2559,9 +2540,10 @@ pub(crate) fn build_app_state(config: AppStateConfig) -> anyhow::Result<Arc<AppS
         worker_runtime,
         scheduler_notify: Notify::new(),
         automation_scheduler_notify: Notify::new(),
+        pull_request_scheduler_notify: Notify::new(),
         global_event_tx,
         files_in_flight: new_files_in_flight(),
-        pull_request_create_locks: Arc::new(Mutex::new(HashMap::new())),
+        pull_request_create_locks: KeyedMutex::new(),
         parent_link_lock: AsyncMutex::new(()),
         server_secrets,
         llm_source,

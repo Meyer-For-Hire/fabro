@@ -272,6 +272,8 @@ export * from './prune-run-entry';
 export * from './prune-runs-request';
 export * from './prune-runs-response';
 export * from './pull-request';
+export * from './pull-request-creation';
+export * from './pull-request-creation-status';
 export * from './pull-request-details';
 export * from './pull-request-details-status';
 export * from './pull-request-details-timestamps';

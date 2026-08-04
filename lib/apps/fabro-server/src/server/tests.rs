@@ -4167,6 +4167,30 @@ async fn wait_for_mock_hits(mock: &httpmock::Mock<'_>, expected: usize) {
     panic!("mock did not receive {expected} request(s)");
 }
 
+/// Poll `GET /runs/{id}/pull_request/creation` until the creation leaves
+/// `pending`, returning the terminal creation body.
+async fn wait_for_pull_request_creation(app: &Router, run_id: RunId) -> serde_json::Value {
+    for _ in 0..150 {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(api(&format!("/runs/{run_id}/pull_request/creation")))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response_json!(response, StatusCode::OK).await;
+        if body["status"] != "pending" {
+            return body;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("pull request creation for run {run_id} did not finish");
+}
+
 async fn title_update_event_count(state: &AppState, run_id: RunId) -> usize {
     let run_store = state.stores.runs.open_run(&run_id).await.unwrap();
     run_store
@@ -9723,6 +9747,17 @@ async fn create_run_pull_request_creates_and_persists_record() {
                 .to_string(),
             );
     });
+    let find_mock = github.mock(|when, then| {
+        when.method("GET")
+            .path("/repos/acme/widgets/pulls")
+            .query_param("state", "open")
+            .query_param("base", "main")
+            .query_param("head", "acme:fabro/run/42")
+            .header("authorization", "Bearer ghu_test");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body("[]");
+    });
     let llm = MockServer::start_async().await;
     let response_mock = llm
         .mock_async(|when, then| {
@@ -9782,12 +9817,29 @@ async fn create_run_pull_request_creates_and_persists_record() {
         )
         .await
         .unwrap();
-    let body = response_json!(response, StatusCode::OK).await;
+    assert_eq!(
+        response.headers().get(header::LOCATION).unwrap(),
+        &format!("/api/v1/runs/{run_id}/pull_request/creation")
+    );
+    let body = response_json!(response, StatusCode::ACCEPTED).await;
 
-    assert_eq!(body["number"], 42);
-    assert_eq!(body["owner"], "acme");
-    assert_eq!(body["repo"], "widgets");
-    assert_eq!(body["html_url"], "https://github.com/acme/widgets/pull/42");
+    assert_eq!(body["status"], "pending");
+    assert_eq!(body["model"], "gpt-5.4");
+
+    // Starting the supervisor after the request simulates server recovery:
+    // the durable pending event is enough to resume the operation.
+    let supervisor = spawn_pull_request_creation_supervisor(Arc::clone(&state));
+
+    let creation_body = wait_for_pull_request_creation(&app, run_id).await;
+
+    assert_eq!(creation_body["status"], "succeeded");
+    assert_eq!(creation_body["pull_request"]["number"], 42);
+    assert_eq!(creation_body["pull_request"]["owner"], "acme");
+    assert_eq!(creation_body["pull_request"]["repo"], "widgets");
+    assert_eq!(
+        creation_body["pull_request"]["html_url"],
+        "https://github.com/acme/widgets/pull/42"
+    );
 
     let state_response = app
         .oneshot(
@@ -9806,7 +9858,136 @@ async fn create_run_pull_request_creates_and_persists_record() {
 
     response_mock.assert_async().await;
     branch_mock.assert();
+    find_mock.assert();
     create_mock.assert();
+    state.shutdown_token().cancel();
+    supervisor.await.unwrap();
+}
+
+#[tokio::test]
+async fn create_run_pull_request_returns_the_active_durable_request() {
+    let github = MockServer::start();
+    let (state, app, run_id) = Box::pin(pr_test_app_with_completed_run(
+        Some("ghu_test"),
+        Some(github.base_url()),
+        Some("https://github.com/acme/widgets.git"),
+    ))
+    .await;
+
+    let configured_provider_ids = state.ready_llm_provider_ids().await;
+    let expected_default_model = state
+        .catalog()
+        .default_for_configured_ids(&configured_provider_ids)
+        .id
+        .to_string();
+    let request_body = json!({
+        "force": false,
+        "model": null
+    })
+    .to_string();
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(api(&format!("/runs/{run_id}/pull_request")))
+                .header("content-type", "application/json")
+                .body(Body::from(request_body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let first_body = response_json!(first, StatusCode::ACCEPTED).await;
+
+    let second = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(api(&format!("/runs/{run_id}/pull_request")))
+                .header("content-type", "application/json")
+                .body(Body::from(request_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let second_body = response_json!(second, StatusCode::ACCEPTED).await;
+
+    assert_eq!(first_body["id"], second_body["id"]);
+    assert_eq!(first_body["model"], expected_default_model);
+    let run_store = state.stores.runs.open_run_reader(&run_id).await.unwrap();
+    let events = run_store.list_events().await.unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event.event_name() == "pull_request.creation_requested")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn create_run_pull_request_persists_generation_failure() {
+    let github = MockServer::start();
+    let branch_mock = github.mock(|when, then| {
+        when.method("GET")
+            .path("/repos/acme/widgets/branches/fabro/run/42")
+            .header("authorization", "Bearer ghu_test");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(json!({ "commit": { "sha": "final-sha" } }).to_string());
+    });
+    let find_mock = github.mock(|when, then| {
+        when.method("GET")
+            .path("/repos/acme/widgets/pulls")
+            .query_param("state", "open")
+            .query_param("base", "main")
+            .query_param("head", "acme:fabro/run/42")
+            .header("authorization", "Bearer ghu_test");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body("[]");
+    });
+    let (state, app, run_id) = Box::pin(pr_test_app_with_completed_run(
+        Some("ghu_test"),
+        Some(github.base_url()),
+        Some("https://github.com/acme/widgets.git"),
+    ))
+    .await;
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(api(&format!("/runs/{run_id}/pull_request")))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "force": false, "model": "gpt-5.4" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    response_json!(response, StatusCode::ACCEPTED).await;
+    let supervisor = spawn_pull_request_creation_supervisor(Arc::clone(&state));
+
+    let creation = wait_for_pull_request_creation(&app, run_id).await;
+
+    assert_eq!(creation["status"], "failed");
+    // The unconfigured LLM is what fails this fixture; pin the error to the
+    // generation step so the test cannot pass on an earlier validation error.
+    assert!(
+        creation["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("LLM generation failed")),
+        "unexpected error: {:?}",
+        creation["error"]
+    );
+    assert!(creation["pull_request"].is_null());
+    branch_mock.assert();
+    find_mock.assert();
+    state.shutdown_token().cancel();
+    supervisor.await.unwrap();
 }
 
 #[tokio::test]

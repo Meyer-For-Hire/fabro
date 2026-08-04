@@ -12,14 +12,14 @@ use fabro_types::{
     ActivatedSkill, AgentControlState, AskFabro, BilledModelUsage, BilledTokenCounts, Checkpoint,
     CheckpointRecord, CommandTermination, Conclusion, EventBody, FailureCategory, FailureSignature,
     InterviewQuestionRecord, McpServerProjection, McpServerStatus, Outcome, PendingInterviewRecord,
-    PendingReason, PullRequestLink, RepositoryRef, Run, RunApproval, RunApprovalState,
-    RunBillingSummary, RunControlAction, RunDiff, RunEvent, RunId, RunLifecycle, RunLinks,
-    RunModel, RunOrigin, RunProjection, RunSandbox, RunSandboxFailure, RunSandboxInstance,
-    RunSandboxPlan, RunSandboxRuntime, RunSize, RunSpec, RunStatus, RunTimestamps,
-    SandboxProviderKind, StageCompletion, StageHandler, StageId, StageInferenceProjection,
-    StageModelUsage, StageOutcome, StageProjection, StageState, StartRecord, SubAgentProjection,
-    SubAgentStatus, TodoListKind, TodoListProjection, TodoProjection, WorkflowRef, first_event_seq,
-    timing,
+    PendingReason, PullRequestCreation, PullRequestCreationStatus, PullRequestLink, RepositoryRef,
+    Run, RunApproval, RunApprovalState, RunBillingSummary, RunControlAction, RunDiff, RunEvent,
+    RunId, RunLifecycle, RunLinks, RunModel, RunOrigin, RunProjection, RunSandbox,
+    RunSandboxFailure, RunSandboxInstance, RunSandboxPlan, RunSandboxRuntime, RunSize, RunSpec,
+    RunStatus, RunTimestamps, SandboxProviderKind, StageCompletion, StageHandler, StageId,
+    StageInferenceProjection, StageModelUsage, StageOutcome, StageProjection, StageState,
+    StartRecord, SubAgentProjection, SubAgentStatus, TodoListKind, TodoListProjection,
+    TodoProjection, WorkflowRef, first_event_seq, timing,
 };
 use fabro_util::error::render_compact_with_causes;
 
@@ -307,18 +307,59 @@ impl RunProjectionReducer for RunProjection {
                     },
                 }));
             }
+            EventBody::PullRequestCreationRequested(props) => {
+                self.pull_request_creation = Some(PullRequestCreation {
+                    id:           props.creation_id,
+                    status:       PullRequestCreationStatus::Pending,
+                    model:        props.model.clone(),
+                    force:        props.force,
+                    requested_at: ts,
+                    updated_at:   ts,
+                    pull_request: None,
+                    error:        None,
+                });
+            }
             EventBody::PullRequestCreated(props) => {
-                self.pull_request = Some(PullRequestLink {
+                let pull_request = PullRequestLink {
                     owner:  props.owner.clone(),
                     repo:   props.repo.clone(),
                     number: props.pr_number,
-                });
+                };
+                self.pull_request = Some(pull_request.clone());
+                if let Some(creation) = self
+                    .pull_request_creation
+                    .as_mut()
+                    .filter(|creation| creation.is_pending())
+                {
+                    creation.succeed(pull_request, ts);
+                }
             }
             EventBody::PullRequestLinked(props) => {
                 self.pull_request = Some(props.pull_request.clone());
+                if let Some(creation) = self
+                    .pull_request_creation
+                    .as_mut()
+                    .filter(|creation| creation.is_pending())
+                {
+                    creation.succeed(props.pull_request.clone(), ts);
+                }
             }
             EventBody::PullRequestUnlinked(_) => {
                 self.pull_request = None;
+                // Clear the creation record too: a lingering `Succeeded`
+                // record would point at a pull request that is no longer
+                // linked, and it would block a later explicit creation.
+                self.pull_request_creation = None;
+            }
+            EventBody::PullRequestFailed(props) => {
+                // Only a failure that names the pending creation resolves it;
+                // publish-stage failures carry no creation id and must not
+                // fail an unrelated explicit creation.
+                if let Some(creation) = self.pull_request_creation.as_mut().filter(|creation| {
+                    Some(creation.id) == props.creation_id && creation.is_pending()
+                }) {
+                    creation.fail(props.error.clone(), ts);
+                }
             }
             EventBody::InterviewStarted(props) => {
                 if props.question_id.is_empty() {
@@ -1651,13 +1692,13 @@ mod tests {
         AgentBackend, AgentControlState, AttrValue, AutomationRef, BilledModelUsage,
         BilledTokenCounts, BlockedReason, Checkpoint, CheckpointRecord, CommandTermination,
         EventBody, FailureCategory, FailureDetail, FailureReason, Graph, McpServerStatus, Node,
-        Outcome, ParallelBranchId, PendingReason, PermissionLevel, PullRequestLink, QuestionType,
-        ReasoningEffort, RunApprovalState, RunBlobId, RunControlAction, RunDiff, RunEvent, RunSize,
-        RunSpec, RunStatus, Speed, StageContextWindowBreakdownItem, StageContextWindowCategory,
-        StageContextWindowCountMethod, StageContextWindowProjection, StageContextWindowStaleness,
-        StageContextWindowWarning, StageHandler, StageModelUsage, StageOutcome, StageState,
-        StageTiming, SubAgentStatus, SuccessReason, WorkflowSettings, first_event_seq, fixtures,
-        test_support,
+        Outcome, ParallelBranchId, PendingReason, PermissionLevel, PullRequestCreationStatus,
+        PullRequestLink, QuestionType, ReasoningEffort, RunApprovalState, RunBlobId,
+        RunControlAction, RunDiff, RunEvent, RunSize, RunSpec, RunStatus, Speed,
+        StageContextWindowBreakdownItem, StageContextWindowCategory, StageContextWindowCountMethod,
+        StageContextWindowProjection, StageContextWindowStaleness, StageContextWindowWarning,
+        StageHandler, StageModelUsage, StageOutcome, StageState, StageTiming, SubAgentStatus,
+        SuccessReason, WorkflowSettings, first_event_seq, fixtures, test_support,
     };
     use serde_json::json;
 
@@ -4630,6 +4671,94 @@ mod tests {
 
         let summary = build_summary(&state, &fixtures::RUN_1);
         assert_eq!(summary.pull_request, state.pull_request);
+    }
+
+    #[test]
+    fn pull_request_creation_projects_failure_retry_and_success() {
+        use fabro_types::run_event::{
+            PullRequestCreatedProps, PullRequestCreationRequestedProps, PullRequestFailedProps,
+        };
+
+        let mut state = running_projection();
+        let first_id = "01KYYK70WTZT2E551P3H5P0059".parse().unwrap();
+        state
+            .apply_event(&test_event(
+                1,
+                EventBody::PullRequestCreationRequested(PullRequestCreationRequestedProps {
+                    creation_id: first_id,
+                    model:       "kimi-k3".to_string(),
+                    force:       false,
+                }),
+                None,
+            ))
+            .unwrap();
+        assert!(state.pull_request_creation.as_ref().unwrap().is_pending());
+
+        state
+            .apply_event(&test_event(
+                2,
+                EventBody::PullRequestFailed(PullRequestFailedProps {
+                    creation_id: None,
+                    error:       "publish stage failure".to_string(),
+                }),
+                None,
+            ))
+            .unwrap();
+        assert!(
+            state.pull_request_creation.as_ref().unwrap().is_pending(),
+            "a failure without a creation id must not resolve the creation"
+        );
+
+        state
+            .apply_event(&test_event(
+                3,
+                EventBody::PullRequestFailed(PullRequestFailedProps {
+                    creation_id: Some(first_id),
+                    error:       "provider unavailable".to_string(),
+                }),
+                None,
+            ))
+            .unwrap();
+        let failed = state.pull_request_creation.as_ref().unwrap();
+        assert_eq!(failed.status, PullRequestCreationStatus::Failed);
+        assert_eq!(failed.error.as_deref(), Some("provider unavailable"));
+
+        let retry_id = "01KYYK70WTZT2E551P3H5P0060".parse().unwrap();
+        state
+            .apply_event(&test_event(
+                4,
+                EventBody::PullRequestCreationRequested(PullRequestCreationRequestedProps {
+                    creation_id: retry_id,
+                    model:       "claude-sonnet-4-6".to_string(),
+                    force:       true,
+                }),
+                None,
+            ))
+            .unwrap();
+        assert_eq!(state.pull_request_creation.as_ref().unwrap().id, retry_id);
+
+        state
+            .apply_event(&test_event(
+                5,
+                EventBody::PullRequestCreated(PullRequestCreatedProps {
+                    pr_url:      "https://github.com/fabro-sh/fabro/pull/123".to_string(),
+                    pr_number:   123,
+                    owner:       "fabro-sh".to_string(),
+                    repo:        "fabro".to_string(),
+                    base_branch: "main".to_string(),
+                    head_branch: "fabro/run/demo".to_string(),
+                    head_sha:    Some("final-sha".to_string()),
+                    title:       "Create asynchronously".to_string(),
+                    draft:       true,
+                }),
+                None,
+            ))
+            .unwrap();
+        let succeeded = state.pull_request_creation.as_ref().unwrap();
+        assert_eq!(succeeded.status, PullRequestCreationStatus::Succeeded);
+        assert_eq!(succeeded.pull_request.as_ref().unwrap().number, 123);
+        assert_eq!(succeeded.pull_request, state.pull_request);
+        assert!(succeeded.error.is_none());
     }
 
     #[test]

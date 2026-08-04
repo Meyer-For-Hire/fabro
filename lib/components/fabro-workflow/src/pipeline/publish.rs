@@ -116,7 +116,8 @@ impl Concluded {
         .await
         .map_err(|error| {
             self.services.emitter.emit(&Event::PullRequestFailed {
-                error: error.clone(),
+                creation_id: None,
+                error:       error.clone(),
             });
             Error::publish_with_source("failed to create pull request", anyhow::anyhow!(error))
         })?;
@@ -185,7 +186,8 @@ impl Concluded {
 
     fn pull_request_error(&self, message: &str) -> Error {
         self.services.emitter.emit(&Event::PullRequestFailed {
-            error: message.to_string(),
+            creation_id: None,
+            error:       message.to_string(),
         });
         Error::publish(message)
     }

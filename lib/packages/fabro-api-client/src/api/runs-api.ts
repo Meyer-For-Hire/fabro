@@ -56,6 +56,8 @@ import type { PaginatedRunList } from '../models';
 // @ts-ignore
 import type { PreflightResponse } from '../models';
 // @ts-ignore
+import type { PullRequestCreation } from '../models';
+// @ts-ignore
 import type { PullRequestLink } from '../models';
 // @ts-ignore
 import type { PullRequestResponse } from '../models';
@@ -409,7 +411,7 @@ export const RunsApiAxiosParamCreator = function (configuration?: Configuration)
             };
         },
         /**
-         * Creates a pull request for a completed run on GitHub and persists the record on the server.
+         * Durably requests creation of a pull request for a completed run. The server generates the pull request content and creates the GitHub pull request after this request returns. Poll the URL in the Location response header until the creation succeeds or fails.  If a creation is already pending for the run, the response returns that creation unchanged; any different `model` or `force` values in the new request are ignored.
          * @summary Create Run Pull Request
          * @param {string} id Unique run identifier (ULID).
          * @param {CreateRunPullRequestRequest} createRunPullRequestRequest
@@ -595,6 +597,46 @@ export const RunsApiAxiosParamCreator = function (configuration?: Configuration)
             // verify required parameter 'id' is not null or undefined
             assertParamExists('getRunPullRequest', 'id', id)
             const localVarPath = `/api/v1/runs/{id}/pull_request`
+                .replace(`{${"id"}}`, encodeURIComponent(String(id)));
+            // use dummy base URL string because the URL constructor only accepts absolute URLs.
+            const localVarUrlObj = new URL(localVarPath, DUMMY_BASE_URL);
+            let baseOptions;
+            if (configuration) {
+                baseOptions = configuration.baseOptions;
+            }
+
+            const localVarRequestOptions = { method: 'GET', ...baseOptions, ...options};
+            const localVarHeaderParameter = {} as any;
+            const localVarQueryParameter = {} as any;
+
+            // authentication SessionCookie required
+
+            // authentication BearerAuth required
+            // http bearer authentication required
+            await setBearerAuthToObject(localVarHeaderParameter, configuration)
+
+            localVarHeaderParameter['Accept'] = 'application/json';
+
+            setSearchParams(localVarUrlObj, localVarQueryParameter);
+            let headersFromBaseOptions = baseOptions && baseOptions.headers ? baseOptions.headers : {};
+            localVarRequestOptions.headers = {...localVarHeaderParameter, ...headersFromBaseOptions, ...options.headers};
+
+            return {
+                url: toPathString(localVarUrlObj),
+                options: localVarRequestOptions,
+            };
+        },
+        /**
+         * Returns the latest explicit pull request creation requested for this run.
+         * @summary Get Run Pull Request Creation
+         * @param {string} id Unique run identifier (ULID).
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        getRunPullRequestCreation: async (id: string, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
+            // verify required parameter 'id' is not null or undefined
+            assertParamExists('getRunPullRequestCreation', 'id', id)
+            const localVarPath = `/api/v1/runs/{id}/pull_request/creation`
                 .replace(`{${"id"}}`, encodeURIComponent(String(id)));
             // use dummy base URL string because the URL constructor only accepts absolute URLs.
             const localVarUrlObj = new URL(localVarPath, DUMMY_BASE_URL);
@@ -1646,14 +1688,14 @@ export const RunsApiFp = function(configuration?: Configuration) {
             return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
         },
         /**
-         * Creates a pull request for a completed run on GitHub and persists the record on the server.
+         * Durably requests creation of a pull request for a completed run. The server generates the pull request content and creates the GitHub pull request after this request returns. Poll the URL in the Location response header until the creation succeeds or fails.  If a creation is already pending for the run, the response returns that creation unchanged; any different `model` or `force` values in the new request are ignored.
          * @summary Create Run Pull Request
          * @param {string} id Unique run identifier (ULID).
          * @param {CreateRunPullRequestRequest} createRunPullRequestRequest
          * @param {*} [options] Override http request option.
          * @throws {RequiredError}
          */
-        async createRunPullRequest(id: string, createRunPullRequestRequest: CreateRunPullRequestRequest, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<PullRequestLink>> {
+        async createRunPullRequest(id: string, createRunPullRequestRequest: CreateRunPullRequestRequest, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<PullRequestCreation>> {
             const localVarAxiosArgs = await localVarAxiosParamCreator.createRunPullRequest(id, createRunPullRequestRequest, options);
             const localVarOperationServerIndex = configuration?.serverIndex ?? 0;
             const localVarOperationServerBasePath = operationServerMap['RunsApi.createRunPullRequest']?.[localVarOperationServerIndex]?.url;
@@ -1712,6 +1754,19 @@ export const RunsApiFp = function(configuration?: Configuration) {
             const localVarAxiosArgs = await localVarAxiosParamCreator.getRunPullRequest(id, options);
             const localVarOperationServerIndex = configuration?.serverIndex ?? 0;
             const localVarOperationServerBasePath = operationServerMap['RunsApi.getRunPullRequest']?.[localVarOperationServerIndex]?.url;
+            return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
+        },
+        /**
+         * Returns the latest explicit pull request creation requested for this run.
+         * @summary Get Run Pull Request Creation
+         * @param {string} id Unique run identifier (ULID).
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        async getRunPullRequestCreation(id: string, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<PullRequestCreation>> {
+            const localVarAxiosArgs = await localVarAxiosParamCreator.getRunPullRequestCreation(id, options);
+            const localVarOperationServerIndex = configuration?.serverIndex ?? 0;
+            const localVarOperationServerBasePath = operationServerMap['RunsApi.getRunPullRequestCreation']?.[localVarOperationServerIndex]?.url;
             return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
         },
         /**
@@ -2090,14 +2145,14 @@ export const RunsApiFactory = function (configuration?: Configuration, basePath?
             return localVarFp.createRun(runManifest, options).then((request) => request(axios, basePath));
         },
         /**
-         * Creates a pull request for a completed run on GitHub and persists the record on the server.
+         * Durably requests creation of a pull request for a completed run. The server generates the pull request content and creates the GitHub pull request after this request returns. Poll the URL in the Location response header until the creation succeeds or fails.  If a creation is already pending for the run, the response returns that creation unchanged; any different `model` or `force` values in the new request are ignored.
          * @summary Create Run Pull Request
          * @param {string} id Unique run identifier (ULID).
          * @param {CreateRunPullRequestRequest} createRunPullRequestRequest
          * @param {*} [options] Override http request option.
          * @throws {RequiredError}
          */
-        createRunPullRequest(id: string, createRunPullRequestRequest: CreateRunPullRequestRequest, options?: RawAxiosRequestConfig): AxiosPromise<PullRequestLink> {
+        createRunPullRequest(id: string, createRunPullRequestRequest: CreateRunPullRequestRequest, options?: RawAxiosRequestConfig): AxiosPromise<PullRequestCreation> {
             return localVarFp.createRunPullRequest(id, createRunPullRequestRequest, options).then((request) => request(axios, basePath));
         },
         /**
@@ -2142,6 +2197,16 @@ export const RunsApiFactory = function (configuration?: Configuration, basePath?
          */
         getRunPullRequest(id: string, options?: RawAxiosRequestConfig): AxiosPromise<PullRequestResponse> {
             return localVarFp.getRunPullRequest(id, options).then((request) => request(axios, basePath));
+        },
+        /**
+         * Returns the latest explicit pull request creation requested for this run.
+         * @summary Get Run Pull Request Creation
+         * @param {string} id Unique run identifier (ULID).
+         * @param {*} [options] Override http request option.
+         * @throws {RequiredError}
+         */
+        getRunPullRequestCreation(id: string, options?: RawAxiosRequestConfig): AxiosPromise<PullRequestCreation> {
+            return localVarFp.getRunPullRequestCreation(id, options).then((request) => request(axios, basePath));
         },
         /**
          * Returns checkpoint timeline entries from durable run-store checkpoints. Metadata branches are write-only archives and are not read by this endpoint.
@@ -2462,7 +2527,7 @@ export class RunsApi extends BaseAPI {
     }
 
     /**
-     * Creates a pull request for a completed run on GitHub and persists the record on the server.
+     * Durably requests creation of a pull request for a completed run. The server generates the pull request content and creates the GitHub pull request after this request returns. Poll the URL in the Location response header until the creation succeeds or fails.  If a creation is already pending for the run, the response returns that creation unchanged; any different `model` or `force` values in the new request are ignored.
      * @summary Create Run Pull Request
      * @param {string} id Unique run identifier (ULID).
      * @param {CreateRunPullRequestRequest} createRunPullRequestRequest
@@ -2518,6 +2583,17 @@ export class RunsApi extends BaseAPI {
      */
     public getRunPullRequest(id: string, options?: RawAxiosRequestConfig) {
         return RunsApiFp(this.configuration).getRunPullRequest(id, options).then((request) => request(this.axios, this.basePath));
+    }
+
+    /**
+     * Returns the latest explicit pull request creation requested for this run.
+     * @summary Get Run Pull Request Creation
+     * @param {string} id Unique run identifier (ULID).
+     * @param {*} [options] Override http request option.
+     * @throws {RequiredError}
+     */
+    public getRunPullRequestCreation(id: string, options?: RawAxiosRequestConfig) {
+        return RunsApiFp(this.configuration).getRunPullRequestCreation(id, options).then((request) => request(this.axios, this.basePath));
     }
 
     /**

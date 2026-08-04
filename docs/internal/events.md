@@ -2101,6 +2101,26 @@ These legacy events may appear in older run logs. Current CLI backend runs do no
 
 ## Pull request events
 
+### `pull_request.creation_requested`
+
+```json
+{
+  "id": "...", "ts": "...", "run_id": "...",
+  "event": "pull_request.creation_requested",
+  "properties": {
+    "creation_id": "01KYYK70WTZT2E551P3H5P0059",
+    "model": "gpt-5.4",
+    "force": false
+  }
+}
+```
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `creation_id` | string | Stable identifier for this pull request creation request |
+| `model` | string | Resolved model identifier used to generate the pull request content |
+| `force` | boolean | Whether creation is allowed for a run without a successful conclusion |
+
 ### `pull_request.created`
 
 ```json
@@ -2173,6 +2193,7 @@ These legacy events may appear in older run logs. Current CLI backend runs do no
   "id": "...", "ts": "...", "run_id": "...",
   "event": "pull_request.failed",
   "properties": {
+    "creation_id": "01KYYK70WTZT2E551P3H5P0059",
     "error": "insufficient permissions"
   }
 }
@@ -2180,7 +2201,12 @@ These legacy events may appear in older run logs. Current CLI backend runs do no
 
 | Property | Type | Description |
 |----------|------|-------------|
+| `creation_id` | string (optional) | Explicit pull request creation this failure resolves. Absent for publish-stage failures. |
 | `error` | string | Error message |
+
+When `creation_id` names the run's pending pull request creation, the run
+projection marks that creation `failed`. A `pull_request.failed` event without
+a `creation_id` (the workflow publish stage) does not change creation state.
 
 ## Artifact events
 

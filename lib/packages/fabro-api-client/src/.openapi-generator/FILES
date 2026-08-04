@@ -301,6 +301,8 @@ models/provider.ts
 models/prune-run-entry.ts
 models/prune-runs-request.ts
 models/prune-runs-response.ts
+models/pull-request-creation-status.ts
+models/pull-request-creation.ts
 models/pull-request-details-status.ts
 models/pull-request-details-timestamps.ts
 models/pull-request-details-unavailable-reason.ts
