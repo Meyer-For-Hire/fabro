@@ -2,7 +2,9 @@ use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
 use fabro_llm::Error as LlmError;
-use fabro_llm::types::{ContentPart, ThinkingData, TokenCounts, ToolCall, ToolResult};
+use fabro_llm::types::{
+    ContentPart, Message as LlmMessage, Role, ThinkingData, TokenCounts, ToolCall, ToolResult,
+};
 use fabro_model::{CostSource, ModelRef};
 use fabro_types::{
     CommandTermination, ExecOutputTail, LlmOutputKind, LlmRetryPhase, ReasoningOutput,
@@ -91,6 +93,61 @@ impl Message {
             }) => Some(text.as_str()),
             _ => None,
         })
+    }
+
+    /// Convert this turn into the wire message sent to the provider. Durable
+    /// history and round-staged turns must share this conversion so a staged
+    /// turn produces the same wire shape it will have once committed.
+    #[must_use]
+    pub fn to_llm_message(&self) -> LlmMessage {
+        match self {
+            Self::User { content, .. } => LlmMessage::user(content),
+            Self::Assistant {
+                content,
+                tool_calls,
+                provider_parts,
+                ..
+            } => {
+                let mut parts: Vec<ContentPart> = Vec::new();
+                // Provider-specific opaque parts (e.g. OpenAI reasoning items,
+                // Anthropic thinking blocks with signatures) must precede
+                // function calls for correct round-tripping.
+                parts.extend(provider_parts.iter().cloned());
+                if !content.is_empty() {
+                    parts.push(ContentPart::text(content));
+                }
+                for tc in tool_calls {
+                    parts.push(ContentPart::ToolCall(tc.clone()));
+                }
+                LlmMessage {
+                    role:         Role::Assistant,
+                    content:      parts,
+                    name:         None,
+                    tool_call_id: None,
+                }
+            }
+            Self::ToolResults { results, .. } => {
+                let content: Vec<ContentPart> = results
+                    .iter()
+                    .map(|r| ContentPart::ToolResult(r.clone()))
+                    .collect();
+                // Use the first result's tool_call_id if available
+                let tool_call_id = results.first().map(|r| r.tool_call_id.clone());
+                LlmMessage {
+                    role: Role::Tool,
+                    content,
+                    name: None,
+                    tool_call_id,
+                }
+            }
+            Self::System { content, .. } => LlmMessage::system(content),
+            Self::Steering { content, .. } => LlmMessage {
+                role:         Role::User,
+                content:      vec![ContentPart::text(content)],
+                name:         None,
+                tool_call_id: None,
+            },
+        }
     }
 
     #[must_use]

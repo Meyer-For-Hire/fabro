@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use fabro_llm::types::{ContentPart, Message as LlmMessage, Role, TokenCounts};
+use fabro_llm::types::{Message as LlmMessage, TokenCounts};
 use fabro_types::SessionMessage;
 
 use crate::types::Message;
@@ -94,57 +94,7 @@ impl History {
 
     #[must_use]
     pub fn convert_to_messages(&self) -> Vec<LlmMessage> {
-        self.turns
-            .iter()
-            .map(|turn| match turn {
-                Message::User { content, .. } => LlmMessage::user(content),
-                Message::Assistant {
-                    content,
-                    tool_calls,
-                    provider_parts,
-                    ..
-                } => {
-                    let mut parts: Vec<ContentPart> = Vec::new();
-                    // Provider-specific opaque parts (e.g. OpenAI reasoning items,
-                    // Anthropic thinking blocks with signatures) must precede
-                    // function calls for correct round-tripping.
-                    parts.extend(provider_parts.iter().cloned());
-                    if !content.is_empty() {
-                        parts.push(ContentPart::text(content));
-                    }
-                    for tc in tool_calls {
-                        parts.push(ContentPart::ToolCall(tc.clone()));
-                    }
-                    LlmMessage {
-                        role:         Role::Assistant,
-                        content:      parts,
-                        name:         None,
-                        tool_call_id: None,
-                    }
-                }
-                Message::ToolResults { results, .. } => {
-                    let content: Vec<ContentPart> = results
-                        .iter()
-                        .map(|r| ContentPart::ToolResult(r.clone()))
-                        .collect();
-                    // Use the first result's tool_call_id if available
-                    let tool_call_id = results.first().map(|r| r.tool_call_id.clone());
-                    LlmMessage {
-                        role: Role::Tool,
-                        content,
-                        name: None,
-                        tool_call_id,
-                    }
-                }
-                Message::System { content, .. } => LlmMessage::system(content),
-                Message::Steering { content, .. } => LlmMessage {
-                    role:         Role::User,
-                    content:      vec![ContentPart::text(content)],
-                    name:         None,
-                    tool_call_id: None,
-                },
-            })
-            .collect()
+        self.turns.iter().map(Message::to_llm_message).collect()
     }
 }
 
@@ -214,7 +164,7 @@ fn add_tool_result_call_ids<'a>(turns: &'a [Message], call_ids: &mut HashSet<&'a
 mod tests {
     use std::time::SystemTime;
 
-    use fabro_llm::types::{ThinkingData, TokenCounts, ToolCall, ToolResult};
+    use fabro_llm::types::{ContentPart, Role, ThinkingData, TokenCounts, ToolCall, ToolResult};
 
     use super::*;
 
