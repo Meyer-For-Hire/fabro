@@ -635,17 +635,9 @@ pub async fn create_installation_access_token_for_pr(
     .await
 }
 
-/// Result of a successful pull request creation.
-pub struct CreatedPullRequest {
-    pub html_url: String,
-    pub number:   u64,
-    pub node_id:  String,
-}
-
-/// Existing open pull request found for an exact base, head branch, and head
-/// commit.
+/// Pull request created on, or reconciled from, GitHub.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExistingPullRequest {
+pub struct CreatedPullRequest {
     pub html_url: String,
     pub number:   u64,
     pub node_id:  String,
@@ -663,7 +655,7 @@ pub async fn find_open_pull_request(
     base: &str,
     head: &str,
     expected_head_sha: &str,
-) -> anyhow::Result<Option<ExistingPullRequest>> {
+) -> anyhow::Result<Option<CreatedPullRequest>> {
     let client = ctx.http_client()?;
     find_open_pull_request_with_client(&client, ctx, owner, repo, base, head, expected_head_sha)
         .await
@@ -681,7 +673,7 @@ pub async fn find_open_pull_request_with_client(
     base: &str,
     head: &str,
     expected_head_sha: &str,
-) -> anyhow::Result<Option<ExistingPullRequest>> {
+) -> anyhow::Result<Option<CreatedPullRequest>> {
     #[derive(Deserialize)]
     struct PullRequestHead {
         sha: String,
@@ -736,7 +728,7 @@ pub async fn find_open_pull_request_with_client(
     Ok(pull_requests
         .into_iter()
         .find(|pull_request| pull_request.head.sha == expected_head_sha)
-        .map(|pull_request| ExistingPullRequest {
+        .map(|pull_request| CreatedPullRequest {
             html_url: pull_request.html_url,
             number:   pull_request.number,
             node_id:  pull_request.node_id,
@@ -849,6 +841,7 @@ pub async fn create_pull_request_with_client(
         html_url: pr.html_url,
         number:   pr.number,
         node_id:  pr.node_id,
+        title:    title.to_string(),
     })
 }
 

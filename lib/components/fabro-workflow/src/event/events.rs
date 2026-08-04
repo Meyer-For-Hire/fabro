@@ -751,7 +751,10 @@ pub enum Event {
         pull_request: PullRequestLink,
     },
     PullRequestFailed {
-        error: String,
+        /// Set when the failure resolves an explicitly requested creation;
+        /// `None` for pull request failures in the workflow publish stage.
+        creation_id: Option<PullRequestCreationId>,
+        error:       String,
     },
 }
 

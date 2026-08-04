@@ -411,7 +411,7 @@ export const RunsApiAxiosParamCreator = function (configuration?: Configuration)
             };
         },
         /**
-         * Durably requests creation of a pull request for a completed run. The server generates the pull request content and creates the GitHub pull request after this request returns. Poll the URL in the Location response header until the creation succeeds or fails.
+         * Durably requests creation of a pull request for a completed run. The server generates the pull request content and creates the GitHub pull request after this request returns. Poll the URL in the Location response header until the creation succeeds or fails.  If a creation is already pending for the run, the response returns that creation unchanged; any different `model` or `force` values in the new request are ignored.
          * @summary Create Run Pull Request
          * @param {string} id Unique run identifier (ULID).
          * @param {CreateRunPullRequestRequest} createRunPullRequestRequest
@@ -1688,7 +1688,7 @@ export const RunsApiFp = function(configuration?: Configuration) {
             return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
         },
         /**
-         * Durably requests creation of a pull request for a completed run. The server generates the pull request content and creates the GitHub pull request after this request returns. Poll the URL in the Location response header until the creation succeeds or fails.
+         * Durably requests creation of a pull request for a completed run. The server generates the pull request content and creates the GitHub pull request after this request returns. Poll the URL in the Location response header until the creation succeeds or fails.  If a creation is already pending for the run, the response returns that creation unchanged; any different `model` or `force` values in the new request are ignored.
          * @summary Create Run Pull Request
          * @param {string} id Unique run identifier (ULID).
          * @param {CreateRunPullRequestRequest} createRunPullRequestRequest
@@ -2145,7 +2145,7 @@ export const RunsApiFactory = function (configuration?: Configuration, basePath?
             return localVarFp.createRun(runManifest, options).then((request) => request(axios, basePath));
         },
         /**
-         * Durably requests creation of a pull request for a completed run. The server generates the pull request content and creates the GitHub pull request after this request returns. Poll the URL in the Location response header until the creation succeeds or fails.
+         * Durably requests creation of a pull request for a completed run. The server generates the pull request content and creates the GitHub pull request after this request returns. Poll the URL in the Location response header until the creation succeeds or fails.  If a creation is already pending for the run, the response returns that creation unchanged; any different `model` or `force` values in the new request are ignored.
          * @summary Create Run Pull Request
          * @param {string} id Unique run identifier (ULID).
          * @param {CreateRunPullRequestRequest} createRunPullRequestRequest
@@ -2527,7 +2527,7 @@ export class RunsApi extends BaseAPI {
     }
 
     /**
-     * Durably requests creation of a pull request for a completed run. The server generates the pull request content and creates the GitHub pull request after this request returns. Poll the URL in the Location response header until the creation succeeds or fails.
+     * Durably requests creation of a pull request for a completed run. The server generates the pull request content and creates the GitHub pull request after this request returns. Poll the URL in the Location response header until the creation succeeds or fails.  If a creation is already pending for the run, the response returns that creation unchanged; any different `model` or `force` values in the new request are ignored.
      * @summary Create Run Pull Request
      * @param {string} id Unique run identifier (ULID).
      * @param {CreateRunPullRequestRequest} createRunPullRequestRequest

@@ -4098,6 +4098,30 @@ async fn wait_for_mock_hits(mock: &httpmock::Mock<'_>, expected: usize) {
     panic!("mock did not receive {expected} request(s)");
 }
 
+/// Poll `GET /runs/{id}/pull_request/creation` until the creation leaves
+/// `pending`, returning the terminal creation body.
+async fn wait_for_pull_request_creation(app: &Router, run_id: RunId) -> serde_json::Value {
+    for _ in 0..150 {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(api(&format!("/runs/{run_id}/pull_request/creation")))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response_json!(response, StatusCode::OK).await;
+        if body["status"] != "pending" {
+            return body;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("pull request creation for run {run_id} did not finish");
+}
+
 async fn title_update_event_count(state: &AppState, run_id: RunId) -> usize {
     let run_store = state.stores.runs.open_run(&run_id).await.unwrap();
     run_store
@@ -9754,28 +9778,7 @@ async fn create_run_pull_request_creates_and_persists_record() {
     // the durable pending event is enough to resume the operation.
     let supervisor = spawn_pull_request_creation_supervisor(Arc::clone(&state));
 
-    let creation_body = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        loop {
-            let response = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method("GET")
-                        .uri(api(&format!("/runs/{run_id}/pull_request/creation")))
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            let body = response_json!(response, StatusCode::OK).await;
-            if body["status"] != "pending" {
-                break body;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("pull request creation should finish");
+    let creation_body = wait_for_pull_request_creation(&app, run_id).await;
 
     assert_eq!(creation_body["status"], "succeeded");
     assert_eq!(creation_body["pull_request"]["number"], 42);
@@ -9916,34 +9919,17 @@ async fn create_run_pull_request_persists_generation_failure() {
     response_json!(response, StatusCode::ACCEPTED).await;
     let supervisor = spawn_pull_request_creation_supervisor(Arc::clone(&state));
 
-    let creation = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        loop {
-            let response = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method("GET")
-                        .uri(api(&format!("/runs/{run_id}/pull_request/creation")))
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            let body = response_json!(response, StatusCode::OK).await;
-            if body["status"] != "pending" {
-                break body;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("pull request creation should finish");
+    let creation = wait_for_pull_request_creation(&app, run_id).await;
 
     assert_eq!(creation["status"], "failed");
+    // The unconfigured LLM is what fails this fixture; pin the error to the
+    // generation step so the test cannot pass on an earlier validation error.
     assert!(
         creation["error"]
             .as_str()
-            .is_some_and(|error| !error.is_empty())
+            .is_some_and(|error| error.contains("LLM generation failed")),
+        "unexpected error: {:?}",
+        creation["error"]
     );
     assert!(creation["pull_request"].is_null());
     branch_mock.assert();

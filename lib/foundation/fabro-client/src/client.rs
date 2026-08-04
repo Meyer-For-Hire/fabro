@@ -38,7 +38,13 @@ use crate::{AuthEntry, OAuthEntry, StoredSubject, sse};
 const DEFAULT_CONTROL_PLANE_REQUEST_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(30);
 const DEFAULT_HEALTH_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+/// Matches the `Retry-After` the server sends on the 202
+/// (`PULL_REQUEST_CREATION_RETRY_AFTER` in `fabro-server`).
 const PULL_REQUEST_CREATION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// Overall polling deadline. The server abandons a creation attempt after 10
+/// minutes, but a creation can also sit pending behind the server's worker
+/// pool (or a dead server), so the client needs its own bound.
+const PULL_REQUEST_CREATION_POLL_DEADLINE: std::time::Duration = std::time::Duration::from_mins(15);
 
 type TransportFuture = BoxFuture<'static, Result<(fabro_http::HttpClient, String)>>;
 
@@ -1440,9 +1446,17 @@ impl Client {
             .request_run_pull_request_creation(run_id, force, model)
             .await?;
         let creation_id = creation.id;
+        let deadline = std::time::Instant::now() + PULL_REQUEST_CREATION_POLL_DEADLINE;
         loop {
             match creation.status {
                 fabro_types::PullRequestCreationStatus::Pending => {
+                    if std::time::Instant::now() >= deadline {
+                        bail!(
+                            "Pull request creation {creation_id} is still pending after {} \
+                             minutes. Check its status with: fabro pr create {run_id}",
+                            PULL_REQUEST_CREATION_POLL_DEADLINE.as_secs() / 60
+                        );
+                    }
                     time::sleep(PULL_REQUEST_CREATION_POLL_INTERVAL).await;
                     creation = self.get_run_pull_request_creation(run_id).await?;
                     if creation.id != creation_id {

@@ -1362,9 +1362,10 @@ fn event_body_from_event(event: &Event) -> EventBody {
                 pull_request: pull_request.clone(),
             })
         }
-        Event::PullRequestFailed { error } => {
+        Event::PullRequestFailed { creation_id, error } => {
             EventBody::PullRequestFailed(fabro_types::PullRequestFailedProps {
-                error: error.clone(),
+                creation_id: *creation_id,
+                error:       error.clone(),
             })
         }
     }

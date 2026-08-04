@@ -2580,6 +2580,10 @@ paths:
         server generates the pull request content and creates the GitHub pull
         request after this request returns. Poll the URL in the Location
         response header until the creation succeeds or fails.
+
+        If a creation is already pending for the run, the response returns
+        that creation unchanged; any different `model` or `force` values in
+        the new request are ignored.
       parameters:
         - $ref: "#/components/parameters/RunId"
       requestBody:
@@ -2644,7 +2648,6 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
-
     put:
       operationId: linkRunPullRequest
       tags: [Runs]

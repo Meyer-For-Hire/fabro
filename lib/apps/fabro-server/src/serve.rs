@@ -997,18 +997,11 @@ where
         }
     } else {
         cleanup_handle.abort();
-    }
-
-    if shutdown.is_cancelled() {
-        if let Err(join_err) = pull_request_creation_supervisor.await {
-            warn!(error = %join_err, "Pull request creation supervisor task panicked");
-        }
-    } else {
         pull_request_creation_supervisor.abort();
-        if let Err(join_err) = pull_request_creation_supervisor.await {
-            if !join_err.is_cancelled() {
-                warn!(error = %join_err, "Pull request creation supervisor task panicked");
-            }
+    }
+    if let Err(join_err) = pull_request_creation_supervisor.await {
+        if !join_err.is_cancelled() {
+            warn!(error = %join_err, "Pull request creation supervisor task panicked");
         }
     }
 

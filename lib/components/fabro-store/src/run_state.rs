@@ -326,37 +326,39 @@ impl RunProjectionReducer for RunProjection {
                     number: props.pr_number,
                 };
                 self.pull_request = Some(pull_request.clone());
-                if let Some(creation) = self.pull_request_creation.as_mut() {
-                    if creation.is_pending() {
-                        creation.status = PullRequestCreationStatus::Succeeded;
-                        creation.updated_at = ts;
-                        creation.pull_request = Some(pull_request);
-                        creation.error = None;
-                    }
+                if let Some(creation) = self
+                    .pull_request_creation
+                    .as_mut()
+                    .filter(|creation| creation.is_pending())
+                {
+                    creation.succeed(pull_request, ts);
                 }
             }
             EventBody::PullRequestLinked(props) => {
                 self.pull_request = Some(props.pull_request.clone());
-                if let Some(creation) = self.pull_request_creation.as_mut() {
-                    if creation.is_pending() {
-                        creation.status = PullRequestCreationStatus::Succeeded;
-                        creation.updated_at = ts;
-                        creation.pull_request = Some(props.pull_request.clone());
-                        creation.error = None;
-                    }
+                if let Some(creation) = self
+                    .pull_request_creation
+                    .as_mut()
+                    .filter(|creation| creation.is_pending())
+                {
+                    creation.succeed(props.pull_request.clone(), ts);
                 }
             }
             EventBody::PullRequestUnlinked(_) => {
                 self.pull_request = None;
+                // Clear the creation record too: a lingering `Succeeded`
+                // record would point at a pull request that is no longer
+                // linked, and it would block a later explicit creation.
                 self.pull_request_creation = None;
             }
             EventBody::PullRequestFailed(props) => {
-                if let Some(creation) = self.pull_request_creation.as_mut() {
-                    if creation.is_pending() {
-                        creation.status = PullRequestCreationStatus::Failed;
-                        creation.updated_at = ts;
-                        creation.error = Some(props.error.clone());
-                    }
+                // Only a failure that names the pending creation resolves it;
+                // publish-stage failures carry no creation id and must not
+                // fail an unrelated explicit creation.
+                if let Some(creation) = self.pull_request_creation.as_mut().filter(|creation| {
+                    Some(creation.id) == props.creation_id && creation.is_pending()
+                }) {
+                    creation.fail(props.error.clone(), ts);
                 }
             }
             EventBody::InterviewStarted(props) => {
@@ -4663,7 +4665,23 @@ mod tests {
             .apply_event(&test_event(
                 2,
                 EventBody::PullRequestFailed(PullRequestFailedProps {
-                    error: "provider unavailable".to_string(),
+                    creation_id: None,
+                    error:       "publish stage failure".to_string(),
+                }),
+                None,
+            ))
+            .unwrap();
+        assert!(
+            state.pull_request_creation.as_ref().unwrap().is_pending(),
+            "a failure without a creation id must not resolve the creation"
+        );
+
+        state
+            .apply_event(&test_event(
+                3,
+                EventBody::PullRequestFailed(PullRequestFailedProps {
+                    creation_id: Some(first_id),
+                    error:       "provider unavailable".to_string(),
                 }),
                 None,
             ))
@@ -4675,7 +4693,7 @@ mod tests {
         let retry_id = "01KYYK70WTZT2E551P3H5P0060".parse().unwrap();
         state
             .apply_event(&test_event(
-                3,
+                4,
                 EventBody::PullRequestCreationRequested(PullRequestCreationRequestedProps {
                     creation_id: retry_id,
                     model:       "claude-sonnet-4-6".to_string(),
@@ -4688,7 +4706,7 @@ mod tests {
 
         state
             .apply_event(&test_event(
-                4,
+                5,
                 EventBody::PullRequestCreated(PullRequestCreatedProps {
                     pr_url:      "https://github.com/fabro-sh/fabro/pull/123".to_string(),
                     pr_number:   123,
@@ -4706,6 +4724,7 @@ mod tests {
         let succeeded = state.pull_request_creation.as_ref().unwrap();
         assert_eq!(succeeded.status, PullRequestCreationStatus::Succeeded);
         assert_eq!(succeeded.pull_request.as_ref().unwrap().number, 123);
+        assert_eq!(succeeded.pull_request, state.pull_request);
         assert!(succeeded.error.is_none());
     }
 
