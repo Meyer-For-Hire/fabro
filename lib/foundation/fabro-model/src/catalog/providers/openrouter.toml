@@ -595,6 +595,30 @@ reasoning = false
 input_cost_per_mtok = 0.1875
 output_cost_per_mtok = 1.125
 
+[providers.openrouter.models."qwen3.8-max"]
+api_id = "qwen/qwen3.8-max"
+display_name = "Qwen3.8 Max"
+family = "qwen3"
+
+[providers.openrouter.models."qwen3.8-max".limits]
+context_window = 1000000
+max_output = 131072
+
+[providers.openrouter.models."qwen3.8-max".features]
+tools = true
+vision = true
+reasoning = true
+reasoning_effort = "levels"
+prompt_cache = true
+
+[providers.openrouter.models."qwen3.8-max".controls]
+reasoning_effort = ["low", "medium", "high", "xhigh"]
+
+[providers.openrouter.models."qwen3.8-max".costs]
+input_cost_per_mtok = 2.0
+output_cost_per_mtok = 6.0
+cache_input_cost_per_mtok = 0.25
+
 [providers.openrouter.models."glm-5.2"]
 api_id = "z-ai/glm-5.2"
 display_name = "GLM 5.2 (via OpenRouter)"
