@@ -24,7 +24,7 @@ use fabro_template::{
 };
 use fabro_types::settings::interp::InterpString;
 use fabro_types::settings::run::{ApprovalMode, ResolvedGoalSource, ResolvedRunGoal, RunMode};
-use fabro_types::{DirtyStatus, GitContext, ManifestPath, PreRunPushOutcome, WorkflowSettings};
+use fabro_types::{DirtyStatus, GitContext, ManifestPath, WorkflowSettings};
 use fabro_workflow::git::{
     GitSyncStatus, branch_needs_push, head_sha, push_branch_noninteractive, sync_status,
 };
@@ -754,7 +754,7 @@ fn build_git_context(
                 .filter(|url| !url.is_empty())
         })
         .unwrap_or_default();
-    let push_outcome = build_manifest_push_outcome(
+    push_manifest_branch_best_effort(
         repo_path,
         &branch,
         origin_url.as_deref(),
@@ -765,7 +765,6 @@ fn build_git_context(
         branch,
         sha,
         dirty,
-        push_outcome,
     })
 }
 
@@ -798,14 +797,18 @@ fn detect_manifest_repo_info(repo_path: &Path) -> Option<(Option<String>, String
     Some((origin_url, branch))
 }
 
-fn build_manifest_push_outcome(
+/// Best-effort push of the local branch so clone-based execution can see
+/// local commits. A failed push must not fail manifest creation, and the
+/// discarded push error may contain raw Git stderr, so it is deliberately
+/// neither returned nor logged here.
+fn push_manifest_branch_best_effort(
     repo_path: &Path,
     branch: &str,
     origin_url: Option<&str>,
     configured_repo_origin_url: Option<&str>,
-) -> PreRunPushOutcome {
+) {
     let Some(origin_url) = origin_url else {
-        return PreRunPushOutcome::SkippedNoRemote;
+        return;
     };
 
     if let Some(repo_origin_url) = configured_repo_origin_url
@@ -814,28 +817,15 @@ fn build_manifest_push_outcome(
     {
         let remote = fabro_github::normalize_repo_origin_url(origin_url);
         if remote != repo_origin_url {
-            return PreRunPushOutcome::SkippedRemoteMismatch {
-                remote,
-                repo_origin_url,
-            };
+            return;
         }
     }
 
     if !branch_needs_push(repo_path, "origin", branch) {
-        return PreRunPushOutcome::NotAttempted;
+        return;
     }
 
-    match push_branch_noninteractive(repo_path, "origin", branch) {
-        Ok(()) => PreRunPushOutcome::Succeeded {
-            remote: "origin".to_string(),
-            branch: branch.to_string(),
-        },
-        Err(err) => PreRunPushOutcome::Failed {
-            remote:  "origin".to_string(),
-            branch:  branch.to_string(),
-            message: err.to_string(),
-        },
-    }
+    let _ = push_branch_noninteractive(repo_path, "origin", branch);
 }
 
 fn normalize_absolute_path(base_dir: &Path, reference: &str) -> Option<PathBuf> {
@@ -1709,19 +1699,58 @@ working_dir = "repos/target"
             .expect("manifest git info should be detected");
         assert_eq!(git.branch, "target-branch");
         assert_eq!(git.origin_url, "https://github.com/example/target");
-        assert_eq!(git.push_outcome, PreRunPushOutcome::NotAttempted);
+    }
+
+    /// A local branch ahead of its origin is pushed as a side effect of
+    /// building the manifest, so clone-based execution sees local commits.
+    #[test]
+    fn build_manifest_pushes_local_commits_to_bare_origin() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let bare_origin = init_bare_origin(temp.path());
+
+        init_git_repo(&workspace, "feature", bare_origin.to_str().unwrap());
+
+        let workflow_dir = workspace.join(".fabro/workflows/demo");
+        std::fs::create_dir_all(&workflow_dir).unwrap();
+        std::fs::write(workspace.join(".fabro/project.toml"), "_version = 1\n").unwrap();
+        std::fs::write(
+            workflow_dir.join("workflow.toml"),
+            "_version = 1\n\n[workflow]\ngraph = \"workflow.fabro\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            workflow_dir.join("workflow.fabro"),
+            r"digraph Demo { start [shape=Mdiamond] exit [shape=Msquare] start -> exit }",
+        )
+        .unwrap();
+
+        let built = build_run_manifest(ManifestBuildInput {
+            workflow: PathBuf::from(".fabro/workflows/demo/workflow.toml"),
+            cwd: workspace.clone(),
+            environment_defaults: test_environment_defaults(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert!(built.manifest.git.is_some());
+        let local_head = head_sha(&workspace).expect("workspace HEAD should resolve");
+        assert_eq!(
+            bare_remote_branch_sha(&bare_origin, "feature").as_deref(),
+            Some(local_head.trim()),
+            "the local branch should be pushed to the bare origin during manifest build",
+        );
     }
 
     #[test]
     fn build_manifest_git_skips_push_when_configured_repository_differs_from_origin() {
         let temp = tempfile::tempdir().unwrap();
-        let workspace = temp.path();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let bare_origin = init_bare_origin(temp.path());
 
-        init_git_repo(
-            workspace,
-            "feature",
-            "https://github.com/user/forked-target.git",
-        );
+        init_git_repo(&workspace, "feature", bare_origin.to_str().unwrap());
 
         let workflow_dir = workspace.join(".fabro/workflows/demo");
         std::fs::create_dir_all(&workflow_dir).unwrap();
@@ -1749,7 +1778,7 @@ repository = "target"
 
         let built = build_run_manifest(ManifestBuildInput {
             workflow: PathBuf::from(".fabro/workflows/demo/workflow.toml"),
-            cwd: workspace.to_path_buf(),
+            cwd: workspace.clone(),
             environment_defaults: test_environment_defaults(),
             ..Default::default()
         })
@@ -1760,10 +1789,11 @@ repository = "target"
             .git
             .expect("manifest git info should be detected");
         assert_eq!(git.origin_url, "https://github.com/example/target");
-        assert_eq!(git.push_outcome, PreRunPushOutcome::SkippedRemoteMismatch {
-            remote:          "https://github.com/user/forked-target".to_string(),
-            repo_origin_url: "https://github.com/example/target".to_string(),
-        });
+        assert_eq!(
+            bare_remote_branch_sha(&bare_origin, "feature"),
+            None,
+            "a mismatched configured repository must not be pushed to",
+        );
     }
 
     #[cfg(unix)]
@@ -1820,13 +1850,9 @@ exit 1
                     environment_defaults: test_environment_defaults(),
                     ..Default::default()
                 })
-                .unwrap();
+                .expect("a failed push must not fail manifest creation");
 
-                let git = built
-                    .manifest
-                    .git
-                    .expect("manifest git info should be detected");
-                assert!(matches!(git.push_outcome, PreRunPushOutcome::Failed { .. }));
+                assert!(built.manifest.git.is_some());
             });
         });
 
@@ -1857,6 +1883,21 @@ exit 1
     fn mark_origin_branch_synced(path: &Path, branch: &str) {
         let remote_ref = format!("refs/remotes/origin/{branch}");
         run_git(path, &["update-ref", &remote_ref, "HEAD"]);
+    }
+
+    fn init_bare_origin(parent: &Path) -> PathBuf {
+        let bare = parent.join("origin.git");
+        std::fs::create_dir_all(&bare).unwrap();
+        run_git(&bare, &["init", "--bare", "--quiet"]);
+        bare
+    }
+
+    fn bare_remote_branch_sha(bare_path: &Path, branch: &str) -> Option<String> {
+        let repo = git2::Repository::open_bare(bare_path).expect("bare origin should open");
+        repo.find_reference(&format!("refs/heads/{branch}"))
+            .ok()
+            .and_then(|reference| reference.target())
+            .map(|oid| oid.to_string())
     }
 
     fn run_git(path: &Path, args: &[&str]) {

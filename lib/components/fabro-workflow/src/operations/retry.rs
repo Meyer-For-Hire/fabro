@@ -118,8 +118,8 @@ mod tests {
     use fabro_store::{Database, RunProjectionReducer};
     use fabro_types::{
         AuthMethod, DirtyStatus, FailureReason, ForkSourceRef, GitContext, Graph, IdpIdentity,
-        PreRunPushOutcome, Principal, PullRequestLink, RunBlobId, RunRunnableSource,
-        RunServerProvenance, RunTiming, WorkflowSettings, fixtures,
+        Principal, PullRequestLink, RunBlobId, RunRunnableSource, RunServerProvenance, RunTiming,
+        WorkflowSettings, fixtures,
     };
     use object_store::memory::InMemory;
 
@@ -154,11 +154,10 @@ mod tests {
 
     fn git_context() -> GitContext {
         GitContext {
-            origin_url:   "https://github.com/fabro-sh/fabro.git".to_string(),
-            branch:       "main".to_string(),
-            sha:          Some("abc123".to_string()),
-            dirty:        DirtyStatus::Clean,
-            push_outcome: PreRunPushOutcome::NotAttempted,
+            origin_url: "https://github.com/fabro-sh/fabro.git".to_string(),
+            branch:     "main".to_string(),
+            sha:        Some("abc123".to_string()),
+            dirty:      DirtyStatus::Clean,
         }
     }
 

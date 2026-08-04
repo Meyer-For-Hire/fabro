@@ -16,9 +16,6 @@
 // May contain unused imports in some cases
 // @ts-ignore
 import type { DirtyStatus } from './dirty-status';
-// May contain unused imports in some cases
-// @ts-ignore
-import type { PreRunPushOutcome } from './pre-run-push-outcome';
 
 /**
  * Observable git state captured before the run starts.
@@ -37,5 +34,4 @@ export interface GitContext {
      */
     'sha'?: string | null;
     'dirty': DirtyStatus;
-    'push_outcome': PreRunPushOutcome;
 }

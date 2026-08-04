@@ -7,7 +7,7 @@ use fabro_api::types::RunManifest;
 use fabro_automation::{AutomationId, AutomationTarget};
 use fabro_config::{EnvironmentLayer, MergeMap};
 use fabro_manifest::ManifestBuildInput;
-use fabro_types::{DirtyStatus, GitContext, GitHubRepositorySlug, PreRunPushOutcome, RunId};
+use fabro_types::{DirtyStatus, GitContext, GitHubRepositorySlug, RunId};
 use fabro_util::error::collect_chain;
 use tokio::{fs, task};
 
@@ -199,11 +199,10 @@ fn build_manifest_from_checkout(
 
     let mut manifest = built.manifest;
     manifest.git = Some(GitContext {
-        origin_url:   github_metadata_url(&git_context.repo),
-        branch:       git_context.ref_selector,
-        sha:          Some(git_context.checked_out_sha),
-        dirty:        DirtyStatus::Clean,
-        push_outcome: PreRunPushOutcome::NotAttempted,
+        origin_url: github_metadata_url(&git_context.repo),
+        branch:     git_context.ref_selector,
+        sha:        Some(git_context.checked_out_sha),
+        dirty:      DirtyStatus::Clean,
     });
     let submitted_manifest_bytes = serde_json::to_vec(&manifest)
         .context("failed to serialize materialized run manifest")
@@ -299,7 +298,7 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
 
-    use fabro_types::{DirtyStatus, PreRunPushOutcome};
+    use fabro_types::DirtyStatus;
     use tempfile::TempDir;
 
     use super::*;
@@ -367,7 +366,6 @@ mod tests {
         assert_eq!(git.branch, "release");
         assert_eq!(git.sha.as_deref(), Some(sha.as_str()));
         assert_eq!(git.dirty, DirtyStatus::Clean);
-        assert_eq!(git.push_outcome, PreRunPushOutcome::NotAttempted);
         let submitted_manifest: serde_json::Value =
             serde_json::from_slice(&materialized.submitted_manifest_bytes)
                 .expect("submitted bytes should be a manifest");

@@ -537,9 +537,7 @@ mod tests {
     use std::sync::Arc;
 
     use fabro_store::RunProjection;
-    use fabro_types::{
-        DirtyStatus, GitContext, PreRunPushOutcome, RunSpec, WorkflowSettings, test_support,
-    };
+    use fabro_types::{DirtyStatus, GitContext, RunSpec, WorkflowSettings, test_support};
     use git2::{ErrorClass, ErrorCode};
 
     use super::*;
@@ -634,11 +632,10 @@ mod tests {
                 automation:       None,
                 source_directory: Some("/Users/client/project".to_string()),
                 git:              Some(GitContext {
-                    origin_url:   "https://github.com/fabro-sh/fabro.git".to_string(),
-                    branch:       "main".to_string(),
-                    sha:          None,
-                    dirty:        DirtyStatus::Clean,
-                    push_outcome: PreRunPushOutcome::NotAttempted,
+                    origin_url: "https://github.com/fabro-sh/fabro.git".to_string(),
+                    branch:     "main".to_string(),
+                    sha:        None,
+                    dirty:      DirtyStatus::Clean,
                 }),
                 labels:           HashMap::new(),
                 provenance:       test_support::test_run_provenance(),
@@ -670,11 +667,10 @@ mod tests {
                 },
             )),
             pre_run_git:      Some(GitContext {
-                origin_url:   origin_url.to_string(),
-                branch:       "main".to_string(),
-                sha:          None,
-                dirty:        DirtyStatus::Clean,
-                push_outcome: PreRunPushOutcome::NotAttempted,
+                origin_url: origin_url.to_string(),
+                branch:     "main".to_string(),
+                sha:        None,
+                dirty:      DirtyStatus::Clean,
             }),
             fork_source_ref:  None,
             base_branch:      None,

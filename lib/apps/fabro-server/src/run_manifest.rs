@@ -1695,11 +1695,10 @@ digraph Demo {{
 
     fn git_context(origin_url: &str, branch: &str) -> types::GitContext {
         types::GitContext {
-            origin_url:   origin_url.to_string(),
-            branch:       branch.to_string(),
-            sha:          None,
-            dirty:        fabro_types::DirtyStatus::Clean,
-            push_outcome: fabro_types::PreRunPushOutcome::NotAttempted,
+            origin_url: origin_url.to_string(),
+            branch:     branch.to_string(),
+            sha:        None,
+            dirty:      fabro_types::DirtyStatus::Clean,
         }
     }
 

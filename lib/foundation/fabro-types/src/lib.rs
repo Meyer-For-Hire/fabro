@@ -109,7 +109,7 @@ pub use pull_request::{
 pub use reasoning::ReasoningOutput;
 pub use repository::{GitHubRepositorySlug, RepositoryProvider, RepositoryRef};
 pub use run::{
-    DirtyStatus, ForkSourceRef, GitContext, PreRunPushOutcome, RunClientProvenance, RunProvenance,
+    DirtyStatus, ForkSourceRef, GitContext, RunClientProvenance, RunProvenance,
     RunServerProvenance, RunSpec,
 };
 pub use run_blob_id::RunBlobId;

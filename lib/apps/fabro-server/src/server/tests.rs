@@ -3784,8 +3784,7 @@ layer = "project"
         "origin_url": "https://github.com/acme/payments.git",
         "branch": "feature/compiler",
         "sha": "0123456789abcdef",
-        "dirty": "clean",
-        "push_outcome": { "type": "not_attempted" }
+        "dirty": "clean"
     });
     let manifest: RunManifest = serde_json::from_value(manifest_json).unwrap();
     let submitted_manifest_bytes = serde_json::to_vec(&manifest).unwrap();
@@ -7054,11 +7053,10 @@ async fn create_completed_run_ready_for_pull_request(
     );
     let git = match (repo_origin_url, base_branch) {
         (Some(origin), Some(branch)) => Some(fabro_types::GitContext {
-            origin_url:   origin.to_string(),
-            branch:       branch.to_string(),
-            sha:          None,
-            dirty:        fabro_types::DirtyStatus::Clean,
-            push_outcome: fabro_types::PreRunPushOutcome::NotAttempted,
+            origin_url: origin.to_string(),
+            branch:     branch.to_string(),
+            sha:        None,
+            dirty:      fabro_types::DirtyStatus::Clean,
         }),
         _ => None,
     };

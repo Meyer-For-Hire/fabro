@@ -138,11 +138,10 @@ mod tests {
             automation: None,
             source_directory: Some("/tmp/project".to_string()),
             git: Some(fabro_types::GitContext {
-                origin_url:   String::new(),
-                branch:       "main".to_string(),
-                sha:          None,
-                dirty:        fabro_types::DirtyStatus::Clean,
-                push_outcome: fabro_types::PreRunPushOutcome::NotAttempted,
+                origin_url: String::new(),
+                branch:     "main".to_string(),
+                sha:        None,
+                dirty:      fabro_types::DirtyStatus::Clean,
             }),
             labels: HashMap::from([
                 ("env".to_string(), "test".to_string()),
