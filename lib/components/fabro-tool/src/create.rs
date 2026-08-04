@@ -92,13 +92,6 @@ impl JsonSchema for CreateRunSpecInput {
                             ],
                             "description": "Working directory used to resolve relative workflow paths."
                         },
-                        "run_id": {
-                            "anyOf": [
-                                { "type": "string" },
-                                { "type": "null" }
-                            ],
-                            "description": "Optional run id to use for the created run."
-                        },
                         "parent_id": {
                             "anyOf": [
                                 { "type": "string" },
@@ -198,7 +191,6 @@ impl JsonSchema for CreateRunSpecInput {
 pub struct CreateRunSpec {
     pub workflow:         String,
     pub cwd:              Option<PathBuf>,
-    pub run_id:           Option<String>,
     pub parent_id:        Option<String>,
     pub goal:             Option<String>,
     pub goal_file:        Option<PathBuf>,
@@ -262,7 +254,6 @@ pub struct ValidatedCreateRuns {
 pub struct ValidatedCreateRunSpec {
     pub workflow:         String,
     pub cwd:              Option<PathBuf>,
-    pub run_id:           Option<RunId>,
     pub parent_id:        Option<String>,
     pub goal:             Option<String>,
     pub goal_file:        Option<PathBuf>,
@@ -304,7 +295,6 @@ impl TryFrom<CreateRunSpecInput> for ValidatedCreateRunSpec {
                 Self::try_from(CreateRunSpec {
                     workflow:         workflow.to_string(),
                     cwd:              None,
-                    run_id:           None,
                     parent_id:        None,
                     goal:             None,
                     goal_file:        None,
@@ -328,14 +318,6 @@ impl TryFrom<CreateRunSpec> for ValidatedCreateRunSpec {
     type Error = ToolError;
 
     fn try_from(spec: CreateRunSpec) -> Result<Self, Self::Error> {
-        let run_id = spec
-            .run_id
-            .as_deref()
-            .map(str::parse::<RunId>)
-            .transpose()
-            .map_err(|err| {
-                ToolError::message(format!("run_id must be a valid Fabro run id: {err}"))
-            })?;
         let parent_id = spec
             .parent_id
             .as_deref()
@@ -368,7 +350,6 @@ impl TryFrom<CreateRunSpec> for ValidatedCreateRunSpec {
         Ok(Self {
             workflow: spec.workflow,
             cwd: spec.cwd,
-            run_id,
             parent_id,
             goal: spec.goal,
             goal_file: spec.goal_file,
@@ -533,11 +514,22 @@ mod tests {
     }
 
     #[test]
+    fn create_spec_schema_omits_run_id() {
+        let mut generator = SchemaGenerator::default();
+        let schema = CreateRunSpecInput::json_schema(&mut generator);
+        let schema = serde_json::to_value(schema).expect("schema should serialize");
+        let properties = schema["anyOf"][1]["properties"]
+            .as_object()
+            .expect("object form should have properties");
+
+        assert!(!properties.contains_key("run_id"));
+    }
+
+    #[test]
     fn create_spec_accepts_parent_selector() {
         let spec = ValidatedCreateRunSpec::try_from(CreateRunSpec {
             workflow:         "simple.fabro".to_string(),
             cwd:              None,
-            run_id:           None,
             parent_id:        Some(" nightly-parent ".to_string()),
             goal:             None,
             goal_file:        None,
@@ -568,7 +560,6 @@ mod tests {
         let spec = &params.runs[0];
         assert_eq!(spec.workflow, "simple.fabro");
         assert_eq!(spec.cwd, None);
-        assert_eq!(spec.run_id, None);
         assert_eq!(spec.parent_id, None);
         assert!(spec.inputs.is_empty());
         assert!(spec.labels.is_empty());
@@ -599,6 +590,23 @@ mod tests {
             Some("mcp-test")
         );
         assert_eq!(spec.start, Some(false));
+    }
+
+    #[test]
+    fn create_params_ignore_removed_run_id() {
+        let params: FabroRunCreateParams = serde_json::from_value(json!({
+            "runs": [{
+                "workflow": "simple.fabro",
+                "run_id": "not-a-valid-run-id",
+                "start": false
+            }]
+        }))
+        .expect("old object form should deserialize with run_id ignored");
+
+        let params =
+            ValidatedCreateRuns::try_from(params).expect("remaining create fields should validate");
+        assert_eq!(params.runs[0].workflow, "simple.fabro");
+        assert_eq!(params.runs[0].start, Some(false));
     }
 
     #[test]
@@ -683,7 +691,6 @@ mod tests {
                 CreateRunSpec {
                     workflow:         "simple.fabro".to_string(),
                     cwd:              None,
-                    run_id:           None,
                     parent_id:        Some("nightly-parent".to_string()),
                     goal:             None,
                     goal_file:        None,
@@ -734,7 +741,6 @@ mod tests {
                 CreateRunSpecInput::from(CreateRunSpec {
                     workflow:         "simple.fabro".to_string(),
                     cwd:              None,
-                    run_id:           None,
                     parent_id:        Some("nightly-parent".to_string()),
                     goal:             None,
                     goal_file:        None,
@@ -784,7 +790,6 @@ mod tests {
                 CreateRunSpec {
                     workflow:         "simple.fabro".to_string(),
                     cwd:              None,
-                    run_id:           None,
                     parent_id:        Some(parent_id.to_string()),
                     goal:             None,
                     goal_file:        None,
@@ -839,7 +844,6 @@ mod tests {
                 CreateRunSpec {
                     workflow:         "simple.fabro".to_string(),
                     cwd:              None,
-                    run_id:           None,
                     parent_id:        Some(parent_id.to_string()),
                     goal:             None,
                     goal_file:        None,

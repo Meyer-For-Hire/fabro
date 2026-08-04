@@ -2378,7 +2378,6 @@ mod tests {
                 "settings": WorkflowSettings::default(),
                 "graph": Graph::new("test"),
                 "labels": {},
-                "run_dir": "/tmp/run",
                 "provenance": test_support::test_run_provenance()
             }),
             None,
@@ -2390,6 +2389,48 @@ mod tests {
             build_summary(&projection, &fixtures::RUN_1).retried_from,
             None
         );
+    }
+
+    #[test]
+    fn run_created_replay_ignores_unknown_properties() {
+        let provenance = test_support::test_run_provenance();
+        let event = test_raw_event(
+            1,
+            "run.created",
+            &json!({
+                "title": "Historical run",
+                "settings": WorkflowSettings::default(),
+                "graph": Graph::new("historical"),
+                "workflow_source": "digraph historical { start -> exit }",
+                "labels": {"team": "platform"},
+                "source_directory": "/workspace/project",
+                "workflow_slug": "historical",
+                "unknown_future_property": {
+                    "nested": ["value", 42, true]
+                },
+                "provenance": provenance
+            }),
+            None,
+        );
+
+        let projection = RunProjection::apply_events(&[event]).unwrap();
+
+        assert_eq!(projection.title(), "Historical run");
+        assert_eq!(projection.spec.graph.name, "historical");
+        assert_eq!(
+            projection.spec.graph_source.as_deref(),
+            Some("digraph historical { start -> exit }")
+        );
+        assert_eq!(
+            projection.spec.labels.get("team").map(String::as_str),
+            Some("platform")
+        );
+        assert_eq!(
+            projection.spec.source_directory.as_deref(),
+            Some("/workspace/project")
+        );
+        assert_eq!(projection.spec.workflow_slug.as_deref(), Some("historical"));
+        assert_eq!(projection.spec.provenance, provenance);
     }
 
     #[test]
@@ -2407,7 +2448,6 @@ mod tests {
                 "graph": Graph::new("test"),
                 "automation": automation,
                 "labels": {},
-                "run_dir": "/tmp/run",
                 "provenance": test_support::test_run_provenance()
             }),
             None,
@@ -2431,7 +2471,6 @@ mod tests {
                 "settings": WorkflowSettings::default(),
                 "graph": Graph::new("test"),
                 "labels": {},
-                "run_dir": "/tmp/run",
                 "provenance": test_support::test_run_provenance()
             }),
             None,
@@ -2454,7 +2493,6 @@ mod tests {
                 "settings": WorkflowSettings::default(),
                 "graph": Graph::new("test"),
                 "labels": {},
-                "run_dir": "/tmp/run",
                 "provenance": test_support::test_run_provenance()
             }),
             None,
@@ -2532,7 +2570,6 @@ mod tests {
                     "settings": WorkflowSettings::default(),
                     "graph": Graph::new("test"),
                     "labels": {},
-                    "run_dir": "/tmp/run",
                     "provenance": test_support::test_run_provenance()
                 }),
                 None,
@@ -4123,7 +4160,6 @@ mod tests {
                     "attrs": { "goal": { "String": "Goal title" } }
                 },
                 "labels": {},
-                "run_dir": "/tmp/run",
                 "provenance": test_support::test_run_provenance()
             }),
             None,
@@ -4151,7 +4187,6 @@ mod tests {
                     "attrs": { "goal": { "String": "## Plan: Legacy title\n\nDetails" } }
                 },
                 "labels": {},
-                "run_dir": "/tmp/run",
                 "provenance": test_support::test_run_provenance()
             }),
             None,
@@ -4181,7 +4216,6 @@ mod tests {
                         "attrs": { "goal": { "String": "Goal title" } }
                     },
                     "labels": {},
-                    "run_dir": "/tmp/run",
                     "provenance": test_support::test_run_provenance()
                 }),
                 None,
@@ -4224,7 +4258,6 @@ mod tests {
                             "attrs": {}
                         },
                         "labels": {},
-                        "run_dir": "/tmp/run",
                         "source_directory": "/tmp/run",
                         "provenance": test_support::test_run_provenance(),
                         "manifest_blob": manifest_blob

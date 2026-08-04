@@ -9087,10 +9087,6 @@ components:
           type: integer
           description: Manifest schema version.
           example: 1
-        run_id:
-          type: ["string", "null"]
-          description: Optional pre-generated run ID to use instead of allocating a new ULID.
-          example: "01HV6D7S5YF4Z4B2M7K4N0Q6T9"
         parent_id:
           type: ["string", "null"]
           description: Optional orchestration parent run ID. Fork and rewind lineage use separate fields and should not set this value.
@@ -9128,7 +9124,6 @@ components:
         - origin_url
         - branch
         - dirty
-        - push_outcome
       properties:
         origin_url:
           type: string
@@ -9144,99 +9139,9 @@ components:
           example: abc123def
         dirty:
           $ref: "#/components/schemas/DirtyStatus"
-        push_outcome:
-          $ref: "#/components/schemas/PreRunPushOutcome"
-
-    PreRunPushOutcome:
-      description: Outcome of the CLI's best-effort pre-run push.
-      oneOf:
-        - $ref: "#/components/schemas/PreRunPushOutcomeNotAttempted"
-        - $ref: "#/components/schemas/PreRunPushOutcomeSucceeded"
-        - $ref: "#/components/schemas/PreRunPushOutcomeFailed"
-        - $ref: "#/components/schemas/PreRunPushOutcomeSkippedNoRemote"
-        - $ref: "#/components/schemas/PreRunPushOutcomeSkippedRemoteMismatch"
-      discriminator:
-        propertyName: type
-        mapping:
-          not_attempted: "#/components/schemas/PreRunPushOutcomeNotAttempted"
-          succeeded: "#/components/schemas/PreRunPushOutcomeSucceeded"
-          failed: "#/components/schemas/PreRunPushOutcomeFailed"
-          skipped_no_remote: "#/components/schemas/PreRunPushOutcomeSkippedNoRemote"
-          skipped_remote_mismatch: "#/components/schemas/PreRunPushOutcomeSkippedRemoteMismatch"
-
-    PreRunPushOutcomeNotAttempted:
-      type: object
-      required:
-        - type
-      properties:
-        type:
-          type: string
-          enum:
-            - not_attempted
-
-    PreRunPushOutcomeSucceeded:
-      type: object
-      required:
-        - type
-        - remote
-        - branch
-      properties:
-        type:
-          type: string
-          enum:
-            - succeeded
-        remote:
-          type: string
-        branch:
-          type: string
-
-    PreRunPushOutcomeFailed:
-      type: object
-      required:
-        - type
-        - remote
-        - branch
-        - message
-      properties:
-        type:
-          type: string
-          enum:
-            - failed
-        remote:
-          type: string
-        branch:
-          type: string
-        message:
-          type: string
-
-    PreRunPushOutcomeSkippedNoRemote:
-      type: object
-      required:
-        - type
-      properties:
-        type:
-          type: string
-          enum:
-            - skipped_no_remote
-
-    PreRunPushOutcomeSkippedRemoteMismatch:
-      type: object
-      required:
-        - type
-        - remote
-        - repo_origin_url
-      properties:
-        type:
-          type: string
-          enum:
-            - skipped_remote_mismatch
-        remote:
-          type: string
-        repo_origin_url:
-          type: string
 
     ManifestGoal:
-      description: Resolved goal with provenance.
+      description: Resolved goal kind and content.
       type: object
       required:
         - type
@@ -9251,9 +9156,6 @@ components:
         text:
           type: string
           description: Resolved goal content.
-        path:
-          type: ["string", "null"]
-          description: Original goal file path when the goal came from a file.
 
     ManifestArgs:
       description: Sparse command-local args that affect run settings.
@@ -9287,13 +9189,8 @@ components:
     ManifestTarget:
       type: object
       required:
-        - identifier
         - path
       properties:
-        identifier:
-          type: string
-          description: What the user typed.
-          example: smoke
         path:
           type: string
           description: Resolved path that keys into the workflows map.

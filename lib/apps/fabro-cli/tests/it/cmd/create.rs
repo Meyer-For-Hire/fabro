@@ -4,8 +4,8 @@ use insta::assert_snapshot;
 use serde_json::json;
 
 use super::support::{
-    fixture, output_stdout, remote_run_summary_json, resolve_run, run_count_for_test_case,
-    run_state,
+    created_run_id, fixture, output_stdout, remote_run_summary_json, resolve_run,
+    run_count_for_test_case, run_state,
 };
 use crate::support::unique_run_id;
 
@@ -271,7 +271,6 @@ fn create_cli_server_target_overrides_configured_server_target() {
 fn create_persists_directory_workflow_slug_and_cached_graph() {
     let context = test_context!();
     context.ensure_home_server_auth_methods();
-    let run_id = unique_run_id();
     let workflow_path = context.temp_dir.join("sluggy/workflow.fabro");
 
     context.write_temp(
@@ -285,18 +284,17 @@ digraph BarBaz {
 ",
     );
 
-    context
+    let create = context
         .command()
         .args([
             "create",
             "--dry-run",
             "--auto-approve",
-            "--run-id",
-            run_id.as_str(),
             workflow_path.to_str().unwrap(),
         ])
         .assert()
         .success();
+    let run_id = created_run_id(create.get_output());
 
     let run_dir = context.find_run_dir(&run_id);
     let state = run_state(&run_dir);
@@ -328,7 +326,6 @@ digraph BarBaz {
 fn create_persists_file_stem_slug_for_standalone_file() {
     let context = test_context!();
     context.ensure_home_server_auth_methods();
-    let run_id = unique_run_id();
     let workflow_path = context.temp_dir.join("alpha.fabro");
 
     context.write_temp(
@@ -342,18 +339,17 @@ digraph FooWorkflow {
 ",
     );
 
-    context
+    let create = context
         .command()
         .args([
             "create",
             "--dry-run",
             "--auto-approve",
-            "--run-id",
-            run_id.as_str(),
             workflow_path.to_str().unwrap(),
         ])
         .assert()
         .success();
+    let run_id = created_run_id(create.get_output());
 
     let run_dir = context.find_run_dir(&run_id);
     let state = run_state(&run_dir);

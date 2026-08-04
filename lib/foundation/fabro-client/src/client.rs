@@ -37,7 +37,7 @@ use crate::{AuthEntry, OAuthEntry, StoredSubject, sse};
 
 const DEFAULT_CONTROL_PLANE_REQUEST_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(30);
-const DEFAULT_HEALTH_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+const DEFAULT_HEALTH_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 /// Matches the `Retry-After` the server sends on the 202
 /// (`PULL_REQUEST_CREATION_RETRY_AFTER` in `fabro-server`).
 const PULL_REQUEST_CREATION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);

@@ -146,22 +146,6 @@ impl Database {
     pub async fn create_run(&self, run_id: &RunId) -> Result<RunDatabase> {
         self.warm_projection_cache().await?;
         let db = self.open_db().await?;
-        // Keep the active-writer miss and insert atomic. Otherwise concurrent
-        // callers can create independent writers with the same recovered seq.
-        let mut active_runs = self.active_runs.lock().await;
-
-        if let Some(active) = active_run_from(&active_runs, run_id) {
-            if !active.matches_run(run_id) {
-                return Err(Error::RunAlreadyExists(run_id.to_string()));
-            }
-            self.catalog_index().await?.add(run_id).await?;
-            return Ok(active);
-        }
-
-        let run_exists = RunDatabase::has_any_events(&db, run_id).await?;
-        if run_exists {
-            return Err(Error::RunAlreadyExists(run_id.to_string()));
-        }
 
         self.catalog_index().await?.add(run_id).await?;
         let run_store = RunDatabase::open_writer(
@@ -171,6 +155,7 @@ impl Database {
             Arc::clone(&self.run_summary_store),
         )
         .await?;
+        let mut active_runs = self.active_runs.lock().await;
         Self::cache_active_run(&mut active_runs, &run_store);
         Ok(run_store)
     }
@@ -618,11 +603,10 @@ mod tests {
             manifest_blob: None,
             definition_blob: None,
             git: Some(fabro_types::GitContext {
-                origin_url:   "https://github.com/fabro-sh/fabro".to_string(),
-                branch:       "main".to_string(),
-                sha:          None,
-                dirty:        fabro_types::DirtyStatus::Clean,
-                push_outcome: fabro_types::PreRunPushOutcome::NotAttempted,
+                origin_url: "https://github.com/fabro-sh/fabro".to_string(),
+                branch:     "main".to_string(),
+                sha:        None,
+                dirty:      fabro_types::DirtyStatus::Clean,
             }),
             fork_source_ref: None,
         }
@@ -670,7 +654,6 @@ mod tests {
                 "graph": run_spec.graph,
                 "workflow_slug": run_spec.workflow_slug,
                 "source_directory": run_spec.source_directory,
-                "run_dir": format!("/tmp/{label}"),
                 "git": run_spec.git,
                 "labels": run_spec.labels,
                 "provenance": run_spec.provenance,
@@ -696,7 +679,6 @@ mod tests {
                 "graph": run_spec.graph,
                 "workflow_slug": run_spec.workflow_slug,
                 "source_directory": run_spec.source_directory,
-                "run_dir": format!("/tmp/{label}"),
                 "git": run_spec.git,
                 "labels": run_spec.labels,
                 "parent_id": parent_id,
@@ -1063,7 +1045,6 @@ mod tests {
                 "properties": {
                     "settings": WorkflowSettings::default(),
                     "graph": Graph::new("test"),
-                    "run_dir": "/tmp/test",
                     "provenance": test_support::test_run_provenance(),
                 },
             }),
@@ -1612,7 +1593,6 @@ mod tests {
                         "graph": run_spec["graph"],
                         "workflow_slug": run_spec["workflow_slug"],
                         "source_directory": run_spec["source_directory"],
-                        "run_dir": "/tmp/run-2",
                         "git": run_spec["git"],
                         "labels": run_spec["labels"],
                     },

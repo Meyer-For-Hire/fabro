@@ -1010,7 +1010,6 @@ mod tests {
                 "settings": settings,
                 "graph": graph,
                 "labels": {},
-                "run_dir": "/tmp/run",
                 "source_directory": "/tmp/run",
                 "provenance": test_support::test_run_provenance()
             }
@@ -1058,7 +1057,6 @@ mod tests {
                 "settings": WorkflowSettings::default(),
                 "graph": Graph::new("test"),
                 "labels": {},
-                "run_dir": "/tmp/run",
                 "source_directory": "/tmp/run",
                 "provenance": test_support::test_run_provenance(),
                 "manifest_blob": RunBlobId::new(br#"{"version":1}"#).to_string()

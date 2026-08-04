@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use fabro_types::graph::Graph;
-use fabro_types::run::{DirtyStatus, ForkSourceRef, GitContext, PreRunPushOutcome};
+use fabro_types::run::{DirtyStatus, ForkSourceRef, GitContext};
 use fabro_types::run_event::run::{RunCreatedProps, RunParentLinkedProps, RunParentUnlinkedProps};
 use fabro_types::run_event::{RunSessionTurnFailedCode, RunSessionTurnFailedProps};
 use fabro_types::settings::InterpString;
@@ -22,9 +22,7 @@ fn run_created_props_round_trip_templated_settings() {
         settings:         templated_settings(),
         graph:            Graph::new("ship"),
         workflow_source:  Some("digraph Ship { start -> exit }".to_string()),
-        workflow_config:  Some("[run]\ngoal = \"Ship {{ env.TASK }}\"".to_string()),
         labels:           BTreeMap::from([("team".to_string(), "platform".to_string())]),
-        run_dir:          "/tmp/run".to_string(),
         source_directory: Some("/Users/client/project".to_string()),
         workflow_slug:    Some("demo".to_string()),
         automation:       Some(AutomationRef {
@@ -32,15 +30,13 @@ fn run_created_props_round_trip_templated_settings() {
             name:       Some("Nightly".to_string()),
             trigger_id: Some("schedule_1".to_string()),
         }),
-        db_prefix:        Some("run_".to_string()),
         provenance:       test_run_provenance(),
         manifest_blob:    None,
         git:              Some(GitContext {
-            origin_url:   "https://github.com/fabro-sh/fabro.git".to_string(),
-            branch:       "main".to_string(),
-            sha:          None,
-            dirty:        DirtyStatus::Unknown,
-            push_outcome: PreRunPushOutcome::SkippedNoRemote,
+            origin_url: "https://github.com/fabro-sh/fabro.git".to_string(),
+            branch:     "main".to_string(),
+            sha:        None,
+            dirty:      DirtyStatus::Unknown,
         }),
         fork_source_ref:  Some(ForkSourceRef {
             source_run_id:  fixtures::RUN_2,
@@ -61,7 +57,7 @@ fn run_created_props_round_trip_templated_settings() {
     );
     assert_eq!(json["git"]["branch"], "main");
     assert_eq!(json["git"]["dirty"], "unknown");
-    assert_eq!(json["git"]["push_outcome"]["type"], "skipped_no_remote");
+    assert!(json["git"].get("push_outcome").is_none());
     assert_eq!(
         json["web_url"],
         "http://localhost:3000/runs/01JNQVR7M0EJ5GKAT2SC4ERS1Z"
@@ -91,13 +87,10 @@ fn run_created_props_omits_web_url_when_absent() {
         settings:         WorkflowSettings::default(),
         graph:            Graph::new("ship"),
         workflow_source:  None,
-        workflow_config:  None,
         labels:           BTreeMap::new(),
-        run_dir:          "/tmp/run".to_string(),
         source_directory: None,
         workflow_slug:    None,
         automation:       None,
-        db_prefix:        None,
         provenance:       test_run_provenance(),
         manifest_blob:    None,
         git:              None,
@@ -135,7 +128,6 @@ fn run_created_props_defaults_additive_fields_for_legacy_events() {
         "settings": WorkflowSettings::default(),
         "graph": Graph::new("ship"),
         "labels": {},
-        "run_dir": "/tmp/run",
         "provenance": test_run_provenance()
     });
 
@@ -143,6 +135,41 @@ fn run_created_props_defaults_additive_fields_for_legacy_events() {
         serde_json::from_value(json).expect("legacy props should deserialize");
     assert_eq!(props.retried_from, None);
     assert_eq!(props.automation, None);
+}
+
+#[test]
+fn run_created_props_tolerates_legacy_git_push_outcome() {
+    let json = serde_json::json!({
+        "title": null,
+        "settings": WorkflowSettings::default(),
+        "graph": Graph::new("ship"),
+        "labels": {},
+        "provenance": test_run_provenance(),
+        "git": {
+            "origin_url": "https://github.com/fabro-sh/fabro.git",
+            "branch": "main",
+            "sha": "abc123",
+            "dirty": "clean",
+            "push_outcome": {
+                "type": "failed",
+                "remote": "origin",
+                "branch": "main",
+                "message": "remote rejected"
+            }
+        }
+    });
+
+    let props: RunCreatedProps =
+        serde_json::from_value(json).expect("legacy event with push_outcome should deserialize");
+    let git = props.git.as_ref().expect("git context should be present");
+    assert_eq!(git.origin_url, "https://github.com/fabro-sh/fabro.git");
+    assert_eq!(git.branch, "main");
+    assert_eq!(git.sha.as_deref(), Some("abc123"));
+    assert_eq!(git.dirty, DirtyStatus::Clean);
+
+    let reserialized = serde_json::to_value(&props).expect("props should reserialize");
+    assert!(reserialized["git"].get("push_outcome").is_none());
+    assert_eq!(reserialized["git"]["origin_url"], git.origin_url);
 }
 
 #[test]

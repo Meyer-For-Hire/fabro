@@ -42,33 +42,12 @@ pub enum DirtyStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum PreRunPushOutcome {
-    NotAttempted,
-    Succeeded {
-        remote: String,
-        branch: String,
-    },
-    Failed {
-        remote:  String,
-        branch:  String,
-        message: String,
-    },
-    SkippedNoRemote,
-    SkippedRemoteMismatch {
-        remote:          String,
-        repo_origin_url: String,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitContext {
-    pub origin_url:   String,
-    pub branch:       String,
+    pub origin_url: String,
+    pub branch:     String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sha:          Option<String>,
-    pub dirty:        DirtyStatus,
-    pub push_outcome: PreRunPushOutcome,
+    pub sha:        Option<String>,
+    pub dirty:      DirtyStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

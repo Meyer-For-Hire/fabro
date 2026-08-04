@@ -33,7 +33,6 @@ export interface PlaygroundRunManifest {
   cwd: string;
   title?: string;
   target: {
-    identifier: string;
     path: string;
   };
   workflows: {
@@ -67,8 +66,7 @@ export function buildRunManifest(draft: WorkflowDraft): PlaygroundRunManifest {
     cwd:     PLAYGROUND_CWD,
     title:   draft.goal && draft.goal.length > 0 ? draft.goal : `Playground: ${name}`,
     target:  {
-      identifier: name,
-      path:       workflowPath,
+      path: workflowPath,
     },
     workflows: {
       [workflowPath]: {

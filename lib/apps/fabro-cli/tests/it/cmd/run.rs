@@ -9,8 +9,10 @@ use fabro_vault::{SecretType, Vault};
 use httpmock::MockServer;
 use serde_json::Value;
 
-use super::support::{output_stderr, remote_run_summary_json, wait_for_event_names};
-use crate::support::{run_output_filters, run_projection_json, unique_run_id};
+use super::support::{
+    created_run_id, output_stderr, remote_run_summary_json, run_state, wait_for_event_names,
+};
+use crate::support::{LightweightCli, run_output_filters, run_projection_json, unique_run_id};
 
 fn run_status_response(run_id: &str, status: &str) -> serde_json::Value {
     let status = match status {
@@ -357,7 +359,6 @@ fn run_uses_vault_credentials_for_worker_execution() {
         ),
     );
     context.isolated_server();
-    let run_id = unique_run_id();
     seed_anthropic_vault(&context.storage_dir);
 
     let llm_mock = llm_server.mock(|when, then| {
@@ -410,8 +411,6 @@ digraph VaultWorkerLlm {
         .env_remove("OPENAI_BASE_URL")
         .env_remove("GEMINI_API_KEY")
         .args([
-            "--run-id",
-            run_id.as_str(),
             "--auto-approve",
             "--environment",
             "local",
@@ -436,7 +435,7 @@ digraph VaultWorkerLlm {
     );
 
     llm_mock.assert();
-    wait_for_event_names(&context.find_run_dir(&run_id), &["run.completed"]);
+    wait_for_event_names(&context.single_run_dir(), &["run.completed"]);
 }
 
 #[test]
@@ -731,7 +730,6 @@ fn foreground_run_rejects_invalid_workflow_before_creating_remote_run() {
 #[test]
 fn local_foreground_run_prints_artifact_paths_from_server_artifact_list() {
     let context = test_context!();
-    let run_id = unique_run_id();
     let workspace_dir = context.temp_dir.join("artifact-summary");
     context.write_temp(
         "artifact-summary/workflow.fabro",
@@ -767,8 +765,6 @@ include = ["assets/**"]
         .current_dir(&workspace_dir)
         .env("OPENAI_API_KEY", "test")
         .args([
-            "--run-id",
-            run_id.as_str(),
             "--auto-approve",
             "--environment",
             "local",
@@ -890,25 +886,22 @@ fn dry_run_rejects_goal_and_goal_file_together() {
 fn dry_run_persists_event_history_in_store() {
     let context = test_context!();
     context.ensure_home_server_auth_methods();
-    let run_id = unique_run_id();
     let workflow = context.install_fixture("simple.fabro");
 
     context
-        .command()
+        .run_cmd()
         .args([
-            "run",
             "--dry-run",
             "--auto-approve",
             "--environment",
             "local",
-            "--run-id",
-            run_id.as_str(),
             workflow.to_str().unwrap(),
         ])
         .assert()
         .success();
 
-    let run_dir = context.find_run_dir(&run_id);
+    let run_dir = context.single_run_dir();
+    let run_id = run_state(&run_dir).spec.run_id.to_string();
     wait_for_event_names(&run_dir, &["run.completed", "sandbox.stop.completed"]);
     let output = context
         .command()
@@ -991,26 +984,26 @@ fn dry_run_persists_event_history_in_store() {
 }
 
 #[test]
-fn run_id_passthrough_uses_provided_ulid() {
-    let context = test_context!();
-    context.ensure_home_server_auth_methods();
-    let run_id = unique_run_id();
-    let workflow = context.install_fixture("simple.fabro");
+fn run_rejects_removed_run_id_flag() {
+    let cli = LightweightCli::new();
 
-    context
+    let output = cli
         .command()
         .args([
             "run",
             "--dry-run",
             "--auto-approve",
             "--run-id",
-            run_id.as_str(),
-            workflow.to_str().unwrap(),
+            "01KRBZW5C00000000000000001",
+            "workflow.fabro",
         ])
         .assert()
-        .success();
-
-    context.find_run_dir(&run_id);
+        .failure();
+    let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+    assert!(
+        stderr.contains("unexpected argument '--run-id'"),
+        "{stderr}"
+    );
 }
 
 #[test]
@@ -1100,21 +1093,19 @@ fn detach_prints_ulid_and_exits() {
 #[test]
 fn detach_creates_run_dir_with_detach_log() {
     let context = test_context!();
-    let run_id = unique_run_id();
     let workflow = context.install_fixture("simple.fabro");
 
-    context
+    let run = context
         .run_cmd()
         .args([
             "--detach",
             "--dry-run",
             "--auto-approve",
-            "--run-id",
-            run_id.as_str(),
             workflow.to_str().unwrap(),
         ])
         .assert()
         .success();
+    let run_id = created_run_id(run.get_output());
 
     let run_dir = context.find_run_dir(&run_id);
     fabro_json_snapshot!(

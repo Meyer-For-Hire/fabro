@@ -138,11 +138,10 @@ mod tests {
             automation: None,
             source_directory: Some("/tmp/project".to_string()),
             git: Some(fabro_types::GitContext {
-                origin_url:   String::new(),
-                branch:       "main".to_string(),
-                sha:          None,
-                dirty:        fabro_types::DirtyStatus::Clean,
-                push_outcome: fabro_types::PreRunPushOutcome::NotAttempted,
+                origin_url: String::new(),
+                branch:     "main".to_string(),
+                sha:        None,
+                dirty:      fabro_types::DirtyStatus::Clean,
             }),
             labels: HashMap::from([
                 ("env".to_string(), "test".to_string()),
@@ -155,7 +154,7 @@ mod tests {
         }
     }
 
-    async fn seeded_store(run_dir: &Path, record: &RunSpec, source: Option<&str>) -> RunDatabase {
+    async fn seeded_store(record: &RunSpec, source: Option<&str>) -> RunDatabase {
         let store = memory_store();
         let run_store = store.create_run(&record.run_id).await.unwrap();
         append_event(&run_store, &record.run_id, &Event::RunCreated {
@@ -164,13 +163,10 @@ mod tests {
             settings:         serde_json::to_value(&record.settings).unwrap(),
             graph:            serde_json::to_value(&record.graph).unwrap(),
             workflow_source:  source.map(ToOwned::to_owned),
-            workflow_config:  None,
             labels:           record.labels.clone().into_iter().collect(),
-            run_dir:          run_dir.to_string_lossy().to_string(),
             source_directory: record.source_directory.clone(),
             workflow_slug:    record.workflow_slug.clone(),
             automation:       record.automation.clone(),
-            db_prefix:        None,
             provenance:       record.provenance.clone(),
             manifest_blob:    None,
             git:              record.git.clone(),
@@ -250,7 +246,7 @@ mod tests {
         )
         .unwrap();
 
-        let run_store = seeded_store(&run_dir, &expected, Some(&source)).await;
+        let run_store = seeded_store(&expected, Some(&source)).await;
         let loaded = load_from_store(&run_store.clone().into(), &run_dir)
             .await
             .unwrap();
@@ -301,7 +297,7 @@ mod tests {
         let mut record = sample_record(different_graph());
         record.graph = graph;
 
-        let run_store = seeded_store(&run_dir, &record, None).await;
+        let run_store = seeded_store(&record, None).await;
         let loaded = load_from_store(&run_store.clone().into(), &run_dir)
             .await
             .unwrap();
@@ -319,7 +315,7 @@ mod tests {
         let mut record = sample_record(different_graph());
         record.graph = graph.clone();
 
-        let run_store = seeded_store(&run_dir, &record, Some(&source)).await;
+        let run_store = seeded_store(&record, Some(&source)).await;
         let loaded = load_from_store(&run_store.clone().into(), &run_dir)
             .await
             .unwrap();

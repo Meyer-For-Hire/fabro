@@ -188,17 +188,14 @@ async fn initialized(
             .expect("failed to serialize settings"),
         graph:            serde_json::to_value(graph).expect("failed to serialize graph"),
         workflow_source:  None,
-        workflow_config:  None,
         labels:           run_options
             .labels
             .clone()
             .into_iter()
             .collect::<BTreeMap<_, _>>(),
-        run_dir:          run_options.run_dir.display().to_string(),
         source_directory: Some(sandbox.working_directory().to_string()),
         workflow_slug:    run_options.workflow_slug.clone(),
         automation:       None,
-        db_prefix:        None,
         provenance:       fabro_types::RunProvenance {
             server:  None,
             client:  None,

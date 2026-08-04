@@ -4,10 +4,10 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use async_trait::async_trait;
 use fabro_api::types::RunManifest;
-use fabro_automation::{AutomationId, AutomationTarget, GitHubRepositorySlug};
+use fabro_automation::{AutomationId, AutomationTarget};
 use fabro_config::{EnvironmentLayer, MergeMap};
 use fabro_manifest::ManifestBuildInput;
-use fabro_types::{DirtyStatus, GitContext, PreRunPushOutcome, RunId};
+use fabro_types::{DirtyStatus, GitContext, GitHubRepositorySlug, RunId};
 use fabro_util::error::collect_chain;
 use tokio::{fs, task};
 
@@ -136,7 +136,6 @@ impl AutomationRunMaterializer for ProductionAutomationRunMaterializer {
 
         let manifest_input = ManifestFromCheckoutInput {
             workflow: input.target.workflow,
-            run_id: input.run_id,
             user_settings_path: input.user_settings_path,
             checkout_dir,
             git_context: ManifestGitContextInput {
@@ -166,7 +165,6 @@ fn parse_target_repository(value: &str) -> Result<GitHubRepositorySlug, RunMater
 #[derive(Debug)]
 pub(crate) struct ManifestFromCheckoutInput {
     workflow:             String,
-    run_id:               RunId,
     user_settings_path:   PathBuf,
     checkout_dir:         PathBuf,
     git_context:          ManifestGitContextInput,
@@ -185,7 +183,6 @@ fn build_manifest_from_checkout(
 ) -> Result<AutomationRunMaterialized, RunMaterializeError> {
     let ManifestFromCheckoutInput {
         workflow,
-        run_id,
         user_settings_path,
         checkout_dir,
         git_context,
@@ -194,7 +191,6 @@ fn build_manifest_from_checkout(
     let built = fabro_manifest::build_run_manifest(ManifestBuildInput {
         workflow: workflow.into(),
         cwd: checkout_dir,
-        run_id: Some(run_id),
         user_settings_path: Some(user_settings_path),
         environment_defaults,
         ..ManifestBuildInput::default()
@@ -203,11 +199,10 @@ fn build_manifest_from_checkout(
 
     let mut manifest = built.manifest;
     manifest.git = Some(GitContext {
-        origin_url:   github_metadata_url(&git_context.repo),
-        branch:       git_context.ref_selector,
-        sha:          Some(git_context.checked_out_sha),
-        dirty:        DirtyStatus::Clean,
-        push_outcome: PreRunPushOutcome::NotAttempted,
+        origin_url: github_metadata_url(&git_context.repo),
+        branch:     git_context.ref_selector,
+        sha:        Some(git_context.checked_out_sha),
+        dirty:      DirtyStatus::Clean,
     });
     let submitted_manifest_bytes = serde_json::to_vec(&manifest)
         .context("failed to serialize materialized run manifest")
@@ -303,7 +298,7 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
 
-    use fabro_types::{DirtyStatus, PreRunPushOutcome, RunId};
+    use fabro_types::DirtyStatus;
     use tempfile::TempDir;
 
     use super::*;
@@ -334,16 +329,14 @@ mod tests {
         .unwrap();
         let user_settings_path = temp.path().join("settings.toml");
         fs::write(&user_settings_path, "_version = 1\n").unwrap();
-        let run_id = RunId::new();
         let repo = parse_target_repository("workspace-org/app").unwrap();
         let sha = "0123456789abcdef0123456789abcdef01234567".to_string();
 
         let materialized = build_manifest_from_checkout(ManifestFromCheckoutInput {
-            workflow: "demo".to_string(),
-            run_id,
-            user_settings_path: user_settings_path.clone(),
-            checkout_dir: checkout.clone(),
-            git_context: ManifestGitContextInput {
+            workflow:             "demo".to_string(),
+            user_settings_path:   user_settings_path.clone(),
+            checkout_dir:         checkout.clone(),
+            git_context:          ManifestGitContextInput {
                 repo,
                 ref_selector: "release".to_string(),
                 checked_out_sha: sha.clone(),
@@ -352,10 +345,6 @@ mod tests {
         })
         .expect("manifest should build from checkout");
 
-        assert_eq!(
-            materialized.manifest.run_id.as_deref(),
-            Some(run_id.to_string().as_str())
-        );
         assert_eq!(materialized.manifest.cwd, checkout.display().to_string());
         assert_eq!(
             materialized.manifest.target.path,
@@ -377,10 +366,10 @@ mod tests {
         assert_eq!(git.branch, "release");
         assert_eq!(git.sha.as_deref(), Some(sha.as_str()));
         assert_eq!(git.dirty, DirtyStatus::Clean);
-        assert_eq!(git.push_outcome, PreRunPushOutcome::NotAttempted);
         let submitted_manifest: serde_json::Value =
             serde_json::from_slice(&materialized.submitted_manifest_bytes)
                 .expect("submitted bytes should be a manifest");
+        assert!(submitted_manifest.get("run_id").is_none());
         assert_eq!(
             submitted_manifest,
             serde_json::to_value(&materialized.manifest).unwrap()

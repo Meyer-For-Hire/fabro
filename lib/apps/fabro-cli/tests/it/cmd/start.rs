@@ -1,7 +1,8 @@
 use fabro_test::{fabro_json_snapshot, fabro_snapshot, test_context};
 
-use super::support::{output_stdout, resolve_run, wait_for_status, write_gated_workflow};
-use crate::support::unique_run_id;
+use super::support::{
+    created_run_id, output_stdout, resolve_run, wait_for_status, write_gated_workflow,
+};
 
 const SHARED_DAEMON_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -37,21 +38,19 @@ fn help() {
 fn start_by_run_id_starts_created_run() {
     let context = test_context!();
     context.ensure_home_server_auth_methods();
-    let run_id = unique_run_id();
     let workflow = context.install_fixture("simple.fabro");
 
-    context
+    let create = context
         .command()
         .args([
             "create",
             "--dry-run",
             "--auto-approve",
-            "--run-id",
-            run_id.as_str(),
             workflow.to_str().unwrap(),
         ])
         .assert()
         .success();
+    let run_id = created_run_id(create.get_output());
 
     context
         .command()
@@ -89,21 +88,19 @@ fn start_by_run_id_starts_created_run() {
 fn start_by_run_id_starts_created_run_without_run_json_or_status_json() {
     let context = test_context!();
     context.ensure_home_server_auth_methods();
-    let run_id = unique_run_id();
     let workflow = context.install_fixture("simple.fabro");
 
-    context
+    let create = context
         .command()
         .args([
             "create",
             "--dry-run",
             "--auto-approve",
-            "--run-id",
-            run_id.as_str(),
             workflow.to_str().unwrap(),
         ])
         .assert()
         .success();
+    let run_id = created_run_id(create.get_output());
 
     context
         .command()

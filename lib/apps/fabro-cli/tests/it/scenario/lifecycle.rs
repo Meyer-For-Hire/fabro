@@ -11,7 +11,7 @@ use fabro_test::{fabro_json_snapshot, test_context};
 use serde_json::Value;
 
 use super::{fixture, run_state, timeout_for};
-use crate::support::unique_run_id;
+use crate::cmd::support::created_run_id;
 
 #[fabro_macros::e2e_test()]
 fn local_run_lifecycle() {
@@ -116,21 +116,19 @@ fn local_run_lifecycle() {
 fn dry_run_create_start_attach_works_with_default_run_lookup() {
     let context = test_context!();
     context.ensure_home_server_auth_methods();
-    let run_id = unique_run_id();
     let workflow = context.install_fixture("simple.fabro");
 
-    context
+    let create = context
         .command()
         .args([
             "create",
             "--dry-run",
             "--auto-approve",
-            "--run-id",
-            run_id.as_str(),
             workflow.to_str().unwrap(),
         ])
         .assert()
         .success();
+    let run_id = created_run_id(create.get_output());
 
     context
         .command()
@@ -181,22 +179,20 @@ fn dry_run_create_start_attach_works_with_default_run_lookup() {
 fn dry_run_detach_attach_works_with_default_run_lookup() {
     let context = test_context!();
     context.ensure_home_server_auth_methods();
-    let run_id = unique_run_id();
     let workflow = context.install_fixture("simple.fabro");
 
-    context
+    let run = context
         .command()
         .args([
             "run",
             "--detach",
             "--dry-run",
             "--auto-approve",
-            "--run-id",
-            run_id.as_str(),
             workflow.to_str().unwrap(),
         ])
         .assert()
         .success();
+    let run_id = created_run_id(run.get_output());
 
     context
         .command()
@@ -229,7 +225,6 @@ fn completed_run_can_be_attached_by_workflow_slug() {
     let project = tempfile::tempdir().unwrap();
     let workflow_dir = project.path().join("workflows").join("sluggy");
     let workflow_path = workflow_dir.join("workflow.fabro");
-    let run_id = unique_run_id();
 
     std::fs::create_dir_all(&workflow_dir).unwrap();
     std::fs::write(
@@ -244,19 +239,18 @@ digraph BarBaz {
     )
     .unwrap();
 
-    context
+    let create = context
         .command()
         .current_dir(project.path())
         .args([
             "create",
             "--dry-run",
             "--auto-approve",
-            "--run-id",
-            run_id.as_str(),
             workflow_path.to_str().unwrap(),
         ])
         .assert()
         .success();
+    let run_id = created_run_id(create.get_output());
     context
         .command()
         .current_dir(project.path())
@@ -301,7 +295,6 @@ fn completed_run_can_be_attached_by_file_stem() {
     context.ensure_home_server_auth_methods();
     let workflow_dir = tempfile::tempdir().unwrap();
     let workflow_path = workflow_dir.path().join("alpha.fabro");
-    let run_id = unique_run_id();
 
     std::fs::write(
         &workflow_path,
@@ -315,18 +308,17 @@ digraph FooWorkflow {
     )
     .unwrap();
 
-    context
+    let create = context
         .command()
         .args([
             "create",
             "--dry-run",
             "--auto-approve",
-            "--run-id",
-            run_id.as_str(),
             workflow_path.to_str().unwrap(),
         ])
         .assert()
         .success();
+    let run_id = created_run_id(create.get_output());
     context
         .command()
         .args(["start", "alpha"])

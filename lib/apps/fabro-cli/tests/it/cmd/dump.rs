@@ -11,10 +11,10 @@ use fabro_test::{fabro_snapshot, test_context};
 use insta::assert_snapshot;
 
 use super::support::{
-    local_dev_token, server_target, setup_completed_dry_run, setup_seeded_completed_dry_run,
-    setup_seeded_created_dry_run,
+    local_dev_token, run_state, server_target, setup_completed_dry_run,
+    setup_seeded_completed_dry_run, setup_seeded_created_dry_run,
 };
-use crate::support::{LightweightCli, seed_dev_token_auth, unique_run_id};
+use crate::support::{LightweightCli, seed_dev_token_auth};
 
 #[test]
 fn help() {
@@ -99,11 +99,10 @@ fn dump_exports_large_command_output_backed_by_blob_refs() {
     )
     .unwrap();
 
-    let run_id = unique_run_id();
     let mut run_cmd = context.run_cmd();
     run_cmd.current_dir(&context.temp_dir);
     run_cmd.timeout(Duration::from_secs(30));
-    run_cmd.args(["--run-id", run_id.as_str(), "--environment", "local"]);
+    run_cmd.args(["--environment", "local"]);
     run_cmd.arg(&workflow);
     let run_output = run_cmd.output().expect("command should execute");
     assert!(
@@ -112,6 +111,7 @@ fn dump_exports_large_command_output_backed_by_blob_refs() {
         String::from_utf8_lossy(&run_output.stdout),
         String::from_utf8_lossy(&run_output.stderr)
     );
+    let run_id = run_state(&context.single_run_dir()).spec.run_id.to_string();
 
     let mut inspect_cmd = context.command();
     inspect_cmd.args(["inspect", "--json", &run_id]);
@@ -186,17 +186,10 @@ include = ["assets/**"]
     )
     .unwrap();
 
-    let run_id = unique_run_id();
     let mut run_cmd = context.run_cmd();
     run_cmd.current_dir(&workspace_dir);
     run_cmd.timeout(Duration::from_secs(30));
-    run_cmd.args([
-        "--run-id",
-        run_id.as_str(),
-        "--environment",
-        "local",
-        "run.toml",
-    ]);
+    run_cmd.args(["--environment", "local", "run.toml"]);
     let run_output = run_cmd.output().expect("command should execute");
     assert!(
         run_output.status.success(),
@@ -204,6 +197,7 @@ include = ["assets/**"]
         String::from_utf8_lossy(&run_output.stdout),
         String::from_utf8_lossy(&run_output.stderr)
     );
+    let run_id = run_state(&context.single_run_dir()).spec.run_id.to_string();
 
     let mut inspect_cmd = context.command();
     inspect_cmd.args(["inspect", "--json", &run_id]);

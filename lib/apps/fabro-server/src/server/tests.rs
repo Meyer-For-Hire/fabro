@@ -3190,7 +3190,6 @@ fn manifest_json(target_path: &str, dot_source: &str) -> serde_json::Value {
         "version": 1,
         "cwd": "/tmp",
         "target": {
-            "identifier": target_path,
             "path": target_path,
         },
         "workflows": {
@@ -3546,6 +3545,77 @@ async fn post_run_manifest(app: &Router, manifest: serde_json::Value) -> serde_j
 }
 
 #[tokio::test]
+async fn post_runs_ignores_removed_run_id_input() {
+    let app = crate::test_support::build_test_router(test_app_state());
+    let submitted_run_id = RunId::new();
+    let mut manifest = minimal_manifest_json(MINIMAL_DOT);
+    manifest["run_id"] = json!(submitted_run_id.to_string());
+
+    let created = post_run_manifest(&app, manifest).await;
+    let allocated_run_id = created["id"]
+        .as_str()
+        .expect("create response should contain an id")
+        .parse::<RunId>()
+        .expect("create response id should be valid");
+
+    assert_ne!(allocated_run_id, submitted_run_id);
+}
+
+/// Old clients may still send the removed `target.identifier` and
+/// `goal.path` manifest properties. The server must keep accepting such
+/// bodies as unknown fields: the workflow is selected by `target.path`
+/// and the goal comes from the resolved `goal.text`.
+#[tokio::test]
+async fn post_runs_accepts_legacy_manifest_metadata_properties() {
+    let state = test_app_state();
+    let app = crate::test_support::build_test_router(Arc::clone(&state));
+    let picked_dot = r"digraph PickedFlow {
+        start [shape=Mdiamond]
+        exit [shape=Msquare]
+        start -> exit
+    }";
+    let decoy_dot = r"digraph DecoyFlow {
+        start [shape=Mdiamond]
+        exit [shape=Msquare]
+        start -> exit
+    }";
+    let manifest = serde_json::json!({
+        "version": 1,
+        "cwd": "/tmp",
+        "target": {
+            // Legacy display metadata: deliberately names the decoy entry
+            // to prove selection never reads it.
+            "identifier": "decoy.fabro",
+            "path": "picked.fabro",
+        },
+        "goal": {
+            "type": "file",
+            "text": "Goal text from the legacy body",
+            "path": "/tmp/original/goal.md",
+        },
+        "workflows": {
+            "picked.fabro": { "source": picked_dot, "files": {} },
+            "decoy.fabro": { "source": decoy_dot, "files": {} },
+        },
+    });
+
+    let created = post_run_manifest(&app, manifest).await;
+    let run_id = created["id"]
+        .as_str()
+        .expect("create response should contain an id")
+        .parse::<RunId>()
+        .expect("create response id should be valid");
+
+    let run_store = state.stores.runs.open_run_reader(&run_id).await.unwrap();
+    let run_state = run_store.state().await.unwrap();
+    assert_eq!(run_state.spec.graph.name, "PickedFlow");
+    assert_eq!(
+        run_state.spec.graph.goal(),
+        "Goal text from the legacy body"
+    );
+}
+
+#[tokio::test]
 async fn post_runs_create_regression_keeps_api_behavior_without_automation_metadata() {
     let state = TestAppStateBuilder::new()
         .env_lookup(|_| None)
@@ -3714,8 +3784,7 @@ layer = "project"
         "origin_url": "https://github.com/acme/payments.git",
         "branch": "feature/compiler",
         "sha": "0123456789abcdef",
-        "dirty": "clean",
-        "push_outcome": { "type": "not_attempted" }
+        "dirty": "clean"
     });
     let manifest: RunManifest = serde_json::from_value(manifest_json).unwrap();
     let submitted_manifest_bytes = serde_json::to_vec(&manifest).unwrap();
@@ -4232,7 +4301,6 @@ async fn validate_endpoint_returns_template_source_coordinates() {
         "version": 1,
         "cwd": "/tmp",
         "target": {
-            "identifier": "workflow.fabro",
             "path": "workflow.fabro",
         },
         "workflows": {
@@ -4576,13 +4644,10 @@ async fn append_default_run_created(run_store: &fabro_store::RunDatabase, run_id
         settings: serde_json::to_value(WorkflowSettings::default()).unwrap(),
         graph: serde_json::to_value(Graph::new("test")).unwrap(),
         workflow_source: None,
-        workflow_config: None,
         labels: std::collections::BTreeMap::default(),
-        run_dir: "/tmp".to_string(),
         source_directory: None,
         workflow_slug: None,
         automation: None,
-        db_prefix: None,
         provenance: test_support::test_run_provenance(),
         manifest_blob: None,
         git: None,
@@ -4630,13 +4695,10 @@ async fn create_slack_notification_run(
         settings: serde_json::to_value(settings).unwrap(),
         graph: serde_json::to_value(Graph::new(graph_name)).unwrap(),
         workflow_source: None,
-        workflow_config: None,
         labels: std::collections::BTreeMap::default(),
-        run_dir: "/tmp".to_string(),
         source_directory: None,
         workflow_slug: workflow_slug.map(str::to_string),
         automation: None,
-        db_prefix: None,
         provenance: test_support::test_run_provenance(),
         manifest_blob: None,
         git: None,
@@ -5706,13 +5768,10 @@ async fn list_run_stages_distinguishes_visits() {
             settings: serde_json::to_value(fabro_types::WorkflowSettings::default()).unwrap(),
             graph: serde_json::to_value(&graph).unwrap(),
             workflow_source: None,
-            workflow_config: None,
             labels: std::collections::BTreeMap::default(),
-            run_dir: String::new(),
             source_directory: None,
             workflow_slug: Some("test".to_string()),
             automation: None,
-            db_prefix: None,
             provenance: test_support::test_run_provenance(),
             manifest_blob: None,
             git: None,
@@ -5845,13 +5904,10 @@ async fn list_run_stages_exposes_execution_identity_for_resumed_stage() {
             settings: serde_json::to_value(fabro_types::WorkflowSettings::default()).unwrap(),
             graph: serde_json::to_value(&graph).unwrap(),
             workflow_source: None,
-            workflow_config: None,
             labels: std::collections::BTreeMap::default(),
-            run_dir: String::new(),
             source_directory: None,
             workflow_slug: Some("test".to_string()),
             automation: None,
-            db_prefix: None,
             provenance: test_support::test_run_provenance(),
             manifest_blob: None,
             git: None,
@@ -7021,11 +7077,10 @@ async fn create_completed_run_ready_for_pull_request(
     );
     let git = match (repo_origin_url, base_branch) {
         (Some(origin), Some(branch)) => Some(fabro_types::GitContext {
-            origin_url:   origin.to_string(),
-            branch:       branch.to_string(),
-            sha:          None,
-            dirty:        fabro_types::DirtyStatus::Clean,
-            push_outcome: fabro_types::PreRunPushOutcome::NotAttempted,
+            origin_url: origin.to_string(),
+            branch:     branch.to_string(),
+            sha:        None,
+            dirty:      fabro_types::DirtyStatus::Clean,
         }),
         _ => None,
     };
@@ -7052,13 +7107,10 @@ async fn create_completed_run_ready_for_pull_request(
             settings: serde_json::to_value(&run_spec.settings).unwrap(),
             graph: serde_json::to_value(&run_spec.graph).unwrap(),
             workflow_source: None,
-            workflow_config: None,
             labels: run_spec.labels.clone().into_iter().collect(),
-            run_dir: run_spec.source_directory.clone().unwrap_or_default(),
             source_directory: run_spec.source_directory.clone(),
             workflow_slug: run_spec.workflow_slug.clone(),
             automation: None,
-            db_prefix: None,
             provenance: run_spec.provenance.clone(),
             manifest_blob: None,
             git,
@@ -10762,10 +10814,6 @@ async fn create_run_persists_manifest_and_definition_blobs_without_bundle_file()
     );
     assert_eq!(accepted_definition["workflow_path"], "workflow.fabro");
     assert!(accepted_definition["workflows"]["workflow.fabro"].is_object());
-
-    created["properties"]["run_dir"]
-        .as_str()
-        .expect("run.created should include run_dir");
 }
 
 #[tokio::test]
@@ -11333,7 +11381,6 @@ async fn create_run_keeps_missing_project_and_workflow_names_absent() {
         "version": 1,
         "cwd": "/tmp/project",
         "target": {
-            "identifier": "workflow.fabro",
             "path": "workflow.fabro",
         },
         "configs": [
@@ -13530,7 +13577,6 @@ async fn get_graph_returns_svg() {
                 "version": 1,
                 "cwd": "/tmp",
                 "target": {
-                    "identifier": "workflow.fabro",
                     "path": "workflow.fabro",
                 },
                 "workflows": {
@@ -13590,7 +13636,6 @@ async fn get_graph_source_returns_dot() {
                 "version": 1,
                 "cwd": "/tmp",
                 "target": {
-                    "identifier": "workflow.fabro",
                     "path": "workflow.fabro",
                 },
                 "workflows": {
@@ -13644,7 +13689,6 @@ async fn render_graph_from_manifest_returns_svg() {
                     "version": 1,
                     "cwd": "/tmp",
                     "target": {
-                        "identifier": "workflow.fabro",
                         "path": "workflow.fabro",
                     },
                     "workflows": {
@@ -13702,7 +13746,6 @@ async fn render_graph_from_manifest_accepts_fabro_dotted_attributes() {
                     "version": 1,
                     "cwd": "/tmp",
                     "target": {
-                        "identifier": "workflow.fabro",
                         "path": "workflow.fabro",
                     },
                     "workflows": {
@@ -14033,13 +14076,10 @@ async fn create_preserved_local_sandbox_run(state: &Arc<AppState>, run_id: RunId
             settings: serde_json::to_value(settings).unwrap(),
             graph: serde_json::to_value(graph).unwrap(),
             workflow_source: None,
-            workflow_config: None,
             labels: std::collections::BTreeMap::default(),
-            run_dir: "/tmp/fabro-run".to_string(),
             source_directory: Some("/tmp/fabro-run".to_string()),
             workflow_slug: Some("test".to_string()),
             automation: None,
-            db_prefix: None,
             provenance: test_support::test_run_provenance(),
             manifest_blob: None,
             git: None,
@@ -14785,13 +14825,10 @@ async fn delete_run_retry_after_missing_provider_resource_removes_metadata() {
             settings: serde_json::to_value(fabro_types::WorkflowSettings::default()).unwrap(),
             graph: serde_json::to_value(graph).unwrap(),
             workflow_source: None,
-            workflow_config: None,
             labels: std::collections::BTreeMap::default(),
-            run_dir: "/tmp/fabro-run".to_string(),
             source_directory: Some("/tmp/fabro-run".to_string()),
             workflow_slug: Some("test".to_string()),
             automation: None,
-            db_prefix: None,
             provenance: test_support::test_run_provenance(),
             manifest_blob: None,
             git: None,

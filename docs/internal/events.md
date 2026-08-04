@@ -44,18 +44,12 @@ Emitted when the run record is created.
   "event": "run.created",
   "properties": {
     "workflow_slug": "my-workflow",
-    "run_dir": "/home/user/.fabro/storage/scratch/20260428-01JQXYZ",
     "source_directory": "/home/user/src/my-project",
-    "repo_origin_url": "https://github.com/acme/my-project.git",
-    "base_branch": "main",
-    "pre_run_git": {
-      "display_base_sha": "abc123",
-      "local_dirty": "clean",
-      "push_outcome": {
-        "type": "succeeded",
-        "remote": "origin",
-        "branch": "main"
-      }
+    "git": {
+      "origin_url": "https://github.com/acme/my-project",
+      "branch": "main",
+      "sha": "abc123",
+      "dirty": "clean"
     },
     "fork_source_ref": null,
     "in_place": false,
@@ -79,19 +73,19 @@ Emitted when the run record is created.
 | `settings` | object | Workflow settings snapshot |
 | `graph` | object | Parsed workflow graph |
 | `workflow_source` | string? | Workflow source text |
-| `workflow_config` | string? | Workflow config text |
 | `labels` | object | Run labels |
-| `run_dir` | string | Local scratch directory for the run |
 | `source_directory` | string? | Submitter-side source directory |
-| `repo_origin_url` | string? | Normalized repository origin URL used by clone-based sandboxes |
-| `base_branch` | string? | Submitter-side base branch |
 | `workflow_slug` | string? | Workflow slug |
-| `db_prefix` | string? | Store prefix used for the run |
 | `provenance` | object | Actor and request provenance |
 | `manifest_blob` | string? | Blob id for the submitted manifest |
-| `pre_run_git` | object? | Submitter-side pre-run git context and push outcome |
+| `git` | object? | Git provenance observed before the run: normalized `origin_url`, `branch`, optional `sha`, and `dirty` status |
 | `fork_source_ref` | object? | Source run/checkpoint reference when this run was forked |
 | `in_place` | boolean | Whether the run was created with `--in-place` (no git checkpoints) |
+
+Readers remain tolerant of the legacy `workflow_config`, `run_dir`, and
+`db_prefix` properties, and of a legacy `push_outcome` object nested inside
+`git`, when replaying historical events; newly emitted `run.created` events
+omit them.
 
 ### `run.started`
 

@@ -1,32 +1,29 @@
+use fabro_types::JsonScalarToTomlError;
 use serde_json::Value;
 
 use super::common::{ToolError, ToolResult};
 
 pub fn json_to_toml_value(key: &str, value: &Value) -> ToolResult<toml::Value> {
-    match value {
-        Value::Null => Err(ToolError::message(format!(
-            "input `{key}` cannot be null; use a string, boolean, or number"
-        ))),
-        Value::Bool(value) => Ok(toml::Value::Boolean(*value)),
-        Value::Number(value) => {
-            if let Some(integer) = value.as_i64() {
-                Ok(toml::Value::Integer(integer))
-            } else if let Some(float) = value.as_f64() {
-                Ok(toml::Value::Float(float))
-            } else {
-                Err(ToolError::message(format!(
-                    "input `{key}` contains a number outside TOML's supported range"
-                )))
-            }
+    fabro_types::json_scalar_to_toml_value(value)
+        .map_err(|error| json_scalar_to_tool_error(key, error))
+}
+
+fn json_scalar_to_tool_error(key: &str, error: JsonScalarToTomlError) -> ToolError {
+    let message = match error {
+        JsonScalarToTomlError::Null => {
+            format!("input `{key}` cannot be null; use a string, boolean, or number")
         }
-        Value::String(value) => Ok(toml::Value::String(value.clone())),
-        Value::Array(_) => Err(ToolError::message(format!(
-            "input `{key}` does not support array values; use a string, boolean, or number",
-        ))),
-        Value::Object(_) => Err(ToolError::message(format!(
+        JsonScalarToTomlError::Array => {
+            format!("input `{key}` does not support array values; use a string, boolean, or number")
+        }
+        JsonScalarToTomlError::Object => format!(
             "input `{key}` does not support object values; use a string, boolean, or number",
-        ))),
-    }
+        ),
+        JsonScalarToTomlError::NumberOutOfRange => {
+            format!("input `{key}` contains a number outside TOML's supported range")
+        }
+    };
+    ToolError::message(message)
 }
 
 #[cfg(test)]
@@ -45,19 +42,25 @@ mod tests {
         ];
 
         for (json, expected) in cases {
-            assert_eq!(json_to_toml_value("input", &json).unwrap(), expected);
+            assert_eq!(
+                json_to_toml_value("input", &json)
+                    .expect("representative JSON scalar should convert"),
+                expected
+            );
         }
     }
 
     #[test]
     fn json_input_arrays_and_objects_are_rejected() {
-        let array_err = json_to_toml_value("matrix", &json!(["a", 1])).unwrap_err();
+        let array_err = json_to_toml_value("matrix", &json!(["a", 1]))
+            .expect_err("JSON arrays should be rejected");
         assert_eq!(
             array_err.as_str(),
             "input `matrix` does not support array values; use a string, boolean, or number",
         );
 
-        let object_err = json_to_toml_value("settings", &json!({ "enabled": true })).unwrap_err();
+        let object_err = json_to_toml_value("settings", &json!({ "enabled": true }))
+            .expect_err("JSON objects should be rejected");
         assert_eq!(
             object_err.as_str(),
             "input `settings` does not support object values; use a string, boolean, or number",
@@ -66,11 +69,22 @@ mod tests {
 
     #[test]
     fn json_input_null_is_rejected_with_key_name() {
-        let err = json_to_toml_value("goal", &Value::Null).unwrap_err();
+        let err =
+            json_to_toml_value("goal", &Value::Null).expect_err("JSON null should be rejected");
 
         assert_eq!(
             err.as_str(),
             "input `goal` cannot be null; use a string, boolean, or number",
+        );
+    }
+
+    #[test]
+    fn json_input_out_of_range_number_preserves_tool_message() {
+        let err = json_scalar_to_tool_error("threshold", JsonScalarToTomlError::NumberOutOfRange);
+
+        assert_eq!(
+            err.as_str(),
+            "input `threshold` contains a number outside TOML's supported range",
         );
     }
 }

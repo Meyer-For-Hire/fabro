@@ -16,6 +16,7 @@ workspace = true
 chrono.workspace = true
 croner.workspace = true
 fabro-db = { path = "../../foundation/fabro-db" }
+fabro-types = { path = "../../foundation/fabro-types" }
 hex.workspace = true
 serde.workspace = true
 sha2.workspace = true

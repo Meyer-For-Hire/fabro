@@ -591,7 +591,6 @@ fn main() {
         ),
         ("SecretType", "fabro_types::SecretType", &[]),
         ("DiffStats", "fabro_types::DiffStats", &[]),
-        ("PreRunPushOutcome", "fabro_types::PreRunPushOutcome", &[]),
         ("DirtyStatus", "fabro_types::DirtyStatus", &[]),
         ("GitContext", "fabro_types::GitContext", &[]),
         (

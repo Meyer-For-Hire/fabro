@@ -157,12 +157,6 @@ pub(crate) fn prepare_manifest_with_environment_defaults(
         .map(|title| fabro_types::normalize_explicit_run_title(title.as_str()))
         .transpose()?;
     manifest
-        .run_id
-        .as_deref()
-        .map(str::parse::<RunId>)
-        .transpose()
-        .context("invalid run ID")?;
-    manifest
         .parent_id
         .as_deref()
         .map(str::parse::<RunId>)
@@ -1404,11 +1398,9 @@ mod tests {
             git:       None,
             goal:      None,
             parent_id: None,
-            run_id:    None,
             title:     None,
             target:    types::ManifestTarget {
-                identifier: "workflow.fabro".to_string(),
-                path:       "workflow.fabro".to_string(),
+                path: "workflow.fabro".to_string(),
             },
             version:   1,
             workflows: HashMap::from([("workflow.fabro".to_string(), types::ManifestWorkflow {
@@ -1703,11 +1695,10 @@ digraph Demo {{
 
     fn git_context(origin_url: &str, branch: &str) -> types::GitContext {
         types::GitContext {
-            origin_url:   origin_url.to_string(),
-            branch:       branch.to_string(),
-            sha:          None,
-            dirty:        fabro_types::DirtyStatus::Clean,
-            push_outcome: fabro_types::PreRunPushOutcome::NotAttempted,
+            origin_url: origin_url.to_string(),
+            branch:     branch.to_string(),
+            sha:        None,
+            dirty:      fabro_types::DirtyStatus::Clean,
         }
     }
 
@@ -2236,7 +2227,6 @@ id = "local"
     #[test]
     fn prepare_manifest_keeps_missing_metadata_names_absent() {
         let mut manifest = minimal_manifest();
-        manifest.target.identifier = "release-flow".to_string();
         manifest.workflows.get_mut("workflow.fabro").unwrap().source = r"
 digraph GraphName {
     start [shape=Mdiamond]
