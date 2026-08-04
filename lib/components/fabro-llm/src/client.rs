@@ -1231,6 +1231,62 @@ base_url = "{}/v1"
     }
 
     #[tokio::test]
+    async fn fireworks_routes_kimi_k3_fast_to_router_model_id() {
+        let upstream = httpmock::MockServer::start_async().await;
+        let completion = upstream
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::POST)
+                    .path("/inference/v1/chat/completions")
+                    .header("Authorization", "Bearer test-key")
+                    .json_body_includes(r#"{"model":"accounts/fireworks/routers/kimi-k3-fast"}"#);
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(serde_json::json!({
+                        "id": "chatcmpl-fireworks",
+                        "model": "accounts/fireworks/routers/kimi-k3-fast",
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "OK"},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {
+                            "prompt_tokens": 1,
+                            "completion_tokens": 1,
+                            "total_tokens": 2
+                        }
+                    }));
+            })
+            .await;
+        let catalog = catalog_with(&format!(
+            r#"
+[providers.fireworks]
+enabled = true
+base_url = "{}/inference/v1"
+"#,
+            upstream.base_url()
+        ));
+        let fireworks = ProviderId::new("fireworks");
+        let client = Client::from_credentials(
+            vec![
+                ApiCredential::from_api_key(fireworks.clone(), "test-key".to_string(), &catalog)
+                    .unwrap(),
+            ],
+            catalog,
+        )
+        .await
+        .unwrap();
+        let mut request = test_request();
+        request.model = "kimi-k3-fast".to_string();
+        request.provider = Some(fireworks.to_string());
+
+        let response = client.complete(&request).await.unwrap();
+
+        assert_eq!(response.text(), "OK");
+        assert_eq!(response.model, "kimi-k3-fast");
+        assert_eq!(response.provider, "fireworks");
+        completion.assert_async().await;
+    }
+
+    #[tokio::test]
     async fn complete_stamps_estimated_cost_from_catalog() {
         let mut client = Client::new(HashMap::new(), None, vec![]);
         client

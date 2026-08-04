@@ -3878,26 +3878,35 @@ enabled = true
     }
 
     #[test]
-    fn builtin_kimi_k3_selection_prefers_modal_then_moonshot_over_openrouter() {
+    fn builtin_kimi_k3_selection_follows_provider_priority() {
         let moonshot = ProviderId::new("moonshot");
         let modal = ProviderId::new("modal");
+        let fireworks = ProviderId::new("fireworks");
         let openrouter = ProviderId::new("openrouter");
         let catalog = Catalog::from_builtin_with_overrides(&minimal_settings(
             r"
 [providers.modal]
 enabled = true
 
+[providers.fireworks]
+enabled = true
+
 [providers.openrouter]
 enabled = true
 ",
         ))
-        .expect("enabled Modal and OpenRouter overrides should build");
+        .expect("enabled Kimi K3 provider overrides should build");
 
         let selected = catalog
             .select(
                 "kimi-k3",
                 None,
-                &HashSet::from([moonshot.clone(), modal.clone(), openrouter.clone()]),
+                &HashSet::from([
+                    moonshot.clone(),
+                    modal.clone(),
+                    fireworks.clone(),
+                    openrouter.clone(),
+                ]),
             )
             .expect("Modal should win portable Kimi K3 selection");
         assert_eq!(selected.provider, modal);
@@ -3906,15 +3915,19 @@ enabled = true
             .select(
                 "kimi-k3",
                 None,
-                &HashSet::from([moonshot.clone(), openrouter.clone()]),
+                &HashSet::from([moonshot.clone(), fireworks.clone(), openrouter.clone()]),
             )
             .expect("Moonshot should win when Modal is unavailable");
         assert_eq!(selected.provider, moonshot);
 
         let selected = catalog
-            .select("kimi-k3", None, &HashSet::from([modal.clone(), openrouter]))
-            .expect("Modal should win gateway-only Kimi K3 selection");
-        assert_eq!(selected.provider, modal);
+            .select(
+                "kimi-k3",
+                None,
+                &HashSet::from([fireworks.clone(), openrouter]),
+            )
+            .expect("Fireworks should win when only gateway routes are available");
+        assert_eq!(selected.provider, fireworks);
     }
 
     #[test]
@@ -4028,6 +4041,30 @@ enabled = true
         // (id, api_id, family, context_window, max_output, vision, reasoning,
         //  input, output, cache_read)
         let expected = [
+            (
+                "kimi-k3",
+                "accounts/fireworks/models/kimi-k3",
+                "kimi-k3",
+                1_048_576,
+                131_072,
+                true,
+                true,
+                3.0,
+                15.0,
+                0.3,
+            ),
+            (
+                "kimi-k3-fast",
+                "accounts/fireworks/routers/kimi-k3-fast",
+                "kimi-k3",
+                1_048_576,
+                131_072,
+                true,
+                true,
+                4.5,
+                22.5,
+                0.45,
+            ),
             (
                 "kimi-k2.7-code",
                 "accounts/fireworks/models/kimi-k2p7-code",
@@ -4188,6 +4225,32 @@ enabled = true
             assert_eq!(settings.api_id, api_id, "{id}");
             assert_eq!(settings.billing_policy, BillingPolicy::OpenAi, "{id}");
         }
+
+        for id in ["kimi-k3", "kimi-k3-fast"] {
+            let model = catalog
+                .get_on_provider(&fireworks, id)
+                .unwrap_or_else(|| panic!("Fireworks model '{id}' should be present"));
+            assert_eq!(
+                model.features.reasoning_effort,
+                ReasoningEffortFeature::AlwaysAdaptive,
+                "{id}"
+            );
+            assert!(!model.features.sampling_params, "{id}");
+
+            let settings = catalog
+                .model_settings_on_provider(&fireworks, id)
+                .unwrap_or_else(|| panic!("Fireworks settings for '{id}' should be present"));
+            assert_eq!(settings.agent_profile, AgentProfileKind::Kimi, "{id}");
+            assert_eq!(
+                settings.controls.reasoning_effort,
+                [
+                    ReasoningEffort::Low,
+                    ReasoningEffort::Medium,
+                    ReasoningEffort::High,
+                ],
+                "{id}"
+            );
+        }
     }
 
     #[test]
@@ -4205,6 +4268,7 @@ enabled = true
 
         for provider in [ProviderId::new("fireworks"), ProviderId::new("openrouter")] {
             for id in [
+                "kimi-k3",
                 "kimi-k2.6",
                 "deepseek-v4-pro",
                 "deepseek-v4-flash",
