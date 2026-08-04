@@ -212,6 +212,13 @@ pub async fn make_session(responses: Vec<Response>) -> Session {
 
 pub async fn make_session_with_tools(responses: Vec<Response>, registry: ToolRegistry) -> Session {
     let provider = Arc::new(MockLlmProvider::new(responses));
+    make_session_with_provider_and_tools(provider, registry).await
+}
+
+pub async fn make_session_with_provider_and_tools(
+    provider: Arc<dyn ProviderAdapter>,
+    registry: ToolRegistry,
+) -> Session {
     let client = make_client(provider).await;
     let profile = Arc::new(TestProfile::with_tools(registry));
     let env = Arc::new(MockSandbox::default());
