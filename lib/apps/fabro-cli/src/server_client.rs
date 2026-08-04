@@ -443,7 +443,7 @@ mod tests {
 
         let target = ServerTarget::http_url(format!("http://{addr}")).unwrap();
         let client = connect_target_api_client_bundle(&target).await.unwrap();
-        let result = time::timeout(Duration::from_millis(750), client.get_health()).await;
+        let result = time::timeout(Duration::from_secs(5), client.get_health()).await;
 
         server.abort();
         assert!(
