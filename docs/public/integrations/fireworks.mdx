@@ -48,6 +48,8 @@ The built-in catalog gives Fireworks offerings the same human-facing model slugs
 
 | Fabro model slug | Fireworks API ID / notes |
 | --- | --- |
+| `kimi-k3` | `accounts/fireworks/models/kimi-k3` |
+| `kimi-k3-fast` | `accounts/fireworks/routers/kimi-k3-fast`; Fast tier at 50% above standard rates |
 | `kimi-k2.7-code` | `accounts/fireworks/models/kimi-k2p7-code`; provider default |
 | `kimi-k2.6` | `accounts/fireworks/models/kimi-k2p6` |
 | `deepseek-v4-pro`, `deepseek-v4-flash` (`deepseek`, `deepseek-v4`, `deepseek-flash`) | `accounts/fireworks/models/deepseek-v4-...` |
@@ -80,15 +82,15 @@ Note that Fireworks' `GET /v1/models` endpoint only returns a featured subset of
 
 ```bash
 fabro model list --provider fireworks
-fabro model test --provider fireworks --model kimi-k2.7-code
-fabro run workflow.fabro --provider fireworks --model deepseek-v4-flash
+fabro model test --provider fireworks --model kimi-k3-fast
+fabro run workflow.fabro --provider fireworks --model kimi-k3-fast
 ```
 
 When targeting a non-default remote server, pass the same `--server` value to verification commands:
 
 ```bash
 fabro model list --server https://your-fabro.example --provider fireworks
-fabro model test --server https://your-fabro.example --provider fireworks --model kimi-k2.7-code
+fabro model test --server https://your-fabro.example --provider fireworks --model kimi-k3-fast
 ```
 
 In workflow stylesheets:
@@ -97,7 +99,7 @@ In workflow stylesheets:
 digraph Example {
     graph [
         model_stylesheet="
-            * { model: fireworks/kimi-k2.7-code; }
+            * { model: fireworks/kimi-k3-fast; }
         "
     ]
 
@@ -115,7 +117,7 @@ Fireworks caches prompt prefixes automatically — no cache breakpoints or reque
 
 ## Costs
 
-Catalog prices mirror [Fireworks serverless pricing](https://docs.fireworks.ai/serverless/pricing) (standard tier). Fireworks does not return in-band billing, so Fabro reports `cost_source = "estimated"` from catalog rates. Fireworks' "Fast" model variants and Priority service tier are not included in the built-in catalog.
+Catalog prices mirror [Fireworks serverless pricing](https://docs.fireworks.ai/serverless/pricing). Fireworks does not return in-band billing, so Fabro reports `cost_source = "estimated"` from catalog rates. `kimi-k3-fast` uses the published 50% Fast tier premium. Other Fast model variants and the Priority service tier are not included in the built-in catalog.
 
 ## Troubleshooting
 
@@ -125,7 +127,7 @@ Catalog prices mirror [Fireworks serverless pricing](https://docs.fireworks.ai/s
 
 **402 / insufficient credits** — Serverless inference requires prepaid credit; check your balance in the [Fireworks billing dashboard](https://app.fireworks.ai/settings/billing).
 
-**Unknown model** — Confirm the model's `api_id` matches a Fireworks account-scoped path exactly (`accounts/fireworks/models/...`), then run `fabro model test --model <fabro-model-id>`. Remember that `GET /v1/models` only lists a featured subset, so absence from that list is not conclusive.
+**Unknown model** — Confirm the model's `api_id` matches a Fireworks account-scoped model or router path exactly (`accounts/fireworks/models/...` or `accounts/fireworks/routers/...`), then run `fabro model test --model <fabro-model-id>`. Remember that `GET /v1/models` only lists a featured subset, so absence from that list is not conclusive.
 
 ## Further reading
 

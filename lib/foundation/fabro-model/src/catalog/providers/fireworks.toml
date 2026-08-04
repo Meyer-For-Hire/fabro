@@ -24,8 +24,62 @@ credentials = ["env:FIREWORKS_API_KEY", "vault:FIREWORKS_API_KEY"]
 #
 # Prompt caching is automatic prefix caching (no cache_control breakpoints);
 # serverless responses report prompt_tokens_details.cached_tokens in the
-# usage body. Costs below are from docs.fireworks.ai/serverless/pricing
-# (standard tier), verified 2026-07-31.
+# usage body. Costs below are from docs.fireworks.ai/serverless/pricing,
+# verified 2026-08-04. Rows use standard-tier prices unless noted otherwise.
+
+[providers.fireworks.models."kimi-k3"]
+api_id = "accounts/fireworks/models/kimi-k3"
+display_name = "Kimi K3"
+family = "kimi-k3"
+agent_profile = "kimi"
+
+[providers.fireworks.models."kimi-k3".limits]
+context_window = 1048576
+max_output = 131072
+
+[providers.fireworks.models."kimi-k3".features]
+tools = true
+vision = true
+reasoning = true
+reasoning_effort = "always_adaptive"
+prompt_cache = true
+sampling_params = false
+
+[providers.fireworks.models."kimi-k3".controls]
+reasoning_effort = ["low", "medium", "high"]
+
+[providers.fireworks.models."kimi-k3".costs]
+input_cost_per_mtok = 3.0
+output_cost_per_mtok = 15.0
+cache_input_cost_per_mtok = 0.3
+
+# Fireworks exposes the Fast tier through a separate router model ID. Its
+# published prices are 50% above the standard Kimi K3 rates.
+[providers.fireworks.models."kimi-k3-fast"]
+api_id = "accounts/fireworks/routers/kimi-k3-fast"
+display_name = "Kimi K3 Fast"
+family = "kimi-k3"
+agent_profile = "kimi"
+
+[providers.fireworks.models."kimi-k3-fast".limits]
+context_window = 1048576
+max_output = 131072
+
+[providers.fireworks.models."kimi-k3-fast".features]
+tools = true
+vision = true
+reasoning = true
+reasoning_effort = "always_adaptive"
+prompt_cache = true
+sampling_params = false
+
+[providers.fireworks.models."kimi-k3-fast".controls]
+reasoning_effort = ["low", "medium", "high"]
+
+[providers.fireworks.models."kimi-k3-fast".costs]
+input_cost_per_mtok = 4.5
+output_cost_per_mtok = 22.5
+cache_input_cost_per_mtok = 0.45
 
 [providers.fireworks.models."kimi-k2.7-code"]
 api_id = "accounts/fireworks/models/kimi-k2p7-code"

@@ -643,6 +643,17 @@ async fn fireworks_kimi_k2_7_code_deep_tool_round_trip() {
     assert_deep_tool_round_trip(&catalog, &provider, "kimi-k2.7-code", credential).await;
 }
 
+#[fabro_macros::e2e_test(live("FIREWORKS_API_KEY"))]
+async fn fireworks_kimi_k3_fast_deep_tool_round_trip() {
+    let api_key = std::env::var(EnvVars::FIREWORKS_API_KEY).expect("FIREWORKS_API_KEY must be set");
+    let provider = ProviderId::new("fireworks");
+    let catalog = enabled_provider_catalog(&provider, None);
+    let credential = ApiCredential::from_api_key(provider.clone(), api_key, &catalog)
+        .expect("Fireworks credential should resolve from the catalog");
+
+    assert_deep_tool_round_trip(&catalog, &provider, "kimi-k3-fast", credential).await;
+}
+
 #[fabro_macros::e2e_test(live("OPENROUTER_API_KEY"))]
 async fn openrouter_kimi_k3_deep_tool_round_trip() {
     let api_key =
